@@ -132,21 +132,21 @@ function Write-RecoveryBrief {
 
 ## Changed files
 
-````text
+``````text
 $changedFiles
-````
+``````
 
 ## Existing PR for branch
 
-````text
+``````text
 $prStatus
-````
+``````
 
 ## Scrubbed log tail (last 50 lines)
 
-````text
+``````text
 $logTail
-````
+``````
 "@
     Set-Content -LiteralPath $briefPath -Value $brief -Encoding utf8
   } catch {
