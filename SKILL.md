@@ -9,6 +9,18 @@ Use this as the Opus session's conductor procedure. The full design lives in
 [`docs/specs/2026-06-26-loopcoder-v1-design.md`](docs/specs/2026-06-26-loopcoder-v1-design.md);
 keep this playbook practical and procedural instead of duplicating the spec.
 
+## Process discipline (doc-first)
+
+Follow the mandatory workflow in [`docs/PROCESS.md`](docs/PROCESS.md) for every
+unit of work. The order is non-skippable: first a documentation issue writes and
+merges the design/spec under `docs/`; only then a separate code issue implements
+per that merged doc; verification comes last and checks both conformance to the
+doc and working behavior.
+
+Never open a code issue before its design doc is merged. Never bundle
+documentation and code in the same issue or PR. Never hand-write code outside
+this loop.
+
 ## Operating Contract
 
 - Invocation is `/loopcoder <need>`, or automatic activation when the user states a delivery/build request.
@@ -35,6 +47,11 @@ keep this playbook practical and procedural instead of duplicating the spec.
    - Keep v1 to a small batch. If the need is too broad for one session, propose a smaller first batch.
 
 2. Draft GitHub issues and a dependency DAG.
+   - Classify each WorkItem as documentation or code.
+   - For new behavior or implementation work, draft the documentation issue first. It writes the design/spec under `docs/` and must merge before any code issue is opened.
+   - Draft code issues only for already-merged docs. Each code issue must be separate, reference the merged doc path, and state `implement per docs/<doc>.md`.
+   - Do not publish speculative code issues for docs that are not merged yet.
+   - Never combine documentation and code in one issue or PR.
    - Convert the need into WorkItems with clear titles, bodies, acceptance criteria, and temporary IDs.
    - Identify which items can run in parallel and which are blocked by other items.
    - Show the proposed issue list and DAG to the user, including `blocked-by` relationships and the worker line from "Model and speed".
