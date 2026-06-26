@@ -25,6 +25,8 @@ param(
   [string]$BaseBranch = 'main',
   [string]$Branch,
   [string]$RunId,
+  [int]$Attempt = 1,
+  [string]$RecoveryContext = '',
   [ValidateSet('codex')][string]$Provider = 'codex',   # v1: codex only (Worker port is provider-pluggable)
   [string]$Model,
   [string]$Effort,
@@ -35,6 +37,17 @@ function Log($m){ Write-Host "[loopcoder] $m" }
 function Quote-CmdArg($arg){ '"' + ($arg -replace '"','\"') + '"' }
 function Get-UtcIso(){ (Get-Date).ToUniversalTime().ToString('o') }
 function Get-UtcCompact(){ (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') }
+function Scrub-RecoveryText {
+  param([AllowNull()][string]$Text)
+  if ($null -eq $Text) { return '' }
+
+  $scrubbed = $Text
+  $scrubbed = $scrubbed -replace '(?i)(ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+', '[REDACTED_GITHUB_TOKEN]'
+  $scrubbed = $scrubbed -replace '(?i)sk-[A-Za-z0-9_-]{20,}', '[REDACTED_API_KEY]'
+  $scrubbed = $scrubbed -replace '(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+', '$1[REDACTED_TOKEN]'
+  $scrubbed = $scrubbed -replace '(?i)((token|password|secret|api[_-]?key)\s*[=:]\s*)\S+', '$1[REDACTED_SECRET]'
+  return $scrubbed
+}
 function Get-AttemptLogBytes(){
   try {
     if ($script:logFile -and (Test-Path -LiteralPath $script:logFile)) {
@@ -42,6 +55,103 @@ function Get-AttemptLogBytes(){
     }
   } catch {}
   return [int64]0
+}
+function Write-RecoveryBrief {
+  param(
+    [string]$FailurePhase,
+    [AllowNull()][string]$ErrorMessage
+  )
+  try {
+    if (-not $script:runPath -or -not $script:jobId) { return }
+
+    $recoveryPath = Join-Path $script:runPath 'recovery'
+    New-Item -ItemType Directory -Force -Path $recoveryPath | Out-Null
+    $briefPath = Join-Path $recoveryPath "$($script:jobId)-context.md"
+
+    $changedFiles = '(worktree path does not exist)'
+    if ($script:wt -and (Test-Path -LiteralPath $script:wt -PathType Container)) {
+      try {
+        $statusLines = @(git -C $script:wt status --porcelain 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+          $changedFiles = if ($statusLines.Count -gt 0) { $statusLines -join [Environment]::NewLine } else { '(none)' }
+        } else {
+          $changedFiles = "(git status failed with exit $LASTEXITCODE)"
+        }
+      } catch {
+        $changedFiles = "(git status failed: $($_.Exception.Message))"
+      }
+    }
+
+    $logTail = '(log file not found)'
+    if ($script:logFile -and (Test-Path -LiteralPath $script:logFile)) {
+      try {
+        $tailLines = @(Get-Content -LiteralPath $script:logFile -Tail 50 -ErrorAction Stop)
+        $logTail = Scrub-RecoveryText ($tailLines -join [Environment]::NewLine)
+        if ([string]::IsNullOrWhiteSpace($logTail)) { $logTail = '(log tail empty)' }
+      } catch {
+        $logTail = "(failed to read log tail: $($_.Exception.Message))"
+      }
+    }
+
+    $prStatus = 'PR lookup failed or unavailable'
+    try {
+      Push-Location $Repo
+      try {
+        $prJson = & gh pr list --head $Branch --json number,url 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($prJson)) {
+          $prs = @($prJson | ConvertFrom-Json)
+          if ($prs.Count -gt 0) {
+            $prStatus = ($prs | ForEach-Object { "#$($_.number) $($_.url)" }) -join [Environment]::NewLine
+          } else {
+            $prStatus = 'No open PR found for branch'
+          }
+        } else {
+          $prStatus = "gh pr list failed with exit $LASTEXITCODE"
+        }
+      } finally {
+        Pop-Location
+      }
+    } catch {
+      $prStatus = "PR lookup failed: $($_.Exception.Message)"
+    }
+
+    $safeError = Scrub-RecoveryText $ErrorMessage
+    $brief = @"
+# Recovery context for issue #$IssueNumber
+
+- Issue: #$IssueNumber
+- Title: $IssueTitle
+- Branch: $Branch
+- Worktree path: $script:wt
+- Log path: $script:logFile
+- Summary path: $script:summaryFile
+- Attempt: $script:attempt
+- Last phase: $FailurePhase
+- Status: $script:attemptStatus
+- Error: $safeError
+
+## Changed files
+
+````text
+$changedFiles
+````
+
+## Existing PR for branch
+
+````text
+$prStatus
+````
+
+## Scrubbed log tail (last 50 lines)
+
+````text
+$logTail
+````
+"@
+    Set-Content -LiteralPath $briefPath -Value $brief -Encoding utf8
+  } catch {
+    Write-Warning "[loopcoder] failed to write recovery brief for $($script:jobId): $($_.Exception.Message)"
+  }
 }
 function Write-AttemptSidecar {
   param(
@@ -134,7 +244,7 @@ $wt          = Join-Path $scratch 'wt'
 $promptFile  = Join-Path $scratch 'prompt.txt'
 $summaryFile = Join-Path $scratch 'summary.txt'
 $logFile     = Join-Path $scratch 'codex.log'
-$attempt     = 1
+$attempt     = $Attempt
 $jobId       = "job-$IssueNumber-$PID"
 $runPath     = Join-Path (Join-Path (Join-Path $Repo '.loopcoder') 'runs') $RunId
 $workersPath = Join-Path $runPath 'workers'
@@ -187,6 +297,14 @@ $IssueBody
 - You may read files and run commands, but do NOT run git commit or git push — the harness commits and opens the PR.
 - When finished, print a 2-4 sentence summary of exactly what you changed.
 "@
+  if (-not [string]::IsNullOrWhiteSpace($RecoveryContext)) {
+    $prompt = $prompt + @"
+
+## Recovery context from a prior failed attempt (reuse what is valid, fix what failed)
+
+$RecoveryContext
+"@
+  }
   Set-Content -LiteralPath $promptFile -Value $prompt -Encoding utf8
   Write-AttemptSidecar -Phase $activePhase -Status 'running'
 
@@ -252,6 +370,7 @@ catch {
   $preserveArtifacts = $true
   $failurePhase = if ($activePhase) { $activePhase } elseif ($attemptPhase) { $attemptPhase } else { 'worktree_created' }
   Write-AttemptSidecar -Phase $failurePhase -Status 'failed' -ErrorMessage $_.Exception.Message
+  Write-RecoveryBrief -FailurePhase $failurePhase -ErrorMessage $_.Exception.Message
   throw
 }
 finally {
