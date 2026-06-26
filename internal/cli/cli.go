@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -214,7 +215,7 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
 	if err == nil {
 		cfg = loaded
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(stderr, "ready-set: %v\n", err)
 		return 1
 	}
