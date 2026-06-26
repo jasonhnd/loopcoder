@@ -93,30 +93,30 @@ jobs:
               }
             }
           } else {
-            $script = @'
-          import glob
-          import sys
-
-          import yaml
-
-          with open(".delivery.yml", encoding="utf-8") as delivery_file:
-              delivery = yaml.safe_load(delivery_file) or {}
-
-          required_checks = (delivery.get("ci") or {}).get("checks") or []
-          job_ids = set()
-
-          for workflow_path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):
-              with open(workflow_path, encoding="utf-8") as workflow_file:
-                  workflow = yaml.safe_load(workflow_file) or {}
-              job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())
-
-          missing = [str(check) for check in required_checks if str(check) not in job_ids]
-          if missing:
-              print("The following ci.checks entries do not match any workflow job id:")
-              for check in missing:
-                  print(f"  - {check}")
-              sys.exit(1)
-          '@
+            $script = @(
+              'import glob'
+              'import sys'
+              ''
+              'import yaml'
+              ''
+              'with open(".delivery.yml", encoding="utf-8") as delivery_file:'
+              '    delivery = yaml.safe_load(delivery_file) or {}'
+              ''
+              'required_checks = (delivery.get("ci") or {}).get("checks") or []'
+              'job_ids = set()'
+              ''
+              'for workflow_path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):'
+              '    with open(workflow_path, encoding="utf-8") as workflow_file:'
+              '        workflow = yaml.safe_load(workflow_file) or {}'
+              '    job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())'
+              ''
+              'missing = [str(check) for check in required_checks if str(check) not in job_ids]'
+              'if missing:'
+              '    print("The following ci.checks entries do not match any workflow job id:")'
+              '    for check in missing:'
+              '        print(f"  - {check}")'
+              '    sys.exit(1)'
+            ) -join [Environment]::NewLine
 
             $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } else { 'python' }
             $script | & $python -
