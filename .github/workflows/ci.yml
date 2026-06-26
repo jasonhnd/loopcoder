@@ -65,3 +65,71 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+
+      - name: CI check mapping check
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workflowFiles = Get-ChildItem -Path '.github/workflows' -File |
+            Where-Object { $_.Extension -in '.yml', '.yaml' } |
+            Sort-Object FullName
+
+          $jobIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+          if (Get-Command yq -ErrorAction SilentlyContinue) {
+            $requiredChecks = @(& yq -r '(.ci.checks // []) | .[]' '.delivery.yml')
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            foreach ($file in $workflowFiles) {
+              $workflowJobIds = @(& yq -r '(.jobs // {}) | keys | .[]' $file.FullName)
+              if ($LASTEXITCODE -ne 0) {
+                exit $LASTEXITCODE
+              }
+
+              foreach ($jobId in $workflowJobIds) {
+                [void]$jobIds.Add([string]$jobId)
+              }
+            }
+          } else {
+            $script = @'
+          import glob
+          import sys
+
+          import yaml
+
+          with open(".delivery.yml", encoding="utf-8") as delivery_file:
+              delivery = yaml.safe_load(delivery_file) or {}
+
+          required_checks = (delivery.get("ci") or {}).get("checks") or []
+          job_ids = set()
+
+          for workflow_path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):
+              with open(workflow_path, encoding="utf-8") as workflow_file:
+                  workflow = yaml.safe_load(workflow_file) or {}
+              job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())
+
+          missing = [str(check) for check in required_checks if str(check) not in job_ids]
+          if missing:
+              print("The following ci.checks entries do not match any workflow job id:")
+              for check in missing:
+                  print(f"  - {check}")
+              sys.exit(1)
+          '@
+
+            $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } else { 'python' }
+            $script | & $python -
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            exit 0
+          }
+
+          $missing = @($requiredChecks | Where-Object { -not $jobIds.Contains([string]$_) })
+          if ($missing.Count -gt 0) {
+            Write-Host "The following ci.checks entries do not match any workflow job id:"
+            $missing | ForEach-Object { Write-Host "  - $_" }
+            exit 1
+          }
