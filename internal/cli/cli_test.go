@@ -137,6 +137,56 @@ func TestReadySetRequiresRepo(t *testing.T) {
 	}
 }
 
+func TestResumeRunsWithInjectedReaderAndDefaultConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{"resume", "--repo", repo}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				issues: []gh.Issue{{Number: 97, Title: "Implement resume", State: "OPEN"}},
+			}
+		},
+		ProcessAlive: func(int) bool { return false },
+		Now: func() time.Time {
+			return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	text := stdout.String()
+	for _, want := range []string{
+		"RESUME REPORT",
+		"Repo: owner/repo",
+		"RunId: (none) (.loopcoder/runs not found)",
+		"GitHub snapshot: open issues=1, open PRs=0",
+		"Local state: attempts=0, events=0",
+		"classification: ready",
+		"resume is read-only",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestResumeRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"resume"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
 type cliFakeReader struct {
 	issues []gh.Issue
 }

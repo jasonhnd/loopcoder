@@ -2,6 +2,7 @@
 package state
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,12 +104,43 @@ func WorkersPath(repoPath, runID string) string {
 	return filepath.Join(RunPath(repoPath, runID), "workers")
 }
 
+func EventsPath(repoPath, runID string) string {
+	return filepath.Join(RunPath(repoPath, runID), "events.jsonl")
+}
+
 // LoadAttempts reads .loopcoder/runs/<runID>/workers/*.attempt.json records.
 func LoadAttempts(repoPath, runID string) ([]Attempt, error) {
 	if strings.TrimSpace(runID) == "" {
 		return nil, nil
 	}
 	return LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+}
+
+func CountEvents(repoPath, runID string) (int, error) {
+	if strings.TrimSpace(runID) == "" {
+		return 0, nil
+	}
+	file, err := os.Open(EventsPath(repoPath, runID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read events file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	count := 0
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read events file: %w", err)
+	}
+	return count, nil
 }
 
 func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {

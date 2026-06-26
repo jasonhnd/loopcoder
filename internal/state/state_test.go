@@ -149,3 +149,32 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 		t.Fatalf("Path = %q, want %q", got.Path, attemptPath)
 	}
 }
+
+func TestCountEventsCountsNonBlankLines(t *testing.T) {
+	repo := t.TempDir()
+	runPath := filepath.Join(repo, ".loopcoder", "runs", "run-test")
+	if err := os.MkdirAll(runPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll run path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runPath, "events.jsonl"), []byte("{\"event\":\"one\"}\n\n{\"event\":\"two\"}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile events: %v", err)
+	}
+
+	got, err := CountEvents(repo, "run-test")
+	if err != nil {
+		t.Fatalf("CountEvents returned error: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("CountEvents() = %d, want 2", got)
+	}
+}
+
+func TestCountEventsReturnsZeroWhenMissing(t *testing.T) {
+	got, err := CountEvents(t.TempDir(), "run-missing")
+	if err != nil {
+		t.Fatalf("CountEvents returned error: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("CountEvents() = %d, want 0", got)
+	}
+}
