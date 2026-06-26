@@ -25,10 +25,13 @@ param(
   [string]$BaseBranch = 'main',
   [string]$Branch,
   [ValidateSet('codex')][string]$Provider = 'codex',   # v1: codex only (Worker port is provider-pluggable)
+  [string]$Model,
+  [string]$Effort,
   [switch]$KeepWorktree
 )
 $ErrorActionPreference = 'Stop'
 function Log($m){ Write-Host "[loopcoder] $m" }
+function Quote-CmdArg($arg){ '"' + ($arg -replace '"','\"') + '"' }
 
 $Repo = (Resolve-Path -LiteralPath $Repo).Path
 if (-not $Branch) { $Branch = "loop/issue-$IssueNumber" }
@@ -67,7 +70,17 @@ $IssueBody
   Set-Content -LiteralPath $promptFile -Value $prompt -Encoding utf8
 
   Log "codex implementing (headless, stdin-from-file)..."
-  cmd /c "codex exec --cd `"$wt`" --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -o `"$summaryFile`" - < `"$promptFile`" > `"$logFile`" 2>&1"
+  $codexArgs = @(
+    'exec',
+    '--cd', $wt,
+    '--dangerously-bypass-approvals-and-sandbox',
+    '--skip-git-repo-check'
+  )
+  if (-not [string]::IsNullOrWhiteSpace($Model)) { $codexArgs += @('-m', $Model) }
+  if (-not [string]::IsNullOrWhiteSpace($Effort)) { $codexArgs += @('-c', "model_reasoning_effort=$Effort") }
+  $codexArgs += @('-o', $summaryFile, '-')
+  $codexCommand = 'codex ' + (($codexArgs | ForEach-Object { Quote-CmdArg $_ }) -join ' ')
+  cmd /c "$codexCommand < `"$promptFile`" > `"$logFile`" 2>&1"
   if ($LASTEXITCODE -ne 0) { throw "codex exec failed (exit $LASTEXITCODE). See $logFile" }
   $summary = if (Test-Path $summaryFile) { (Get-Content -LiteralPath $summaryFile -Raw).Trim() } else { '(codex produced no summary)' }
 

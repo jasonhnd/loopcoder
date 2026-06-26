@@ -7,6 +7,10 @@ adapters:
   verifier: opus          # Opus reviews worker output.
   gate: human-merge       # Humans choose what merges.
 worker:
+  # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
+  # model:
+  # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
+  # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
 ci:

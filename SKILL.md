@@ -18,6 +18,15 @@ keep this playbook practical and procedural instead of duplicating the spec.
 - Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
 
+## Model and speed (never chosen for the user)
+
+- DEFAULT: pass no model or effort flags; inherit the user's codex config (`~/.codex/config.toml`). Never auto-pick a model or effort per issue.
+- TRANSPARENCY: in the plan, show the worker line as `worker: codex (your global codex setting)` so the user sees what will run without being asked.
+- RECOMMENDATION ONLY: you may add one short passive hint, such as `tip: say use high for faster runs`. It is never auto-applied, and if the user says to stop suggesting, stop including the hint.
+- OVERRIDE ONLY ON EXPLICIT REQUEST: for a one-off request such as `run these faster` or `#B use max`, pass `-Effort` and/or `-Model` to `scripts/dispatch-worker.ps1` for that run only. For a permanent request such as `from now on default to high`, only then write `worker.reasoning_effort` and/or `worker.model` into `.delivery.yml`.
+- Never write to `.delivery.yml` or change model/effort without an explicit user statement. The config must only ever reflect what the user has said.
+- Natural-language effort mapping: `fast`/`quick` -> `low`; `balanced` -> `medium`; `thorough`/`max`/`highest` -> `xhigh`; `high` -> `high`.
+
 ## Procedure
 
 1. Intake the user's need.
@@ -28,7 +37,7 @@ keep this playbook practical and procedural instead of duplicating the spec.
 2. Draft GitHub issues and a dependency DAG.
    - Convert the need into WorkItems with clear titles, bodies, acceptance criteria, and temporary IDs.
    - Identify which items can run in parallel and which are blocked by other items.
-   - Show the proposed issue list and DAG to the user, including `blocked-by` relationships.
+   - Show the proposed issue list and DAG to the user, including `blocked-by` relationships and the worker line from "Model and speed".
    - Get explicit user approval before publishing anything.
 
 3. Publish approved issues.
