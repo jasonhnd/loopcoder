@@ -133,3 +133,22 @@ jobs:
             $missing | ForEach-Object { Write-Host "  - $_" }
             exit 1
           }
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Go build
+        run: go build ./cmd/loopcoder
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test ./...
