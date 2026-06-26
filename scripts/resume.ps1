@@ -343,12 +343,10 @@ function Read-EventCount {
   }
 }
 
-function Get-MergedClosingPrs {
+function Get-ClosingPrRefs {
   param([AllowNull()][object]$Issue)
   $refs = @(Get-JsonProperty -Object $Issue -Name 'closedByPullRequestsReferences' -Default @())
-  return @($refs | Where-Object {
-    -not [string]::IsNullOrWhiteSpace([string](Get-JsonProperty -Object $_ -Name 'mergedAt' -Default ''))
-  })
+  return @($refs | Where-Object { $null -ne $_ })
 }
 
 function Get-BlockedLabels {
@@ -363,6 +361,7 @@ function New-IssueRecord {
     [int]$Number,
     [string]$Title,
     [string]$State,
+    [string]$StateReason = '',
     [object[]]$Labels,
     [object[]]$ClosedByPullRequestsReferences = @()
   )
@@ -370,6 +369,7 @@ function New-IssueRecord {
     number = $Number
     title = $Title
     state = $State
+    stateReason = $StateReason
     labels = $Labels
     closedByPullRequestsReferences = $ClosedByPullRequestsReferences
   }
@@ -381,7 +381,7 @@ $thresholds = Get-ConfiguredThresholds
 $heartbeatFreshSeconds = [int]$thresholds.heartbeat_interval_seconds * 2
 
 # GitHub first: issues, PRs, and PR checks are read before local sidecars.
-$openIssueResult = Invoke-Gh -GhArgs @('issue', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,labels')
+$openIssueResult = Invoke-Gh -GhArgs @('issue', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,stateReason')
 $openIssues = @(Convert-GhJson -Result $openIssueResult -Description 'issue list --state open' -AllowFailure:$false)
 
 $openPrResult = Invoke-Gh -GhArgs @('pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,title,url,isDraft,closingIssuesReferences')
@@ -450,7 +450,8 @@ $eventCount = Read-EventCount -EventsPath $eventsPath
 $issueMap = @{}
 foreach ($issue in $openIssues) {
   $labels = Get-LabelNames -Issue $issue
-  $issueMap[[string]$issue.number] = New-IssueRecord -Number ([int]$issue.number) -Title ([string]$issue.title) -State 'OPEN' -Labels $labels
+  $stateReason = [string](Get-JsonProperty -Object $issue -Name 'stateReason' -Default '')
+  $issueMap[[string]$issue.number] = New-IssueRecord -Number ([int]$issue.number) -Title ([string]$issue.title) -State 'OPEN' -StateReason $stateReason -Labels $labels
 }
 
 $candidateIssueNumbers = @()
@@ -461,13 +462,14 @@ $candidateIssueNumbers = @($candidateIssueNumbers | Where-Object { $_ -gt 0 } | 
 
 foreach ($number in $candidateIssueNumbers) {
   if ($issueMap.ContainsKey([string]$number)) { continue }
-  $issueView = Invoke-Gh -GhArgs @('issue', 'view', [string]$number, '--json', 'number,title,state,labels,closedByPullRequestsReferences')
+  $issueView = Invoke-Gh -GhArgs @('issue', 'view', [string]$number, '--json', 'number,title,state,stateReason,labels,closedByPullRequestsReferences')
   $issueDetails = @(Convert-GhJson -Result $issueView -Description "issue view $number" -AllowFailure)
   if ($issueDetails.Count -gt 0) {
     $detail = $issueDetails[0]
     $labels = Get-LabelNames -Issue $detail
+    $stateReason = [string](Get-JsonProperty -Object $detail -Name 'stateReason' -Default '')
     $closedRefs = @(Get-JsonProperty -Object $detail -Name 'closedByPullRequestsReferences' -Default @())
-    $issueMap[[string]$number] = New-IssueRecord -Number ([int]$detail.number) -Title ([string]$detail.title) -State ([string]$detail.state) -Labels $labels -ClosedByPullRequestsReferences $closedRefs
+    $issueMap[[string]$number] = New-IssueRecord -Number ([int]$detail.number) -Title ([string]$detail.title) -State ([string]$detail.state) -StateReason $stateReason -Labels $labels -ClosedByPullRequestsReferences $closedRefs
   } else {
     $issueMap[[string]$number] = New-IssueRecord -Number $number -Title '(issue details unavailable)' -State 'UNKNOWN' -Labels @()
   }
@@ -520,8 +522,10 @@ foreach ($number in $candidateIssueNumbers) {
   $pidState = $null
   $remoteBranchState = $null
 
-  $mergedClosingPrs = @(Get-MergedClosingPrs -Issue $issue)
-  if ($issue.state -eq 'CLOSED' -and $mergedClosingPrs.Count -gt 0) {
+  $closingPrRefs = @(Get-ClosingPrRefs -Issue $issue)
+  $stateReason = [string](Get-JsonProperty -Object $issue -Name 'stateReason' -Default '')
+  $closedAsCompleted = ($issue.state -eq 'CLOSED' -and $stateReason -eq 'COMPLETED')
+  if ($issue.state -eq 'CLOSED' -and ($closedAsCompleted -or $closingPrRefs.Count -gt 0)) {
     $classification = 'done'
     $actionKind = 'none'
     $action = 'done on GitHub; no local recovery needed'
@@ -591,7 +595,7 @@ foreach ($number in $candidateIssueNumbers) {
     } else {
       $classification = 'needs-inspection'
       $actionKind = 'blocked'
-      $action = "issue state is $($issue.state) without a merged closing PR"
+      $action = "issue state is $($issue.state) without completed state reason or closing PR reference"
     }
   }
 
@@ -603,12 +607,14 @@ foreach ($number in $candidateIssueNumbers) {
   } else {
     'PR: none open'
   }
-  $mergedEvidence = if ($mergedClosingPrs.Count -gt 0) {
-    'merged closing PRs: ' + (($mergedClosingPrs | ForEach-Object {
+  $closureEvidence = if ($closingPrRefs.Count -gt 0) {
+    'closing PRs: ' + (($closingPrRefs | ForEach-Object {
       "#$((Get-JsonProperty -Object $_ -Name 'number' -Default '?'))"
     }) -join ', ')
+  } elseif ($classification -eq 'done' -and $closedAsCompleted) {
+    'closing PRs: closed as completed'
   } else {
-    'merged closing PRs: none observed'
+    'closing PRs: none observed'
   }
 
   $reports += [pscustomobject]@{
@@ -630,7 +636,7 @@ foreach ($number in $candidateIssueNumbers) {
       pid = $pidEvidence
       branch = $branchEvidence
       heartbeat = "heartbeat age=$(Format-Age -AgeSeconds $heartbeatAge), progress age=$(Format-Age -AgeSeconds $progressAge)"
-      merged = $mergedEvidence
+      closure = $closureEvidence
     }
   }
 }
@@ -656,7 +662,7 @@ foreach ($report in ($reports | Sort-Object number)) {
   Write-Host "  evidence: $($report.evidence.pid)"
   Write-Host "  evidence: $($report.evidence.branch)"
   Write-Host "  evidence: $($report.evidence.heartbeat)"
-  Write-Host "  evidence: $($report.evidence.merged)"
+  Write-Host "  evidence: $($report.evidence.closure)"
   Write-Host "  next: $($report.action)"
 }
 
