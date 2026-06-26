@@ -89,6 +89,11 @@ func RunIDForIssue(issueNumber int, at time.Time) string {
 	return fmt.Sprintf("run-%s-issue-%d", at.UTC().Format(runIDTimeLayout), issueNumber)
 }
 
+// RunIDForWave returns a run id in the run-<utc-compact>-wave shape.
+func RunIDForWave(at time.Time) string {
+	return fmt.Sprintf("run-%s-wave", at.UTC().Format(runIDTimeLayout))
+}
+
 // IsRunID reports whether value matches the documented run id shape.
 func IsRunID(value string) bool {
 	return runIDPattern.MatchString(value)

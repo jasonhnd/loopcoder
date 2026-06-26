@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +34,8 @@ type Deps struct {
 	NewGitHubReader func(repoPath string) orchestration.GitHubReader
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
+	Stdin           io.Reader
+	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
@@ -66,6 +69,10 @@ func DefaultDeps() Deps {
 		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
+		Stdin:        os.Stdin,
+		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
+			return orchestration.ComputeReadySet(ctx, opts)
+		},
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
 		},
@@ -109,6 +116,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "verify-local" {
 		return runVerifyLocal(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "dispatch-wave" {
+		return runDispatchWave(args[1:], stdout, stderr, deps)
 	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
@@ -182,6 +192,18 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --branch string        branch to verify (required unless --pr-number is set)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for isolated checkout (default \"main\")")
 	}
+	if command.Name == "dispatch-wave" {
+		fmt.Fprintln(w, "  --repo string              repository path (required)")
+		fmt.Fprintln(w, "  --base-branch string       base branch passed to dispatch (default \"main\")")
+		fmt.Fprintln(w, "  --run-id string            shared run id for the wave (default generated once)")
+		fmt.Fprintln(w, "  --issue-numbers string     comma-separated issue numbers to dispatch")
+		fmt.Fprintln(w, "  --from-ready-set           read ready-set JSON from stdin")
+		fmt.Fprintln(w, "  --ready-set-path string    read ready-set JSON from a file")
+		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
+		fmt.Fprintln(w, "  --model string             optional Codex model pass-through")
+		fmt.Fprintln(w, "  --effort string            optional Codex reasoning effort pass-through")
+		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
+	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
 
@@ -214,6 +236,9 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if deps.Now == nil {
 		deps.Now = DefaultDeps().Now
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = DefaultDeps().ComputeReadySet
 	}
 
 	fs := flag.NewFlagSet("ready-set", flag.ContinueOnError)
@@ -299,7 +324,7 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 
-	readyReport, err := orchestration.ComputeReadySet(context.Background(), orchestration.Options{
+	readyReport, err := deps.ComputeReadySet(context.Background(), orchestration.Options{
 		Reader:        deps.NewGitHubReader(resolvedRepo),
 		RepoPath:      resolvedRepo,
 		BaseBranch:    baseBranch,
@@ -452,6 +477,206 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if _, err := stdout.Write(append(data, '\n')); err != nil {
 		fmt.Fprintf(stderr, "dispatch: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = defaults.ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+	if deps.Stdin == nil {
+		deps.Stdin = defaults.Stdin
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = defaults.ComputeReadySet
+	}
+	if deps.Dispatch == nil {
+		deps.Dispatch = defaults.Dispatch
+	}
+
+	fs := flag.NewFlagSet("dispatch-wave", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
+	var runID string
+	var runIDAlias string
+	var issueNumbersValue string
+	var issueNumbersAlias string
+	var fromReadySet bool
+	var fromReadySetAlias bool
+	var readySetPath string
+	var readySetPathAlias string
+	var provider string
+	var providerAlias string
+	var model string
+	var modelAlias string
+	var effort string
+	var effortAlias string
+	var throttleLimit int
+	var throttleLimitAlias int
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&issueNumbersValue, "issue-numbers", "", "issue numbers")
+	fs.StringVar(&issueNumbersAlias, "IssueNumbers", "", "issue numbers")
+	fs.BoolVar(&fromReadySet, "from-ready-set", false, "read ready-set JSON from stdin")
+	fs.BoolVar(&fromReadySetAlias, "FromReadySet", false, "read ready-set JSON from stdin")
+	fs.StringVar(&readySetPath, "ready-set-path", "", "ready-set JSON path")
+	fs.StringVar(&readySetPathAlias, "ReadySetPath", "", "ready-set JSON path")
+	fs.StringVar(&provider, "provider", "", "provider")
+	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&model, "model", "", "model")
+	fs.StringVar(&modelAlias, "Model", "", "model")
+	fs.StringVar(&effort, "effort", "", "effort")
+	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
+	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	if issueNumbersAlias != "" {
+		issueNumbersValue = issueNumbersAlias
+	}
+	fromReadySet = fromReadySet || fromReadySetAlias
+	if readySetPathAlias != "" {
+		readySetPath = readySetPathAlias
+	}
+	if providerAlias != "" {
+		provider = providerAlias
+	}
+	if modelAlias != "" {
+		model = modelAlias
+	}
+	if effortAlias != "" {
+		effort = effortAlias
+	}
+	if throttleLimitAlias != 0 {
+		throttleLimit = throttleLimitAlias
+	}
+
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "dispatch-wave: --repo is required")
+		return 2
+	}
+	if throttleLimit <= 0 {
+		fmt.Fprintln(stderr, "dispatch-wave: --throttle-limit must be greater than zero")
+		return 2
+	}
+
+	selectionCount := 0
+	if strings.TrimSpace(issueNumbersValue) != "" {
+		selectionCount++
+	}
+	if fromReadySet {
+		selectionCount++
+	}
+	if strings.TrimSpace(readySetPath) != "" {
+		selectionCount++
+	}
+	if selectionCount > 1 {
+		fmt.Fprintln(stderr, "dispatch-wave: choose only one of --issue-numbers, --from-ready-set, or --ready-set-path")
+		return 2
+	}
+
+	var issueNumbers []int
+	var readySet *report.ReadySetReport
+	var err error
+	if strings.TrimSpace(issueNumbersValue) != "" {
+		issueNumbers, err = parseIssueNumbers(issueNumbersValue)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+			return 2
+		}
+	}
+	if fromReadySet {
+		readySet, err = readReadySetJSON(deps.Stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+			return 2
+		}
+	}
+	if strings.TrimSpace(readySetPath) != "" {
+		file, openErr := os.Open(readySetPath)
+		if openErr != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: read ready-set file: %v\n", openErr)
+			return 2
+		}
+		defer file.Close()
+		readySet, err = readReadySetJSON(file)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+			return 2
+		}
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+		return 2
+	}
+
+	cfg := config.Default()
+	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
+	if err == nil {
+		cfg = loaded
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+		return 1
+	}
+
+	waveReport, err := orchestration.DispatchWave(context.Background(), orchestration.DispatchWaveOptions{
+		Reader:          deps.NewGitHubReader(resolvedRepo),
+		RepoPath:        resolvedRepo,
+		BaseBranch:      baseBranch,
+		RunID:           runID,
+		IssueNumbers:    issueNumbers,
+		ReadySet:        readySet,
+		Provider:        provider,
+		Model:           model,
+		Effort:          effort,
+		ThrottleLimit:   throttleLimit,
+		Thresholds:      cfg.Resilience.Worker,
+		ProcessAlive:    deps.ProcessAlive,
+		Now:             deps.Now(),
+		Stderr:          stderr,
+		ComputeReadySet: deps.ComputeReadySet,
+		Dispatch:        deps.Dispatch,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); err != nil {
+		fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", err)
+		return 1
+	}
+	if orchestration.DispatchWaveHasFailures(waveReport) {
 		return 1
 	}
 	return 0
@@ -699,6 +924,31 @@ func parseBackoffSeconds(value string) ([]int, error) {
 		out = append(out, seconds)
 	}
 	return out, nil
+}
+
+func parseIssueNumbers(value string) ([]int, error) {
+	parts := strings.Split(value, ",")
+	out := make([]int, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return nil, fmt.Errorf("invalid --issue-numbers %q", value)
+		}
+		number, err := strconv.Atoi(trimmed)
+		if err != nil || number <= 0 {
+			return nil, fmt.Errorf("invalid --issue-numbers %q", value)
+		}
+		out = append(out, number)
+	}
+	return out, nil
+}
+
+func readReadySetJSON(r io.Reader) (*report.ReadySetReport, error) {
+	var readySet report.ReadySetReport
+	if err := json.NewDecoder(r).Decode(&readySet); err != nil {
+		return nil, fmt.Errorf("read ready-set JSON: %w", err)
+	}
+	return &readySet, nil
 }
 
 func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
