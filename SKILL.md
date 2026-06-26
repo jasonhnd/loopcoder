@@ -71,7 +71,11 @@ this loop.
    ```
 
 4. Dispatch ready issues.
-   - A ready issue is one whose dependencies are all done. Dispatch independent ready issues in parallel; dispatch dependent issues only after their blockers are verified done.
+   - Follow the layered ready-set scheduler in [`docs/scheduling.md`](docs/scheduling.md).
+   - A ready issue is an unstarted issue whose `depends_on` entries / `blocked-by:#N` labels are all merged to `main`, not merely open as PRs.
+   - Keep the two ordering axes from [`docs/scheduling.md`](docs/scheduling.md) separate: a real code dependency forces serial order, so B waits until A is merged and then branches from `main`; file overlap does not block dispatch.
+   - Dispatch the whole ready set in parallel, then recompute as PRs merge. Repeat until the DAG is drained or blocked.
+   - `scripts/dispatch-worker.ps1` already serializes git worktree creation, so independent ready issues can be dispatched concurrently safely.
    - Call the existing worker adapter once per ready issue. Do not recreate worktree, Codex, commit, push, or PR logic in the conductor.
    - Capture each worker's output, job handle, PR URL, and failure details.
 
@@ -93,11 +97,17 @@ this loop.
    - Run `gh pr checks <pr>` and record whether required checks pass.
    - Report failures, risky changes, or missing acceptance coverage in chat. Do not silently merge or hide verifier concerns.
 
-6. Report progress and final status.
+6. Merge ordering.
+   - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/scheduling.md`](docs/scheduling.md).
+   - Never auto-merge. When the user names PRs to merge, read each named ready PR's real changed files with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run `gh pr merge` only for those named PRs.
+   - Non-overlapping PRs may merge in any order. Overlapping PRs merge serially: merge the first, rebase the next onto updated `main`, verify it remains acceptable, then merge it.
+   - If an overlapping PR cannot rebase cleanly, evict it from the merge group, capture the changed files, conflicting paths, rebase output, and PRs that landed, then narrow the scope and re-dispatch a worker with that context instead of blindly retrying.
+
+7. Report progress and final status.
    - Report meaningful state changes in chat: issues published, workers dispatched, PRs opened, checks passed/failed, verifier verdicts, blocked items, and unblocked dependents.
    - Continue until the DAG is drained or blocked.
    - End with a final summary listing issues, PRs, verifier status, check status, and any human decisions still needed.
-   - When the user names PRs to merge, run `gh pr merge` for those PRs only, following `.delivery.yml` merge settings when present.
+   - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
 ## Recovery Notes
 
