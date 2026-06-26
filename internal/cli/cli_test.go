@@ -2,8 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
 func TestRootHelpListsSubcommands(t *testing.T) {
@@ -82,4 +88,75 @@ func TestUnknownCommandReturnsUsageError(t *testing.T) {
 	if !strings.Contains(stderr.String(), "unknown command") {
 		t.Fatalf("stderr missing unknown-command message: %q", stderr.String())
 	}
+}
+
+func TestReadySetRunsWithInjectedReader(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{"ready-set", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				issues: []gh.Issue{{Number: 93, Title: "Implement ready-set", State: "OPEN"}},
+			}
+		},
+		ProcessAlive: func(int) bool { return false },
+		Now: func() time.Time {
+			return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if got["repo"] != "owner/repo" {
+		t.Fatalf("repo = %#v, want owner/repo", got["repo"])
+	}
+	summary := got["summary"].(map[string]any)
+	if summary["ready_count"] != float64(1) {
+		t.Fatalf("ready_count = %#v, want 1", summary["ready_count"])
+	}
+}
+
+func TestReadySetRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"ready-set"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
+type cliFakeReader struct {
+	issues []gh.Issue
+}
+
+func (f cliFakeReader) RepoName(context.Context) (string, error) {
+	return "owner/repo", nil
+}
+
+func (f cliFakeReader) ListIssues(context.Context, string) ([]gh.Issue, error) {
+	return f.issues, nil
+}
+
+func (f cliFakeReader) ViewIssue(context.Context, int) (gh.Issue, error) {
+	return gh.Issue{}, nil
+}
+
+func (f cliFakeReader) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
+	return nil, nil
+}
+
+func (f cliFakeReader) PRChecks(context.Context, int) ([]gh.Check, error) {
+	return nil, nil
 }

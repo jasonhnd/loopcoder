@@ -2,17 +2,40 @@
 package state
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
 const runIDTimeLayout = "20060102T150405Z"
 
-var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-issue-[1-9]\d*$`)
+var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
 
-var ErrLatestRunSelectionNotImplemented = errors.New("latest run selection not yet implemented; see docs/go-migration.md")
+type Attempt struct {
+	Version        int       `json:"version,omitempty"`
+	JobID          string    `json:"job_id"`
+	Issue          int       `json:"issue"`
+	Attempt        int       `json:"attempt"`
+	Provider       string    `json:"provider,omitempty"`
+	PID            *int      `json:"pid,omitempty"`
+	Phase          string    `json:"phase,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	Branch         string    `json:"branch,omitempty"`
+	StartedAt      string    `json:"started_at,omitempty"`
+	HeartbeatAt    string    `json:"heartbeat_at,omitempty"`
+	LastProgressAt string    `json:"last_progress_at,omitempty"`
+	LogBytes       *int64    `json:"log_bytes,omitempty"`
+	ExitCode       *int      `json:"exit_code,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	Path           string    `json:"path,omitempty"`
+	LastWriteUTC   time.Time `json:"-"`
+}
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.
 func FormatTimestamp(t time.Time) string {
@@ -38,7 +61,222 @@ func IsRunID(value string) bool {
 	return runIDPattern.MatchString(value)
 }
 
-// LatestRunID will select the newest local run in a later migration phase.
-func LatestRunID(_ string) (string, error) {
-	return "", ErrLatestRunSelectionNotImplemented
+// LatestRunID selects the newest local run directory by modification time.
+func LatestRunID(repoPath string) (string, error) {
+	runsRoot := RunsRoot(repoPath)
+	entries, err := os.ReadDir(runsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read runs directory: %w", err)
+	}
+
+	var latestName string
+	var latestMod time.Time
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		mod := info.ModTime()
+		if latestName == "" || mod.After(latestMod) || (mod.Equal(latestMod) && entry.Name() > latestName) {
+			latestName = entry.Name()
+			latestMod = mod
+		}
+	}
+	return latestName, nil
+}
+
+func RunsRoot(repoPath string) string {
+	return filepath.Join(repoPath, ".loopcoder", "runs")
+}
+
+func RunPath(repoPath, runID string) string {
+	return filepath.Join(RunsRoot(repoPath), runID)
+}
+
+func WorkersPath(repoPath, runID string) string {
+	return filepath.Join(RunPath(repoPath, runID), "workers")
+}
+
+// LoadAttempts reads .loopcoder/runs/<runID>/workers/*.attempt.json records.
+func LoadAttempts(repoPath, runID string) ([]Attempt, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, nil
+	}
+	return LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+}
+
+func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
+	entries, err := os.ReadDir(workersDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read workers directory: %w", err)
+	}
+
+	var attempts []Attempt
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".attempt.json") {
+			continue
+		}
+		path := filepath.Join(workersDir, entry.Name())
+		attempt, ok := readAttempt(path, entry.Name())
+		if ok {
+			attempts = append(attempts, attempt)
+		}
+	}
+
+	sort.Slice(attempts, func(i, j int) bool {
+		if attempts[i].Issue != attempts[j].Issue {
+			return attempts[i].Issue < attempts[j].Issue
+		}
+		if attempts[i].Attempt != attempts[j].Attempt {
+			return attempts[i].Attempt < attempts[j].Attempt
+		}
+		if !attempts[i].LastWriteUTC.Equal(attempts[j].LastWriteUTC) {
+			return attempts[i].LastWriteUTC.Before(attempts[j].LastWriteUTC)
+		}
+		return attempts[i].JobID < attempts[j].JobID
+	})
+	return attempts, nil
+}
+
+type attemptJSON struct {
+	Version        int             `json:"version"`
+	JobID          string          `json:"job_id"`
+	Issue          json.RawMessage `json:"issue"`
+	Attempt        json.RawMessage `json:"attempt"`
+	Provider       string          `json:"provider"`
+	PID            json.RawMessage `json:"pid"`
+	Phase          string          `json:"phase"`
+	Status         string          `json:"status"`
+	Branch         string          `json:"branch"`
+	StartedAt      string          `json:"started_at"`
+	HeartbeatAt    string          `json:"heartbeat_at"`
+	LastProgressAt string          `json:"last_progress_at"`
+	LogBytes       json.RawMessage `json:"log_bytes"`
+	ExitCode       json.RawMessage `json:"exit_code"`
+	Error          string          `json:"error"`
+}
+
+func readAttempt(path, fileName string) (Attempt, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return Attempt{}, false
+	}
+
+	var raw attemptJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return Attempt{}, false
+	}
+
+	issue, ok := rawInt(raw.Issue, 0)
+	if !ok || issue <= 0 {
+		return Attempt{}, false
+	}
+
+	attemptNumber, ok := rawInt(raw.Attempt, 1)
+	if !ok || attemptNumber <= 0 {
+		attemptNumber = 1
+	}
+
+	branch := strings.TrimSpace(raw.Branch)
+	if branch == "" {
+		if attemptNumber > 1 {
+			branch = fmt.Sprintf("loop/issue-%d-retry-%d", issue, attemptNumber)
+		} else {
+			branch = fmt.Sprintf("loop/issue-%d", issue)
+		}
+	}
+
+	jobID := strings.TrimSpace(raw.JobID)
+	if jobID == "" {
+		jobID = strings.TrimSuffix(fileName, ".attempt.json")
+	}
+
+	var lastWrite time.Time
+	if info, err := os.Stat(path); err == nil {
+		lastWrite = info.ModTime().UTC()
+	}
+
+	return Attempt{
+		Version:        raw.Version,
+		JobID:          jobID,
+		Issue:          issue,
+		Attempt:        attemptNumber,
+		Provider:       raw.Provider,
+		PID:            rawIntPtr(raw.PID),
+		Phase:          raw.Phase,
+		Status:         raw.Status,
+		Branch:         branch,
+		StartedAt:      raw.StartedAt,
+		HeartbeatAt:    raw.HeartbeatAt,
+		LastProgressAt: raw.LastProgressAt,
+		LogBytes:       rawInt64Ptr(raw.LogBytes),
+		ExitCode:       rawIntPtr(raw.ExitCode),
+		Error:          raw.Error,
+		Path:           path,
+		LastWriteUTC:   lastWrite,
+	}, true
+}
+
+func rawIntPtr(raw json.RawMessage) *int {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return nil
+	}
+	value, ok := rawInt(raw, 0)
+	if !ok {
+		return nil
+	}
+	return &value
+}
+
+func rawInt64Ptr(raw json.RawMessage) *int64 {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return nil
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return &value
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err != nil {
+		return nil
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(asString), 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func rawInt(raw json.RawMessage, defaultValue int) (int, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return defaultValue, true
+	}
+	if text == "null" {
+		return 0, false
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err != nil {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(asString))
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
 }

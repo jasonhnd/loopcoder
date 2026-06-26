@@ -1,4 +1,2 @@
-// Package report will contain ready-set, resume, and wave report models.
-//
-// TODO: implement report models as helper behavior is ported from docs/go-migration.md.
+// Package report contains ready-set, resume, and wave report models.
 package report
