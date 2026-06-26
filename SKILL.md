@@ -256,12 +256,17 @@ remain the source of truth for delivery state.
 - Idle is not done: a worker that exits with no branch, PR, or concrete
   deliverable is a retryable failure, not success. Verify a deliverable through
   the branch, PR, and required checks before counting an issue done.
-- Bounded retry: before re-dispatching, adopt an existing PR or branch for the
-  issue if one exists. Otherwise retry with recovery context: issue details,
-  prior summary, changed files, useful log tail, and the reason for retry.
-  Respect `resilience.worker.max_attempts` and
-  `resilience.worker.retry_backoff_seconds`; after the limit, block the issue
-  and report the concrete human decision needed.
+- Recovery briefs: on adapter failure, `scripts/dispatch-worker.ps1` writes a
+  context brief under `.loopcoder/runs/<RunId>/recovery/<job_id>-context.md`
+  with issue, branch, worktree, log, summary, attempt, phase, status, error,
+  changed files, log tail, and PR lookup details. Use it as the concrete
+  recovery context described in [`docs/resilience.md`](docs/resilience.md).
+- Bounded retry: recover failed, hung, or idle attempts through
+  `scripts/recover-and-retry.ps1`. It adopts an existing PR first; otherwise it
+  re-dispatches with the latest recovery brief up to
+  `resilience.worker.max_attempts`, using
+  `resilience.worker.retry_backoff_seconds`, and blocks after the limit with
+  the brief, attempt history, and the concrete human decision needed.
 - Resume: a fresh conductor session re-derives state from GitHub first: issues,
   labels, PRs, branches, and checks. Local sidecars are advisory for local
   liveness only and must not cause duplicate dispatch when GitHub already has a
