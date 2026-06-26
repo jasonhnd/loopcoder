@@ -65,3 +65,27 @@ higher-authority source and report the conflict.
 - Candidate improvement: Add a post-merge parse/smoke check before relying on a changed dispatch script.
 - Confidence: high
 - Supersedes: none
+
+### 2026-06-26 - run 2026-06-26-v0.1.3-improve - Full v0.1.2 loop validated end-to-end on loopcoder itself
+
+- Scope: validation cycle, issues #73 / #74 -> PRs #75 / #76
+- Role: conductor
+- Observed: An improvement-review (B M3) selected two real improvements; both ran through parallel dispatch under one -RunId, were gated by the `verify` CI check (green) plus explicit verdicts, reconciled by `scripts/resume.ps1` (classified `done`), and human-merged. No step failed.
+- Evidence: PRs #75 and #76 verify green; `resume.ps1` on run-v0.1.3-improve classified #73 and #74 as `done` with no ready or blocked actions.
+- Learning: The full v0.1.2 stack (verification gate + self-improvement reflection + durable state / resume + worker) works as one system on loopcoder's own development.
+- Applies to: process
+- Candidate improvement: none
+- Confidence: high
+- Supersedes: none
+
+### 2026-06-26 - run 2026-06-26-v0.1.3-improve - The verify gate now protects itself
+
+- Scope: .github/workflows/ci.yml (issues #74 / #76)
+- Role: verifier
+- Observed: Added a CI step asserting every `.delivery.yml` `ci.checks` name maps to a workflow job id; it ran on its own PR and passed, and was shown to fail on a bogus check name.
+- Evidence: PR #76 verify green; the worker tested a missing-check name and got exit 1.
+- Learning: Gate config drift (a renamed or removed required check) is now caught loudly by CI instead of silently stalling the conductor.
+- Applies to: scripts, CI
+- Candidate improvement: the python fallback in that CI step has leading indentation that would error if it ever ran; yq is always present on ubuntu-latest so it is dormant, but dedent or simplify it in a future cleanup.
+- Confidence: high
+- Supersedes: none
