@@ -49,8 +49,21 @@ $logFile     = Join-Path $scratch 'codex.log'
 
 Log "issue #$IssueNumber  ->  branch $Branch   (repo $slug, provider $Provider)"
 git -C $Repo fetch -q origin $BaseBranch
-git -C $Repo worktree add -b $Branch $wt "origin/$BaseBranch" 2>&1 | ForEach-Object { Log $_ }
-if ($LASTEXITCODE -ne 0) { throw "git worktree add failed" }
+$repoKey = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Repo.ToLowerInvariant())))
+$worktreeMutex = [System.Threading.Mutex]::new($false, "Global\loopcoder-worktree-add-$repoKey")
+$worktreeLockAcquired = $false
+$worktreeAddExitCode = $null
+try {
+  $worktreeLockAcquired = $worktreeMutex.WaitOne([TimeSpan]::FromSeconds(60))
+  if (-not $worktreeLockAcquired) { throw "timed out after 60 seconds waiting for git worktree add lock for repo $Repo" }
+  git -C $Repo worktree add -b $Branch $wt "origin/$BaseBranch" 2>&1 | ForEach-Object { Log $_ }
+  $worktreeAddExitCode = $LASTEXITCODE
+}
+finally {
+  if ($worktreeLockAcquired) { $worktreeMutex.ReleaseMutex() }
+  $worktreeMutex.Dispose()
+}
+if ($worktreeAddExitCode -ne 0) { throw "git worktree add failed" }
 
 try {
   $prompt = @"
