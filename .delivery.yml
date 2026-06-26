@@ -1,0 +1,15 @@
+version: 1
+adapters:
+  work_items: github      # Work items are GitHub issues.
+  workspace: git-worktree # Work happens in git worktrees.
+  worker: codex           # Codex implements each issue.
+  vcs: github             # GitHub hosts PRs and checks.
+  verifier: opus          # Opus reviews worker output.
+  gate: human-merge       # Humans choose what merges.
+worker:
+  base_branch: main
+  command_hint: "implement the issue, run relevant checks, commit"
+ci:
+  checks: []
+report:
+  channel: chat
