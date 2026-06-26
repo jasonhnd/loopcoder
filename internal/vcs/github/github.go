@@ -20,8 +20,18 @@ type Reader interface {
 	PRChecks(ctx context.Context, number int) ([]Check, error)
 }
 
+type Writer interface {
+	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
+	ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error)
+}
+
+type Runner interface {
+	Run(ctx context.Context, dir, name string, args ...string) ([]byte, error)
+}
+
 type CLI struct {
 	repoPath string
+	runner   Runner
 }
 
 type Label struct {
@@ -44,12 +54,12 @@ type IssueReference struct {
 }
 
 type Issue struct {
-	Number                          int                    `json:"number"`
-	Title                           string                 `json:"title"`
-	State                           string                 `json:"state"`
-	StateReason                     string                 `json:"stateReason"`
-	Labels                          []Label                `json:"labels"`
-	ClosedByPullRequestsReferences  []PullRequestReference `json:"closedByPullRequestsReferences"`
+	Number                         int                    `json:"number"`
+	Title                          string                 `json:"title"`
+	State                          string                 `json:"state"`
+	StateReason                    string                 `json:"stateReason"`
+	Labels                         []Label                `json:"labels"`
+	ClosedByPullRequestsReferences []PullRequestReference `json:"closedByPullRequestsReferences"`
 }
 
 type PullRequest struct {
@@ -69,7 +79,40 @@ type Check struct {
 
 // New returns a gh-backed reader rooted at repoPath.
 func New(repoPath string) *CLI {
-	return &CLI{repoPath: repoPath}
+	return NewWithRunner(repoPath, ExecRunner{})
+}
+
+// NewWithRunner returns a gh-backed client using runner.
+func NewWithRunner(repoPath string, runner Runner) *CLI {
+	if runner == nil {
+		runner = ExecRunner{}
+	}
+	return &CLI{repoPath: repoPath, runner: runner}
+}
+
+// ExecRunner runs external commands through exec.CommandContext.
+type ExecRunner struct{}
+
+func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		if detail != "" {
+			return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
+		}
+		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return stdout.Bytes(), nil
 }
 
 func (c *CLI) RepoName(ctx context.Context) (string, error) {
@@ -141,6 +184,28 @@ func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {
 	return checks, nil
 }
 
+func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {
+	output, err := c.run(ctx, "gh", "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body)
+	if err != nil {
+		return "", err
+	}
+	url := strings.TrimSpace(string(output))
+	if url == "" {
+		return "", fmt.Errorf("gh pr create returned an empty URL")
+	}
+	return url, nil
+}
+
+func (c *CLI) ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error) {
+	var prs []PullRequestReference
+	err := c.runJSON(ctx, []string{
+		"pr", "list",
+		"--head", branch,
+		"--json", "number,url",
+	}, &prs)
+	return prs, err
+}
+
 func (c *CLI) runJSON(ctx context.Context, args []string, target any) error {
 	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
@@ -153,25 +218,10 @@ func (c *CLI) runJSON(ctx context.Context, args []string, target any) error {
 }
 
 func (c *CLI) run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = c.repoPath
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = strings.TrimSpace(stdout.String())
-		}
-		if detail != "" {
-			return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
-		}
-		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	if c == nil || c.runner == nil {
+		return nil, fmt.Errorf("github client is not configured")
 	}
-	return stdout.Bytes(), nil
+	return c.runner.Run(ctx, c.repoPath, name, args...)
 }
 
 func (c *CLI) gitRemote(ctx context.Context) (string, error) {

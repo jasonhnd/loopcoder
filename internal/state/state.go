@@ -38,6 +38,36 @@ type Attempt struct {
 	LastWriteUTC   time.Time `json:"-"`
 }
 
+type AttemptRecord struct {
+	Version        int     `json:"version"`
+	JobID          string  `json:"job_id"`
+	Issue          int     `json:"issue"`
+	Attempt        int     `json:"attempt"`
+	Provider       string  `json:"provider"`
+	PID            int     `json:"pid"`
+	Phase          string  `json:"phase"`
+	Status         string  `json:"status"`
+	Branch         string  `json:"branch,omitempty"`
+	StartedAt      string  `json:"started_at"`
+	HeartbeatAt    string  `json:"heartbeat_at"`
+	LastProgressAt string  `json:"last_progress_at"`
+	LogBytes       int64   `json:"log_bytes"`
+	ExitCode       *int    `json:"exit_code"`
+	Error          *string `json:"error"`
+}
+
+type Event struct {
+	Timestamp string  `json:"ts"`
+	RunID     string  `json:"run_id"`
+	JobID     string  `json:"job_id"`
+	Issue     int     `json:"issue"`
+	Phase     string  `json:"phase"`
+	Status    string  `json:"status"`
+	LogBytes  int64   `json:"log_bytes"`
+	ExitCode  *int    `json:"exit_code"`
+	Error     *string `json:"error"`
+}
+
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.
 func FormatTimestamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
@@ -106,6 +136,55 @@ func WorkersPath(repoPath, runID string) string {
 
 func EventsPath(repoPath, runID string) string {
 	return filepath.Join(RunPath(repoPath, runID), "events.jsonl")
+}
+
+func RecoveryPath(repoPath, runID string) string {
+	return filepath.Join(RunPath(repoPath, runID), "recovery")
+}
+
+func AttemptPath(repoPath, runID, jobID string) string {
+	return filepath.Join(WorkersPath(repoPath, runID), jobID+".attempt.json")
+}
+
+func RecoveryBriefPath(repoPath, runID, jobID string) string {
+	return filepath.Join(RecoveryPath(repoPath, runID), jobID+"-context.md")
+}
+
+// WriteAttempt writes a compact attempt sidecar under workers/<job>.attempt.json.
+func WriteAttempt(repoPath, runID string, attempt AttemptRecord) (string, error) {
+	path := AttemptPath(repoPath, runID, attempt.JobID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return path, fmt.Errorf("create workers directory: %w", err)
+	}
+	data, err := json.Marshal(attempt)
+	if err != nil {
+		return path, fmt.Errorf("marshal attempt sidecar: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return path, fmt.Errorf("write attempt sidecar: %w", err)
+	}
+	return path, nil
+}
+
+// AppendEvent appends one compact JSON transition line to events.jsonl.
+func AppendEvent(repoPath, runID string, event Event) error {
+	path := EventsPath(repoPath, runID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create run directory: %w", err)
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal event: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open events file: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("append event: %w", err)
+	}
+	return nil
 }
 
 // LoadAttempts reads .loopcoder/runs/<runID>/workers/*.attempt.json records.
