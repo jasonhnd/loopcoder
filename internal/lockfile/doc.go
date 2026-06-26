@@ -1,4 +1,2 @@
-// Package lockfile will contain cross-platform locks described by docs/go-migration.md.
-//
-// TODO: add the file-lock implementation in a later Go migration phase.
+// Package lockfile provides cross-platform locks for short critical sections.
 package lockfile
