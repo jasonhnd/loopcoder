@@ -6,7 +6,7 @@ An autonomous delivery loop - ROADMAP in, shipped code out
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
-[![Version](https://img.shields.io/badge/version-v0.1.1-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.1.2-brightgreen.svg)](CHANGELOG.md)
 
 [What it is](#what-it-is) . [How the loop works](#how-the-loop-works) . [Install](#install) . [Design](#design)
 
@@ -120,12 +120,21 @@ Install automation is on the roadmap.
 
 ## Status
 
-v0.1.1 is the M1 build: a thin full loop for small batches, with Opus as the
+v0.1.2 is the M1 build plus first bounded slices for verification,
+self-improvement, and worker resilience. The base loop remains Opus as the
 single-session conductor, Codex as the v1 worker, GitHub as the work-item and
 PR host, Opus review, chat reporting, and merge-on-instruction.
 
-The release also documents the mandatory doc-first process, worker model/speed
-inheritance, and dependency-aware scheduling design.
+It adds:
+
+- A verification gate with required checks, spec conformance, and explicit
+  pass/fail/needs-human verdicts.
+- A bounded self-improvement learnings loop.
+- Worker resilience through a heartbeat sidecar, stuck detection, and bounded
+  retry.
+
+The mandatory doc-first process, worker model/speed inheritance,
+dependency-aware scheduling, and full designs remain documented targets.
 
 loopcoder is self-hosting: it has written its own `SKILL.md`, `.delivery.yml`,
 `README.md`, and `ROADMAP.md`.
@@ -138,6 +147,10 @@ loopcoder is self-hosting: it has written its own `SKILL.md`, `.delivery.yml`,
 - [`docs/worker.md`](docs/worker.md) - Codex worker adapter and model/speed knobs.
 - [`docs/usage.md`](docs/usage.md) - install, setup, and end-to-end usage.
 - [`docs/scheduling.md`](docs/scheduling.md) - dependency-aware scheduling design.
+- [`docs/verification.md`](docs/verification.md) - verification gate design.
+- [`docs/self-improvement.md`](docs/self-improvement.md) - bounded learnings loop design.
+- [`docs/resilience.md`](docs/resilience.md) - worker resilience design.
+- [`docs/learnings.md`](docs/learnings.md) - captured learnings.
 - [`docs/specs/2026-06-26-loopcoder-v1-design.md`](docs/specs/2026-06-26-loopcoder-v1-design.md) - v1 design spec.
 - [`docs/specs/`](docs/specs/) - implementation specs.
 - [`docs/BACKLOG.md`](docs/BACKLOG.md) - deferred items and follow-ups.
