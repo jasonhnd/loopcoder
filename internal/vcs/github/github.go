@@ -56,6 +56,7 @@ type IssueReference struct {
 type Issue struct {
 	Number                         int                    `json:"number"`
 	Title                          string                 `json:"title"`
+	Body                           string                 `json:"body"`
 	State                          string                 `json:"state"`
 	StateReason                    string                 `json:"stateReason"`
 	Labels                         []Label                `json:"labels"`
@@ -156,7 +157,7 @@ func (c *CLI) ViewIssue(ctx context.Context, number int) (Issue, error) {
 	var issue Issue
 	err := c.runJSON(ctx, []string{
 		"issue", "view", fmt.Sprintf("%d", number),
-		"--json", "number,title,state,stateReason,labels,closedByPullRequestsReferences",
+		"--json", "number,title,body,state,stateReason,labels,closedByPullRequestsReferences",
 	}, &issue)
 	return issue, err
 }

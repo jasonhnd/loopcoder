@@ -10,6 +10,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/report"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -269,6 +270,71 @@ func TestDispatchRequiresIssueFields(t *testing.T) {
 	}
 }
 
+func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	var dispatchOpts worker.Options
+
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--repo", repo,
+		"--from-ready-set",
+		"--run-id", "run-test-wave",
+		"--model", "gpt-5",
+		"--effort", "high",
+	}, &stdout, &stderr, Deps{
+		Stdin: strings.NewReader(`{"ready":[{"issue":201,"title":"Wave","reason":"ready"}]}`),
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				views: map[int]gh.Issue{
+					201: {Number: 201, Title: "Wave", Body: "Body"},
+				},
+			}
+		},
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			return report.ReadySetReport{
+				Repo:       "owner/repo",
+				BaseBranch: "main",
+				Ready: []report.ReadyIssue{{
+					Issue:  201,
+					Title:  "Wave",
+					Reason: "ready",
+				}},
+			}, nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchOpts = opts
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-201",
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/201",
+				AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-201.attempt.json",
+				Status:      "succeeded",
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if dispatchOpts.IssueNumber != 201 || dispatchOpts.IssueTitle != "Wave" || dispatchOpts.IssueBody != "Body" {
+		t.Fatalf("dispatch opts issue fields = %#v", dispatchOpts)
+	}
+	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5" || dispatchOpts.Effort != "high" {
+		t.Fatalf("dispatch opts run/model/effort = %#v", dispatchOpts)
+	}
+	text := stdout.String()
+	for _, want := range []string{"DISPATCH WAVE", "RunId: run-test-wave", "- #201 succeeded", "Verify successful PRs"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -392,6 +458,7 @@ func TestResumeRequiresRepo(t *testing.T) {
 
 type cliFakeReader struct {
 	issues []gh.Issue
+	views  map[int]gh.Issue
 }
 
 func (f cliFakeReader) RepoName(context.Context) (string, error) {
@@ -402,7 +469,10 @@ func (f cliFakeReader) ListIssues(context.Context, string) ([]gh.Issue, error) {
 	return f.issues, nil
 }
 
-func (f cliFakeReader) ViewIssue(context.Context, int) (gh.Issue, error) {
+func (f cliFakeReader) ViewIssue(_ context.Context, number int) (gh.Issue, error) {
+	if f.views != nil {
+		return f.views[number], nil
+	}
 	return gh.Issue{}, nil
 }
 
