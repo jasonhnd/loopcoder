@@ -30,6 +30,33 @@ this loop.
 - Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
 
+## Learnings (self-improvement)
+
+Use [`docs/learnings.md`](docs/learnings.md) as advisory operational memory per
+[`docs/self-improvement.md`](docs/self-improvement.md).
+
+- Read path: during intake for loopcoder self-work, when the target repository
+  is the loopcoder repository, or when the user asks for self-improvement
+  analysis, read the `docs/learnings.md` header and most recent entries. Search
+  it for entries matching changed paths, commands, labels, failing checks, or
+  component names.
+- Worker context: pass only relevant excerpts to workers. Mark them advisory
+  and tell workers to reconcile them with the issue and current docs. Do not
+  paste the whole learnings file into every worker prompt.
+- Authority: learnings never override system or tool safety constraints, the
+  user's current request, [`docs/PROCESS.md`](docs/PROCESS.md), this playbook,
+  the target repo `.delivery.yml`, or issue acceptance criteria. On conflict,
+  prefer the higher-authority source and report the conflict.
+- Write path: at final report time, draft proposed learning entries from the
+  run when it exposed reusable conventions, repeated worker mistakes,
+  command/script/check failures, missing prompt instructions, or gaps human
+  review caught. Present the drafts for human approval; after approval, append
+  them via a separate documentation PR. Never auto-apply a learning, bundle a
+  learnings change into a feature PR, or silently edit `docs/learnings.md`.
+- Concurrency: parallel workers may return learning candidates in their output.
+  The conductor deduplicates and classifies them; a separate learning-update PR
+  appends approved entries.
+
 ## Model and speed (never chosen for the user)
 
 - DEFAULT: pass no model or effort flags; inherit the user's codex config (`~/.codex/config.toml`). Never auto-pick a model or effort per issue.
@@ -107,6 +134,10 @@ this loop.
 7. Report progress and final status.
    - Report meaningful state changes in chat: issues published, workers dispatched, PRs opened, checks passed/failed, verifier verdicts, blocked items, and unblocked dependents.
    - Continue until the DAG is drained or blocked.
+   - Run the learning review from "Learnings (self-improvement)": collect
+     worker-returned candidates, draft any proposed learning entries for human
+     approval, and keep approved append changes for a separate documentation
+     PR.
    - End with a final summary listing issues, PRs, verifier status, check status, and any human decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
