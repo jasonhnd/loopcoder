@@ -24,6 +24,7 @@ param(
   [string]$IssueBody = '',
   [string]$BaseBranch = 'main',
   [string]$Branch,
+  [string]$RunId,
   [ValidateSet('codex')][string]$Provider = 'codex',   # v1: codex only (Worker port is provider-pluggable)
   [string]$Model,
   [string]$Effort,
@@ -33,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 function Log($m){ Write-Host "[loopcoder] $m" }
 function Quote-CmdArg($arg){ '"' + ($arg -replace '"','\"') + '"' }
 function Get-UtcIso(){ (Get-Date).ToUniversalTime().ToString('o') }
+function Get-UtcCompact(){ (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') }
 function Get-AttemptLogBytes(){
   try {
     if ($script:logFile -and (Test-Path -LiteralPath $script:logFile)) {
@@ -63,11 +65,26 @@ function Write-AttemptSidecar {
     }
     $script:attemptHeartbeatAt = $now
     $script:attemptLogBytes = $currentLogBytes
-    if ($Status) { $script:attemptStatus = $Status }
-    if ($PSBoundParameters.ContainsKey('ExitCode')) { $script:attemptExitCode = $ExitCode }
-    if ($PSBoundParameters.ContainsKey('ErrorMessage')) { $script:attemptError = $ErrorMessage }
+    $statusChanged = $false
+    if ($Status) {
+      $statusChanged = $Status -ne $script:attemptStatus
+      $script:attemptStatus = $Status
+    }
+    $exitCodeChanged = $false
+    if ($PSBoundParameters.ContainsKey('ExitCode')) {
+      $exitCodeChanged = $ExitCode -ne $script:attemptExitCode
+      $script:attemptExitCode = $ExitCode
+    }
+    $errorChanged = $false
+    if ($PSBoundParameters.ContainsKey('ErrorMessage')) {
+      $errorChanged = $ErrorMessage -ne $script:attemptError
+      $script:attemptError = $ErrorMessage
+    }
 
-    [ordered]@{
+    New-Item -ItemType Directory -Force -Path $script:runPath | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:workersPath | Out-Null
+
+    $attemptRecord = [ordered]@{
       version = 1
       job_id = $script:jobId
       issue = $IssueNumber
@@ -82,14 +99,30 @@ function Write-AttemptSidecar {
       log_bytes = $script:attemptLogBytes
       exit_code = $script:attemptExitCode
       error = $script:attemptError
-    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:attemptPath -Encoding utf8
+    }
+    $attemptRecord | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:attemptPath -Encoding utf8
+
+    if ($phaseAdvanced -or $statusChanged -or $exitCodeChanged -or $errorChanged) {
+      [ordered]@{
+        ts = $now
+        run_id = $RunId
+        job_id = $script:jobId
+        issue = $IssueNumber
+        phase = $script:attemptPhase
+        status = $script:attemptStatus
+        log_bytes = $script:attemptLogBytes
+        exit_code = $script:attemptExitCode
+        error = $script:attemptError
+      } | ConvertTo-Json -Compress | Add-Content -LiteralPath $script:eventsPath -Encoding utf8
+    }
   } catch {
-    Write-Warning "[loopcoder] failed to write attempt sidecar $($script:attemptPath): $($_.Exception.Message)"
+    Write-Warning "[loopcoder] failed to write durable attempt state $($script:attemptPath): $($_.Exception.Message)"
   }
 }
 
 $Repo = (Resolve-Path -LiteralPath $Repo).Path
 if (-not $Branch) { $Branch = "loop/issue-$IssueNumber" }
+if ([string]::IsNullOrWhiteSpace($RunId)) { $RunId = "run-$(Get-UtcCompact)-issue-$IssueNumber" }
 
 Push-Location $Repo
 try { $slug = (& gh repo view --json nameWithOwner -q .nameWithOwner) } finally { Pop-Location }
@@ -101,9 +134,12 @@ $wt          = Join-Path $scratch 'wt'
 $promptFile  = Join-Path $scratch 'prompt.txt'
 $summaryFile = Join-Path $scratch 'summary.txt'
 $logFile     = Join-Path $scratch 'codex.log'
-$attemptPath = Join-Path $scratch 'attempt.json'
 $attempt     = 1
 $jobId       = "job-$IssueNumber-$PID"
+$runPath     = Join-Path (Join-Path (Join-Path $Repo '.loopcoder') 'runs') $RunId
+$workersPath = Join-Path $runPath 'workers'
+$eventsPath  = Join-Path $runPath 'events.jsonl'
+$attemptPath = Join-Path $workersPath "$jobId.attempt.json"
 $attemptStartedAt = Get-UtcIso
 $attemptHeartbeatAt = $attemptStartedAt
 $attemptLastProgressAt = $attemptStartedAt
@@ -203,6 +239,7 @@ $IssueBody
     ok = $true
     issue = $IssueNumber
     branch = $Branch
+    run_id = $RunId
     pr = "$prUrl"
     summary = $summary
     attempt_path = $attemptPath

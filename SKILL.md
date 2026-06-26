@@ -236,9 +236,15 @@ v0.1.2 keep verification inside the conductor playbook.
 ## Worker liveness & recovery
 
 Follow the resilience contract in [`docs/resilience.md`](docs/resilience.md).
-In v0.1.2, each dispatched worker attempt has a local heartbeat/attempt sidecar
-written by `scripts/dispatch-worker.ps1`; it is a local liveness aid, not the
-source of truth for delivery state.
+The conductor passes a stable `-RunId` to `scripts/dispatch-worker.ps1` for all
+dispatches in one batch so those attempts share
+`.loopcoder/runs/<RunId>/` under the main repo.
+
+Durable run state currently consists of
+`.loopcoder/runs/<RunId>/workers/*.attempt.json` plus
+`.loopcoder/runs/<RunId>/events.jsonl`. These files are local, gitignored, and
+advisory for liveness and recovery only. GitHub issues, labels, PRs, and checks
+remain the source of truth for delivery state.
 
 - Liveness: `heartbeat_at` means the adapter advanced through a write point;
   `last_progress_at` means observable progress happened, either a phase advance
