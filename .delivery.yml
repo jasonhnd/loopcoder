@@ -13,6 +13,18 @@ worker:
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
+# resilience:
+#   worker:
+#     Optional. Absent = 15; expected worker heartbeat cadence in seconds.
+#     heartbeat_interval_seconds: 15
+#     Optional. Absent = 120; mark progress stale after this many seconds without phase or log growth.
+#     stale_after_seconds: 120
+#     Optional. Absent = 300; classify hung after stale progress or stale sidecar with no live process.
+#     hung_after_seconds: 300
+#     Optional. Absent = 3; maximum attempts before blocking for a human decision.
+#     max_attempts: 3
+#     Optional. Absent = [10, 30, 120]; retry backoff schedule between attempts.
+#     retry_backoff_seconds: [10, 30, 120]
 ci:
   checks: []
   # Optional. Absent = no local test command gate.
