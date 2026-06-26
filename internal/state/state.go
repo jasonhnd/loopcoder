@@ -19,41 +19,43 @@ const runIDTimeLayout = "20060102T150405Z"
 var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
 
 type Attempt struct {
-	Version        int       `json:"version,omitempty"`
-	JobID          string    `json:"job_id"`
-	Issue          int       `json:"issue"`
-	Attempt        int       `json:"attempt"`
-	Provider       string    `json:"provider,omitempty"`
-	PID            *int      `json:"pid,omitempty"`
-	Phase          string    `json:"phase,omitempty"`
-	Status         string    `json:"status,omitempty"`
-	Branch         string    `json:"branch,omitempty"`
-	StartedAt      string    `json:"started_at,omitempty"`
-	HeartbeatAt    string    `json:"heartbeat_at,omitempty"`
-	LastProgressAt string    `json:"last_progress_at,omitempty"`
-	LogBytes       *int64    `json:"log_bytes,omitempty"`
-	ExitCode       *int      `json:"exit_code,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	Path           string    `json:"path,omitempty"`
-	LastWriteUTC   time.Time `json:"-"`
+	Version             int       `json:"version,omitempty"`
+	JobID               string    `json:"job_id"`
+	Issue               int       `json:"issue"`
+	Attempt             int       `json:"attempt"`
+	Provider            string    `json:"provider,omitempty"`
+	PID                 *int      `json:"pid,omitempty"`
+	Phase               string    `json:"phase,omitempty"`
+	Status              string    `json:"status,omitempty"`
+	Branch              string    `json:"branch,omitempty"`
+	RecoveryContextPath string    `json:"recovery_context_path,omitempty"`
+	StartedAt           string    `json:"started_at,omitempty"`
+	HeartbeatAt         string    `json:"heartbeat_at,omitempty"`
+	LastProgressAt      string    `json:"last_progress_at,omitempty"`
+	LogBytes            *int64    `json:"log_bytes,omitempty"`
+	ExitCode            *int      `json:"exit_code,omitempty"`
+	Error               string    `json:"error,omitempty"`
+	Path                string    `json:"path,omitempty"`
+	LastWriteUTC        time.Time `json:"-"`
 }
 
 type AttemptRecord struct {
-	Version        int     `json:"version"`
-	JobID          string  `json:"job_id"`
-	Issue          int     `json:"issue"`
-	Attempt        int     `json:"attempt"`
-	Provider       string  `json:"provider"`
-	PID            int     `json:"pid"`
-	Phase          string  `json:"phase"`
-	Status         string  `json:"status"`
-	Branch         string  `json:"branch,omitempty"`
-	StartedAt      string  `json:"started_at"`
-	HeartbeatAt    string  `json:"heartbeat_at"`
-	LastProgressAt string  `json:"last_progress_at"`
-	LogBytes       int64   `json:"log_bytes"`
-	ExitCode       *int    `json:"exit_code"`
-	Error          *string `json:"error"`
+	Version             int     `json:"version"`
+	JobID               string  `json:"job_id"`
+	Issue               int     `json:"issue"`
+	Attempt             int     `json:"attempt"`
+	Provider            string  `json:"provider"`
+	PID                 int     `json:"pid"`
+	Phase               string  `json:"phase"`
+	Status              string  `json:"status"`
+	Branch              string  `json:"branch,omitempty"`
+	RecoveryContextPath string  `json:"recovery_context_path,omitempty"`
+	StartedAt           string  `json:"started_at"`
+	HeartbeatAt         string  `json:"heartbeat_at"`
+	LastProgressAt      string  `json:"last_progress_at"`
+	LogBytes            int64   `json:"log_bytes"`
+	ExitCode            *int    `json:"exit_code"`
+	Error               *string `json:"error"`
 }
 
 type Event struct {
@@ -259,21 +261,22 @@ func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
 }
 
 type attemptJSON struct {
-	Version        int             `json:"version"`
-	JobID          string          `json:"job_id"`
-	Issue          json.RawMessage `json:"issue"`
-	Attempt        json.RawMessage `json:"attempt"`
-	Provider       string          `json:"provider"`
-	PID            json.RawMessage `json:"pid"`
-	Phase          string          `json:"phase"`
-	Status         string          `json:"status"`
-	Branch         string          `json:"branch"`
-	StartedAt      string          `json:"started_at"`
-	HeartbeatAt    string          `json:"heartbeat_at"`
-	LastProgressAt string          `json:"last_progress_at"`
-	LogBytes       json.RawMessage `json:"log_bytes"`
-	ExitCode       json.RawMessage `json:"exit_code"`
-	Error          string          `json:"error"`
+	Version             int             `json:"version"`
+	JobID               string          `json:"job_id"`
+	Issue               json.RawMessage `json:"issue"`
+	Attempt             json.RawMessage `json:"attempt"`
+	Provider            string          `json:"provider"`
+	PID                 json.RawMessage `json:"pid"`
+	Phase               string          `json:"phase"`
+	Status              string          `json:"status"`
+	Branch              string          `json:"branch"`
+	RecoveryContextPath string          `json:"recovery_context_path"`
+	StartedAt           string          `json:"started_at"`
+	HeartbeatAt         string          `json:"heartbeat_at"`
+	LastProgressAt      string          `json:"last_progress_at"`
+	LogBytes            json.RawMessage `json:"log_bytes"`
+	ExitCode            json.RawMessage `json:"exit_code"`
+	Error               string          `json:"error"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -317,23 +320,24 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 	}
 
 	return Attempt{
-		Version:        raw.Version,
-		JobID:          jobID,
-		Issue:          issue,
-		Attempt:        attemptNumber,
-		Provider:       raw.Provider,
-		PID:            rawIntPtr(raw.PID),
-		Phase:          raw.Phase,
-		Status:         raw.Status,
-		Branch:         branch,
-		StartedAt:      raw.StartedAt,
-		HeartbeatAt:    raw.HeartbeatAt,
-		LastProgressAt: raw.LastProgressAt,
-		LogBytes:       rawInt64Ptr(raw.LogBytes),
-		ExitCode:       rawIntPtr(raw.ExitCode),
-		Error:          raw.Error,
-		Path:           path,
-		LastWriteUTC:   lastWrite,
+		Version:             raw.Version,
+		JobID:               jobID,
+		Issue:               issue,
+		Attempt:             attemptNumber,
+		Provider:            raw.Provider,
+		PID:                 rawIntPtr(raw.PID),
+		Phase:               raw.Phase,
+		Status:              raw.Status,
+		Branch:              branch,
+		RecoveryContextPath: strings.TrimSpace(raw.RecoveryContextPath),
+		StartedAt:           raw.StartedAt,
+		HeartbeatAt:         raw.HeartbeatAt,
+		LastProgressAt:      raw.LastProgressAt,
+		LogBytes:            rawInt64Ptr(raw.LogBytes),
+		ExitCode:            rawIntPtr(raw.ExitCode),
+		Error:               raw.Error,
+		Path:                path,
+		LastWriteUTC:        lastWrite,
 	}, true
 }
 
