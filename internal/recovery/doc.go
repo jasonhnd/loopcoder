@@ -1,4 +1,2 @@
-// Package recovery will contain retry, adoption, and recovery brief helpers.
-//
-// TODO: implement recovery behavior in a later Go migration phase.
+// Package recovery provides secret scrubbing and recovery brief rendering.
 package recovery
