@@ -170,7 +170,40 @@ v0.1.2 keep verification inside the conductor playbook.
   merge-eligible.
 - Human merge remains the gate: a `pass` verdict never calls `gh pr merge`.
 
+## Worker liveness & recovery
+
+Follow the resilience contract in [`docs/resilience.md`](docs/resilience.md).
+In v0.1.2, each dispatched worker attempt has a local heartbeat/attempt sidecar
+written by `scripts/dispatch-worker.ps1`; it is a local liveness aid, not the
+source of truth for delivery state.
+
+- Liveness: `heartbeat_at` means the adapter advanced through a write point;
+  `last_progress_at` means observable progress happened, either a phase advance
+  or log growth. Treat an attempt as stale when there is no progress beyond
+  `resilience.worker.stale_after_seconds`.
+- Hung: treat an attempt as hung when it remains stale beyond
+  `resilience.worker.hung_after_seconds`, or when the sidecar heartbeat is stale
+  and no matching live process can be found.
+- Idle is not done: a worker that exits with no branch, PR, or concrete
+  deliverable is a retryable failure, not success. Verify a deliverable through
+  the branch, PR, and required checks before counting an issue done.
+- Bounded retry: before re-dispatching, adopt an existing PR or branch for the
+  issue if one exists. Otherwise retry with recovery context: issue details,
+  prior summary, changed files, useful log tail, and the reason for retry.
+  Respect `resilience.worker.max_attempts` and
+  `resilience.worker.retry_backoff_seconds`; after the limit, block the issue
+  and report the concrete human decision needed.
+- Resume: a fresh conductor session re-derives state from GitHub first: issues,
+  labels, PRs, branches, and checks. Local sidecars are advisory for local
+  liveness only and must not cause duplicate dispatch when GitHub already has a
+  deliverable.
+
 ## Recovery Notes
 
-- If a worker fails, mark that item blocked in the chat state, include the error or log path, and do not dispatch dependents.
-- If the session is interrupted, re-derive issue and PR state from GitHub before continuing. The v1 conductor cannot reliably adopt orphaned background workers; see the spec's single-session limits.
+- If a worker fails, goes hung, or exits idle with no deliverable, capture the
+  sidecar path, error, log path, changed files if available, and retry/block
+  reason before deciding whether to re-dispatch.
+- Do not dispatch dependents while an item is failed, stale, hung, idle, or past
+  its retry limit. Mark it blocked in the chat state when human input is needed.
+- If the session is interrupted, re-derive issue and PR state from GitHub before
+  continuing, then use local sidecars only to classify same-host liveness.
