@@ -57,6 +57,65 @@ Use [`docs/learnings.md`](docs/learnings.md) as advisory operational memory per
   The conductor deduplicates and classifies them; a separate learning-update PR
   appends approved entries.
 
+## Improvement review
+
+Use this optional, bounded reflection pass per
+[`docs/self-improvement.md`](docs/self-improvement.md), especially sections 6,
+9, and 12. It is proposal-only and human-gated: the conductor may draft
+improvement candidates, but it must not create issues, dispatch workers, mutate
+the harness, change `SKILL.md`, scripts, docs, or `.delivery.yml`, or merge
+anything without explicit human approval through the normal gates.
+
+- Triggers: run only on a human command such as "run a loopcoder improvement
+  review", at the end of a run that produced failures or repeated human
+  corrections, or when a failure class recurs across runs. Prefer manual and
+  end-of-run triggers; do not add an automatic periodic trigger in this slice.
+- Observe: read a limited recent window of run traces, issues, PRs, checks,
+  verifier notes, and [`docs/learnings.md`](docs/learnings.md).
+- Classify: group observations by failure class, missing convention, script
+  weakness, verification gap, or effective reusable tactic.
+- Reflect: decide whether each pattern justifies a harness improvement, a
+  learning entry, both, or neither.
+- Propose: draft at most a small set of candidates, default three, and reject
+  vague "make the agent better" candidates.
+- Approve: present the candidate report and ask which candidates should become
+  issues. Stop after the report unless the human approves; never publish issues
+  or start workers without approval.
+- Doc-first: approved behavior or implementation changes follow
+  [`docs/PROCESS.md`](docs/PROCESS.md): documentation issue and merged design
+  first, then a separate code issue and implementation.
+- Verify: review the resulting PRs against the approved doc, changed harness
+  surface, checks, and evidence chain.
+- Measure: in later runs, compare the same failure class against the changed
+  harness version and record whether the change helped.
+
+Improvement candidates must be presented before any issue creation in this
+format:
+
+- Evidence: concrete run, issue, PR, check, verifier note, or learning entry.
+- Failure class: the grouped behavior being addressed.
+- Target surface: `SKILL.md`, docs, worker prompt, dispatch script, gates,
+  `.delivery.yml`, or another explicit harness surface.
+- Proposed change: the smallest specific change being recommended.
+- Expected effect: how the next run should behave differently.
+- Risk: how the change could overfit, weaken review, or affect unrelated work.
+- Verification plan: how the doc, diff, command, or prompt behavior will be
+  checked.
+- Recommendation: approve, defer, reject, or collect more evidence.
+
+Bounds and scrutiny:
+
+- Analyze only a limited window of recent runs or PRs.
+- Propose no more than three candidates by default.
+- Do not recursively trigger another improvement review from an unmerged
+  self-improvement PR.
+- If a candidate was rejected before, escalate the prior rejection and new
+  evidence to the human; do not silently re-propose it.
+- Treat changes to `SKILL.md`, dispatch scripts, gates, and `.delivery.yml`
+  defaults as high-scrutiny. Prefer documentation or prompt clarification before
+  script logic, never weaken gates, and never change model or effort defaults as
+  ordinary self-improvement.
+
 ## Model and speed (never chosen for the user)
 
 - DEFAULT: pass no model or effort flags; inherit the user's codex config (`~/.codex/config.toml`). Never auto-pick a model or effort per issue.
@@ -138,6 +197,10 @@ Use [`docs/learnings.md`](docs/learnings.md) as advisory operational memory per
      worker-returned candidates, draft any proposed learning entries for human
      approval, and keep approved append changes for a separate documentation
      PR.
+   - If triggered by a human request, run failures, repeated human corrections,
+     or a recurring failure class, offer the optional deeper pass from
+     "Improvement review" and stop after its candidate report unless the human
+     approves issue creation.
    - End with a final summary listing issues, PRs, verifier status, check status, and any human decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
