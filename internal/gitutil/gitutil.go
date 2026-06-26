@@ -77,10 +77,37 @@ func (c *Client) WorktreeAdd(ctx context.Context, repoPath, branch, worktreePath
 	return err
 }
 
+// WorktreeAddDetached creates a detached worktree from origin/<baseBranch>.
+func (c *Client) WorktreeAddDetached(ctx context.Context, repoPath, worktreePath, baseBranch string) error {
+	_, err := c.run(ctx, repoPath, "worktree", "add", "--detach", worktreePath, "origin/"+baseBranch)
+	return err
+}
+
 // WorktreeRemove removes a worktree forcefully.
 func (c *Client) WorktreeRemove(ctx context.Context, repoPath, worktreePath string) error {
 	_, err := c.run(ctx, repoPath, "worktree", "remove", "--force", worktreePath)
 	return err
+}
+
+// FetchOriginBranch fetches one branch from origin into the selected repo.
+func (c *Client) FetchOriginBranch(ctx context.Context, repoPath, branch string) error {
+	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", branch)
+	return err
+}
+
+// CheckoutDetached checks out rev detached in repoPath.
+func (c *Client) CheckoutDetached(ctx context.Context, repoPath, rev string) error {
+	_, err := c.run(ctx, repoPath, "checkout", "--detach", rev)
+	return err
+}
+
+// RevParse resolves rev to a commit-ish string.
+func (c *Client) RevParse(ctx context.Context, repoPath, rev string) (string, error) {
+	output, err := c.run(ctx, repoPath, "rev-parse", "--verify", rev)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // StatusPorcelain returns git status --porcelain output.

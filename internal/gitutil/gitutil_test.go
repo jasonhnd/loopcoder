@@ -10,7 +10,8 @@ import (
 func TestClientRunsExpectedGitCommands(t *testing.T) {
 	runner := &fakeGitRunner{
 		outputs: map[string][]byte{
-			"repo\x00status\x00--porcelain": []byte(" M file.go\n"),
+			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}": []byte("abc123\n"),
+			"repo\x00status\x00--porcelain":                            []byte(" M file.go\n"),
 		},
 	}
 	client := NewWithRunner(runner)
@@ -21,6 +22,22 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	}
 	if err := client.WorktreeAdd(ctx, "repo", "loop/issue-101", "wt", "main"); err != nil {
 		t.Fatalf("WorktreeAdd returned error: %v", err)
+	}
+	if err := client.WorktreeAddDetached(ctx, "repo", "verify-wt", "main"); err != nil {
+		t.Fatalf("WorktreeAddDetached returned error: %v", err)
+	}
+	if err := client.FetchOriginBranch(ctx, "verify-wt", "loop/issue-101"); err != nil {
+		t.Fatalf("FetchOriginBranch returned error: %v", err)
+	}
+	if err := client.CheckoutDetached(ctx, "verify-wt", "FETCH_HEAD"); err != nil {
+		t.Fatalf("CheckoutDetached returned error: %v", err)
+	}
+	commit, err := client.RevParse(ctx, "repo", "loop/issue-101^{commit}")
+	if err != nil {
+		t.Fatalf("RevParse returned error: %v", err)
+	}
+	if commit != "abc123" {
+		t.Fatalf("RevParse = %q, want abc123", commit)
 	}
 	status, err := client.StatusPorcelain(ctx, "repo")
 	if err != nil {
@@ -48,6 +65,10 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	want := [][]string{
 		{"repo", "fetch", "origin", "main"},
 		{"repo", "worktree", "add", "-b", "loop/issue-101", "wt", "origin/main"},
+		{"repo", "worktree", "add", "--detach", "verify-wt", "origin/main"},
+		{"verify-wt", "fetch", "-q", "origin", "loop/issue-101"},
+		{"verify-wt", "checkout", "--detach", "FETCH_HEAD"},
+		{"repo", "rev-parse", "--verify", "loop/issue-101^{commit}"},
 		{"repo", "status", "--porcelain"},
 		{"wt", "add", "-A"},
 		{"wt", "commit", "-m", "title (closes #101)"},

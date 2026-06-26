@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -34,6 +35,7 @@ type Deps struct {
 	Now             func() time.Time
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify          func(ctx context.Context, opts verify.Options) verify.Result
 }
 
 var commands = []Command{
@@ -66,6 +68,9 @@ func DefaultDeps() Deps {
 		Now:          time.Now,
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
+		},
+		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
+			return verify.Run(ctx, opts, verify.DefaultDeps())
 		},
 	}
 }
@@ -101,6 +106,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "verify-local" {
+		return runVerifyLocal(args[1:], stdout, stderr, deps)
 	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
@@ -167,6 +175,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string                  optional Codex model pass-through")
 		fmt.Fprintln(w, "  --effort string                 optional Codex reasoning effort pass-through")
+	}
+	if command.Name == "verify-local" {
+		fmt.Fprintln(w, "  --repo string          repository path (required)")
+		fmt.Fprintln(w, "  --pr-number int        pull request number to verify (required unless --branch is set)")
+		fmt.Fprintln(w, "  --branch string        branch to verify (required unless --pr-number is set)")
+		fmt.Fprintln(w, "  --base-branch string   base branch for isolated checkout (default \"main\")")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
@@ -568,6 +582,64 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Verify == nil {
+		deps.Verify = DefaultDeps().Verify
+	}
+
+	fs := flag.NewFlagSet("verify-local", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts verify.Options
+	var repoAlias string
+	var prNumberAlias int
+	var branchAlias string
+	var baseBranchAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.IntVar(&opts.PRNumber, "pr-number", 0, "pull request number")
+	fs.IntVar(&prNumberAlias, "PrNumber", 0, "pull request number")
+	fs.StringVar(&opts.Branch, "branch", "", "branch")
+	fs.StringVar(&branchAlias, "Branch", "", "branch")
+	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if prNumberAlias != 0 {
+		opts.PRNumber = prNumberAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if baseBranchAlias != "" {
+		opts.BaseBranch = baseBranchAlias
+	}
+
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "verify-local: --repo is required")
+		return 2
+	}
+	hasPR := opts.PRNumber > 0
+	hasBranch := strings.TrimSpace(opts.Branch) != ""
+	if hasPR == hasBranch {
+		fmt.Fprintln(stderr, "verify-local: exactly one of --pr-number or --branch is required")
+		return 2
+	}
+
+	result := deps.Verify(context.Background(), opts)
+	if err := verify.Render(stdout, result); err != nil {
+		fmt.Fprintf(stderr, "verify-local: write output: %v\n", err)
+		return 1
+	}
+	return result.ExitCode
 }
 
 func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
