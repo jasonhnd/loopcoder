@@ -1,8 +1,10 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,5 +178,99 @@ func TestCountEventsReturnsZeroWhenMissing(t *testing.T) {
 	}
 	if got != 0 {
 		t.Fatalf("CountEvents() = %d, want 0", got)
+	}
+}
+
+func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
+	repo := t.TempDir()
+	exitCode := 0
+	errText := "failed password=hunter2"
+
+	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
+		Version:        1,
+		JobID:          "job-101-1234",
+		Issue:          101,
+		Attempt:        2,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_exited",
+		Status:         "failed",
+		Branch:         "loop/issue-101-retry-2",
+		StartedAt:      "2026-06-26T12:00:00Z",
+		HeartbeatAt:    "2026-06-26T12:01:00Z",
+		LastProgressAt: "2026-06-26T12:01:00Z",
+		LogBytes:       123,
+		ExitCode:       &exitCode,
+		Error:          &errText,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt returned error: %v", err)
+	}
+	if path != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-1234.attempt.json") {
+		t.Fatalf("path = %q", path)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile attempt: %v", err)
+	}
+	if strings.Contains(string(data), "\n") {
+		t.Fatalf("attempt JSON is not compact: %q", string(data))
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("attempt JSON invalid: %v", err)
+	}
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
+		}
+	}
+	if got["branch"] != "loop/issue-101-retry-2" {
+		t.Fatalf("branch = %#v", got["branch"])
+	}
+}
+
+func TestAppendEventWritesCompactJSONLine(t *testing.T) {
+	repo := t.TempDir()
+	exitCode := 0
+
+	err := AppendEvent(repo, "run-test", Event{
+		Timestamp: "2026-06-26T12:00:00Z",
+		RunID:     "run-test",
+		JobID:     "job-101-1234",
+		Issue:     101,
+		Phase:     "cleanup",
+		Status:    "succeeded",
+		LogBytes:  99,
+		ExitCode:  &exitCode,
+		Error:     nil,
+	})
+	if err != nil {
+		t.Fatalf("AppendEvent returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(EventsPath(repo, "run-test"))
+	if err != nil {
+		t.Fatalf("ReadFile events: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("event lines = %d, want 1: %q", len(lines), string(data))
+	}
+	if strings.Contains(lines[0], " ") {
+		t.Fatalf("event JSON line is not compact: %q", lines[0])
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("event JSON invalid: %v", err)
+	}
+	for _, key := range []string{"ts", "run_id", "job_id", "issue", "phase", "status", "log_bytes", "exit_code", "error"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("event JSON missing key %q: %s", key, lines[0])
+		}
+	}
+	if got["error"] != nil {
+		t.Fatalf("error = %#v, want nil", got["error"])
 	}
 }

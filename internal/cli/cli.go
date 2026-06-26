@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
 type Command struct {
@@ -29,6 +30,7 @@ type Deps struct {
 	NewGitHubReader func(repoPath string) orchestration.GitHubReader
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
+	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 }
 
 var commands = []Command{
@@ -59,6 +61,9 @@ func DefaultDeps() Deps {
 		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
+		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
+			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
+		},
 	}
 }
 
@@ -88,6 +93,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "dispatch" {
+		return runDispatch(args[1:], stdout, stderr, deps)
+	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
 	return 1
@@ -114,6 +122,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	fmt.Fprintf(w, "Usage:\n  loopcoder %s [flags]\n\n", command.Name)
 	fmt.Fprintf(w, "%s\n\n", sentenceCase(command.Summary))
 	fmt.Fprintln(w, "Flags:")
+	if command.Name == "dispatch" {
+		fmt.Fprintln(w, "  --repo string               repository path (required)")
+		fmt.Fprintln(w, "  --issue-number int          GitHub issue number (required)")
+		fmt.Fprintln(w, "  --issue-title string        GitHub issue title (required)")
+		fmt.Fprintln(w, "  --issue-body string         GitHub issue body")
+		fmt.Fprintln(w, "  --base-branch string        base branch to fetch and branch from (default \"main\")")
+		fmt.Fprintln(w, "  --branch string             worker branch (default loop/issue-<issue-number>)")
+		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
+		fmt.Fprintln(w, "  --attempt int               attempt number (default 1)")
+		fmt.Fprintln(w, "  --recovery-context string   prior recovery context to append to the prompt")
+		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
+		fmt.Fprintln(w, "  --model string              optional Codex model pass-through")
+		fmt.Fprintln(w, "  --effort string             optional Codex reasoning effort pass-through")
+		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for dependency reasoning (default \"main\")")
@@ -275,6 +298,128 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "ready-set: write output: %v\n", err)
 			return 1
 		}
+	}
+	return 0
+}
+
+func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Dispatch == nil {
+		deps.Dispatch = DefaultDeps().Dispatch
+	}
+
+	fs := flag.NewFlagSet("dispatch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts worker.Options
+	var repoAlias string
+	var issueNumberAlias int
+	var issueTitleAlias string
+	var issueBodyAlias string
+	var baseBranchAlias string
+	var branchAlias string
+	var runIDAlias string
+	var attemptAlias int
+	var recoveryContextAlias string
+	var providerAlias string
+	var modelAlias string
+	var effortAlias string
+	var keepWorktreeAlias bool
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.IntVar(&opts.IssueNumber, "issue-number", 0, "issue number")
+	fs.IntVar(&issueNumberAlias, "IssueNumber", 0, "issue number")
+	fs.StringVar(&opts.IssueTitle, "issue-title", "", "issue title")
+	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
+	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
+	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
+	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&opts.Branch, "branch", "", "branch")
+	fs.StringVar(&branchAlias, "Branch", "", "branch")
+	fs.StringVar(&opts.RunID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.IntVar(&opts.Attempt, "attempt", 1, "attempt")
+	fs.IntVar(&attemptAlias, "Attempt", 0, "attempt")
+	fs.StringVar(&opts.RecoveryContext, "recovery-context", "", "recovery context")
+	fs.StringVar(&recoveryContextAlias, "RecoveryContext", "", "recovery context")
+	fs.StringVar(&opts.Provider, "provider", "codex", "provider")
+	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&opts.Model, "model", "", "model")
+	fs.StringVar(&modelAlias, "Model", "", "model")
+	fs.StringVar(&opts.Effort, "effort", "", "effort")
+	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
+	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if issueNumberAlias != 0 {
+		opts.IssueNumber = issueNumberAlias
+	}
+	if issueTitleAlias != "" {
+		opts.IssueTitle = issueTitleAlias
+	}
+	if issueBodyAlias != "" {
+		opts.IssueBody = issueBodyAlias
+	}
+	if baseBranchAlias != "" {
+		opts.BaseBranch = baseBranchAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if runIDAlias != "" {
+		opts.RunID = runIDAlias
+	}
+	if attemptAlias != 0 {
+		opts.Attempt = attemptAlias
+	}
+	if recoveryContextAlias != "" {
+		opts.RecoveryContext = recoveryContextAlias
+	}
+	if providerAlias != "" {
+		opts.Provider = providerAlias
+	}
+	if modelAlias != "" {
+		opts.Model = modelAlias
+	}
+	if effortAlias != "" {
+		opts.Effort = effortAlias
+	}
+	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	opts.Stderr = stderr
+
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "dispatch: --repo is required")
+		return 2
+	}
+	if opts.IssueNumber <= 0 {
+		fmt.Fprintln(stderr, "dispatch: --issue-number is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.IssueTitle) == "" {
+		fmt.Fprintln(stderr, "dispatch: --issue-title is required")
+		return 2
+	}
+
+	result, err := deps.Dispatch(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+		return 1
+	}
+	data, err := worker.MarshalResult(result)
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(append(data, '\n')); err != nil {
+		fmt.Fprintf(stderr, "dispatch: write output: %v\n", err)
+		return 1
 	}
 	return 0
 }

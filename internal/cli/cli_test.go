@@ -10,6 +10,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
 func TestRootHelpListsSubcommands(t *testing.T) {
@@ -58,7 +59,7 @@ func TestSubcommandHelpWorks(t *testing.T) {
 func TestUnimplementedSubcommandReportsMigrationDoc(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	exitCode := Run([]string{"dispatch"}, &stdout, &stderr)
+	exitCode := Run([]string{"recover"}, &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatal("Run returned exit code 0, want non-zero")
 	}
@@ -129,6 +130,79 @@ func TestReadySetRequiresRepo(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	exitCode := RunWithDeps([]string{"ready-set"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
+func TestDispatchRunsWithInjectedWorker(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+		"--issue-body", "Body",
+		"--model", "gpt-5",
+		"--effort", "high",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if opts.IssueNumber != 101 || opts.IssueTitle != "Implement dispatch" || opts.IssueBody != "Body" {
+				t.Fatalf("dispatch opts issue fields = %#v", opts)
+			}
+			if opts.BaseBranch != "main" || opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
+				t.Fatalf("dispatch opts defaults/pass-through = %#v", opts)
+			}
+			if opts.Stderr == nil {
+				t.Fatal("dispatch opts Stderr is nil")
+			}
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-101",
+				RunID:       "run-test",
+				PR:          "https://github.com/owner/repo/pull/101",
+				Summary:     "Implemented dispatch.",
+				AttemptPath: "/repo/.loopcoder/runs/run-test/workers/job-101-1.attempt.json",
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    12,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	for _, key := range []string{"ok", "issue", "branch", "run_id", "pr", "summary", "attempt_path", "status", "exit_code", "log_bytes"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("dispatch JSON missing %q: %s", key, stdout.String())
+		}
+	}
+	if got["ok"] != true || got["status"] != "succeeded" {
+		t.Fatalf("dispatch JSON has wrong success fields: %#v", got)
+	}
+}
+
+func TestDispatchRequiresIssueFields(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"dispatch"}, &stdout, &stderr, Deps{})
 	if exitCode != 2 {
 		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
 	}
