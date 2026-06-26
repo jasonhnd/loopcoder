@@ -1,6 +1,8 @@
 package state
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -50,5 +52,100 @@ func TestRunIDForIssueUsesDocumentedShape(t *testing.T) {
 	}
 	if !IsRunID(got) {
 		t.Fatalf("IsRunID(%q) = false, want true", got)
+	}
+}
+
+func TestLatestRunIDSelectsNewestRunDirectory(t *testing.T) {
+	repo := t.TempDir()
+	runsRoot := filepath.Join(repo, ".loopcoder", "runs")
+	if err := os.MkdirAll(filepath.Join(runsRoot, "run-old"), 0o755); err != nil {
+		t.Fatalf("MkdirAll old run: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(runsRoot, "run-new"), 0o755); err != nil {
+		t.Fatalf("MkdirAll new run: %v", err)
+	}
+
+	oldTime := time.Date(2026, 6, 26, 1, 0, 0, 0, time.UTC)
+	newTime := time.Date(2026, 6, 26, 2, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(runsRoot, "run-old"), oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes old run: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(runsRoot, "run-new"), newTime, newTime); err != nil {
+		t.Fatalf("Chtimes new run: %v", err)
+	}
+
+	got, err := LatestRunID(repo)
+	if err != nil {
+		t.Fatalf("LatestRunID returned error: %v", err)
+	}
+	if got != "run-new" {
+		t.Fatalf("LatestRunID() = %q, want run-new", got)
+	}
+}
+
+func TestLatestRunIDReturnsEmptyWhenRunsRootMissing(t *testing.T) {
+	got, err := LatestRunID(t.TempDir())
+	if err != nil {
+		t.Fatalf("LatestRunID returned error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("LatestRunID() = %q, want empty", got)
+	}
+}
+
+func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
+	repo := t.TempDir()
+	workers := filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers")
+	if err := os.MkdirAll(workers, 0o755); err != nil {
+		t.Fatalf("MkdirAll workers: %v", err)
+	}
+	attemptPath := filepath.Join(workers, "job-42-1234.attempt.json")
+	data := []byte(`{
+  "version": 1,
+  "issue": "42",
+  "attempt": 2,
+  "provider": "codex",
+  "pid": "1234",
+  "phase": "codex_started",
+  "status": "running",
+  "heartbeat_at": "2026-06-26T12:01:00Z",
+  "last_progress_at": "2026-06-26T12:01:00Z",
+  "exit_code": null
+}`)
+	if err := os.WriteFile(attemptPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile attempt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workers, "bad.attempt.json"), []byte(`{bad`), 0o644); err != nil {
+		t.Fatalf("WriteFile bad attempt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workers, "missing-issue.attempt.json"), []byte(`{"attempt":1}`), 0o644); err != nil {
+		t.Fatalf("WriteFile missing issue attempt: %v", err)
+	}
+
+	attempts, err := LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("LoadAttempts returned %d attempts, want 1: %#v", len(attempts), attempts)
+	}
+	got := attempts[0]
+	if got.JobID != "job-42-1234" {
+		t.Fatalf("JobID = %q, want job-42-1234", got.JobID)
+	}
+	if got.Issue != 42 || got.Attempt != 2 {
+		t.Fatalf("Issue/Attempt = %d/%d, want 42/2", got.Issue, got.Attempt)
+	}
+	if got.Branch != "loop/issue-42-retry-2" {
+		t.Fatalf("Branch = %q, want loop/issue-42-retry-2", got.Branch)
+	}
+	if got.PID == nil || *got.PID != 1234 {
+		t.Fatalf("PID = %#v, want 1234", got.PID)
+	}
+	if got.ExitCode != nil {
+		t.Fatalf("ExitCode = %#v, want nil", got.ExitCode)
+	}
+	if got.Path != attemptPath {
+		t.Fatalf("Path = %q, want %q", got.Path, attemptPath)
 	}
 }
