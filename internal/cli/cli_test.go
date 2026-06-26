@@ -11,6 +11,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -57,23 +58,79 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
-func TestUnimplementedSubcommandReportsMigrationDoc(t *testing.T) {
+func TestVerifyLocalRunsWithInjectedVerifierAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+	prNumber := 105
+
+	exitCode := RunWithDeps([]string{
+		"verify-local",
+		"-Repo", repo,
+		"-PrNumber", "105",
+		"-BaseBranch", "trunk",
+	}, &stdout, &stderr, Deps{
+		Verify: func(_ context.Context, opts verify.Options) verify.Result {
+			called = true
+			if opts.RepoPath != repo || opts.PRNumber != 105 || opts.Branch != "" || opts.BaseBranch != "trunk" {
+				t.Fatalf("verify opts = %#v", opts)
+			}
+			return verify.Result{
+				ExitCode: 1,
+				Summary: verify.Summary{
+					Repo:              repo,
+					PR:                &prNumber,
+					BaseBranch:        opts.BaseBranch,
+					GeneratedAt:       "2026-06-26T12:00:00Z",
+					LocalCommandGates: "configured",
+					Verdict:           verify.StatusFail,
+					Groups: []verify.GroupResult{{
+						Group:  "tests",
+						Status: verify.StatusFail,
+						Commands: []verify.CommandResult{{
+							Command:  "go test ./...",
+							ExitCode: 1,
+							Status:   verify.StatusFail,
+							Reason:   "command-exit-nonzero",
+						}},
+					}},
+				},
+			}
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1", exitCode)
+	}
+	if !called {
+		t.Fatal("Verify dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	text := stdout.String()
+	if !strings.Contains(text, "LOCAL VERIFICATION SUMMARY") || !strings.Contains(text, "JSON SUMMARY") {
+		t.Fatalf("stdout missing verification report:\n%s", text)
+	}
+	if !strings.Contains(text, "verdict: fail") {
+		t.Fatalf("stdout missing fail verdict:\n%s", text)
+	}
+}
+
+func TestVerifyLocalRequiresExactlyOneTarget(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	exitCode := Run([]string{"verify-local"}, &stdout, &stderr)
-	if exitCode == 0 {
-		t.Fatal("Run returned exit code 0, want non-zero")
+	exitCode := RunWithDeps([]string{
+		"verify-local",
+		"--repo", t.TempDir(),
+		"--pr-number", "105",
+		"--branch", "loop/issue-105",
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
-	}
-
-	message := stderr.String()
-	if !strings.Contains(message, "not yet implemented") {
-		t.Fatalf("stderr missing not-yet-implemented message: %q", message)
-	}
-	if !strings.Contains(message, "docs/go-migration.md") {
-		t.Fatalf("stderr missing migration doc reference: %q", message)
+	if !strings.Contains(stderr.String(), "exactly one of --pr-number or --branch is required") {
+		t.Fatalf("stderr missing target-choice message: %q", stderr.String())
 	}
 }
 
