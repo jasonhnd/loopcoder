@@ -271,6 +271,12 @@ remain the source of truth for delivery state.
   labels, PRs, branches, and checks. Local sidecars are advisory for local
   liveness only and must not cause duplicate dispatch when GitHub already has a
   deliverable.
+- Resume command: before dispatching anything after an interruption, run
+  `scripts/resume.ps1 -Repo <repo> -RunId <run>` (omit `-RunId` to select the
+  latest local run). The report follows [`docs/resilience.md`](docs/resilience.md):
+  GitHub is the source of truth, `.loopcoder` state is advisory, and resume
+  prints next ready actions but never auto-dispatches, pushes, merges, or adopts
+  a local attempt without conductor/human review.
 
 ## Recovery Notes
 
