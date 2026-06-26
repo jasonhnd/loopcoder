@@ -213,6 +213,15 @@ v0.1.2 keep verification inside the conductor playbook.
   present and green in `gh pr checks <pr>` before a PR is called
   merge-eligible. A missing, failed, cancelled, timed-out, skipped, or
   still-pending required check means the PR is not merge-eligible.
+- Local command gates: for a code PR, in addition to hosted checks and spec
+  conformance, the verifier may run
+  `scripts/verify-local.ps1 -Repo <repo> -PrNumber <pr>` to execute the
+  configured local command gates from `.delivery.yml` `ci.tests`,
+  `ci.typecheck`, and `ci.build`, as described in
+  [`docs/verification.md`](docs/verification.md). Fold its explicit
+  `pass` / `fail` / `needs-human` result into the PR verdict. If no local
+  commands are configured, report that portion as `not-configured`; this is not
+  a failure.
 - Spec conformance: for a code PR, read the merged design doc referenced by the
   code issue from the base branch, for example
   `git show origin/main:docs/<doc>.md`. Extract acceptance criteria, Goals, and
