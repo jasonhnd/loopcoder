@@ -93,13 +93,14 @@ this loop.
 
 5. Verify each resulting PR.
    - For each worker-created PR, review as the Verifier. The worker model and verifier model differ on purpose.
-   - Run `gh pr diff <pr>` and inspect whether the diff satisfies the issue and avoids unrelated changes.
-   - Run `gh pr checks <pr>` and record whether required checks pass.
-   - Report failures, risky changes, or missing acceptance coverage in chat. Do not silently merge or hide verifier concerns.
+   - Follow the "Verification gate" subsection below, which is the v0.1.2 conductor encoding of [`docs/verification.md`](docs/verification.md).
+   - Run `gh pr diff <pr>` and `gh pr diff <pr> --name-only`; inspect whether the diff satisfies the issue, conforms to the referenced merged design doc, and avoids unrelated changes.
+   - Run `gh pr checks <pr>` and verify every check named in `.delivery.yml` `ci.checks` is present and green.
+   - End every PR review with exactly one explicit verdict in chat: `pass`, `fail`, or `needs-human`, with evidence for check status, spec criteria, and changed files.
 
 6. Merge ordering.
    - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/scheduling.md`](docs/scheduling.md).
-   - Never auto-merge. When the user names PRs to merge, read each named ready PR's real changed files with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run `gh pr merge` only for those named PRs.
+   - Never auto-merge. A `pass` verdict means merge-eligible only; it never calls `gh pr merge`. When the user names PRs to merge, read each named ready PR's real changed files with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run `gh pr merge` only for those named PRs that remain merge-eligible.
    - Non-overlapping PRs may merge in any order. Overlapping PRs merge serially: merge the first, rebase the next onto updated `main`, verify it remains acceptable, then merge it.
    - If an overlapping PR cannot rebase cleanly, evict it from the merge group, capture the changed files, conflicting paths, rebase output, and PRs that landed, then narrow the scope and re-dispatch a worker with that context instead of blindly retrying.
 
@@ -108,6 +109,35 @@ this loop.
    - Continue until the DAG is drained or blocked.
    - End with a final summary listing issues, PRs, verifier status, check status, and any human decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
+
+## Verification gate
+
+Follow [`docs/verification.md`](docs/verification.md) for the gate model, but in
+v0.1.2 keep verification inside the conductor playbook.
+
+- Required checks: every check named in `.delivery.yml` `ci.checks` must be
+  present and green in `gh pr checks <pr>` before a PR is called
+  merge-eligible. A missing, failed, cancelled, timed-out, skipped, or
+  still-pending required check means the PR is not merge-eligible.
+- Spec conformance: for a code PR, read the merged design doc referenced by the
+  code issue from the base branch, for example
+  `git show origin/main:docs/<doc>.md`. Extract acceptance criteria, Goals, and
+  normative `must` / `only` / `never` items; then check that the diff implements
+  them and avoids the doc's non-goals and unrelated changes.
+- Empty automated gate: if `ci.checks` is empty for a code PR, report
+  `needs-human` for the automated-gate portion instead of treating the gate as
+  passed, while still completing the diff and spec-conformance review.
+- Verdicts: every PR review reports exactly one of `pass`, `fail`, or
+  `needs-human` in chat, with evidence for check status, spec criteria, and
+  changed files.
+- Routing: `pass` means merge-eligible and waits for the user to name it for
+  merge. `fail` means a red check, missing criterion, spec violation, or
+  unrelated change; re-dispatch a bounded fix pass with the failure evidence
+  attached, respecting `verification.max_fix_passes`. `needs-human` means an
+  ambiguous spec, missing or unreadable referenced doc, or infrastructure /
+  permission failure; ask one concise question and do not mark the PR
+  merge-eligible.
+- Human merge remains the gate: a `pass` verdict never calls `gh pr merge`.
 
 ## Recovery Notes
 

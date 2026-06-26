@@ -15,5 +15,28 @@ worker:
   command_hint: "implement the issue, run relevant checks, commit"
 ci:
   checks: []
+  # Optional. Absent = no local test command gate.
+  # tests:
+  #   - bun run test
+  # Optional. Absent = no local typecheck command gate.
+  # typecheck:
+  #   - bunx tsc --noEmit -p tsconfig.json
+  # Optional. Absent = no local build command gate.
+  # build:
+  #   - bun run build
+# verification:
+#   Optional. Absent = true for loopcoder code PRs.
+#   spec_required: true
+#   Optional. Absent = 3.
+#   max_fix_passes: 3
+#   browser:
+#     Optional. auto|always|never; absent = auto.
+#     enabled: auto
+#     Optional. Changed-path patterns that trigger browser verification in auto mode.
+#     globs:
+#       - web/**
+#       - app/**
+#       - "**/*.css"
+#       - "**/*.tsx"
 report:
   channel: chat
