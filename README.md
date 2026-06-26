@@ -4,7 +4,7 @@
 
 An autonomous delivery loop - ROADMAP in, shipped code out
 
-![License](https://img.shields.io/badge/license-not%20specified-lightgrey.svg)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Version](https://img.shields.io/badge/version-v0.1.0-brightgreen.svg)](CHANGELOG.md)
 
