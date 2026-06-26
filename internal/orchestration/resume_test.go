@@ -1,0 +1,179 @@
+package orchestration
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/state"
+	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+)
+
+func TestComputeResumeClassifiesGitHubPRAndLocalState(t *testing.T) {
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	pid := 1234
+	reader := fakeReader{
+		repo: "owner/repo",
+		issues: []gh.Issue{
+			{Number: 1, Title: "Ready", State: "OPEN"},
+			{Number: 4, Title: "Fixing", State: "OPEN"},
+			{Number: 5, Title: "Gated", State: "OPEN"},
+			{Number: 6, Title: "In review", State: "OPEN"},
+			{Number: 7, Title: "Adopt PR", State: "OPEN"},
+			{Number: 8, Title: "Running", State: "OPEN"},
+			{Number: 9, Title: "Stale", State: "OPEN"},
+			{Number: 10, Title: "Hung", State: "OPEN"},
+			{Number: 11, Title: "Orphaned", State: "OPEN"},
+			{Number: 12, Title: "Blocked label", State: "OPEN", Labels: []gh.Label{{Name: "needs-human"}}},
+		},
+		views: map[int]gh.Issue{
+			2: {Number: 2, Title: "Closed completed", State: "CLOSED", StateReason: "COMPLETED"},
+			3: {
+				Number:                         3,
+				Title:                          "Closed by PR ref",
+				State:                          "CLOSED",
+				StateReason:                    "NOT_PLANNED",
+				ClosedByPullRequestsReferences: []gh.PullRequestReference{{Number: 33}},
+			},
+		},
+		prs: []gh.PullRequest{
+			{Number: 40, Title: "Fix #4", HeadRefName: "loop/issue-4"},
+			{Number: 50, Title: "Fix #5", HeadRefName: "loop/issue-5"},
+			{Number: 60, Title: "Fix #6", HeadRefName: "loop/issue-6"},
+			{Number: 70, Title: "Fix #7", HeadRefName: "loop/issue-7"},
+		},
+		checks: map[int][]gh.Check{
+			40: {{Name: "go", Bucket: "fail"}},
+			50: {{Name: "go", Bucket: "pending"}},
+			60: {{Name: "go", Bucket: "pass"}},
+			70: {{Name: "go", Bucket: "pass"}},
+		},
+	}
+
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader:     reader,
+		RepoPath:   "C:/repo",
+		BaseBranch: "main",
+		RunID:      "run-test",
+		Attempts: []state.Attempt{
+			{
+				JobID:   "job-2",
+				Issue:   2,
+				Attempt: 1,
+				Status:  "succeeded",
+				Phase:   "done",
+				Branch:  "loop/issue-2",
+				Path:    "C:/repo/.loopcoder/runs/run-test/workers/job-2.attempt.json",
+			},
+			{
+				JobID:   "job-3",
+				Issue:   3,
+				Attempt: 1,
+				Status:  "succeeded",
+				Branch:  "loop/issue-3",
+			},
+			{
+				JobID:   "job-7",
+				Issue:   7,
+				Attempt: 1,
+				Status:  "running",
+				Branch:  "loop/issue-7",
+			},
+			{
+				JobID:          "job-8",
+				Issue:          8,
+				Attempt:        1,
+				Status:         "running",
+				PID:            &pid,
+				HeartbeatAt:    "2026-06-26T11:59:50Z",
+				LastProgressAt: "2026-06-26T11:59:50Z",
+				Branch:         "loop/issue-8",
+			},
+			{
+				JobID:          "job-9",
+				Issue:          9,
+				Attempt:        1,
+				Status:         "running",
+				HeartbeatAt:    "2026-06-26T11:59:55Z",
+				LastProgressAt: "2026-06-26T11:57:00Z",
+				Branch:         "loop/issue-9",
+			},
+			{
+				JobID:          "job-10",
+				Issue:          10,
+				Attempt:        1,
+				Status:         "running",
+				LastProgressAt: "2026-06-26T11:50:00Z",
+				Branch:         "loop/issue-10",
+			},
+			{
+				JobID:       "job-11",
+				Issue:       11,
+				Attempt:     1,
+				Status:      "running",
+				HeartbeatAt: "2026-06-26T11:59:00Z",
+				Branch:      "loop/issue-11",
+			},
+		},
+		EventCount:   2,
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(got int) bool { return got == pid },
+		Now:          now,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+
+	if result.Repo != "owner/repo" || result.GeneratedAt != "2026-06-26T12:00:00Z" {
+		t.Fatalf("metadata mismatch: %#v", result)
+	}
+	if result.GitHub.OpenIssueCount != 10 || result.GitHub.OpenPRCount != 4 {
+		t.Fatalf("github counts = %#v", result.GitHub)
+	}
+	if result.Local.AttemptCount != 7 || result.Local.EventCount != 2 {
+		t.Fatalf("local counts = %#v", result.Local)
+	}
+
+	classes := map[int]string{}
+	actions := map[int]string{}
+	evidence := map[int]string{}
+	for _, issue := range result.Issues {
+		classes[issue.Issue] = issue.Classification
+		actions[issue.Issue] = issue.ActionKind
+		evidence[issue.Issue] = strings.Join(issue.Evidence, "\n")
+	}
+
+	wantClasses := map[int]string{
+		1:  "ready",
+		2:  "done",
+		3:  "done",
+		4:  "fixing",
+		5:  "gated",
+		6:  "in-review",
+		7:  "adopt-PR",
+		8:  "running",
+		9:  "stale",
+		10: "hung",
+		11: "orphaned",
+		12: "needs-inspection",
+	}
+	for issue, want := range wantClasses {
+		if classes[issue] != want {
+			t.Fatalf("issue #%d classification = %q, want %q; all=%#v", issue, classes[issue], want, classes)
+		}
+	}
+	if actions[2] != "none" {
+		t.Fatalf("issue #2 action kind = %q, want none", actions[2])
+	}
+	if actions[10] != "ready" || actions[11] != "ready" {
+		t.Fatalf("hung/orphaned action kinds = %q/%q, want ready/ready", actions[10], actions[11])
+	}
+	if !strings.Contains(evidence[2], "attempt: job=job-2") || !strings.Contains(evidence[2], "branch: loop/issue-2") {
+		t.Fatalf("done issue evidence missing attempt/branch lines:\n%s", evidence[2])
+	}
+	if !strings.Contains(evidence[3], "closing PRs: #33") {
+		t.Fatalf("closing ref done evidence missing:\n%s", evidence[3])
+	}
+}

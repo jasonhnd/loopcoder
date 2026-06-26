@@ -85,6 +85,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "resume" {
+		return runResume(args[1:], stdout, stderr, deps)
+	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
 	return 1
@@ -117,6 +120,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
+	}
+	if command.Name == "resume" {
+		fmt.Fprintln(w, "  --repo string          repository path (required)")
+		fmt.Fprintln(w, "  --base-branch string   base branch for branch and dependency reasoning (default \"main\")")
+		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
@@ -269,6 +277,131 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 	}
 	return 0
+}
+
+func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = DefaultDeps().NewGitHubReader
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = DefaultDeps().ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
+	var runID string
+	var runIDAlias string
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "resume: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 2
+	}
+
+	cfg := config.Default()
+	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
+	if err == nil {
+		cfg = loaded
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 1
+	}
+
+	runNote := "requested run"
+	if strings.TrimSpace(runID) == "" {
+		runID, runNote, err = latestRunIDWithNote(resolvedRepo)
+		if err != nil {
+			fmt.Fprintf(stderr, "resume: %v\n", err)
+			return 1
+		}
+	}
+
+	attempts, err := state.LoadAttempts(resolvedRepo, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 1
+	}
+	eventCount, err := state.CountEvents(resolvedRepo, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 1
+	}
+
+	resumeReport, err := orchestration.ComputeResume(context.Background(), orchestration.ResumeOptions{
+		Reader:       deps.NewGitHubReader(resolvedRepo),
+		RepoPath:     resolvedRepo,
+		BaseBranch:   baseBranch,
+		RunID:        runID,
+		RunNote:      runNote,
+		Attempts:     attempts,
+		EventCount:   eventCount,
+		Thresholds:   cfg.Resilience.Worker,
+		ProcessAlive: deps.ProcessAlive,
+		Now:          deps.Now(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+	return 0
+}
+
+func latestRunIDWithNote(repoPath string) (string, string, error) {
+	runsRoot := state.RunsRoot(repoPath)
+	info, err := os.Stat(runsRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ".loopcoder/runs not found", nil
+		}
+		return "", "", fmt.Errorf("read runs directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("runs path is not a directory: %s", runsRoot)
+	}
+
+	runID, err := state.LatestRunID(repoPath)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(runID) == "" {
+		return "", "no run directories found", nil
+	}
+	return runID, "latest modified run selected", nil
 }
 
 func resolveRepo(repoPath string) (string, error) {
