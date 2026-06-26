@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell parse check
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = $false
+
+          Get-ChildItem -Path scripts -Filter '*.ps1' -File | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "Parse errors in $($_.FullName):"
+              $errors | ForEach-Object { Write-Host $_.ToString() }
+            }
+          }
+
+          if ($failed) {
+            exit 1
+          }
+
+      - name: YAML validity check
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $yamlFiles = @((Resolve-Path '.delivery.yml').Path)
+          $yamlFiles += Get-ChildItem -Path '.github' -Recurse -File |
+            Where-Object { $_.Extension -in '.yml', '.yaml' } |
+            ForEach-Object { $_.FullName }
+
+          if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+            foreach ($file in $yamlFiles) {
+              Get-Content -Raw -LiteralPath $file | ConvertFrom-Yaml | Out-Null
+            }
+            exit 0
+          }
+
+          if (Get-Command yq -ErrorAction SilentlyContinue) {
+            foreach ($file in $yamlFiles) {
+              yq '.' $file > $null
+              if ($LASTEXITCODE -ne 0) {
+                exit $LASTEXITCODE
+              }
+            }
+            exit 0
+          }
+
+          python -c "import sys, yaml; [yaml.safe_load(open(path, encoding='utf-8')) for path in sys.argv[1:]]" @yamlFiles
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
