@@ -522,6 +522,12 @@ foreach ($number in $candidateIssueNumbers) {
   $pidState = $null
   $remoteBranchState = $null
 
+  if ($latestAttempt) {
+    $attemptEvidence = "attempt: job=$($latestAttempt.job_id), attempt=$($latestAttempt.attempt), status=$($latestAttempt.status), phase=$($latestAttempt.phase), sidecar=$($latestAttempt.path)"
+    $remoteBranchState = Test-RemoteBranch -Branch $latestAttempt.branch
+    $branchEvidence = $remoteBranchState.evidence
+  }
+
   $closingPrRefs = @(Get-ClosingPrRefs -Issue $issue)
   $stateReason = [string](Get-JsonProperty -Object $issue -Name 'stateReason' -Default '')
   $closedAsCompleted = ($issue.state -eq 'CLOSED' -and $stateReason -eq 'COMPLETED')
@@ -542,7 +548,6 @@ foreach ($number in $candidateIssueNumbers) {
     $heartbeatAge = Get-AgeSeconds -Timestamp $latestAttempt.heartbeat_at
     $progressAge = Get-AgeSeconds -Timestamp $latestAttempt.last_progress_at
     $pidState = Test-PidLiveness -PidValue $latestAttempt.pid
-    $remoteBranchState = Test-RemoteBranch -Branch $latestAttempt.branch
 
     $heartbeatFresh = ($null -ne $heartbeatAge -and $heartbeatAge -le $heartbeatFreshSeconds)
     $progressStale = ($null -ne $progressAge -and $progressAge -gt [int]$thresholds.stale_after_seconds)
@@ -579,9 +584,7 @@ foreach ($number in $candidateIssueNumbers) {
       $action = 'attempt or branch exists without an open PR; inspect before dispatching'
     }
 
-    $attemptEvidence = "attempt: job=$($latestAttempt.job_id), attempt=$($latestAttempt.attempt), status=$($latestAttempt.status), phase=$($latestAttempt.phase), sidecar=$($latestAttempt.path)"
     $pidEvidence = $pidState.evidence
-    $branchEvidence = $remoteBranchState.evidence
   } else {
     $blockedLabels = Get-BlockedLabels -Labels (Get-LabelNames -Issue $issue)
     if ($blockedLabels.Count -gt 0) {
