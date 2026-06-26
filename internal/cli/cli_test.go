@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
@@ -59,7 +60,7 @@ func TestSubcommandHelpWorks(t *testing.T) {
 func TestUnimplementedSubcommandReportsMigrationDoc(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	exitCode := Run([]string{"recover"}, &stdout, &stderr)
+	exitCode := Run([]string{"verify-local"}, &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatal("Run returned exit code 0, want non-zero")
 	}
@@ -208,6 +209,77 @@ func TestDispatchRequiresIssueFields(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--repo is required") {
 		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
+func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"recover",
+		"-Repo", repo,
+		"-IssueNumber", "103",
+		"-IssueTitle", "Implement recover",
+		"-IssueBody", "Body",
+		"-RunId", "run-test",
+		"-BaseBranch", "trunk",
+		"-MaxAttempts", "4",
+		"-BackoffSeconds", "1,2,3",
+		"-Provider", "codex",
+		"-Model", "gpt-5",
+		"-Effort", "high",
+	}, &stdout, &stderr, Deps{
+		Recover: func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if opts.IssueNumber != 103 || opts.IssueTitle != "Implement recover" || opts.IssueBody != "Body" {
+				t.Fatalf("recover opts issue fields = %#v", opts)
+			}
+			if opts.RunID != "run-test" || opts.BaseBranch != "trunk" || opts.MaxAttempts != 4 {
+				t.Fatalf("recover opts run/base/max = %#v", opts)
+			}
+			if len(opts.BackoffSeconds) != 3 || opts.BackoffSeconds[0] != 1 || opts.BackoffSeconds[2] != 3 {
+				t.Fatalf("BackoffSeconds = %#v, want [1 2 3]", opts.BackoffSeconds)
+			}
+			if opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
+				t.Fatalf("recover opts provider/model/effort = %#v", opts)
+			}
+			if opts.Stderr == nil {
+				t.Fatal("recover opts Stderr is nil")
+			}
+			return recovery.Result{
+				Action: recovery.ActionRetry,
+				Report: "RETRY: dispatching issue #103 attempt 2\n",
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "RETRY: dispatching issue #103 attempt 2") {
+		t.Fatalf("stdout missing retry report: %q", stdout.String())
+	}
+}
+
+func TestRecoverRequiresRunID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{
+		"recover",
+		"--repo", t.TempDir(),
+		"--issue-number", "103",
+		"--issue-title", "Implement recover",
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--run-id is required") {
+		t.Fatalf("stderr missing required run-id message: %q", stderr.String())
 	}
 }
 

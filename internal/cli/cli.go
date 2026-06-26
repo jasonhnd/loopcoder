@@ -9,12 +9,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -31,6 +33,7 @@ type Deps struct {
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 }
 
 var commands = []Command{
@@ -96,6 +99,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "dispatch" {
 		return runDispatch(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "recover" {
+		return runRecover(args[1:], stdout, stderr, deps)
+	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
 	return 1
@@ -148,6 +154,19 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for branch and dependency reasoning (default \"main\")")
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
+	}
+	if command.Name == "recover" {
+		fmt.Fprintln(w, "  --repo string                   repository path (required)")
+		fmt.Fprintln(w, "  --issue-number int              GitHub issue number (required)")
+		fmt.Fprintln(w, "  --issue-title string            GitHub issue title (required)")
+		fmt.Fprintln(w, "  --issue-body string             GitHub issue body")
+		fmt.Fprintln(w, "  --run-id string                 run id containing attempt history (required)")
+		fmt.Fprintln(w, "  --base-branch string            retry base branch (default \"main\")")
+		fmt.Fprintln(w, "  --max-attempts int              retry limit (default 3)")
+		fmt.Fprintln(w, "  --backoff-seconds string        comma-separated retry backoff schedule (default \"10,30,120\")")
+		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
+		fmt.Fprintln(w, "  --model string                  optional Codex model pass-through")
+		fmt.Fprintln(w, "  --effort string                 optional Codex reasoning effort pass-through")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
@@ -422,6 +441,192 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Dispatch == nil {
+		deps.Dispatch = DefaultDeps().Dispatch
+	}
+	if deps.Recover == nil {
+		deps.Recover = recoverWithDispatch(deps.Dispatch)
+	}
+
+	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts recovery.Options
+	var repoAlias string
+	var issueNumberAlias int
+	var issueTitleAlias string
+	var issueBodyAlias string
+	var runIDAlias string
+	var baseBranchAlias string
+	var maxAttemptsAlias int
+	var backoffSecondsValue string
+	var backoffSecondsAlias string
+	var providerAlias string
+	var modelAlias string
+	var effortAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.IntVar(&opts.IssueNumber, "issue-number", 0, "issue number")
+	fs.IntVar(&issueNumberAlias, "IssueNumber", 0, "issue number")
+	fs.StringVar(&opts.IssueTitle, "issue-title", "", "issue title")
+	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
+	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
+	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
+	fs.StringVar(&opts.RunID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.IntVar(&opts.MaxAttempts, "max-attempts", 3, "max attempts")
+	fs.IntVar(&maxAttemptsAlias, "MaxAttempts", 0, "max attempts")
+	fs.StringVar(&backoffSecondsValue, "backoff-seconds", "10,30,120", "backoff seconds")
+	fs.StringVar(&backoffSecondsAlias, "BackoffSeconds", "", "backoff seconds")
+	fs.StringVar(&opts.Provider, "provider", "codex", "provider")
+	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&opts.Model, "model", "", "model")
+	fs.StringVar(&modelAlias, "Model", "", "model")
+	fs.StringVar(&opts.Effort, "effort", "", "effort")
+	fs.StringVar(&effortAlias, "Effort", "", "effort")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if issueNumberAlias != 0 {
+		opts.IssueNumber = issueNumberAlias
+	}
+	if issueTitleAlias != "" {
+		opts.IssueTitle = issueTitleAlias
+	}
+	if issueBodyAlias != "" {
+		opts.IssueBody = issueBodyAlias
+	}
+	if runIDAlias != "" {
+		opts.RunID = runIDAlias
+	}
+	if baseBranchAlias != "" {
+		opts.BaseBranch = baseBranchAlias
+	}
+	if maxAttemptsAlias != 0 {
+		opts.MaxAttempts = maxAttemptsAlias
+	}
+	if backoffSecondsAlias != "" {
+		backoffSecondsValue = backoffSecondsAlias
+	}
+	if providerAlias != "" {
+		opts.Provider = providerAlias
+	}
+	if modelAlias != "" {
+		opts.Model = modelAlias
+	}
+	if effortAlias != "" {
+		opts.Effort = effortAlias
+	}
+	opts.Stderr = stderr
+
+	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
+	if err != nil {
+		fmt.Fprintf(stderr, "recover: %v\n", err)
+		return 2
+	}
+	opts.BackoffSeconds = backoffSeconds
+
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "recover: --repo is required")
+		return 2
+	}
+	if opts.IssueNumber <= 0 {
+		fmt.Fprintln(stderr, "recover: --issue-number is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.IssueTitle) == "" {
+		fmt.Fprintln(stderr, "recover: --issue-title is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.RunID) == "" {
+		fmt.Fprintln(stderr, "recover: --run-id is required")
+		return 2
+	}
+
+	result, err := deps.Recover(context.Background(), opts)
+	if result.Report != "" {
+		if _, writeErr := stdout.Write([]byte(result.Report)); writeErr != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", writeErr)
+			return 1
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "recover: %v\n", err)
+		return 1
+	}
+	if result.Action == recovery.ActionBlocked {
+		return 1
+	}
+	return 0
+}
+
+func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
+	return func(ctx context.Context, opts recovery.Options) (recovery.Result, error) {
+		recoverDeps := recovery.DefaultDeps()
+		recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
+			result, err := dispatch(ctx, worker.Options{
+				RepoPath:        dispatchOpts.RepoPath,
+				IssueNumber:     dispatchOpts.IssueNumber,
+				IssueTitle:      dispatchOpts.IssueTitle,
+				IssueBody:       dispatchOpts.IssueBody,
+				BaseBranch:      dispatchOpts.BaseBranch,
+				Branch:          dispatchOpts.Branch,
+				RunID:           dispatchOpts.RunID,
+				Attempt:         dispatchOpts.Attempt,
+				RecoveryContext: dispatchOpts.RecoveryContext,
+				Provider:        dispatchOpts.Provider,
+				Model:           dispatchOpts.Model,
+				Effort:          dispatchOpts.Effort,
+				Stderr:          dispatchOpts.Stderr,
+			})
+			if err != nil {
+				return recovery.DispatchResult{}, err
+			}
+			return recovery.DispatchResult{
+				OK:          result.OK,
+				Issue:       result.Issue,
+				Branch:      result.Branch,
+				RunID:       result.RunID,
+				PR:          result.PR,
+				Summary:     result.Summary,
+				AttemptPath: result.AttemptPath,
+				Status:      result.Status,
+				ExitCode:    result.ExitCode,
+				LogBytes:    result.LogBytes,
+			}, nil
+		}
+		return recovery.Run(ctx, opts, recoverDeps)
+	}
+}
+
+func parseBackoffSeconds(value string) ([]int, error) {
+	if strings.TrimSpace(value) == "" {
+		return []int{}, nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]int, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return nil, fmt.Errorf("invalid --backoff-seconds %q", value)
+		}
+		seconds, err := strconv.Atoi(trimmed)
+		if err != nil || seconds < 0 {
+			return nil, fmt.Errorf("invalid --backoff-seconds %q", value)
+		}
+		out = append(out, seconds)
+	}
+	return out, nil
 }
 
 func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {

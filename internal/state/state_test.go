@@ -110,6 +110,7 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
   "pid": "1234",
   "phase": "codex_started",
   "status": "running",
+  "recovery_context_path": ".loopcoder/runs/run-test/recovery/job-42-1234-context.md",
   "heartbeat_at": "2026-06-26T12:01:00Z",
   "last_progress_at": "2026-06-26T12:01:00Z",
   "exit_code": null
@@ -140,6 +141,9 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	}
 	if got.Branch != "loop/issue-42-retry-2" {
 		t.Fatalf("Branch = %q, want loop/issue-42-retry-2", got.Branch)
+	}
+	if got.RecoveryContextPath != ".loopcoder/runs/run-test/recovery/job-42-1234-context.md" {
+		t.Fatalf("RecoveryContextPath = %q", got.RecoveryContextPath)
 	}
 	if got.PID == nil || *got.PID != 1234 {
 		t.Fatalf("PID = %#v, want 1234", got.PID)
