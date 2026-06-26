@@ -120,21 +120,30 @@ Install automation is on the roadmap.
 
 ## Status
 
-v0.1.2 is the M1 build plus first bounded slices for verification,
-self-improvement, and worker resilience. The base loop remains Opus as the
-single-session conductor, Codex as the v1 worker, GitHub as the work-item and
-PR host, Opus review, chat reporting, and merge-on-instruction.
+v0.1.2 is the current local, human-gated A/B/C buildout. The base loop remains
+Opus as the single-session conductor, Codex as the v1 worker, GitHub as the
+work-item and PR host, Opus review, chat reporting, and merge-on-instruction.
 
-It adds:
+It implements:
 
-- A verification gate with required checks, spec conformance, and explicit
-  pass/fail/needs-human verdicts.
-- A bounded self-improvement learnings loop.
-- Worker resilience through a heartbeat sidecar, stuck detection, and bounded
-  retry.
+- Verification: a real GitHub Actions `verify` check, required-check gating
+  through `.delivery.yml`, spec-conformance review against the merged design
+  document, and explicit `pass`, `fail`, or `needs-human` verdicts. A PR is not
+  merge-eligible until the conductor has seen the required checks green.
+- Self-improvement: an append-only [`docs/learnings.md`](docs/learnings.md)
+  file with real entries, relevant-learning read guidance, final-run learning
+  review, and a bounded, proposal-only improvement-review pass that remains
+  human-gated.
+- Resilience: local durable run state under `.loopcoder/`, attempt sidecars,
+  heartbeat/progress records, an events log, recovery briefs, bounded retry via
+  [`scripts/recover-and-retry.ps1`](scripts/recover-and-retry.ps1), and
+  GitHub-first resume/reconcile via [`scripts/resume.ps1`](scripts/resume.ps1).
 
 The mandatory doc-first process, worker model/speed inheritance,
-dependency-aware scheduling, and full designs remain documented targets.
+dependency-aware scheduling, and human merge gate are active v1 rules. The
+background or cloud conductor tick, browser verification automation, periodic
+self-improvement review, and broader provider adapters remain documented
+targets rather than current behavior.
 
 loopcoder is self-hosting: it has written its own `SKILL.md`, `.delivery.yml`,
 `README.md`, and `ROADMAP.md`.
