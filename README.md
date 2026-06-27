@@ -124,9 +124,9 @@ go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
 
 The backend expects `git`, `gh`, and `codex` on `PATH`. Put the installed
 `loopcoder` binary on `PATH`, or set `LOOPCODER_BIN` to an explicit binary path.
-The conductor selects `LOOPCODER_BIN` first, then `loopcoder` from `PATH`, then
-the Windows `.ps1` fallback scripts for one release window. macOS and Linux use
-the native binary; they do not require PowerShell.
+The conductor selects `LOOPCODER_BIN` first, then `loopcoder` from `PATH`. This
+native binary backend is required on macOS, Linux, and Windows; PowerShell is
+not used as a backend.
 
 The binary commands are:
 
@@ -153,7 +153,8 @@ v0.2.0 is the current cross-platform native Go CLI release. The base loop
 remains Opus as the single-session conductor, Codex as the v1 worker, GitHub as
 the work-item and PR host, Opus review, chat reporting, doc-first execution, and
 merge-on-instruction. The change is the mechanical backend: the native
-`loopcoder` binary replaces the PowerShell helper layer as the normal path.
+`loopcoder` binary replaces the PowerShell helper layer as the sole mechanical
+backend on all platforms.
 
 It implements:
 
@@ -163,8 +164,9 @@ It implements:
   through `.delivery.yml`, spec-conformance review against the merged design
   document, and explicit `pass`, `fail`, or `needs-human` verdicts. A PR is not
   merge-eligible until the conductor has seen the required checks green.
-  Command parity is covered by unit tests plus the CI `go` gate; real-Codex
-  end-to-end validation is still an operator responsibility.
+  Command parity is covered by unit tests plus the CI `go` gate; the binary has
+  also been validated end-to-end by building it and running `loopcoder dispatch`
+  to produce a real PR.
 - Self-improvement: an append-only [`docs/learnings.md`](docs/learnings.md)
   file with real entries, relevant-learning read guidance, final-run learning
   review, and a bounded, proposal-only improvement-review pass that remains
