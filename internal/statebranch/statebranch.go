@@ -234,9 +234,6 @@ func Pull(ctx context.Context, opts PullOptions, deps Deps) (PullResult, error) 
 	if err := copyTree(worktreePath, mirrorPath, copyTreeOptions{skipGit: true, overwrite: true}); err != nil {
 		return PullResult{}, err
 	}
-	if err := makeTreeReadOnly(mirrorPath); err != nil {
-		return PullResult{}, err
-	}
 
 	runs, err := hydrateMissingRuns(filepath.Join(worktreePath, "runs"), state.RunsRoot(repoPath))
 	if err != nil {
@@ -1164,7 +1161,6 @@ func sanitizePathPart(value string) string {
 type copyTreeOptions struct {
 	skipGit   bool
 	overwrite bool
-	readOnly  bool
 }
 
 func copyTree(sourceRoot, destRoot string, opts copyTreeOptions) error {
@@ -1204,11 +1200,7 @@ func copyTree(sourceRoot, destRoot string, opts copyTreeOptions) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		mode := fs.FileMode(0o644)
-		if opts.readOnly {
-			mode = 0o444
-		}
-		return os.WriteFile(target, data, mode)
+		return os.WriteFile(target, data, 0o644)
 	})
 }
 
@@ -1252,18 +1244,6 @@ func safeRemoveAll(path, root string) error {
 		return fmt.Errorf("refusing to remove path outside root: %s", path)
 	}
 	return os.RemoveAll(absPath)
-}
-
-func makeTreeReadOnly(root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return os.Chmod(path, 0o555)
-		}
-		return os.Chmod(path, 0o444)
-	})
 }
 
 func makeTreeWritable(root string) error {

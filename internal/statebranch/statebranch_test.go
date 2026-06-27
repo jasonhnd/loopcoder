@@ -246,6 +246,20 @@ func TestPullMirrorsStateBranchAndHydratesMissingRuns(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(result.MirrorPath, "runs", "run-test", "state.json")); err != nil {
 		t.Fatalf("mirror state missing: %v", err)
 	}
+	for _, path := range []string{
+		result.MirrorPath,
+		filepath.Join(result.MirrorPath, "runs"),
+		filepath.Join(result.MirrorPath, "runs", "run-test"),
+		filepath.Join(result.MirrorPath, "runs", "run-test", "state.json"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat mirror path %s: %v", path, err)
+		}
+		if info.Mode().Perm()&0o200 == 0 {
+			t.Fatalf("mirror path %s mode = %v, want owner-writable", path, info.Mode().Perm())
+		}
+	}
 	if _, err := os.Stat(filepath.Join(repo, ".loopcoder", "runs", "run-test", "state.json")); err != nil {
 		t.Fatalf("hydrated run state missing: %v", err)
 	}
