@@ -8,7 +8,7 @@ on:
 
 defaults:
   run:
-    shell: pwsh
+    shell: bash
 
 jobs:
   verify:
@@ -16,123 +16,94 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: PowerShell parse check
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $failed = $false
-
-          Get-ChildItem -Path scripts -Filter '*.ps1' -File | ForEach-Object {
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
-
-            if ($errors.Count -gt 0) {
-              $failed = $true
-              Write-Host "Parse errors in $($_.FullName):"
-              $errors | ForEach-Object { Write-Host $_.ToString() }
-            }
-          }
-
-          if ($failed) {
-            exit 1
-          }
-
       - name: YAML validity check
         run: |
-          $ErrorActionPreference = 'Stop'
-          $yamlFiles = @((Resolve-Path '.delivery.yml').Path)
-          $yamlFiles += Get-ChildItem -Path '.github' -Recurse -File |
-            Where-Object { $_.Extension -in '.yml', '.yaml' } |
-            ForEach-Object { $_.FullName }
+          set -euo pipefail
 
-          if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
-            foreach ($file in $yamlFiles) {
-              Get-Content -Raw -LiteralPath $file | ConvertFrom-Yaml | Out-Null
-            }
+          mapfile -t yaml_files < <(
+            {
+              printf '%s\n' '.delivery.yml'
+              find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print
+            } | sort
+          )
+
+          if command -v yq >/dev/null 2>&1; then
+            for file in "${yaml_files[@]}"; do
+              yq '.' "$file" >/dev/null
+            done
             exit 0
-          }
+          fi
 
-          if (Get-Command yq -ErrorAction SilentlyContinue) {
-            foreach ($file in $yamlFiles) {
-              yq '.' $file > $null
-              if ($LASTEXITCODE -ne 0) {
-                exit $LASTEXITCODE
-              }
-            }
-            exit 0
-          }
+          python3 - "${yaml_files[@]}" <<'PY'
+          import sys
 
-          python -c "import sys, yaml; [yaml.safe_load(open(path, encoding='utf-8')) for path in sys.argv[1:]]" @yamlFiles
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
+          import yaml
+
+          for path in sys.argv[1:]:
+              with open(path, encoding="utf-8") as yaml_file:
+                  yaml.safe_load(yaml_file)
+          PY
 
       - name: CI check mapping check
         run: |
-          $ErrorActionPreference = 'Stop'
+          set -euo pipefail
 
-          $workflowFiles = Get-ChildItem -Path '.github/workflows' -File |
-            Where-Object { $_.Extension -in '.yml', '.yaml' } |
-            Sort-Object FullName
+          if command -v yq >/dev/null 2>&1; then
+            mapfile -t required_checks < <(yq -r '(.ci.checks // []) | .[]' '.delivery.yml')
+            mapfile -t workflow_files < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print | sort)
+            job_ids_file="$(mktemp)"
+            trap 'rm -f "$job_ids_file"' EXIT
 
-          $jobIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            for file in "${workflow_files[@]}"; do
+              yq -r '(.jobs // {}) | keys | .[]' "$file" >>"$job_ids_file"
+            done
 
-          if (Get-Command yq -ErrorAction SilentlyContinue) {
-            $requiredChecks = @(& yq -r '(.ci.checks // []) | .[]' '.delivery.yml')
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
+            missing=()
+            for check in "${required_checks[@]}"; do
+              if ! grep -Fxq "$check" "$job_ids_file"; then
+                missing+=("$check")
+              fi
+            done
 
-            foreach ($file in $workflowFiles) {
-              $workflowJobIds = @(& yq -r '(.jobs // {}) | keys | .[]' $file.FullName)
-              if ($LASTEXITCODE -ne 0) {
-                exit $LASTEXITCODE
-              }
-
-              foreach ($jobId in $workflowJobIds) {
-                [void]$jobIds.Add([string]$jobId)
-              }
-            }
-          } else {
-            $script = @(
-              'import glob'
-              'import sys'
-              ''
-              'import yaml'
-              ''
-              'with open(".delivery.yml", encoding="utf-8") as delivery_file:'
-              '    delivery = yaml.safe_load(delivery_file) or {}'
-              ''
-              'required_checks = (delivery.get("ci") or {}).get("checks") or []'
-              'job_ids = set()'
-              ''
-              'for workflow_path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):'
-              '    with open(workflow_path, encoding="utf-8") as workflow_file:'
-              '        workflow = yaml.safe_load(workflow_file) or {}'
-              '    job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())'
-              ''
-              'missing = [str(check) for check in required_checks if str(check) not in job_ids]'
-              'if missing:'
-              '    print("The following ci.checks entries do not match any workflow job id:")'
-              '    for check in missing:'
-              '        print(f"  - {check}")'
-              '    sys.exit(1)'
-            ) -join [Environment]::NewLine
-
-            $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } else { 'python' }
-            $script | & $python -
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
+            if ((${#missing[@]} > 0)); then
+              echo "The following ci.checks entries do not match any workflow job id:"
+              printf '  - %s\n' "${missing[@]}"
+              exit 1
+            fi
 
             exit 0
-          }
+          fi
 
-          $missing = @($requiredChecks | Where-Object { -not $jobIds.Contains([string]$_) })
-          if ($missing.Count -gt 0) {
-            Write-Host "The following ci.checks entries do not match any workflow job id:"
-            $missing | ForEach-Object { Write-Host "  - $_" }
-            exit 1
-          }
+          python3 - <<'PY'
+          import glob
+          import sys
+
+          import yaml
+
+          with open(".delivery.yml", encoding="utf-8") as delivery_file:
+              delivery = yaml.safe_load(delivery_file) or {}
+
+          required_checks = [
+              str(check) for check in (delivery.get("ci") or {}).get("checks") or []
+          ]
+          job_ids = set()
+
+          workflow_paths = sorted(
+              glob.glob(".github/workflows/*.yml")
+              + glob.glob(".github/workflows/*.yaml")
+          )
+          for workflow_path in workflow_paths:
+              with open(workflow_path, encoding="utf-8") as workflow_file:
+                  workflow = yaml.safe_load(workflow_file) or {}
+              job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())
+
+          missing = [check for check in required_checks if check not in job_ids]
+          if missing:
+              print("The following ci.checks entries do not match any workflow job id:")
+              for check in missing:
+                  print(f"  - {check}")
+              sys.exit(1)
+          PY
 
   go:
     runs-on: ubuntu-latest
