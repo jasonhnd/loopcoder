@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-27
+
+### Added
+
+- Native cross-platform `loopcoder` Go binary with subcommands at parity with the v0.1.x PowerShell helpers: `dispatch`, `ready-set`, `resume`, `recover`, `verify-local`, plus native `dispatch-wave` (one-wave orchestration) and `state` / `lease` (cross-session state branch + conductor lease per docs/resilience.md).
+- Cross-platform Codex execution: `exec.Command` with a real file-handle stdin (the portable closed-stdin fix), replacing the Windows `cmd /c` redirection.
+- Cross-platform worktree-add lock via `github.com/gofrs/flock`, replacing the Windows named mutex.
+- A CI `go` job (build / vet / test) and `.delivery.yml ci.checks: [verify, go]` so Go code is gated.
+- `go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest` distribution.
+- Secret scrubbing + recovery briefs, durable run state, and bounded retry ported to Go with deterministic unit tests.
+
+### Changed
+
+- SKILL.md backend selection: the conductor calls the `loopcoder` binary (resolution: `LOOPCODER_BIN` -> `PATH` -> Windows `.ps1` fallback). macOS and Linux no longer require PowerShell. The conductor model (human-merge only, doc-first, observe-at-merge, model/effort inheritance, verification gate) is unchanged; only the helper command names changed.
+
+### Notes
+
+- The `scripts/*.ps1` helpers remain a Windows fallback for one release window and will be deprecated in a later doc-first PR.
+- Command parity is covered by unit tests and the `go` CI gate; real-codex end-to-end is validated by the operator on their platform.
+
 ## [0.1.2] - 2026-06-26
 
 ### Added
