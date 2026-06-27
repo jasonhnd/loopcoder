@@ -5,20 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-06-27
+## [0.3.0] - 2026-06-28
 
 ### Added
 
 - Provider-neutral agent abstraction and registry for dispatch and verification, with actionable errors for unknown providers.
-- `claude` and `gemini` worker adapters alongside the default `codex` adapter.
-- Independent `loopcoder loopreview` verifier command that checks a PR branch in read-only mode and emits a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status.
+- `claude` verified worker adapter and experimental/unverified `gemini` worker adapter alongside the default `codex` adapter.
+- Independent `loopcoder loopreview` verifier command that checks a PR branch in read-only mode, emits a structured `pass`, `fail`, or `needs-human` verdict when the verifier completes, and degrades a slow or hung verifier to `needs-human` at the timeout.
 - `.delivery.yml adapters` role slots for `conductor`, `worker`, and `verifier`, plus a reviewer-not-worker advisory warning when the verifier is configured to match the worker.
 
 ### Changed
 
 - Worker output and repo-facing artifacts are documented as English.
-- Worker `--provider`, `--model`, and `--effort` behavior is provider-specific: `codex` remains the default, `claude` can honor effort, and `gemini` ignores effort with an advisory.
+- Worker `--provider`, `--model`, and `--effort` behavior is provider-specific: `codex` remains the default, `claude` can honor effort, and experimental/unverified `gemini` ignores effort with an advisory.
 - Documentation now describes loopcoder in runtime- and ecosystem-agnostic terms, removing paseo and internal-ecosystem framing from the user-facing surface.
+
+### Notes
+
+- The `gemini` adapter is present and registered, but it was not verified end-to-end because the Gemini CLI was not usable in the development environment due to missing authentication.
+- `loopreview` ships as a command with a working timeout safety net. LLM verifier provider reliability is experimental in v0.3.0: a real `claude` verifier run did not complete within the 180s timeout and returned `needs-human`, and `gemini` verification is unverified. Reliable provider verification is a v0.3.1 follow-up.
 
 ## [0.2.0] - 2026-06-27
 

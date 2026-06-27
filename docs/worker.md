@@ -20,9 +20,13 @@ requires the provider's final summary to be in English.
 As of 0.3.0 the worker is provider-pluggable. The adapter step is delegated to a
 provider registry, and three providers are registered:
 
-- `codex` (default)
-- `claude`
-- `gemini`
+- `codex` (default; verified)
+- `claude` (verified)
+- `gemini` (experimental/unverified)
+
+The `gemini` worker adapter code is present and registered, but it has not been
+verified end-to-end because the Gemini CLI was not usable in the development
+environment due to missing authentication.
 
 The provider is selected per dispatch with the `--provider` flag and defaults to
 `codex`. The registry rejects any unknown provider with an actionable error.
@@ -118,7 +122,7 @@ deterministic and in the conductor's hands:
 | `--run-id` | No | generated | Run id used for attempt state and recovery context. |
 | `--attempt` | No | `1` | Attempt number recorded in state and recovery output. |
 | `--recovery-context` | No | unset | Prior recovery context to append to the worker prompt. |
-| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, or `gemini`. |
+| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, or experimental/unverified `gemini`. |
 | `--model` | No | unset | Optional provider-specific model override. Passed only when set. |
 | `--effort` | No | unset | Optional provider-specific reasoning effort override. `codex` and `claude` honor it; `gemini` logs an advisory and ignores it. |
 | `--keep-worktree` | No | false | Keeps the worktree and scratch directory for inspection instead of cleaning them up. |
