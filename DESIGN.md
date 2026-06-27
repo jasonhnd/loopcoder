@@ -16,10 +16,10 @@ Reusable across projects: any repo onboards by dropping `.delivery.yml` + `ROADM
 We already own ~80% of this:
 - **Runtime/host layer**: a human-launched session, local scheduler, CI cron, or cloud worker can run conductor ticks, notifications, approval prompts, and bounded execution.
 - **loopcoder worker adapter**: the native binary owns per-issue git worktrees, provider-pluggable workers, PR creation, liveness, recovery, and cleanup.
-- **ralphinho-rfc-pipeline + autonomous-loops** (prose specs): the *design* — DAG decomposition, tiered pipelines, "reviewer is not the author" adversarial review, merge-queue-with-eviction.
-- **Harvestable ECC scripts**: `work-items.js` (+ `state-store/`, with `sync-github` pulling issue/PR state via gh), `orchestrate-codex-worker.sh` (codex-as-worktree-worker harness).
+- **Reusable delivery patterns**: DAG decomposition, tiered pipelines, "reviewer is not the author" adversarial review, merge-queue-with-eviction.
+- **GitHub integration primitives**: issue/PR state synced via `gh`, plus codex-as-worktree-worker harness conventions for dispatch, liveness, and cleanup.
 
-Engine = **runtime-agnostic conductor + loopcoder worker adapter + ralphinho design + a thin glue layer we build (section 5).**
+Engine = **runtime-agnostic conductor + loopcoder worker adapter + reusable delivery patterns + a thin glue layer we build (section 5).**
 
 ## 3. Roles
 - **Conductor** — a human-launched or scheduled agent session. Stateless per tick; re-derives state from GitHub each wake. Scans issues, computes the ready set, dispatches workers, triggers reviews, enforces the gate, merges only when allowed, advances the DAG.
@@ -46,10 +46,10 @@ Per conductor tick:
 ## 5. Components to build (the glue)
 ### 5a. Roadmap -> issue-DAG compiler
 - Input: `ROADMAP.md` / `roadmap.yml` — a list of work units. Output: GitHub issues + dependency labels.
-- WorkUnit schema (from ralphinho): `{ id, title, scope, acceptance[], depends_on[], tier, risk, visual? }`.
+- WorkUnit schema: `{ id, title, scope, acceptance[], depends_on[], tier, risk, visual? }`.
 - Emit `gh issue create` per unit (English body: Context/Scope/Acceptance/Constraints/Dependencies), labels `delivery:unit`, `tier:<n>`, `risk:<low|med|high>`, `blocked-by:#N`.
 - Idempotent: re-running updates, never duplicates (match by a hidden `unit-id` marker in the body).
-- We already did this by hand for GEO Phase-1 (#52-#57) — codify that exact logic.
+- Codify the compiler around roadmap parsing, GitHub issue creation, dependency labels, and idempotent updates.
 
 ### 5b. Conductor (host-driven agent session + prompt)
 - Trigger: human command, cron, desktop scheduler, CI event, or cloud scheduler. The trigger starts a conductor-capable agent session with repo access.
@@ -107,7 +107,7 @@ The conductor reads those choices and passes only the relevant worker selection 
 ## 8. State model
 - Source of truth = GitHub (issues, labels, PRs, checks). Conductor is stateless; re-derives each tick -> crash/restart safe.
 - Labels: `delivery:unit`, `status:*`, `tier:*`, `risk:*`, `blocked-by:#N`, `gated`.
-- Optional: harvest `work-items.js` + `state-store` (SQLite) as a durable mirror / metrics; not required for correctness.
+- Optional: maintain a durable mirror or metrics cache of GitHub issue/PR state synced via `gh`; not required for correctness.
 
 ## 9. Human surface
 - You touch: ROADMAP (input) + gated-merge approvals + escalations.
@@ -133,7 +133,7 @@ Same engine, new repo.
 - **v2 (cloud, later):** Conductor as a GitHub Action, cloud event, or service; workers via provider APIs or hosted worker adapters; approvals via GitHub review or a bot. Stateless, team-grade, host-independent. Same `.delivery.yml` + labels; swap the runtime.
 
 ## 13. Build milestones
-- **M1** Compiler: `ROADMAP.md` -> issue DAG (idempotent). [reuses GEO Phase-1 logic]
+- **M1** Compiler: `ROADMAP.md` -> issue DAG (idempotent), using the roadmap-to-issues rules in section 5a.
 - **M2** Happy path: conductor dispatches ONE ready issue -> Codex worker -> PR (no review/gate yet). Proves worktree + provider adapter wiring.
 - **M3** Review + CI gate (reviewer != author, `gh pr checks`).
 - **M4** Merge-gate risk policy + human approval + visual detection.
@@ -148,4 +148,4 @@ Same engine, new repo.
 - Naming / repo home for the tool itself (this design currently lives at D:\AgenticCoder\loopcoder\).
 
 ## 15. Before "done" (rigor audit)
-Per project rule: before finalizing, audit this doc against the current `SKILL.md`, `docs/architecture.md`, `docs/worker.md`, the `loopcoder` CLI help, `.delivery.yml`, and harvested ECC scripts — not self-review only.
+Per project rule: before finalizing, audit this doc against the current `SKILL.md`, `docs/architecture.md`, `docs/worker.md`, the `loopcoder` CLI help, `.delivery.yml`, GitHub issue/PR state-sync behavior, and worker-harness assumptions — not self-review only.

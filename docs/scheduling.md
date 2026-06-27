@@ -218,8 +218,8 @@ changes must come later in separate code issues after this document merges.
 [`worker.md`](worker.md) describes the current worker adapter and its use of
 fresh git worktrees.
 
-[`../DESIGN.md`](../DESIGN.md) is the north-star lineage. It cites
-`autonomous-loops` and the Ralphinho RFC-driven DAG plus
+[`../DESIGN.md`](../DESIGN.md) is the north-star lineage. It describes generic
+DAG decomposition, tiered delivery, reviewer-not-author adversarial review, and
 merge-queue-with-eviction patterns. This document narrows that lineage to the
 minimal small-batch, single-session, no-auto-merge scheduling behavior for
 loopcoder v1.
