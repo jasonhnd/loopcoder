@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -57,6 +59,149 @@ func TestSubcommandHelpWorks(t *testing.T) {
 				t.Fatalf("command help missing --help flag:\n%s", help)
 			}
 		})
+	}
+}
+
+func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"loopreview", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"-Repo", repo,
+		"-PrNumber", "152",
+		"-Provider", "claude",
+		"-BaseBranch", "trunk",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			called = true
+			if opts.RepoPath != repo || opts.PRNumber != 152 || opts.Provider != "claude" || opts.BaseBranch != "trunk" {
+				t.Fatalf("loopreview opts = %#v", opts)
+			}
+			if opts.Stderr == nil {
+				t.Fatal("loopreview opts Stderr is nil")
+			}
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Findings:        []loopreview.Finding{},
+					Evidence:        "review passed",
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Loopreview dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if got["verdict"] != "pass" || got["spec_conformance"] != "pass" {
+		t.Fatalf("stdout JSON has wrong verdict fields: %#v", got)
+	}
+}
+
+func TestLoopreviewSurfacesNeedsHumanExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "codex",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict: loopreview.VerdictNeedsHuman,
+					Findings: []loopreview.Finding{{
+						Severity: "warning",
+						File:     "",
+						Note:     "needs manual review",
+					}},
+					Evidence:        "manual review required",
+					SpecConformance: loopreview.SpecConformanceNotApplicable,
+				},
+				ExitCode: 2,
+			}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"verdict":"needs-human"`) {
+		t.Fatalf("stdout missing needs-human verdict: %s", stdout.String())
+	}
+}
+
+func TestLoopreviewWarnsWhenVerifierMatchesConfiguredWorker(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "codex",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			called = true
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Findings:        []loopreview.Finding{},
+					Evidence:        "review passed",
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Loopreview dependency was not called")
+	}
+	if !strings.Contains(stderr.String(), `adapters.verifier "codex" matches adapters.worker`) {
+		t.Fatalf("stderr missing advisory warning: %q", stderr.String())
 	}
 }
 

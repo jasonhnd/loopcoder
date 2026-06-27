@@ -66,6 +66,7 @@ type Issue struct {
 type PullRequest struct {
 	Number                  int              `json:"number"`
 	Title                   string           `json:"title"`
+	Body                    string           `json:"body"`
 	URL                     string           `json:"url"`
 	HeadRefName             string           `json:"headRefName"`
 	IsDraft                 bool             `json:"isDraft"`
@@ -171,6 +172,38 @@ func (c *CLI) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
 		"--json", "number,title,url,headRefName,isDraft,closingIssuesReferences",
 	}, &prs)
 	return prs, err
+}
+
+func (c *CLI) ViewPR(ctx context.Context, number int) (PullRequest, error) {
+	var pr PullRequest
+	err := c.runJSON(ctx, []string{
+		"pr", "view", fmt.Sprintf("%d", number),
+		"--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences",
+	}, &pr)
+	return pr, err
+}
+
+func (c *CLI) PRDiff(ctx context.Context, number int) (string, error) {
+	output, err := c.run(ctx, "gh", "pr", "diff", fmt.Sprintf("%d", number))
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+func (c *CLI) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) {
+	output, err := c.run(ctx, "gh", "pr", "diff", fmt.Sprintf("%d", number), "--name-only")
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
+	files := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			files = append(files, trimmed)
+		}
+	}
+	return files, nil
 }
 
 func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {

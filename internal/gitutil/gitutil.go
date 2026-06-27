@@ -71,6 +71,12 @@ func (c *Client) FetchOriginBase(ctx context.Context, repoPath, baseBranch strin
 	return err
 }
 
+// FetchPRHead fetches a pull request head into FETCH_HEAD.
+func (c *Client) FetchPRHead(ctx context.Context, repoPath string, prNumber int) error {
+	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", fmt.Sprintf("pull/%d/head", prNumber))
+	return err
+}
+
 // WorktreeAdd creates a branch worktree from origin/<baseBranch>.
 func (c *Client) WorktreeAdd(ctx context.Context, repoPath, branch, worktreePath, baseBranch string) error {
 	_, err := c.run(ctx, repoPath, "worktree", "add", "-b", branch, worktreePath, "origin/"+baseBranch)
@@ -80,6 +86,12 @@ func (c *Client) WorktreeAdd(ctx context.Context, repoPath, branch, worktreePath
 // WorktreeAddDetached creates a detached worktree from origin/<baseBranch>.
 func (c *Client) WorktreeAddDetached(ctx context.Context, repoPath, worktreePath, baseBranch string) error {
 	_, err := c.run(ctx, repoPath, "worktree", "add", "--detach", worktreePath, "origin/"+baseBranch)
+	return err
+}
+
+// WorktreeAddDetachedAt creates a detached worktree at rev.
+func (c *Client) WorktreeAddDetachedAt(ctx context.Context, repoPath, worktreePath, rev string) error {
+	_, err := c.run(ctx, repoPath, "worktree", "add", "--detach", worktreePath, rev)
 	return err
 }
 
@@ -108,6 +120,15 @@ func (c *Client) RevParse(ctx context.Context, repoPath, rev string) (string, er
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// Show returns the contents of a git object path such as origin/main:file.
+func (c *Client) Show(ctx context.Context, repoPath, revPath string) (string, error) {
+	output, err := c.run(ctx, repoPath, "show", revPath)
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
 }
 
 // StatusPorcelain returns git status --porcelain output.

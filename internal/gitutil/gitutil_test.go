@@ -11,6 +11,7 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	runner := &fakeGitRunner{
 		outputs: map[string][]byte{
 			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}": []byte("abc123\n"),
+			"repo\x00show\x00origin/main:docs/specs/design.md":         []byte("# Design\n"),
 			"repo\x00status\x00--porcelain":                            []byte(" M file.go\n"),
 		},
 	}
@@ -26,6 +27,12 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	if err := client.WorktreeAddDetached(ctx, "repo", "verify-wt", "main"); err != nil {
 		t.Fatalf("WorktreeAddDetached returned error: %v", err)
 	}
+	if err := client.FetchPRHead(ctx, "repo", 152); err != nil {
+		t.Fatalf("FetchPRHead returned error: %v", err)
+	}
+	if err := client.WorktreeAddDetachedAt(ctx, "repo", "review-wt", "FETCH_HEAD"); err != nil {
+		t.Fatalf("WorktreeAddDetachedAt returned error: %v", err)
+	}
 	if err := client.FetchOriginBranch(ctx, "verify-wt", "loop/issue-101"); err != nil {
 		t.Fatalf("FetchOriginBranch returned error: %v", err)
 	}
@@ -38,6 +45,13 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	}
 	if commit != "abc123" {
 		t.Fatalf("RevParse = %q, want abc123", commit)
+	}
+	spec, err := client.Show(ctx, "repo", "origin/main:docs/specs/design.md")
+	if err != nil {
+		t.Fatalf("Show returned error: %v", err)
+	}
+	if spec != "# Design\n" {
+		t.Fatalf("Show = %q, want # Design", spec)
 	}
 	status, err := client.StatusPorcelain(ctx, "repo")
 	if err != nil {
@@ -66,9 +80,12 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 		{"repo", "fetch", "origin", "main"},
 		{"repo", "worktree", "add", "-b", "loop/issue-101", "wt", "origin/main"},
 		{"repo", "worktree", "add", "--detach", "verify-wt", "origin/main"},
+		{"repo", "fetch", "-q", "origin", "pull/152/head"},
+		{"repo", "worktree", "add", "--detach", "review-wt", "FETCH_HEAD"},
 		{"verify-wt", "fetch", "-q", "origin", "loop/issue-101"},
 		{"verify-wt", "checkout", "--detach", "FETCH_HEAD"},
 		{"repo", "rev-parse", "--verify", "loop/issue-101^{commit}"},
+		{"repo", "show", "origin/main:docs/specs/design.md"},
 		{"repo", "status", "--porcelain"},
 		{"wt", "add", "-A"},
 		{"wt", "commit", "-m", "title (closes #101)"},
