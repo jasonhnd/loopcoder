@@ -11,6 +11,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -132,6 +133,96 @@ func TestVerifyLocalRequiresExactlyOneTarget(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "exactly one of --pr-number or --branch is required") {
 		t.Fatalf("stderr missing target-choice message: %q", stderr.String())
+	}
+}
+
+func TestStatePushRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"state",
+		"push",
+		"-Repo", repo,
+		"-RunId", "run-test",
+		"-Branch", "loopcoder/state-test",
+		"-Remote", "upstream",
+	}, &stdout, &stderr, Deps{
+		StatePush: func(_ context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
+			if opts.RepoPath != repo || opts.RunID != "run-test" || opts.Branch != "loopcoder/state-test" || opts.Remote != "upstream" {
+				t.Fatalf("state push opts = %#v", opts)
+			}
+			return statebranch.PushResult{
+				RepoPath:  repo,
+				RunID:     opts.RunID,
+				Branch:    opts.Branch,
+				Remote:    opts.Remote,
+				Committed: true,
+				PushError: "offline",
+				Files:     []string{"runs/run-test/state.json"},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{"STATE PUSH", "RunId: run-test", "Branch: loopcoder/state-test", "local state branch commit retained"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestLeaseAcquireRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"lease",
+		"acquire",
+		"-Repo", repo,
+		"-RunId", "run-test",
+		"-Branch", "loopcoder/state-test",
+		"-Remote", "upstream",
+		"-Ttl", "42",
+	}, &stdout, &stderr, Deps{
+		LeaseAcquire: func(_ context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			if opts.RepoPath != repo || opts.RunID != "run-test" || opts.Branch != "loopcoder/state-test" || opts.Remote != "upstream" {
+				t.Fatalf("lease acquire opts = %#v", opts)
+			}
+			if opts.TTL != 42*time.Second {
+				t.Fatalf("TTL = %s, want 42s", opts.TTL)
+			}
+			return statebranch.LeaseResult{
+				RepoPath:    repo,
+				RunID:       opts.RunID,
+				Branch:      opts.Branch,
+				Remote:      opts.Remote,
+				Status:      "observe-only",
+				ObserveOnly: true,
+				Lease: &statebranch.Lease{
+					LeaseID:        "host-123-abc",
+					Host:           "host",
+					PID:            123,
+					LeaseExpiresAt: "2026-06-27T01:10:00Z",
+				},
+				Message: "observe only: another conductor holds a valid lease",
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{"LEASE ACQUIRE", "Status: observe-only", "Observe only: true", "LeaseId: host-123-abc"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 
