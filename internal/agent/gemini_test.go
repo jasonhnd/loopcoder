@@ -61,6 +61,30 @@ func TestBuildGeminiArgs(t *testing.T) {
 				"--output-format", "json",
 			},
 		},
+		{
+			name: "read-only argv",
+			inv: Invocation{
+				Prompt:   "do the work",
+				ReadOnly: true,
+			},
+			want: []string{
+				"--prompt", "do the work",
+				"--approval-mode", "plan",
+				"--output-format", "json",
+			},
+		},
+		{
+			name: "output schema uses json output only",
+			inv: Invocation{
+				Prompt:       "do the work",
+				OutputSchema: `{"type":"object"}`,
+			},
+			want: []string{
+				"--prompt", "do the work",
+				"--yolo",
+				"--output-format", "json",
+			},
+		},
 	}
 
 	for _, tt := range tests {

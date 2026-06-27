@@ -21,11 +21,16 @@ func init() {
 func BuildGeminiArgs(inv Invocation) []string {
 	args := []string{
 		"--prompt", inv.Prompt,
-		"--yolo",
+	}
+	if inv.ReadOnly {
+		args = append(args, "--approval-mode", "plan")
+	} else {
+		args = append(args, "--yolo")
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "-m", inv.Model)
 	}
+	// Gemini has no separate schema flag; JSON output is its structured-output mode.
 	args = append(args, "--output-format", "json")
 	return args
 }

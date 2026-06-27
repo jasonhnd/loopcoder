@@ -21,8 +21,15 @@ func init() {
 func BuildClaudeArgs(inv Invocation) []string {
 	args := []string{
 		"--print",
-		"--dangerously-skip-permissions",
-		"--output-format", "json",
+	}
+	if inv.ReadOnly {
+		args = append(args, "--permission-mode", "plan")
+	} else {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	args = append(args, "--output-format", "json")
+	if strings.TrimSpace(inv.OutputSchema) != "" {
+		args = append(args, "--json-schema", inv.OutputSchema)
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "--model", inv.Model)

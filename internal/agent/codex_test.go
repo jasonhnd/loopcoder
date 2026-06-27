@@ -45,6 +45,39 @@ func TestBuildCodexArgs(t *testing.T) {
 				"-",
 			},
 		},
+		{
+			name: "read-only argv",
+			inv: Invocation{
+				WorktreePath: "wt",
+				LogPath:      "codex.log",
+				ReadOnly:     true,
+			},
+			want: []string{
+				"exec",
+				"--cd", "wt",
+				"-s", "read-only",
+				"--skip-git-repo-check",
+				"-o", "summary.txt",
+				"-",
+			},
+		},
+		{
+			name: "with output schema",
+			inv: Invocation{
+				WorktreePath: "wt",
+				LogPath:      "codex.log",
+				OutputSchema: "schema.json",
+			},
+			want: []string{
+				"exec",
+				"--cd", "wt",
+				"--dangerously-bypass-approvals-and-sandbox",
+				"--skip-git-repo-check",
+				"--output-schema", "schema.json",
+				"-o", "summary.txt",
+				"-",
+			},
+		},
 	}
 
 	for _, tt := range tests {

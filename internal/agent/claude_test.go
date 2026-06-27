@@ -59,6 +59,29 @@ func TestBuildClaudeArgs(t *testing.T) {
 				"--effort", "high",
 			},
 		},
+		{
+			name: "read-only argv",
+			inv: Invocation{
+				ReadOnly: true,
+			},
+			want: []string{
+				"--print",
+				"--permission-mode", "plan",
+				"--output-format", "json",
+			},
+		},
+		{
+			name: "with output schema",
+			inv: Invocation{
+				OutputSchema: `{"type":"object"}`,
+			},
+			want: []string{
+				"--print",
+				"--dangerously-skip-permissions",
+				"--output-format", "json",
+				"--json-schema", `{"type":"object"}`,
+			},
+		},
 	}
 
 	for _, tt := range tests {
