@@ -234,6 +234,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --pr-number int        pull request number to review (required)")
 		fmt.Fprintln(w, "  --provider string      verifier provider (required)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
+		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -1229,6 +1230,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prNumberAlias int
 	var providerAlias string
 	var baseBranchAlias string
+	var timeoutAlias time.Duration
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1238,6 +1240,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&providerAlias, "Provider", "", "provider")
 	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.DurationVar(&opts.Timeout, "timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
+	fs.DurationVar(&timeoutAlias, "Timeout", 0, "verifier timeout")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1254,6 +1258,9 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias
 	}
+	if timeoutAlias != 0 {
+		opts.Timeout = timeoutAlias
+	}
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "loopreview: --repo is required")
@@ -1265,6 +1272,10 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if strings.TrimSpace(opts.Provider) == "" {
 		fmt.Fprintln(stderr, "loopreview: --provider is required")
+		return 2
+	}
+	if opts.Timeout <= 0 {
+		fmt.Fprintln(stderr, "loopreview: --timeout must be positive")
 		return 2
 	}
 

@@ -23,7 +23,7 @@ func BuildClaudeArgs(inv Invocation) []string {
 		"--print",
 	}
 	if inv.ReadOnly {
-		args = append(args, "--permission-mode", "plan")
+		args = append(args, "--allowedTools", "Read Grep Glob")
 	} else {
 		args = append(args, "--dangerously-skip-permissions")
 	}

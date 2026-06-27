@@ -66,7 +66,7 @@ func TestBuildClaudeArgs(t *testing.T) {
 			},
 			want: []string{
 				"--print",
-				"--permission-mode", "plan",
+				"--allowedTools", "Read Grep Glob",
 				"--output-format", "json",
 			},
 		},
