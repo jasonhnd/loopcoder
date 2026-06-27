@@ -10,14 +10,25 @@ GitHub, git worktrees, Codex, and PR review.
 ## Prerequisites
 
 - Claude Code, because loopcoder is a Claude Code skill.
-- `gh`, authenticated for the target GitHub repository.
 - `git`.
+- `gh`, authenticated for the target GitHub repository.
 - `codex` on `PATH`.
+- Go, for installing the native `loopcoder` binary with `go install`.
 - A GitHub repository with a configured remote.
 
 ## Install
 
-loopcoder is installed as a Claude Code skill. Invoke it from Claude Code with:
+Install the native helper binary:
+
+```text
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
+```
+
+Make sure the installed binary is on `PATH`, or set `LOOPCODER_BIN` to its full
+path. The conductor uses the native binary as its mechanical backend.
+
+loopcoder is also installed as a Claude Code skill. Invoke it from Claude Code
+with:
 
 ```text
 /loopcoder <need>
@@ -35,6 +46,23 @@ For a global install, copy or symlink this repository to:
 
 On Windows, a directory junction is also fine. Install automation is on the
 roadmap.
+
+## Backend Selection
+
+The conductor selects one helper backend for a run:
+
+1. `LOOPCODER_BIN` when set.
+2. `loopcoder` found on `PATH`.
+3. On Windows only, the `scripts/*.ps1` helpers when the binary is unavailable.
+4. Otherwise, the native binary is required.
+
+The binary is preferred everywhere. macOS and Linux require the binary and do
+not require `pwsh`. The `.ps1` scripts remain a Windows fallback for one release
+window and will be deprecated in a later doc-first PR.
+
+Never call both backends for one mutating operation. The binary reaches command
+parity with the scripts; real-Codex end-to-end operation is validated by the
+operator.
 
 ## Per-Repo Setup
 
@@ -82,9 +110,11 @@ report:
 3. You approve the plan before anything is published.
 
 4. loopcoder creates the approved GitHub issues and dispatches ready issues to
-   workers. The v1 worker adapter is `scripts/dispatch-worker.ps1`, which
-   creates a fresh git worktree, runs headless `codex exec`, commits the
-   resulting changes, pushes the branch, opens a PR, and cleans up.
+   workers through the selected backend. The primary backend is `loopcoder
+   dispatch` / `loopcoder dispatch-wave`; on Windows, the temporary fallback is
+   `scripts/dispatch-worker.ps1`. The backend creates a fresh git worktree,
+   runs headless `codex exec`, commits the resulting changes, pushes the branch,
+   opens a PR, and cleans up.
 
 5. loopcoder reviews each PR in the Opus chat session, checks the diff and
    `gh pr checks`, and reports progress, failures, risks, and final status in
@@ -130,6 +160,51 @@ workflow is described in [`PROCESS.md`](PROCESS.md):
 3. Verify the implementation against the merged document and working behavior.
 
 Documentation and code are intentionally not bundled in the same issue or PR.
+
+## Binary Commands
+
+Use the native `loopcoder` commands as the primary helper interface:
+
+```text
+loopcoder ready-set --repo . --base-branch main --format text
+
+loopcoder dispatch \
+  --repo . \
+  --issue-number <number> \
+  --issue-title "<title>" \
+  --issue-body "<body>" \
+  --base-branch main \
+  --provider codex
+
+loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2>
+
+loopcoder resume --repo . --run-id <run-id>
+
+loopcoder recover \
+  --repo . \
+  --issue-number <number> \
+  --issue-title "<title>" \
+  --issue-body "<body>" \
+  --run-id <run-id>
+
+loopcoder verify-local --repo . --pr-number <pr>
+
+loopcoder state push --repo .
+loopcoder state pull --repo .
+loopcoder lease acquire --repo .
+loopcoder lease release --repo .
+```
+
+On Windows, if the binary is unavailable, the conductor may use the matching
+PowerShell helpers as a fallback for this release window:
+
+```powershell
+pwsh scripts/ready-set.ps1 -Repo . -BaseBranch main -Format text
+pwsh scripts/dispatch-worker.ps1 -Repo . -IssueNumber <number> -IssueTitle "<title>" -IssueBody "<body>" -BaseBranch main -Provider codex
+pwsh scripts/resume.ps1 -Repo . -RunId <run-id>
+pwsh scripts/recover-and-retry.ps1 -Repo . -IssueNumber <number> -IssueTitle "<title>" -IssueBody "<body>" -RunId <run-id>
+pwsh scripts/verify-local.ps1 -Repo . -PrNumber <pr>
+```
 
 ## Limits
 
