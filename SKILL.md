@@ -5,7 +5,10 @@ description: "Use this skill when the user invokes /loopcoder with a delivery ne
 
 # loopcoder Conductor Playbook
 
-Use this as the Opus session's conductor procedure. The full design lives in
+Use this as the canonical conductor session procedure. Claude Code loads this
+file as the skill entrypoint; Codex CLI and Gemini CLI should use
+[`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md), which point back here
+instead of forking the procedure. The full design lives in
 [`docs/specs/2026-06-26-loopcoder-v1-design.md`](docs/specs/2026-06-26-loopcoder-v1-design.md);
 keep this playbook practical and procedural instead of duplicating the spec.
 
@@ -24,11 +27,11 @@ this loop.
 ## Operating Contract
 
 - Invocation is `/loopcoder <need>`, or automatic activation when the user states a delivery/build request.
-- The Opus chat session is the conductor/runtime. Keep it open while the loop runs; workers may run in the background.
+- The conductor session is the runtime. It must be a sufficiently capable agent session, and it must stay open while the loop runs; workers may run in the background.
 - Read `.delivery.yml` as the per-repo config when present; see spec section 6. It declares adapters and defaults such as worker provider, base branch, checks, gate, and report channel. If it is absent, use the v1 defaults from the spec.
 - Do not implement work items in the conductor. Dispatch implementation through
   the `loopcoder` binary (`loopcoder dispatch`); the binary owns worktree ->
-  codex -> commit -> push -> PR.
+  worker agent -> commit -> push -> PR.
 - Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
 
@@ -46,7 +49,7 @@ Resolve the binary before calling it:
 3. Else report that the `loopcoder` binary is required on all platforms.
 
 Use the resolved binary for every mechanical operation. Never recreate
-worktree, Codex, commit, push, PR, liveness, recovery, resume, local
+worktree, worker-agent invocation, commit, push, PR, liveness, recovery, resume, local
 verification, state, or lease mechanics in the conductor.
 
 Keep model and effort omitted unless the user explicitly requested them. When a
@@ -141,8 +144,8 @@ Bounds and scrutiny:
 
 ## Model and speed (never chosen for the user)
 
-- DEFAULT: pass no model or effort flags; inherit the user's codex config (`~/.codex/config.toml`). Never auto-pick a model or effort per issue.
-- TRANSPARENCY: in the plan, show the worker line as `worker: codex (your global codex setting)` so the user sees what will run without being asked.
+- DEFAULT: pass no model or effort flags; inherit the selected worker provider's own local/global config. Never auto-pick a model or effort per issue.
+- TRANSPARENCY: in the plan, show the worker line from `.delivery.yml` `adapters.worker`, for example `worker: <adapters.worker> (configured worker provider; default codex if absent)`, so the user sees what will run without being asked.
 - RECOMMENDATION ONLY: you may add one short passive hint, such as `tip: say use high for faster runs`. It is never auto-applied, and if the user says to stop suggesting, stop including the hint.
 - OVERRIDE ONLY ON EXPLICIT REQUEST: for a one-off request such as `run these
   faster` or `#B use max`, pass `--effort` and/or `--model` to `loopcoder
@@ -190,7 +193,7 @@ Bounds and scrutiny:
    - Keep the two ordering axes from [`docs/scheduling.md`](docs/scheduling.md) separate: a real code dependency forces serial order, so B waits until A is merged and then branches from `main`; file overlap does not block dispatch.
    - Dispatch one ready wave with `loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> ...`, or dispatch one issue with `loopcoder dispatch ...`. Then recompute as PRs merge. Repeat until the DAG is drained or blocked.
    - `loopcoder dispatch` and `loopcoder dispatch-wave` preserve git worktree creation serialization, so independent ready issues can be dispatched concurrently safely.
-   - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, Codex, commit, push, or PR logic in the conductor.
+   - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
    - Capture each worker's output, job handle, PR URL, and failure details.
 
    Example shape:
@@ -204,17 +207,24 @@ Bounds and scrutiny:
      --issue-title "<title>" \
      --issue-body "<body>" \
      --base-branch <base-branch> \
-     --provider codex
+     --provider <worker-provider>
 
    loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> --issue-numbers <n1>,<n2>
    ```
 
 5. Verify each resulting PR.
-   - For each worker-created PR, review as the Verifier. The worker model and verifier model differ on purpose.
-   - Follow the "Verification gate" subsection below, which is the v0.1.2 conductor encoding of [`docs/verification.md`](docs/verification.md).
-   - Run `gh pr diff <pr>` and `gh pr diff <pr> --name-only`; inspect whether the diff satisfies the issue, conforms to the referenced merged design doc, and avoids unrelated changes.
-   - Run `gh pr checks <pr>` and verify every check named in `.delivery.yml` `ci.checks` is present and green.
-   - End every PR review with exactly one explicit verdict in chat: `pass`, `fail`, or `needs-human`, with evidence for check status, spec criteria, and changed files.
+   - For each worker-created PR, delegate the primary adversarial review to the independent Verifier command. The verifier provider SHOULD differ from the configured worker provider (`adapters.worker`); if they match, report the reviewer-not-worker advisory warning and continue because the human merge gate remains the backstop.
+   - Resolve the verifier provider from `.delivery.yml` `adapters.verifier` when present, otherwise use the v1 default from the spec, and run:
+
+     ```text
+     loopcoder loopreview --repo . --pr-number <pr> --provider <verifier-provider>
+     ```
+
+     Add `--base-branch <base-branch>` when the run is not targeting the default base branch.
+   - Read the structured `loopreview` verdict (`pass`, `fail`, or `needs-human`) plus its findings, evidence, and spec-conformance field. A malformed verdict, unreadable referenced design doc, or verifier infrastructure / permission failure is `needs-human`, never a silent pass.
+   - Follow the "Verification gate" subsection below, which folds the independent Verifier verdict together with hosted checks from `gh pr checks <pr>` and deterministic local gates from `loopcoder verify-local --repo . --pr-number <pr>`.
+   - Use `gh pr diff <pr> --name-only` and, when needed, `gh pr diff <pr>` as supporting evidence for changed files and unrelated-change checks; the primary adversarial findings come from `loopreview`.
+   - End every PR review with exactly one explicit conductor verdict in chat: `pass`, `fail`, or `needs-human`, with evidence for the `loopreview` verdict, required check status, local gate status, spec criteria, and changed files.
 
 6. Merge ordering.
    - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/scheduling.md`](docs/scheduling.md).
@@ -238,15 +248,23 @@ Bounds and scrutiny:
 
 ## Verification gate
 
-Follow [`docs/verification.md`](docs/verification.md) for the gate model, but in
-v0.1.2 keep verification inside the conductor playbook.
+Follow [`docs/verification.md`](docs/verification.md) for the gate model, with
+the primary adversarial review delegated to `loopcoder loopreview`.
 
+- Independent Verifier: run
+  `loopcoder loopreview --repo <repo> --pr-number <pr> --provider <verifier-provider>`
+  for each worker-created PR, adding `--base-branch <base-branch>` when needed.
+  The verifier provider SHOULD differ from `adapters.worker`; if it does not,
+  report the reviewer-not-worker advisory warning and continue. Read the
+  structured verdict (`pass` / `fail` / `needs-human`), findings, evidence, and
+  spec-conformance field. A parse failure, unreadable referenced spec, or
+  verifier infrastructure / permission failure is `needs-human`.
 - Required checks: every check named in `.delivery.yml` `ci.checks` must be
   present and green in `gh pr checks <pr>` before a PR is called
   merge-eligible. A missing, failed, cancelled, timed-out, skipped, or
   still-pending required check means the PR is not merge-eligible.
-- Local command gates: for a code PR, in addition to hosted checks and spec
-  conformance, the verifier may run
+- Local command gates: for a code PR, in addition to hosted checks and the
+  independent Verifier verdict, the conductor may run
   `loopcoder verify-local --repo <repo> --pr-number <pr>` to execute the
   configured local command gates from `.delivery.yml` `ci.tests`,
   `ci.typecheck`, and `ci.build`, as described in
@@ -262,9 +280,15 @@ v0.1.2 keep verification inside the conductor playbook.
 - Empty automated gate: if `ci.checks` is empty for a code PR, report
   `needs-human` for the automated-gate portion instead of treating the gate as
   passed, while still completing the diff and spec-conformance review.
-- Verdicts: every PR review reports exactly one of `pass`, `fail`, or
-  `needs-human` in chat, with evidence for check status, spec criteria, and
-  changed files.
+- Merge eligibility: fold the `loopreview` verdict, required hosted checks, and
+  `verify-local` result into one conductor verdict. `pass` requires all
+  configured required checks green, local command gates passing or
+  `not-configured`, and `loopreview` returning `pass`. Any failing signal makes
+  the conductor verdict `fail`; any ambiguous, unavailable, malformed, or
+  permission-blocked signal makes it `needs-human`.
+- Verdicts: every PR review reports exactly one conductor verdict of `pass`,
+  `fail`, or `needs-human` in chat, with evidence for `loopreview`, check
+  status, local gate status, spec criteria, and changed files.
 - Routing: `pass` means merge-eligible and waits for the user to name it for
   merge. `fail` means a red check, missing criterion, spec violation, or
   unrelated change; re-dispatch a bounded fix pass with the failure evidence
