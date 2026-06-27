@@ -145,7 +145,7 @@ Same engine, new repo.
 - Worker provider adapters: Codex CLI vs future provider CLIs/APIs; confirm each adapter can edit in an isolated worktree and that the `loopcoder` binary can open PRs with available network + `gh` credentials.
 - Idempotent compiler matching (the unit-id marker) — design the marker.
 - Cost: many workers in parallel; bound via maxRuns + tier-based concurrency cap.
-- Naming / repo home for the tool itself (this design currently lives at D:\AgenticCoder\loopcoder\).
+- Naming / repo home for the tool itself; define the canonical repo-home reference generically rather than relying on a local checkout path.
 
 ## 15. Before "done" (rigor audit)
 Per project rule: before finalizing, audit this doc against the current `SKILL.md`, `docs/architecture.md`, `docs/worker.md`, the `loopcoder` CLI help, `.delivery.yml`, GitHub issue/PR state-sync behavior, and worker-harness assumptions — not self-review only.

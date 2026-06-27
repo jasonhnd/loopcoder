@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-27
+
+### Added
+
+- Provider-neutral agent abstraction and registry for dispatch and verification, with actionable errors for unknown providers.
+- `claude` and `gemini` worker adapters alongside the default `codex` adapter.
+- Independent `loopcoder loopreview` verifier command that checks a PR branch in read-only mode and emits a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status.
+- `.delivery.yml adapters` role slots for `conductor`, `worker`, and `verifier`, plus a reviewer-not-worker advisory warning when the verifier is configured to match the worker.
+
+### Changed
+
+- Worker output and repo-facing artifacts are documented as English.
+- Worker `--provider`, `--model`, and `--effort` behavior is provider-specific: `codex` remains the default, `claude` can honor effort, and `gemini` ignores effort with an advisory.
+- Documentation now describes loopcoder in runtime- and ecosystem-agnostic terms, removing paseo and internal-ecosystem framing from the user-facing surface.
+
 ## [0.2.0] - 2026-06-27
 
 ### Added

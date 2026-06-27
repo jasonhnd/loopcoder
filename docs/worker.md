@@ -1,18 +1,19 @@
 # Worker Adapter
 
 This document describes the worker adapter as built in `loopcoder dispatch`,
-the native `loopcoder` binary subcommand. It covers the v1 `codex` adapter
-only.
+the native `loopcoder` binary subcommand. As of 0.3.0 the adapter is
+provider-pluggable and uses the shared provider registry.
 
 ## Purpose
 
 The worker adapter turns one approved GitHub issue into a pull request. The
 subcommand owns the mechanical delivery steps: repository resolution, worktree
-creation, Codex invocation, change detection, commit, push, PR creation,
+creation, provider invocation, change detection, commit, push, PR creation,
 attempt state, recovery briefs, and cleanup.
 
-`codex` only edits files in the fresh worktree. It does not commit, push, or
-open the PR.
+The selected provider only edits files in the fresh worktree. It does not
+commit, push, or open the PR; loopcoder owns those VCS steps. The worker prompt
+requires the provider's final summary to be in English.
 
 ## Supported worker providers
 
@@ -45,8 +46,8 @@ For one issue, `loopcoder dispatch` runs these steps in order:
    `origin/<base-branch>`.
 3. Write a self-contained prompt file containing the issue number, title, body,
    branch, current working directory, and rules.
-4. Run headless `codex exec` in the worktree with stdin redirected from the
-   prompt file.
+4. Run the selected provider through the registry in the worktree, capturing its
+   log and summary with provider-specific adapter behavior.
 5. Verify that file changes exist with `git status --porcelain`.
 6. Commit all changes with the issue title and `closes #<IssueNumber>` in the
    commit message.
@@ -55,13 +56,17 @@ For one issue, `loopcoder dispatch` runs these steps in order:
 9. Remove the worktree, delete the local branch, and remove the scratch
    directory unless `--keep-worktree` is set.
 
-If Codex exits non-zero, makes no file changes, commit fails, push fails, or PR
-creation fails, the subcommand returns a failed result instead of producing a
-successful result.
+If the provider exits non-zero, makes no file changes, commit fails, push fails,
+or PR creation fails, the subcommand returns a failed result instead of
+producing a successful result.
 
-## Codex Invocation
+## Provider Invocation
 
-The adapter runs:
+All providers share the same contract: edit files only, do not commit or push,
+and return a final summary for the harness to include in the PR body and JSON
+result.
+
+The `codex` adapter runs:
 
 ```text
 codex exec --cd <worktree> --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check ... -o <summaryFile> -
@@ -74,13 +79,21 @@ codex exec ... - < promptfile
 ```
 
 This is required because headless `codex exec` hangs forever waiting on stdin if
-it is not given a closed stdin stream. The adapter writes the prompt to
-`prompt.txt`, then runs the command through `cmd /c` with stdin redirected from
-that file and stdout/stderr redirected to `codex.log`.
+it is not given a closed stdin stream. The adapter writes the prompt to a
+`prompt.txt` file, opens it as stdin, and writes stdout/stderr to `codex.log`.
 
 The adapter passes `--dangerously-bypass-approvals-and-sandbox` so Codex can run
 unattended without approval prompts. The fresh worktree is the intended blast
 radius. The current invocation also passes `--skip-git-repo-check`.
+
+The `claude` adapter runs `claude --print --dangerously-skip-permissions
+--output-format json ...` with the prompt on stdin, and parses the JSON `result`
+field as the summary.
+
+The `gemini` adapter runs `gemini --prompt <prompt> --yolo --output-format json
+...` and parses the JSON response fields, falling back to raw stdout when
+needed. Gemini has no reasoning-effort flag, so a supplied `--effort` is logged
+as an advisory and otherwise ignored.
 
 ## Why VCS Stays In The Adapter
 
@@ -105,26 +118,30 @@ deterministic and in the conductor's hands:
 | `--run-id` | No | generated | Run id used for attempt state and recovery context. |
 | `--attempt` | No | `1` | Attempt number recorded in state and recovery output. |
 | `--recovery-context` | No | unset | Prior recovery context to append to the worker prompt. |
-| `--provider` | No | `codex` | Worker provider. v1 validates this to `codex` only. |
-| `--model` | No | unset | Optional Codex model override. Passed as `-m <model>` only when set. |
-| `--effort` | No | unset | Optional Codex reasoning effort override. Passed as `-c model_reasoning_effort=<effort>` only when set. |
+| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, or `gemini`. |
+| `--model` | No | unset | Optional provider-specific model override. Passed only when set. |
+| `--effort` | No | unset | Optional provider-specific reasoning effort override. `codex` and `claude` honor it; `gemini` logs an advisory and ignores it. |
 | `--keep-worktree` | No | false | Keeps the worktree and scratch directory for inspection instead of cleaning them up. |
 
-## Model And Speed
+## Model And Effort
 
 `--model` and `--effort` are optional knobs. The adapter passes them to
-`codex exec` only when the caller provides non-empty values:
+the selected provider only when the caller provides non-empty values and the
+provider supports the relevant flag:
 
-- `--model` becomes `-m <model>`.
-- `--effort` becomes `-c model_reasoning_effort=<effort>`.
+- `codex`: `--model` becomes `-m <model>` and `--effort` becomes
+  `-c model_reasoning_effort=<effort>`.
+- `claude`: `--model` becomes `--model <model>` and `--effort` becomes
+  `--effort <effort>`.
+- `gemini`: `--model` becomes `-m <model>` and `--effort` is ignored with a
+  one-time advisory because the Gemini CLI has no separate effort knob.
 
 When both are absent, loopcoder passes no model or reasoning-effort flags and
-Codex inherits the user's global Codex configuration from
-`~/.codex/config.toml`.
+the selected provider inherits its own configured defaults.
 
 loopcoder never chooses a model or reasoning effort on its own. The conductor
-playbook in [`../SKILL.md`](../SKILL.md) says to inherit the user's global Codex
-setting by default, and
+playbook in [`../SKILL.md`](../SKILL.md) says to inherit the selected provider's
+own setting by default, and
 [`BACKLOG.md` B1](BACKLOG.md#b1--worker-model--speed-selection) records the same
 principle: configuration and command-line overrides should reflect only what the
 user has explicitly requested.
@@ -134,7 +151,7 @@ user has explicitly requested.
 On success, `loopcoder dispatch` prints a compact JSON object:
 
 ```json
-{"ok":true,"issue":24,"branch":"loop/issue-24","pr":"https://github.com/owner/repo/pull/123","summary":"Codex summary text"}
+{"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234}
 ```
 
 The fields are:
@@ -143,5 +160,10 @@ The fields are:
 - `issue`: the issue number.
 - `branch`: the branch pushed for the PR.
 - `pr`: the PR URL returned by `gh pr create`.
-- `summary`: Codex's summary from the `-o <summaryFile>` output, or a fallback
-  message if no summary file exists.
+- `run_id`: the run id used for durable attempt state.
+- `summary`: the selected provider's summary, or a fallback message if no
+  summary exists.
+- `attempt_path`: path to the durable attempt sidecar.
+- `status`: attempt status.
+- `exit_code`: provider exit code.
+- `log_bytes`: size of the provider log.

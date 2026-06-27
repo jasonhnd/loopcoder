@@ -4,7 +4,7 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.2.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.3.0-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/go-migration.md)
@@ -15,23 +15,23 @@
 
 ## What it is
 
-loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches Codex workers in isolated git worktrees, opens pull requests, has Opus review them, and leaves the merge to you.
+loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches provider-pluggable workers in isolated git worktrees, opens pull requests, runs an independent read-only verifier, and leaves the merge to you.
 
-It kills the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. You stay the merge authority.
+It kills the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. You stay the merge authority. Repo-facing artifacts and worker summaries are written in English.
 
 ## The loop
 
 ```mermaid
 flowchart LR
   need([your need]) --> plan[plan issues + DAG]
-  plan --> dispatch[dispatch workers<br/>git worktree -> codex]
+  plan --> dispatch[dispatch workers<br/>codex / claude / gemini]
   dispatch --> pr[pull requests]
-  pr --> review[Opus review<br/>+ required checks]
+  pr --> review[loopreview verifier<br/>read-only verdict + required checks]
   review --> gate{{you merge}}
   gate -. next layer .-> plan
 ```
 
-The conductor is Opus in Claude Code; the worker is Codex; the gate is you.
+The conductor is a configured agent session. The worker defaults to `codex` and can also be `claude` or `gemini`; the verifier is configured separately and should normally differ from the worker. The gate is always you.
 
 ## What it looks like
 
@@ -51,40 +51,43 @@ loop  > done. 2 PRs, you merged both, 0 blocked.
 go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
 ```
 
-Prerequisites on `PATH`: `git`, `gh` (authenticated), and `codex`.
+Prerequisites on `PATH`: `git`, `gh` (authenticated), and at least one supported provider CLI. `codex` is the default worker; `claude` and `gemini` are also supported worker providers and can be used as verifiers.
 
 Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
 ## Usage
 
-- In Claude Code: `/loopcoder <your need>` -- the Opus conductor plans, dispatches, reviews, and reports; you name what to merge.
+- In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; you name what to merge.
 - The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
 
 ```bash
 loopcoder ready-set     --repo .                  # classify ready vs blocked work
 loopcoder dispatch-wave --repo .                  # dispatch the current ready wave
+loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude
 loopcoder resume        --repo .                  # reconcile a run after an interruption
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>   # bounded retry of a failed attempt
+loopcoder loopreview    --repo . --pr-number 43 --provider claude   # read-only independent verifier
 loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check commands on a PR
 ```
 
 ## How it works
 
-- Conductor: Opus, in Claude Code. It plans issues, reviews PRs, and reports status. It never writes the code itself.
-- Worker: `loopcoder dispatch` runs Codex for one issue in a fresh, isolated git worktree, then opens a PR.
+- Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into status, and reports progress. It never writes the code itself.
+- Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh, isolated git worktree, then opens a PR. The provider registry currently supports `codex` (default), `claude`, and `gemini`.
+- Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status.
 - Gate: you merge. loopcoder never auto-merges.
-- Ports and adapters: GitHub work items, git-worktree workspace, Codex worker (provider-pluggable), GitHub PRs and checks, Opus verifier, human-merge gate. Configure them per repo in `.delivery.yml`.
+- Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, human-merge gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, and `verifier`; `verifier == worker` is advisory-only but should be avoided for author-bias reduction.
 - Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
-- Cross-platform: one Go binary; Codex runs through a real file-handle stdin instead of shell redirection, and worktree creation is serialized with a cross-platform file lock.
+- Cross-platform: one Go binary; providers run through native adapters, and worktree creation is serialized with a cross-platform file lock.
 
 ## Why loopcoder
 
 - You always merge -- explicit human gate, never auto-merge.
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
-- A real verification gate -- required CI checks must be green before a PR is merge-eligible; every review ends in `pass`, `fail`, or `needs-human`.
-- Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and `codex`.
-- Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go.
+- A real verification gate -- required CI checks must be green before a PR is merge-eligible; independent verifier output ends in `pass`, `fail`, or `needs-human`.
+- Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
+- Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go and its v0.3.0 multi-provider worker layer.
 
 ## Design
 
@@ -102,7 +105,7 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 
 ## Status
 
-v0.2.0 is the current cross-platform native Go CLI: Opus conductor, Codex worker, human-merge gate, doc-first workflow, and real self-hosting. Some pieces remain documented targets rather than current behavior, including a background or cloud conductor tick and broader provider adapters.
+v0.3.0 is the current cross-platform native Go CLI: provider-pluggable workers, independent `loopreview`, `.delivery.yml` role slots, human-merge gate, doc-first workflow, and real self-hosting. A background or cloud conductor tick remains a documented target rather than current behavior.
 
 ## License
 
