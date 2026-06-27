@@ -27,6 +27,7 @@ func TestBuildPromptWithAndWithoutRecoveryContext(t *testing.T) {
 		"# Title\nImplement dispatch",
 		"# Details\nDetails here",
 		"do NOT run git commit or git push",
+		"final summary in English",
 	} {
 		if !strings.Contains(base, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, base)
