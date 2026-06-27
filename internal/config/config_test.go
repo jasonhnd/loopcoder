@@ -43,6 +43,7 @@ version: 1
 adapters:
   work_items: github
   workspace: git-worktree
+  conductor: opus
   worker: codex
   vcs: github
   verifier: opus
@@ -86,10 +87,13 @@ report:
 	if cfg.Adapters.WorkItems != "github" || cfg.Adapters.Workspace != "git-worktree" {
 		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
 	}
-	if cfg.Adapters.Worker != "codex" || cfg.Adapters.VCS != "github" {
+	if cfg.Adapters.Conductor != "opus" || cfg.Adapters.Worker != "codex" {
 		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
 	}
-	if cfg.Adapters.Verifier != "opus" || cfg.Adapters.Gate != "human-merge" {
+	if cfg.Adapters.VCS != "github" || cfg.Adapters.Verifier != "opus" {
+		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
+	}
+	if cfg.Adapters.Gate != "human-merge" {
 		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
 	}
 	if cfg.Worker.BaseBranch != "trunk" || cfg.Worker.Model != "gpt-test" {
@@ -139,5 +143,44 @@ report:
 	}
 	if cfg.Report.Channel != "chat" {
 		t.Fatalf("Report.Channel = %q, want chat", cfg.Report.Channel)
+	}
+}
+
+func TestReviewerNotWorkerWarning(t *testing.T) {
+	tests := []struct {
+		name     string
+		adapters Adapters
+		want     string
+	}{
+		{
+			name: "same provider warns",
+			adapters: Adapters{
+				Worker:   "codex",
+				Verifier: "codex",
+			},
+			want: `adapters.verifier "codex" matches adapters.worker; reviewer and worker SHOULD differ, but this is advisory only`,
+		},
+		{
+			name: "different providers empty",
+			adapters: Adapters{
+				Worker:   "codex",
+				Verifier: "opus",
+			},
+			want: "",
+		},
+		{
+			name:     "unset providers empty",
+			adapters: Adapters{},
+			want:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ReviewerNotWorkerWarning(tt.adapters)
+			if got != tt.want {
+				t.Fatalf("ReviewerNotWorkerWarning() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

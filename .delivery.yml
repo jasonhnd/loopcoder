@@ -2,9 +2,10 @@ version: 1
 adapters:
   work_items: github      # Work items are GitHub issues.
   workspace: git-worktree # Work happens in git worktrees.
+  conductor: opus         # Transparency only: the human session that conducts.
   worker: codex           # Codex implements each issue.
   vcs: github             # GitHub hosts PRs and checks.
-  verifier: opus          # Opus reviews worker output.
+  verifier: opus          # SHOULD differ from worker; conductor self-reviews until loopreview lands.
   gate: human-merge       # Humans choose what merges.
 worker:
   # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.

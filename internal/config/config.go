@@ -21,10 +21,20 @@ type Config struct {
 type Adapters struct {
 	WorkItems string `yaml:"work_items"`
 	Workspace string `yaml:"workspace"`
+	Conductor string `yaml:"conductor"`
 	Worker    string `yaml:"worker"`
 	VCS       string `yaml:"vcs"`
 	Verifier  string `yaml:"verifier"`
 	Gate      string `yaml:"gate"`
+}
+
+// ReviewerNotWorkerWarning returns an advisory warning when reviewer and worker
+// roles are configured to the same provider.
+func ReviewerNotWorkerWarning(adapters Adapters) string {
+	if adapters.Worker == "" || adapters.Verifier == "" || adapters.Worker != adapters.Verifier {
+		return ""
+	}
+	return fmt.Sprintf("adapters.verifier %q matches adapters.worker; reviewer and worker SHOULD differ, but this is advisory only", adapters.Verifier)
 }
 
 type Worker struct {
