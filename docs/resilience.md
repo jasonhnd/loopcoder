@@ -528,7 +528,7 @@ release lease
 ```
 
 That tick can run inside the current Opus chat, a local scheduled process, a
-paseo schedule, a GitHub Action, or a later cloud service. The model session no
+scheduled agent session, a GitHub Action, or a later cloud service. The model session no
 longer needs to carry the full run in memory. Each tick can be fresh context,
 like Ralph, and still make correct progress because it reads the same GitHub and
 git-backed state.
