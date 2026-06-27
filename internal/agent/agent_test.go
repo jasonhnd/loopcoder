@@ -18,11 +18,11 @@ func TestLookup(t *testing.T) {
 		},
 		{
 			name:     "unknown lists supported providers",
-			provider: "claude",
+			provider: "gemini",
 			wantErr:  true,
 			errContains: []string{
-				`unknown provider "claude"`,
-				"supported providers: codex",
+				`unknown provider "gemini"`,
+				"supported providers: claude, codex",
 			},
 		},
 	}
