@@ -1,17 +1,18 @@
 # loopcoder Orchestration Design
 
-Status: DESIGN. This is a target design and is not yet built.
+Status: LIVE. This is the foreground orchestration surface in the native
+`loopcoder` binary.
 
 This document defines the executable orchestration layer for loopcoder's
 foreground conductor: ready-set computation plus dispatch of one ready wave. It
-is written doc-first per [`PROCESS.md`](PROCESS.md). The scripts described here
-must be implemented in later code issues after this document merges.
+is written doc-first per [`PROCESS.md`](PROCESS.md). The subcommands described
+here are implemented by the `loopcoder` binary.
 
 The design intentionally preserves the v1 boundaries from
 [`architecture.md`](architecture.md), [`scheduling.md`](scheduling.md),
 [`resilience.md`](resilience.md), and [`verification.md`](verification.md): the
 human remains the merge authority, file overlap is observed at merge time, and
-workers still run through [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
+workers still run through `loopcoder dispatch`.
 
 ## Problem
 
@@ -21,10 +22,8 @@ Today the conductor manually performs two steps that are already specified in
 1. Compute the ready set: which open issues can start because their real
    dependencies have landed, no open PR already represents the issue, and no
    live local attempt is still running.
-2. Dispatch each ready issue by calling
-   [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1), usually
-   one command at a time, then reconcile the run with
-   [`../scripts/resume.ps1`](../scripts/resume.ps1).
+2. Dispatch each ready issue by calling `loopcoder dispatch`, usually one
+   command at a time, then reconcile the run with `loopcoder resume`.
 
 That is workable for small batches, but it leaves the most mechanical conductor
 work in chat memory and manual copy/paste. The model exists, but it is a human
@@ -32,9 +31,9 @@ playbook rather than an executable foreground loop.
 
 The orchestration layer makes those two steps executable:
 
-- `scripts/ready-set.ps1` computes readiness from GitHub plus local run state.
-- A one-wave dispatch helper dispatches the current ready set under one shared
-  `-RunId`.
+- `loopcoder ready-set` computes readiness from GitHub plus local run state.
+- `loopcoder dispatch-wave` dispatches the current ready set under one shared
+  `--run-id`.
 
 It does not remove the human merge gate. It does not decide merge order before
 real PR diffs exist. It only automates the conductor's current ready-set and
@@ -42,15 +41,12 @@ dispatch mechanics.
 
 ## Goals
 
-- Add a read-only `scripts/ready-set.ps1` target that computes the ready set
+- Add a read-only `loopcoder ready-set` target that computes the ready set
   from GitHub issues, GitHub PRs, and local `.loopcoder/runs/<RunId>` state.
-- Add a one-wave dispatch helper target that dispatches the current ready set
-  under a shared `-RunId`.
-- Compose cleanly with [`../scripts/resume.ps1`](../scripts/resume.ps1) for
-  reconciliation, [`../scripts/recover-and-retry.ps1`](../scripts/recover-and-retry.ps1)
-  for recovery, and
-  [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1) for the
-  worker adapter.
+- Add a `loopcoder dispatch-wave` target that dispatches the current ready set
+  under a shared `--run-id`.
+- Compose cleanly with `loopcoder resume` for reconciliation, `loopcoder
+  recover` for recovery, and `loopcoder dispatch` for the worker adapter.
 - Preserve human-merge: no helper created by this layer may call `gh pr merge`
   or mark a PR merged.
 - Preserve observe-at-merge: file overlap and merge ordering are handled only
@@ -69,11 +65,10 @@ dispatch mechanics.
   [`../SKILL.md`](../SKILL.md). If the user did not explicitly request a model
   or effort override, the helper omits those flags.
 - No change to the worktree mutex. Worktree creation remains serialized inside
-  [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
-- No replacement for [`../scripts/resume.ps1`](../scripts/resume.ps1) or
-  [`../scripts/recover-and-retry.ps1`](../scripts/recover-and-retry.ps1). The
-  new scripts call into the same state model instead of creating a competing
-  one.
+  `loopcoder dispatch`.
+- No replacement for the `loopcoder resume` or `loopcoder recover` state
+  model. The orchestration commands call into the same state model instead of
+  creating a competing one.
 - No new status-label workflow requirement. The layer can read labels such as
   `blocked-by:#N`, but it does not require new mutation labels to be correct.
 
@@ -123,9 +118,9 @@ a PR or live attempt appeared after the ready-set snapshot was generated.
 
 ## Ready-Set Model (Executable)
 
-`scripts/ready-set.ps1` is the executable version of "compute the ready set" in
+`loopcoder ready-set` is the executable version of "compute the ready set" in
 [`scheduling.md`](scheduling.md), with the reconciliation vocabulary from
-[`../scripts/resume.ps1`](../scripts/resume.ps1).
+`loopcoder resume`.
 
 ### Inputs
 
@@ -137,7 +132,7 @@ The ready-set computation reads:
 - Open GitHub PRs, including PR numbers, URLs, titles, head branches, draft
   state, closing issue references, and check summaries when available.
 - Local attempt state under `.loopcoder/runs/<RunId>/workers/*.attempt.json`
-  when a `-RunId` is supplied or a latest run is selected.
+  when a `--run-id` is supplied or a latest run is selected.
 - The target base branch, defaulting to `main`.
 
 The first implementation can use GitHub CLI calls like:
@@ -172,7 +167,7 @@ is unknown. Unknown dependency state must fail closed.
 ### Open PR Detection
 
 An issue has an open PR when any open PR can be attributed to it by one of the
-same signals used by `resume.ps1`:
+same signals used by `loopcoder resume`:
 
 - the PR's closing issue references include the issue number,
 - the PR head branch matches the normal branch shape, such as
@@ -182,7 +177,7 @@ same signals used by `resume.ps1`:
 When an open PR exists, the issue is not ready for a new implementation
 dispatch. Its non-ready classification is `has-open-PR`.
 
-The human-readable sub-state should mirror `resume.ps1`:
+The human-readable sub-state should mirror `loopcoder resume`:
 
 - `in-review` when the PR exists and checks are passing or not required,
 - `fixing` when checks have failed or the verifier has requested a fix pass,
@@ -198,7 +193,7 @@ blocks duplicate dispatch.
 An issue has a live local attempt when local `.loopcoder` sidecars show that a
 worker attempt may still be active and no GitHub PR has superseded it.
 
-The ready-set script should use the same signals as `resume.ps1`:
+The ready-set computation should use the same signals as `loopcoder resume`:
 
 - latest `*.attempt.json` for the issue,
 - `status`, `phase`, `heartbeat_at`, `last_progress_at`, and `pid`,
@@ -212,13 +207,12 @@ classification is `has-live-attempt`, with a reason such as "running",
 "progress stale", or "hung but pid still alive".
 
 When the latest attempt failed, exited idle, became orphaned, or is hung with no
-live process, the conductor should route through
-[`../scripts/recover-and-retry.ps1`](../scripts/recover-and-retry.ps1) rather
-than silently treating the issue as a clean first dispatch. `ready-set.ps1`
-should surface that as a non-ready recovery reason unless the implementation
-explicitly supports a separate `ready_for_recovery` bucket. Either way, the
-one-wave dispatch helper should not start an ordinary duplicate worker over a
-recoverable local attempt without conductor review.
+live process, the conductor should route through `loopcoder recover` rather
+than silently treating the issue as a clean first dispatch. `loopcoder
+ready-set` should surface that as a non-ready recovery reason unless the
+implementation explicitly supports a separate `ready_for_recovery` bucket.
+Either way, `loopcoder dispatch-wave` should not start an ordinary duplicate
+worker over a recoverable local attempt without conductor review.
 
 ### Readiness Rule
 
@@ -239,7 +233,7 @@ The primary non-ready classifications are:
 | `blocked-by-unmerged-dep` | At least one `blocked-by:#N` dependency is not completed or cannot be read. | Wait for the dependency to merge or inspect the missing dependency. |
 | `has-open-PR` | GitHub already has an open PR for the issue. | Verify, fix, gate, or wait for human merge. Do not dispatch a duplicate worker. |
 | `has-live-attempt` | Local run state shows a worker attempt may still be active. | Wait, inspect, or run recovery when it becomes recoverable. |
-| `recovery-needed` | A failed, idle, orphaned, or non-live attempt needs bounded recovery. | Use `recover-and-retry.ps1` with the same `-RunId`. |
+| `recovery-needed` | A failed, idle, orphaned, or non-live attempt needs bounded recovery. | Use `loopcoder recover` with the same `--run-id`. |
 
 The required machine output must make it easy for the dispatch helper to select
 only `READY` issues and for the human to understand every exclusion.
@@ -248,25 +242,25 @@ only `READY` issues and for the human to understand every exclusion.
 
 The dispatch helper is the executable version of "dispatch the whole ready set"
 in [`scheduling.md`](scheduling.md). Its target name is
-`scripts/dispatch-ready-wave.ps1`.
+`loopcoder dispatch-wave`.
 
 ### Inputs
 
 The helper accepts either:
 
 - an explicit list of issue numbers, or
-- a ready-set snapshot produced by `scripts/ready-set.ps1`.
+- a ready-set snapshot produced by `loopcoder ready-set`.
 
 It also accepts:
 
-- `-Repo`, defaulting to the current repository when safe,
-- `-BaseBranch`, defaulting to `main`,
-- optional `-RunId`,
+- `--repo`, defaulting to the current repository when safe,
+- `--base-branch`, defaulting to `main`,
+- optional `--run-id`,
 - optional provider/model/effort pass-throughs,
-- optional concurrency bounds such as `-ThrottleLimit`, if implementation needs
+- optional concurrency bounds such as `--throttle-limit`, if implementation needs
   them for local resource control.
 
-If `-RunId` is absent, the helper generates one stable run id for the wave and
+If `--run-id` is absent, the helper generates one stable run id for the wave and
 passes that same value to every worker dispatch. A suitable target shape is:
 
 ```text
@@ -287,15 +281,14 @@ For each selected issue, the helper:
 1. Revalidates that the issue is still ready, or that the ready-set snapshot is
    fresh enough and no open PR or live attempt appeared since it was produced.
 2. Reads the issue title and body from GitHub.
-3. Calls [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1)
-   with the shared `-RunId`, issue fields, base branch, and only the explicit
-   provider/model/effort flags the human or caller supplied.
+3. Calls `loopcoder dispatch` with the shared `--run-id`, issue fields, base
+   branch, and only the explicit provider/model/effort flags the human or
+   caller supplied.
 4. Captures the worker result, including PR URL, branch, attempt path, status,
    exit code, and failure text when available.
 5. Prints a wave summary.
 
-The helper may dispatch concurrently because
-[`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1) already owns
+The helper may dispatch concurrently because `loopcoder dispatch` already owns
 the git worktree creation mutex. The concurrency boundary is therefore local
 resource management, not correctness. Serial dispatch remains an acceptable
 implementation fallback, but it should not change scheduling semantics.
@@ -313,8 +306,8 @@ After the wave:
 3. The human names PRs to merge.
 4. The conductor applies observe-at-merge ordering from
    [`scheduling.md`](scheduling.md).
-5. The conductor runs `resume.ps1` to reconcile.
-6. The conductor runs `ready-set.ps1` again for the next layer.
+5. The conductor runs `loopcoder resume` to reconcile.
+6. The conductor runs `loopcoder ready-set` again for the next layer.
 
 This bounded shape is the main difference between this foreground orchestration
 layer and the later background conductor tick.
@@ -324,26 +317,26 @@ layer and the later background conductor tick.
 The composed foreground cycle is:
 
 ```text
-ready-set.ps1
+loopcoder ready-set
   -> dispatch one wave
   -> human verifies + merges (gate + observe-at-merge)
-  -> resume.ps1 reconcile
+  -> loopcoder resume reconcile
   -> repeat until the ready set is empty
 ```
 
 Expanded:
 
-1. `ready-set.ps1` reads GitHub and local run state, then reports ready and
+1. `loopcoder ready-set` reads GitHub and local run state, then reports ready and
    non-ready issues.
-2. `dispatch-ready-wave.ps1` dispatches only the current ready set under one
-   shared `-RunId`.
-3. Workers create branches and PRs through `dispatch-worker.ps1`.
+2. `loopcoder dispatch-wave` dispatches only the current ready set under one
+   shared `--run-id`.
+3. Workers create branches and PRs through `loopcoder dispatch`.
 4. The conductor verifies each PR. A passing gate means merge-eligible, not
    merged.
 5. The human names PRs to merge.
 6. The conductor observes real PR file sets at merge time, orders overlapping
    PRs, rebases where needed, and evicts conflicts.
-7. `resume.ps1` reconciles GitHub and local state.
+7. `loopcoder resume` reconciles GitHub and local state.
 8. The conductor repeats the cycle if more issues are ready.
 
 This is the human-gated, foreground precursor to the stateless/background
@@ -354,29 +347,29 @@ invocation rather than a daemon.
 
 ## Interfaces
 
-### `scripts/ready-set.ps1`
+### `loopcoder ready-set`
 
 Target command shape:
 
-```powershell
-pwsh scripts/ready-set.ps1 `
-  -Repo . `
-  -BaseBranch main `
-  -RunId <run-id> `
-  -Format text
+```text
+loopcoder ready-set \
+  --repo . \
+  --base-branch main \
+  --run-id <run-id> \
+  --format text
 ```
 
 Target parameters:
 
 | Parameter | Required | Meaning |
 | --- | --- | --- |
-| `-Repo` | Yes | Repository path. Resolved before running GitHub and git commands. |
-| `-BaseBranch` | No | Base branch used for dependency and branch reasoning. Defaults to `main`. |
-| `-RunId` | No | Local run to inspect under `.loopcoder/runs/<RunId>`. If omitted, select the latest local run when present, matching `resume.ps1`. |
-| `-Format` | No | `text`, `json`, or `both`. Text is human-readable. JSON is machine-readable for the dispatch helper. |
-| `-IncludeClosed` | No | Optional diagnostic switch for implementation debugging. Normal ready-set output should focus on open issues. |
+| `--repo` | Yes | Repository path. Resolved before running GitHub and git commands. |
+| `--base-branch` | No | Base branch used for dependency and branch reasoning. Defaults to `main`. |
+| `--run-id` | No | Local run to inspect under `.loopcoder/runs/<RunId>`. If omitted, select the latest local run when present, matching `loopcoder resume`. |
+| `--format` | No | `text`, `json`, or `both`. Text is human-readable. JSON is machine-readable for the dispatch helper. |
+| `--include-closed` | No | Optional diagnostic switch for implementation debugging. Normal ready-set output should focus on open issues. |
 
-`ready-set.ps1` is read-only:
+`loopcoder ready-set` is read-only:
 
 - no GitHub mutations,
 - no dispatch,
@@ -464,46 +457,45 @@ Safety
 - ready-set is read-only: no dispatch, no merge, no push, and no GitHub mutation was attempted.
 ```
 
-The text form should be close enough to `resume.ps1` that a conductor can read
-both reports without translating vocabulary.
+The text form should be close enough to `loopcoder resume` that a conductor can
+read both reports without translating vocabulary.
 
-### `scripts/dispatch-ready-wave.ps1`
+### `loopcoder dispatch-wave`
 
 Target command shapes:
 
-```powershell
-pwsh scripts/dispatch-ready-wave.ps1 `
-  -Repo . `
-  -BaseBranch main `
-  -IssueNumbers 81,84 `
-  -RunId run-20260626T120000Z-wave
+```text
+loopcoder dispatch-wave \
+  --repo . \
+  --base-branch main \
+  --issue-numbers 81,84 \
+  --run-id run-20260626T120000Z-wave
 ```
 
-```powershell
-pwsh scripts/ready-set.ps1 -Repo . -RunId run-20260626T120000Z-wave -Format json |
-  pwsh scripts/dispatch-ready-wave.ps1 -Repo . -FromReadySet -RunId run-20260626T120000Z-wave
+```text
+loopcoder ready-set --repo . --run-id run-20260626T120000Z-wave --format json |
+  loopcoder dispatch-wave --repo . --from-ready-set --run-id run-20260626T120000Z-wave
 ```
 
 Target parameters:
 
 | Parameter | Required | Meaning |
 | --- | --- | --- |
-| `-Repo` | Yes | Repository path. |
-| `-BaseBranch` | No | Base branch passed to worker dispatch. Defaults to `main`. |
-| `-RunId` | No | Shared run id for every worker in the wave. Generated once if absent. |
-| `-IssueNumbers` | Choice | Explicit issue numbers to dispatch. Mutually exclusive with `-FromReadySet`. |
-| `-FromReadySet` | Choice | Read the machine output from `ready-set.ps1` via pipeline or file. Dispatch only entries in `ready`. |
-| `-ReadySetPath` | No | Optional path to a JSON ready-set snapshot. |
-| `-Provider` | No | Pass-through to `dispatch-worker.ps1` only when explicitly supplied or configured. |
-| `-Model` | No | Pass-through to `dispatch-worker.ps1` only when explicitly supplied by the human. |
-| `-Effort` | No | Pass-through to `dispatch-worker.ps1` only when explicitly supplied by the human. |
-| `-ThrottleLimit` | No | Optional local concurrency bound. It does not change readiness semantics. |
+| `--repo` | Yes | Repository path. |
+| `--base-branch` | No | Base branch passed to worker dispatch. Defaults to `main`. |
+| `--run-id` | No | Shared run id for every worker in the wave. Generated once if absent. |
+| `--issue-numbers` | Choice | Explicit issue numbers to dispatch. Mutually exclusive with `--from-ready-set`. |
+| `--from-ready-set` | Choice | Read the machine output from `loopcoder ready-set` via pipeline or file. Dispatch only entries in `ready`. |
+| `--ready-set-path` | No | Optional path to a JSON ready-set snapshot. |
+| `--provider` | No | Pass-through to `loopcoder dispatch` only when explicitly supplied or configured. |
+| `--model` | No | Pass-through to `loopcoder dispatch` only when explicitly supplied by the human. |
+| `--effort` | No | Pass-through to `loopcoder dispatch` only when explicitly supplied by the human. |
+| `--throttle-limit` | No | Optional local concurrency bound. It does not change readiness semantics. |
 
-The helper's only delivery side effect is calling
-[`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1). It may read
-GitHub, read local state, and write its own console summary, but it must not
-merge, push directly, edit issues, or mutate labels. Pushes and PR creation
-happen inside `dispatch-worker.ps1`, which already owns that adapter boundary.
+The helper's only delivery side effect is calling `loopcoder dispatch`. It may
+read GitHub, read local state, and write its own console summary, but it must
+not merge, push directly, edit issues, or mutate labels. Pushes and PR creation
+happen inside `loopcoder dispatch`, which already owns that adapter boundary.
 
 Target wave summary shape:
 
@@ -530,8 +522,8 @@ Results
 
 Next
 - Verify successful PRs before calling them merge-eligible.
-- Use recover-and-retry.ps1 for failed attempts.
-- Run resume.ps1 after human review/merge or interruption.
+- Use loopcoder recover for failed attempts.
+- Run loopcoder resume after human review/merge or interruption.
 ```
 
 Machine output should contain the same fields:
@@ -562,11 +554,11 @@ eviction, merge grouping, or observe-at-merge ordering.
 ### `resilience.md`
 
 [`resilience.md`](resilience.md) defines durable local run state, worker
-heartbeats, recovery briefs, reconciliation, and bounded retry. The ready-set
-script reuses that vocabulary instead of creating a second state language.
+heartbeats, recovery briefs, reconciliation, and bounded retry. `loopcoder
+ready-set` reuses that vocabulary instead of creating a second state language.
 
-The shared `-RunId` is the main bridge: every dispatch in a wave writes attempt
-state under one run directory, and `resume.ps1` plus `recover-and-retry.ps1`
+The shared `--run-id` is the main bridge: every dispatch in a wave writes attempt
+state under one run directory, and `loopcoder resume` plus `loopcoder recover`
 can reason about the wave after interruption or failure.
 
 ### `verification.md`
@@ -580,25 +572,24 @@ to the merged design document. The gate still reports `pass`, `fail`, or
 ### `architecture.md`
 
 [`architecture.md`](architecture.md) says v1 is an Opus conductor session plus
-a thin PowerShell worker adapter, not a daemon or cloud service. This design
-keeps that architecture. The new scripts are conductor helpers in the foreground
-session, and `dispatch-worker.ps1` remains the Worker adapter.
+a native `loopcoder` worker adapter, not a daemon or cloud service. This design
+keeps that architecture. The orchestration subcommands are conductor helpers in
+the foreground session, and `loopcoder dispatch` remains the Worker adapter.
 
 ### `PROCESS.md`
 
 [`PROCESS.md`](PROCESS.md) requires doc-first, one concern per PR, and separate
 documentation and code changes. This file is the design document for the
-orchestration layer. The implementation scripts must land in later code PRs.
+orchestration layer. Implementation changes land in separate code PRs.
 
 ### `SKILL.md`
 
-[`../SKILL.md`](../SKILL.md) is the conductor playbook. After this design and
-its implementation merge, the playbook should call:
+[`../SKILL.md`](../SKILL.md) is the conductor playbook. The playbook should call:
 
-1. `ready-set.ps1` before starting or resuming a dispatch layer.
-2. `dispatch-ready-wave.ps1` to run the foreground wave.
-3. `resume.ps1` after interruption, human review, or merges.
-4. `recover-and-retry.ps1` for failed, hung, idle, or orphaned attempts.
+1. `loopcoder ready-set` before starting or resuming a dispatch layer.
+2. `loopcoder dispatch-wave` to run the foreground wave.
+3. `loopcoder resume` after interruption, human review, or merges.
+4. `loopcoder recover` for failed, hung, idle, or orphaned attempts.
 
 The playbook should continue to state the human-merge rule explicitly.
 
@@ -616,7 +607,7 @@ A wave can partially succeed:
 The helper must not roll back successful dispatches because a sibling issue
 failed. Successful PRs proceed to verification. Failed issues are reported with
 their attempt state and recovery brief, then routed through
-`recover-and-retry.ps1` when retry is appropriate.
+`loopcoder recover` when retry is appropriate.
 
 The wave summary is the handoff surface. It should make the next action obvious
 for each issue:
@@ -631,7 +622,7 @@ for each issue:
 
 Ready-set snapshots can become stale. A human may merge a dependency, a worker
 may open a PR, or another conductor session may start a worker between
-`ready-set.ps1` and `dispatch-ready-wave.ps1`.
+`loopcoder ready-set` and `loopcoder dispatch-wave`.
 
 The dispatch helper therefore must perform a final preflight for each issue. If
 the issue no longer satisfies the readiness rule, it is skipped and reported
@@ -650,16 +641,16 @@ When a wave failure produces a recovery brief under:
 
 the conductor should call:
 
-```powershell
-pwsh scripts/recover-and-retry.ps1 `
-  -Repo . `
-  -IssueNumber <n> `
-  -IssueTitle "<title>" `
-  -IssueBody "<body>" `
-  -RunId <same-run-id>
+```text
+loopcoder recover \
+  --repo . \
+  --issue-number <n> \
+  --issue-title "<title>" \
+  --issue-body "<body>" \
+  --run-id <same-run-id>
 ```
 
-`recover-and-retry.ps1` first adopts an existing PR when one exists. Otherwise
+`loopcoder recover` first adopts an existing PR when one exists. Otherwise
 it retries with bounded attempts, backoff, and the latest recovery brief. That
 behavior is deliberately outside ordinary ready dispatch.
 
@@ -683,13 +674,13 @@ context and re-dispatches a narrowed worker as described in
 
 ## Decisions
 
-### Decision 1: Ready-Set Is A Read-Only Script
+### Decision 1: Ready-Set Is Read-Only
 
 Rationale: readiness must be inspectable and safe. A conductor should be able
 to run the command before deciding whether to dispatch anything.
 
-Consequence: all mutations stay in explicit follow-up commands. The ready-set
-script reports facts and recommendations only.
+Consequence: all mutations stay in explicit follow-up commands. `loopcoder
+ready-set` reports facts and recommendations only.
 
 ### Decision 2: One Wave Per Invocation
 
@@ -699,17 +690,17 @@ human verification and merge decisions, not merely worker completion.
 Consequence: the helper stops after dispatching the current ready set. The
 human and conductor decide when to run the next wave.
 
-### Decision 3: Shared `-RunId` Per Wave
+### Decision 3: Shared `--run-id` Per Wave
 
-Rationale: `resume.ps1`, `recover-and-retry.ps1`, and local sidecars need one
+Rationale: `loopcoder resume`, `loopcoder recover`, and local sidecars need one
 run namespace that groups sibling attempts.
 
 Consequence: the dispatch helper generates or accepts a run id once and passes
-it to every `dispatch-worker.ps1` call in the wave.
+it to every `loopcoder dispatch` call in the wave.
 
 ### Decision 4: Dispatch Uses The Existing Worker Adapter
 
-Rationale: `dispatch-worker.ps1` already owns worktree creation, prompt file
+Rationale: `loopcoder dispatch` already owns worktree creation, prompt file
 construction, Codex execution, commit, push, PR creation, sidecars, recovery
 briefs, and the worktree mutex.
 
@@ -722,7 +713,7 @@ Rationale: [`../SKILL.md`](../SKILL.md) says defaults inherit from the user's
 Codex configuration unless the user explicitly requests overrides.
 
 Consequence: the helper never chooses model or effort. If the caller does not
-provide `-Model` or `-Effort`, those flags are omitted.
+provide `--model` or `--effort`, those flags are omitted.
 
 ### Decision 6: Observe-At-Merge Is Preserved
 
@@ -734,12 +725,9 @@ PR-diff-driven and human-named.
 
 ## Open Questions
 
-- What final script name should the project prefer for the one-wave helper:
-  `dispatch-ready-wave.ps1`, `dispatch-wave.ps1`, or another shorter name?
-  This document uses `dispatch-ready-wave.ps1` because it names the scheduling
-  concept directly.
-- Should `ready-set.ps1` support issue filters, such as `-Label delivery:unit`
-  or `-IssueNumbers`, or should v1 inspect every open issue in the repository?
+- Should `loopcoder ready-set` support issue filters, such as
+  `--label delivery:unit` or `--issue-numbers`, or should v1 inspect every open
+  issue in the repository?
   The core readiness rule works either way.
 - Should ready-set snapshots be accepted only from stdin/file JSON, or should
   the dispatch helper always recompute readiness internally and treat snapshots
@@ -747,7 +735,7 @@ PR-diff-driven and human-named.
 - What concurrency default is appropriate for local machines? The correctness
   model allows parallel dispatch because of worktree isolation and the mutex,
   but local CPU, memory, and provider limits may justify a conservative
-  `-ThrottleLimit`.
+  `--throttle-limit`.
 - Should recovery-needed issues appear in the primary `blocked` list only, or
   should the JSON output include a separate `recovery` array to make conductor
   routing easier?

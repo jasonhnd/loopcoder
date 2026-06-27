@@ -8,10 +8,10 @@ loopcoder must not make the user choose routine settings (model, speed, etc.) on
 ## Deferred items
 
 ### B1 — Worker model & speed selection
-Raised 2026-06-26. When `scripts/dispatch-worker.ps1` passes no model flags, the codex worker follows codex's global `~/.codex/config.toml`. That inheritance remains the default.
+Raised 2026-06-26. Implemented in the native binary: when `loopcoder dispatch` passes no `--model` or `--effort` flags, the codex worker follows codex's global `~/.codex/config.toml`. That inheritance remains the default.
 
-Add knobs so model + reasoning effort are configurable only when the user explicitly asks:
-- `dispatch-worker.ps1`: add optional `-Model` and `-Effort` params -> pass `codex exec -m <model> -c model_reasoning_effort=<effort>` only when provided.
+The binary exposes knobs so model + reasoning effort are configurable only when the user explicitly asks:
+- `loopcoder dispatch`: optional `--model` and `--effort` flags pass `codex exec -m <model> -c model_reasoning_effort=<effort>` only when provided.
 - `.delivery.yml`: document optional `worker.model` and `worker.reasoning_effort` as commented keys only; absent means inherit codex's global default.
 - No automatic per-issue effort routing. The config and command line must only reflect what the user has said.
 

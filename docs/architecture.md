@@ -5,10 +5,10 @@ current repo, not the larger north-star system in `DESIGN.md`.
 
 ## Overview
 
-loopcoder is a Claude Code skill plus a thin PowerShell worker adapter. It is
+loopcoder is a Claude Code skill plus a native Go worker adapter. It is
 not a daemon or cloud service in v1. The Opus chat session is the conductor and
 runtime, while workers run in separate git worktrees through the
-`scripts/dispatch-worker.ps1` adapter.
+`loopcoder dispatch` adapter.
 
 The built loop is:
 
@@ -38,12 +38,11 @@ issues, reviews resulting PRs, reports progress in chat, and merges only the PRs
 the user names.
 
 The Conductor does not implement code or recreate worker mechanics. For
-implementation it calls [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
+implementation it calls `loopcoder dispatch`.
 
 ### Worker
 
-The Worker is `codex` in v1, invoked by
-[`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1). The script
+The Worker is `codex` in v1, invoked by `loopcoder dispatch`. The binary
 creates a fresh git worktree from the configured base branch, feeds a
 self-contained issue prompt to headless `codex exec`, commits the resulting
 changes, pushes the branch, and opens a pull request.
@@ -67,7 +66,7 @@ interfaces; `.delivery.yml` selects the v1 adapters that exist today.
 | --- | --- | --- |
 | WorkItemSource | Create, list, and update work items | GitHub issues via `gh` |
 | Workspace | Create and clean isolated implementation workspaces | `git worktree` |
-| Worker | Implement one approved issue in a workspace | `codex` via `scripts/dispatch-worker.ps1`; provider-pluggable, with `codex` shipped in v1 |
+| Worker | Implement one approved issue in a workspace | `codex` via `loopcoder dispatch`; provider-pluggable, with `codex` shipped in v1 |
 | VcsHost | Open PRs, read checks, and merge named PRs | GitHub PRs/checks/merge via `gh` |
 | Verifier | Review changes against the issue and checks | Opus review |
 | Gate | Decide whether a PR may merge | `human-merge`; the user names PRs and Opus runs `gh pr merge` |

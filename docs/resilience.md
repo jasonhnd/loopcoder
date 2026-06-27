@@ -4,7 +4,7 @@ Status: DESIGN. This is a target design and is not yet built.
 
 This document extends the v1 loop described in `docs/architecture.md`,
 `docs/scheduling.md`, `docs/worker.md`, `SKILL.md`, and
-`scripts/dispatch-worker.ps1`. It is intentionally written as a bridge between
+`loopcoder dispatch`. It is intentionally written as a bridge between
 the current single-session implementation and the stateless/background conductor
 described in `DESIGN.md` sections 8 and 12.
 
@@ -12,7 +12,7 @@ described in `DESIGN.md` sections 8 and 12.
 
 loopcoder v1 is deliberately small and session-bound. The Opus chat session is
 the Conductor, the in-chat table is part of the live state machine, and
-`scripts/dispatch-worker.ps1` launches one Codex worker per issue in a fresh git
+`loopcoder dispatch` launches one Codex worker per issue in a fresh git
 worktree. This is enough for small batches, but it creates two resilience gaps.
 
 First, conductor state is fragile. The durable systems today are GitHub issues,
@@ -25,7 +25,7 @@ issue. Those workers are effectively orphaned.
 
 Second, loopcoder has no stuck-worker detection. A worker can hang, block on
 stdin, wait on a tool, enter an idle state, run out of context, or stop producing
-observable output without the conductor knowing. The current worker script
+observable output without the conductor knowing. The current worker adapter
 already avoids one specific failure mode by feeding `codex exec` from a prompt
 file with closed stdin. That fix matters because we have already seen Codex hang
 on stdin for roughly eight minutes. But avoiding one known hang is not a general
@@ -264,7 +264,7 @@ worker until the conductor proves otherwise from process and GitHub state.
 
 ## What Counts As Progress
 
-For the Codex worker in `scripts/dispatch-worker.ps1`, progress is any
+For the Codex worker in `loopcoder dispatch`, progress is any
 observable change that increases confidence the attempt is moving toward a PR.
 The adapter should update `last_progress_at` when any of these changes:
 
@@ -488,9 +488,9 @@ durably and counted as an attempt with its own recovery reason.
 
 ## Relationship To The Worker Adapter
 
-`scripts/dispatch-worker.ps1` currently owns the mechanical worker path:
+`loopcoder dispatch` owns the mechanical worker path:
 worktree, prompt file, `codex exec`, dirty check, commit, push, PR creation, and
-cleanup. In the target design it remains the adapter, but it gains supervisor
+cleanup. It is the worker adapter and includes supervisor
 responsibilities:
 
 - Create a stable `job_id` and attempt metadata before launching Codex.
@@ -502,8 +502,8 @@ responsibilities:
 - Preserve worktree/logs on failure, hung termination, or retry capture.
 - Return structured JSON for success, failure, and retryable classification.
 
-Codex still only edits files. The script still controls commits, pushes, and PR
-creation. The resilience layer makes those script-owned phases visible and
+Codex still only edits files. The adapter still controls commits, pushes, and PR
+creation. The resilience layer makes those adapter-owned phases visible and
 replayable.
 
 ## Toward A Stateless Background Conductor
