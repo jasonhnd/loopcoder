@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -38,6 +39,7 @@ type Deps struct {
 	Stdin           io.Reader
 	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
 	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
@@ -53,6 +55,7 @@ var commands = []Command{
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
+	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
 }
@@ -82,6 +85,9 @@ func DefaultDeps() Deps {
 		},
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
+		},
+		Loopreview: func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
 		},
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
@@ -138,6 +144,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "loopreview" {
+		return runLoopreview(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "verify-local" {
 		return runVerifyLocal(args[1:], stdout, stderr, deps)
@@ -219,6 +228,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string                  optional Codex model pass-through")
 		fmt.Fprintln(w, "  --effort string                 optional Codex reasoning effort pass-through")
+	}
+	if command.Name == "loopreview" {
+		fmt.Fprintln(w, "  --repo string          repository path (required)")
+		fmt.Fprintln(w, "  --pr-number int        pull request number to review (required)")
+		fmt.Fprintln(w, "  --provider string      verifier provider (required)")
+		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -1199,6 +1214,93 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Loopreview == nil {
+		deps.Loopreview = DefaultDeps().Loopreview
+	}
+
+	fs := flag.NewFlagSet("loopreview", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts loopreview.Options
+	var repoAlias string
+	var prNumberAlias int
+	var providerAlias string
+	var baseBranchAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.IntVar(&opts.PRNumber, "pr-number", 0, "pull request number")
+	fs.IntVar(&prNumberAlias, "PrNumber", 0, "pull request number")
+	fs.StringVar(&opts.Provider, "provider", "", "provider")
+	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if prNumberAlias != 0 {
+		opts.PRNumber = prNumberAlias
+	}
+	if providerAlias != "" {
+		opts.Provider = providerAlias
+	}
+	if baseBranchAlias != "" {
+		opts.BaseBranch = baseBranchAlias
+	}
+
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "loopreview: --repo is required")
+		return 2
+	}
+	if opts.PRNumber <= 0 {
+		fmt.Fprintln(stderr, "loopreview: --pr-number is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.Provider) == "" {
+		fmt.Fprintln(stderr, "loopreview: --provider is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "loopreview: %v\n", err)
+		return 2
+	}
+	opts.RepoPath = resolvedRepo
+	opts.Stderr = stderr
+
+	cfg := config.Default()
+	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
+	if err == nil {
+		cfg = loaded
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "loopreview: %v\n", err)
+		return 1
+	}
+	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
+		Worker:   cfg.Adapters.Worker,
+		Verifier: opts.Provider,
+	}); warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	result, err := deps.Loopreview(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "loopreview: %v\n", err)
+		return 1
+	}
+	if err := loopreview.Render(stdout, result); err != nil {
+		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
+		return 1
+	}
+	return result.ExitCode
 }
 
 func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {

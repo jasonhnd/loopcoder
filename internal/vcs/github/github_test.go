@@ -87,6 +87,48 @@ func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	}
 }
 
+func TestViewPRAndDiffRunGhCommands(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00view\x00152\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":152,"title":"PR","body":"Body","url":"https://github.com/owner/repo/pull/152","headRefName":"loop/issue-152","closingIssuesReferences":[{"number":152}]}`),
+			"repo\x00gh\x00pr\x00diff\x00152":                []byte("diff --git a/a.go b/a.go\n"),
+			"repo\x00gh\x00pr\x00diff\x00152\x00--name-only": []byte("a.go\r\nb.go\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	pr, err := client.ViewPR(context.Background(), 152)
+	if err != nil {
+		t.Fatalf("ViewPR returned error: %v", err)
+	}
+	if pr.Number != 152 || pr.Title != "PR" || pr.Body != "Body" || pr.HeadRefName != "loop/issue-152" || len(pr.ClosingIssuesReferences) != 1 {
+		t.Fatalf("ViewPR parsed incorrectly: %#v", pr)
+	}
+	diff, err := client.PRDiff(context.Background(), 152)
+	if err != nil {
+		t.Fatalf("PRDiff returned error: %v", err)
+	}
+	if diff != "diff --git a/a.go b/a.go\n" {
+		t.Fatalf("diff = %q", diff)
+	}
+	files, err := client.PRDiffNameOnly(context.Background(), 152)
+	if err != nil {
+		t.Fatalf("PRDiffNameOnly returned error: %v", err)
+	}
+	if !reflect.DeepEqual(files, []string{"a.go", "b.go"}) {
+		t.Fatalf("files = %#v, want a.go and b.go", files)
+	}
+
+	want := [][]string{
+		{"repo", "gh", "pr", "view", "152", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "pr", "diff", "152"},
+		{"repo", "gh", "pr", "diff", "152", "--name-only"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestCreatePRPropagatesRunnerError(t *testing.T) {
 	wantErr := errors.New("gh failed")
 	client := NewWithRunner("repo", &fakeRunner{err: wantErr})
