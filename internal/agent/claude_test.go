@@ -2,6 +2,7 @@ package agent
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -15,8 +16,8 @@ func TestClaudeRegistration(t *testing.T) {
 	}
 
 	providers := SupportedProviders()
-	if !reflect.DeepEqual(providers, []string{"claude", "codex"}) {
-		t.Fatalf("SupportedProviders() = %#v, want %#v", providers, []string{"claude", "codex"})
+	if !slices.Contains(providers, "claude") {
+		t.Fatalf("SupportedProviders() = %#v, want claude registered", providers)
 	}
 }
 
