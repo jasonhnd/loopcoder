@@ -42,8 +42,7 @@ periodically propose improvements to its own harness under human approval.
 The harness includes:
 
 - The conductor playbook in [`../SKILL.md`](../SKILL.md).
-- Worker and dispatch scripts such as
-  [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
+- Worker and dispatch code such as `loopcoder dispatch` and `internal/worker`.
 - Process, architecture, scheduler, worker, and usage docs under `docs/`.
 - Future prompt templates, issue templates, trace parsers, and verification
   helpers that shape how loopcoder behaves.
@@ -147,8 +146,7 @@ The important constraints are:
 
 - The Opus chat session is the conductor and runtime.
 - The conductor keeps a compact in-chat state table.
-- Workers run in separate git worktrees through
-  [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
+- Workers run in separate git worktrees through `loopcoder dispatch`.
 - GitHub issues, PRs, checks, and labels are the durable project state.
 - The verifier role is the conductor reviewing worker PRs and checks.
 - The user names PRs to merge; loopcoder never auto-merges.
@@ -188,9 +186,9 @@ not recursively spawn more self-improvement work without human approval.
 
 ### Higher Scrutiny For Harness Surface
 
-Changes to `SKILL.md`, dispatch scripts, process docs, and gate behavior are
+Changes to `SKILL.md`, dispatch code, process docs, and gate behavior are
 high-scrutiny because they affect every future run. The default should be
-documentation or prompt clarification before script logic, and script logic
+documentation or prompt clarification before implementation logic, and code
 before any change that weakens gates.
 
 ### Human-Owned Governance
@@ -213,7 +211,7 @@ parts of a run that should influence future runs:
 - Commands that worked or failed in the actual environment.
 - Verification gaps found by the conductor or human.
 - Prompt instructions that were missing or ambiguous.
-- Script behavior that caused confusion or operational risk.
+- Worker or helper behavior that caused confusion or operational risk.
 - Improvement candidates that should be considered later.
 
 It is inspired by Ralph's `progress.txt` and `AGENTS.md` pattern, but it is
@@ -275,7 +273,7 @@ entries are not rewritten except to fix formatting or remove sensitive data.
 - Observed: <what happened>
 - Evidence: <links to issue, PR, check, log, or command output>
 - Learning: <reusable fact or pattern>
-- Applies to: <SKILL.md | scripts | docs | scheduling | worker prompts | repo-specific>
+- Applies to: <SKILL.md | worker code | helper scripts | docs | scheduling | worker prompts | repo-specific>
 - Candidate improvement: <none | suggested issue title>
 - Confidence: low | medium | high
 - Supersedes: <optional earlier entry id>
@@ -367,7 +365,7 @@ Target fields:
 | `failures` | Command failures, check failures, merge conflicts, review blockers. |
 | `human_decisions` | Approvals, rejections, merge instructions, and escalations. |
 | `learning_candidates` | Candidate entries proposed by workers or conductor. |
-| `harness_version` | Commit SHA or file checksums for `SKILL.md`, scripts, and docs used in the run. |
+| `harness_version` | Commit SHA or file checksums for `SKILL.md`, worker/helper code, and docs used in the run. |
 
 The `harness_version` field is important. Without it, a future reflection pass
 cannot tell whether a failure happened before or after a relevant harness
@@ -401,7 +399,7 @@ triggers can come later after trace quality is good.
    docs/learnings.md.
 
 2. Classify
-   Group events by failure class, missing convention, script weakness,
+   Group events by failure class, missing convention, worker/helper weakness,
    verification gap, or successful reusable tactic.
 
 3. Reflect
@@ -421,7 +419,7 @@ triggers can come later after trace quality is good.
    The doc describes the target change and must merge before code work starts.
 
 7. Implement
-   Dispatch code or script changes only after the relevant design/spec doc has
+   Dispatch code or helper changes only after the relevant design/spec doc has
    merged, following PROCESS.md.
 
 8. Verify
@@ -465,8 +463,8 @@ Self-improvement targets are divided by scrutiny level.
 | Usage docs and troubleshooting docs | Yes | Medium | Good first target for repeated operational gotchas. |
 | Worker briefing templates | Yes | High | Affects generated code quality and scope control. |
 | [`../SKILL.md`](../SKILL.md) playbook text | Yes | High | Changes conductor behavior across all loopcoder runs. Keep diffs small and evidence-backed. |
-| `scripts/dispatch-worker.ps1` logging and ergonomics | Yes | High | Requires command-level verification on Windows PowerShell. |
-| `scripts/dispatch-worker.ps1` execution semantics | Conditional | Very high | Requires design doc, focused tests or dry run, and explicit human review. |
+| `internal/worker` and `loopcoder dispatch` logging and ergonomics | Yes | High | Requires command-level verification of the binary worker path. |
+| `internal/worker` and `loopcoder dispatch` execution semantics | Conditional | Very high | Requires design doc, focused tests or dry run, and explicit human review. |
 | `.delivery.yml` defaults in loopcoder repo | Conditional | High | Do not change model or effort defaults unless the human explicitly requested that policy. |
 | Issue templates or PR templates | Yes | Medium | Useful for standardizing improvement evidence and acceptance criteria. |
 | Trace parser or reflection helper scripts | Yes | High | Must be deterministic and inspectable; no hidden network behavior. |
@@ -538,17 +536,17 @@ A reflection pass should have explicit limits:
 
 ### High-Scrutiny Path Rules
 
-For `SKILL.md` and script changes, the improvement issue must include:
+For `SKILL.md` and worker/helper changes, the improvement issue must include:
 
 - The exact failure or missed behavior being addressed.
-- The current text or script behavior that caused the gap.
+- The current text or implementation behavior that caused the gap.
 - The proposed new behavior.
 - Examples of prompts, commands, or runs that should behave differently.
 - A verification plan.
 - Rollback guidance.
 
-For script changes, verification should include at least one dry run or
-command-level check in PowerShell. For playbook changes, verification should
+For worker/helper changes, verification should include at least one dry run or
+command-level check of the native binary. For playbook changes, verification should
 include a prompt-level review: the new instruction must be specific enough to
 help but not so broad that it distorts unrelated tasks.
 
@@ -582,16 +580,16 @@ The verifier should check:
 - It does not create ambiguous instructions that could override issue scope.
 - It references the relevant design doc.
 
-### Script PRs
+### Worker And Helper Code PRs
 
 The verifier should check:
 
-- The script change matches the approved design.
+- The worker or helper change matches the approved design.
 - It preserves worktree isolation.
 - It preserves explicit provider/model behavior from `SKILL.md`.
 - It does not introduce destructive filesystem operations without path checks.
 - It reports enough information for future run traces.
-- It was verified in PowerShell on Windows.
+- It was verified with the relevant native command-level checks.
 
 ### Learning PRs
 
@@ -689,7 +687,7 @@ and human approval; they are not routine learning updates.
 
 - Pick one low-risk recurring failure.
 - Write and merge the design/spec doc.
-- Implement the smallest corresponding playbook, doc, or script change.
+- Implement the smallest corresponding playbook, doc, or code change.
 - Verify the next run against the original failure class.
 
 ### M5 - Trace Artifacts
@@ -732,7 +730,7 @@ A future code or playbook implementation of this design is acceptable only if:
   verification plan.
 - Improvement issue creation requires human approval.
 - Harness changes follow [PROCESS.md](PROCESS.md).
-- `SKILL.md` and script changes are treated as high-scrutiny.
+- `SKILL.md` and worker/helper changes are treated as high-scrutiny.
 - No self-improvement path can auto-merge or silently mutate the harness.
 - The loop is bounded by explicit limits.
 - The verifier can inspect the evidence chain from failure to learning to

@@ -154,7 +154,7 @@ automated_checks:
 spec_conformance:
   - criterion: "The worker branches from main."
     status: pass | fail | needs-human
-    evidence: "scripts/dispatch-worker.ps1 creates a worktree from origin/main."
+    evidence: "loopcoder dispatch creates a worktree from origin/main."
 agent_checks:
   - name: browser-flow
     status: pass | fail | needs-human | not-required

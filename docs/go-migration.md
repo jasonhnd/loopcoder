@@ -24,11 +24,11 @@ The part that is not cross-platform is smaller and more concrete: the
 mechanical helper layer is PowerShell and Windows-bound. Today the conductor
 calls:
 
-- [`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1)
-- [`../scripts/ready-set.ps1`](../scripts/ready-set.ps1)
-- [`../scripts/resume.ps1`](../scripts/resume.ps1)
-- [`../scripts/recover-and-retry.ps1`](../scripts/recover-and-retry.ps1)
-- [`../scripts/verify-local.ps1`](../scripts/verify-local.ps1)
+- `scripts/dispatch-worker.ps1`
+- `scripts/ready-set.ps1`
+- `scripts/resume.ps1`
+- `scripts/recover-and-retry.ps1`
+- `scripts/verify-local.ps1`
 
 Those scripts currently own the deterministic mechanics around GitHub, git
 worktrees, Codex execution, local run state, recovery briefs, ready-set
@@ -41,10 +41,10 @@ The lock-in is narrow enough to remove cleanly. The main Windows-specific
 implementation details are:
 
 - `cmd /c "codex ... < promptfile"` in
-  [`dispatch-worker.ps1`](../scripts/dispatch-worker.ps1), which depends on
+  `scripts/dispatch-worker.ps1`, which depends on
   `cmd.exe` for stdin redirection and log redirection.
 - `[System.Threading.Mutex] "Global\..."` in
-  [`dispatch-worker.ps1`](../scripts/dispatch-worker.ps1), which serializes
+  `scripts/dispatch-worker.ps1`, which serializes
   `git worktree add` with a Windows named mutex.
 
 The goal is a single native helper binary named `loopcoder` that the conductor
@@ -137,7 +137,7 @@ post-parity form should be lowercase long flags.
 ### `loopcoder dispatch`
 
 Reference:
-[`../scripts/dispatch-worker.ps1`](../scripts/dispatch-worker.ps1).
+`scripts/dispatch-worker.ps1`.
 
 Target command shape:
 
@@ -193,7 +193,7 @@ The exact fields are part of the contract:
 
 ### `loopcoder ready-set`
 
-Reference: [`../scripts/ready-set.ps1`](../scripts/ready-set.ps1).
+Reference: `scripts/ready-set.ps1`.
 
 Target command shape:
 
@@ -230,7 +230,7 @@ such as `closed` when `--include-closed` is supplied.
 
 ### `loopcoder resume`
 
-Reference: [`../scripts/resume.ps1`](../scripts/resume.ps1).
+Reference: `scripts/resume.ps1`.
 
 Target command shape:
 
@@ -265,7 +265,7 @@ keep their current meanings.
 ### `loopcoder recover`
 
 Reference:
-[`../scripts/recover-and-retry.ps1`](../scripts/recover-and-retry.ps1).
+`scripts/recover-and-retry.ps1`.
 
 Target command shape:
 
@@ -304,7 +304,7 @@ The command must continue to adopt an existing issue PR before retrying.
 
 ### `loopcoder verify-local`
 
-Reference: [`../scripts/verify-local.ps1`](../scripts/verify-local.ps1).
+Reference: `scripts/verify-local.ps1`.
 
 Target command shapes:
 
