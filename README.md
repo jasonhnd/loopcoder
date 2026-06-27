@@ -2,202 +2,108 @@
 
 # loopcoder
 
-An autonomous delivery loop - ROADMAP in, shipped code out
+**Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Version](https://img.shields.io/badge/version-v0.2.0-brightgreen.svg)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
+[![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/go-migration.md)
 
-[What it is](#what-it-is) . [How the loop works](#how-the-loop-works) . [Install](#install) . [Design](#design)
+[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
 ## What it is
 
-loopcoder removes the human relay between Opus, GitHub, Codex, and PR review.
-Today, a person often has to turn a need into issues, post them to GitHub,
-start Codex workers, copy PR results back to Opus, review the output, and merge
-the result.
+loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches Codex workers in isolated git worktrees, opens pull requests, has Opus review them, and leaves the merge to you.
 
-With loopcoder, one chat drives the loop:
+It kills the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. You stay the merge authority.
 
-```text
-need -> issues + DAG -> approve -> codex workers in worktrees -> PRs -> Opus review -> merge in chat
+## The loop
+
+```mermaid
+flowchart LR
+  need([your need]) --> plan[plan issues + DAG]
+  plan --> dispatch[dispatch workers<br/>git worktree -> codex]
+  dispatch --> pr[pull requests]
+  pr --> review[Opus review<br/>+ required checks]
+  review --> gate{{you merge}}
+  gate -. next layer .-> plan
 ```
 
-The v1 conductor is the Opus chat session itself. It plans a small batch,
-publishes approved GitHub issues, dispatches background workers, reviews each
-PR, reports progress in the same chat, and merges only the PRs the user names.
+The conductor is Opus in Claude Code; the worker is Codex; the gate is you.
 
-In v0.2.0, the mechanical backend is a single native Go `loopcoder` binary. It
-replaces the PowerShell helper layer so loopcoder can run on macOS, Linux, and
-Windows without a PowerShell dependency. The Opus conductor in [`SKILL.md`](SKILL.md)
-is unchanged: the binary is the worktree, Codex, PR, state, resume, and recovery
-backend it calls.
+## What it looks like
 
-## How the loop works
-
-loopcoder is a Claude Code skill plus a native helper CLI, not a separate
-daemon. The design is ports and adapters: the loop core speaks stable
-interfaces, while v1 binds those interfaces to GitHub, git worktrees, Codex,
-Opus, `gh`, the `loopcoder` binary, and chat.
-
-The conductor is the Opus session following [`SKILL.md`](SKILL.md). It reads
-`.delivery.yml`, drafts the issue dependency DAG, keeps a compact state table,
-dispatches ready work, verifies PRs, and reports progress.
-
-loopcoder uses a doc-first process: write and merge the design or spec under
-`docs/` first, implement from that merged document in a separate issue, then
-verify the result against the document.
-
-The worker backend is `loopcoder dispatch`. It creates a fresh git worktree,
-runs headless `codex exec`, commits and pushes the result, and opens a pull
-request. The Worker port is provider-pluggable by design; v1 ships the `codex`
-adapter, with other direct-CLI adapters deferred. Model and speed are knobs only
-when you choose them. By default the worker passes no model or reasoning-effort
-flags, inherits your Codex config, and loopcoder never chooses them for you.
-
-The dependency DAG drives scheduling: independent ready work can run in
-parallel, real code dependencies stay serial until upstream PRs merge, and file
-overlap is observed at merge time from the actual PR diffs.
-
-The v1 ports are:
-
-| Port | v1 adapter |
-| --- | --- |
-| WorkItemSource | GitHub issues via `gh` |
-| Workspace | `git worktree` |
-| Worker | `codex` via `loopcoder dispatch` |
-| VcsHost | GitHub PRs, checks, and merges via `gh` |
-| Verifier | Opus review in chat |
-| Gate | human-merge; never auto-merge |
-| Reporter | the same Opus chat |
+Illustrative:
 
 ```text
-User need
-    |
-    v
-Opus conductor (SKILL.md)
-    |
-    v
-Issues + dependency DAG
-    |
-    v
-Human approval
-    |
-    v
-GitHub issues
-    |
-    v
-Ready issue(s)
-    |
-    v
-loopcoder dispatch / dispatch-wave
-    |
-    v
-git worktree + codex worker
-    |
-    v
-Pull request
-    |
-    v
-Opus verifier + gh checks
-    |
-    v
-Chat report -> user names PRs -> gh pr merge
+you   > /loopcoder add a /healthz endpoint and a test, behind a feature flag
+loop  > plan: #41 endpoint, #42 test (blocked-by #41). dispatch the ready set? [y]
+loop  > #41 -> worktree -> codex -> PR #43   checks green   verdict: pass
+loop  > #41 merged; #42 ready -> PR #44   verdict: pass
+loop  > done. 2 PRs, you merged both, 0 blocked.
 ```
 
 ## Install
 
-loopcoder is a Claude Code skill plus a native helper binary. Invoke the
-conductor from Claude Code with:
-
-```text
-/loopcoder <need>
-```
-
-Install the native backend with:
-
-```text
+```bash
 go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
 ```
 
-The backend expects `git`, `gh`, and `codex` on `PATH`. Put the installed
-`loopcoder` binary on `PATH`, or set `LOOPCODER_BIN` to an explicit binary path.
-The conductor selects `LOOPCODER_BIN` first, then `loopcoder` from `PATH`. This
-native binary backend is required on macOS, Linux, and Windows; PowerShell is
-not used as a backend.
+Prerequisites on `PATH`: `git`, `gh` (authenticated), and `codex`.
 
-The binary commands are:
+Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
-- `loopcoder dispatch`
-- `loopcoder ready-set`
-- `loopcoder dispatch-wave`
-- `loopcoder resume`
-- `loopcoder recover`
-- `loopcoder verify-local`
-- `loopcoder state`
-- `loopcoder lease`
+## Usage
 
-For a global install, copy or symlink this repo to:
+- In Claude Code: `/loopcoder <your need>` -- the Opus conductor plans, dispatches, reviews, and reports; you name what to merge.
+- The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
 
-```text
-~/.claude/skills/loopcoder/
+```bash
+loopcoder ready-set     --repo .                  # classify ready vs blocked work
+loopcoder dispatch-wave --repo .                  # dispatch the current ready wave
+loopcoder resume        --repo .                  # reconcile a run after an interruption
+loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>   # bounded retry of a failed attempt
+loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check commands on a PR
 ```
 
-Install automation is on the roadmap.
+## How it works
 
-## Status
+- Conductor: Opus, in Claude Code. It plans issues, reviews PRs, and reports status. It never writes the code itself.
+- Worker: `loopcoder dispatch` runs Codex for one issue in a fresh, isolated git worktree, then opens a PR.
+- Gate: you merge. loopcoder never auto-merges.
+- Ports and adapters: GitHub work items, git-worktree workspace, Codex worker (provider-pluggable), GitHub PRs and checks, Opus verifier, human-merge gate. Configure them per repo in `.delivery.yml`.
+- Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
+- Cross-platform: one Go binary; Codex runs through a real file-handle stdin instead of shell redirection, and worktree creation is serialized with a cross-platform file lock.
 
-v0.2.0 is the current cross-platform native Go CLI release. The base loop
-remains Opus as the single-session conductor, Codex as the v1 worker, GitHub as
-the work-item and PR host, Opus review, chat reporting, doc-first execution, and
-merge-on-instruction. The change is the mechanical backend: the native
-`loopcoder` binary replaces the PowerShell helper layer as the sole mechanical
-backend on all platforms.
+## Why loopcoder
 
-It implements:
-
-- Native backend: `dispatch`, `ready-set`, `dispatch-wave`, `resume`, `recover`,
-  `verify-local`, `state`, and `lease` commands in one cross-platform Go binary.
-- Verification: a real GitHub Actions `verify` check, required-check gating
-  through `.delivery.yml`, spec-conformance review against the merged design
-  document, and explicit `pass`, `fail`, or `needs-human` verdicts. A PR is not
-  merge-eligible until the conductor has seen the required checks green.
-  Command parity is covered by unit tests plus the CI `go` gate; the binary has
-  also been validated end-to-end by building it and running `loopcoder dispatch`
-  to produce a real PR.
-- Self-improvement: an append-only [`docs/learnings.md`](docs/learnings.md)
-  file with real entries, relevant-learning read guidance, final-run learning
-  review, and a bounded, proposal-only improvement-review pass that remains
-  human-gated.
-- Resilience: local durable run state under `.loopcoder/`, attempt sidecars,
-  heartbeat/progress records, an events log, recovery briefs, bounded retry via
-  `loopcoder recover`, GitHub-first resume/reconcile via `loopcoder resume`, and
-  state/lease operations through the native backend.
-
-The mandatory doc-first process, worker model/speed inheritance,
-dependency-aware scheduling, and human merge gate are active v1 rules. The
-background or cloud conductor tick, browser verification automation, periodic
-self-improvement review, and broader provider adapters remain documented
-targets rather than current behavior.
-
-loopcoder is self-hosting: it has written its own `SKILL.md`, `.delivery.yml`,
-`README.md`, and `ROADMAP.md`.
+- You always merge -- explicit human gate, never auto-merge.
+- Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
+- Doc-first -- code implements a merged design, and review checks conformance to it.
+- A real verification gate -- required CI checks must be green before a PR is merge-eligible; every review ends in `pass`, `fail`, or `needs-human`.
+- Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and `codex`.
+- Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go.
 
 ## Design
 
-- [`DESIGN.md`](DESIGN.md) - north-star autonomous delivery engine design.
-- [`docs/PROCESS.md`](docs/PROCESS.md) - mandatory doc-first workflow.
-- [`docs/architecture.md`](docs/architecture.md) - current v1 architecture and limits.
-- [`docs/go-migration.md`](docs/go-migration.md) - native Go CLI migration design.
-- [`docs/worker.md`](docs/worker.md) - Codex worker adapter and model/speed knobs.
-- [`docs/usage.md`](docs/usage.md) - install, setup, and end-to-end usage.
-- [`docs/scheduling.md`](docs/scheduling.md) - dependency-aware scheduling design.
-- [`docs/verification.md`](docs/verification.md) - verification gate design.
-- [`docs/self-improvement.md`](docs/self-improvement.md) - bounded learnings loop design.
-- [`docs/resilience.md`](docs/resilience.md) - worker resilience design.
-- [`docs/learnings.md`](docs/learnings.md) - captured learnings.
-- [`docs/specs/2026-06-26-loopcoder-v1-design.md`](docs/specs/2026-06-26-loopcoder-v1-design.md) - v1 design spec.
-- [`docs/specs/`](docs/specs/) - implementation specs.
-- [`docs/BACKLOG.md`](docs/BACKLOG.md) - deferred items and follow-ups.
+- [`docs/PROCESS.md`](docs/PROCESS.md) -- mandatory doc-first workflow.
+- [`docs/architecture.md`](docs/architecture.md) -- current architecture and limits.
+- [`docs/scheduling.md`](docs/scheduling.md) -- dependency-aware scheduling.
+- [`docs/verification.md`](docs/verification.md) -- required checks and verifier verdicts.
+- [`docs/self-improvement.md`](docs/self-improvement.md) -- bounded, human-gated learning loop.
+- [`docs/resilience.md`](docs/resilience.md) -- worker state, resume, recovery, and retry.
+- [`docs/orchestration.md`](docs/orchestration.md) -- ready-set and dispatch-wave orchestration.
+- [`docs/go-migration.md`](docs/go-migration.md) -- native Go backend migration.
+- [`docs/usage.md`](docs/usage.md) -- setup and end-to-end usage.
+- [`docs/learnings.md`](docs/learnings.md) -- append-only operational learnings.
+- [`CHANGELOG.md`](CHANGELOG.md) -- release history.
+
+## Status
+
+v0.2.0 is the current cross-platform native Go CLI: Opus conductor, Codex worker, human-merge gate, doc-first workflow, and real self-hosting. Some pieces remain documented targets rather than current behavior, including a background or cloud conductor tick and broader provider adapters.
+
+## License
+
+[MIT](LICENSE)
