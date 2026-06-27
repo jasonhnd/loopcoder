@@ -26,9 +26,37 @@ this loop.
 - Invocation is `/loopcoder <need>`, or automatic activation when the user states a delivery/build request.
 - The Opus chat session is the conductor/runtime. Keep it open while the loop runs; workers may run in the background.
 - Read `.delivery.yml` as the per-repo config when present; see spec section 6. It declares adapters and defaults such as worker provider, base branch, checks, gate, and report channel. If it is absent, use the v1 defaults from the spec.
-- Do not implement work items in the conductor. Dispatch implementation through `scripts/dispatch-worker.ps1`; that script owns worktree -> codex -> commit -> push -> PR.
+- Do not implement work items in the conductor. Dispatch implementation through
+  the selected mechanical backend (`loopcoder dispatch`; Windows fallback:
+  `scripts/dispatch-worker.ps1`); that backend owns worktree -> codex ->
+  commit -> push -> PR.
 - Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
+
+## Backend selection
+
+Per [`docs/go-migration.md`](docs/go-migration.md), Phase 5 switches the
+conductor's mechanical backend to the native `loopcoder` binary. The conductor
+still owns planning, review, reporting, doc-first ordering, observe-at-merge
+ordering, and the human merge gate; only the helper command names change.
+
+Select exactly one backend before calling a helper:
+
+1. If `LOOPCODER_BIN` is set, call that path.
+2. Else if `loopcoder` is on `PATH`, call `loopcoder`.
+3. Else, on Windows only, if the `scripts/*.ps1` helpers are present, call the
+   PowerShell fallback scripts.
+4. Else report that the native `loopcoder` binary is required.
+
+The binary is preferred everywhere. macOS and Linux require the binary; do not
+require `pwsh` there. Never call both the binary and the PowerShell fallback
+for one mutating operation. The `.ps1` scripts remain a Windows fallback for one
+release window and will be deprecated in a later doc-first PR; do not remove
+them as part of backend selection.
+
+Keep model and effort omitted unless the user explicitly requested them. When a
+one-off override is explicit, pass it through to the selected backend for that
+run only.
 
 ## Learnings (self-improvement)
 
@@ -121,7 +149,13 @@ Bounds and scrutiny:
 - DEFAULT: pass no model or effort flags; inherit the user's codex config (`~/.codex/config.toml`). Never auto-pick a model or effort per issue.
 - TRANSPARENCY: in the plan, show the worker line as `worker: codex (your global codex setting)` so the user sees what will run without being asked.
 - RECOMMENDATION ONLY: you may add one short passive hint, such as `tip: say use high for faster runs`. It is never auto-applied, and if the user says to stop suggesting, stop including the hint.
-- OVERRIDE ONLY ON EXPLICIT REQUEST: for a one-off request such as `run these faster` or `#B use max`, pass `-Effort` and/or `-Model` to `scripts/dispatch-worker.ps1` for that run only. For a permanent request such as `from now on default to high`, only then write `worker.reasoning_effort` and/or `worker.model` into `.delivery.yml`.
+- OVERRIDE ONLY ON EXPLICIT REQUEST: for a one-off request such as `run these
+  faster` or `#B use max`, pass `--effort` and/or `--model` to `loopcoder
+  dispatch` / `loopcoder dispatch-wave` for that run only. On the Windows
+  fallback, pass `-Effort` and/or `-Model` to
+  `scripts/dispatch-worker.ps1`. For a permanent request such as `from now on
+  default to high`, only then write `worker.reasoning_effort` and/or
+  `worker.model` into `.delivery.yml`.
 - Never write to `.delivery.yml` or change model/effort without an explicit user statement. The config must only ever reflect what the user has said.
 - Natural-language effort mapping: `fast`/`quick` -> `low`; `balanced` -> `medium`; `thorough`/`max`/`highest` -> `xhigh`; `high` -> `high`.
 
@@ -158,16 +192,35 @@ Bounds and scrutiny:
 
 4. Dispatch ready issues.
    - Follow the layered ready-set scheduler in [`docs/scheduling.md`](docs/scheduling.md).
+   - Compute the ready set with `loopcoder ready-set --repo . --base-branch <base-branch> --run-id <run-id> --format text` (Windows fallback: `scripts/ready-set.ps1`).
    - A ready issue is an unstarted issue whose `depends_on` entries / `blocked-by:#N` labels are all merged to `main`, not merely open as PRs.
    - Keep the two ordering axes from [`docs/scheduling.md`](docs/scheduling.md) separate: a real code dependency forces serial order, so B waits until A is merged and then branches from `main`; file overlap does not block dispatch.
-   - Dispatch the whole ready set in parallel, then recompute as PRs merge. Repeat until the DAG is drained or blocked.
-   - `scripts/dispatch-worker.ps1` already serializes git worktree creation, so independent ready issues can be dispatched concurrently safely.
-   - Call the existing worker adapter once per ready issue. Do not recreate worktree, Codex, commit, push, or PR logic in the conductor.
+   - Dispatch one ready wave with `loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> ...`, or dispatch one issue with `loopcoder dispatch ...`. Then recompute as PRs merge. Repeat until the DAG is drained or blocked.
+   - `loopcoder dispatch` and `loopcoder dispatch-wave` preserve git worktree creation serialization, so independent ready issues can be dispatched concurrently safely.
+   - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, Codex, commit, push, or PR logic in the conductor.
    - Capture each worker's output, job handle, PR URL, and failure details.
 
    Example shape:
 
+   ```text
+   loopcoder ready-set --repo . --base-branch <base-branch> --run-id <run-id> --format text
+
+   loopcoder dispatch \
+     --repo . \
+     --issue-number <number> \
+     --issue-title "<title>" \
+     --issue-body "<body>" \
+     --base-branch <base-branch> \
+     --provider codex
+
+   loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> --issue-numbers <n1>,<n2>
+   ```
+
+   Windows fallback:
+
    ```powershell
+   pwsh scripts/ready-set.ps1 -Repo . -BaseBranch <base-branch> -RunId <run-id> -Format text
+
    pwsh scripts/dispatch-worker.ps1 `
      -Repo . `
      -IssueNumber <number> `
@@ -215,7 +268,8 @@ v0.1.2 keep verification inside the conductor playbook.
   still-pending required check means the PR is not merge-eligible.
 - Local command gates: for a code PR, in addition to hosted checks and spec
   conformance, the verifier may run
-  `scripts/verify-local.ps1 -Repo <repo> -PrNumber <pr>` to execute the
+  `loopcoder verify-local --repo <repo> --pr-number <pr>` (Windows fallback:
+  `scripts/verify-local.ps1 -Repo <repo> -PrNumber <pr>`) to execute the
   configured local command gates from `.delivery.yml` `ci.tests`,
   `ci.typecheck`, and `ci.build`, as described in
   [`docs/verification.md`](docs/verification.md). Fold its explicit
@@ -245,8 +299,8 @@ v0.1.2 keep verification inside the conductor playbook.
 ## Worker liveness & recovery
 
 Follow the resilience contract in [`docs/resilience.md`](docs/resilience.md).
-The conductor passes a stable `-RunId` to `scripts/dispatch-worker.ps1` for all
-dispatches in one batch so those attempts share
+The conductor passes a stable `--run-id` to `loopcoder dispatch` or `loopcoder
+dispatch-wave` for all dispatches in one batch so those attempts share
 `.loopcoder/runs/<RunId>/` under the main repo.
 
 Durable run state currently consists of
@@ -265,13 +319,15 @@ remain the source of truth for delivery state.
 - Idle is not done: a worker that exits with no branch, PR, or concrete
   deliverable is a retryable failure, not success. Verify a deliverable through
   the branch, PR, and required checks before counting an issue done.
-- Recovery briefs: on adapter failure, `scripts/dispatch-worker.ps1` writes a
+- Recovery briefs: on adapter failure, `loopcoder dispatch` writes a
   context brief under `.loopcoder/runs/<RunId>/recovery/<job_id>-context.md`
   with issue, branch, worktree, log, summary, attempt, phase, status, error,
   changed files, log tail, and PR lookup details. Use it as the concrete
   recovery context described in [`docs/resilience.md`](docs/resilience.md).
 - Bounded retry: recover failed, hung, or idle attempts through
-  `scripts/recover-and-retry.ps1`. It adopts an existing PR first; otherwise it
+  `loopcoder recover --repo <repo> --issue-number <n> --issue-title "<title>"
+  --issue-body "<body>" --run-id <run-id>` (Windows fallback:
+  `scripts/recover-and-retry.ps1`). It adopts an existing PR first; otherwise it
   re-dispatches with the latest recovery brief up to
   `resilience.worker.max_attempts`, using
   `resilience.worker.retry_backoff_seconds`, and blocks after the limit with
@@ -281,11 +337,16 @@ remain the source of truth for delivery state.
   liveness only and must not cause duplicate dispatch when GitHub already has a
   deliverable.
 - Resume command: before dispatching anything after an interruption, run
-  `scripts/resume.ps1 -Repo <repo> -RunId <run>` (omit `-RunId` to select the
-  latest local run). The report follows [`docs/resilience.md`](docs/resilience.md):
+  `loopcoder resume --repo <repo> --run-id <run>` (omit `--run-id` to select the
+  latest local run; Windows fallback: `scripts/resume.ps1 -Repo <repo> -RunId
+  <run>`). The report follows [`docs/resilience.md`](docs/resilience.md):
   GitHub is the source of truth, `.loopcoder` state is advisory, and resume
   prints next ready actions but never auto-dispatches, pushes, merges, or adopts
   a local attempt without conductor/human review.
+- Cross-session state and conductor lease operations use the native backend:
+  `loopcoder state push`, `loopcoder state pull`, `loopcoder lease acquire`,
+  and `loopcoder lease release`. Treat lease operations as mutating operations:
+  select one backend path and do not mix helper implementations.
 
 ## Recovery Notes
 
