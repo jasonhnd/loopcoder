@@ -95,7 +95,7 @@ moved into the codex adapter under the new abstraction. The hard reject at
 | prompt delivery | positional or stdin (`-`) | positional or stdin | `-p` arg or stdin |
 | working dir | `-C`/`--cd <dir>` | process cwd + `--add-dir` | process cwd + `--include-directories` |
 | write/yolo | `--dangerously-bypass-approvals-and-sandbox` | `--dangerously-skip-permissions` | `-y`/`--yolo` (or `--approval-mode yolo`) |
-| **read-only** | `-s read-only` | `--permission-mode plan` | `--approval-mode plan` |
+| **read-only** | `-s read-only` | `--allowedTools "Read Grep Glob"` | `tools.core: []` settings override + `--extensions none` |
 | model | `-m` | `--model` | `-m` |
 | reasoning effort | `-c model_reasoning_effort=<x>` | `--effort <low..max>` | (none — ignored) |
 | final-message capture | `-o <file>` | `--output-format json` (stdout) | `--output-format json` (stdout) |
@@ -144,10 +144,12 @@ worker that produced the PR.
 - **Command:** `loopcoder loopreview --repo <path> --pr-number <n> --provider <V>
   [--base-branch main]`.
 - **Execution model: read-only worktree checkout** of the PR branch (reuse the
-  worktree machinery in `internal/worker` / `internal/gitutil`). The agent sees the
-  full post-change tree and may read/run checks, but runs in each provider's
-  **read-only mode** (`-s read-only` / `--permission-mode plan` / `--approval-mode
-  plan`) so it cannot mutate or push.
+  worktree machinery in `internal/worker` / `internal/gitutil`). Providers with
+  read-only tools can inspect the full post-change tree, but every verifier runs
+  in a **headless-safe read-only mode** (`-s read-only` / read-only tool allowlist /
+  disabled tools) so it cannot mutate or push. Do not use provider plan modes
+  for headless verifier runs when they wait for interactive approval. The Gemini
+  fallback is prompt-only because its tool-restricted path was not headless-safe.
 - **Inputs to the review prompt:** the PR diff (`gh pr diff <n>` and `--name-only`),
   the issue title/body + acceptance criteria, and the merged design doc referenced by
   the code issue (read from the base branch).

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,7 +24,7 @@ func BuildGeminiArgs(inv Invocation) []string {
 		"--prompt", inv.Prompt,
 	}
 	if inv.ReadOnly {
-		args = append(args, "--approval-mode", "plan")
+		args = append(args, "--skip-trust", "--extensions", "none")
 	} else {
 		args = append(args, "--yolo")
 	}
@@ -49,10 +50,18 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.Effort) != "" {
 		fmt.Fprintf(logFile, "[loopcoder] advisory: gemini ignores effort %q; Gemini CLI has no reasoning-effort knob\n", inv.Effort)
 	}
+	if inv.ReadOnly {
+		if err := os.WriteFile(geminiReadOnlySettingsPath(inv.LogPath), []byte(geminiReadOnlySettings), 0o644); err != nil {
+			return Result{ExitCode: -1}, fmt.Errorf("write gemini read-only settings: %w", err)
+		}
+	}
 
 	var stdout bytes.Buffer
 	cmd := exec.CommandContext(ctx, "gemini", BuildGeminiArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
+	if inv.ReadOnly {
+		cmd.Env = append(os.Environ(), "GEMINI_CLI_SYSTEM_SETTINGS_PATH="+geminiReadOnlySettingsPath(inv.LogPath))
+	}
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
 	cmd.Stderr = logFile
 
@@ -94,3 +103,9 @@ func parseGeminiSummary(stdout []byte) string {
 	}
 	return ""
 }
+
+func geminiReadOnlySettingsPath(logPath string) string {
+	return filepath.Join(filepath.Dir(logPath), "gemini-read-only-settings.json")
+}
+
+const geminiReadOnlySettings = `{"tools":{"core":[]}}`

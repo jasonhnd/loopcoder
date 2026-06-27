@@ -3,6 +3,7 @@ package agent
 import (
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -65,11 +66,13 @@ func TestBuildGeminiArgs(t *testing.T) {
 			name: "read-only argv",
 			inv: Invocation{
 				Prompt:   "do the work",
+				LogPath:  "gemini.log",
 				ReadOnly: true,
 			},
 			want: []string{
 				"--prompt", "do the work",
-				"--approval-mode", "plan",
+				"--skip-trust",
+				"--extensions", "none",
 				"--output-format", "json",
 			},
 		},
@@ -94,6 +97,17 @@ func TestBuildGeminiArgs(t *testing.T) {
 				t.Fatalf("BuildGeminiArgs() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGeminiReadOnlySettingsDisableTools(t *testing.T) {
+	if !strings.Contains(geminiReadOnlySettings, `"tools":{"core":[]}`) {
+		t.Fatalf("geminiReadOnlySettings does not disable tools:\n%s", geminiReadOnlySettings)
+	}
+	for _, forbidden := range []string{"write_file", "replace", "run_shell_command", "read_file", "glob", "grep_search"} {
+		if strings.Contains(geminiReadOnlySettings, forbidden) {
+			t.Fatalf("geminiReadOnlySettings should not enable %q:\n%s", forbidden, geminiReadOnlySettings)
+		}
 	}
 }
 

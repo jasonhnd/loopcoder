@@ -207,6 +207,69 @@ func TestRunUnreadableSpecForcesNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  "diff",
+		files: []string{"file.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{blockUntilCanceled: true}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "claude",
+		BaseBranch: "main",
+		Timeout:    10 * time.Millisecond,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	if !strings.Contains(result.Verdict.Evidence, "claude verifier timed out after 10ms") {
+		t.Fatalf("evidence = %q", result.Verdict.Evidence)
+	}
+	if fakeAgent.ctxErr != context.DeadlineExceeded {
+		t.Fatalf("agent ctxErr = %v, want context deadline exceeded", fakeAgent.ctxErr)
+	}
+}
+
 func runWithAgentSummary(t *testing.T, summary string, showErr error) Result {
 	t.Helper()
 	repo := t.TempDir()
@@ -323,16 +386,23 @@ func (f *loopreviewFakeGitHub) PRDiffNameOnly(context.Context, int) ([]string, e
 }
 
 type loopreviewFakeAgent struct {
-	invocation agent.Invocation
-	summary    string
-	exitCode   int
-	err        error
+	invocation         agent.Invocation
+	summary            string
+	exitCode           int
+	err                error
+	blockUntilCanceled bool
+	ctxErr             error
 }
 
-func (f *loopreviewFakeAgent) Run(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
+func (f *loopreviewFakeAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
 	f.invocation = invocation
 	if err := os.WriteFile(invocation.LogPath, []byte("verifier log\n"), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
+	}
+	if f.blockUntilCanceled {
+		<-ctx.Done()
+		f.ctxErr = ctx.Err()
+		return agent.Result{ExitCode: -1}, f.ctxErr
 	}
 	if f.err != nil {
 		return agent.Result{ExitCode: -1}, f.err

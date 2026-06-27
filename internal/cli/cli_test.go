@@ -73,7 +73,7 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch"} {
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--timeout"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -91,10 +91,11 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"-PrNumber", "152",
 		"-Provider", "claude",
 		"-BaseBranch", "trunk",
+		"-Timeout", "15s",
 	}, &stdout, &stderr, Deps{
 		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			called = true
-			if opts.RepoPath != repo || opts.PRNumber != 152 || opts.Provider != "claude" || opts.BaseBranch != "trunk" {
+			if opts.RepoPath != repo || opts.PRNumber != 152 || opts.Provider != "claude" || opts.BaseBranch != "trunk" || opts.Timeout != 15*time.Second {
 				t.Fatalf("loopreview opts = %#v", opts)
 			}
 			if opts.Stderr == nil {

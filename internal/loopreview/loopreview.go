@@ -27,6 +27,8 @@ const (
 	SpecConformancePass          = "pass"
 	SpecConformanceFail          = "fail"
 	SpecConformanceNotApplicable = "not-applicable"
+
+	DefaultVerifierTimeout = 600 * time.Second
 )
 
 type Options struct {
@@ -34,6 +36,7 @@ type Options struct {
 	PRNumber   int
 	Provider   string
 	BaseBranch string
+	Timeout    time.Duration
 	Stderr     io.Writer
 }
 
@@ -130,6 +133,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
 	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = DefaultVerifierTimeout
+	}
 
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
@@ -166,13 +172,21 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
-	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
+	agentCtx, cancelAgent := context.WithTimeout(ctx, opts.Timeout)
+	defer cancelAgent()
+
+	agentResult, agentErr := runner.Run(agentCtx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       BuildPrompt(opts, inputs),
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
 	})
+	if errors.Is(agentCtx.Err(), context.DeadlineExceeded) {
+		note := fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout))
+		verdict := needsHumanVerdict("error", "", note)
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	}
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr))
 		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
@@ -481,6 +495,13 @@ func needsHumanVerdict(severity, file, note string) Verdict {
 		Evidence:        note,
 		SpecConformance: SpecConformanceNotApplicable,
 	}
+}
+
+func formatTimeout(timeout time.Duration) string {
+	if timeout%time.Second == 0 {
+		return fmt.Sprintf("%ds", int(timeout/time.Second))
+	}
+	return timeout.String()
 }
 
 func ExitCodeForVerdict(verdict string) int {
