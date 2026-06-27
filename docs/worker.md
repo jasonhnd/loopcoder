@@ -14,6 +14,27 @@ attempt state, recovery briefs, and cleanup.
 `codex` only edits files in the fresh worktree. It does not commit, push, or
 open the PR.
 
+## Supported worker providers
+
+As of 0.3.0 the worker is provider-pluggable. The adapter step is delegated to a
+provider registry, and three providers are registered:
+
+- `codex` (default)
+- `claude`
+- `gemini`
+
+The provider is selected per dispatch with the `--provider` flag and defaults to
+`codex`. The registry rejects any unknown provider with an actionable error.
+
+`--model` and `--effort` are provider-specific. `codex` and `claude` honor the
+reasoning-effort knob; `gemini` has no effort knob, so `--effort` is ignored for
+it (logged once, not an error). As always, loopcoder passes these only when the
+caller sets them and otherwise inherits each provider's own configuration.
+
+For the full design — roles, the provider abstraction, and per-provider adapter
+facts — see
+[`specs/2026-06-27-multi-provider-roles-design.md`](specs/2026-06-27-multi-provider-roles-design.md).
+
 ## Flow
 
 For one issue, `loopcoder dispatch` runs these steps in order:
