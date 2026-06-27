@@ -352,7 +352,7 @@ func BuildPrompt(opts PromptOptions) string {
 # Rules
 - Implement the change so the issue is satisfied. Keep it minimal and follow existing conventions in the repo.
 - You may read files and run commands, but do NOT run git commit or git push — the harness commits and opens the PR.
-- When finished, print a 2-4 sentence summary of exactly what you changed.
+- When finished, print a 2-4 sentence final summary in English describing exactly what you changed.
 `, opts.IssueNumber, opts.Branch, opts.IssueTitle, opts.IssueBody)
 
 	if strings.TrimSpace(opts.RecoveryContext) != "" {
