@@ -16,8 +16,15 @@ func BuildCodexArgs(inv Invocation) []string {
 	args := []string{
 		"exec",
 		"--cd", inv.WorktreePath,
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--skip-git-repo-check",
+	}
+	if inv.ReadOnly {
+		args = append(args, "-s", "read-only")
+	} else {
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	}
+	args = append(args, "--skip-git-repo-check")
+	if strings.TrimSpace(inv.OutputSchema) != "" {
+		args = append(args, "--output-schema", inv.OutputSchema)
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "-m", inv.Model)
