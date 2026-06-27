@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -39,12 +40,18 @@ type Deps struct {
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
+	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
+	{Name: "state", Summary: "publish or pull durable run state"},
+	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
@@ -79,6 +86,18 @@ func DefaultDeps() Deps {
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
 		},
+		StatePush: func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
+			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
+		},
+		StatePull: func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error) {
+			return statebranch.Pull(ctx, opts, statebranch.DefaultDeps())
+		},
+		LeaseAcquire: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			return statebranch.Acquire(ctx, opts, statebranch.DefaultDeps())
+		},
+		LeaseRelease: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
+		},
 	}
 }
 
@@ -107,6 +126,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "state" {
+		return runState(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "lease" {
+		return runLease(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "dispatch" {
 		return runDispatch(args[1:], stdout, stderr, deps)
@@ -143,6 +168,15 @@ func PrintRootHelp(w io.Writer) {
 
 // PrintCommandHelp writes help for one registered command.
 func PrintCommandHelp(w io.Writer, command Command) {
+	if command.Name == "state" {
+		printStateHelp(w)
+		return
+	}
+	if command.Name == "lease" {
+		printLeaseHelp(w)
+		return
+	}
+
 	fmt.Fprintf(w, "Usage:\n  loopcoder %s [flags]\n\n", command.Name)
 	fmt.Fprintf(w, "%s\n\n", sentenceCase(command.Summary))
 	fmt.Fprintln(w, "Flags:")
@@ -207,6 +241,37 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	fmt.Fprintln(w, "  --help    show command help")
 }
 
+func printStateHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder state push --repo <path> --run-id <id> [flags]")
+	fmt.Fprintln(w, "  loopcoder state pull --repo <path> [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Publish or pull durable run state on the dedicated state branch.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string      repository path (required)")
+	fmt.Fprintln(w, "  --run-id string    run id for push")
+	fmt.Fprintf(w, "  --branch string    state branch (default %q)\n", statebranch.DefaultBranch)
+	fmt.Fprintf(w, "  --remote string    git remote (default %q)\n", statebranch.DefaultRemote)
+	fmt.Fprintln(w, "  --help             show command help")
+}
+
+func printLeaseHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder lease acquire --repo <path> --run-id <id> [flags]")
+	fmt.Fprintln(w, "  loopcoder lease release --repo <path> --run-id <id> [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Acquire, renew, observe, or release the best-effort conductor lease.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string      repository path (required)")
+	fmt.Fprintln(w, "  --run-id string    run id (required)")
+	fmt.Fprintf(w, "  --ttl int          lease TTL seconds for acquire (default %d)\n", statebranch.DefaultTTLSeconds)
+	fmt.Fprintf(w, "  --branch string    state branch (default %q)\n", statebranch.DefaultBranch)
+	fmt.Fprintf(w, "  --remote string    git remote (default %q)\n", statebranch.DefaultRemote)
+	fmt.Fprintln(w, "  --help             show command help")
+}
+
 func findCommand(name string) (Command, bool) {
 	for _, command := range commands {
 		if command.Name == name {
@@ -225,6 +290,333 @@ func sentenceCase(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:] + "."
+}
+
+func runState(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "state: expected push or pull")
+		printStateHelp(stderr)
+		return 2
+	}
+	switch args[0] {
+	case "push":
+		return runStatePush(args[1:], stdout, stderr, deps)
+	case "pull":
+		return runStatePull(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "state: unknown subcommand %q\n", args[0])
+		printStateHelp(stderr)
+		return 2
+	}
+}
+
+func runStatePush(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.StatePush == nil {
+		deps.StatePush = DefaultDeps().StatePush
+	}
+
+	fs := flag.NewFlagSet("state push", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts statebranch.PushOptions
+	var repoAlias string
+	var runIDAlias string
+	var branchAlias string
+	var remoteAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.RunID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&opts.Branch, "branch", statebranch.DefaultBranch, "state branch")
+	fs.StringVar(&branchAlias, "Branch", "", "state branch")
+	fs.StringVar(&opts.Remote, "remote", statebranch.DefaultRemote, "git remote")
+	fs.StringVar(&remoteAlias, "Remote", "", "git remote")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if runIDAlias != "" {
+		opts.RunID = runIDAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if remoteAlias != "" {
+		opts.Remote = remoteAlias
+	}
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "state push: --repo is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.RunID) == "" {
+		fmt.Fprintln(stderr, "state push: --run-id is required")
+		return 2
+	}
+
+	result, err := deps.StatePush(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "state push: %v\n", err)
+		return 1
+	}
+	renderStatePush(stdout, result)
+	return 0
+}
+
+func runStatePull(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.StatePull == nil {
+		deps.StatePull = DefaultDeps().StatePull
+	}
+
+	fs := flag.NewFlagSet("state pull", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts statebranch.PullOptions
+	var repoAlias string
+	var branchAlias string
+	var remoteAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.Branch, "branch", statebranch.DefaultBranch, "state branch")
+	fs.StringVar(&branchAlias, "Branch", "", "state branch")
+	fs.StringVar(&opts.Remote, "remote", statebranch.DefaultRemote, "git remote")
+	fs.StringVar(&remoteAlias, "Remote", "", "git remote")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if remoteAlias != "" {
+		opts.Remote = remoteAlias
+	}
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "state pull: --repo is required")
+		return 2
+	}
+
+	result, err := deps.StatePull(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "state pull: %v\n", err)
+		return 1
+	}
+	renderStatePull(stdout, result)
+	return 0
+}
+
+func runLease(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "lease: expected acquire or release")
+		printLeaseHelp(stderr)
+		return 2
+	}
+	switch args[0] {
+	case "acquire":
+		return runLeaseAcquire(args[1:], stdout, stderr, deps)
+	case "release":
+		return runLeaseRelease(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "lease: unknown subcommand %q\n", args[0])
+		printLeaseHelp(stderr)
+		return 2
+	}
+}
+
+func runLeaseAcquire(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.LeaseAcquire == nil {
+		deps.LeaseAcquire = DefaultDeps().LeaseAcquire
+	}
+
+	fs := flag.NewFlagSet("lease acquire", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts statebranch.LeaseOptions
+	var repoAlias string
+	var runIDAlias string
+	var branchAlias string
+	var remoteAlias string
+	var ttlSeconds int
+	var ttlAlias int
+	var ttlUpperAlias int
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.RunID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&opts.Branch, "branch", statebranch.DefaultBranch, "state branch")
+	fs.StringVar(&branchAlias, "Branch", "", "state branch")
+	fs.StringVar(&opts.Remote, "remote", statebranch.DefaultRemote, "git remote")
+	fs.StringVar(&remoteAlias, "Remote", "", "git remote")
+	fs.IntVar(&ttlSeconds, "ttl", statebranch.DefaultTTLSeconds, "ttl seconds")
+	fs.IntVar(&ttlAlias, "Ttl", 0, "ttl seconds")
+	fs.IntVar(&ttlUpperAlias, "TTL", 0, "ttl seconds")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if runIDAlias != "" {
+		opts.RunID = runIDAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if remoteAlias != "" {
+		opts.Remote = remoteAlias
+	}
+	if ttlAlias != 0 {
+		ttlSeconds = ttlAlias
+	}
+	if ttlUpperAlias != 0 {
+		ttlSeconds = ttlUpperAlias
+	}
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "lease acquire: --repo is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.RunID) == "" {
+		fmt.Fprintln(stderr, "lease acquire: --run-id is required")
+		return 2
+	}
+	if ttlSeconds < 0 {
+		fmt.Fprintln(stderr, "lease acquire: --ttl must be non-negative")
+		return 2
+	}
+	opts.TTL = time.Duration(ttlSeconds) * time.Second
+
+	result, err := deps.LeaseAcquire(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "lease acquire: %v\n", err)
+		return 1
+	}
+	renderLease(stdout, "LEASE ACQUIRE", result)
+	return 0
+}
+
+func runLeaseRelease(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.LeaseRelease == nil {
+		deps.LeaseRelease = DefaultDeps().LeaseRelease
+	}
+
+	fs := flag.NewFlagSet("lease release", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts statebranch.LeaseOptions
+	var repoAlias string
+	var runIDAlias string
+	var branchAlias string
+	var remoteAlias string
+
+	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.RunID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&opts.Branch, "branch", statebranch.DefaultBranch, "state branch")
+	fs.StringVar(&branchAlias, "Branch", "", "state branch")
+	fs.StringVar(&opts.Remote, "remote", statebranch.DefaultRemote, "git remote")
+	fs.StringVar(&remoteAlias, "Remote", "", "git remote")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if opts.RepoPath == "" {
+		opts.RepoPath = repoAlias
+	}
+	if runIDAlias != "" {
+		opts.RunID = runIDAlias
+	}
+	if branchAlias != "" {
+		opts.Branch = branchAlias
+	}
+	if remoteAlias != "" {
+		opts.Remote = remoteAlias
+	}
+	if strings.TrimSpace(opts.RepoPath) == "" {
+		fmt.Fprintln(stderr, "lease release: --repo is required")
+		return 2
+	}
+	if strings.TrimSpace(opts.RunID) == "" {
+		fmt.Fprintln(stderr, "lease release: --run-id is required")
+		return 2
+	}
+
+	result, err := deps.LeaseRelease(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "lease release: %v\n", err)
+		return 1
+	}
+	renderLease(stdout, "LEASE RELEASE", result)
+	return 0
+}
+
+func renderStatePush(w io.Writer, result statebranch.PushResult) {
+	fmt.Fprintln(w, "STATE PUSH")
+	fmt.Fprintf(w, "Repo: %s\n", result.RepoPath)
+	fmt.Fprintf(w, "RunId: %s\n", result.RunID)
+	fmt.Fprintf(w, "Branch: %s\n", result.Branch)
+	fmt.Fprintf(w, "Remote: %s\n", result.Remote)
+	fmt.Fprintf(w, "Committed: %t\n", result.Committed)
+	if result.Pushed {
+		fmt.Fprintln(w, "Push: succeeded")
+	} else if result.PushError != "" {
+		fmt.Fprintf(w, "Push: failed; local state branch commit retained for retry: %s\n", result.PushError)
+	} else {
+		fmt.Fprintln(w, "Push: skipped")
+	}
+	fmt.Fprintf(w, "Files: %d\n", len(result.Files))
+}
+
+func renderStatePull(w io.Writer, result statebranch.PullResult) {
+	fmt.Fprintln(w, "STATE PULL")
+	fmt.Fprintf(w, "Repo: %s\n", result.RepoPath)
+	fmt.Fprintf(w, "Branch: %s\n", result.Branch)
+	fmt.Fprintf(w, "Remote: %s\n", result.Remote)
+	fmt.Fprintf(w, "Mirror: %s\n", result.MirrorPath)
+	fmt.Fprintf(w, "Runs: %d\n", len(result.Runs))
+	for _, runID := range result.Runs {
+		fmt.Fprintf(w, "- %s\n", runID)
+	}
+}
+
+func renderLease(w io.Writer, title string, result statebranch.LeaseResult) {
+	fmt.Fprintln(w, title)
+	fmt.Fprintf(w, "Repo: %s\n", result.RepoPath)
+	fmt.Fprintf(w, "RunId: %s\n", result.RunID)
+	fmt.Fprintf(w, "Branch: %s\n", result.Branch)
+	fmt.Fprintf(w, "Status: %s\n", result.Status)
+	if result.ObserveOnly {
+		fmt.Fprintln(w, "Observe only: true")
+	}
+	lease := result.Lease
+	if lease == nil {
+		lease = result.PreviousLease
+	}
+	if lease != nil {
+		fmt.Fprintf(w, "LeaseId: %s\n", lease.LeaseID)
+		fmt.Fprintf(w, "Host: %s\n", lease.Host)
+		fmt.Fprintf(w, "PID: %d\n", lease.PID)
+		if lease.LeaseExpiresAt != "" {
+			fmt.Fprintf(w, "ExpiresAt: %s\n", lease.LeaseExpiresAt)
+		}
+	}
+	if result.Pushed {
+		fmt.Fprintln(w, "Push: succeeded")
+	} else if result.PushError != "" {
+		fmt.Fprintf(w, "Push: failed: %s\n", result.PushError)
+	}
+	if result.Message != "" {
+		fmt.Fprintf(w, "Message: %s\n", result.Message)
+	}
 }
 
 func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
