@@ -54,7 +54,7 @@ The core knows nothing about GitHub, Codex, or git — only the port interfaces 
 |---|---|---|
 | **WorkItemSource** | `list()` / `create()` / `setStatus()` over WorkItem | GitHub issues via `gh` |
 | **Workspace** | `create(item, baseBranch) -> {path,branch}`; `cleanup()` | `git worktree` (branch off `main`) |
-| **Worker** | `implement(item, ws, provider) -> {ok, summary, changedFiles[]}` | **`codex exec`** via PowerShell, run in the **background** (v1). Provider-pluggable: M3 adds `gemini`/`claude`/`openai` as **direct-CLI adapters**. Not via paseo. |
+| **Worker** | `implement(item, ws, provider) -> {ok, summary, changedFiles[]}` | **`codex exec`** via PowerShell, run in the **background** (v1). Provider-pluggable: M3 adds `gemini`/`claude`/`openai` as **direct-CLI adapters**. Not through a runtime-bound worker agent. |
 | **VcsHost** | `openChange(ws,item) -> {pr,url}`; `checks(pr) -> status`; `merge(pr)` | `gh pr create` / `gh pr checks` / `gh pr merge` |
 | **Verifier** | `verify(change,item) -> {pass, notes, needsHuman}` | Opus reads diff + checks — **different model than Worker** |
 | **Gate** | `decide(change,verdict) -> merge \| report \| escalate` | **report to chat; the human names PRs to merge and Opus runs `gh pr merge` for them — no leaving the chat, never auto-merges without the user's word** |
@@ -99,7 +99,7 @@ report:
 - **M3:** multi-provider Worker (`gemini`/`claude`/`openai` direct-CLI adapters by config) + Gate policies (the "open the site to verify" visual/human gate; richer Verifier).
 
 ## 10. Non-goals (v1 — YAGNI)
-- No cron/daemon, no **paseo**, no auto-merge, no phone approval, no risk-policy engine.
+- No cron/daemon, no runtime-specific worker-agent dependency, no auto-merge, no phone approval, no risk-policy engine.
 - **No per-issue model routing**, **no ensemble**.
 - One adapter per port — **except the Worker port** (multi-provider, but only `codex` in v1).
 - No support for large unattended roadmaps (see §8 — that is v2).
@@ -110,7 +110,7 @@ report:
 3. **No auto-merge** — Opus opens + reviews PRs and **merges only the ones you name, via `gh pr merge`, from the chat** (you never open GitHub to merge).
 4. The dependency DAG is proposed by Opus at approval time, not inferred silently.
 5. Ports defined now (choice **B**); one adapter per port, **except Worker**.
-6. **Multi-LLM = Worker-port concern:** provider config-selectable; v1 ships `codex` only; `gemini`/`claude`/`openai` are added as **direct-CLI** adapters in M3 — **not** via paseo.
+6. **Multi-LLM = Worker-port concern:** provider config-selectable; v1 ships `codex` only; `gemini`/`claude`/`openai` are added as **direct-CLI** adapters in M3 — not through a runtime-bound worker agent.
 7. **Model-diverse review** via the Worker ≠ Verifier split; both roles' providers are selectable.
 8. Invocation = `/loopcoder` **or** auto-activation; a repo `CLAUDE.md` line can make it the default.
 9. v1 is **small-batch / single-session**; large unattended roadmaps wait for a v2 background conductor (§8).
