@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -66,10 +66,6 @@ type GitHubClient interface {
 	ListHeadPRs(ctx context.Context, branch string) ([]gh.PullRequestReference, error)
 }
 
-type CodexRunner interface {
-	Run(ctx context.Context, invocation CodexInvocation) (int, error)
-}
-
 type Lock interface {
 	Release() error
 }
@@ -77,7 +73,7 @@ type Lock interface {
 type Deps struct {
 	Git         GitClient
 	GitHub      func(repoPath string) GitHubClient
-	Codex       CodexRunner
+	AgentLookup func(provider string) (agent.Runner, error)
 	AcquireLock func(repoPath string, timeout time.Duration) (Lock, error)
 	Now         func() time.Time
 	PID         func() int
@@ -85,24 +81,13 @@ type Deps struct {
 	RemoveAll   func(path string) error
 }
 
-type CodexInvocation struct {
-	WorktreePath string
-	PromptPath   string
-	SummaryPath  string
-	LogPath      string
-	Model        string
-	Effort       string
-}
-
-type ExecCodexRunner struct{}
-
 func DefaultDeps() Deps {
 	return Deps{
 		Git: gitutil.New(),
 		GitHub: func(repoPath string) GitHubClient {
 			return gh.New(repoPath)
 		},
-		Codex: ExecCodexRunner{},
+		AgentLookup: agent.Lookup,
 		AcquireLock: func(repoPath string, timeout time.Duration) (Lock, error) {
 			return lockfile.Acquire(repoPath, timeout)
 		},
@@ -129,8 +114,12 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if strings.TrimSpace(opts.Provider) == "" {
 		opts.Provider = "codex"
 	}
-	if opts.Provider != "codex" {
-		return Result{}, fmt.Errorf("unsupported provider %q", opts.Provider)
+	agentRunner, lookupErr := deps.AgentLookup(opts.Provider)
+	if lookupErr != nil {
+		return Result{}, lookupErr
+	}
+	if agentRunner == nil {
+		return Result{}, fmt.Errorf("provider %q resolved to nil runner", opts.Provider)
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
@@ -267,33 +256,30 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	codexExitCode, codexErr := deps.Codex.Run(ctx, CodexInvocation{
+	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
-		PromptPath:   promptPath,
-		SummaryPath:  summaryPath,
+		Prompt:       prompt,
 		LogPath:      logPath,
 		Model:        opts.Model,
 		Effort:       opts.Effort,
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int
-	if codexExitCode >= 0 {
-		exitCode := codexExitCode
+	if agentResult.ExitCode >= 0 {
+		exitCode := agentResult.ExitCode
 		exitCodePtr = &exitCode
 	}
 	tracker.transition(activePhase, "running", exitCodePtr, nil)
-	if codexErr != nil {
-		return Result{}, fmt.Errorf("codex exec failed: %w", codexErr)
+	if agentErr != nil {
+		return Result{}, fmt.Errorf("%s exec failed: %w", opts.Provider, agentErr)
 	}
-	if codexExitCode != 0 {
-		return Result{}, fmt.Errorf("codex exec failed (exit %d). See %s", codexExitCode, logPath)
+	if agentResult.ExitCode != 0 {
+		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", opts.Provider, agentResult.ExitCode, logPath)
 	}
 
-	summary := "(codex produced no summary)"
-	if summaryBytes, readErr := os.ReadFile(summaryPath); readErr == nil {
-		if trimmed := strings.TrimSpace(string(summaryBytes)); trimmed != "" {
-			summary = trimmed
-		}
+	summary := fmt.Sprintf("(%s produced no summary)", opts.Provider)
+	if trimmed := strings.TrimSpace(agentResult.Summary); trimmed != "" {
+		summary = trimmed
 	}
 
 	activePhase = "dirty_checked"
@@ -380,54 +366,6 @@ func BuildPrompt(opts PromptOptions) string {
 	return prompt
 }
 
-func BuildCodexArgs(invocation CodexInvocation) []string {
-	args := []string{
-		"exec",
-		"--cd", invocation.WorktreePath,
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--skip-git-repo-check",
-	}
-	if strings.TrimSpace(invocation.Model) != "" {
-		args = append(args, "-m", invocation.Model)
-	}
-	if strings.TrimSpace(invocation.Effort) != "" {
-		args = append(args, "-c", "model_reasoning_effort="+invocation.Effort)
-	}
-	args = append(args, "-o", invocation.SummaryPath, "-")
-	return args
-}
-
-func (ExecCodexRunner) Run(ctx context.Context, invocation CodexInvocation) (int, error) {
-	prompt, err := os.Open(invocation.PromptPath)
-	if err != nil {
-		return -1, fmt.Errorf("open prompt: %w", err)
-	}
-	defer prompt.Close()
-
-	logFile, err := os.Create(invocation.LogPath)
-	if err != nil {
-		return -1, fmt.Errorf("open codex log: %w", err)
-	}
-	defer logFile.Close()
-
-	cmd := exec.CommandContext(ctx, "codex", BuildCodexArgs(invocation)...)
-	cmd.Stdin = prompt
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode := exitErr.ExitCode()
-			if exitCode >= 0 {
-				return exitCode, nil
-			}
-		}
-		return -1, err
-	}
-	return 0, nil
-}
-
 func MarshalResult(result Result) ([]byte, error) {
 	return json.Marshal(result)
 }
@@ -440,8 +378,8 @@ func withDefaults(deps Deps) Deps {
 	if deps.GitHub == nil {
 		deps.GitHub = defaults.GitHub
 	}
-	if deps.Codex == nil {
-		deps.Codex = defaults.Codex
+	if deps.AgentLookup == nil {
+		deps.AgentLookup = defaults.AgentLookup
 	}
 	if deps.AcquireLock == nil {
 		deps.AcquireLock = defaults.AcquireLock

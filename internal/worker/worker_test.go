@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -52,48 +52,12 @@ func TestBuildPromptWithAndWithoutRecoveryContext(t *testing.T) {
 	}
 }
 
-func TestBuildCodexArgsOmitsAndIncludesModelEffort(t *testing.T) {
-	base := CodexInvocation{
-		WorktreePath: "wt",
-		SummaryPath:  "summary.txt",
-	}
-	got := BuildCodexArgs(base)
-	want := []string{
-		"exec",
-		"--cd", "wt",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--skip-git-repo-check",
-		"-o", "summary.txt",
-		"-",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("BuildCodexArgs() = %#v, want %#v", got, want)
-	}
-
-	base.Model = "gpt-5"
-	base.Effort = "high"
-	got = BuildCodexArgs(base)
-	want = []string{
-		"exec",
-		"--cd", "wt",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--skip-git-repo-check",
-		"-m", "gpt-5",
-		"-c", "model_reasoning_effort=high",
-		"-o", "summary.txt",
-		"-",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("BuildCodexArgs() with model/effort = %#v, want %#v", got, want)
-	}
-}
-
 func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
 	fakeGit := &workerFakeGit{status: " M internal/worker/worker.go\n"}
-	fakeCodex := &workerFakeCodex{summary: "Implemented dispatch.", log: "codex ok\n"}
+	fakeAgent := &workerFakeAgent{summary: "Implemented dispatch.", log: "codex ok\n"}
 	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
 
 	result, err := Dispatch(context.Background(), Options{
@@ -109,7 +73,12 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		GitHub: func(string) GitHubClient {
 			return fakeGitHub
 		},
-		Codex: fakeCodex,
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			if provider != "codex" {
+				t.Fatalf("provider = %q, want codex", provider)
+			}
+			return fakeAgent, nil
+		},
 		AcquireLock: func(string, time.Duration) (Lock, error) {
 			return &workerFakeLock{}, nil
 		},
@@ -173,8 +142,8 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if eventCount != 9 {
 		t.Fatalf("event count = %d, want 9", eventCount)
 	}
-	if fakeCodex.invocation.PromptPath == "" || fakeCodex.invocation.LogPath == "" || fakeCodex.invocation.SummaryPath == "" {
-		t.Fatalf("codex invocation missing file paths: %#v", fakeCodex.invocation)
+	if fakeAgent.invocation.WorktreePath == "" || fakeAgent.invocation.Prompt == "" || fakeAgent.invocation.LogPath == "" {
+		t.Fatalf("agent invocation missing required fields: %#v", fakeAgent.invocation)
 	}
 }
 
@@ -183,7 +152,7 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
 	fakeGit := &workerFakeGit{status: " M file.go\n"}
-	fakeCodex := &workerFakeCodex{
+	fakeAgent := &workerFakeAgent{
 		exitCode: 7,
 		log:      "Authorization: Bearer abc.def\npassword=hunter2\nlast line\n",
 	}
@@ -203,7 +172,12 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 		GitHub: func(string) GitHubClient {
 			return fakeGitHub
 		},
-		Codex: fakeCodex,
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			if provider != "codex" {
+				t.Fatalf("provider = %q, want codex", provider)
+			}
+			return fakeAgent, nil
+		},
 		AcquireLock: func(string, time.Duration) (Lock, error) {
 			return &workerFakeLock{}, nil
 		},
@@ -343,28 +317,23 @@ func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullReques
 	return f.prs, nil
 }
 
-type workerFakeCodex struct {
-	invocation CodexInvocation
+type workerFakeAgent struct {
+	invocation agent.Invocation
 	summary    string
 	log        string
 	exitCode   int
 	err        error
 }
 
-func (f *workerFakeCodex) Run(_ context.Context, invocation CodexInvocation) (int, error) {
+func (f *workerFakeAgent) Run(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
 	f.invocation = invocation
 	if err := os.WriteFile(invocation.LogPath, []byte(f.log), 0o644); err != nil {
-		return -1, err
-	}
-	if f.summary != "" {
-		if err := os.WriteFile(invocation.SummaryPath, []byte(f.summary), 0o644); err != nil {
-			return -1, err
-		}
+		return agent.Result{ExitCode: -1}, err
 	}
 	if f.err != nil {
-		return -1, f.err
+		return agent.Result{ExitCode: -1}, f.err
 	}
-	return f.exitCode, nil
+	return agent.Result{ExitCode: f.exitCode, Summary: f.summary}, nil
 }
 
 type workerFakeLock struct {
