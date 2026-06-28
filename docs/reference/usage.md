@@ -151,7 +151,7 @@ into `.delivery.yml`.
 ## Doc-First Process
 
 New work is documented first, coded second, and verified last. The mandatory
-workflow is described in [`PROCESS.md`](PROCESS.md):
+workflow is described in [`PROCESS.md`](../PROCESS.md):
 
 1. Write and merge the design or spec under `docs/`.
 2. Open separate code issues only after the relevant document is merged.

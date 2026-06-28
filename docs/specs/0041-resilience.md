@@ -1,9 +1,20 @@
+---
+id: 41
+title: loopcoder Resilience Design
+status: accepted
+date: 2026-06-26
+issue: 41
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder Resilience Design
 
 Status: DESIGN. This is a target design and is not yet built.
 
-This document extends the v1 loop described in `docs/architecture.md`,
-`docs/scheduling.md`, `docs/worker.md`, `SKILL.md`, and
+This document extends the v1 loop described in `docs/reference/architecture.md`,
+`docs/specs/0028-scheduling.md`, `docs/reference/worker.md`, `SKILL.md`, and
 `loopcoder dispatch`. It is intentionally written as a bridge between
 the current single-session implementation and the stateless/background conductor
 described in `DESIGN.md` sections 8 and 12.
@@ -45,7 +56,7 @@ the run from GitHub plus state files committed to git.
   the original prompt.
 - Preserve enough state in files and git that a new conductor session can resume
   after chat loss, terminal loss, host reboot, or context exhaustion.
-- Reuse the scheduling model in `docs/scheduling.md`: real dependencies govern
+- Reuse the scheduling model in `docs/specs/0028-scheduling.md`: real dependencies govern
   dispatch order, file overlap is handled at merge time, and conflict eviction
   narrows and re-dispatches work with concrete conflict context.
 - Keep GitHub issues, labels, PRs, branches, and checks as the source of truth
@@ -158,7 +169,7 @@ The minimum `state.json` model is:
   "items": {
     "41": {
       "issue": 41,
-      "title": "Design: resilience (docs/resilience.md)",
+      "title": "Design: resilience (docs/specs/0041-resilience.md)",
       "depends_on": [],
       "status": "implementing",
       "labels": ["delivery:unit", "status:implementing"],
@@ -354,7 +365,7 @@ attempt. The brief should include:
   landed, and the updated base branch.
 - The narrowed next objective for the replacement worker.
 
-This follows `docs/scheduling.md`: re-dispatch is not a blind retry. Conflict
+This follows `docs/specs/0028-scheduling.md`: re-dispatch is not a blind retry. Conflict
 eviction already requires capturing real conflict context and narrowing scope.
 The resilience layer generalizes that rule to all recovery. A replacement worker
 should know exactly what failed, what state survived, what it may reuse, and
@@ -433,7 +444,7 @@ A fresh conductor session should be able to resume with this procedure:
    orphaned, superseded, or unknown.
 7. Adopt completed PRs, retry recoverable attempts, and block attempts needing
    human input.
-8. Recompute the ready set using `docs/scheduling.md`.
+8. Recompute the ready set using `docs/specs/0028-scheduling.md`.
 9. Dispatch only items whose dependencies are merged and whose active attempts
    are not still running.
 10. Write a new state event summarizing the resume.
@@ -472,7 +483,7 @@ sessions can see why a worker was killed, adopted, retried, or blocked.
 ## Relationship To Scheduling
 
 The resilience layer does not change the two ordering axes in
-`docs/scheduling.md`.
+`docs/specs/0028-scheduling.md`.
 
 Real code dependencies still force serial dispatch: B waits until A is merged
 to `main`, then branches from updated `main`. Resilience state can remember that

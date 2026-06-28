@@ -1,3 +1,14 @@
+---
+id: 0000
+title: loopcoder v1 - Design Spec
+status: accepted
+date: 2026-06-26
+issue: null
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder v1 — Design Spec
 
 Status: DRAFT (approved; building M1). Date: 2026-06-26.

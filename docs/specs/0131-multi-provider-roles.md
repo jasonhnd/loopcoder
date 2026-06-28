@@ -1,9 +1,20 @@
+---
+id: 131
+title: loopcoder 0.3.0 - Multi-Provider Roles (Conductor / Worker / Verifier)
+status: accepted
+date: 2026-06-27
+issue: 131
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder 0.3.0 — Multi-Provider Roles (Conductor / Worker / Verifier)
 
 Status: DRAFT (design-first; not yet built). Owner: jasonhnd. Date: 2026-06-27.
 Target version: 0.3.0 (minor — new feature; not a patch).
 Relates to: [`DESIGN.md`](../../DESIGN.md) (roles, "reviewer ≠ author"),
-[`docs/worker.md`](../worker.md), [`SKILL.md`](../../SKILL.md), [`docs/PROCESS.md`](../PROCESS.md).
+[`docs/reference/worker.md`](../reference/worker.md), [`SKILL.md`](../../SKILL.md), [`docs/PROCESS.md`](../PROCESS.md).
 
 ## 1. Purpose
 
@@ -248,7 +259,7 @@ below is separate and references the merged doc. Suggested DAG:
   warning. *(blocked-by C1)*
 - **C6 (doc):** de-Opus-ify `SKILL.md` + add `AGENTS.md` / `GEMINI.md` entrypoints +
   revise step 5 to delegate to the Verifier. *(blocked-by C4, C5)*
-- **C7 (doc):** README / CHANGELOG / `docs/worker.md` sweep for multi-provider.
+- **C7 (doc):** README / CHANGELOG / `docs/reference/worker.md` sweep for multi-provider.
 
 ## 11. Non-goals (0.3.0)
 

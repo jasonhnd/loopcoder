@@ -1,9 +1,20 @@
+---
+id: 40
+title: loopcoder Self-Improvement Loop
+status: accepted
+date: 2026-06-26
+issue: 40
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder Self-Improvement Loop
 
 Status: TARGET DESIGN (not yet built). Date: 2026-06-26.
 
 This document designs bounded recursive self-improvement for loopcoder. It is
-written doc-first per [PROCESS.md](PROCESS.md): the design must merge before
+written doc-first per [PROCESS.md](../PROCESS.md): the design must merge before
 any implementation issue changes `SKILL.md`, scripts, prompts, or run-state
 handling.
 
@@ -41,7 +52,7 @@ periodically propose improvements to its own harness under human approval.
 
 The harness includes:
 
-- The conductor playbook in [`../SKILL.md`](../SKILL.md).
+- The conductor playbook in [`../SKILL.md`](../../SKILL.md).
 - Worker and dispatch code such as `loopcoder dispatch` and `internal/worker`.
 - Process, architecture, scheduler, worker, and usage docs under `docs/`.
 - Future prompt templates, issue templates, trace parsers, and verification
@@ -75,7 +86,7 @@ This design does not add any of the following:
 - Model-weight updates, fine-tuning, or hidden policy changes.
 - A large autonomous daemon that rewrites the whole repository.
 - A cross-repository telemetry service.
-- A replacement for the mandatory doc-first process in [PROCESS.md](PROCESS.md).
+- A replacement for the mandatory doc-first process in [PROCESS.md](../PROCESS.md).
 - A special privileged path for loopcoder's own repository.
 
 Self-improvement is a proposal and evidence system wrapped around the existing
@@ -141,7 +152,7 @@ approval, doc-first review, and normal merge gates.
 
 ## 5. Current Baseline
 
-The built v1 architecture is described in [architecture.md](architecture.md).
+The built v1 architecture is described in [architecture.md](../reference/architecture.md).
 The important constraints are:
 
 - The Opus chat session is the conductor and runtime.
@@ -150,7 +161,7 @@ The important constraints are:
 - GitHub issues, PRs, checks, and labels are the durable project state.
 - The verifier role is the conductor reviewing worker PRs and checks.
 - The user names PRs to merge; loopcoder never auto-merges.
-- Documentation and code work are separated by [PROCESS.md](PROCESS.md).
+- Documentation and code work are separated by [PROCESS.md](../PROCESS.md).
 
 Self-improvement must fit that baseline. In v1 it should not require a daemon,
 cloud service, database, or new orchestrator. The first implementation can be
@@ -245,8 +256,8 @@ prompts, but it does not override:
 
 1. System and tool safety constraints.
 2. The user's current request.
-3. [PROCESS.md](PROCESS.md).
-4. [`../SKILL.md`](../SKILL.md).
+3. [PROCESS.md](../PROCESS.md).
+4. [`../SKILL.md`](../../SKILL.md).
 5. `.delivery.yml` in the target repository.
 6. Issue acceptance criteria.
 
@@ -441,7 +452,7 @@ reviewable form:
 
 - Evidence: Issue #N worker left generated artifacts after local build; verifier removed them.
 - Failure class: cleanup / repo hygiene
-- Target: SKILL.md worker briefing section or docs/worker.md
+- Target: SKILL.md worker briefing section or docs/reference/worker.md
 - Proposed change: Tell workers to inspect `git status --short` after verification and remove generated build artifacts not required by the issue.
 - Expected effect: Fewer noisy PRs and fewer verifier cleanup passes.
 - Risk: Medium if phrased too broadly; could cause workers to delete legitimate generated files.
@@ -462,7 +473,7 @@ Self-improvement targets are divided by scrutiny level.
 | Process and architecture docs | Yes | Medium | Must not contradict `PROCESS.md`; process changes need explicit human approval. |
 | Usage docs and troubleshooting docs | Yes | Medium | Good first target for repeated operational gotchas. |
 | Worker briefing templates | Yes | High | Affects generated code quality and scope control. |
-| [`../SKILL.md`](../SKILL.md) playbook text | Yes | High | Changes conductor behavior across all loopcoder runs. Keep diffs small and evidence-backed. |
+| [`../SKILL.md`](../../SKILL.md) playbook text | Yes | High | Changes conductor behavior across all loopcoder runs. Keep diffs small and evidence-backed. |
 | `internal/worker` and `loopcoder dispatch` logging and ergonomics | Yes | High | Requires command-level verification of the binary worker path. |
 | `internal/worker` and `loopcoder dispatch` execution semantics | Conditional | Very high | Requires design doc, focused tests or dry run, and explicit human review. |
 | `.delivery.yml` defaults in loopcoder repo | Conditional | High | Do not change model or effort defaults unless the human explicitly requested that policy. |
@@ -565,7 +576,7 @@ Self-improvement PRs need review that is stricter than ordinary docs cleanup.
 The verifier should check:
 
 - The doc states whether it is current behavior or target design.
-- The proposed behavior is consistent with [PROCESS.md](PROCESS.md).
+- The proposed behavior is consistent with [PROCESS.md](../PROCESS.md).
 - The doc does not imply auto-merge or automatic harness mutation.
 - Every improvement claim points to run evidence or a clearly stated hypothesis.
 - Open questions are real unknowns, not placeholders for core requirements.
@@ -705,17 +716,17 @@ and human approval; they are not routine learning updates.
 
 ## 17. Relationship To Existing Docs
 
-- [PROCESS.md](PROCESS.md) remains the mandatory workflow. Self-improvement
+- [PROCESS.md](../PROCESS.md) remains the mandatory workflow. Self-improvement
   does not bypass doc-first development.
-- [architecture.md](architecture.md) describes the built v1 system. This design
+- [architecture.md](../reference/architecture.md) describes the built v1 system. This design
   fits inside that system rather than replacing it with a daemon.
-- [scheduling.md](scheduling.md) governs issue dispatch and merge ordering.
+- [scheduling.md](0028-scheduling.md) governs issue dispatch and merge ordering.
   Self-improvement issues are ordinary issues in that DAG, with high-scrutiny
   labels or review notes when they touch harness surfaces.
-- [`../SKILL.md`](../SKILL.md) is the conductor playbook. Future changes to it
+- [`../SKILL.md`](../../SKILL.md) is the conductor playbook. Future changes to it
   should reference this design and the specific learning entries or traces that
   justify the change.
-- [`../DESIGN.md`](../DESIGN.md) is the north-star autonomous delivery design.
+- [`../DESIGN.md`](../../DESIGN.md) is the north-star autonomous delivery design.
   This document adds a bounded improvement layer to the current local,
   human-gated v1 path.
 
@@ -729,7 +740,7 @@ A future code or playbook implementation of this design is acceptable only if:
 - Reflection can draft improvement candidates with target, risk, and
   verification plan.
 - Improvement issue creation requires human approval.
-- Harness changes follow [PROCESS.md](PROCESS.md).
+- Harness changes follow [PROCESS.md](../PROCESS.md).
 - `SKILL.md` and worker/helper changes are treated as high-scrutiny.
 - No self-improvement path can auto-merge or silently mutate the harness.
 - The loop is bounded by explicit limits.

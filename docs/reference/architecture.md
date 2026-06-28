@@ -31,7 +31,7 @@ single open Opus session, not large unattended roadmaps.
 
 ### Conductor
 
-The Conductor is the Opus session following [`../SKILL.md`](../SKILL.md). It
+The Conductor is the Opus session following [`SKILL.md`](../../SKILL.md). It
 intakes the user's need, inspects repo context, drafts GitHub issues and a
 dependency DAG, gets explicit approval before publishing work, dispatches ready
 issues, reviews resulting PRs, reports progress in chat, and merges only the PRs
@@ -105,7 +105,7 @@ future background/stateless conductor as the scaling path.
 ## Doc-First Process
 
 loopcoder follows the mandatory doc-first workflow in
-[`PROCESS.md`](PROCESS.md):
+[`PROCESS.md`](../PROCESS.md):
 
 1. Write and merge the design or spec under `docs/`.
 2. Open separate code issues only after the relevant document is merged.
@@ -115,8 +115,8 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 
 ## Design References
 
-- [`../DESIGN.md`](../DESIGN.md) is the north-star autonomous delivery engine
+- [`DESIGN.md`](../../DESIGN.md) is the north-star autonomous delivery engine
   design. It includes larger ideas that are not built in v1.
-- [`specs/2026-06-26-loopcoder-v1-design.md`](specs/2026-06-26-loopcoder-v1-design.md)
+- [`../specs/0000-loopcoder-v1.md`](../specs/0000-loopcoder-v1.md)
   is the v1 design spec and the source for current scope and limits.
-- [`specs/`](specs/) contains implementation specs.
+- [`../specs/`](../specs/) contains implementation specs.

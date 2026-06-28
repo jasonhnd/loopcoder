@@ -73,6 +73,36 @@ func TestParseVerdictRejectsInvalidJSONOrSchema(t *testing.T) {
 	}
 }
 
+func TestDiscoverSpecPathPrefersSpecsInNewLayout(t *testing.T) {
+	tests := []struct {
+		name  string
+		texts []string
+		want  string
+	}{
+		{
+			name:  "spec only",
+			texts: []string{"Implement per docs/specs/0165-documentation-layout.md."},
+			want:  "docs/specs/0165-documentation-layout.md",
+		},
+		{
+			name: "reference before spec",
+			texts: []string{
+				"Read docs/reference/architecture.md for current behavior.",
+				"Implement per docs/specs/0165-documentation-layout.md.",
+			},
+			want: "docs/specs/0165-documentation-layout.md",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := discoverSpecPath(tt.texts...); got != tt.want {
+				t.Fatalf("discoverSpecPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
