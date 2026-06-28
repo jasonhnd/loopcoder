@@ -72,13 +72,16 @@ verifier matches `.delivery.yml`'s worker provider, the CLI emits an advisory
 warning and still proceeds because human merge remains the final gate.
 
 As of the 0.3.x provider proof, `claude` and `codex` are verified
-`loopreview` providers. A representative `--timeout 180s` run against merged
-PR #202 completed with no input truncation for both providers: `codex` returned
-`pass` in 77.398s wall time with parsed model `gpt-5.5`, effort `xhigh`, and
-18,266 total tokens; `claude` returned `pass` in 70.686s wall time with parsed
-model `claude-haiku-4-5-20251001`, no explicit effort, and 2,447 input /
-4,947 output tokens. `gemini` remains unverified for `loopreview` until issue
-#188 resolves headless authentication.
+`loopreview` providers in the mechanism sense: both providers returned a valid
+structured verdict plus attestation within a `--timeout 180s` smoke run. The
+LLM verdict itself is non-deterministic, so the proof does not mean either
+provider will always return `pass` for the same PR. One representative
+point-in-time run against merged PR #202 completed with no input truncation for
+both providers: `codex` returned `pass` in 77.398s wall time with parsed model
+`gpt-5.5`, effort `xhigh`, and 18,266 total tokens; `claude` returned `pass` in
+70.686s wall time with parsed model `claude-haiku-4-5-20251001`, no explicit
+effort, and 2,447 input / 4,947 output tokens. `gemini` remains unverified for
+`loopreview` until issue #188 resolves headless authentication.
 
 ## Ports And Adapters
 
