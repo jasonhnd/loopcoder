@@ -105,6 +105,263 @@ func TestDiscoverSpecPathPrefersSpecsInNewLayout(t *testing.T) {
 	}
 }
 
+func TestBuildPromptUsesBoundedReviewPacketContract(t *testing.T) {
+	prompt, _ := buildPromptWithLimits(loopreviewPromptTestOptions(), loopreviewPromptTestInputs(), ReviewPacketLimits{})
+	for _, want := range []string{
+		"# Bounded review packet",
+		"Use the bounded review packet below as the primary evidence.",
+		"Return \"needs-human\" if a TRUNCATED marker could hide",
+		"bounded input/tool budget",
+		"Total changed files: 1",
+		"Per-file diff budget:",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildReviewPacketTruncatesChangedFilesBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{
+		"internal/loopreview/a.go",
+		"internal/loopreview/b.go",
+		"internal/loopreview/c.go",
+		"internal/loopreview/d.go",
+	}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		ChangedFilesBytes: len("- internal/loopreview/a.go\n") + 1,
+	})
+	if !packet.ChangedFiles.Truncated {
+		t.Fatal("changed files were not truncated")
+	}
+	for _, want := range []string{
+		"Total changed files: 4",
+		"[TRUNCATED changed files: omitted 3 files",
+		"omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "internal/loopreview/d.go") {
+		t.Fatalf("prompt contains omitted changed file:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPacketTruncatesPerFileDiffBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Diff = loopreviewDiffPatch("internal/loopreview/big.go", "kept-line\n"+strings.Repeat("+ omitted body\n", 40)+"TAIL_DIFF_SHOULD_NOT_APPEAR\n")
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DiffFileBytes: 90,
+	})
+	if !packet.Diff.Truncated {
+		t.Fatal("diff was not truncated")
+	}
+	for _, want := range []string{
+		"[TRUNCATED diff for internal/loopreview/big.go: omitted",
+		"[TRUNCATED diff: omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_DIFF_SHOULD_NOT_APPEAR") {
+		t.Fatalf("prompt contains omitted diff tail:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Diff = loopreviewDiffPatch("internal/loopreview/a.go", "+ kept\n") +
+		loopreviewDiffPatch("internal/loopreview/b.go", strings.Repeat("+ omitted body\n", 40)+"TAIL_TOTAL_DIFF_SHOULD_NOT_APPEAR\n")
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DiffBytes:     180,
+		DiffFileBytes: 4096,
+	})
+	if !packet.Diff.Truncated {
+		t.Fatal("diff was not truncated")
+	}
+	if !strings.Contains(prompt, "internal/loopreview/a.go") {
+		t.Fatalf("prompt missing first diff patch:\n%s", prompt)
+	}
+	for _, want := range []string{
+		"[TRUNCATED diff: omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_TOTAL_DIFF_SHOULD_NOT_APPEAR") {
+		t.Fatalf("prompt contains omitted total diff tail:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPacketTruncatesIssueBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Issue.Body = "keep issue context\n" + strings.Repeat("omitted issue context\n", 40) + "TAIL_ISSUE_SHOULD_NOT_APPEAR\n"
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		IssueBytes: len("keep issue context\n") + 1,
+	})
+	if !packet.IssueBody.Truncated {
+		t.Fatal("issue body was not truncated")
+	}
+	for _, want := range []string{
+		"keep issue context",
+		"[TRUNCATED issue body: omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_ISSUE_SHOULD_NOT_APPEAR") {
+		t.Fatalf("prompt contains omitted issue tail:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPacketTruncatesSpecBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Spec.Content = "# Spec\n\nkeep spec context\n" + strings.Repeat("omitted spec context\n", 40) + "TAIL_SPEC_SHOULD_NOT_APPEAR\n"
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		SpecBytes: len("# Spec\n\nkeep spec context\n") + 1,
+	})
+	if !packet.SpecContent.Truncated {
+		t.Fatal("spec body was not truncated")
+	}
+	for _, want := range []string{
+		"keep spec context",
+		"[TRUNCATED merged spec: omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_SPEC_SHOULD_NOT_APPEAR") {
+		t.Fatalf("prompt contains omitted spec tail:\n%s", prompt)
+	}
+}
+
+func TestBuildPromptAppliesTotalByteBudget(t *testing.T) {
+	basePrompt, _ := buildPromptWithLimits(loopreviewPromptTestOptions(), loopreviewPromptTestInputs(), ReviewPacketLimits{})
+	totalBudget := len(basePrompt) + 1200
+
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{}
+	for i := 0; i < 200; i++ {
+		inputs.ChangedFiles = append(inputs.ChangedFiles, "internal/loopreview/very-long-file-name-for-budget-test.go")
+	}
+	inputs.Diff = loopreviewDiffPatch("internal/loopreview/big.go", strings.Repeat("+ big diff line for total prompt budget\n", 400))
+	inputs.Issue.Body = strings.Repeat("issue body line for total prompt budget\n", 400)
+	inputs.Spec.Content = strings.Repeat("spec body line for total prompt budget\n", 400)
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		TotalPromptBytes: totalBudget,
+	})
+	if packet.Insufficient {
+		t.Fatalf("packet unexpectedly insufficient: %s", packet.InsufficientReason)
+	}
+	if len(prompt) > totalBudget {
+		t.Fatalf("prompt length = %d, want <= %d", len(prompt), totalBudget)
+	}
+	if !packet.TotalPromptBudgetApplied {
+		t.Fatal("total prompt budget was not applied")
+	}
+	for _, want := range []string{
+		"TOTAL PROMPT BUDGET APPLIED",
+		"TRUNCATED",
+		"omitted",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestRunInsufficientReviewPacketReturnsNeedsHumanWithoutAgent(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  "diff --git a/file.go b/file.go\n+change\n",
+		files: []string{"file.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"would pass","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		ReviewPacketLimits: ReviewPacketLimits{
+			TotalPromptBytes: 64,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	if !strings.Contains(result.Verdict.Evidence, "review packet insufficient") {
+		t.Fatalf("evidence = %q", result.Verdict.Evidence)
+	}
+	if fakeAgent.calls != 0 {
+		t.Fatalf("agent calls = %d, want 0", fakeAgent.calls)
+	}
+	if fakeGit.fetchPR != 0 || fakeGit.addRev != "" {
+		t.Fatalf("worktree checkout should not run for insufficient packet: %#v", fakeGit)
+	}
+}
+
 func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
@@ -395,6 +652,44 @@ func runWithAgentSummary(t *testing.T, summary string, showErr error) Result {
 	return runWithAgentResult(t, validLoopreviewAgentResult(summary, 0), showErr, nil)
 }
 
+func loopreviewPromptTestOptions() Options {
+	return Options{
+		PRNumber:   199,
+		BaseBranch: "main",
+	}
+}
+
+func loopreviewPromptTestInputs() reviewInputs {
+	return reviewInputs{
+		PR: gh.PullRequest{
+			Number:      199,
+			Title:       "Bounded packet",
+			HeadRefName: "loop/issue-199",
+		},
+		Issue: gh.Issue{
+			Number: 199,
+			Title:  "Implement bounded review packet",
+			Body:   "Implement per docs/specs/0194-reliable-loopreview-verifier.md.",
+		},
+		IssuePresent: true,
+		Diff:         loopreviewDiffPatch("internal/loopreview/loopreview.go", "+ bounded packet\n"),
+		ChangedFiles: []string{"internal/loopreview/loopreview.go"},
+		Spec: specInput{
+			Path:      "docs/specs/0194-reliable-loopreview-verifier.md",
+			Content:   "# Reliable loopreview Verifier\n\nBounded packet acceptance criteria.\n",
+			Available: true,
+		},
+	}
+}
+
+func loopreviewDiffPatch(path, body string) string {
+	return "diff --git a/" + path + " b/" + path + "\n" +
+		"--- a/" + path + "\n" +
+		"+++ b/" + path + "\n" +
+		"@@ -1 +1 @@\n" +
+		body
+}
+
 func runWithAgentResult(t *testing.T, agentResult agent.Result, showErr error, stderr *strings.Builder) Result {
 	t.Helper()
 	repo := t.TempDir()
@@ -545,9 +840,11 @@ type loopreviewFakeAgent struct {
 	err                error
 	blockUntilCanceled bool
 	ctxErr             error
+	calls              int
 }
 
 func (f *loopreviewFakeAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
+	f.calls++
 	f.invocation = invocation
 	if err := os.WriteFile(invocation.LogPath, []byte("verifier log\n"), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
