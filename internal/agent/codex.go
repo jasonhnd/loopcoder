@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type ExecCodexRunner struct{}
@@ -61,17 +63,24 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
-	if err := cmd.Run(); err != nil {
+	startedAt := time.Now()
+	runErr := cmd.Run()
+	endedAt := time.Now()
+	_ = logFile.Sync()
+	logBytes, _ := os.ReadFile(inv.LogPath)
+	summary := readCodexSummary(inv.LogPath)
+	metadata := parseCodexInvocation(logBytes)
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			exitCode := exitErr.ExitCode()
 			if exitCode >= 0 {
-				return Result{ExitCode: exitCode, Summary: readCodexSummary(inv.LogPath)}, nil
+				return resultWithTiming(exitCode, summary, metadata, startedAt, endedAt), nil
 			}
 		}
-		return Result{ExitCode: -1}, err
+		return resultWithTiming(-1, summary, metadata, startedAt, endedAt), runErr
 	}
-	return Result{ExitCode: 0, Summary: readCodexSummary(inv.LogPath)}, nil
+	return resultWithTiming(0, summary, metadata, startedAt, endedAt), nil
 }
 
 func codexPromptPath(logPath string) string {
@@ -88,4 +97,76 @@ func readCodexSummary(logPath string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(summaryBytes))
+}
+
+func parseCodexInvocation(output []byte) invocationMetadata {
+	text := string(output)
+	metadata := invocationMetadata{
+		Model:  parseCodexHeaderValue(text, "model"),
+		Effort: parseCodexHeaderValue(text, "reasoning effort"),
+	}
+	if totalTokens, ok := parseCodexTotalTokens(text); ok {
+		metadata.Usage.TotalTokens = &totalTokens
+	}
+	return metadata
+}
+
+func parseCodexHeaderValue(text, label string) string {
+	prefix := strings.ToLower(label) + ":"
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):])
+		}
+	}
+	return ""
+}
+
+func parseCodexTotalTokens(text string) (int64, bool) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if !strings.HasPrefix(lower, "tokens used") {
+			continue
+		}
+
+		remainder := strings.TrimSpace(trimmed[len("tokens used"):])
+		remainder = strings.TrimPrefix(remainder, ":")
+		remainder = strings.TrimSpace(remainder)
+		if total, ok := parseTokenCount(remainder); ok {
+			return total, true
+		}
+
+		for next := index + 1; next < len(lines); next++ {
+			nextLine := strings.TrimSpace(lines[next])
+			if nextLine == "" {
+				continue
+			}
+			return parseTokenCount(nextLine)
+		}
+	}
+	return 0, false
+}
+
+func parseTokenCount(text string) (int64, bool) {
+	var cleaned strings.Builder
+	for _, r := range strings.TrimSpace(text) {
+		switch {
+		case r >= '0' && r <= '9':
+			cleaned.WriteRune(r)
+		case r == ',' || r == ' ' || r == '\t':
+			continue
+		default:
+			return 0, false
+		}
+	}
+	if cleaned.Len() == 0 {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(cleaned.String(), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }

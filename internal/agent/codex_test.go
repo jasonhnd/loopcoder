@@ -89,3 +89,60 @@ func TestBuildCodexArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCodexInvocation(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     string
+		wantModel  string
+		wantEffort string
+		wantTotal  *int64
+	}{
+		{
+			name: "real two-line token total",
+			output: `model: gpt-5.5
+provider: openai
+reasoning effort: xhigh
+
+tokens used
+15,988
+`,
+			wantModel:  "gpt-5.5",
+			wantEffort: "xhigh",
+			wantTotal:  testInt64Ptr(15988),
+		},
+		{
+			name: "inline token total",
+			output: `model: gpt-5
+reasoning effort: high
+tokens used: 1,234
+`,
+			wantModel:  "gpt-5",
+			wantEffort: "high",
+			wantTotal:  testInt64Ptr(1234),
+		},
+		{
+			name:   "missing header fields",
+			output: "raw output without attestation header",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCodexInvocation([]byte(tt.output))
+			if got.Model != tt.wantModel {
+				t.Fatalf("Model = %q, want %q", got.Model, tt.wantModel)
+			}
+			if got.Effort != tt.wantEffort {
+				t.Fatalf("Effort = %q, want %q", got.Effort, tt.wantEffort)
+			}
+			assertNilInt64Ptr(t, got.Usage.InputTokens)
+			assertNilInt64Ptr(t, got.Usage.OutputTokens)
+			if tt.wantTotal == nil {
+				assertNilInt64Ptr(t, got.Usage.TotalTokens)
+			} else {
+				assertInt64Ptr(t, got.Usage.TotalTokens, *tt.wantTotal)
+			}
+		})
+	}
+}

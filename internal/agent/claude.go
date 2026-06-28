@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type ClaudeRunner struct{}
@@ -58,17 +59,22 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
 	cmd.Stderr = logFile
 
-	if err := cmd.Run(); err != nil {
+	startedAt := time.Now()
+	runErr := cmd.Run()
+	endedAt := time.Now()
+	summary := parseClaudeSummary(stdout.Bytes())
+	metadata := parseClaudeInvocation(stdout.Bytes(), inv)
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			exitCode := exitErr.ExitCode()
 			if exitCode >= 0 {
-				return Result{ExitCode: exitCode, Summary: parseClaudeSummary(stdout.Bytes())}, nil
+				return resultWithTiming(exitCode, summary, metadata, startedAt, endedAt), nil
 			}
 		}
-		return Result{ExitCode: -1}, err
+		return resultWithTiming(-1, summary, metadata, startedAt, endedAt), runErr
 	}
-	return Result{ExitCode: 0, Summary: parseClaudeSummary(stdout.Bytes())}, nil
+	return resultWithTiming(0, summary, metadata, startedAt, endedAt), nil
 }
 
 func parseClaudeSummary(output []byte) string {
@@ -84,4 +90,35 @@ func parseClaudeSummary(output []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(payload.Result)
+}
+
+func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
+	metadata := invocationMetadata{
+		Effort: strings.TrimSpace(inv.Effort),
+	}
+
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 {
+		return metadata
+	}
+
+	var payload struct {
+		ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+		Usage      struct {
+			InputTokens  json.RawMessage `json:"input_tokens"`
+			OutputTokens json.RawMessage `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return metadata
+	}
+
+	metadata.Model = firstSortedKey(payload.ModelUsage)
+	if inputTokens, ok := parseRawInt64(payload.Usage.InputTokens); ok {
+		metadata.Usage.InputTokens = inputTokens
+	}
+	if outputTokens, ok := parseRawInt64(payload.Usage.OutputTokens); ok {
+		metadata.Usage.OutputTokens = outputTokens
+	}
+	return metadata
 }
