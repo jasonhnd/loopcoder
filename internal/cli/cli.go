@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -49,6 +50,7 @@ type Deps struct {
 }
 
 var commands = []Command{
+	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -130,6 +132,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "attest" {
+		return runAttest(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
 	}
@@ -203,6 +208,23 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string              optional Codex model pass-through")
 		fmt.Fprintln(w, "  --effort string             optional Codex reasoning effort pass-through")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+	}
+	if command.Name == "attest" {
+		fmt.Fprintln(w, "  --role string            attestation role (default \"conductor\")")
+		fmt.Fprintln(w, "  --provider string        conductor host provider (required)")
+		fmt.Fprintln(w, "  --model string           conductor host model (required)")
+		fmt.Fprintln(w, "  --effort string          optional reasoning effort")
+		fmt.Fprintln(w, "  --permission string      conductor permission (default \"orchestrate\")")
+		fmt.Fprintln(w, "  --action string          action performed by the conductor (required)")
+		fmt.Fprintln(w, "  --exit-code int          conductor action exit code (default 0)")
+		fmt.Fprintln(w, "  --started-at string      RFC3339 invocation start timestamp")
+		fmt.Fprintln(w, "  --ended-at string        RFC3339 invocation end timestamp")
+		fmt.Fprintln(w, "  --duration-ms int        invocation duration in milliseconds")
+		fmt.Fprintln(w, "  --input-tokens int       input token count")
+		fmt.Fprintln(w, "  --output-tokens int      output token count")
+		fmt.Fprintln(w, "  --total-tokens int       total token count")
+		fmt.Fprintln(w, "  --model-source string    ignored; forced to self-reported")
+		fmt.Fprintln(w, "  --verified               ignored; forced to false")
 	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -888,6 +910,215 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+
+	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	role := string(attestation.RoleConductor)
+	var roleAlias string
+	var provider string
+	var providerAlias string
+	var model string
+	var modelAlias string
+	var effort string
+	var effortAlias string
+	permission := string(attestation.PermissionOrchestrate)
+	var permissionAlias string
+	var action string
+	var actionAlias string
+	var exitCode int
+	var exitCodeAlias int
+	var startedAt string
+	var startedAtAlias string
+	var endedAt string
+	var endedAtAlias string
+	var durationMS int64
+	var durationMSAlias int64
+	var inputTokens int64
+	var inputTokensAlias int64
+	var outputTokens int64
+	var outputTokensAlias int64
+	var totalTokens int64
+	var totalTokensAlias int64
+	var ignoredModelSource string
+	var ignoredModelSourceAlias string
+	var ignoredVerified bool
+	var ignoredVerifiedAlias bool
+
+	fs.StringVar(&role, "role", role, "role")
+	fs.StringVar(&roleAlias, "Role", "", "role")
+	fs.StringVar(&provider, "provider", "", "provider")
+	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&model, "model", "", "model")
+	fs.StringVar(&modelAlias, "Model", "", "model")
+	fs.StringVar(&effort, "effort", "", "effort")
+	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.StringVar(&permission, "permission", permission, "permission")
+	fs.StringVar(&permissionAlias, "Permission", "", "permission")
+	fs.StringVar(&action, "action", "", "action")
+	fs.StringVar(&actionAlias, "Action", "", "action")
+	fs.IntVar(&exitCode, "exit-code", 0, "exit code")
+	fs.IntVar(&exitCodeAlias, "ExitCode", 0, "exit code")
+	fs.StringVar(&startedAt, "started-at", "", "started at")
+	fs.StringVar(&startedAtAlias, "StartedAt", "", "started at")
+	fs.StringVar(&endedAt, "ended-at", "", "ended at")
+	fs.StringVar(&endedAtAlias, "EndedAt", "", "ended at")
+	fs.Int64Var(&durationMS, "duration-ms", 0, "duration milliseconds")
+	fs.Int64Var(&durationMSAlias, "DurationMs", 0, "duration milliseconds")
+	fs.Int64Var(&inputTokens, "input-tokens", 0, "input tokens")
+	fs.Int64Var(&inputTokensAlias, "InputTokens", 0, "input tokens")
+	fs.Int64Var(&outputTokens, "output-tokens", 0, "output tokens")
+	fs.Int64Var(&outputTokensAlias, "OutputTokens", 0, "output tokens")
+	fs.Int64Var(&totalTokens, "total-tokens", 0, "total tokens")
+	fs.Int64Var(&totalTokensAlias, "TotalTokens", 0, "total tokens")
+	fs.StringVar(&ignoredModelSource, "model-source", "", "model source")
+	fs.StringVar(&ignoredModelSourceAlias, "ModelSource", "", "model source")
+	fs.BoolVar(&ignoredVerified, "verified", false, "verified")
+	fs.BoolVar(&ignoredVerifiedAlias, "Verified", false, "verified")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if roleAlias != "" {
+		role = roleAlias
+	}
+	if providerAlias != "" {
+		provider = providerAlias
+	}
+	if modelAlias != "" {
+		model = modelAlias
+	}
+	if effortAlias != "" {
+		effort = effortAlias
+	}
+	if permissionAlias != "" {
+		permission = permissionAlias
+	}
+	if actionAlias != "" {
+		action = actionAlias
+	}
+	if flagWasSet(fs, "ExitCode") {
+		exitCode = exitCodeAlias
+	}
+	if startedAtAlias != "" {
+		startedAt = startedAtAlias
+	}
+	if endedAtAlias != "" {
+		endedAt = endedAtAlias
+	}
+
+	durationSet := flagWasSet(fs, "duration-ms")
+	if flagWasSet(fs, "DurationMs") {
+		durationMS = durationMSAlias
+		durationSet = true
+	}
+	hasTimestamps := strings.TrimSpace(startedAt) != "" || strings.TrimSpace(endedAt) != ""
+	if durationSet && hasTimestamps {
+		fmt.Fprintln(stderr, "attest: choose either --started-at/--ended-at or --duration-ms")
+		return 2
+	}
+
+	payload := map[string]any{
+		"role":         role,
+		"provider":     provider,
+		"model":        model,
+		"model_source": string(attestation.ModelSourceSelfReported),
+		"effort":       effort,
+		"permission":   permission,
+		"action":       action,
+		"exit_code":    exitCode,
+		"verified":     false,
+	}
+
+	if durationSet {
+		ended := deps.Now().UTC()
+		started := ended.Add(-time.Duration(durationMS) * time.Millisecond)
+		payload["started_at"] = started.Format(time.RFC3339Nano)
+		payload["ended_at"] = ended.Format(time.RFC3339Nano)
+		payload["duration_ms"] = durationMS
+	} else {
+		if strings.TrimSpace(startedAt) != "" {
+			payload["started_at"] = startedAt
+		}
+		if strings.TrimSpace(endedAt) != "" {
+			payload["ended_at"] = endedAt
+		}
+		if strings.TrimSpace(startedAt) != "" && strings.TrimSpace(endedAt) != "" {
+			started, startErr := time.Parse(time.RFC3339Nano, startedAt)
+			ended, endErr := time.Parse(time.RFC3339Nano, endedAt)
+			if startErr == nil && endErr == nil {
+				payload["duration_ms"] = ended.Sub(started).Milliseconds()
+			}
+		}
+	}
+
+	usage := map[string]int64{}
+	if flagWasSet(fs, "input-tokens") {
+		usage["input_tokens"] = inputTokens
+	}
+	if flagWasSet(fs, "InputTokens") {
+		usage["input_tokens"] = inputTokensAlias
+	}
+	if flagWasSet(fs, "output-tokens") {
+		usage["output_tokens"] = outputTokens
+	}
+	if flagWasSet(fs, "OutputTokens") {
+		usage["output_tokens"] = outputTokensAlias
+	}
+	if flagWasSet(fs, "total-tokens") {
+		usage["total_tokens"] = totalTokens
+	}
+	if flagWasSet(fs, "TotalTokens") {
+		usage["total_tokens"] = totalTokensAlias
+	}
+	if len(usage) > 0 {
+		payload["usage"] = usage
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(stderr, "attest: %v\n", err)
+		return 1
+	}
+	var record attestation.AttestationRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		fmt.Fprintf(stderr, "attest: %v\n", err)
+		return 1
+	}
+	if err := record.Validate(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	canonical, err := record.CanonicalJSON()
+	if err != nil {
+		fmt.Fprintf(stderr, "attest: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(append(canonical, '\n')); err != nil {
+		fmt.Fprintf(stderr, "attest: write output: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout, record.Header()); err != nil {
+		fmt.Fprintf(stderr, "attest: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	wasSet := false
+	fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == name {
+			wasSet = true
+		}
+	})
+	return wasSet
 }
 
 func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
