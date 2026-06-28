@@ -7,7 +7,7 @@
 [![Version](https://img.shields.io/badge/version-v0.3.0-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
-[![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/go-migration.md)
+[![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
 
 [What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [How it works](#how-it-works) | [Design](#design)
 
@@ -96,15 +96,16 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 
 ## Design
 
+- [`docs/README.md`](docs/README.md) -- document type legend and docs index.
 - [`docs/PROCESS.md`](docs/PROCESS.md) -- mandatory doc-first workflow.
-- [`docs/architecture.md`](docs/architecture.md) -- current architecture and limits.
-- [`docs/scheduling.md`](docs/scheduling.md) -- dependency-aware scheduling.
-- [`docs/verification.md`](docs/verification.md) -- required checks and verifier verdicts.
-- [`docs/self-improvement.md`](docs/self-improvement.md) -- bounded, human-gated learning loop.
-- [`docs/resilience.md`](docs/resilience.md) -- worker state, resume, recovery, and retry.
-- [`docs/orchestration.md`](docs/orchestration.md) -- ready-set and dispatch-wave orchestration.
-- [`docs/go-migration.md`](docs/go-migration.md) -- native Go backend migration.
-- [`docs/usage.md`](docs/usage.md) -- setup and end-to-end usage.
+- [`docs/reference/architecture.md`](docs/reference/architecture.md) -- current architecture and limits.
+- [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) -- dependency-aware scheduling.
+- [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md) -- required checks and verifier verdicts.
+- [`docs/specs/0040-self-improvement.md`](docs/specs/0040-self-improvement.md) -- bounded, human-gated learning loop.
+- [`docs/specs/0041-resilience.md`](docs/specs/0041-resilience.md) -- worker state, resume, recovery, and retry.
+- [`docs/specs/0081-orchestration.md`](docs/specs/0081-orchestration.md) -- ready-set and dispatch-wave orchestration.
+- [`docs/specs/0089-go-migration.md`](docs/specs/0089-go-migration.md) -- native Go backend migration.
+- [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/learnings.md`](docs/learnings.md) -- append-only operational learnings.
 - [`CHANGELOG.md`](CHANGELOG.md) -- release history.
 

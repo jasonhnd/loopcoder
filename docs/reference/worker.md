@@ -38,7 +38,7 @@ caller sets them and otherwise inherits each provider's own configuration.
 
 For the full design — roles, the provider abstraction, and per-provider adapter
 facts — see
-[`specs/2026-06-27-multi-provider-roles-design.md`](specs/2026-06-27-multi-provider-roles-design.md).
+[`../specs/0131-multi-provider-roles.md`](../specs/0131-multi-provider-roles.md).
 
 ## Flow
 
@@ -144,9 +144,9 @@ When both are absent, loopcoder passes no model or reasoning-effort flags and
 the selected provider inherits its own configured defaults.
 
 loopcoder never chooses a model or reasoning effort on its own. The conductor
-playbook in [`../SKILL.md`](../SKILL.md) says to inherit the selected provider's
+playbook in [`SKILL.md`](../../SKILL.md) says to inherit the selected provider's
 own setting by default, and
-[`BACKLOG.md` B1](BACKLOG.md#b1--worker-model--speed-selection) records the same
+[`BACKLOG.md` B1](../BACKLOG.md#b1--worker-model--speed-selection) records the same
 principle: configuration and command-line overrides should reflect only what the
 user has explicitly requested.
 

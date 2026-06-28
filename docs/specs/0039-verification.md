@@ -1,9 +1,20 @@
+---
+id: 39
+title: loopcoder Verification And Quality Gates
+status: accepted
+date: 2026-06-26
+issue: 39
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder Verification And Quality Gates
 
 Status: DESIGN. This document describes the target verification and
 quality-gate layer for loopcoder. It is not implemented yet.
 
-Relationship to current v1: [`architecture.md`](architecture.md) describes the
+Relationship to current v1: [`architecture.md`](../reference/architecture.md) describes the
 built system, where the Verifier is Opus review in the conductor session plus a
 read of `gh pr checks`. This document specifies the next design target: an
 evidence-backed verifier and gate that decide whether a pull request is
@@ -29,7 +40,7 @@ uses browser verification for UI behavior. loopcoder should adopt the same
 evidence-before-ready discipline while adding its doc-first advantage.
 
 loopcoder's unique advantage is the doc-first contract in
-[`PROCESS.md`](PROCESS.md). Every feature starts with a merged design or spec
+[`PROCESS.md`](../PROCESS.md). Every feature starts with a merged design or spec
 document under `docs/`. The code issue then implements that merged document in a
 separate pull request. That means verification can be stricter than generic
 "does the diff look reasonable?" review: the verifier can check the code
@@ -48,7 +59,7 @@ against a living artifact that constrains the output.
 - Keep the human as the merge authority for v1. A passing gate means
   merge-eligible, not auto-merged.
 - Keep the design compatible with the existing ports in
-  [`architecture.md`](architecture.md): VcsHost supplies PRs and checks,
+  [`architecture.md`](../reference/architecture.md): VcsHost supplies PRs and checks,
   Verifier produces evidence, Gate decides merge eligibility, and Reporter
   surfaces state in chat.
 
@@ -61,7 +72,7 @@ against a living artifact that constrains the output.
 - No claim that tests prove correctness. Automated checks are necessary
   evidence, not sufficient evidence for every change.
 - No new long-running daemon in this design. The conductor is still the Opus
-  session described in [`architecture.md`](architecture.md), and the target
+  session described in [`architecture.md`](../reference/architecture.md), and the target
   verifier runs inside that session unless a later design introduces a separate
   runtime.
 
@@ -109,7 +120,7 @@ dispatch
 ```
 
 This refines the current v1 loop without changing the scheduling model in
-[`scheduling.md`](scheduling.md). Ready issues still dispatch according to the
+[`scheduling.md`](0028-scheduling.md). Ready issues still dispatch according to the
 dependency DAG. File overlap is still observed from actual PR diffs at merge
 time. The new layer sits between worker-created PRs and human-directed merge.
 
@@ -306,7 +317,7 @@ The doc-first workflow requires code issues to reference the merged document
 they implement, for example:
 
 ```text
-implement per docs/verification.md
+implement per docs/specs/0039-verification.md
 ```
 
 The verifier finds the design document by scanning, in order:
@@ -526,7 +537,7 @@ Gate rules are intentionally simple for v1:
 
 The Gate never calls `gh pr merge` on its own while `.delivery.yml` uses
 `adapters.gate: human-merge`. Merge still happens only when the user names one
-or more PRs. At that point, the conductor follows [`scheduling.md`](scheduling.md):
+or more PRs. At that point, the conductor follows [`scheduling.md`](0028-scheduling.md):
 it reads real changed files, groups overlapping PRs, rebases where needed, and
 runs `gh pr merge` only for named PRs that remain merge-eligible.
 
@@ -707,17 +718,17 @@ Consequence: A passing gate reports readiness. It does not merge.
 
 ## Relationship To Existing Docs
 
-- [`PROCESS.md`](PROCESS.md) defines the doc-first contract this verifier
+- [`PROCESS.md`](../PROCESS.md) defines the doc-first contract this verifier
   enforces.
-- [`architecture.md`](architecture.md) defines the v1 ports and current
+- [`architecture.md`](../reference/architecture.md) defines the v1 ports and current
   Verifier/Gate adapters.
-- [`scheduling.md`](scheduling.md) defines dispatch, dependency, file-overlap,
+- [`scheduling.md`](0028-scheduling.md) defines dispatch, dependency, file-overlap,
   and merge-ordering behavior. Verification sits before merge ordering.
-- [`worker.md`](worker.md) defines how a worker turns an issue into a PR. The
+- [`worker.md`](../reference/worker.md) defines how a worker turns an issue into a PR. The
   verifier must not trust worker self-report as final gate evidence.
-- [`../SKILL.md`](../SKILL.md) is the conductor playbook that should eventually
+- [`../SKILL.md`](../../SKILL.md) is the conductor playbook that should eventually
   call this target verification procedure.
-- [`../.delivery.yml`](../.delivery.yml) is the per-repo configuration surface
+- [`../.delivery.yml`](../../.delivery.yml) is the per-repo configuration surface
   that declares checks and adapters.
 
 ## References
@@ -728,6 +739,6 @@ Consequence: A passing gate reports readiness. It does not merge.
 - Spec-driven verification: loopcoder's merged design document is a living
   artifact that constrains output; the verifier checks compliance before merge
   eligibility.
-- Doc-first contract: [`PROCESS.md`](PROCESS.md) requires design first, code
+- Doc-first contract: [`PROCESS.md`](../PROCESS.md) requires design first, code
   from the merged document, and verification last.
 

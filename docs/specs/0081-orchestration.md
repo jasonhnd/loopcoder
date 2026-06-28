@@ -1,3 +1,14 @@
+---
+id: 81
+title: loopcoder Orchestration Design
+status: accepted
+date: 2026-06-27
+issue: 81
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder Orchestration Design
 
 Status: LIVE. This is the foreground orchestration surface in the native
@@ -5,19 +16,19 @@ Status: LIVE. This is the foreground orchestration surface in the native
 
 This document defines the executable orchestration layer for loopcoder's
 foreground conductor: ready-set computation plus dispatch of one ready wave. It
-is written doc-first per [`PROCESS.md`](PROCESS.md). The subcommands described
+is written doc-first per [`PROCESS.md`](../PROCESS.md). The subcommands described
 here are implemented by the `loopcoder` binary.
 
 The design intentionally preserves the v1 boundaries from
-[`architecture.md`](architecture.md), [`scheduling.md`](scheduling.md),
-[`resilience.md`](resilience.md), and [`verification.md`](verification.md): the
+[`architecture.md`](../reference/architecture.md), [`scheduling.md`](0028-scheduling.md),
+[`resilience.md`](0041-resilience.md), and [`verification.md`](0039-verification.md): the
 human remains the merge authority, file overlap is observed at merge time, and
 workers still run through `loopcoder dispatch`.
 
 ## Problem
 
 Today the conductor manually performs two steps that are already specified in
-[`scheduling.md`](scheduling.md):
+[`scheduling.md`](0028-scheduling.md):
 
 1. Compute the ready set: which open issues can start because their real
    dependencies have landed, no open PR already represents the issue, and no
@@ -60,9 +71,9 @@ dispatch mechanics.
 - No auto-merge. A dispatched and verified PR can become merge-eligible, but it
   is still merged only after the human names it.
 - No background daemon, cron job, scheduled tick, or unattended loop. That is
-  the later target in [`../DESIGN.md` section 12](../DESIGN.md#12-local-v1-vs-cloud-v2).
+  the later target in [`../DESIGN.md` section 12](../../DESIGN.md#12-local-v1-vs-cloud-v2).
 - No change to the model or effort inheritance rule in
-  [`../SKILL.md`](../SKILL.md). If the user did not explicitly request a model
+  [`../SKILL.md`](../../SKILL.md). If the user did not explicitly request a model
   or effort override, the helper omits those flags.
 - No change to the worktree mutex. Worktree creation remains serialized inside
   `loopcoder dispatch`.
@@ -82,7 +93,7 @@ Local `.loopcoder` state is advisory for local liveness and recovery. It can
 block duplicate dispatch when a worker is still live, but it must not override a
 GitHub PR or a completed GitHub issue.
 
-This follows [`resilience.md`](resilience.md): GitHub is the source of truth for
+This follows [`resilience.md`](0041-resilience.md): GitHub is the source of truth for
 delivery state, and local run state explains worker attempts.
 
 ### Execute Only The Next Layer
@@ -107,7 +118,7 @@ report known risks, but it still treats file overlap as a merge-time concern.
 Observe-at-merge remains the rule: when the human names PRs for merge, the
 conductor reads actual file sets with `gh pr diff <pr> --name-only`, groups
 overlapping PRs, rebases where needed, and evicts conflicts as described in
-[`scheduling.md`](scheduling.md).
+[`scheduling.md`](0028-scheduling.md).
 
 ### Idempotent Enough For Re-Runs
 
@@ -119,7 +130,7 @@ a PR or live attempt appeared after the ready-set snapshot was generated.
 ## Ready-Set Model (Executable)
 
 `loopcoder ready-set` is the executable version of "compute the ready set" in
-[`scheduling.md`](scheduling.md), with the reconciliation vocabulary from
+[`scheduling.md`](0028-scheduling.md), with the reconciliation vocabulary from
 `loopcoder resume`.
 
 ### Inputs
@@ -241,7 +252,7 @@ only `READY` issues and for the human to understand every exclusion.
 ## One-Wave Dispatch
 
 The dispatch helper is the executable version of "dispatch the whole ready set"
-in [`scheduling.md`](scheduling.md). Its target name is
+in [`scheduling.md`](0028-scheduling.md). Its target name is
 `loopcoder dispatch-wave`.
 
 ### Inputs
@@ -302,10 +313,10 @@ never loops on its own.
 After the wave:
 
 1. Workers open PRs or fail.
-2. The conductor verifies PRs according to [`verification.md`](verification.md).
+2. The conductor verifies PRs according to [`verification.md`](0039-verification.md).
 3. The human names PRs to merge.
 4. The conductor applies observe-at-merge ordering from
-   [`scheduling.md`](scheduling.md).
+   [`scheduling.md`](0028-scheduling.md).
 5. The conductor runs `loopcoder resume` to reconcile.
 6. The conductor runs `loopcoder ready-set` again for the next layer.
 
@@ -340,9 +351,9 @@ Expanded:
 8. The conductor repeats the cycle if more issues are ready.
 
 This is the human-gated, foreground precursor to the stateless/background
-conductor described in [`../DESIGN.md` section 12](../DESIGN.md#12-local-v1-vs-cloud-v2).
+conductor described in [`../DESIGN.md` section 12](../../DESIGN.md#12-local-v1-vs-cloud-v2).
 It borrows the "re-derive on each tick" state shape from
-[`../DESIGN.md` section 8](../DESIGN.md#8-state-model), but the tick is a human
+[`../DESIGN.md` section 8](../../DESIGN.md#8-state-model), but the tick is a human
 invocation rather than a daemon.
 
 ## Interfaces
@@ -542,7 +553,7 @@ Machine output should contain the same fields:
 
 ### `scheduling.md`
 
-[`scheduling.md`](scheduling.md) defines the two ordering axes:
+[`scheduling.md`](0028-scheduling.md) defines the two ordering axes:
 
 - real code dependencies govern dispatch readiness,
 - file overlap governs merge ordering only after PR diffs exist.
@@ -553,7 +564,7 @@ eviction, merge grouping, or observe-at-merge ordering.
 
 ### `resilience.md`
 
-[`resilience.md`](resilience.md) defines durable local run state, worker
+[`resilience.md`](0041-resilience.md) defines durable local run state, worker
 heartbeats, recovery briefs, reconciliation, and bounded retry. `loopcoder
 ready-set` reuses that vocabulary instead of creating a second state language.
 
@@ -563,7 +574,7 @@ can reason about the wave after interruption or failure.
 
 ### `verification.md`
 
-[`verification.md`](verification.md) is unchanged. The orchestration layer can
+[`verification.md`](0039-verification.md) is unchanged. The orchestration layer can
 create PRs faster, but it cannot call them merge-eligible. The verifier still
 checks required GitHub checks, local evidence when configured, and conformance
 to the merged design document. The gate still reports `pass`, `fail`, or
@@ -571,20 +582,20 @@ to the merged design document. The gate still reports `pass`, `fail`, or
 
 ### `architecture.md`
 
-[`architecture.md`](architecture.md) says v1 is an Opus conductor session plus
+[`architecture.md`](../reference/architecture.md) says v1 is an Opus conductor session plus
 a native `loopcoder` worker adapter, not a daemon or cloud service. This design
 keeps that architecture. The orchestration subcommands are conductor helpers in
 the foreground session, and `loopcoder dispatch` remains the Worker adapter.
 
 ### `PROCESS.md`
 
-[`PROCESS.md`](PROCESS.md) requires doc-first, one concern per PR, and separate
+[`PROCESS.md`](../PROCESS.md) requires doc-first, one concern per PR, and separate
 documentation and code changes. This file is the design document for the
 orchestration layer. Implementation changes land in separate code PRs.
 
 ### `SKILL.md`
 
-[`../SKILL.md`](../SKILL.md) is the conductor playbook. The playbook should call:
+[`../SKILL.md`](../../SKILL.md) is the conductor playbook. The playbook should call:
 
 1. `loopcoder ready-set` before starting or resuming a dispatch layer.
 2. `loopcoder dispatch-wave` to run the foreground wave.
@@ -670,7 +681,7 @@ Conflict eviction remains a merge-time recovery path. The one-wave dispatch
 helper must not predict or preempt file overlap. If an overlapping PR cannot be
 rebased after another named PR lands, the conductor captures the conflict
 context and re-dispatches a narrowed worker as described in
-[`scheduling.md`](scheduling.md) and [`resilience.md`](resilience.md).
+[`scheduling.md`](0028-scheduling.md) and [`resilience.md`](0041-resilience.md).
 
 ## Decisions
 
@@ -709,7 +720,7 @@ coordinates calls to the adapter and summarizes their outcomes.
 
 ### Decision 5: Model And Effort Are Pass-Through Only
 
-Rationale: [`../SKILL.md`](../SKILL.md) says defaults inherit from the user's
+Rationale: [`../SKILL.md`](../../SKILL.md) says defaults inherit from the user's
 Codex configuration unless the user explicitly requests overrides.
 
 Consequence: the helper never chooses model or effort. If the caller does not
@@ -746,7 +757,7 @@ ready issues, and stops before verification and human merge.
 
 ## Compatibility With The Background Tick
 
-[`../DESIGN.md` section 8](../DESIGN.md#8-state-model) defines the north-star
+[`../DESIGN.md` section 8](../../DESIGN.md#8-state-model) defines the north-star
 state model as GitHub-first and re-derived on each conductor tick. Section 12
 moves the conductor to a later local/cloud background runtime.
 
@@ -768,18 +779,18 @@ compose these pieces without inheriting an accidental auto-merge loop.
 
 ## References
 
-- [`scheduling.md`](scheduling.md): layered ready-set scheduling, the two
+- [`scheduling.md`](0028-scheduling.md): layered ready-set scheduling, the two
   ordering axes, observe-at-merge, and conflict eviction.
-- [`resilience.md`](resilience.md): run state, heartbeat, recovery,
+- [`resilience.md`](0041-resilience.md): run state, heartbeat, recovery,
   reconciliation, and bounded retry.
-- [`verification.md`](verification.md): evidence-backed verification and the
+- [`verification.md`](0039-verification.md): evidence-backed verification and the
   human merge gate.
-- [`architecture.md`](architecture.md): v1 roles, ports, adapters, and
+- [`architecture.md`](../reference/architecture.md): v1 roles, ports, adapters, and
   single-session limits.
-- [`PROCESS.md`](PROCESS.md): doc-first workflow and one concern per PR.
-- [`../SKILL.md`](../SKILL.md): conductor playbook that should call these
+- [`PROCESS.md`](../PROCESS.md): doc-first workflow and one concern per PR.
+- [`../SKILL.md`](../../SKILL.md): conductor playbook that should call these
   helpers after implementation.
-- [`../DESIGN.md` section 8](../DESIGN.md#8-state-model): GitHub-first state
+- [`../DESIGN.md` section 8](../../DESIGN.md#8-state-model): GitHub-first state
   model.
-- [`../DESIGN.md` section 12](../DESIGN.md#12-local-v1-vs-cloud-v2): later
+- [`../DESIGN.md` section 12](../../DESIGN.md#12-local-v1-vs-cloud-v2): later
   local/cloud background conductor target.

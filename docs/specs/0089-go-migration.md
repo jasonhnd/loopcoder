@@ -1,10 +1,21 @@
+---
+id: 89
+title: Go Native CLI Migration
+status: accepted
+date: 2026-06-27
+issue: 89
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # Go Native CLI Migration
 
 Status: DESIGN. This is a target design and is not yet built.
 
 This document defines the doc-first migration from loopcoder's current
 PowerShell helper layer to a single cross-platform Go binary. It is written per
-[`PROCESS.md`](PROCESS.md): this design should merge before any Go code lands,
+[`PROCESS.md`](../PROCESS.md): this design should merge before any Go code lands,
 and the implementation should be split into follow-up PRs with one concern per
 PR.
 
@@ -16,7 +27,7 @@ parity.
 ## Problem And Motivation
 
 loopcoder's conductor is already cross-platform in the important sense: it is
-the Opus session following [`../SKILL.md`](../SKILL.md) inside Claude Code. The
+the Opus session following [`../SKILL.md`](../../SKILL.md) inside Claude Code. The
 conductor reads the playbook, plans issues, reviews PRs, reports status, and
 honors the human merge gate without relying on Windows-only process semantics.
 
@@ -50,7 +61,7 @@ implementation details are:
 The goal is a single native helper binary named `loopcoder` that the conductor
 can call on macOS, Linux, and Windows with no PowerShell dependency. The binary
 does not replace `git`, `gh`, or `codex`; those remain the external adapters
-already described by [`architecture.md`](architecture.md). The binary replaces
+already described by [`architecture.md`](../reference/architecture.md). The binary replaces
 the PowerShell glue around those tools.
 
 ## Goals
@@ -60,7 +71,7 @@ the PowerShell glue around those tools.
 - Preserve identical observable behavior and identical state/config formats.
   The `.ps1` scripts are the reference implementation during the migration.
 - Keep the conductor model intact: Opus reads
-  [`../SKILL.md`](../SKILL.md), chooses the next action, and calls the binary as
+  [`../SKILL.md`](../../SKILL.md), chooses the next action, and calls the binary as
   its hands.
 - Cleanly fix the Windows-specific process and locking details while porting.
 - Keep model and reasoning-effort handling as pass-through only. If the caller
@@ -78,17 +89,17 @@ It does not change the loopcoder runtime model.
 Out of scope:
 
 - Replacing the Opus conductor. The conductor remains the
-  [`../SKILL.md`](../SKILL.md) playbook running in Claude Code. The binary is
+  [`../SKILL.md`](../../SKILL.md) playbook running in Claude Code. The binary is
   the mechanical layer it calls.
 - Building the autonomous/background runtime described in
-  [`../DESIGN.md` section 12](../DESIGN.md#12-local-v1-vs-cloud-v2). That is
+  [`../DESIGN.md` section 12](../../DESIGN.md#12-local-v1-vs-cloud-v2). That is
   Scope B. The Go binary may include foreground helpers that are shaped like
   future ticks, but this document does not authorize a daemon, cron loop, or
   unattended cloud conductor.
 - Changing `.delivery.yml` schema, the `.loopcoder/runs/<RunId>/` layout,
   GitHub issue/PR/label/check flow, branch names, PR body conventions, or the
   conductor's intelligence.
-- Changing the doc-first process in [`PROCESS.md`](PROCESS.md).
+- Changing the doc-first process in [`PROCESS.md`](../PROCESS.md).
 - Changing the human merge gate. A passing verification state still means
   merge-eligible, not auto-merged.
 - Adding provider-specific worker intelligence. The first Go binary keeps the
@@ -126,7 +137,7 @@ The command names are stable user-facing contracts after the migration.
 | `loopcoder resume` | `scripts/resume.ps1` |
 | `loopcoder recover` | `scripts/recover-and-retry.ps1` |
 | `loopcoder verify-local` | `scripts/verify-local.ps1` |
-| `loopcoder dispatch-wave` | The one-wave helper specified by [`orchestration.md`](orchestration.md), implemented natively in Go. |
+| `loopcoder dispatch-wave` | The one-wave helper specified by [`orchestration.md`](0081-orchestration.md), implemented natively in Go. |
 
 During migration, the binary should accept idiomatic long flags such as
 `--repo` and compatibility aliases matching the PowerShell parameters, such as
@@ -224,7 +235,7 @@ The JSON output must preserve the current shape:
 - `summary`
 
 The ready/non-ready classifications must remain compatible with
-[`orchestration.md`](orchestration.md): `blocked-by-unmerged-dep`,
+[`orchestration.md`](0081-orchestration.md): `blocked-by-unmerged-dep`,
 `has-open-PR`, `has-live-attempt`, `recovery-needed`, and diagnostic states
 such as `closed` when `--include-closed` is supplied.
 
@@ -323,7 +334,7 @@ Parameters:
 | `--base-branch` | No | `main` | Base branch used for isolated checkout. |
 
 The command must preserve the local command gate model from
-[`verification.md`](verification.md):
+[`verification.md`](0039-verification.md):
 
 - read `ci.tests`, `ci.typecheck`, and `ci.build` from `.delivery.yml`;
 - create an isolated worktree;
@@ -337,7 +348,7 @@ The command must preserve the local command gate model from
 ### `loopcoder dispatch-wave`
 
 Reference: the one-wave helper specified by
-[`orchestration.md`](orchestration.md). The PowerShell design called this
+[`orchestration.md`](0081-orchestration.md). The PowerShell design called this
 helper `dispatch-ready-wave.ps1`; the Go CLI should expose it as the shorter
 subcommand `dispatch-wave`.
 
@@ -370,7 +381,7 @@ run id, then stops. It must not merge, push directly, edit labels, or loop the
 DAG. Push and PR creation remain inside the dispatch path, as they are today.
 
 The state-branch and conductor-lease work described in
-[`resilience.md`](resilience.md) is also implemented directly in Go when it
+[`0041-resilience.md`](0041-resilience.md) is also implemented directly in Go when it
 lands. It should not be introduced as another PowerShell shim.
 
 ## Unchanged Contracts
@@ -415,8 +426,8 @@ The current meanings remain unchanged:
 
 The Go parser may be stricter about malformed YAML, but it must remain tolerant
 of absent optional sections and use the same defaults documented in
-[`SKILL.md`](../SKILL.md), [`resilience.md`](resilience.md), and
-[`verification.md`](verification.md).
+[`SKILL.md`](../../SKILL.md), [`0041-resilience.md`](0041-resilience.md), and
+[`verification.md`](0039-verification.md).
 
 The migration must not add required `.delivery.yml` keys. New optional keys
 need their own doc-first design or a narrowly scoped amendment.
@@ -519,7 +530,7 @@ without a separate compatibility design.
 
 ### Ready-Set And Resume Reports
 
-The `ready-set` JSON report shape from [`orchestration.md`](orchestration.md)
+The `ready-set` JSON report shape from [`orchestration.md`](0081-orchestration.md)
 is unchanged:
 
 - `version`
@@ -717,7 +728,7 @@ Rules:
 - dispatch concurrency must not bypass readiness checks, retry bounds, or the
   human merge gate.
 
-This preserves [`scheduling.md`](scheduling.md): real dependencies govern
+This preserves [`scheduling.md`](0028-scheduling.md): real dependencies govern
 dispatch readiness, and file overlap is handled later at merge time from real
 PR diffs.
 
@@ -914,7 +925,7 @@ Port:
 - `verify-local`;
 - `dispatch-wave`;
 - state-branch and conductor-lease mechanics from
-  [`resilience.md`](resilience.md), when those are ready to leave target-design
+  [`0041-resilience.md`](0041-resilience.md), when those are ready to leave target-design
   status.
 
 `dispatch-wave` should be implemented directly in Go rather than copying the
@@ -931,7 +942,7 @@ command cannot run on the current platform.
 
 ### Phase 5: Switch The Conductor Backend
 
-After command parity is proven, update [`../SKILL.md`](../SKILL.md) and usage
+After command parity is proven, update [`../SKILL.md`](../../SKILL.md) and usage
 docs to call the binary:
 
 ```text
@@ -979,7 +990,7 @@ During migration:
 - Keep model and effort flags omitted unless the user explicitly requested
   them.
 
-Once parity lands, [`../SKILL.md`](../SKILL.md) should describe `loopcoder` as
+Once parity lands, [`../SKILL.md`](../../SKILL.md) should describe `loopcoder` as
 the helper interface. It can keep a short fallback note for Windows users on an
 older checkout, but the examples should use the native binary.
 
@@ -1187,27 +1198,27 @@ bounded timeout.
 - Binary name collision: verify package-manager and PATH collision risk before
   publishing prebuilt binaries. The repo-local command should remain
   `loopcoder` unless a real collision is found.
-- State branch timing: `resilience.md` describes state branch plus conductor
+- State branch timing: `0041-resilience.md` describes state branch plus conductor
   lease as target behavior. Decide whether that lands in the same phase as
   `dispatch-wave` or in a separate follow-up after local parity is complete.
 
 ## References
 
-- [`architecture.md`](architecture.md): current v1 roles, ports, adapters, and
+- [`architecture.md`](../reference/architecture.md): current v1 roles, ports, adapters, and
   single-session limits.
-- [`scheduling.md`](scheduling.md): dependency-aware dispatch, worktree
+- [`scheduling.md`](0028-scheduling.md): dependency-aware dispatch, worktree
   isolation, file-overlap-at-merge, and worktree creation serialization.
-- [`resilience.md`](resilience.md): durable run state, heartbeats, recovery
+- [`0041-resilience.md`](0041-resilience.md): durable run state, heartbeats, recovery
   briefs, resume, state branch, and conductor lease.
-- [`verification.md`](verification.md): hosted checks, local command gates,
+- [`verification.md`](0039-verification.md): hosted checks, local command gates,
   spec conformance, and explicit `pass` / `fail` / `needs-human` verdicts.
-- [`orchestration.md`](orchestration.md): ready-set computation and one-wave
+- [`orchestration.md`](0081-orchestration.md): ready-set computation and one-wave
   dispatch helper.
-- [`PROCESS.md`](PROCESS.md): doc-first workflow and one concern per PR.
-- [`../DESIGN.md` section 8](../DESIGN.md#8-state-model): GitHub-first state
+- [`PROCESS.md`](../PROCESS.md): doc-first workflow and one concern per PR.
+- [`../DESIGN.md` section 8](../../DESIGN.md#8-state-model): GitHub-first state
   model and re-derive-on-tick direction.
-- [`../DESIGN.md` section 12](../DESIGN.md#12-local-v1-vs-cloud-v2): later
+- [`../DESIGN.md` section 12](../../DESIGN.md#12-local-v1-vs-cloud-v2): later
   local/cloud background conductor target, explicitly out of scope for this
   Scope A migration.
-- [`../SKILL.md`](../SKILL.md): conductor playbook that will select the Go
+- [`../SKILL.md`](../../SKILL.md): conductor playbook that will select the Go
   backend after parity lands.

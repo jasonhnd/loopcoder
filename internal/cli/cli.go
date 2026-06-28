@@ -155,7 +155,7 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runDispatchWave(args[1:], stdout, stderr, deps)
 	}
 
-	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/go-migration.md\n", command.Name)
+	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)
 	return 1
 }
 

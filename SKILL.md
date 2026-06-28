@@ -9,7 +9,7 @@ Use this as the canonical conductor session procedure. Claude Code loads this
 file as the skill entrypoint; Codex CLI and Gemini CLI should use
 [`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md), which point back here
 instead of forking the procedure. The full design lives in
-[`docs/specs/2026-06-26-loopcoder-v1-design.md`](docs/specs/2026-06-26-loopcoder-v1-design.md);
+[`docs/specs/0000-loopcoder-v1.md`](docs/specs/0000-loopcoder-v1.md);
 keep this playbook practical and procedural instead of duplicating the spec.
 
 ## Process discipline (doc-first)
@@ -59,7 +59,7 @@ run only.
 ## Learnings (self-improvement)
 
 Use [`docs/learnings.md`](docs/learnings.md) as advisory operational memory per
-[`docs/self-improvement.md`](docs/self-improvement.md).
+[`docs/specs/0040-self-improvement.md`](docs/specs/0040-self-improvement.md).
 
 - Read path: during intake for loopcoder self-work, when the target repository
   is the loopcoder repository, or when the user asks for self-improvement
@@ -86,7 +86,7 @@ Use [`docs/learnings.md`](docs/learnings.md) as advisory operational memory per
 ## Improvement review
 
 Use this optional, bounded reflection pass per
-[`docs/self-improvement.md`](docs/self-improvement.md), especially sections 6,
+[`docs/specs/0040-self-improvement.md`](docs/specs/0040-self-improvement.md), especially sections 6,
 9, and 12. It is proposal-only and human-gated: the conductor may draft
 improvement candidates, but it must not create issues, dispatch workers, mutate
 the harness, change `SKILL.md`, scripts, docs, or `.delivery.yml`, or merge
@@ -187,10 +187,10 @@ Bounds and scrutiny:
    ```
 
 4. Dispatch ready issues.
-   - Follow the layered ready-set scheduler in [`docs/scheduling.md`](docs/scheduling.md).
+   - Follow the layered ready-set scheduler in [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md).
    - Compute the ready set with `loopcoder ready-set --repo . --base-branch <base-branch> --run-id <run-id> --format text`.
    - A ready issue is an unstarted issue whose `depends_on` entries / `blocked-by:#N` labels are all merged to `main`, not merely open as PRs.
-   - Keep the two ordering axes from [`docs/scheduling.md`](docs/scheduling.md) separate: a real code dependency forces serial order, so B waits until A is merged and then branches from `main`; file overlap does not block dispatch.
+   - Keep the two ordering axes from [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) separate: a real code dependency forces serial order, so B waits until A is merged and then branches from `main`; file overlap does not block dispatch.
    - Dispatch one ready wave with `loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> ...`, or dispatch one issue with `loopcoder dispatch ...`. Then recompute as PRs merge. Repeat until the DAG is drained or blocked.
    - `loopcoder dispatch` and `loopcoder dispatch-wave` preserve git worktree creation serialization, so independent ready issues can be dispatched concurrently safely.
    - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
@@ -227,7 +227,7 @@ Bounds and scrutiny:
    - End every PR review with exactly one explicit conductor verdict in chat: `pass`, `fail`, or `needs-human`, with evidence for the `loopreview` verdict, required check status, local gate status, spec criteria, and changed files.
 
 6. Merge ordering.
-   - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/scheduling.md`](docs/scheduling.md).
+   - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md).
    - Never auto-merge. A `pass` verdict means merge-eligible only; it never calls `gh pr merge`. When the user names PRs to merge, read each named ready PR's real changed files with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run `gh pr merge` only for those named PRs that remain merge-eligible.
    - Non-overlapping PRs may merge in any order. Overlapping PRs merge serially: merge the first, rebase the next onto updated `main`, verify it remains acceptable, then merge it.
    - If an overlapping PR cannot rebase cleanly, evict it from the merge group, capture the changed files, conflicting paths, rebase output, and PRs that landed, then narrow the scope and re-dispatch a worker with that context instead of blindly retrying.
@@ -248,7 +248,7 @@ Bounds and scrutiny:
 
 ## Verification gate
 
-Follow [`docs/verification.md`](docs/verification.md) for the gate model, with
+Follow [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md) for the gate model, with
 the primary adversarial review delegated to `loopcoder loopreview`.
 
 - Independent Verifier: run
@@ -268,7 +268,7 @@ the primary adversarial review delegated to `loopcoder loopreview`.
   `loopcoder verify-local --repo <repo> --pr-number <pr>` to execute the
   configured local command gates from `.delivery.yml` `ci.tests`,
   `ci.typecheck`, and `ci.build`, as described in
-  [`docs/verification.md`](docs/verification.md). Fold its explicit
+  [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md). Fold its explicit
   `pass` / `fail` / `needs-human` result into the PR verdict. If no local
   commands are configured, report that portion as `not-configured`; this is not
   a failure.
@@ -300,7 +300,7 @@ the primary adversarial review delegated to `loopcoder loopreview`.
 
 ## Worker liveness & recovery
 
-Follow the resilience contract in [`docs/resilience.md`](docs/resilience.md).
+Follow the resilience contract in [`docs/specs/0041-resilience.md`](docs/specs/0041-resilience.md).
 The conductor passes a stable `--run-id` to `loopcoder dispatch` or `loopcoder
 dispatch-wave` for all dispatches in one batch so those attempts share
 `.loopcoder/runs/<RunId>/` under the main repo.
@@ -325,7 +325,7 @@ remain the source of truth for delivery state.
   context brief under `.loopcoder/runs/<RunId>/recovery/<job_id>-context.md`
   with issue, branch, worktree, log, summary, attempt, phase, status, error,
   changed files, log tail, and PR lookup details. Use it as the concrete
-  recovery context described in [`docs/resilience.md`](docs/resilience.md).
+  recovery context described in [`docs/specs/0041-resilience.md`](docs/specs/0041-resilience.md).
 - Bounded retry: recover failed, hung, or idle attempts through
   `loopcoder recover --repo <repo> --issue-number <n> --issue-title "<title>"
   --issue-body "<body>" --run-id <run-id>`. It adopts an existing PR first;
@@ -339,7 +339,7 @@ remain the source of truth for delivery state.
   deliverable.
 - Resume command: before dispatching anything after an interruption, run
   `loopcoder resume --repo <repo> --run-id <run>` (omit `--run-id` to select the
-  latest local run). The report follows [`docs/resilience.md`](docs/resilience.md):
+  latest local run). The report follows [`docs/specs/0041-resilience.md`](docs/specs/0041-resilience.md):
   GitHub is the source of truth, `.loopcoder` state is advisory, and resume
   prints next ready actions but never auto-dispatches, pushes, merges, or adopts
   a local attempt without conductor/human review.

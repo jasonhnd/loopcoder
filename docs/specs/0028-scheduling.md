@@ -1,8 +1,19 @@
+---
+id: 28
+title: loopcoder Scheduling Design
+status: accepted
+date: 2026-06-26
+issue: 28
+pr: null
+supersedes: []
+superseded_by: []
+---
+
 # loopcoder Scheduling Design
 
 Status: DESIGN. This document specifies the intended scheduling behavior for a
 batch of issues that mixes parallel and serial work. It is written doc-first per
-[`PROCESS.md`](PROCESS.md); conductor and worker implementation changes come
+[`PROCESS.md`](../PROCESS.md); conductor and worker implementation changes come
 later as separate code issues after this document merges.
 
 Current state: the built conductor path dispatches issues sequentially today.
@@ -69,7 +80,7 @@ concern.
 ## Worktree Isolation
 
 Each worker runs in a separate git worktree created by the worker adapter
-described in [`worker.md`](worker.md). Worktrees isolate the working directories,
+described in [`worker.md`](../reference/worker.md). Worktrees isolate the working directories,
 branches, indexes, and uncommitted files used by each worker.
 
 Because of that isolation, parallel work does not conflict while workers are
@@ -207,18 +218,18 @@ The conductor reports blocked state in chat rather than silently skipping work.
 
 ## Relationship To Existing Docs
 
-[`architecture.md`](architecture.md) describes the v1 system as built: an Opus
+[`architecture.md`](../reference/architecture.md) describes the v1 system as built: an Opus
 conductor session, GitHub issues and PRs, git worktrees, the Codex worker
 adapter, Opus verification, chat reporting, and human-directed merges.
 
-[`PROCESS.md`](PROCESS.md) defines the mandatory doc-first workflow. This file
+[`PROCESS.md`](../PROCESS.md) defines the mandatory doc-first workflow. This file
 is the scheduling design document; conductor logic in `SKILL.md` and any worker
 changes must come later in separate code issues after this document merges.
 
-[`worker.md`](worker.md) describes the current worker adapter and its use of
+[`worker.md`](../reference/worker.md) describes the current worker adapter and its use of
 fresh git worktrees.
 
-[`../DESIGN.md`](../DESIGN.md) is the north-star lineage. It describes generic
+[`../DESIGN.md`](../../DESIGN.md) is the north-star lineage. It describes generic
 DAG decomposition, tiered delivery, reviewer-not-author adversarial review, and
 merge-queue-with-eviction patterns. This document narrows that lineage to the
 minimal small-batch, single-session, no-auto-merge scheduling behavior for

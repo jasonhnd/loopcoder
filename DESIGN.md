@@ -148,4 +148,4 @@ Same engine, new repo.
 - Naming / repo home for the tool itself; define the canonical repo-home reference generically rather than relying on a local checkout path.
 
 ## 15. Before "done" (rigor audit)
-Per project rule: before finalizing, audit this doc against the current `SKILL.md`, `docs/architecture.md`, `docs/worker.md`, the `loopcoder` CLI help, `.delivery.yml`, GitHub issue/PR state-sync behavior, and worker-harness assumptions — not self-review only.
+Per project rule: before finalizing, audit this doc against the current `SKILL.md`, `docs/reference/architecture.md`, `docs/reference/worker.md`, the `loopcoder` CLI help, `.delivery.yml`, GitHub issue/PR state-sync behavior, and worker-harness assumptions — not self-review only.
