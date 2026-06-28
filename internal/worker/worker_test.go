@@ -158,6 +158,9 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if attempts[0].ExitCode == nil || *attempts[0].ExitCode != 0 {
 		t.Fatalf("attempt exit code = %#v, want 0", attempts[0].ExitCode)
 	}
+	if attempts[0].Usage == nil || attempts[0].Usage.TotalTokens == nil || *attempts[0].Usage.TotalTokens != 154 {
+		t.Fatalf("attempt usage = %#v, want total tokens 154", attempts[0].Usage)
+	}
 	eventCount, err := state.CountEvents(repo, "run-test")
 	if err != nil {
 		t.Fatalf("CountEvents returned error: %v", err)

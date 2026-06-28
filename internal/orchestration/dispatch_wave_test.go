@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -219,6 +222,63 @@ func TestDispatchWaveSharedRunIDPropagation(t *testing.T) {
 	}
 	if len(runIDs) != 2 {
 		t.Fatalf("dispatch run id count = %d, want 2", len(runIDs))
+	}
+}
+
+func TestDispatchWaveBudgetNeedsHumanWithoutDispatchingOverCap(t *testing.T) {
+	repo := t.TempDir()
+	maxAttempts := 1
+	var dispatched []int
+
+	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			1: {Number: 1, Title: "One"},
+			2: {Number: 2, Title: "Two"},
+		}},
+		RepoPath:      repo,
+		RunID:         "run-test-wave",
+		IssueNumbers:  []int{1, 2},
+		ThrottleLimit: 1,
+		Budget:        config.GuardrailBudget{MaxTotalAttempts: &maxAttempts},
+		Now:           time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(1, 2), nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatched = append(dispatched, opts.IssueNumber)
+			return waveWorkerResult(opts), nil
+		},
+		LoadAttempts: noAttempts,
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(dispatched, []int{1}) {
+		t.Fatalf("dispatched issues = %#v, want [1]", dispatched)
+	}
+	if report.Results[0].Status != DispatchWaveStatusSucceeded {
+		t.Fatalf("issue #1 result = %#v, want succeeded", report.Results[0])
+	}
+	if report.Results[1].Status != DispatchWaveStatusNeedsHuman {
+		t.Fatalf("issue #2 result = %#v, want needs-human", report.Results[1])
+	}
+	for _, want := range []string{"guardrails.budget.max_total_attempts", "planned_increment=1", "proposed_increment=1"} {
+		if !strings.Contains(report.Results[1].Error, want) {
+			t.Fatalf("needs-human error missing %q:\n%s", want, report.Results[1].Error)
+		}
+	}
+	if !DispatchWaveHasFailures(report) {
+		t.Fatal("DispatchWaveHasFailures = false, want true for needs-human")
+	}
+
+	ledgerPath := guardrails.LedgerPath(repo, "run-test-wave", 2)
+	data, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("ReadFile ledger: %v", err)
+	}
+	if !strings.Contains(string(data), `"status": "needs-human"`) {
+		t.Fatalf("ledger missing needs-human status:\n%s", string(data))
 	}
 }
 

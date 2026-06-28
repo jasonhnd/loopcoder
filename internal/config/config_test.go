@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -77,6 +78,12 @@ resilience:
     retry_backoff_seconds: [1, 2, 3]
 report:
   channel: chat
+guardrails:
+  budget:
+    max_runs: 3
+    max_total_attempts: 12
+    max_total_tokens: 500000
+    max_total_cost_usd: 25.50
 `)
 
 	cfg, err := Parse(data)
@@ -143,6 +150,59 @@ report:
 	}
 	if cfg.Report.Channel != "chat" {
 		t.Fatalf("Report.Channel = %q, want chat", cfg.Report.Channel)
+	}
+	if cfg.Guardrails.Budget.MaxRuns == nil || *cfg.Guardrails.Budget.MaxRuns != 3 {
+		t.Fatalf("Guardrails.Budget.MaxRuns = %#v, want 3", cfg.Guardrails.Budget.MaxRuns)
+	}
+	if cfg.Guardrails.Budget.MaxTotalAttempts == nil || *cfg.Guardrails.Budget.MaxTotalAttempts != 12 {
+		t.Fatalf("Guardrails.Budget.MaxTotalAttempts = %#v, want 12", cfg.Guardrails.Budget.MaxTotalAttempts)
+	}
+	if cfg.Guardrails.Budget.MaxTotalTokens == nil || *cfg.Guardrails.Budget.MaxTotalTokens != 500000 {
+		t.Fatalf("Guardrails.Budget.MaxTotalTokens = %#v, want 500000", cfg.Guardrails.Budget.MaxTotalTokens)
+	}
+	if cfg.Guardrails.Budget.MaxTotalCostUSD == nil || *cfg.Guardrails.Budget.MaxTotalCostUSD != 25.50 {
+		t.Fatalf("Guardrails.Budget.MaxTotalCostUSD = %#v, want 25.50", cfg.Guardrails.Budget.MaxTotalCostUSD)
+	}
+}
+
+func TestParseRejectsInvalidGuardrailBudgetCaps(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "max runs zero",
+			body: "guardrails:\n  budget:\n    max_runs: 0\n",
+			want: "guardrails.budget.max_runs must be greater than zero",
+		},
+		{
+			name: "max attempts negative",
+			body: "guardrails:\n  budget:\n    max_total_attempts: -1\n",
+			want: "guardrails.budget.max_total_attempts must be greater than zero",
+		},
+		{
+			name: "max tokens zero",
+			body: "guardrails:\n  budget:\n    max_total_tokens: 0\n",
+			want: "guardrails.budget.max_total_tokens must be greater than zero",
+		},
+		{
+			name: "max cost zero",
+			body: "guardrails:\n  budget:\n    max_total_cost_usd: 0\n",
+			want: "guardrails.budget.max_total_cost_usd must be greater than zero",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil {
+				t.Fatal("Parse returned nil error, want invalid guardrail budget")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
 	}
 }
 

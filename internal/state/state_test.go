@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
 
 func TestFormatTimestampUsesUTCRFC3339(t *testing.T) {
@@ -113,6 +115,8 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
   "recovery_context_path": ".loopcoder/runs/run-test/recovery/job-42-1234-context.md",
   "heartbeat_at": "2026-06-26T12:01:00Z",
   "last_progress_at": "2026-06-26T12:01:00Z",
+  "usage": {"input_tokens": 10, "output_tokens": 5},
+  "cost_usd": "1.25",
   "exit_code": null
 }`)
 	if err := os.WriteFile(attemptPath, data, 0o644); err != nil {
@@ -150,6 +154,13 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	}
 	if got.ExitCode != nil {
 		t.Fatalf("ExitCode = %#v, want nil", got.ExitCode)
+	}
+	if got.Usage == nil || got.Usage.InputTokens == nil || *got.Usage.InputTokens != 10 ||
+		got.Usage.OutputTokens == nil || *got.Usage.OutputTokens != 5 {
+		t.Fatalf("Usage = %#v, want input=10 output=5", got.Usage)
+	}
+	if got.CostUSD == nil || *got.CostUSD != 1.25 {
+		t.Fatalf("CostUSD = %#v, want 1.25", got.CostUSD)
 	}
 	if got.Path != attemptPath {
 		t.Fatalf("Path = %q, want %q", got.Path, attemptPath)
@@ -189,6 +200,8 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	repo := t.TempDir()
 	exitCode := 0
 	errText := "failed password=hunter2"
+	totalTokens := int64(154)
+	costUSD := 0.42
 
 	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
 		Version:        1,
@@ -206,6 +219,8 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		LogBytes:       123,
 		ExitCode:       &exitCode,
 		Error:          &errText,
+		Usage:          &attestation.Usage{TotalTokens: &totalTokens},
+		CostUSD:        &costUSD,
 	})
 	if err != nil {
 		t.Fatalf("WriteAttempt returned error: %v", err)
@@ -225,7 +240,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("attempt JSON invalid: %v", err)
 	}
-	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error"} {
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "cost_usd"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
 		}

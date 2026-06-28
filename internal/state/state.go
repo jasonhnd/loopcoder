@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
 
 const runIDTimeLayout = "20060102T150405Z"
@@ -19,43 +21,47 @@ const runIDTimeLayout = "20060102T150405Z"
 var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
 
 type Attempt struct {
-	Version             int       `json:"version,omitempty"`
-	JobID               string    `json:"job_id"`
-	Issue               int       `json:"issue"`
-	Attempt             int       `json:"attempt"`
-	Provider            string    `json:"provider,omitempty"`
-	PID                 *int      `json:"pid,omitempty"`
-	Phase               string    `json:"phase,omitempty"`
-	Status              string    `json:"status,omitempty"`
-	Branch              string    `json:"branch,omitempty"`
-	RecoveryContextPath string    `json:"recovery_context_path,omitempty"`
-	StartedAt           string    `json:"started_at,omitempty"`
-	HeartbeatAt         string    `json:"heartbeat_at,omitempty"`
-	LastProgressAt      string    `json:"last_progress_at,omitempty"`
-	LogBytes            *int64    `json:"log_bytes,omitempty"`
-	ExitCode            *int      `json:"exit_code,omitempty"`
-	Error               string    `json:"error,omitempty"`
-	Path                string    `json:"path,omitempty"`
-	LastWriteUTC        time.Time `json:"-"`
+	Version             int                `json:"version,omitempty"`
+	JobID               string             `json:"job_id"`
+	Issue               int                `json:"issue"`
+	Attempt             int                `json:"attempt"`
+	Provider            string             `json:"provider,omitempty"`
+	PID                 *int               `json:"pid,omitempty"`
+	Phase               string             `json:"phase,omitempty"`
+	Status              string             `json:"status,omitempty"`
+	Branch              string             `json:"branch,omitempty"`
+	RecoveryContextPath string             `json:"recovery_context_path,omitempty"`
+	StartedAt           string             `json:"started_at,omitempty"`
+	HeartbeatAt         string             `json:"heartbeat_at,omitempty"`
+	LastProgressAt      string             `json:"last_progress_at,omitempty"`
+	LogBytes            *int64             `json:"log_bytes,omitempty"`
+	ExitCode            *int               `json:"exit_code,omitempty"`
+	Error               string             `json:"error,omitempty"`
+	Usage               *attestation.Usage `json:"usage,omitempty"`
+	CostUSD             *float64           `json:"cost_usd,omitempty"`
+	Path                string             `json:"path,omitempty"`
+	LastWriteUTC        time.Time          `json:"-"`
 }
 
 type AttemptRecord struct {
-	Version             int     `json:"version"`
-	JobID               string  `json:"job_id"`
-	Issue               int     `json:"issue"`
-	Attempt             int     `json:"attempt"`
-	Provider            string  `json:"provider"`
-	PID                 int     `json:"pid"`
-	Phase               string  `json:"phase"`
-	Status              string  `json:"status"`
-	Branch              string  `json:"branch,omitempty"`
-	RecoveryContextPath string  `json:"recovery_context_path,omitempty"`
-	StartedAt           string  `json:"started_at"`
-	HeartbeatAt         string  `json:"heartbeat_at"`
-	LastProgressAt      string  `json:"last_progress_at"`
-	LogBytes            int64   `json:"log_bytes"`
-	ExitCode            *int    `json:"exit_code"`
-	Error               *string `json:"error"`
+	Version             int                `json:"version"`
+	JobID               string             `json:"job_id"`
+	Issue               int                `json:"issue"`
+	Attempt             int                `json:"attempt"`
+	Provider            string             `json:"provider"`
+	PID                 int                `json:"pid"`
+	Phase               string             `json:"phase"`
+	Status              string             `json:"status"`
+	Branch              string             `json:"branch,omitempty"`
+	RecoveryContextPath string             `json:"recovery_context_path,omitempty"`
+	StartedAt           string             `json:"started_at"`
+	HeartbeatAt         string             `json:"heartbeat_at"`
+	LastProgressAt      string             `json:"last_progress_at"`
+	LogBytes            int64              `json:"log_bytes"`
+	ExitCode            *int               `json:"exit_code"`
+	Error               *string            `json:"error"`
+	Usage               *attestation.Usage `json:"usage,omitempty"`
+	CostUSD             *float64           `json:"cost_usd,omitempty"`
 }
 
 type Event struct {
@@ -266,22 +272,24 @@ func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
 }
 
 type attemptJSON struct {
-	Version             int             `json:"version"`
-	JobID               string          `json:"job_id"`
-	Issue               json.RawMessage `json:"issue"`
-	Attempt             json.RawMessage `json:"attempt"`
-	Provider            string          `json:"provider"`
-	PID                 json.RawMessage `json:"pid"`
-	Phase               string          `json:"phase"`
-	Status              string          `json:"status"`
-	Branch              string          `json:"branch"`
-	RecoveryContextPath string          `json:"recovery_context_path"`
-	StartedAt           string          `json:"started_at"`
-	HeartbeatAt         string          `json:"heartbeat_at"`
-	LastProgressAt      string          `json:"last_progress_at"`
-	LogBytes            json.RawMessage `json:"log_bytes"`
-	ExitCode            json.RawMessage `json:"exit_code"`
-	Error               string          `json:"error"`
+	Version             int                `json:"version"`
+	JobID               string             `json:"job_id"`
+	Issue               json.RawMessage    `json:"issue"`
+	Attempt             json.RawMessage    `json:"attempt"`
+	Provider            string             `json:"provider"`
+	PID                 json.RawMessage    `json:"pid"`
+	Phase               string             `json:"phase"`
+	Status              string             `json:"status"`
+	Branch              string             `json:"branch"`
+	RecoveryContextPath string             `json:"recovery_context_path"`
+	StartedAt           string             `json:"started_at"`
+	HeartbeatAt         string             `json:"heartbeat_at"`
+	LastProgressAt      string             `json:"last_progress_at"`
+	LogBytes            json.RawMessage    `json:"log_bytes"`
+	ExitCode            json.RawMessage    `json:"exit_code"`
+	Error               string             `json:"error"`
+	Usage               *attestation.Usage `json:"usage"`
+	CostUSD             json.RawMessage    `json:"cost_usd"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -341,9 +349,31 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		LogBytes:            rawInt64Ptr(raw.LogBytes),
 		ExitCode:            rawIntPtr(raw.ExitCode),
 		Error:               raw.Error,
+		Usage:               cloneUsage(raw.Usage),
+		CostUSD:             rawFloat64Ptr(raw.CostUSD),
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func cloneUsage(usage *attestation.Usage) *attestation.Usage {
+	if usage == nil {
+		return nil
+	}
+	clone := *usage
+	if usage.InputTokens != nil {
+		value := *usage.InputTokens
+		clone.InputTokens = &value
+	}
+	if usage.OutputTokens != nil {
+		value := *usage.OutputTokens
+		clone.OutputTokens = &value
+	}
+	if usage.TotalTokens != nil {
+		value := *usage.TotalTokens
+		clone.TotalTokens = &value
+	}
+	return &clone
 }
 
 func rawIntPtr(raw json.RawMessage) *int {
@@ -372,6 +402,26 @@ func rawInt64Ptr(raw json.RawMessage) *int64 {
 		return nil
 	}
 	parsed, err := strconv.ParseInt(strings.TrimSpace(asString), 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func rawFloat64Ptr(raw json.RawMessage) *float64 {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return nil
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return &value
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err != nil {
+		return nil
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(asString), 64)
 	if err != nil {
 		return nil
 	}
