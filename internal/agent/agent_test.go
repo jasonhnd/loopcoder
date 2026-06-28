@@ -67,3 +67,15 @@ func assertNilInt64Ptr(t *testing.T, got *int64) {
 		t.Fatalf("value = %d, want nil", *got)
 	}
 }
+
+func assertArgsDoNotContain(t *testing.T, args []string, forbidden ...string) {
+	t.Helper()
+	for _, arg := range args {
+		lowerArg := strings.ToLower(arg)
+		for _, value := range forbidden {
+			if strings.Contains(lowerArg, strings.ToLower(value)) {
+				t.Fatalf("args %#v contain forbidden value %q in arg %q", args, value, arg)
+			}
+		}
+	}
+}

@@ -90,6 +90,29 @@ func TestBuildCodexArgs(t *testing.T) {
 	}
 }
 
+func TestBuildCodexReadOnlyVerifierArgs(t *testing.T) {
+	schema := `{"type":"object"}`
+	got := BuildCodexArgs(Invocation{
+		WorktreePath: "wt",
+		LogPath:      "codex.log",
+		ReadOnly:     true,
+		OutputSchema: schema,
+	})
+	want := []string{
+		"exec",
+		"--cd", "wt",
+		"-s", "read-only",
+		"--skip-git-repo-check",
+		"--output-schema", schema,
+		"-o", "summary.txt",
+		"-",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildCodexArgs() = %#v, want %#v", got, want)
+	}
+	assertArgsDoNotContain(t, got, "dangerously-bypass-approvals-and-sandbox", "approval", "plan")
+}
+
 func TestParseCodexInvocation(t *testing.T) {
 	tests := []struct {
 		name       string

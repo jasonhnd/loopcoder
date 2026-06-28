@@ -94,6 +94,24 @@ func TestBuildClaudeArgs(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeReadOnlyVerifierArgs(t *testing.T) {
+	schema := `{"type":"object"}`
+	got := BuildClaudeArgs(Invocation{
+		ReadOnly:     true,
+		OutputSchema: schema,
+	})
+	want := []string{
+		"--print",
+		"--allowedTools", "Read Grep Glob",
+		"--output-format", "json",
+		"--json-schema", schema,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildClaudeArgs() = %#v, want %#v", got, want)
+	}
+	assertArgsDoNotContain(t, got, "dangerously-skip-permissions", "--permission-mode", "approval", "plan")
+}
+
 func TestParseClaudeSummary(t *testing.T) {
 	payload := []byte(`{
 		"type": "result",

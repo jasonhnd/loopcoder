@@ -571,6 +571,19 @@ func TestRunParseFailureReturnsNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestRunVerifierNonZeroExitReturnsNeedsHuman(t *testing.T) {
+	result := runWithAgentResult(t, validLoopreviewAgentResult("not-json", 7), nil, nil)
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	if !strings.Contains(result.Verdict.Evidence, "codex verifier exited with code 7") {
+		t.Fatalf("evidence = %q", result.Verdict.Evidence)
+	}
+	if result.Verdict.Attestation == nil || result.Verdict.Attestation.ExitCode != 7 {
+		t.Fatalf("attestation = %#v, want exit code 7", result.Verdict.Attestation)
+	}
+}
+
 func TestRunUnreadableSpecForcesNeedsHuman(t *testing.T) {
 	result := runWithAgentSummary(t, `{"verdict":"pass","findings":[],"evidence":"looks good","spec_conformance":"pass"}`, errors.New("missing spec"))
 	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
@@ -641,6 +654,9 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 	}
 	if !strings.Contains(result.Verdict.Evidence, "claude verifier timed out after 10ms") {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
+	}
+	if fakeAgent.calls != 1 {
+		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
 	}
 	if fakeAgent.ctxErr != context.DeadlineExceeded {
 		t.Fatalf("agent ctxErr = %v, want context deadline exceeded", fakeAgent.ctxErr)
