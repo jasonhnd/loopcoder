@@ -1,7 +1,7 @@
 # Worker Adapter
 
 This document describes the worker adapter as built in `loopcoder dispatch`,
-the native `loopcoder` binary subcommand. As of 0.3.0 the adapter is
+the native `loopcoder` binary subcommand. As of 0.3.1 the adapter is
 provider-pluggable and uses the shared provider registry.
 
 ## Purpose
@@ -17,7 +17,7 @@ requires the provider's final summary to be in English.
 
 ## Supported worker providers
 
-As of 0.3.0 the worker is provider-pluggable. The adapter step is delegated to a
+As of 0.3.1 the worker is provider-pluggable. The adapter step is delegated to a
 provider registry, and three providers are registered:
 
 - `codex` (default; verified)
