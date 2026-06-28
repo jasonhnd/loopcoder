@@ -24,7 +24,11 @@ func BuildClaudeArgs(inv Invocation) []string {
 		"--print",
 	}
 	if inv.ReadOnly {
-		args = append(args, "--allowedTools", "Read Grep Glob")
+		args = append(args,
+			"--safe-mode",
+			"--no-session-persistence",
+			"--allowedTools", "Read Grep Glob",
+		)
 	} else {
 		args = append(args, "--dangerously-skip-permissions")
 	}
@@ -84,10 +88,18 @@ func parseClaudeSummary(output []byte) string {
 	}
 
 	var payload struct {
-		Result string `json:"result"`
+		Result           string          `json:"result"`
+		StructuredOutput json.RawMessage `json:"structured_output"`
 	}
 	if err := json.Unmarshal(trimmed, &payload); err != nil {
 		return ""
+	}
+	if structured := bytes.TrimSpace(payload.StructuredOutput); len(structured) > 0 && !bytes.Equal(structured, []byte("null")) {
+		var compacted bytes.Buffer
+		if err := json.Compact(&compacted, structured); err == nil {
+			return compacted.String()
+		}
+		return string(structured)
 	}
 	return strings.TrimSpace(payload.Result)
 }
@@ -113,7 +125,7 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 		return metadata
 	}
 
-	metadata.Model = firstSortedKey(payload.ModelUsage)
+	metadata.Model = claudePrimaryModel(payload.ModelUsage)
 	if inputTokens, ok := parseRawInt64(payload.Usage.InputTokens); ok {
 		metadata.Usage.InputTokens = inputTokens
 	}
@@ -121,4 +133,40 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 		metadata.Usage.OutputTokens = outputTokens
 	}
 	return metadata
+}
+
+func claudePrimaryModel(values map[string]json.RawMessage) string {
+	if len(values) == 0 {
+		return ""
+	}
+	type candidate struct {
+		model  string
+		tokens int64
+	}
+	best := candidate{}
+	for model, raw := range values {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		var usage struct {
+			InputTokens  json.RawMessage `json:"inputTokens"`
+			OutputTokens json.RawMessage `json:"outputTokens"`
+		}
+		_ = json.Unmarshal(raw, &usage)
+		tokens := int64(0)
+		if input, ok := parseRawInt64(usage.InputTokens); ok && input != nil {
+			tokens += *input
+		}
+		if output, ok := parseRawInt64(usage.OutputTokens); ok && output != nil {
+			tokens += *output
+		}
+		if best.model == "" || tokens > best.tokens || (tokens == best.tokens && model < best.model) {
+			best = candidate{model: model, tokens: tokens}
+		}
+	}
+	if best.model == "" {
+		return firstSortedKey(values)
+	}
+	return best.model
 }

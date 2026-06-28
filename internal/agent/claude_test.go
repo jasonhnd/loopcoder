@@ -66,6 +66,8 @@ func TestBuildClaudeArgs(t *testing.T) {
 			},
 			want: []string{
 				"--print",
+				"--safe-mode",
+				"--no-session-persistence",
 				"--allowedTools", "Read Grep Glob",
 				"--output-format", "json",
 			},
@@ -102,6 +104,8 @@ func TestBuildClaudeReadOnlyVerifierArgs(t *testing.T) {
 	})
 	want := []string{
 		"--print",
+		"--safe-mode",
+		"--no-session-persistence",
 		"--allowedTools", "Read Grep Glob",
 		"--output-format", "json",
 		"--json-schema", schema,
@@ -122,6 +126,26 @@ func TestParseClaudeSummary(t *testing.T) {
 
 	got := parseClaudeSummary(payload)
 	want := "Implemented the adapter and tests.\nVerification passed."
+	if got != want {
+		t.Fatalf("parseClaudeSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestParseClaudeSummaryPrefersStructuredOutput(t *testing.T) {
+	payload := []byte(`{
+		"type": "result",
+		"subtype": "success",
+		"result": "Pass. The structured output contains the verdict.",
+		"structured_output": {
+			"verdict": "pass",
+			"findings": [],
+			"evidence": "bounded packet complete",
+			"spec_conformance": "pass"
+		}
+	}`)
+
+	got := parseClaudeSummary(payload)
+	want := `{"verdict":"pass","findings":[],"evidence":"bounded packet complete","spec_conformance":"pass"}`
 	if got != want {
 		t.Fatalf("parseClaudeSummary() = %q, want %q", got, want)
 	}
@@ -159,6 +183,31 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantEffort: "high",
 			wantInput:  testInt64Ptr(1234),
 			wantOutput: testInt64Ptr(567),
+		},
+		{
+			name: "chooses primary model when Claude reports helper model usage too",
+			output: []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"result": "done",
+				"usage": {
+					"input_tokens": 2447,
+					"output_tokens": 71
+				},
+				"modelUsage": {
+					"claude-haiku-4-5-20251001": {
+						"inputTokens": 446,
+						"outputTokens": 11
+					},
+					"claude-opus-4-8[1m]": {
+						"inputTokens": 2447,
+						"outputTokens": 71
+					}
+				}
+			}`),
+			wantModel:  "claude-opus-4-8[1m]",
+			wantInput:  testInt64Ptr(2447),
+			wantOutput: testInt64Ptr(71),
 		},
 		{
 			name:       "invalid json keeps invocation effort only",

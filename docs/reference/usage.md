@@ -14,8 +14,8 @@ GitHub, git worktrees, worker providers, and PR review.
 - `git` on `PATH`.
 - `gh` on `PATH`, authenticated for the target GitHub repository.
 - At least one supported provider CLI on `PATH`. `codex` is the default worker,
-  `claude` is a verified worker provider, and `gemini` is experimental and
-  unverified end-to-end.
+  `codex` and `claude` are verified worker and verifier providers, and
+  `gemini` is experimental and unverified end-to-end.
 - Go, for installing the native `loopcoder` binary with `go install`.
 - A GitHub repository with a configured remote.
 
@@ -84,7 +84,7 @@ adapters:
   conductor: codex-cli    # Transparency only: the human session that conducts.
   worker: codex           # Default worker provider; claude is also verified.
   vcs: github             # GitHub hosts PRs and checks.
-  verifier: claude        # Should differ from worker; LLM verifier reliability is still experimental.
+  verifier: claude        # Verified loopreview provider; should differ from worker.
   gate: human-merge       # Humans choose what merges.
 worker:
   # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
@@ -120,8 +120,8 @@ report:
 
 5. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
    `gh pr checks`, and reports progress, failures, risks, and final status in
-   chat. LLM verifier provider reliability is still experimental, so ambiguous,
-   malformed, timed-out, or incomplete verifier output is reported as
+   chat. `codex` and `claude` have real verifier smoke proof; ambiguous,
+   malformed, timed-out, or incomplete verifier output is still reported as
    `needs-human`.
 
 6. You name which PRs to merge. loopcoder merges only those named PRs by running
@@ -209,6 +209,31 @@ loopcoder state pull --repo .
 loopcoder lease acquire --repo .
 loopcoder lease release --repo .
 ```
+
+## Verifier Provider Status
+
+`loopcoder loopreview` is verified for `claude` and `codex` on the 0.3.x line.
+The proof run used merged PR #202 (`0.3.x: loopreview bounded review packet`)
+with the representative command:
+
+```text
+loopcoder loopreview --repo . --pr-number 202 --provider <provider> --timeout 180s
+```
+
+The review packet was not truncated: 2 changed files, 73 changed-file bytes
+of 8,192, 29,730 diff bytes of 81,920, max per-file patch 18,925 bytes of
+24,576, 541 issue-body bytes of 12,288, and 13,769 spec bytes of 40,960.
+
+| Provider | Wall elapsed | Parsed model / effort | Token usage | Verdict | Inputs truncated |
+| --- | ---: | --- | --- | --- | --- |
+| `codex` | 77.398s | `gpt-5.5` / `xhigh` | `18,266` total | `pass` | no |
+| `claude` | 70.686s | `claude-haiku-4-5-20251001` / unset | `2,447` input / `4,947` output | `pass` | no |
+
+The `codex` verifier run emits the expected reviewer-not-worker advisory when
+the repository worker default is also `codex`; that warning does not block the
+run, but `claude` remains the preferred verifier for default Codex-worker
+repos. `gemini` remains unverified for `loopreview` until issue #188 resolves
+headless authentication.
 
 ## Attestation
 

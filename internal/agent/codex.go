@@ -26,7 +26,11 @@ func BuildCodexArgs(inv Invocation) []string {
 	}
 	args = append(args, "--skip-git-repo-check")
 	if strings.TrimSpace(inv.OutputSchema) != "" {
-		args = append(args, "--output-schema", inv.OutputSchema)
+		schemaArg := strings.TrimSpace(inv.OutputSchema)
+		if strings.HasPrefix(schemaArg, "{") || strings.HasPrefix(schemaArg, "[") {
+			schemaArg = codexSchemaPath(inv.LogPath)
+		}
+		args = append(args, "--output-schema", schemaArg)
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "-m", inv.Model)
@@ -41,6 +45,11 @@ func BuildCodexArgs(inv Invocation) []string {
 func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("codex log path is required")
+	}
+	if strings.TrimSpace(inv.OutputSchema) != "" {
+		if err := os.WriteFile(codexSchemaPath(inv.LogPath), []byte(inv.OutputSchema), 0o644); err != nil {
+			return Result{ExitCode: -1}, fmt.Errorf("write output schema: %w", err)
+		}
 	}
 	promptPath := codexPromptPath(inv.LogPath)
 	if err := os.WriteFile(promptPath, []byte(inv.Prompt), 0o644); err != nil {
@@ -89,6 +98,10 @@ func codexPromptPath(logPath string) string {
 
 func codexSummaryPath(logPath string) string {
 	return filepath.Join(filepath.Dir(logPath), "summary.txt")
+}
+
+func codexSchemaPath(logPath string) string {
+	return filepath.Join(filepath.Dir(logPath), "schema.json")
 }
 
 func readCodexSummary(logPath string) string {
