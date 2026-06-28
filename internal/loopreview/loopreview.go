@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
@@ -30,6 +31,13 @@ const (
 	SpecConformanceNotApplicable = "not-applicable"
 
 	DefaultVerifierTimeout = 600 * time.Second
+
+	reviewPacketChangedFilesBudgetBytes = 8 * 1024
+	reviewPacketDiffBudgetBytes         = 80 * 1024
+	reviewPacketDiffFileBudgetBytes     = 24 * 1024
+	reviewPacketIssueBudgetBytes        = 12 * 1024
+	reviewPacketSpecBudgetBytes         = 40 * 1024
+	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
 )
 
 type Options struct {
@@ -80,12 +88,22 @@ type Lock interface {
 }
 
 type Deps struct {
-	Git         GitClient
-	GitHub      func(repoPath string) GitHubClient
-	AgentLookup func(provider string) (agent.Runner, error)
-	AcquireLock func(repoPath string, timeout time.Duration) (Lock, error)
-	MkdirTemp   func(dir, pattern string) (string, error)
-	RemoveAll   func(path string) error
+	Git                GitClient
+	GitHub             func(repoPath string) GitHubClient
+	AgentLookup        func(provider string) (agent.Runner, error)
+	AcquireLock        func(repoPath string, timeout time.Duration) (Lock, error)
+	MkdirTemp          func(dir, pattern string) (string, error)
+	RemoveAll          func(path string) error
+	ReviewPacketLimits ReviewPacketLimits
+}
+
+type ReviewPacketLimits struct {
+	ChangedFilesBytes int
+	DiffBytes         int
+	DiffFileBytes     int
+	IssueBytes        int
+	SpecBytes         int
+	TotalPromptBytes  int
 }
 
 type reviewInputs struct {
@@ -170,6 +188,12 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	prompt, packet := buildPromptWithLimits(opts, inputs, deps.ReviewPacketLimits)
+	if packet.Insufficient {
+		note := "review packet insufficient: " + packet.InsufficientReason
+		verdict := needsHumanVerdict("warning", "", note)
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	}
 	if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
 		return Result{}, err
 	}
@@ -179,7 +203,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 
 	agentResult, agentErr := runner.Run(agentCtx, agent.Invocation{
 		WorktreePath: worktreePath,
-		Prompt:       BuildPrompt(opts, inputs),
+		Prompt:       prompt,
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
@@ -326,6 +350,80 @@ func ParseVerdict(raw string) (Verdict, error) {
 }
 
 func BuildPrompt(opts Options, inputs reviewInputs) string {
+	prompt, _ := buildPromptWithLimits(opts, inputs, ReviewPacketLimits{})
+	return prompt
+}
+
+type reviewPacket struct {
+	PRNumber                 int
+	PRTitle                  string
+	HeadRef                  string
+	BaseBranch               string
+	IssueNumber              string
+	IssueTitle               string
+	IssueBody                packetSection
+	SpecPath                 string
+	SpecAvailable            bool
+	SpecReason               string
+	SpecContent              packetSection
+	ChangedFiles             changedFilesSection
+	Diff                     packetSection
+	Limits                   ReviewPacketLimits
+	TotalPromptBudgetApplied bool
+	Insufficient             bool
+	InsufficientReason       string
+}
+
+type packetSection struct {
+	Text          string
+	OriginalBytes int
+	OriginalLines int
+	OmittedBytes  int
+	OmittedLines  int
+	Truncated     bool
+}
+
+type changedFilesSection struct {
+	Text         string
+	TotalFiles   int
+	OmittedFiles int
+	OmittedBytes int
+	OmittedLines int
+	Truncated    bool
+}
+
+func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacketLimits) (string, reviewPacket) {
+	limits = limits.withDefaults()
+	packet := buildReviewPacket(opts, inputs, limits)
+	prompt := formatReviewPrompt(opts, packet)
+
+	if limits.TotalPromptBytes <= 0 || len(prompt) <= limits.TotalPromptBytes {
+		return prompt, packet
+	}
+
+	adjusted := limits
+	for i := 0; i < 12 && len(prompt) > limits.TotalPromptBytes; i++ {
+		overflow := len(prompt) - limits.TotalPromptBytes
+		if !reduceReviewPacketBudgets(&adjusted, overflow) {
+			break
+		}
+		packet = buildReviewPacket(opts, inputs, adjusted)
+		packet.TotalPromptBudgetApplied = true
+		prompt = formatReviewPrompt(opts, packet)
+	}
+	if len(prompt) > limits.TotalPromptBytes {
+		packet.Insufficient = true
+		packet.InsufficientReason = fmt.Sprintf("minimum review packet is %d bytes, exceeding total prompt budget %d bytes", len(prompt), limits.TotalPromptBytes)
+	}
+	return prompt, packet
+}
+
+func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLimits) reviewPacket {
+	baseBranch := opts.BaseBranch
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+
 	issueTitle := "(issue unavailable)"
 	issueBody := "(issue body unavailable)"
 	issueNumber := "(unknown)"
@@ -338,11 +436,34 @@ func BuildPrompt(opts Options, inputs reviewInputs) string {
 		issueBody = inputs.Issue.Body
 	}
 
-	specText := fmt.Sprintf("Unavailable: %s", inputs.Spec.Reason)
+	specPath := inputs.Spec.Path
+	if strings.TrimSpace(specPath) == "" {
+		specPath = "(not discovered)"
+	}
+	specReason := inputs.Spec.Reason
 	if inputs.Spec.Available {
-		specText = fmt.Sprintf("Path: %s\n\n%s", inputs.Spec.Path, inputs.Spec.Content)
+		specReason = ""
 	}
 
+	return reviewPacket{
+		PRNumber:      opts.PRNumber,
+		PRTitle:       inputs.PR.Title,
+		HeadRef:       inputs.PR.HeadRefName,
+		BaseBranch:    baseBranch,
+		IssueNumber:   issueNumber,
+		IssueTitle:    issueTitle,
+		IssueBody:     truncatePacketSection(issueBody, limits.IssueBytes),
+		SpecPath:      specPath,
+		SpecAvailable: inputs.Spec.Available,
+		SpecReason:    specReason,
+		SpecContent:   truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
+		ChangedFiles:  buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
+		Diff:          buildDiffSection(inputs.Diff, limits.DiffBytes, limits.DiffFileBytes),
+		Limits:        limits,
+	}
+}
+
+func formatReviewPrompt(opts Options, packet reviewPacket) string {
 	return fmt.Sprintf(`You are the independent loopcoder Verifier for pull request #%d.
 
 Review adversarially. You are not the implementation worker. Run only read-only inspections or checks. Do not modify files, commit, push, or write review comments.
@@ -352,35 +473,321 @@ Return only JSON matching this schema:
 %s
 
 # Review contract
-- Compare the diff against the GitHub issue, acceptance criteria, and merged design/spec.
+- Use the bounded review packet below as the primary evidence.
+- Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, and merged design/spec.
 - Use "pass" only when the PR satisfies the issue and spec and you found no blocking concerns.
 - Use "fail" for concrete implementation defects, missing acceptance criteria, regressions, or test gaps that should be fixed by a worker.
 - Use "needs-human" when evidence is incomplete, ambiguous, unavailable, or unsafe to decide automatically.
+- Return "needs-human" if a TRUNCATED marker could hide a relevant acceptance criterion, risky changed file, or code needed for a safe decision. Cite the marker in evidence.
+- Prefer the packet over broad repository exploration. Inspect only changed files, files cited by the issue/spec, or files necessary to confirm a concrete finding.
+- Stop and return "needs-human" if deciding safely would require broad repository exploration or work beyond the bounded input/tool budget.
 - Include concise findings with severity, file when applicable, and note.
 
-# PR
-Number: #%d
-Title: %s
-Head: %s
-
-# Changed files
+# Bounded review packet
 %s
-
-# Diff
-%s
-
-# Issue
-Number: %s
-Title: %s
-
-%s
-
-# Merged design/spec from origin/%s
-%s
-`, opts.PRNumber, VerdictJSONSchema, opts.PRNumber, inputs.PR.Title, inputs.PR.HeadRefName, formatChangedFiles(inputs.ChangedFiles), inputs.Diff, issueNumber, issueTitle, issueBody, opts.BaseBranch, specText)
+`, opts.PRNumber, VerdictJSONSchema, formatReviewPacket(packet))
 }
 
 const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
+
+func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
+	defaults := ReviewPacketLimits{
+		ChangedFilesBytes: reviewPacketChangedFilesBudgetBytes,
+		DiffBytes:         reviewPacketDiffBudgetBytes,
+		DiffFileBytes:     reviewPacketDiffFileBudgetBytes,
+		IssueBytes:        reviewPacketIssueBudgetBytes,
+		SpecBytes:         reviewPacketSpecBudgetBytes,
+		TotalPromptBytes:  reviewPacketTotalPromptBudgetBytes,
+	}
+	if limits.ChangedFilesBytes <= 0 {
+		limits.ChangedFilesBytes = defaults.ChangedFilesBytes
+	}
+	if limits.DiffBytes <= 0 {
+		limits.DiffBytes = defaults.DiffBytes
+	}
+	if limits.DiffFileBytes <= 0 {
+		limits.DiffFileBytes = defaults.DiffFileBytes
+	}
+	if limits.IssueBytes <= 0 {
+		limits.IssueBytes = defaults.IssueBytes
+	}
+	if limits.SpecBytes <= 0 {
+		limits.SpecBytes = defaults.SpecBytes
+	}
+	if limits.TotalPromptBytes <= 0 {
+		limits.TotalPromptBytes = defaults.TotalPromptBytes
+	}
+	return limits
+}
+
+func reduceReviewPacketBudgets(limits *ReviewPacketLimits, bytesToRemove int) bool {
+	if bytesToRemove <= 0 {
+		bytesToRemove = 1
+	}
+	reduced := false
+	for _, budget := range []*int{
+		&limits.DiffBytes,
+		&limits.SpecBytes,
+		&limits.IssueBytes,
+		&limits.ChangedFilesBytes,
+		&limits.DiffFileBytes,
+	} {
+		if bytesToRemove <= 0 {
+			break
+		}
+		if *budget <= 0 {
+			continue
+		}
+		reduction := bytesToRemove
+		if reduction > *budget {
+			reduction = *budget
+		}
+		*budget -= reduction
+		bytesToRemove -= reduction
+		reduced = true
+	}
+	return reduced
+}
+
+func formatReviewPacket(packet reviewPacket) string {
+	var out strings.Builder
+	if packet.TotalPromptBudgetApplied {
+		fmt.Fprintf(&out, "[TOTAL PROMPT BUDGET APPLIED: prompt budget %d bytes; excerpts were reduced before provider invocation]\n\n", packet.Limits.TotalPromptBytes)
+	}
+	fmt.Fprintf(&out, "# PR\n")
+	fmt.Fprintf(&out, "Number: #%d\n", packet.PRNumber)
+	fmt.Fprintf(&out, "Title: %s\n", packet.PRTitle)
+	fmt.Fprintf(&out, "Head: %s\n", packet.HeadRef)
+	fmt.Fprintf(&out, "Base: %s\n\n", packet.BaseBranch)
+
+	fmt.Fprintf(&out, "# Changed files\n")
+	fmt.Fprintf(&out, "Total changed files: %d\n", packet.ChangedFiles.TotalFiles)
+	fmt.Fprintf(&out, "Budget: %d bytes\n", packet.Limits.ChangedFilesBytes)
+	fmt.Fprintf(&out, "%s\n\n", formatChangedFilesSection(packet.ChangedFiles))
+
+	fmt.Fprintf(&out, "# Diff excerpts\n")
+	fmt.Fprintf(&out, "Total diff budget: %d bytes\n", packet.Limits.DiffBytes)
+	fmt.Fprintf(&out, "Per-file diff budget: %d bytes\n", packet.Limits.DiffFileBytes)
+	fmt.Fprintf(&out, "%s\n\n", formatPacketSection("diff", packet.Diff))
+
+	fmt.Fprintf(&out, "# Issue\n")
+	fmt.Fprintf(&out, "Number: %s\n", packet.IssueNumber)
+	fmt.Fprintf(&out, "Title: %s\n", packet.IssueTitle)
+	fmt.Fprintf(&out, "Issue-body budget: %d bytes\n", packet.Limits.IssueBytes)
+	fmt.Fprintf(&out, "%s\n\n", formatPacketSection("issue body", packet.IssueBody))
+
+	fmt.Fprintf(&out, "# Merged design/spec from origin/%s\n", packet.BaseBranch)
+	fmt.Fprintf(&out, "Path: %s\n", packet.SpecPath)
+	if packet.SpecAvailable {
+		fmt.Fprintf(&out, "Status: available\n")
+		fmt.Fprintf(&out, "Spec budget: %d bytes\n", packet.Limits.SpecBytes)
+		fmt.Fprintf(&out, "%s\n", formatPacketSection("merged spec", packet.SpecContent))
+	} else {
+		fmt.Fprintf(&out, "Status: unavailable\n")
+		fmt.Fprintf(&out, "Reason: %s\n", packet.SpecReason)
+	}
+	return out.String()
+}
+
+func formatPacketSection(label string, section packetSection) string {
+	text := strings.TrimRight(section.Text, "\n")
+	if strings.TrimSpace(text) == "" {
+		text = "(empty)"
+	}
+	if section.Truncated {
+		text += fmt.Sprintf("\n[TRUNCATED %s: omitted %d bytes, %d lines]", label, section.OmittedBytes, section.OmittedLines)
+	}
+	return text
+}
+
+func formatChangedFilesSection(section changedFilesSection) string {
+	text := strings.TrimRight(section.Text, "\n")
+	if strings.TrimSpace(text) == "" {
+		text = "(none)"
+	}
+	if section.Truncated {
+		text += fmt.Sprintf("\n[TRUNCATED changed files: omitted %d files, %d bytes, %d lines]", section.OmittedFiles, section.OmittedBytes, section.OmittedLines)
+	}
+	return text
+}
+
+func buildChangedFilesSection(files []string, byteBudget int) changedFilesSection {
+	section := changedFilesSection{TotalFiles: len(files)}
+	if len(files) == 0 {
+		return section
+	}
+	var out strings.Builder
+	for i, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		line := "- " + file + "\n"
+		if out.Len()+len(line) > byteBudget {
+			section.Truncated = true
+			section.OmittedFiles = countNonEmptyStrings(files[i:])
+			section.OmittedBytes = byteLenChangedFiles(files[i:])
+			section.OmittedLines = section.OmittedFiles
+			break
+		}
+		out.WriteString(line)
+	}
+	section.Text = out.String()
+	return section
+}
+
+func byteLenChangedFiles(files []string) int {
+	total := 0
+	for _, file := range files {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		total += len("- " + file + "\n")
+	}
+	return total
+}
+
+func countNonEmptyStrings(values []string) int {
+	count := 0
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection {
+	diff = strings.TrimRight(diff, "\n")
+	if strings.TrimSpace(diff) == "" {
+		return packetSection{}
+	}
+	patches := splitDiffPatches(diff)
+	var out strings.Builder
+	omittedBytes := 0
+	omittedLines := 0
+	for i, patch := range patches {
+		patchSection := truncatePacketSection(patch.Text, perFileBudget)
+		block := formatDiffPatchBlock(patch.File, patchSection)
+		if out.Len()+len(block) > diffBudget {
+			for _, omitted := range patches[i:] {
+				omittedBytes += len(omitted.Text)
+				omittedLines += countLines(omitted.Text)
+			}
+			break
+		}
+		out.WriteString(block)
+		if patchSection.Truncated {
+			omittedBytes += patchSection.OmittedBytes
+			omittedLines += patchSection.OmittedLines
+		}
+	}
+	return packetSection{
+		Text:          out.String(),
+		OriginalBytes: len(diff),
+		OriginalLines: countLines(diff),
+		OmittedBytes:  omittedBytes,
+		OmittedLines:  omittedLines,
+		Truncated:     omittedBytes > 0 || omittedLines > 0,
+	}
+}
+
+type diffPatch struct {
+	File string
+	Text string
+}
+
+func splitDiffPatches(diff string) []diffPatch {
+	lines := strings.SplitAfter(diff, "\n")
+	patches := []diffPatch{}
+	var current strings.Builder
+	currentFile := "(unattributed diff)"
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		patches = append(patches, diffPatch{File: currentFile, Text: current.String()})
+		current.Reset()
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
+			currentFile = parseDiffHeaderFile(line)
+		}
+		current.WriteString(line)
+	}
+	flush()
+	if len(patches) == 0 {
+		patches = append(patches, diffPatch{File: "(combined diff)", Text: diff})
+	}
+	return patches
+}
+
+func parseDiffHeaderFile(header string) string {
+	fields := strings.Fields(header)
+	if len(fields) >= 4 {
+		return strings.TrimPrefix(fields[3], "b/")
+	}
+	return "(unattributed diff)"
+}
+
+func formatDiffPatchBlock(file string, section packetSection) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "## %s\n", file)
+	out.WriteString(strings.TrimRight(section.Text, "\n"))
+	if section.Truncated {
+		fmt.Fprintf(&out, "\n[TRUNCATED diff for %s: omitted %d bytes, %d lines]", file, section.OmittedBytes, section.OmittedLines)
+	}
+	out.WriteString("\n")
+	return out.String()
+}
+
+func truncatePacketSection(text string, byteBudget int) packetSection {
+	if byteBudget < 0 {
+		byteBudget = 0
+	}
+	prefix, omittedBytes, omittedLines := truncateUTF8(text, byteBudget)
+	return packetSection{
+		Text:          prefix,
+		OriginalBytes: len(text),
+		OriginalLines: countLines(text),
+		OmittedBytes:  omittedBytes,
+		OmittedLines:  omittedLines,
+		Truncated:     omittedBytes > 0,
+	}
+}
+
+func truncateUTF8(text string, byteBudget int) (string, int, int) {
+	if len(text) <= byteBudget {
+		return text, 0, 0
+	}
+	if byteBudget < 0 {
+		byteBudget = 0
+	}
+	end := byteBudget
+	if end > len(text) {
+		end = len(text)
+	}
+	for end > 0 && !utf8.ValidString(text[:end]) {
+		end--
+	}
+	omitted := text[end:]
+	return text[:end], len(text) - end, countOmittedLines(omitted)
+}
+
+func countLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+func countOmittedLines(text string) int {
+	text = strings.TrimPrefix(text, "\r\n")
+	text = strings.TrimPrefix(text, "\n")
+	return countLines(text)
+}
 
 func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath string, opts Options) (reviewInputs, error) {
 	pr, err := github.ViewPR(ctx, opts.PRNumber)
@@ -581,22 +988,6 @@ func nonNilFindings(findings []Finding) []Finding {
 		return []Finding{}
 	}
 	return findings
-}
-
-func formatChangedFiles(files []string) string {
-	if len(files) == 0 {
-		return "(none)"
-	}
-	lines := make([]string, 0, len(files))
-	for _, file := range files {
-		if strings.TrimSpace(file) != "" {
-			lines = append(lines, "- "+strings.TrimSpace(file))
-		}
-	}
-	if len(lines) == 0 {
-		return "(none)"
-	}
-	return strings.Join(lines, "\n")
 }
 
 var specPathPattern = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
