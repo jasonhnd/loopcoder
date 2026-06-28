@@ -58,6 +58,12 @@ func TestParseVerdictAcceptsStructuredVerdicts(t *testing.T) {
 	}
 }
 
+func TestVerdictJSONSchemaIsValidJSON(t *testing.T) {
+	if !json.Valid([]byte(VerdictJSONSchema)) {
+		t.Fatalf("VerdictJSONSchema is not valid JSON: %s", VerdictJSONSchema)
+	}
+}
+
 func TestParseVerdictRejectsInvalidJSONOrSchema(t *testing.T) {
 	tests := []string{
 		`not json`,

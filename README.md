@@ -56,7 +56,7 @@ loop  > done. 2 PRs, you merged both, 0 blocked.
 go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
 ```
 
-Prerequisites on `PATH`: `git`, `gh` (authenticated), and at least one supported provider CLI. `codex` is the default worker, `claude` is a verified worker provider, and `gemini` is an experimental/unverified worker adapter.
+Prerequisites on `PATH`: `git`, `gh` (authenticated), and at least one supported provider CLI. `codex` is the default worker, `codex` and `claude` are verified verifier providers, `claude` is also a verified worker provider, and `gemini` is experimental/unverified.
 
 Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
@@ -80,7 +80,7 @@ loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --pe
 
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into status, and reports progress. It never writes the code itself.
 - Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh, isolated git worktree, then opens a PR. The verified worker providers are `codex` (default) and `claude`; `gemini` is registered but experimental/unverified.
-- Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status when the verifier completes. Its timeout safety net works: a slow or hung verifier degrades to `needs-human`. In v0.3.1, LLM verifier provider reliability remains experimental; a real `claude` verifier run can stall and time out, and `gemini` verification is unverified.
+- Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status when the verifier completes. Its bounded review packet, timeout safety net, and provider attestation are verified for `codex` and `claude`; a slow, hung, malformed, or incomplete verifier still degrades to `needs-human`. `gemini` verification remains unverified.
 - Gate: you merge. loopcoder never auto-merges.
 - Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, human-merge gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, and `verifier`; `verifier == worker` is advisory-only but should be avoided for author-bias reduction.
 - Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
@@ -91,7 +91,7 @@ loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --pe
 - You always merge -- explicit human gate, never auto-merge.
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
-- Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, while reliable LLM verifier provider validation remains a follow-up.
+- Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, with `codex` and `claude` provider verification proven by real smoke runs.
 - Attestation -- worker and verifier invocations are binary-stamped with `verified: true` records covering provider, real parsed model, effort, permission, duration, and token usage. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md).
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 - Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go, its v0.3.0 multi-provider worker layer, and its v0.3.1 attestation layer.
@@ -114,7 +114,7 @@ loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --pe
 
 ## Status
 
-v0.3.1 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), independent `loopreview` command with a timeout safety net, `.delivery.yml` role slots, human-merge gate, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are binary-stamped, the Conductor record is self-attested, the attestation layer is verified end-to-end on `codex` and `claude`, and required identity or usage fails closed. Reliable LLM verifier provider validation remains a follow-up, and a background or cloud conductor tick remains a documented target rather than current behavior.
+v0.3.1 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), independent `loopreview` command with bounded review packets and a timeout safety net, `.delivery.yml` role slots, human-merge gate, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are binary-stamped, the Conductor record is self-attested, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` provider proof exists for `codex` and `claude`, and required identity or usage fails closed. `gemini` verifier validation and a background or cloud conductor tick remain documented targets rather than current behavior.
 
 ## License
 

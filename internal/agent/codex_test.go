@@ -103,7 +103,7 @@ func TestBuildCodexReadOnlyVerifierArgs(t *testing.T) {
 		"--cd", "wt",
 		"-s", "read-only",
 		"--skip-git-repo-check",
-		"--output-schema", schema,
+		"--output-schema", "schema.json",
 		"-o", "summary.txt",
 		"-",
 	}

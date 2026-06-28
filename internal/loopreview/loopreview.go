@@ -38,6 +38,7 @@ const (
 	reviewPacketIssueBudgetBytes        = 12 * 1024
 	reviewPacketSpecBudgetBytes         = 40 * 1024
 	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
+	providerFailureLogBudgetBytes       = 4 * 1024
 )
 
 type Options struct {
@@ -211,16 +212,16 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	record := verifierAttestation(opts, agentResult)
 	fmt.Fprintln(warnings, record.Header())
 	if errors.Is(agentCtx.Err(), context.DeadlineExceeded) {
-		note := fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout))
+		note := providerFailureNote(logPath, fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout)))
 		verdict := needsHumanVerdict("error", "", note)
 		return resultWithAttestation(verdict, record), nil
 	}
 	if agentErr != nil {
-		verdict := needsHumanVerdict("error", "", fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr))
+		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
 		return resultWithAttestation(verdict, record), nil
 	}
 	if agentResult.ExitCode != 0 {
-		verdict := needsHumanVerdict("error", "", fmt.Sprintf("%s verifier exited with code %d; see %s", opts.Provider, agentResult.ExitCode, logPath))
+		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier exited with code %d; see %s", opts.Provider, agentResult.ExitCode, logPath)))
 		return resultWithAttestation(verdict, record), nil
 	}
 
@@ -466,7 +467,7 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 func formatReviewPrompt(opts Options, packet reviewPacket) string {
 	return fmt.Sprintf(`You are the independent loopcoder Verifier for pull request #%d.
 
-Review adversarially. You are not the implementation worker. Run only read-only inspections or checks. Do not modify files, commit, push, or write review comments.
+Review adversarially. You are not the implementation worker. Do not modify files, commit, push, write review comments, or run shell commands.
 
 Return only JSON matching this schema:
 
@@ -475,12 +476,14 @@ Return only JSON matching this schema:
 # Review contract
 - Use the bounded review packet below as the primary evidence.
 - Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, and merged design/spec.
+- For complete packets with no relevant TRUNCATED markers, decide from the packet instead of exploring the repository.
 - Use "pass" only when the PR satisfies the issue and spec and you found no blocking concerns.
 - Use "fail" for concrete implementation defects, missing acceptance criteria, regressions, or test gaps that should be fixed by a worker.
 - Use "needs-human" when evidence is incomplete, ambiguous, unavailable, or unsafe to decide automatically.
 - Return "needs-human" if a TRUNCATED marker could hide a relevant acceptance criterion, risky changed file, or code needed for a safe decision. Cite the marker in evidence.
 - Prefer the packet over broad repository exploration. Inspect only changed files, files cited by the issue/spec, or files necessary to confirm a concrete finding.
 - Stop and return "needs-human" if deciding safely would require broad repository exploration or work beyond the bounded input/tool budget.
+- Return the final JSON in this turn. Do not keep searching for extra confidence once the packet is sufficient.
 - Include concise findings with severity, file when applicable, and note.
 
 # Bounded review packet
@@ -488,7 +491,7 @@ Return only JSON matching this schema:
 `, opts.PRNumber, VerdictJSONSchema, formatReviewPacket(packet))
 }
 
-const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
+const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{
@@ -945,6 +948,22 @@ func needsHumanVerdict(severity, file, note string) Verdict {
 		Evidence:        note,
 		SpecConformance: SpecConformanceNotApplicable,
 	}
+}
+
+func providerFailureNote(logPath, note string) string {
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil || len(logBytes) == 0 {
+		return note
+	}
+	logText := string(logBytes)
+	if len(logText) > providerFailureLogBudgetBytes {
+		logText = logText[len(logText)-providerFailureLogBudgetBytes:]
+	}
+	logText = strings.TrimSpace(logText)
+	if logText == "" {
+		return note
+	}
+	return note + "\nprovider log tail:\n" + logText
 }
 
 func formatTimeout(timeout time.Duration) string {

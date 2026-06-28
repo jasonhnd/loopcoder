@@ -61,14 +61,24 @@ default in the dispatch path. See [`worker.md`](worker.md) for provider details.
 
 The primary adversarial review is delegated to `loopcoder loopreview`. It checks
 out the PR head in an isolated read-only worktree, gathers the PR diff, changed
-files, linked issue, and referenced merged spec from `origin/<base-branch>`, and
-invokes a verifier provider with a structured JSON verdict schema. The verdict
-is one of `pass`, `fail`, or `needs-human`; malformed output, timeouts, provider
-failure, or an unreadable referenced spec become `needs-human`.
+files, linked issue, and referenced merged spec from `origin/<base-branch>`,
+builds a bounded review packet with explicit truncation markers, and invokes a
+verifier provider with a structured JSON verdict schema. The verdict is one of
+`pass`, `fail`, or `needs-human`; malformed output, timeouts, provider failure,
+incomplete attestation, or an unreadable referenced spec become `needs-human`.
 
 The verifier provider should differ from the worker provider. If the invoked
 verifier matches `.delivery.yml`'s worker provider, the CLI emits an advisory
 warning and still proceeds because human merge remains the final gate.
+
+As of the 0.3.x provider proof, `claude` and `codex` are verified
+`loopreview` providers. A representative `--timeout 180s` run against merged
+PR #202 completed with no input truncation for both providers: `codex` returned
+`pass` in 77.398s wall time with parsed model `gpt-5.5`, effort `xhigh`, and
+18,266 total tokens; `claude` returned `pass` in 70.686s wall time with parsed
+model `claude-haiku-4-5-20251001`, no explicit effort, and 2,447 input /
+4,947 output tokens. `gemini` remains unverified for `loopreview` until issue
+#188 resolves headless authentication.
 
 ## Ports And Adapters
 
