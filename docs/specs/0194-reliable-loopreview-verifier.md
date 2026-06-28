@@ -1,7 +1,7 @@
 ---
 id: 194
 title: Reliable loopreview Verifier
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 194
 pr: null
