@@ -52,17 +52,50 @@ For one issue, `loopcoder dispatch` runs these steps in order:
    branch, current working directory, and rules.
 4. Run the selected provider through the registry in the worktree, capturing its
    log and summary with provider-specific adapter behavior.
-5. Verify that file changes exist with `git status --porcelain`.
-6. Commit all changes with the issue title and `closes #<IssueNumber>` in the
+5. Build and validate the Worker `AttestationRecord` from parsed provider
+   output.
+6. Verify that file changes exist with `git status --porcelain`.
+7. Commit all changes with the issue title and `closes #<IssueNumber>` in the
    commit message.
-7. Push the branch to `origin`.
-8. Open a pull request with `gh pr create`.
-9. Remove the worktree, delete the local branch, and remove the scratch
+8. Push the branch to `origin`.
+9. Open a pull request with `gh pr create`.
+10. Remove the worktree, delete the local branch, and remove the scratch
    directory unless `--keep-worktree` is set.
 
 If the provider exits non-zero, makes no file changes, commit fails, push fails,
 or PR creation fails, the subcommand returns a failed result instead of
 producing a successful result.
+
+## Attestation
+
+A successful dispatch stamps the Worker `AttestationRecord` after the provider
+exits and before commit, push, or PR creation. The record is binary-stamped from
+the provider output with `role: worker`, the selected provider, the real parsed
+model and effort, `model_source: parsed`, `permission: write`, the issue action,
+exit code, timestamps, duration, token usage, and `verified: true`.
+
+The PR body carries the one-line attestation header plus a fenced canonical JSON
+block:
+
+````text
+Closes #<issue>
+
+<provider summary>
+
+[attestation] role=worker provider=<provider> model=<model>(parsed) effort=<effort> perm=write action="implement issue #<issue>" exit=0 dur=<duration> tokens=<usage> verified=true
+
+```json
+{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #185","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}
+```
+````
+
+This replaces the older bare `worker: <provider>` line. If attestation
+validation fails, including missing model identity or token usage, dispatch
+hard-fails before delivery and opens no PR. `codex` and `claude` are the
+verified worker providers; `gemini` remains experimental/unverified end-to-end,
+and the same validation still applies to it.
+
+Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
 
 ## Provider Invocation
 
