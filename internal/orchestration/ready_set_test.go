@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -161,11 +162,11 @@ func TestComputeReadySetUnknownDependencyFailsClosed(t *testing.T) {
 				99: errors.New("not found"),
 			},
 		},
-		RepoPath:      "C:/repo",
-		BaseBranch:    "main",
-		Thresholds:    config.Default().Resilience.Worker,
-		ProcessAlive:  func(int) bool { return false },
-		Now:           time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC),
+		RepoPath:     "C:/repo",
+		BaseBranch:   "main",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("ComputeReadySet returned error: %v", err)
@@ -249,5 +250,60 @@ func TestComputeReadySetPRCheckFailureIsBestEffortGated(t *testing.T) {
 	}
 	if len(result.Blocked[0].OpenPRs) != 1 || result.Blocked[0].OpenPRs[0].SubState != "gated" {
 		t.Fatalf("open PR summaries = %#v, want gated", result.Blocked[0].OpenPRs)
+	}
+}
+
+func TestComputeReadySetMarksGuardrailFrozenIssueNonReady(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := guardrails.RecordDecision(repo, guardrails.Decision{
+		Guardrail:       guardrails.GuardrailCircuitBreaker,
+		Enabled:         true,
+		Allowed:         false,
+		Status:          guardrails.StatusNeedsHuman,
+		Reason:          "guardrails.circuit_breaker.max_no_progress_waves",
+		DeliveryScopeID: "main:1,2",
+		BaseBranch:      "main",
+		RunID:           "run-test-wave",
+		Issue:           1,
+		Issues:          []int{1, 2},
+		Observed: guardrails.Observed{
+			NoProgressWaves: 1,
+		},
+		DecisionAt: time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("RecordDecision frozen ledger: %v", err)
+	}
+
+	result, err := ComputeReadySet(context.Background(), Options{
+		Reader: fakeReader{
+			repo: "owner/repo",
+			issues: []gh.Issue{
+				{Number: 1, Title: "Frozen", State: "OPEN"},
+				{Number: 2, Title: "Ready sibling", State: "OPEN"},
+			},
+		},
+		RepoPath:     repo,
+		BaseBranch:   "main",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeReadySet returned error: %v", err)
+	}
+
+	if len(result.Ready) != 1 || result.Ready[0].Issue != 2 {
+		t.Fatalf("ready = %#v, want only issue #2", result.Ready)
+	}
+	if len(result.Blocked) != 1 || result.Blocked[0].Issue != 1 {
+		t.Fatalf("blocked = %#v, want only issue #1", result.Blocked)
+	}
+	if result.Blocked[0].Classification != "guardrail-frozen" {
+		t.Fatalf("classification = %q, want guardrail-frozen", result.Blocked[0].Classification)
+	}
+	for _, want := range []string{"guardrails.circuit_breaker.max_no_progress_waves", "no_progress_waves=1", "human_decision=clarify the issue"} {
+		if !strings.Contains(result.Blocked[0].Reason, want) {
+			t.Fatalf("reason missing %q:\n%s", want, result.Blocked[0].Reason)
+		}
 	}
 }

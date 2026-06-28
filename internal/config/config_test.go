@@ -84,6 +84,9 @@ guardrails:
     max_total_attempts: 12
     max_total_tokens: 500000
     max_total_cost_usd: 25.50
+  circuit_breaker:
+    max_no_progress_waves: 2
+    max_no_progress_attempts: 3
 `)
 
 	cfg, err := Parse(data)
@@ -163,6 +166,12 @@ guardrails:
 	if cfg.Guardrails.Budget.MaxTotalCostUSD == nil || *cfg.Guardrails.Budget.MaxTotalCostUSD != 25.50 {
 		t.Fatalf("Guardrails.Budget.MaxTotalCostUSD = %#v, want 25.50", cfg.Guardrails.Budget.MaxTotalCostUSD)
 	}
+	if cfg.Guardrails.CircuitBreaker.MaxNoProgressWaves == nil || *cfg.Guardrails.CircuitBreaker.MaxNoProgressWaves != 2 {
+		t.Fatalf("Guardrails.CircuitBreaker.MaxNoProgressWaves = %#v, want 2", cfg.Guardrails.CircuitBreaker.MaxNoProgressWaves)
+	}
+	if cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts == nil || *cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts != 3 {
+		t.Fatalf("Guardrails.CircuitBreaker.MaxNoProgressAttempts = %#v, want 3", cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts)
+	}
 }
 
 func TestParseRejectsInvalidGuardrailBudgetCaps(t *testing.T) {
@@ -198,6 +207,37 @@ func TestParseRejectsInvalidGuardrailBudgetCaps(t *testing.T) {
 			_, err := Parse([]byte(tt.body))
 			if err == nil {
 				t.Fatal("Parse returned nil error, want invalid guardrail budget")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidGuardrailCircuitBreakerCaps(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "max no progress waves zero",
+			body: "guardrails:\n  circuit_breaker:\n    max_no_progress_waves: 0\n",
+			want: "guardrails.circuit_breaker.max_no_progress_waves must be greater than zero",
+		},
+		{
+			name: "max no progress attempts negative",
+			body: "guardrails:\n  circuit_breaker:\n    max_no_progress_attempts: -1\n",
+			want: "guardrails.circuit_breaker.max_no_progress_attempts must be greater than zero",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil {
+				t.Fatal("Parse returned nil error, want invalid guardrail circuit breaker")
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error = %v, want containing %q", err, tt.want)

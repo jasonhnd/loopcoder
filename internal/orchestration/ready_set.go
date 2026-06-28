@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -116,6 +117,10 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 
 	attemptsByIssue := groupAttemptsByIssue(opts.Attempts)
 	prsByIssue, prsByBranch := groupPRs(checkedPRs)
+	frozenByIssue, err := guardrails.FrozenIssues(opts.RepoPath, opts.BaseBranch)
+	if err != nil {
+		return report.ReadySetReport{}, fmt.Errorf("read guardrail ledger: %w", err)
+	}
 
 	sort.Slice(issues, func(i, j int) bool {
 		return issues[i].Number < issues[j].Number
@@ -157,6 +162,19 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 					Attempts:       attemptSummaries,
 				})
 			}
+			continue
+		}
+
+		if frozen, ok := frozenByIssue[number]; ok {
+			blocked = append(blocked, report.BlockedIssue{
+				Issue:          number,
+				Title:          issue.Title,
+				Classification: "guardrail-frozen",
+				Reason:         frozen.Message,
+				Dependencies:   dependencies,
+				OpenPRs:        prSummaries,
+				Attempts:       attemptSummaries,
+			})
 			continue
 		}
 

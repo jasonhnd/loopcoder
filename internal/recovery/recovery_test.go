@@ -203,6 +203,75 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 	}
 }
 
+func TestRecoverAdoptsExistingPRBeforeCircuitBreaker(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-103-1",
+		Issue:          103,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_exited",
+		Status:         "failed",
+		Branch:         "loop/issue-103",
+		StartedAt:      state.FormatTimestamp(fixedRecoverTime()),
+		HeartbeatAt:    state.FormatTimestamp(fixedRecoverTime()),
+		LastProgressAt: state.FormatTimestamp(fixedRecoverTime()),
+		LogBytes:       10,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+	fakeGitHub := &recoverFakeGitHub{
+		headPRs: map[string][]gh.PullRequestReference{
+			"loop/issue-103": {{Number: 55, URL: "https://github.com/owner/repo/pull/55"}},
+		},
+	}
+	maxNoProgressAttempts := 1
+	var slept bool
+	var dispatched bool
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+		CircuitBreaker: config.GuardrailCircuitBreaker{
+			MaxNoProgressAttempts: &maxNoProgressAttempts,
+		},
+		Now: fixedRecoverTime(),
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return fakeGitHub },
+		Sleep: func(context.Context, time.Duration) error {
+			slept = true
+			return nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			dispatched = true
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionAdopt {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionAdopt)
+	}
+	if slept || dispatched {
+		t.Fatalf("adopt path slept=%v dispatched=%v, want both false", slept, dispatched)
+	}
+	data, err := os.ReadFile(guardrails.LedgerPath(repo, "run-test", 103))
+	if err != nil {
+		t.Fatalf("read circuit ledger: %v", err)
+	}
+	if !strings.Contains(string(data), `"status": "allowed"`) ||
+		!strings.Contains(string(data), `"material_progress": true`) {
+		t.Fatalf("adopt should record material progress without freezing:\n%s", string(data))
+	}
+}
+
 func TestRecoverBudgetBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
 	repo := t.TempDir()
 	if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
@@ -267,6 +336,82 @@ func TestRecoverBudgetBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
 	}
 	if _, err := os.Stat(guardrails.LedgerPath(repo, "run-test", 103)); err != nil {
 		t.Fatalf("budget ledger was not written: %v", err)
+	}
+}
+
+func TestRecoverCircuitBreakerBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-103-1",
+		Issue:          103,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_exited",
+		Status:         "failed",
+		Branch:         "loop/issue-103",
+		StartedAt:      state.FormatTimestamp(fixedRecoverTime()),
+		HeartbeatAt:    state.FormatTimestamp(fixedRecoverTime()),
+		LastProgressAt: state.FormatTimestamp(fixedRecoverTime()),
+		LogBytes:       10,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	maxNoProgressAttempts := 1
+	var slept bool
+	var dispatched bool
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+		CircuitBreaker: config.GuardrailCircuitBreaker{
+			MaxNoProgressAttempts: &maxNoProgressAttempts,
+		},
+		Now: fixedRecoverTime(),
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		Sleep: func(context.Context, time.Duration) error {
+			slept = true
+			return nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			dispatched = true
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if slept || dispatched {
+		t.Fatalf("circuit-blocked retry slept=%v dispatched=%v, want both false", slept, dispatched)
+	}
+	for _, want := range []string{
+		"BLOCKED: guardrails circuit-breaker needs-human",
+		"guardrails.circuit_breaker.max_no_progress_attempts",
+		"No-progress attempts: 1",
+		"Last material progress: unknown",
+		"Attempt history:",
+		"Human decision needed:",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("circuit blocked report missing %q:\n%s", want, result.Report)
+		}
+	}
+	data, err := os.ReadFile(guardrails.LedgerPath(repo, "run-test", 103))
+	if err != nil {
+		t.Fatalf("read circuit ledger: %v", err)
+	}
+	if !strings.Contains(string(data), `"status": "needs-human"`) ||
+		!strings.Contains(string(data), `"no_progress_attempts": 1`) {
+		t.Fatalf("circuit ledger missing frozen evidence:\n%s", string(data))
 	}
 }
 

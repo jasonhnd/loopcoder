@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -175,5 +176,60 @@ func TestComputeResumeClassifiesGitHubPRAndLocalState(t *testing.T) {
 	}
 	if !strings.Contains(evidence[3], "closing PRs: #33") {
 		t.Fatalf("closing ref done evidence missing:\n%s", evidence[3])
+	}
+}
+
+func TestComputeResumeMarksGuardrailFrozenIssueBlocked(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := guardrails.RecordDecision(repo, guardrails.Decision{
+		Guardrail:       guardrails.GuardrailCircuitBreaker,
+		Enabled:         true,
+		Allowed:         false,
+		Status:          guardrails.StatusNeedsHuman,
+		Reason:          "guardrails.circuit_breaker.max_no_progress_attempts",
+		DeliveryScopeID: "main:7",
+		BaseBranch:      "main",
+		RunID:           "run-test",
+		Issue:           7,
+		Issues:          []int{7},
+		Observed: guardrails.Observed{
+			NoProgressAttempts: 2,
+		},
+		LastMaterialProgressAt: "2026-06-27T12:00:00Z",
+		DecisionAt:             time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("RecordDecision frozen ledger: %v", err)
+	}
+
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader: fakeReader{
+			repo:   "owner/repo",
+			issues: []gh.Issue{{Number: 7, Title: "Frozen", State: "OPEN"}},
+		},
+		RepoPath:     repo,
+		BaseBranch:   "main",
+		RunID:        "run-test",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("issues = %#v, want one", result.Issues)
+	}
+	issue := result.Issues[0]
+	if issue.Classification != "guardrail-frozen" || issue.ActionKind != "blocked" {
+		t.Fatalf("resume issue = %#v, want guardrail-frozen blocked", issue)
+	}
+	if !strings.Contains(issue.Action, "guardrails.circuit_breaker.max_no_progress_attempts") {
+		t.Fatalf("action missing circuit reason:\n%s", issue.Action)
+	}
+	evidence := strings.Join(issue.Evidence, "\n")
+	for _, want := range []string{"guardrail: guardrails.circuit_breaker.max_no_progress_attempts", "no-progress waves=0, attempts=2", "last material progress=2026-06-27T12:00:00Z"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("evidence missing %q:\n%s", want, evidence)
+		}
 	}
 }

@@ -29,21 +29,22 @@ type WorkerDispatchFunc func(ctx context.Context, opts worker.Options) (worker.R
 type LoadAttemptsFunc func(repoPath, runID string) ([]state.Attempt, error)
 
 type DispatchWaveOptions struct {
-	Reader        GitHubReader
-	RepoPath      string
-	BaseBranch    string
-	RunID         string
-	IssueNumbers  []int
-	ReadySet      *report.ReadySetReport
-	Provider      string
-	Model         string
-	Effort        string
-	ThrottleLimit int
-	Thresholds    config.ResilienceWorker
-	Budget        config.GuardrailBudget
-	ProcessAlive  ProcessAliveFunc
-	Now           time.Time
-	Stderr        io.Writer
+	Reader         GitHubReader
+	RepoPath       string
+	BaseBranch     string
+	RunID          string
+	IssueNumbers   []int
+	ReadySet       *report.ReadySetReport
+	Provider       string
+	Model          string
+	Effort         string
+	ThrottleLimit  int
+	Thresholds     config.ResilienceWorker
+	Budget         config.GuardrailBudget
+	CircuitBreaker config.GuardrailCircuitBreaker
+	ProcessAlive   ProcessAliveFunc
+	Now            time.Time
+	Stderr         io.Writer
 
 	ComputeReadySet ReadySetFunc
 	Dispatch        WorkerDispatchFunc
@@ -125,6 +126,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 	results := make([]DispatchWaveIssueResult, len(selected))
 	readyByIssue := readyIssuesByNumber(preflight.Ready)
 	blockedByIssue := blockedIssuesByNumber(preflight.Blocked)
+	priorAttemptCounts := loadIssueAttemptCounts(opts.RepoPath, opts.RunID, opts.LoadAttempts)
 	dispatchJobs := make([]int, 0, len(selected))
 	plannedAttempts := 0
 	for i, issue := range selected {
@@ -175,6 +177,31 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 			}
 			plannedAttempts++
 		}
+		if opts.CircuitBreaker.Enabled() {
+			decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+				RepoPath:       opts.RepoPath,
+				RunID:          opts.RunID,
+				BaseBranch:     opts.BaseBranch,
+				Issue:          issue,
+				ScopeIssues:    selected,
+				CircuitBreaker: opts.CircuitBreaker,
+				Now:            started,
+			})
+			if _, err := guardrails.RecordDecision(opts.RepoPath, decision); err != nil {
+				result.Status = DispatchWaveStatusNeedsHuman
+				result.Error = fmt.Sprintf("needs-human: guardrails.circuit_breaker ledger write failed: %v", err)
+				results[i] = result
+				continue
+			}
+			if !decision.Allowed {
+				result.Status = DispatchWaveStatusNeedsHuman
+				result.Error = decision.Message
+				result.AttemptPath = decision.LatestAttemptPath
+				result.RecoveryContextPath = decision.RecoveryContextPath
+				results[i] = result
+				continue
+			}
+		}
 		dispatchJobs = append(dispatchJobs, i)
 	}
 
@@ -199,6 +226,9 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 		}(index)
 	}
 	wg.Wait()
+	if opts.CircuitBreaker.Enabled() {
+		recordDispatchWaveCircuitOutcomes(opts, selected, results, priorAttemptCounts, started)
+	}
 
 	finished := time.Now().UTC()
 	if !opts.Now.IsZero() {
@@ -214,6 +244,83 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 		FinishedAt:      state.FormatTimestamp(finished),
 		Results:         results,
 	}, nil
+}
+
+func recordDispatchWaveCircuitOutcomes(opts DispatchWaveOptions, selected []int, results []DispatchWaveIssueResult, priorAttemptCounts map[int]int, now time.Time) {
+	for i := range results {
+		result := &results[i]
+		if result.Status == DispatchWaveStatusNeedsHuman {
+			continue
+		}
+		if result.Status == "" {
+			continue
+		}
+		materialProgress := dispatchWaveResultMaterialProgress(opts, selected[i], *result, priorAttemptCounts[selected[i]])
+		decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+			RepoPath:       opts.RepoPath,
+			RunID:          opts.RunID,
+			BaseBranch:     opts.BaseBranch,
+			Issue:          selected[i],
+			ScopeIssues:    selected,
+			CircuitBreaker: opts.CircuitBreaker,
+			Outcome: &guardrails.CircuitOutcome{
+				Kind:             guardrails.CircuitOutcomeWave,
+				MaterialProgress: materialProgress,
+				Detail:           result.Status,
+			},
+			Now: now,
+		})
+		if _, err := guardrails.RecordDecision(opts.RepoPath, decision); err != nil {
+			if result.Status != DispatchWaveStatusSucceeded {
+				result.Status = DispatchWaveStatusNeedsHuman
+				result.Error = fmt.Sprintf("needs-human: guardrails.circuit_breaker ledger write failed: %v", err)
+			}
+			continue
+		}
+		if !decision.Allowed {
+			result.Status = DispatchWaveStatusNeedsHuman
+			result.Error = decision.Message
+			result.AttemptPath = firstNonEmpty(result.AttemptPath, decision.LatestAttemptPath)
+			result.RecoveryContextPath = firstNonEmpty(result.RecoveryContextPath, decision.RecoveryContextPath)
+		}
+	}
+}
+
+func dispatchWaveResultMaterialProgress(opts DispatchWaveOptions, issue int, result DispatchWaveIssueResult, priorAttemptCount int) bool {
+	if strings.TrimSpace(result.PR) != "" || result.Status == DispatchWaveStatusSucceeded {
+		return true
+	}
+	attempts, err := opts.LoadAttempts(opts.RepoPath, opts.RunID)
+	if err != nil {
+		return false
+	}
+	issueAttempts := groupAttemptsByIssue(attempts)[issue]
+	if len(issueAttempts) <= priorAttemptCount {
+		return false
+	}
+	for _, attempt := range issueAttempts[priorAttemptCount:] {
+		if guardrails.AttemptHasMaterialProgress(opts.RepoPath, opts.RunID, attempt) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadIssueAttemptCounts(repoPath, runID string, loadAttempts LoadAttemptsFunc) map[int]int {
+	counts := map[int]int{}
+	if loadAttempts == nil {
+		return counts
+	}
+	attempts, err := loadAttempts(repoPath, runID)
+	if err != nil {
+		return counts
+	}
+	for _, attempt := range attempts {
+		if attempt.Issue > 0 {
+			counts[attempt.Issue]++
+		}
+	}
+	return counts
 }
 
 func computeWaveReadySet(ctx context.Context, opts DispatchWaveOptions, now time.Time) (report.ReadySetReport, error) {

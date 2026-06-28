@@ -154,8 +154,10 @@ best-effort lease to `loopcoder/state`. Design rationale:
 Current built guardrails include readiness checks, open-PR duplicate
 prevention, liveness classification, `resilience.worker.max_attempts` retry
 bounds, and opt-in `guardrails.budget` caps enforced before new
-`dispatch-wave` or `recover` Worker attempts. The loop circuit-breaker remains
-a follow-up guardrail. Design rationale:
+`dispatch-wave` or `recover` Worker attempts. They also include opt-in
+`guardrails.circuit_breaker` no-progress streak thresholds, which freeze only
+the affected issue and surface `guardrail-frozen`/`needs-human` reports.
+Design rationale:
 [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md).
 
 ### Self-Improvement
@@ -205,6 +207,6 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 - [`../specs/0000-loopcoder-v1.md`](../specs/0000-loopcoder-v1.md) is the
   original v1 design record.
 - [`../specs/0146-attestation.md`](../specs/0146-attestation.md) defines per-invocation Worker, Verifier, and Conductor attestation.
-- [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md) defines budget caps and planned loop circuit-breakers.
+- [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md) defines budget caps and loop circuit-breakers.
 - [`../specs/`](../specs/) contains frozen design records. This architecture
   document is the living current-behavior reference.

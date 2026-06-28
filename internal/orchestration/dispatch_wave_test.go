@@ -282,6 +282,77 @@ func TestDispatchWaveBudgetNeedsHumanWithoutDispatchingOverCap(t *testing.T) {
 	}
 }
 
+func TestDispatchWaveCircuitBreakerFreezesOnlyNoProgressIssue(t *testing.T) {
+	repo := t.TempDir()
+	maxWaves := 1
+	var dispatched []int
+
+	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			1: {Number: 1, Title: "One"},
+			2: {Number: 2, Title: "Two"},
+		}},
+		RepoPath:      repo,
+		RunID:         "run-test-wave",
+		IssueNumbers:  []int{1, 2},
+		ThrottleLimit: 1,
+		CircuitBreaker: config.GuardrailCircuitBreaker{
+			MaxNoProgressWaves: &maxWaves,
+		},
+		Now: time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(1, 2), nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatched = append(dispatched, opts.IssueNumber)
+			if opts.IssueNumber == 2 {
+				return worker.Result{}, errors.New("worker repeated same failure")
+			}
+			return waveWorkerResult(opts), nil
+		},
+		LoadAttempts: noAttempts,
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(dispatched, []int{1, 2}) {
+		t.Fatalf("dispatched issues = %#v, want [1 2]", dispatched)
+	}
+	if report.Results[0].Status != DispatchWaveStatusSucceeded {
+		t.Fatalf("issue #1 result = %#v, want succeeded", report.Results[0])
+	}
+	if report.Results[1].Status != DispatchWaveStatusNeedsHuman {
+		t.Fatalf("issue #2 result = %#v, want needs-human", report.Results[1])
+	}
+	for _, want := range []string{
+		"guardrails.circuit_breaker.max_no_progress_waves",
+		"no_progress_waves=1",
+		"last_material_progress=unknown",
+		"human_decision=clarify the issue",
+	} {
+		if !strings.Contains(report.Results[1].Error, want) {
+			t.Fatalf("needs-human error missing %q:\n%s", want, report.Results[1].Error)
+		}
+	}
+
+	issueOneLedger, err := os.ReadFile(guardrails.LedgerPath(repo, "run-test-wave", 1))
+	if err != nil {
+		t.Fatalf("ReadFile issue #1 ledger: %v", err)
+	}
+	if !strings.Contains(string(issueOneLedger), `"status": "allowed"`) {
+		t.Fatalf("issue #1 ledger should remain allowed:\n%s", string(issueOneLedger))
+	}
+	issueTwoLedger, err := os.ReadFile(guardrails.LedgerPath(repo, "run-test-wave", 2))
+	if err != nil {
+		t.Fatalf("ReadFile issue #2 ledger: %v", err)
+	}
+	if !strings.Contains(string(issueTwoLedger), `"status": "needs-human"`) ||
+		!strings.Contains(string(issueTwoLedger), `"reason": "guardrails.circuit_breaker.max_no_progress_waves"`) {
+		t.Fatalf("issue #2 ledger should be frozen:\n%s", string(issueTwoLedger))
+	}
+}
+
 func readySetReport(numbers ...int) report.ReadySetReport {
 	ready := make([]report.ReadyIssue, 0, len(numbers))
 	for _, number := range numbers {
