@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type ClaudeRunner struct{}
@@ -58,17 +59,23 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
 	cmd.Stderr = logFile
 
-	if err := cmd.Run(); err != nil {
+	started := time.Now()
+	runErr := cmd.Run()
+	ended := time.Now()
+	summary := parseClaudeSummary(stdout.Bytes())
+	metadata := parseClaudeMetadata(stdout.Bytes(), inv)
+
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			exitCode := exitErr.ExitCode()
 			if exitCode >= 0 {
-				return Result{ExitCode: exitCode, Summary: parseClaudeSummary(stdout.Bytes())}, nil
+				return resultWithTiming(exitCode, summary, metadata, started, ended), nil
 			}
 		}
-		return Result{ExitCode: -1}, err
+		return resultWithTiming(-1, summary, metadata, started, ended), runErr
 	}
-	return Result{ExitCode: 0, Summary: parseClaudeSummary(stdout.Bytes())}, nil
+	return resultWithTiming(0, summary, metadata, started, ended), nil
 }
 
 func parseClaudeSummary(output []byte) string {
@@ -84,4 +91,20 @@ func parseClaudeSummary(output []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(payload.Result)
+}
+
+func parseClaudeMetadata(output []byte, inv Invocation) resultMetadata {
+	metadata := resultMetadata{Effort: strings.TrimSpace(inv.Effort)}
+	root, ok := decodeJSONMap(output)
+	if !ok {
+		return metadata
+	}
+
+	if modelUsage, ok := objectFromMap(root, "modelUsage"); ok {
+		metadata.Model = modelFromKeyedMap(modelUsage)
+	}
+	if usage, ok := objectFromMap(root, "usage"); ok {
+		metadata.Usage = usageFromFields(usage)
+	}
+	return metadata
 }

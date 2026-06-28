@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 )
 
 type ExecCodexRunner struct{}
@@ -54,24 +56,38 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("open codex log: %w", err)
 	}
-	defer logFile.Close()
+	defer func() {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+	}()
 
 	cmd := exec.CommandContext(ctx, "codex", BuildCodexArgs(inv)...)
 	cmd.Stdin = prompt
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
-	if err := cmd.Run(); err != nil {
+	started := time.Now()
+	runErr := cmd.Run()
+	ended := time.Now()
+	_ = logFile.Sync()
+	_ = logFile.Close()
+	logFile = nil
+	logOutput, _ := os.ReadFile(inv.LogPath)
+	summary := readCodexSummary(inv.LogPath)
+	metadata := parseCodexMetadata(logOutput)
+
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			exitCode := exitErr.ExitCode()
 			if exitCode >= 0 {
-				return Result{ExitCode: exitCode, Summary: readCodexSummary(inv.LogPath)}, nil
+				return resultWithTiming(exitCode, summary, metadata, started, ended), nil
 			}
 		}
-		return Result{ExitCode: -1}, err
+		return resultWithTiming(-1, summary, metadata, started, ended), runErr
 	}
-	return Result{ExitCode: 0, Summary: readCodexSummary(inv.LogPath)}, nil
+	return resultWithTiming(0, summary, metadata, started, ended), nil
 }
 
 func codexPromptPath(logPath string) string {
@@ -88,4 +104,35 @@ func readCodexSummary(logPath string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(summaryBytes))
+}
+
+var (
+	codexModelLinePattern  = regexp.MustCompile(`(?i)^\s*model\s*:\s*(.+?)\s*$`)
+	codexEffortLinePattern = regexp.MustCompile(`(?i)^\s*reasoning\s+effort\s*:\s*(.+?)\s*$`)
+	codexTokensPattern     = regexp.MustCompile(`(?i)\btokens\s+used\b\s*:?\s*([0-9][0-9, _]*)`)
+)
+
+func parseCodexMetadata(output []byte) resultMetadata {
+	var metadata resultMetadata
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
+	for _, line := range lines {
+		if metadata.Model == "" {
+			if matches := codexModelLinePattern.FindStringSubmatch(line); len(matches) == 2 {
+				metadata.Model = strings.TrimSpace(matches[1])
+			}
+		}
+		if metadata.Effort == "" {
+			if matches := codexEffortLinePattern.FindStringSubmatch(line); len(matches) == 2 {
+				metadata.Effort = strings.TrimSpace(matches[1])
+			}
+		}
+		if metadata.Usage.TotalTokens == nil {
+			if matches := codexTokensPattern.FindStringSubmatch(line); len(matches) == 2 {
+				if total, ok := parseInt64Text(matches[1]); ok {
+					metadata.Usage.TotalTokens = int64Ptr(total)
+				}
+			}
+		}
+	}
+	return metadata
 }

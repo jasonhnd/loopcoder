@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
 
 func TestGeminiRegistration(t *testing.T) {
@@ -139,6 +141,71 @@ func TestParseGeminiSummary(t *testing.T) {
 			got := parseGeminiSummary([]byte(tt.in))
 			if got != tt.want {
 				t.Fatalf("parseGeminiSummary() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseGeminiMetadata(t *testing.T) {
+	tests := []struct {
+		name      string
+		output    string
+		wantModel string
+		wantUsage attestation.Usage
+	}{
+		{
+			name: "usage metadata",
+			output: `{
+				"response": "done",
+				"model": "gemini-2.5-pro",
+				"usageMetadata": {
+					"promptTokenCount": 321,
+					"candidatesTokenCount": 76,
+					"totalTokenCount": 397
+				}
+			}`,
+			wantModel: "gemini-2.5-pro",
+			wantUsage: attestation.Usage{
+				InputTokens:  int64Ptr(321),
+				OutputTokens: int64Ptr(76),
+				TotalTokens:  int64Ptr(397),
+			},
+		},
+		{
+			name: "stats model key and tokens",
+			output: `{
+				"response": "done",
+				"stats": {
+					"models": {
+						"gemini-2.5-flash": {
+							"tokens": {
+								"input": 12,
+								"output": 34,
+								"total": 46
+							}
+						}
+					}
+				}
+			}`,
+			wantModel: "gemini-2.5-flash",
+			wantUsage: attestation.Usage{
+				InputTokens:  int64Ptr(12),
+				OutputTokens: int64Ptr(34),
+				TotalTokens:  int64Ptr(46),
+			},
+		},
+		{
+			name:      "auth failure text leaves metadata empty",
+			output:    `You are not logged in. Run gemini auth.`,
+			wantUsage: attestation.Usage{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseGeminiMetadata([]byte(tt.output))
+			if got.Model != tt.wantModel || got.Effort != "" || !reflect.DeepEqual(got.Usage, tt.wantUsage) {
+				t.Fatalf("parseGeminiMetadata() = %#v, want model=%q effort empty usage=%#v", got, tt.wantModel, tt.wantUsage)
 			}
 		})
 	}

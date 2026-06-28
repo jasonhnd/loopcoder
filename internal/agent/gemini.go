@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type GeminiRunner struct{}
@@ -65,19 +66,22 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
 	cmd.Stderr = logFile
 
+	started := time.Now()
 	runErr := cmd.Run()
+	ended := time.Now()
 	summary := parseGeminiSummary(stdout.Bytes())
+	metadata := parseGeminiMetadata(stdout.Bytes())
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
 			exitCode := exitErr.ExitCode()
 			if exitCode >= 0 {
-				return Result{ExitCode: exitCode, Summary: summary}, nil
+				return resultWithTiming(exitCode, summary, metadata, started, ended), nil
 			}
 		}
-		return Result{ExitCode: -1}, runErr
+		return resultWithTiming(-1, summary, metadata, started, ended), runErr
 	}
-	return Result{ExitCode: 0, Summary: summary}, nil
+	return resultWithTiming(0, summary, metadata, started, ended), nil
 }
 
 func parseGeminiSummary(stdout []byte) string {
@@ -109,3 +113,30 @@ func geminiReadOnlySettingsPath(logPath string) string {
 }
 
 const geminiReadOnlySettings = `{"tools":{"core":[]}}`
+
+func parseGeminiMetadata(stdout []byte) resultMetadata {
+	var metadata resultMetadata
+	root, ok := decodeJSONMap(stdout)
+	if !ok {
+		return metadata
+	}
+
+	metadata.Model = firstGeminiModel(root)
+	metadata.Usage = firstUsageInObject(root, 6)
+	return metadata
+}
+
+func firstGeminiModel(root map[string]any) string {
+	if model := stringFromMap(root, "model", "modelVersion", "model_version"); model != "" {
+		return model
+	}
+	if stats, ok := objectFromMap(root, "stats"); ok {
+		if model := stringFromMap(stats, "model", "modelVersion", "model_version"); model != "" {
+			return model
+		}
+		if models, ok := objectFromMap(stats, "models"); ok {
+			return modelFromKeyedMap(models)
+		}
+	}
+	return ""
+}

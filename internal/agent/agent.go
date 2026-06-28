@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
 
 type Invocation struct {
@@ -18,8 +20,14 @@ type Invocation struct {
 }
 
 type Result struct {
-	ExitCode int
-	Summary  string
+	ExitCode   int
+	Summary    string
+	Model      string
+	Effort     string
+	Usage      attestation.Usage
+	StartedAt  string
+	EndedAt    string
+	DurationMS int64
 }
 
 type Runner interface {
