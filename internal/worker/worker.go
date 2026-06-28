@@ -282,6 +282,8 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if err := attestationRecord.Validate(); err != nil {
 		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
 	}
+	tracker.setUsage(attestationRecord.Usage)
+	tracker.writeAttempt()
 	attestationJSON, err := attestationRecord.CanonicalJSON()
 	if err != nil {
 		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
@@ -499,6 +501,7 @@ type attemptTracker struct {
 	logBytes       int64
 	exitCode       *int
 	errorMessage   *string
+	usage          *attestation.Usage
 	now            func() time.Time
 	warnings       io.Writer
 	attemptPath    string
@@ -526,6 +529,10 @@ func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
 	}
 }
 
+func (t *attemptTracker) setUsage(usage attestation.Usage) {
+	t.usage = cloneUsage(&usage)
+}
+
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
 	now := state.FormatTimestamp(t.now())
 	currentLogBytes := fileSize(t.logPath)
@@ -551,6 +558,25 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 		t.errorMessage = &value
 	}
 
+	t.writeAttempt()
+
+	event := state.Event{
+		Timestamp: now,
+		RunID:     t.runID,
+		JobID:     t.jobID,
+		Issue:     t.issue,
+		Phase:     t.phase,
+		Status:    t.status,
+		LogBytes:  t.logBytes,
+		ExitCode:  t.exitCode,
+		Error:     t.errorMessage,
+	}
+	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
+		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
+	}
+}
+
+func (t *attemptTracker) writeAttempt() {
 	record := state.AttemptRecord{
 		Version:        1,
 		JobID:          t.jobID,
@@ -567,25 +593,31 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 		LogBytes:       t.logBytes,
 		ExitCode:       t.exitCode,
 		Error:          t.errorMessage,
+		Usage:          cloneUsage(t.usage),
 	}
 	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
 	}
+}
 
-	event := state.Event{
-		Timestamp: now,
-		RunID:     t.runID,
-		JobID:     t.jobID,
-		Issue:     t.issue,
-		Phase:     t.phase,
-		Status:    t.status,
-		LogBytes:  t.logBytes,
-		ExitCode:  t.exitCode,
-		Error:     t.errorMessage,
+func cloneUsage(usage *attestation.Usage) *attestation.Usage {
+	if usage == nil {
+		return nil
 	}
-	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
-		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
+	clone := *usage
+	if usage.InputTokens != nil {
+		value := *usage.InputTokens
+		clone.InputTokens = &value
 	}
+	if usage.OutputTokens != nil {
+		value := *usage.OutputTokens
+		clone.OutputTokens = &value
+	}
+	if usage.TotalTokens != nil {
+		value := *usage.TotalTokens
+		clone.TotalTokens = &value
+	}
+	return &clone
 }
 
 type recoveryBriefOptions struct {

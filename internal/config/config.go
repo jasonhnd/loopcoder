@@ -15,6 +15,7 @@ type Config struct {
 	CI           CI           `yaml:"ci"`
 	Verification Verification `yaml:"verification"`
 	Resilience   Resilience   `yaml:"resilience"`
+	Guardrails   Guardrails   `yaml:"guardrails"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -78,6 +79,24 @@ type Report struct {
 	Channel string `yaml:"channel"`
 }
 
+type Guardrails struct {
+	Budget GuardrailBudget `yaml:"budget"`
+}
+
+type GuardrailBudget struct {
+	MaxRuns          *int     `yaml:"max_runs"`
+	MaxTotalAttempts *int     `yaml:"max_total_attempts"`
+	MaxTotalTokens   *int64   `yaml:"max_total_tokens"`
+	MaxTotalCostUSD  *float64 `yaml:"max_total_cost_usd"`
+}
+
+func (b GuardrailBudget) Enabled() bool {
+	return b.MaxRuns != nil ||
+		b.MaxTotalAttempts != nil ||
+		b.MaxTotalTokens != nil ||
+		b.MaxTotalCostUSD != nil
+}
+
 // Default returns the documented defaults for optional .delivery.yml sections.
 func Default() Config {
 	return Config{
@@ -115,5 +134,24 @@ func Parse(data []byte) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse delivery config: %w", err)
 	}
+	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func validateGuardrailBudget(b GuardrailBudget) error {
+	if b.MaxRuns != nil && *b.MaxRuns <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.budget.max_runs must be greater than zero")
+	}
+	if b.MaxTotalAttempts != nil && *b.MaxTotalAttempts <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.budget.max_total_attempts must be greater than zero")
+	}
+	if b.MaxTotalTokens != nil && *b.MaxTotalTokens <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.budget.max_total_tokens must be greater than zero")
+	}
+	if b.MaxTotalCostUSD != nil && *b.MaxTotalCostUSD <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.budget.max_total_cost_usd must be greater than zero")
+	}
+	return nil
 }

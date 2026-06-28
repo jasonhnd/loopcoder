@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -61,6 +63,8 @@ type Options struct {
 	Provider       string
 	Model          string
 	Effort         string
+	Budget         config.GuardrailBudget
+	Now            time.Time
 	Stderr         io.Writer
 }
 
@@ -262,6 +266,34 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			Action: ActionBlocked,
 			Report: renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts),
 		}, nil
+	}
+
+	if opts.Budget.Enabled() {
+		now := opts.Now
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		decision := guardrails.EvaluateBudget(guardrails.BudgetOptions{
+			RepoPath:         repoPath,
+			RunID:            opts.RunID,
+			BaseBranch:       opts.BaseBranch,
+			Issue:            opts.IssueNumber,
+			Budget:           opts.Budget,
+			ProposedAttempts: 1,
+			Now:              now,
+		})
+		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+			decision.Allowed = false
+			decision.Status = guardrails.StatusNeedsHuman
+			decision.Reason = "guardrails.budget.ledger-write-failed"
+			decision.Message = fmt.Sprintf("needs-human: guardrails.budget ledger write failed: %v", err)
+		}
+		if !decision.Allowed {
+			return Result{
+				Action: ActionBlocked,
+				Report: renderBudgetBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
+			}, nil
+		}
 	}
 
 	if deps.Dispatch == nil {
@@ -497,6 +529,31 @@ func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttemp
 	fmt.Fprintln(&out, formatAttemptHistory(attempts))
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Human decision needed: inspect the latest recovery brief, then decide whether to fix credentials/environment, clarify the issue, raise the retry limit and dispatch manually, or close/supersede the failed branch.")
+	return out.String()
+}
+
+func renderBudgetBlockedReport(issueNumber int, runID string, priorAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry, decision guardrails.Decision) string {
+	var out bytes.Buffer
+	fmt.Fprintln(&out, "BLOCKED: guardrails budget needs-human")
+	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	fmt.Fprintf(&out, "Prior attempts: %d\n", priorAttempts)
+	fmt.Fprintf(&out, "Latest status: %s\n", latestStatus)
+	fmt.Fprintf(&out, "Latest recovery brief: %s\n", latestBriefPath)
+	fmt.Fprintf(&out, "Guardrail: %s\n", decision.Reason)
+	fmt.Fprintf(&out, "Budget evidence: %s\n", decision.Message)
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Latest recovery brief contents:")
+	if strings.TrimSpace(latestBriefText) == "" {
+		fmt.Fprintln(&out, "(no recovery brief available)")
+	} else {
+		fmt.Fprintln(&out, latestBriefText)
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Attempt history:")
+	fmt.Fprintln(&out, formatAttemptHistory(attempts))
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Human decision needed: inspect the latest recovery brief and budget evidence, then decide whether to raise the cap, clarify the issue, close/supersede it, or explicitly start a new scoped run.")
 	return out.String()
 }
 

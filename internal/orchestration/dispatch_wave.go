@@ -11,15 +11,17 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
 const (
-	DispatchWaveStatusSucceeded = "succeeded"
-	DispatchWaveStatusFailed    = "failed"
-	DispatchWaveStatusSkipped   = "skipped"
+	DispatchWaveStatusSucceeded  = "succeeded"
+	DispatchWaveStatusFailed     = "failed"
+	DispatchWaveStatusSkipped    = "skipped"
+	DispatchWaveStatusNeedsHuman = "needs-human"
 )
 
 type ReadySetFunc func(ctx context.Context, opts Options) (report.ReadySetReport, error)
@@ -38,6 +40,7 @@ type DispatchWaveOptions struct {
 	Effort        string
 	ThrottleLimit int
 	Thresholds    config.ResilienceWorker
+	Budget        config.GuardrailBudget
 	ProcessAlive  ProcessAliveFunc
 	Now           time.Time
 	Stderr        io.Writer
@@ -123,6 +126,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 	readyByIssue := readyIssuesByNumber(preflight.Ready)
 	blockedByIssue := blockedIssuesByNumber(preflight.Blocked)
 	dispatchJobs := make([]int, 0, len(selected))
+	plannedAttempts := 0
 	for i, issue := range selected {
 		result := DispatchWaveIssueResult{Issue: issue}
 		if _, ok := readyByIssue[issue]; !ok {
@@ -142,6 +146,34 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 			}
 			results[i] = result
 			continue
+		}
+		if opts.Budget.Enabled() {
+			decision := guardrails.EvaluateBudget(guardrails.BudgetOptions{
+				RepoPath:         opts.RepoPath,
+				RunID:            opts.RunID,
+				BaseBranch:       opts.BaseBranch,
+				Issue:            issue,
+				ScopeIssues:      selected,
+				Budget:           opts.Budget,
+				PlannedAttempts:  plannedAttempts,
+				ProposedAttempts: 1,
+				Now:              started,
+			})
+			if _, err := guardrails.RecordDecision(opts.RepoPath, decision); err != nil {
+				result.Status = DispatchWaveStatusNeedsHuman
+				result.Error = fmt.Sprintf("needs-human: guardrails.budget ledger write failed: %v", err)
+				results[i] = result
+				continue
+			}
+			if !decision.Allowed {
+				result.Status = DispatchWaveStatusNeedsHuman
+				result.Error = decision.Message
+				result.AttemptPath = decision.LatestAttemptPath
+				result.RecoveryContextPath = decision.RecoveryContextPath
+				results[i] = result
+				continue
+			}
+			plannedAttempts++
 		}
 		dispatchJobs = append(dispatchJobs, i)
 	}
@@ -263,7 +295,7 @@ func enrichDispatchWaveFailure(result *DispatchWaveIssueResult, opts DispatchWav
 
 func RenderDispatchWaveText(report DispatchWaveReport) string {
 	var out bytes.Buffer
-	succeeded, failed, skipped := dispatchWaveCounts(report.Results)
+	succeeded, failed, skipped, needsHuman := dispatchWaveCounts(report.Results)
 	dispatched := succeeded + failed
 
 	fmt.Fprintln(&out, "DISPATCH WAVE")
@@ -273,6 +305,7 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 	fmt.Fprintf(&out, "Issues requested: %s\n", formatIssueList(report.IssuesRequested))
 	fmt.Fprintf(&out, "Issues dispatched: %d\n", dispatched)
 	fmt.Fprintf(&out, "Issues skipped: %d\n", skipped)
+	fmt.Fprintf(&out, "Issues needs-human: %d\n", needsHuman)
 	fmt.Fprintf(&out, "Started at: %s\n", report.StartedAt)
 	fmt.Fprintf(&out, "Finished at: %s\n", report.FinishedAt)
 	fmt.Fprintln(&out)
@@ -309,7 +342,7 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 
 func DispatchWaveHasFailures(report DispatchWaveReport) bool {
 	for _, result := range report.Results {
-		if result.Status == DispatchWaveStatusFailed {
+		if result.Status == DispatchWaveStatusFailed || result.Status == DispatchWaveStatusNeedsHuman {
 			return true
 		}
 	}
@@ -358,7 +391,7 @@ func blockedIssuesByNumber(blocked []report.BlockedIssue) map[int]report.Blocked
 	return out
 }
 
-func dispatchWaveCounts(results []DispatchWaveIssueResult) (succeeded, failed, skipped int) {
+func dispatchWaveCounts(results []DispatchWaveIssueResult) (succeeded, failed, skipped, needsHuman int) {
 	for _, result := range results {
 		switch result.Status {
 		case DispatchWaveStatusSucceeded:
@@ -367,9 +400,11 @@ func dispatchWaveCounts(results []DispatchWaveIssueResult) (succeeded, failed, s
 			failed++
 		case DispatchWaveStatusSkipped:
 			skipped++
+		case DispatchWaveStatusNeedsHuman:
+			needsHuman++
 		}
 	}
-	return succeeded, failed, skipped
+	return succeeded, failed, skipped, needsHuman
 }
 
 func formatIssueList(numbers []int) string {

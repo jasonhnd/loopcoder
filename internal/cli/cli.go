@@ -1301,6 +1301,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Effort:          effort,
 		ThrottleLimit:   throttleLimit,
 		Thresholds:      cfg.Resilience.Worker,
+		Budget:          cfg.Guardrails.Budget,
 		ProcessAlive:    deps.ProcessAlive,
 		Now:             deps.Now(),
 		Stderr:          stderr,
@@ -1430,6 +1431,23 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintln(stderr, "recover: --run-id is required")
 		return 2
 	}
+
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "recover: %v\n", err)
+		return 2
+	}
+	opts.RepoPath = resolvedRepo
+
+	cfg := config.Default()
+	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
+	if err == nil {
+		cfg = loaded
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "recover: %v\n", err)
+		return 1
+	}
+	opts.Budget = cfg.Guardrails.Budget
 
 	result, err := deps.Recover(context.Background(), opts)
 	if result.Report != "" {

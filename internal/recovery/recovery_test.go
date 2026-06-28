@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -145,6 +147,7 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 	}
 	var slept bool
 	var dispatched bool
+	maxBudgetAttempts := 1
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:       repo,
@@ -153,6 +156,7 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 		RunID:          "run-test",
 		MaxAttempts:    3,
 		BackoffSeconds: []int{0},
+		Budget:         config.GuardrailBudget{MaxTotalAttempts: &maxBudgetAttempts},
 	}, Deps{
 		GitHub: func(string) PullRequestReader { return fakeGitHub },
 		LoadAttempts: func(string, string) ([]state.Attempt, error) {
@@ -196,6 +200,73 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 		if !strings.Contains(result.Report, want) {
 			t.Fatalf("adopt report missing %q:\n%s", want, result.Report)
 		}
+	}
+}
+
+func TestRecoverBudgetBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-103-1",
+		Issue:          103,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_exited",
+		Status:         "failed",
+		Branch:         "loop/issue-103",
+		StartedAt:      state.FormatTimestamp(fixedRecoverTime()),
+		HeartbeatAt:    state.FormatTimestamp(fixedRecoverTime()),
+		LastProgressAt: state.FormatTimestamp(fixedRecoverTime()),
+		LogBytes:       10,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	maxBudgetAttempts := 1
+	var slept bool
+	var dispatched bool
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+		Budget:         config.GuardrailBudget{MaxTotalAttempts: &maxBudgetAttempts},
+		Now:            fixedRecoverTime(),
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		Sleep: func(context.Context, time.Duration) error {
+			slept = true
+			return nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			dispatched = true
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if slept || dispatched {
+		t.Fatalf("budget-blocked retry slept=%v dispatched=%v, want both false", slept, dispatched)
+	}
+	for _, want := range []string{
+		"BLOCKED: guardrails budget needs-human",
+		"guardrails.budget.max_total_attempts",
+		"Prior attempts: 1",
+		"Human decision needed:",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("budget blocked report missing %q:\n%s", want, result.Report)
+		}
+	}
+	if _, err := os.Stat(guardrails.LedgerPath(repo, "run-test", 103)); err != nil {
+		t.Fatalf("budget ledger was not written: %v", err)
 	}
 }
 
