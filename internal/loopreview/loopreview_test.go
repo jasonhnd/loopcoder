@@ -186,7 +186,8 @@ func TestBuildReviewPacketTruncatesPerFileDiffBudget(t *testing.T) {
 func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.Diff = loopreviewDiffPatch("internal/loopreview/a.go", "+ kept\n") +
-		loopreviewDiffPatch("internal/loopreview/b.go", strings.Repeat("+ omitted body\n", 40)+"TAIL_TOTAL_DIFF_SHOULD_NOT_APPEAR\n")
+		loopreviewDiffPatch("internal/loopreview/b.go", strings.Repeat("+ omitted b body\n", 40)+"TAIL_TOTAL_DIFF_B_SHOULD_NOT_APPEAR\n") +
+		loopreviewDiffPatch("internal/loopreview/c.go", strings.Repeat("+ omitted c body\n", 40)+"TAIL_TOTAL_DIFF_C_SHOULD_NOT_APPEAR\n")
 
 	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
 		DiffBytes:     180,
@@ -200,6 +201,7 @@ func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 	}
 	for _, want := range []string{
 		"[TRUNCATED diff: omitted",
+		"omitted files: internal/loopreview/b.go, internal/loopreview/c.go",
 		"bytes",
 		"lines",
 	} {
@@ -207,7 +209,15 @@ func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
-	if strings.Contains(prompt, "TAIL_TOTAL_DIFF_SHOULD_NOT_APPEAR") {
+	for _, omittedPatchHeader := range []string{
+		"## internal/loopreview/b.go",
+		"## internal/loopreview/c.go",
+	} {
+		if strings.Contains(prompt, omittedPatchHeader) {
+			t.Fatalf("prompt contains omitted diff patch header %q:\n%s", omittedPatchHeader, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_TOTAL_DIFF_B_SHOULD_NOT_APPEAR") || strings.Contains(prompt, "TAIL_TOTAL_DIFF_C_SHOULD_NOT_APPEAR") {
 		t.Fatalf("prompt contains omitted total diff tail:\n%s", prompt)
 	}
 }

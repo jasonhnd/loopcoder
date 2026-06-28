@@ -381,6 +381,7 @@ type packetSection struct {
 	OriginalLines int
 	OmittedBytes  int
 	OmittedLines  int
+	OmittedFiles  []string
 	Truncated     bool
 }
 
@@ -598,9 +599,16 @@ func formatPacketSection(label string, section packetSection) string {
 		text = "(empty)"
 	}
 	if section.Truncated {
-		text += fmt.Sprintf("\n[TRUNCATED %s: omitted %d bytes, %d lines]", label, section.OmittedBytes, section.OmittedLines)
+		text += fmt.Sprintf("\n[TRUNCATED %s: omitted %d bytes, %d lines%s]", label, section.OmittedBytes, section.OmittedLines, formatOmittedFiles(section.OmittedFiles))
 	}
 	return text
+}
+
+func formatOmittedFiles(files []string) string {
+	if len(files) == 0 {
+		return ""
+	}
+	return "; omitted files: " + strings.Join(files, ", ")
 }
 
 func formatChangedFilesSection(section changedFilesSection) string {
@@ -670,6 +678,7 @@ func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection 
 	var out strings.Builder
 	omittedBytes := 0
 	omittedLines := 0
+	omittedFiles := []string{}
 	for i, patch := range patches {
 		patchSection := truncatePacketSection(patch.Text, perFileBudget)
 		block := formatDiffPatchBlock(patch.File, patchSection)
@@ -677,6 +686,7 @@ func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection 
 			for _, omitted := range patches[i:] {
 				omittedBytes += len(omitted.Text)
 				omittedLines += countLines(omitted.Text)
+				omittedFiles = append(omittedFiles, omitted.File)
 			}
 			break
 		}
@@ -692,6 +702,7 @@ func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection 
 		OriginalLines: countLines(diff),
 		OmittedBytes:  omittedBytes,
 		OmittedLines:  omittedLines,
+		OmittedFiles:  omittedFiles,
 		Truncated:     omittedBytes > 0 || omittedLines > 0,
 	}
 }
