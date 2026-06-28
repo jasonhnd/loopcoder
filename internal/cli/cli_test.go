@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -77,6 +78,199 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestAttestHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"attest", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{
+		"loopcoder attest",
+		"--role",
+		"--provider",
+		"--model",
+		"--effort",
+		"--permission",
+		"--action",
+		"--exit-code",
+		"--started-at",
+		"--ended-at",
+		"--duration-ms",
+		"--input-tokens",
+		"--output-tokens",
+		"--total-tokens",
+		"--model-source",
+		"--verified",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestAttestSuccessPaths(t *testing.T) {
+	now := time.Date(2026, 6, 28, 1, 2, 3, 0, time.UTC)
+	tests := []struct {
+		name           string
+		args           []string
+		wantStartedAt  string
+		wantEndedAt    string
+		wantDurationMS int64
+		wantInput      *int64
+		wantOutput     *int64
+		wantTotal      *int64
+	}{
+		{
+			name: "duration total tokens and forced trust markers",
+			args: []string{
+				"attest",
+				"--provider", "codex-cli",
+				"--model", "gpt-5",
+				"--effort", "high",
+				"--action", "implement issue #175",
+				"--duration-ms", "2000",
+				"--total-tokens", "123",
+				"--model-source", "parsed",
+				"--verified=true",
+			},
+			wantStartedAt:  "2026-06-28T01:02:01Z",
+			wantEndedAt:    "2026-06-28T01:02:03Z",
+			wantDurationMS: 2000,
+			wantTotal:      int64TestPtr(123),
+		},
+		{
+			name: "timestamp pair split tokens and aliases",
+			args: []string{
+				"attest",
+				"-Role", "conductor",
+				"-Provider", "claude-code",
+				"-Model", "opus",
+				"-Permission", "orchestrate",
+				"-Action", "review run",
+				"-ExitCode", "0",
+				"-StartedAt", "2026-06-28T00:00:00Z",
+				"-EndedAt", "2026-06-28T00:00:01Z",
+				"-InputTokens", "10",
+				"-OutputTokens", "20",
+			},
+			wantStartedAt:  "2026-06-28T00:00:00Z",
+			wantEndedAt:    "2026-06-28T00:00:01Z",
+			wantDurationMS: 1000,
+			wantInput:      int64TestPtr(10),
+			wantOutput:     int64TestPtr(20),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, Deps{
+				Now: func() time.Time {
+					return now
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("stdout lines = %d, want 2:\n%s", len(lines), stdout.String())
+			}
+			var record attestation.AttestationRecord
+			if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+				t.Fatalf("stdout first line is not attestation JSON: %v\n%s", err, stdout.String())
+			}
+			if err := record.Validate(); err != nil {
+				t.Fatalf("attestation JSON does not validate: %v", err)
+			}
+			if record.ModelSource != attestation.ModelSourceSelfReported {
+				t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)
+			}
+			if record.Verified {
+				t.Fatal("Verified = true, want false")
+			}
+			if record.StartedAt != tt.wantStartedAt || record.EndedAt != tt.wantEndedAt || record.DurationMS != tt.wantDurationMS {
+				t.Fatalf("timing = (%q, %q, %d), want (%q, %q, %d)", record.StartedAt, record.EndedAt, record.DurationMS, tt.wantStartedAt, tt.wantEndedAt, tt.wantDurationMS)
+			}
+			assertOptionalInt64(t, "input", record.Usage.InputTokens, tt.wantInput)
+			assertOptionalInt64(t, "output", record.Usage.OutputTokens, tt.wantOutput)
+			assertOptionalInt64(t, "total", record.Usage.TotalTokens, tt.wantTotal)
+			if lines[1] != record.Header() {
+				t.Fatalf("header line = %q, want %q", lines[1], record.Header())
+			}
+		})
+	}
+}
+
+func TestAttestValidationHardFails(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		wants []string
+	}{
+		{
+			name: "missing identity and usage",
+			args: []string{"attest", "--duration-ms", "1"},
+			wants: []string{
+				"invalid attestation record",
+				"provider is required",
+				"model is required",
+				"action is required",
+				"usage is required",
+			},
+		},
+		{
+			name: "missing timing",
+			args: []string{
+				"attest",
+				"--provider", "codex-cli",
+				"--model", "gpt-5",
+				"--action", "implement issue #175",
+				"--total-tokens", "123",
+			},
+			wants: []string{
+				"invalid attestation record",
+				"started_at is required",
+				"ended_at is required",
+				"duration_ms is required",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, Deps{
+				Now: func() time.Time {
+					return time.Date(2026, 6, 28, 1, 2, 3, 0, time.UTC)
+				},
+			})
+			if exitCode == 0 {
+				t.Fatalf("RunWithDeps returned exit code 0, want non-zero")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			for _, want := range tt.wants {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+		})
 	}
 }
 
@@ -691,6 +885,23 @@ func TestResumeRequiresRepo(t *testing.T) {
 	if !strings.Contains(stderr.String(), "--repo is required") {
 		t.Fatalf("stderr missing required repo message: %q", stderr.String())
 	}
+}
+
+func assertOptionalInt64(t *testing.T, name string, got, want *int64) {
+	t.Helper()
+	if got == nil || want == nil {
+		if got != want {
+			t.Fatalf("%s token pointer = %#v, want %#v", name, got, want)
+		}
+		return
+	}
+	if *got != *want {
+		t.Fatalf("%s tokens = %d, want %d", name, *got, *want)
+	}
+}
+
+func int64TestPtr(value int64) *int64 {
+	return &value
 }
 
 type cliFakeReader struct {
