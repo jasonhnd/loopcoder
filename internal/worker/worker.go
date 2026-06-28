@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -277,6 +278,15 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", opts.Provider, agentResult.ExitCode, logPath)
 	}
 
+	attestationRecord := buildWorkerAttestation(opts, agentResult)
+	if err := attestationRecord.Validate(); err != nil {
+		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
+	}
+	attestationJSON, err := attestationRecord.CanonicalJSON()
+	if err != nil {
+		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
+	}
+
 	summary := fmt.Sprintf("(%s produced no summary)", opts.Provider)
 	if trimmed := strings.TrimSpace(agentResult.Summary); trimmed != "" {
 		summary = trimmed
@@ -308,7 +318,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	tracker.transition(activePhase, "running", tracker.exitCode, nil)
 
 	activePhase = "pr_opened"
-	body := fmt.Sprintf("Closes #%d\n\n%s\n\n— opened by loopcoder (worker: %s)", opts.IssueNumber, summary, opts.Provider)
+	body := buildPRBody(opts.IssueNumber, summary, attestationRecord, attestationJSON)
 	prURL, err := github.CreatePR(ctx, opts.Branch, opts.BaseBranch, opts.IssueTitle, body)
 	if err != nil {
 		return Result{}, fmt.Errorf("gh pr create: %w", err)
@@ -364,6 +374,28 @@ func BuildPrompt(opts PromptOptions) string {
 `, opts.RecoveryContext)
 	}
 	return prompt
+}
+
+func buildWorkerAttestation(opts Options, result agent.Result) attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    opts.Provider,
+		Model:       result.Model,
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      result.Effort,
+		Permission:  attestation.PermissionWrite,
+		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),
+		ExitCode:    result.ExitCode,
+		StartedAt:   result.StartedAt,
+		EndedAt:     result.EndedAt,
+		DurationMS:  result.DurationMS,
+		Usage:       result.Usage,
+		Verified:    true,
+	}
+}
+
+func buildPRBody(issueNumber int, summary string, record attestation.AttestationRecord, canonicalJSON []byte) string {
+	return fmt.Sprintf("Closes #%d\n\n%s\n\n%s\n\n```json\n%s\n```", issueNumber, summary, record.Header(), string(canonicalJSON))
 }
 
 func MarshalResult(result Result) ([]byte, error) {
