@@ -143,3 +143,80 @@ func TestParseGeminiSummary(t *testing.T) {
 		})
 	}
 }
+
+func TestParseGeminiInvocation(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     string
+		wantModel  string
+		wantInput  *int64
+		wantOutput *int64
+		wantTotal  *int64
+	}{
+		{
+			name: "stats models key with token fields",
+			output: `{
+				"response": "done",
+				"stats": {
+					"models": {
+						"gemini-2.5-pro": {
+							"inputTokens": 321,
+							"outputTokens": 45,
+							"totalTokens": 366
+						}
+					}
+				}
+			}`,
+			wantModel:  "gemini-2.5-pro",
+			wantInput:  testInt64Ptr(321),
+			wantOutput: testInt64Ptr(45),
+			wantTotal:  testInt64Ptr(366),
+		},
+		{
+			name: "top level model and snake case usage",
+			output: `{
+				"model": "gemini-2.0-flash",
+				"usage": {
+					"input_tokens": "1,000",
+					"output_tokens": 25,
+					"total_tokens": 1025
+				}
+			}`,
+			wantModel:  "gemini-2.0-flash",
+			wantInput:  testInt64Ptr(1000),
+			wantOutput: testInt64Ptr(25),
+			wantTotal:  testInt64Ptr(1025),
+		},
+		{
+			name:   "non json output yields empty metadata",
+			output: "auth required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseGeminiInvocation([]byte(tt.output))
+			if got.Model != tt.wantModel {
+				t.Fatalf("Model = %q, want %q", got.Model, tt.wantModel)
+			}
+			if got.Effort != "" {
+				t.Fatalf("Effort = %q, want empty", got.Effort)
+			}
+			if tt.wantInput == nil {
+				assertNilInt64Ptr(t, got.Usage.InputTokens)
+			} else {
+				assertInt64Ptr(t, got.Usage.InputTokens, *tt.wantInput)
+			}
+			if tt.wantOutput == nil {
+				assertNilInt64Ptr(t, got.Usage.OutputTokens)
+			} else {
+				assertInt64Ptr(t, got.Usage.OutputTokens, *tt.wantOutput)
+			}
+			if tt.wantTotal == nil {
+				assertNilInt64Ptr(t, got.Usage.TotalTokens)
+			} else {
+				assertInt64Ptr(t, got.Usage.TotalTokens, *tt.wantTotal)
+			}
+		})
+	}
+}

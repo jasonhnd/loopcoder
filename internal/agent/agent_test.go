@@ -50,3 +50,20 @@ func TestLookup(t *testing.T) {
 		})
 	}
 }
+
+func assertInt64Ptr(t *testing.T, got *int64, want int64) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("value = nil, want %d", want)
+	}
+	if *got != want {
+		t.Fatalf("value = %d, want %d", *got, want)
+	}
+}
+
+func assertNilInt64Ptr(t *testing.T, got *int64) {
+	t.Helper()
+	if got != nil {
+		t.Fatalf("value = %d, want nil", *got)
+	}
+}
