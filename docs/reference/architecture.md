@@ -149,6 +149,15 @@ decision. `statebranch` can publish scrubbed run snapshots, log tails, and a
 best-effort lease to `loopcoder/state`. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
+### Delivery Guardrails
+
+Current built guardrails are limited to readiness checks, open-PR duplicate
+prevention, liveness classification, and `resilience.worker.max_attempts` retry
+bounds. The 0.3.2 delivery guardrails design defines follow-up budget caps and
+loop circuit-breakers for `dispatch-wave` and `recover`, but those caps are not
+enforced until separate code issues implement the spec. Design rationale:
+[`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md).
+
 ### Self-Improvement
 
 Current self-improvement is human-gated and advisory. `docs/learnings.md` is an
@@ -196,5 +205,6 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 - [`../specs/0000-loopcoder-v1.md`](../specs/0000-loopcoder-v1.md) is the
   original v1 design record.
 - [`../specs/0146-attestation.md`](../specs/0146-attestation.md) defines per-invocation Worker, Verifier, and Conductor attestation.
+- [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md) defines planned budget caps and loop circuit-breakers.
 - [`../specs/`](../specs/) contains frozen design records. This architecture
   document is the living current-behavior reference.
