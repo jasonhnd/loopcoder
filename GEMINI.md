@@ -21,3 +21,46 @@ Gemini host specifics:
 - Verification still delegates the primary adversarial review to
   `loopcoder loopreview`; the verifier provider SHOULD differ from the worker
   provider, and human merge remains the final gate.
+- Before completing a delivery or merge turn, run
+  `loopcoder attest --role conductor ...` at least once per active host session
+  with the real Gemini host model,
+  timing, action, and usage available for the session. Stamp the emitted
+  `[attestation] ...` header or canonical JSON into durable artifacts the
+  Conductor produces, such as PR merge comments or merge commit messages; chat
+  alone is not durable enough.
+- Gemini hook enforcement is best-effort in this repository. Gemini CLI exposes
+  `AfterTool` and `AfterAgent` hooks, and `hooks/conductor-attest.js` accepts
+  those event names when wired in, but this repository ships and tests the
+  Claude Code registration only. If you opt in to Gemini hooks, register the
+  same command for shell-tool `AfterTool` and `AfterAgent` events from the repo
+  root:
+
+  ```json
+  {
+    "hooks": {
+      "AfterTool": [
+        {
+          "matcher": "run_shell_command",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node hooks/conductor-attest.js",
+              "timeout": 10
+            }
+          ]
+        }
+      ],
+      "AfterAgent": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node hooks/conductor-attest.js",
+              "timeout": 10
+            }
+          ]
+        }
+      ]
+    }
+  }
+  ```
