@@ -212,9 +212,14 @@ loopcoder lease release --repo .
 
 ## Verifier Provider Status
 
-`loopcoder loopreview` is verified for `claude` and `codex` on the 0.3.x line.
-The proof run used merged PR #202 (`0.3.x: loopreview bounded review packet`)
-with the representative command:
+`loopcoder loopreview` has 0.3.x smoke proof for the `claude` and `codex`
+verifier mechanism: both providers reliably returned a valid structured
+verdict plus attestation within the timeout. This proof does not make the
+LLM verdict itself deterministic; `pass` and `fail` remain model judgments that
+can vary across otherwise valid runs.
+
+One representative point-in-time run used merged PR #202 (`0.3.x: loopreview
+bounded review packet`) with the command:
 
 ```text
 loopcoder loopreview --repo . --pr-number 202 --provider <provider> --timeout 180s
@@ -224,7 +229,7 @@ The review packet was not truncated: 2 changed files, 73 changed-file bytes
 of 8,192, 29,730 diff bytes of 81,920, max per-file patch 18,925 bytes of
 24,576, 541 issue-body bytes of 12,288, and 13,769 spec bytes of 40,960.
 
-| Provider | Wall elapsed | Parsed model / effort | Token usage | Verdict | Inputs truncated |
+| Provider | Wall elapsed | Parsed model / effort | Token usage | Verdict in this run | Inputs truncated |
 | --- | ---: | --- | --- | --- | --- |
 | `codex` | 77.398s | `gpt-5.5` / `xhigh` | `18,266` total | `pass` | no |
 | `claude` | 70.686s | `claude-haiku-4-5-20251001` / unset | `2,447` input / `4,947` output | `pass` | no |
