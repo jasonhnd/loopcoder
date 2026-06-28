@@ -160,6 +160,50 @@ func TestEvaluateBudgetCostCapUsesExactEvidence(t *testing.T) {
 	}
 }
 
+func TestEvaluateCircuitBreakerTreatsHeartbeatAndLogGrowthAsNoProgress(t *testing.T) {
+	repo := t.TempDir()
+	_, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-103-1",
+		Issue:          103,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_started",
+		Status:         "running",
+		Branch:         "loop/issue-103",
+		StartedAt:      state.FormatTimestamp(fixedBudgetTime()),
+		HeartbeatAt:    state.FormatTimestamp(fixedBudgetTime().Add(1 * time.Minute)),
+		LastProgressAt: state.FormatTimestamp(fixedBudgetTime().Add(1 * time.Minute)),
+		LogBytes:       2048,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	maxAttempts := 1
+	decision := EvaluateCircuitBreaker(CircuitOptions{
+		RepoPath:   repo,
+		RunID:      "run-test",
+		BaseBranch: "main",
+		Issue:      103,
+		CircuitBreaker: config.GuardrailCircuitBreaker{
+			MaxNoProgressAttempts: &maxAttempts,
+		},
+		Now: fixedBudgetTime().Add(2 * time.Minute),
+	})
+
+	if decision.Allowed || decision.Reason != "guardrails.circuit_breaker.max_no_progress_attempts" {
+		t.Fatalf("decision = %#v, want circuit breaker block", decision)
+	}
+	if decision.Observed.NoProgressAttempts != 1 {
+		t.Fatalf("NoProgressAttempts = %d, want 1", decision.Observed.NoProgressAttempts)
+	}
+	if strings.Contains(decision.Message, "material-progress") {
+		t.Fatalf("heartbeat/log growth should not be material progress:\n%s", decision.Message)
+	}
+}
+
 func writeAllowedLedger(t *testing.T, repo, runID string, issue int, scopeID string, issues []int) {
 	t.Helper()
 	_, err := RecordDecision(repo, Decision{

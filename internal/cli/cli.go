@@ -1302,6 +1302,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ThrottleLimit:   throttleLimit,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
+		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
 		ProcessAlive:    deps.ProcessAlive,
 		Now:             deps.Now(),
 		Stderr:          stderr,
@@ -1448,6 +1449,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	opts.Budget = cfg.Guardrails.Budget
+	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
 
 	result, err := deps.Recover(context.Background(), opts)
 	if result.Report != "" {

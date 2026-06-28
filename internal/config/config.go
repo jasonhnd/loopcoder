@@ -80,7 +80,8 @@ type Report struct {
 }
 
 type Guardrails struct {
-	Budget GuardrailBudget `yaml:"budget"`
+	Budget         GuardrailBudget         `yaml:"budget"`
+	CircuitBreaker GuardrailCircuitBreaker `yaml:"circuit_breaker"`
 }
 
 type GuardrailBudget struct {
@@ -95,6 +96,16 @@ func (b GuardrailBudget) Enabled() bool {
 		b.MaxTotalAttempts != nil ||
 		b.MaxTotalTokens != nil ||
 		b.MaxTotalCostUSD != nil
+}
+
+type GuardrailCircuitBreaker struct {
+	MaxNoProgressWaves    *int `yaml:"max_no_progress_waves"`
+	MaxNoProgressAttempts *int `yaml:"max_no_progress_attempts"`
+}
+
+func (c GuardrailCircuitBreaker) Enabled() bool {
+	return c.MaxNoProgressWaves != nil ||
+		c.MaxNoProgressAttempts != nil
 }
 
 // Default returns the documented defaults for optional .delivery.yml sections.
@@ -137,6 +148,9 @@ func Parse(data []byte) (Config, error) {
 	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
 		return Config{}, err
 	}
+	if err := validateGuardrailCircuitBreaker(cfg.Guardrails.CircuitBreaker); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -152,6 +166,16 @@ func validateGuardrailBudget(b GuardrailBudget) error {
 	}
 	if b.MaxTotalCostUSD != nil && *b.MaxTotalCostUSD <= 0 {
 		return fmt.Errorf("invalid delivery config: guardrails.budget.max_total_cost_usd must be greater than zero")
+	}
+	return nil
+}
+
+func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
+	if c.MaxNoProgressWaves != nil && *c.MaxNoProgressWaves <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_waves must be greater than zero")
+	}
+	if c.MaxNoProgressAttempts != nil && *c.MaxNoProgressAttempts <= 0 {
+		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_attempts must be greater than zero")
 	}
 	return nil
 }

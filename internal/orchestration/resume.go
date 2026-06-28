@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -110,6 +111,10 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 
 	attemptsByIssue := groupAttemptsByIssue(opts.Attempts)
 	prsByIssue, prsByBranch := groupPRs(checkedPRs)
+	frozenByIssue, err := guardrails.FrozenIssues(opts.RepoPath, opts.BaseBranch)
+	if err != nil {
+		return report.ResumeReport{}, fmt.Errorf("read guardrail ledger: %w", err)
+	}
 
 	issues := make([]report.ResumeIssue, 0, len(candidateIssueNumbers))
 	for _, number := range candidateIssueNumbers {
@@ -126,6 +131,32 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 
 		action := classifyResumeIssue(issue, latest, primaryPR, candidateBranches, opts.Thresholds, opts.ProcessAlive, opts.Now)
 		labels := labelNames(issue.Labels)
+		evidence := resumeEvidenceLines(
+			opts.RepoPath,
+			issue,
+			latest,
+			primaryPR,
+			len(matchingPRs),
+			action.HeartbeatAge,
+			action.ProgressAge,
+			action.PIDEvidence,
+		)
+		if frozen, ok := frozenByIssue[number]; ok && action.Classification != "done" && primaryPR == nil {
+			action = resumeAction{
+				Classification: "guardrail-frozen",
+				ActionKind:     "blocked",
+				Action:         frozen.Message,
+				PIDEvidence:    "pid: n/a",
+			}
+			evidence = append(evidence,
+				fmt.Sprintf("guardrail: %s", frozen.Reason),
+				fmt.Sprintf("no-progress waves=%d, attempts=%d", frozen.Observed.NoProgressWaves, frozen.Observed.NoProgressAttempts),
+				fmt.Sprintf("last material progress=%s", firstNonEmpty(frozen.LastMaterialProgressAt, "unknown")),
+			)
+			if strings.TrimSpace(frozen.RecoveryContextPath) != "" {
+				evidence = append(evidence, "recovery: "+filepath.ToSlash(frozen.RecoveryContextPath))
+			}
+		}
 		issues = append(issues, report.ResumeIssue{
 			Issue:          number,
 			Title:          issue.Title,
@@ -134,16 +165,7 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 			Classification: action.Classification,
 			ActionKind:     action.ActionKind,
 			Action:         action.Action,
-			Evidence: resumeEvidenceLines(
-				opts.RepoPath,
-				issue,
-				latest,
-				primaryPR,
-				len(matchingPRs),
-				action.HeartbeatAge,
-				action.ProgressAge,
-				action.PIDEvidence,
-			),
+			Evidence:       evidence,
 		})
 	}
 

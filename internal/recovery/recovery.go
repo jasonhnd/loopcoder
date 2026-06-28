@@ -64,6 +64,7 @@ type Options struct {
 	Model          string
 	Effort         string
 	Budget         config.GuardrailBudget
+	CircuitBreaker config.GuardrailCircuitBreaker
 	Now            time.Time
 	Stderr         io.Writer
 }
@@ -255,6 +256,31 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		adopted = findOpenIssuePR(ctx, deps.GitHub(repoPath), opts.IssueNumber, attempts, opts.MaxAttempts)
 	}
 	if adopted != nil {
+		if opts.CircuitBreaker.Enabled() {
+			now := opts.Now
+			if now.IsZero() {
+				now = time.Now().UTC()
+			}
+			decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+				RepoPath:       repoPath,
+				RunID:          opts.RunID,
+				BaseBranch:     opts.BaseBranch,
+				Issue:          opts.IssueNumber,
+				CircuitBreaker: opts.CircuitBreaker,
+				Outcome: &guardrails.CircuitOutcome{
+					Kind:             guardrails.CircuitOutcomeAttempt,
+					MaterialProgress: true,
+					Detail:           fmt.Sprintf("adopted PR #%d", adopted.Number),
+				},
+				Now: now,
+			})
+			if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+				return Result{
+					Action: ActionBlocked,
+					Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, ledgerWriteFailedCircuitDecision(opts, repoPath, err)),
+				}, nil
+			}
+		}
 		return Result{
 			Action: ActionAdopt,
 			Report: renderAdoptReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, *adopted),
@@ -296,6 +322,30 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		}
 	}
 
+	if opts.CircuitBreaker.Enabled() {
+		now := opts.Now
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+			RepoPath:       repoPath,
+			RunID:          opts.RunID,
+			BaseBranch:     opts.BaseBranch,
+			Issue:          opts.IssueNumber,
+			CircuitBreaker: opts.CircuitBreaker,
+			Now:            now,
+		})
+		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+			decision = ledgerWriteFailedCircuitDecision(opts, repoPath, err)
+		}
+		if !decision.Allowed {
+			return Result{
+				Action: ActionBlocked,
+				Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
+			}, nil
+		}
+	}
+
 	if deps.Dispatch == nil {
 		return Result{}, errors.New("dispatch is not configured")
 	}
@@ -323,7 +373,34 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		Stderr:          opts.Stderr,
 	})
 	if err != nil {
+		if opts.CircuitBreaker.Enabled() {
+			decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, err.Error())
+			if !decision.Allowed {
+				allAttempts, loadErr := deps.LoadAttempts(repoPath, opts.RunID)
+				if loadErr == nil {
+					attempts = attemptHistory(repoPath, opts.RunID, opts.IssueNumber, allAttempts)
+					priorAttempts = len(attempts)
+					if latest = latestHistoryAttempt(attempts); latest != nil {
+						latestStatus = latest.Record.Status
+						latestBriefPath = latest.RecoveryContextPath
+						latestBriefText = ""
+						if strings.TrimSpace(latestBriefPath) != "" {
+							if data, readErr := deps.ReadFile(latestBriefPath); readErr == nil {
+								latestBriefText = string(data)
+							}
+						}
+					}
+				}
+				return Result{
+					Action: ActionBlocked,
+					Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
+				}, nil
+			}
+		}
 		return Result{Action: ActionRetry, Report: report}, err
+	}
+	if opts.CircuitBreaker.Enabled() {
+		recordRetryCircuitOutcome(repoPath, opts, priorAttempts, dispatchResult.OK || strings.TrimSpace(dispatchResult.PR) != "", dispatchResult.Status)
 	}
 	data, err := json.Marshal(dispatchResult)
 	if err != nil {
@@ -557,6 +634,99 @@ func renderBudgetBlockedReport(issueNumber int, runID string, priorAttempts int,
 	return out.String()
 }
 
+func renderCircuitBlockedReport(issueNumber int, runID string, priorAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry, decision guardrails.Decision) string {
+	var out bytes.Buffer
+	fmt.Fprintln(&out, "BLOCKED: guardrails circuit-breaker needs-human")
+	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	fmt.Fprintf(&out, "Prior attempts: %d\n", priorAttempts)
+	fmt.Fprintf(&out, "Latest status: %s\n", latestStatus)
+	fmt.Fprintf(&out, "Latest recovery brief: %s\n", latestBriefPath)
+	fmt.Fprintf(&out, "Guardrail: %s\n", decision.Reason)
+	fmt.Fprintf(&out, "No-progress waves: %d\n", decision.Observed.NoProgressWaves)
+	fmt.Fprintf(&out, "No-progress attempts: %d\n", decision.Observed.NoProgressAttempts)
+	if strings.TrimSpace(decision.LastMaterialProgressAt) == "" {
+		fmt.Fprintln(&out, "Last material progress: unknown")
+	} else {
+		fmt.Fprintf(&out, "Last material progress: %s\n", decision.LastMaterialProgressAt)
+	}
+	fmt.Fprintf(&out, "Circuit-breaker evidence: %s\n", decision.Message)
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Latest recovery brief contents:")
+	if strings.TrimSpace(latestBriefText) == "" {
+		fmt.Fprintln(&out, "(no recovery brief available)")
+	} else {
+		fmt.Fprintln(&out, latestBriefText)
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Attempt history:")
+	fmt.Fprintln(&out, formatAttemptHistory(attempts))
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Human decision needed: inspect the latest recovery brief and circuit-breaker evidence, then decide whether to clarify the issue, raise the no-progress threshold, close/supersede it, or explicitly start a new scoped run.")
+	return out.String()
+}
+
+func ledgerWriteFailedCircuitDecision(opts Options, repoPath string, err error) guardrails.Decision {
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	decision := guardrails.Decision{
+		Guardrail:       guardrails.GuardrailCircuitBreaker,
+		Enabled:         true,
+		Allowed:         false,
+		Status:          guardrails.StatusNeedsHuman,
+		Reason:          "guardrails.circuit_breaker.ledger-write-failed",
+		DeliveryScopeID: fmt.Sprintf("%s:%d", firstNonEmpty(opts.BaseBranch, "main"), opts.IssueNumber),
+		BaseBranch:      firstNonEmpty(opts.BaseBranch, "main"),
+		Issue:           opts.IssueNumber,
+		RunID:           opts.RunID,
+		DecisionAt:      now,
+	}
+	decision.Message = fmt.Sprintf("needs-human: guardrails.circuit_breaker ledger write failed: %v", err)
+	return decision
+}
+
+func recordRetryCircuitOutcome(repoPath string, opts Options, priorAttempts int, materialProgress bool, detail string) guardrails.Decision {
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	countedInState := retryAttemptCount(repoPath, opts.RunID, opts.IssueNumber) > priorAttempts
+	decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+		RepoPath:       repoPath,
+		RunID:          opts.RunID,
+		BaseBranch:     opts.BaseBranch,
+		Issue:          opts.IssueNumber,
+		CircuitBreaker: opts.CircuitBreaker,
+		Outcome: &guardrails.CircuitOutcome{
+			Kind:             guardrails.CircuitOutcomeAttempt,
+			MaterialProgress: materialProgress,
+			Detail:           detail,
+			CountedInState:   countedInState,
+		},
+		Now: now,
+	})
+	if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+		return ledgerWriteFailedCircuitDecision(opts, repoPath, err)
+	}
+	return decision
+}
+
+func retryAttemptCount(repoPath, runID string, issueNumber int) int {
+	attempts, err := state.LoadAttempts(repoPath, runID)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, attempt := range attempts {
+		if attempt.Issue == issueNumber {
+			count++
+		}
+	}
+	return count
+}
+
 func renderRetryReport(issueNumber int, runID string, priorAttempts int, latestStatus, latestBriefPath, retryBranch string, backoffSeconds int) string {
 	var out bytes.Buffer
 	fmt.Fprintf(&out, "RETRY: dispatching issue #%d attempt %d\n", issueNumber, priorAttempts+1)
@@ -587,4 +757,13 @@ func formatAttemptHistory(attempts []attemptHistoryEntry) string {
 		))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
