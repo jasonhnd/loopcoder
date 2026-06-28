@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -46,10 +47,11 @@ type Result struct {
 }
 
 type Verdict struct {
-	Verdict         string    `json:"verdict"`
-	Findings        []Finding `json:"findings"`
-	Evidence        string    `json:"evidence"`
-	SpecConformance string    `json:"spec_conformance"`
+	Verdict         string                         `json:"verdict"`
+	Findings        []Finding                      `json:"findings"`
+	Evidence        string                         `json:"evidence"`
+	SpecConformance string                         `json:"spec_conformance"`
+	Attestation     *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 
 type Finding struct {
@@ -182,24 +184,26 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
 	})
+	record := verifierAttestation(opts, agentResult)
+	fmt.Fprintln(warnings, record.Header())
 	if errors.Is(agentCtx.Err(), context.DeadlineExceeded) {
 		note := fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout))
 		verdict := needsHumanVerdict("error", "", note)
-		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		return resultWithAttestation(verdict, record), nil
 	}
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr))
-		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		return resultWithAttestation(verdict, record), nil
 	}
 	if agentResult.ExitCode != 0 {
 		verdict := needsHumanVerdict("error", "", fmt.Sprintf("%s verifier exited with code %d; see %s", opts.Provider, agentResult.ExitCode, logPath))
-		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		return resultWithAttestation(verdict, record), nil
 	}
 
 	verdict, err := ParseVerdict(agentResult.Summary)
 	if err != nil {
 		verdict = needsHumanVerdict("error", "", fmt.Sprintf("structured verdict parse failed: %v", err))
-		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		return resultWithAttestation(verdict, record), nil
 	}
 	if !inputs.Spec.Available {
 		verdict.Verdict = VerdictNeedsHuman
@@ -211,7 +215,46 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		})
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
-	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	return resultWithAttestation(verdict, record), nil
+}
+
+func verifierAttestation(opts Options, result agent.Result) attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleVerifier,
+		Provider:    opts.Provider,
+		Model:       result.Model,
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      result.Effort,
+		Permission:  attestation.PermissionReadOnly,
+		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
+		ExitCode:    result.ExitCode,
+		StartedAt:   result.StartedAt,
+		EndedAt:     result.EndedAt,
+		DurationMS:  result.DurationMS,
+		Usage:       result.Usage,
+		Verified:    true,
+	}
+}
+
+func resultWithAttestation(verdict Verdict, record attestation.AttestationRecord) Result {
+	verdict.Attestation = &record
+	if err := record.Validate(); err != nil {
+		note := "incomplete verifier attestation: " + err.Error()
+		verdict.Verdict = VerdictNeedsHuman
+		verdict.SpecConformance = SpecConformanceNotApplicable
+		verdict.Findings = append(nonNilFindings(verdict.Findings), Finding{
+			Severity: "error",
+			File:     "",
+			Note:     note,
+		})
+		if strings.TrimSpace(verdict.Evidence) == "" {
+			verdict.Evidence = note
+		} else if !strings.Contains(verdict.Evidence, note) {
+			verdict.Evidence = strings.TrimSpace(verdict.Evidence) + "\n" + note
+		}
+	}
+	verdict.Findings = nonNilFindings(verdict.Findings)
+	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}
 }
 
 func Render(w io.Writer, result Result) error {

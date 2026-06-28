@@ -2,6 +2,7 @@ package loopreview
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -172,6 +174,9 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
 		t.Fatalf("result = %#v, want pass exit 0", result)
 	}
+	if result.Verdict.Attestation == nil {
+		t.Fatal("verdict missing attestation")
+	}
 	if fakeGit.fetchBase != "main" || fakeGit.fetchPR != 152 || fakeGit.addRev != "FETCH_HEAD" {
 		t.Fatalf("git checkout calls not recorded correctly: %#v", fakeGit)
 	}
@@ -204,6 +209,91 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(inv.WorktreePath)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("scratch directory still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunVerifierAttestation(t *testing.T) {
+	validSummary := `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`
+	tests := []struct {
+		name        string
+		agent       agent.Result
+		wantVerdict string
+		wantNote    string
+	}{
+		{
+			name:        "valid attestation stays pass",
+			agent:       validLoopreviewAgentResult(validSummary, 0),
+			wantVerdict: VerdictPass,
+		},
+		{
+			name: "incomplete attestation forces needs human",
+			agent: agent.Result{
+				ExitCode:   0,
+				Summary:    validSummary,
+				Effort:     "high",
+				StartedAt:  "2026-06-28T00:00:00Z",
+				EndedAt:    "2026-06-28T00:00:02Z",
+				DurationMS: 2000,
+				Usage: attestation.Usage{
+					TotalTokens: int64Ptr(123),
+				},
+			},
+			wantVerdict: VerdictNeedsHuman,
+			wantNote:    "incomplete verifier attestation",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr strings.Builder
+			result := runWithAgentResult(t, tt.agent, nil, &stderr)
+			if result.Verdict.Verdict != tt.wantVerdict {
+				t.Fatalf("verdict = %q, want %q", result.Verdict.Verdict, tt.wantVerdict)
+			}
+			if result.ExitCode != ExitCodeForVerdict(tt.wantVerdict) {
+				t.Fatalf("exit code = %d, want %d", result.ExitCode, ExitCodeForVerdict(tt.wantVerdict))
+			}
+			if result.Verdict.Attestation == nil {
+				t.Fatal("verdict missing attestation")
+			}
+
+			record := result.Verdict.Attestation
+			if record.Role != attestation.RoleVerifier || record.Provider != "codex" || record.ModelSource != attestation.ModelSourceParsed || record.Permission != attestation.PermissionReadOnly || !record.Verified {
+				t.Fatalf("attestation identity fields = %#v", record)
+			}
+			if record.Action != "review PR #152" || record.ExitCode != tt.agent.ExitCode {
+				t.Fatalf("attestation action/exit = (%q, %d), want review PR #152/%d", record.Action, record.ExitCode, tt.agent.ExitCode)
+			}
+			if !strings.Contains(stderr.String(), record.Header()) {
+				t.Fatalf("stderr missing attestation header %q:\n%s", record.Header(), stderr.String())
+			}
+
+			var rendered strings.Builder
+			if err := Render(&rendered, result); err != nil {
+				t.Fatalf("Render returned error: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(rendered.String()), &payload); err != nil {
+				t.Fatalf("rendered verdict is not JSON: %v\n%s", err, rendered.String())
+			}
+			if _, ok := payload["attestation"]; !ok {
+				t.Fatalf("rendered verdict missing attestation: %s", rendered.String())
+			}
+
+			if tt.wantNote != "" {
+				found := false
+				for _, finding := range result.Verdict.Findings {
+					if strings.Contains(finding.Note, tt.wantNote) && strings.Contains(finding.Note, "model is required") {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("findings missing incomplete-attestation note: %#v", result.Verdict.Findings)
+				}
+			} else if err := record.Validate(); err != nil {
+				t.Fatalf("valid attestation did not validate: %v", err)
+			}
+		})
 	}
 }
 
@@ -302,6 +392,11 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 
 func runWithAgentSummary(t *testing.T, summary string, showErr error) Result {
 	t.Helper()
+	return runWithAgentResult(t, validLoopreviewAgentResult(summary, 0), showErr, nil)
+}
+
+func runWithAgentResult(t *testing.T, agentResult agent.Result, showErr error, stderr *strings.Builder) Result {
+	t.Helper()
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	fakeGit := &loopreviewFakeGit{
@@ -327,13 +422,19 @@ func runWithAgentSummary(t *testing.T, summary string, showErr error) Result {
 		diff:  "diff",
 		files: []string{"file.go"},
 	}
-	fakeAgent := &loopreviewFakeAgent{summary: summary}
+	fakeAgent := &loopreviewFakeAgent{result: &agentResult}
+
+	var warnings strings.Builder
+	if stderr == nil {
+		stderr = &warnings
+	}
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:   repo,
 		PRNumber:   152,
 		Provider:   "codex",
 		BaseBranch: "main",
+		Stderr:     stderr,
 	}, Deps{
 		Git: fakeGit,
 		GitHub: func(string) GitHubClient {
@@ -354,6 +455,27 @@ func runWithAgentSummary(t *testing.T, summary string, showErr error) Result {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	return result
+}
+
+func validLoopreviewAgentResult(summary string, exitCode int) agent.Result {
+	return agent.Result{
+		ExitCode:   exitCode,
+		Summary:    summary,
+		Model:      "gpt-5",
+		Effort:     "high",
+		StartedAt:  "2026-06-28T00:00:00Z",
+		EndedAt:    "2026-06-28T00:00:02Z",
+		DurationMS: 2000,
+		Usage: attestation.Usage{
+			InputTokens:  int64Ptr(12),
+			OutputTokens: int64Ptr(34),
+			TotalTokens:  int64Ptr(46),
+		},
+	}
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
 }
 
 type loopreviewFakeGit struct {
@@ -417,6 +539,7 @@ func (f *loopreviewFakeGitHub) PRDiffNameOnly(context.Context, int) ([]string, e
 
 type loopreviewFakeAgent struct {
 	invocation         agent.Invocation
+	result             *agent.Result
 	summary            string
 	exitCode           int
 	err                error
@@ -437,7 +560,10 @@ func (f *loopreviewFakeAgent) Run(ctx context.Context, invocation agent.Invocati
 	if f.err != nil {
 		return agent.Result{ExitCode: -1}, f.err
 	}
-	return agent.Result{ExitCode: f.exitCode, Summary: f.summary}, nil
+	if f.result != nil {
+		return *f.result, nil
+	}
+	return validLoopreviewAgentResult(f.summary, f.exitCode), nil
 }
 
 type loopreviewFakeLock struct {
