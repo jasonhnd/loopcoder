@@ -1,18 +1,21 @@
 # loopcoder Usage
 
-loopcoder turns one delivery need into a small GitHub-issue batch, Codex worker
-PRs, Opus review, chat progress, and user-directed merges.
+loopcoder turns one delivery need into a small GitHub-issue batch,
+provider-pluggable worker PRs, independent `loopreview` verification, chat
+progress, and user-directed merges.
 
-Use it when you want one Claude Code chat to plan, dispatch, review, and merge a
+Use it when you want one conductor chat to plan, dispatch, review, and merge a
 small batch of repository work without manually relaying every step between
-GitHub, git worktrees, Codex, and PR review.
+GitHub, git worktrees, worker providers, and PR review.
 
 ## Prerequisites
 
-- Claude Code, because loopcoder is a Claude Code skill.
+- A conductor host session that follows `SKILL.md`, `AGENTS.md`, or `GEMINI.md`.
 - `git` on `PATH`.
 - `gh` on `PATH`, authenticated for the target GitHub repository.
-- `codex` on `PATH`.
+- At least one supported provider CLI on `PATH`. `codex` is the default worker,
+  `claude` is a verified worker provider, and `gemini` is experimental and
+  unverified end-to-end.
 - Go, for installing the native `loopcoder` binary with `go install`.
 - A GitHub repository with a configured remote.
 
@@ -68,8 +71,8 @@ local verification, state, and lease operations.
 
 Optionally add a `.delivery.yml` file at the repository root. If it is absent,
 loopcoder uses the v1 defaults from the current design: GitHub issues, git
-worktrees, the Codex worker adapter, GitHub PRs/checks/merges, Opus review,
-human merge gating, and chat reporting.
+worktrees, the Codex worker adapter, GitHub PRs/checks/merges, independent
+`loopreview` verification, human merge gating, and chat reporting.
 
 The current example is:
 
@@ -78,9 +81,10 @@ version: 1
 adapters:
   work_items: github      # Work items are GitHub issues.
   workspace: git-worktree # Work happens in git worktrees.
-  worker: codex           # Codex implements each issue.
+  conductor: codex-cli    # Transparency only: the human session that conducts.
+  worker: codex           # Default worker provider; claude is also verified.
   vcs: github             # GitHub hosts PRs and checks.
-  verifier: opus          # Opus reviews worker output.
+  verifier: claude        # Should differ from worker; LLM verifier reliability is still experimental.
   gate: human-merge       # Humans choose what merges.
 worker:
   # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
@@ -111,12 +115,14 @@ report:
 
 4. loopcoder creates the approved GitHub issues and dispatches ready issues to
    workers through `loopcoder dispatch` / `loopcoder dispatch-wave`. The binary
-   creates a fresh git worktree, runs headless `codex exec`, commits the
+   creates a fresh git worktree, runs the selected provider, commits the
    resulting changes, pushes the branch, opens a PR, and cleans up.
 
-5. loopcoder reviews each PR in the Opus chat session, checks the diff and
+5. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
    `gh pr checks`, and reports progress, failures, risks, and final status in
-   chat.
+   chat. LLM verifier provider reliability is still experimental, so ambiguous,
+   malformed, timed-out, or incomplete verifier output is reported as
+   `needs-human`.
 
 6. You name which PRs to merge. loopcoder merges only those named PRs by running
    `gh pr merge`, following `.delivery.yml` merge settings when present.
@@ -187,16 +193,44 @@ loopcoder recover \
 
 loopcoder verify-local --repo . --pr-number <pr>
 
+loopcoder loopreview --repo . --pr-number <pr> --provider claude
+
+loopcoder attest \
+  --role conductor \
+  --provider <host-provider> \
+  --model <host-model> \
+  --permission orchestrate \
+  --action "<delivery action>" \
+  --duration-ms <milliseconds> \
+  --total-tokens <tokens>
+
 loopcoder state push --repo .
 loopcoder state pull --repo .
 loopcoder lease acquire --repo .
 loopcoder lease release --repo .
 ```
 
+## Attestation
+
+Worker and verifier invocations carry binary-stamped attestation records with
+`verified: true`, `model_source: parsed`, provider, real parsed model, effort,
+permission, action, exit code, timing, and token usage. Missing required
+identity or usage fails closed: `dispatch` opens no PR, and `loopreview`
+returns `needs-human` with the incomplete-attestation finding.
+
+`loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
+followed by the one-line `[attestation] ...` header, forces `model_source` to
+`self-reported`, and forces `verified` to `false` even if flags try to set other
+values. It exits non-zero when required fields are missing or invalid,
+including provider, model, action, timing, and usage. Provide either
+`--total-tokens` or both `--input-tokens` and `--output-tokens`.
+
+Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
+
 ## Limits
 
 loopcoder v1 is intentionally small-batch and single-session. It is meant for a
-handful of issues in one open Opus chat session, not large unattended roadmaps.
+handful of issues in one open conductor session, not large unattended roadmaps.
 
 State lives in GitHub plus the conductor's in-chat state table and dependency
 DAG. If the session ends, a later session can re-read GitHub state, but v1 does

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-invocation attestation for Worker, Verifier, and Conductor roles per [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md): worker PR bodies and verifier verdicts carry binary-stamped records with provider, parsed model, effort, permission, duration, and token usage; `loopcoder attest` emits Conductor self-attestation; the Conductor hook enforces the self-attestation step; and missing required identity or usage fails closed with no worker PR, a `needs-human` verifier verdict, or a non-zero `attest` exit.
+
 ## [0.3.0] - 2026-06-28
 
 ### Added

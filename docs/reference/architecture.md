@@ -195,5 +195,6 @@ Documentation and code are intentionally not bundled in the same issue or PR.
   design. It includes larger ideas that are not built in the current system.
 - [`../specs/0000-loopcoder-v1.md`](../specs/0000-loopcoder-v1.md) is the
   original v1 design record.
+- [`../specs/0146-attestation.md`](../specs/0146-attestation.md) defines per-invocation Worker, Verifier, and Conductor attestation.
 - [`../specs/`](../specs/) contains frozen design records. This architecture
   document is the living current-behavior reference.

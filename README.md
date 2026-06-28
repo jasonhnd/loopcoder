@@ -73,6 +73,7 @@ loopcoder resume        --repo .                  # reconcile a run after an int
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>   # bounded retry of a failed attempt
 loopcoder loopreview    --repo . --pr-number 43 --provider claude   # read-only independent verifier
 loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check commands on a PR
+loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
 ## How it works
@@ -91,6 +92,7 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, while reliable LLM verifier provider validation remains a follow-up.
+- Attestation -- worker and verifier invocations are binary-stamped with `verified: true` records covering provider, real parsed model, effort, permission, duration, and token usage. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md).
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 - Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go and its v0.3.0 multi-provider worker layer.
 
@@ -105,6 +107,7 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 - [`docs/specs/0041-resilience.md`](docs/specs/0041-resilience.md) -- worker state, resume, recovery, and retry.
 - [`docs/specs/0081-orchestration.md`](docs/specs/0081-orchestration.md) -- ready-set and dispatch-wave orchestration.
 - [`docs/specs/0089-go-migration.md`](docs/specs/0089-go-migration.md) -- native Go backend migration.
+- [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md) -- per-invocation Worker, Verifier, and Conductor attestation.
 - [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/learnings.md`](docs/learnings.md) -- append-only operational learnings.
 - [`CHANGELOG.md`](CHANGELOG.md) -- release history.
