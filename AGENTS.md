@@ -21,3 +21,46 @@ Codex host specifics:
 - Verification still delegates the primary adversarial review to
   `loopcoder loopreview`; the verifier provider SHOULD differ from the worker
   provider, and human merge remains the final gate.
+- Before completing a delivery or merge turn, run
+  `loopcoder attest --role conductor ...` at least once per active host session
+  with the real Codex host model,
+  timing, action, and usage available for the session. Stamp the emitted
+  `[attestation] ...` header or canonical JSON into durable artifacts the
+  Conductor produces, such as PR merge comments or merge commit messages; chat
+  alone is not durable enough.
+- Codex hook enforcement is best-effort in this repository. Codex CLI exposes
+  hook events that are similar to the Claude Code `PostToolUse` and `Stop`
+  events, and `hooks/conductor-attest.js` accepts those event names when wired
+  in, but this repository ships and tests the Claude Code registration only.
+  If you opt in to Codex hooks, register the same command for Bash
+  `PostToolUse` and `Stop` events from the repo root:
+
+  ```json
+  {
+    "hooks": {
+      "PostToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node hooks/conductor-attest.js",
+              "timeout": 10
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node hooks/conductor-attest.js",
+              "timeout": 10
+            }
+          ]
+        }
+      ]
+    }
+  }
+  ```

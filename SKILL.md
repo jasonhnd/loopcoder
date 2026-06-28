@@ -35,6 +35,33 @@ this loop.
 - Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
 
+## Conductor attestation
+
+Per [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), the
+Conductor must self-attest at least once per active host session before
+completing any delivery or merge turn:
+
+```text
+loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action "<delivery action>" --duration-ms <ms> --total-tokens <tokens>
+```
+
+Use the actual host provider, model, effort, action, timing, and token usage
+available in the host session. The Conductor record is self-reported and must
+remain visibly different from binary-verified Worker or Verifier records.
+
+Claude Code enforcement is provided by the project hook in
+[`hooks/conductor-attest.js`](hooks/conductor-attest.js); install it with the
+snippet in [`hooks/README.md`](hooks/README.md). Codex and Gemini host notes in
+[`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md) describe their current
+best-effort hook story. If the active host is not actually enforcing the hook,
+the manual attestation step is still mandatory and must be reported honestly.
+
+The emitted `[attestation] ...` header or canonical JSON must be stamped into
+durable artifacts the Conductor produces, not only chat. For merge work, include
+it in the PR merge comment, merge commit body, or equivalent durable merge
+artifact so a later Conductor can recover the attestation after compaction or
+session transfer.
+
 ## Backend selection
 
 The conductor's sole mechanical backend is the native `loopcoder` binary. The
