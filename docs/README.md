@@ -40,7 +40,7 @@ Every spec must start with YAML frontmatter:
 ---
 id: 167
 title: Human Title
-status: accepted
+status: draft
 date: 2026-06-28
 issue: 167
 pr: null
@@ -52,13 +52,27 @@ superseded_by: []
 Use `issue: null` for the `0000` genesis spec. `pr` is informational and may be
 `null` when the PR number is not worth recovering.
 
+Spec status is a lifecycle marker:
+
+- A new spec PR opens with `status: draft` while the document is under review.
+- The merging conductor sets `status: accepted` when the spec PR merges.
+- A later replacement changes the old spec to `status: superseded` and records
+  the replacement in `superseded_by`; the replacement spec records the old spec
+  in `supersedes`.
+
+The `status` frontmatter field is the one permitted post-merge edit to an
+otherwise frozen spec. When setting `status: superseded`, the same lifecycle
+edit may also populate `superseded_by`; all other spec content remains
+immutable.
+
 The old `YYYY-MM-DD-...-design.md` date-prefix convention is retired. Dates
 belong in frontmatter.
 
 ## Adding A Document
 
-For a new design decision, open a documentation issue first, write the accepted
-record under `docs/specs/`, and merge it before any implementation issue.
+For a new design decision, open a documentation issue first, write the draft
+record under `docs/specs/`, and merge it as `status: accepted` before any
+implementation issue.
 
 For current behavior, update the relevant living document under
 `docs/reference/` and link to the frozen spec when readers need rationale.

@@ -1,7 +1,7 @@
 ---
 id: 146
 title: Per-Invocation Attestation for Worker, Verifier, and Conductor
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 146
 pr: null
