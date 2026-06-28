@@ -1,7 +1,7 @@
 ---
 id: 212
 title: Release, Distribution, Isolation, and Upgrade
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 212
 pr: null
