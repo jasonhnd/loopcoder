@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-06-28
+
+### Added
+
+- `loopreview` now builds a bounded review packet per [`docs/specs/0194-reliable-loopreview-verifier.md`](docs/specs/0194-reliable-loopreview-verifier.md) and #202, including bounded changed-file, issue, merged-spec, and diff excerpts with visible truncation markers. If the packet is insufficient for a safe verdict, `loopreview` returns `needs-human` without invoking the provider.
+- `codex` and `claude` are verified `loopreview` verifier providers in the mechanism sense per #205: each can return a valid structured verdict plus Verifier attestation within the timeout.
+
+### Changed
+
+- Verifier provider invocation is read-only and headless-hardened per #204: `claude` uses `--print` with a `Read Grep Glob` allowlist and no plan mode, and `codex` uses `exec -s read-only`.
+
+### Fixed
+
+- Follow-up loopreview reliability polish from #208 and #209, including clearer documentation wording and visible omitted-file names when diff packet content is truncated.
+
+### Notes
+
+- The verified-provider proof is about the verifier mechanism, not deterministic model judgment. The LLM `pass` or `fail` verdict itself remains non-deterministic across otherwise valid runs.
+
+## [0.3.2] - 2026-06-28
+
+### Added
+
+- Delivery guardrails per [`docs/specs/0192-delivery-guardrails.md`](docs/specs/0192-delivery-guardrails.md), #198, and #203. `.delivery.yml guardrails.budget` can opt in to `max_runs`, `max_total_attempts`, `max_total_tokens`, and `max_total_cost_usd`; token accounting consumes attestation usage, cost caps are exact-only, and missing or corrupt evidence fails closed to `needs-human`.
+- `.delivery.yml guardrails.circuit_breaker` can opt in to no-progress streak thresholds that freeze only the affected issue and require human input before more work is dispatched for that issue.
+
+### Changed
+
+- `dispatch-wave` and `recover` enforce guardrails as pre-dispatch gates and reuse a guardrail ledger for decisions. `ready-set` and `resume` surface budget-blocked or circuit-frozen issues as `needs-human` / `guardrail-frozen` instead of marking them ready.
+
 ## [0.3.1] - 2026-06-28
 
 ### Added

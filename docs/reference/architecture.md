@@ -71,7 +71,7 @@ The verifier provider should differ from the worker provider. If the invoked
 verifier matches `.delivery.yml`'s worker provider, the CLI emits an advisory
 warning and still proceeds because human merge remains the final gate.
 
-As of the 0.3.x provider proof, `claude` and `codex` are verified
+As of the 0.3.3 provider proof, `claude` and `codex` are verified
 `loopreview` providers in the mechanism sense: both providers returned a valid
 structured verdict plus attestation within a `--timeout 180s` smoke run. The
 LLM verdict itself is non-deterministic, so the proof does not mean either
