@@ -1,7 +1,7 @@
 ---
 id: 192
 title: Delivery Guardrails - Budget Caps and Loop Circuit-Breaker
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 192
 pr: null
