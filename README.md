@@ -74,6 +74,12 @@ Then confirm the binary:
 loopcoder --version
 ```
 
+For a first consumer repository, follow the
+[`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project):
+install once, run `loopcoder --version` and `loopcoder doctor`, install the
+playbook with `loopcoder skill install`, run `loopcoder init` in each repo,
+then drive `/loopcoder <your need>`.
+
 Prerequisites on `PATH`: `git`, `gh` (authenticated), and at least one supported provider CLI. `codex` is the default worker, `codex` and `claude` are verified verifier providers, `claude` is also a verified worker provider, and `gemini` is experimental/unverified.
 
 Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
