@@ -113,8 +113,19 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if result.AttemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-4321.attempt.json") {
 		t.Fatalf("AttemptPath = %q", result.AttemptPath)
 	}
+	if result.Attestation == nil {
+		t.Fatal("result missing attestation")
+	}
+	if err := result.Attestation.Validate(); err != nil {
+		t.Fatalf("result attestation does not validate: %v", err)
+	}
+	canonicalAttestation, err := result.Attestation.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("CanonicalJSON returned error: %v", err)
+	}
 	for _, want := range []string{
-		`[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`,
+		result.Attestation.Header(),
+		string(canonicalAttestation),
 		"```json\n",
 		`"role":"worker"`,
 		`"provider":"codex"`,
@@ -143,6 +154,24 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		if _, ok := jsonFields[key]; !ok {
 			t.Fatalf("success JSON missing field %q: %s", key, string(data))
 		}
+	}
+	attestationField, ok := jsonFields["attestation"]
+	if !ok {
+		t.Fatalf("success JSON missing attestation field: %s", string(data))
+	}
+	attestationBytes, err := json.Marshal(attestationField)
+	if err != nil {
+		t.Fatalf("marshal attestation field: %v", err)
+	}
+	var renderedAttestation attestation.AttestationRecord
+	if err := json.Unmarshal(attestationBytes, &renderedAttestation); err != nil {
+		t.Fatalf("attestation field invalid: %v", err)
+	}
+	if err := renderedAttestation.Validate(); err != nil {
+		t.Fatalf("attestation field does not validate: %v", err)
+	}
+	if renderedAttestation.Header() != result.Attestation.Header() {
+		t.Fatalf("attestation JSON header = %q, want %q", renderedAttestation.Header(), result.Attestation.Header())
 	}
 
 	attempts, err := state.LoadAttempts(repo, "run-test")

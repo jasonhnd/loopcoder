@@ -38,16 +38,17 @@ type Options struct {
 }
 
 type Result struct {
-	OK          bool   `json:"ok"`
-	Issue       int    `json:"issue"`
-	Branch      string `json:"branch"`
-	RunID       string `json:"run_id"`
-	PR          string `json:"pr"`
-	Summary     string `json:"summary"`
-	AttemptPath string `json:"attempt_path"`
-	Status      string `json:"status"`
-	ExitCode    int    `json:"exit_code"`
-	LogBytes    int64  `json:"log_bytes"`
+	OK          bool                           `json:"ok"`
+	Issue       int                            `json:"issue"`
+	Branch      string                         `json:"branch"`
+	RunID       string                         `json:"run_id"`
+	PR          string                         `json:"pr"`
+	Summary     string                         `json:"summary"`
+	AttemptPath string                         `json:"attempt_path"`
+	Status      string                         `json:"status"`
+	ExitCode    int                            `json:"exit_code"`
+	LogBytes    int64                          `json:"log_bytes"`
+	Attestation *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 
 type GitClient interface {
@@ -341,6 +342,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		Status:      "succeeded",
 		ExitCode:    exitCode,
 		LogBytes:    logBytes,
+		Attestation: &attestationRecord,
 	}, nil
 }
 
