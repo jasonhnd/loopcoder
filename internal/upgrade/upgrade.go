@@ -49,6 +49,7 @@ type Result struct {
 	TargetVersion     string
 	Platform          string
 	AssetName         string
+	AlreadyLatest     bool
 	VersionBinaryPath string
 	StableBinaryPath  string
 	Deferred          bool
@@ -187,6 +188,11 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return result, errors.New("release response did not include tag_name")
 	}
 	result.TargetVersion = rel.TagName
+
+	if sameReleaseVersion(currentVersion, rel.TagName) {
+		result.AlreadyLatest = true
+		return result, nil
+	}
 
 	assetVersion := assetVersion(rel.TagName)
 	if assetVersion == "" {
@@ -333,6 +339,21 @@ func normalizeTag(version string) string {
 		return version
 	}
 	return "v" + version
+}
+
+func sameReleaseVersion(a string, b string) bool {
+	return releaseVersionKey(a) == releaseVersionKey(b)
+}
+
+func releaseVersionKey(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return ""
+	}
+	if strings.HasPrefix(version, "v") || strings.HasPrefix(version, "V") {
+		return version[1:]
+	}
+	return version
 }
 
 func assetVersion(tag string) string {

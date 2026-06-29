@@ -52,10 +52,12 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           FORMAT: ${{ matrix.format }}
           TAG_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
           version="${TAG_NAME#v}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           archive="loopcoder_${version}_${GOOS}_${GOARCH}.${FORMAT}"
           binary="loopcoder"
           if [[ "${GOOS}" == "windows" ]]; then
@@ -65,7 +67,25 @@ jobs:
           rm -rf dist
           mkdir -p dist/package
 
-          CGO_ENABLED=0 go build -trimpath -o "dist/package/${binary}" ./cmd/loopcoder
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${version} -X main.commit=${COMMIT_SHA} -X main.date=${build_date}" \
+            -o "dist/package/${binary}" \
+            ./cmd/loopcoder
+
+          if [[ "${GOOS}" == "linux" && "${GOARCH}" == "amd64" ]]; then
+            version_output="$("./dist/package/${binary}" --version)"
+            echo "${version_output}"
+            if [[ "${version_output}" == *"version=dev"* ]]; then
+              echo "release binary still reports version=dev" >&2
+              exit 1
+            fi
+            if [[ "${version_output}" == *"commit=unknown"* || "${version_output}" == *"date=unknown"* ]]; then
+              echo "release binary still reports unknown commit/date" >&2
+              exit 1
+            fi
+          fi
+
           cp LICENSE dist/package/LICENSE
 
           if [[ "${FORMAT}" == "zip" ]]; then

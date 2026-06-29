@@ -84,6 +84,82 @@ func TestVerifyChecksumPassAndFail(t *testing.T) {
 	}
 }
 
+func TestSameReleaseVersionIgnoresOnlyOptionalLeadingV(t *testing.T) {
+	tests := []struct {
+		name string
+		a    string
+		b    string
+		want bool
+	}{
+		{name: "tagged current", a: "v0.3.3", b: "0.3.3", want: true},
+		{name: "tagged target", a: "0.3.3", b: "v0.3.3", want: true},
+		{name: "uppercase tag", a: "V0.3.3", b: "0.3.3", want: true},
+		{name: "same with whitespace", a: " 0.3.3 ", b: " v0.3.3 ", want: true},
+		{name: "different patch", a: "0.3.3", b: "0.3.4", want: false},
+		{name: "build metadata not loosened", a: "0.3.3", b: "v0.3.3+build", want: false},
+		{name: "double v not loosened", a: "vv0.3.3", b: "v0.3.3", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sameReleaseVersion(tt.a, tt.b); got != tt.want {
+				t.Fatalf("sameReleaseVersion(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunAlreadyLatestSkipsDownloadWithOptionalV(t *testing.T) {
+	apiBase := "https://api.example.test"
+	repo := "owner/repo"
+	releaseURL := apiBase + "/repos/" + repo + "/releases/latest"
+	calls := 0
+
+	result, err := Run(context.Background(), Options{
+		CurrentVersion: "0.3.3",
+		RuntimeGOOS:    runtime.GOOS,
+		RuntimeGOARCH:  runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return apiBase
+			case EnvUpgradeRepo:
+				return repo
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("bin", wantBinaryFileName()), nil
+		},
+		HTTPGet: func(_ context.Context, rawURL string) ([]byte, error) {
+			calls++
+			if rawURL != releaseURL {
+				t.Fatalf("unexpected URL %q", rawURL)
+			}
+			return releaseJSON(t, release{TagName: "v0.3.3"}), nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("HTTPGet calls = %d, want only release lookup", calls)
+	}
+	if !result.AlreadyLatest {
+		t.Fatalf("AlreadyLatest = false, result = %#v", result)
+	}
+	if result.TargetVersion != "v0.3.3" || result.CurrentVersion != "0.3.3" {
+		t.Fatalf("result versions = %#v", result)
+	}
+	if result.AssetName != "" || result.VersionBinaryPath != "" || result.StableBinaryPath != "" {
+		t.Fatalf("already-latest result should not include install fields: %#v", result)
+	}
+}
+
 func TestRunFailsWhenAssetMissing(t *testing.T) {
 	apiBase := "https://api.example.test"
 	repo := "owner/repo"
