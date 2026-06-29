@@ -119,6 +119,7 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 		Usage      struct {
 			InputTokens  json.RawMessage `json:"input_tokens"`
 			OutputTokens json.RawMessage `json:"output_tokens"`
+			TotalTokens  json.RawMessage `json:"total_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(trimmed, &payload); err != nil {
@@ -131,6 +132,9 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 	}
 	if outputTokens, ok := parseRawInt64(payload.Usage.OutputTokens); ok {
 		metadata.Usage.OutputTokens = outputTokens
+	}
+	if totalTokens, ok := parseRawInt64(payload.Usage.TotalTokens); ok {
+		metadata.Usage.TotalTokens = totalTokens
 	}
 	return metadata
 }
