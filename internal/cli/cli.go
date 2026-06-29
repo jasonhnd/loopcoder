@@ -1263,7 +1263,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if shouldRenderPretty(stderr, pretty, deps) {
+	if result.Attestation != nil && shouldRenderPretty(stderr, pretty, deps) {
 		if err := renderPrettyAttestation(stderr, *result.Attestation, prettyModeForTarget(stderr, deps)); err != nil {
 			fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
 			return 1
