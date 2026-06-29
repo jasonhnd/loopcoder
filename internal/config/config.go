@@ -12,6 +12,7 @@ type Config struct {
 	Version      int          `yaml:"version"`
 	Adapters     Adapters     `yaml:"adapters"`
 	Worker       Worker       `yaml:"worker"`
+	Verifier     Verifier     `yaml:"verifier"`
 	CI           CI           `yaml:"ci"`
 	Verification Verification `yaml:"verification"`
 	Resilience   Resilience   `yaml:"resilience"`
@@ -43,6 +44,11 @@ type Worker struct {
 	Model           string `yaml:"model"`
 	ReasoningEffort string `yaml:"reasoning_effort"`
 	CommandHint     string `yaml:"command_hint"`
+}
+
+type Verifier struct {
+	Model           string `yaml:"model"`
+	ReasoningEffort string `yaml:"reasoning_effort"`
 }
 
 type CI struct {
