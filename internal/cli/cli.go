@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -51,6 +52,7 @@ type Deps struct {
 	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
+	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
 	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
 	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
@@ -60,6 +62,7 @@ type Deps struct {
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "version", Summary: "print version and build information"},
+	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -108,6 +111,9 @@ func DefaultDeps() Deps {
 		},
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
+		},
+		Doctor: func(ctx context.Context, opts doctor.Options) doctor.Report {
+			return doctor.Run(ctx, opts, doctor.DefaultDeps())
 		},
 		StatePush: func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
@@ -160,6 +166,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "version" {
 		return runVersion(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "doctor" {
+		return runDoctor(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
@@ -253,6 +262,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --total-tokens int       total token count")
 		fmt.Fprintln(w, "  --model-source string    ignored; forced to self-reported")
 		fmt.Fprintln(w, "  --verified               ignored; forced to false")
+	}
+	if command.Name == "doctor" {
+		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
 	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -390,6 +402,51 @@ func printVersion(w io.Writer, build BuildInfo) {
 		runtime.GOOS,
 		runtime.GOARCH,
 	)
+}
+
+func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Doctor == nil {
+		deps.Doctor = DefaultDeps().Doctor
+	}
+
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "doctor: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "doctor: %v\n", err)
+		return 2
+	}
+
+	report := deps.Doctor(context.Background(), doctor.Options{
+		RepoPath: resolvedRepo,
+		BuildInfo: doctor.BuildInfo{
+			Version: deps.BuildInfo.Version,
+			Commit:  deps.BuildInfo.Commit,
+			Date:    deps.BuildInfo.Date,
+		},
+	})
+	if err := doctor.Render(stdout, report); err != nil {
+		fmt.Fprintf(stderr, "doctor: write output: %v\n", err)
+		return 1
+	}
+	return report.ExitCode()
 }
 
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
