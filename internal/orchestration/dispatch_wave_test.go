@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -156,7 +158,9 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 		},
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			if opts.IssueNumber == 2 {
-				return worker.Result{}, errors.New("worker failed")
+				result := waveWorkerResult(opts)
+				result.Attestation = waveAttestation(opts.IssueNumber, 202)
+				return result, errors.New("worker failed")
 			}
 			return waveWorkerResult(opts), nil
 		},
@@ -173,6 +177,63 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 	}
 	if report.Results[1].Status != DispatchWaveStatusFailed || report.Results[1].Error != "worker failed" {
 		t.Fatalf("issue #2 result = %#v, want failed worker error", report.Results[1])
+	}
+	if report.Results[1].Attestation == nil || report.Results[1].Attestation.Model != "worker-model-2" {
+		t.Fatalf("issue #2 attestation = %#v, want preserved worker attestation", report.Results[1].Attestation)
+	}
+}
+
+func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
+	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			11: {Number: 11, Title: "Eleven"},
+			12: {Number: 12, Title: "Twelve"},
+		}},
+		RepoPath:      t.TempDir(),
+		RunID:         "run-test-wave",
+		IssueNumbers:  []int{11, 12},
+		ThrottleLimit: 1,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(11, 12), nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			result := waveWorkerResult(opts)
+			result.Attestation = waveAttestation(opts.IssueNumber, int64(opts.IssueNumber*100))
+			return result, nil
+		},
+		LoadAttempts: noAttempts,
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("result count = %d, want 2", len(report.Results))
+	}
+	for i, result := range report.Results {
+		if result.Attestation == nil {
+			t.Fatalf("result %d missing attestation: %#v", i, result)
+		}
+		if result.Attestation.Action != fmt.Sprintf("implement issue #%d", result.Issue) {
+			t.Fatalf("result %d attestation action = %q, want issue-specific action", i, result.Attestation.Action)
+		}
+	}
+	if report.Results[0].Attestation.Model != "worker-model-11" ||
+		report.Results[1].Attestation.Model != "worker-model-12" {
+		t.Fatalf("attestations collapsed or reordered: %#v", report.Results)
+	}
+	if report.Results[0].Attestation.Usage.TotalTokens == nil ||
+		*report.Results[0].Attestation.Usage.TotalTokens != 1100 ||
+		report.Results[1].Attestation.Usage.TotalTokens == nil ||
+		*report.Results[1].Attestation.Usage.TotalTokens != 1200 {
+		t.Fatalf("attestation token usage not preserved per issue: %#v", report.Results)
+	}
+
+	data, err := json.Marshal(report.Results)
+	if err != nil {
+		t.Fatalf("Marshal results: %v", err)
+	}
+	if got := strings.Count(string(data), `"attestation"`); got != 2 {
+		t.Fatalf("marshaled results contain %d attestation fields, want 2: %s", got, string(data))
 	}
 }
 
@@ -378,6 +439,27 @@ func waveWorkerResult(opts worker.Options) worker.Result {
 		PR:          fmt.Sprintf("https://github.com/owner/repo/pull/%d", opts.IssueNumber),
 		AttemptPath: fmt.Sprintf(".loopcoder/runs/%s/workers/job-%d.attempt.json", opts.RunID, opts.IssueNumber),
 		Status:      "succeeded",
+	}
+}
+
+func waveAttestation(issue int, totalTokens int64) *attestation.AttestationRecord {
+	started := time.Date(2026, 6, 29, 12, 0, issue, 0, time.UTC)
+	return &attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    fmt.Sprintf("worker-provider-%d", issue),
+		Model:       fmt.Sprintf("worker-model-%d", issue),
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  attestation.PermissionWrite,
+		Action:      fmt.Sprintf("implement issue #%d", issue),
+		ExitCode:    0,
+		StartedAt:   started.Format(time.RFC3339),
+		EndedAt:     started.Add(time.Second).Format(time.RFC3339),
+		DurationMS:  1000,
+		Usage: attestation.Usage{
+			TotalTokens: &totalTokens,
+		},
+		Verified: true,
 	}
 }
 

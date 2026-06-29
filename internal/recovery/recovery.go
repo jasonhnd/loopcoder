@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -86,16 +87,17 @@ type DispatchOptions struct {
 }
 
 type DispatchResult struct {
-	OK          bool   `json:"ok"`
-	Issue       int    `json:"issue"`
-	Branch      string `json:"branch"`
-	RunID       string `json:"run_id"`
-	PR          string `json:"pr"`
-	Summary     string `json:"summary"`
-	AttemptPath string `json:"attempt_path"`
-	Status      string `json:"status"`
-	ExitCode    int    `json:"exit_code"`
-	LogBytes    int64  `json:"log_bytes"`
+	OK          bool                           `json:"ok"`
+	Issue       int                            `json:"issue"`
+	Branch      string                         `json:"branch"`
+	RunID       string                         `json:"run_id"`
+	PR          string                         `json:"pr"`
+	Summary     string                         `json:"summary"`
+	AttemptPath string                         `json:"attempt_path"`
+	Status      string                         `json:"status"`
+	ExitCode    int                            `json:"exit_code"`
+	LogBytes    int64                          `json:"log_bytes"`
+	Attestation *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 
 type Result struct {
@@ -396,6 +398,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 					Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
 				}, nil
 			}
+		}
+		if dispatchResult.Attestation != nil {
+			return Result{Action: ActionRetry, Report: report, DispatchResult: &dispatchResult}, err
 		}
 		return Result{Action: ActionRetry, Report: report}, err
 	}

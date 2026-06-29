@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -521,6 +522,7 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 				Status:      "succeeded",
 				ExitCode:    0,
 				LogBytes:    12,
+				Attestation: recoverAttestation(opts.IssueNumber, 321),
 			}, nil
 		},
 	})
@@ -548,10 +550,61 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		"Backoff seconds: 30",
 		`"ok":true`,
 		`"branch":"loop/issue-103-retry-3"`,
+		`"attestation":{"role":"worker"`,
+		`"model":"recover-model-103"`,
 	} {
 		if !strings.Contains(result.Report, want) {
 			t.Fatalf("retry report missing %q:\n%s", want, result.Report)
 		}
+	}
+	if result.DispatchResult == nil || result.DispatchResult.Attestation == nil {
+		t.Fatalf("retry result missing attestation: %#v", result.DispatchResult)
+	}
+	if result.DispatchResult.Attestation.Model != "recover-model-103" ||
+		result.DispatchResult.Attestation.Usage.TotalTokens == nil ||
+		*result.DispatchResult.Attestation.Usage.TotalTokens != 321 {
+		t.Fatalf("retry attestation not preserved: %#v", result.DispatchResult.Attestation)
+	}
+}
+
+func TestRecoverRetryErrorPreservesPartialDispatchAttestation(t *testing.T) {
+	repo := t.TempDir()
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return []state.Attempt{
+				recoverAttempt(repo, 1, "job-103-1", "failed", "first error"),
+			}, nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			return DispatchResult{
+				Issue:       103,
+				Status:      "failed",
+				Attestation: recoverAttestation(103, 654),
+			}, fmt.Errorf("dispatch failed after worker attestation")
+		},
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want dispatch error")
+	}
+	if result.Action != ActionRetry {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionRetry)
+	}
+	if result.DispatchResult == nil || result.DispatchResult.Attestation == nil {
+		t.Fatalf("partial dispatch result missing attestation: %#v", result.DispatchResult)
+	}
+	if result.DispatchResult.Attestation.Model != "recover-model-103" ||
+		result.DispatchResult.Attestation.Usage.TotalTokens == nil ||
+		*result.DispatchResult.Attestation.Usage.TotalTokens != 654 {
+		t.Fatalf("partial dispatch attestation not preserved: %#v", result.DispatchResult.Attestation)
 	}
 }
 
@@ -571,6 +624,27 @@ func recoverAttempt(repo string, attemptNumber int, jobID, status, errText strin
 
 func fixedRecoverTime() time.Time {
 	return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+}
+
+func recoverAttestation(issue int, totalTokens int64) *attestation.AttestationRecord {
+	started := fixedRecoverTime().Add(time.Duration(issue) * time.Second)
+	return &attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    fmt.Sprintf("recover-provider-%d", issue),
+		Model:       fmt.Sprintf("recover-model-%d", issue),
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  attestation.PermissionWrite,
+		Action:      fmt.Sprintf("implement issue #%d", issue),
+		ExitCode:    0,
+		StartedAt:   started.Format(time.RFC3339),
+		EndedAt:     started.Add(time.Second).Format(time.RFC3339),
+		DurationMS:  1000,
+		Usage: attestation.Usage{
+			TotalTokens: &totalTokens,
+		},
+		Verified: true,
+	}
 }
 
 type recoverFakeGitHub struct {
