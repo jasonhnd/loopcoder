@@ -305,6 +305,13 @@ loopcoder dispatch \
   --base-branch main \
   --provider codex
 
+loopcoder dispatch \
+  --repo . \
+  --issue-number <number> \
+  --issue-title "<title>" \
+  --provider codex \
+  --pretty
+
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2>
 
 loopcoder resume --repo . --run-id <run-id>
@@ -319,8 +326,18 @@ loopcoder recover \
 loopcoder verify-local --repo . --pr-number <pr>
 
 loopcoder loopreview --repo . --pr-number <pr> --provider claude
+loopcoder loopreview --repo . --pr-number <pr> --provider claude --pretty
 
 loopcoder attest \
+  --role conductor \
+  --provider <host-provider> \
+  --model <host-model> \
+  --permission orchestrate \
+  --action "<delivery action>" \
+  --duration-ms <milliseconds> \
+  --total-tokens <tokens>
+
+loopcoder attest --pretty \
   --role conductor \
   --provider <host-provider> \
   --model <host-model> \
@@ -395,6 +412,18 @@ Worker attestation can read either the header or the nested `attestation`
 object. The canonical JSON line is the exact machine rendering of that same
 record and is not wrapped in Markdown on stdout.
 
+When `dispatch` runs in an interactive terminal, it also renders the same
+validated Worker attestation in a human-readable form on stderr. This display
+never appears between the three stdout records. Redirected or piped dispatch
+runs emit no pretty output unless the caller opts in with `--pretty` or
+`LOOPCODER_PRETTY=1`; opt-in pretty output still goes to stderr, and stdout
+keeps the same three records.
+
+`loopcoder loopreview` follows the same interactive display rule for the
+Verifier attestation: the verdict JSON remains stdout, and any pretty
+attestation display is stderr-only. Use `--pretty` or `LOOPCODER_PRETTY=1` to
+request the display in non-interactive runs.
+
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
 followed by the one-line `[attestation] ...` header, forces `model_source` to
 `self-reported`, and forces `verified` to `false` even if flags try to set other
@@ -402,7 +431,51 @@ values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
 
-Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md)
+Keep the default `loopcoder attest` output for durable artifacts such as merge
+comments, merge commit bodies, and PR notes. Use `loopcoder attest --pretty`
+only for direct human reading; it prints the pretty rendering to stdout instead
+of the canonical JSON plus header.
+
+Interactive pretty output uses emoji when the target is an interactive terminal
+and emoji is not disabled:
+
+```text
+✅ attestation verified
+   role        worker
+   provider    codex
+   model       gpt-5.5 (source=parsed)
+   effort      xhigh
+   permission  write
+   action      "implement issue #218"
+   exit        0
+   duration    42s (42000 ms)
+   started     2026-06-29T00:00:00Z
+   ended       2026-06-29T00:00:42Z
+   tokens      input=2447 output=4461 total=6908
+   verified    true
+```
+
+Non-interactive output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
+`LOOPCODER_PLAIN=1` forces the plain ASCII form with the same fields:
+
+```text
+attestation: verified
+  role        worker
+  provider    codex
+  model       gpt-5.5 (source=parsed)
+  effort      xhigh
+  permission  write
+  action      "implement issue #218"
+  exit        0
+  duration    42s (42000 ms)
+  started     2026-06-29T00:00:00Z
+  ended       2026-06-29T00:00:42Z
+  tokens      input=2447 output=4461 total=6908
+  verified    true
+```
+
+Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md),
+[`../specs/0214-human-readable-attestation.md`](../specs/0214-human-readable-attestation.md),
 and [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md).
 
 ## Limits

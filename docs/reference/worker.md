@@ -185,13 +185,19 @@ user has explicitly requested.
 
 ## Output
 
-On success, `loopcoder dispatch` prints a compact JSON object:
+On success, `loopcoder dispatch` prints three newline-terminated stdout records:
+
+1. the stable Worker attestation header;
+2. the Worker attestation canonical JSON;
+3. the dispatch result JSON.
+
+The final non-empty stdout line is the dispatch result JSON:
 
 ```json
-{"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234}
+{"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234,"attestation":{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #24","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}}
 ```
 
-The fields are:
+The dispatch result fields are:
 
 - `ok`: `true` on success.
 - `issue`: the issue number.
@@ -204,3 +210,9 @@ The fields are:
 - `status`: attempt status.
 - `exit_code`: provider exit code.
 - `log_bytes`: size of the provider log.
+- `attestation`: the same validated Worker `AttestationRecord` emitted in the
+  first two stdout records.
+
+When stderr is an interactive terminal, or when the caller sets `--pretty` or
+`LOOPCODER_PRETTY=1`, `dispatch` also writes the human-readable pretty
+attestation to stderr. This never changes or reorders the three stdout records.

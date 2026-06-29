@@ -94,6 +94,10 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
+Add `--pretty` to `dispatch`, `loopreview`, or `attest` for human-readable
+attestation output. `dispatch` and `loopreview` keep machine stdout stable and
+write the pretty display to stderr.
+
 ## How it works
 
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into status, and reports progress. It never writes the code itself.
@@ -110,7 +114,7 @@ loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --pe
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, with `codex` and `claude` provider verification proven by real smoke runs.
-- Attestation -- worker and verifier invocations are binary-stamped with `verified: true` records covering provider, real parsed model, effort, permission, duration, and token usage. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md).
+- Attestation -- worker and verifier invocations are binary-stamped with `verified: true` records covering provider, real parsed model, effort, permission, duration, and token usage. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`), and `--pretty` provides a human-readable rendering without replacing durable machine output by default. Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md) and [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md).
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 - Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go, its v0.3.0 multi-provider worker layer, its v0.3.1 attestation layer, its v0.3.2 delivery guardrails, and its v0.3.3 loopreview reliability hardening.
 
