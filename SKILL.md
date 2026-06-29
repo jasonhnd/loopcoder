@@ -221,10 +221,13 @@ Bounds and scrutiny:
    - Dispatch one ready wave with `loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> ...`, or dispatch one issue with `loopcoder dispatch ...`. Then recompute as PRs merge. Repeat until the DAG is drained or blocked.
    - `loopcoder dispatch` and `loopcoder dispatch-wave` preserve git worktree creation serialization, so independent ready issues can be dispatched concurrently safely.
    - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
-   - Capture each worker's output, job handle, PR URL, failure details, and
-     Worker attestation. Read the final dispatch result line and its
-     `attestation` object; dispatch also surfaces the same record as the stable
-     `[attestation] ...` header plus canonical JSON, symmetric with the
+   - Invoke `loopcoder dispatch` and `loopcoder dispatch-wave` with
+     `LOOPCODER_PRETTY=1` or `--pretty` so stderr includes the emoji pretty
+     attestation block. Capture each worker's output, job handle, PR URL,
+     failure details, final dispatch result, and Worker pretty attestation
+     block from stderr. Relay that block verbatim, one per Worker. The stable
+     `[attestation] ...` header, canonical JSON, and final result
+     `attestation` object remain the machine contracts, symmetric with the
      Verifier attestation from `loopreview`.
 
    Example shape:
@@ -238,9 +241,10 @@ Bounds and scrutiny:
      --issue-title "<title>" \
      --issue-body "<body>" \
      --base-branch <base-branch> \
-     --provider <worker-provider>
+     --provider <worker-provider> \
+     --pretty
 
-   loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> --issue-numbers <n1>,<n2>
+   loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> --issue-numbers <n1>,<n2> --pretty
    ```
 
 5. Verify each resulting PR.
@@ -248,10 +252,13 @@ Bounds and scrutiny:
    - Resolve the verifier provider from `.delivery.yml` `adapters.verifier` when present, otherwise use the v1 default from the spec, and run:
 
      ```text
-     loopcoder loopreview --repo . --pr-number <pr> --provider <verifier-provider>
+     loopcoder loopreview --repo . --pr-number <pr> --provider <verifier-provider> --pretty
      ```
 
      Add `--base-branch <base-branch>` when the run is not targeting the default base branch.
+     Use `LOOPCODER_PRETTY=1` instead of `--pretty` if that better fits the
+     conductor shell, but the Verifier pretty attestation block must be emitted
+     in emoji form on stderr for relay.
    - Read the structured `loopreview` verdict (`pass`, `fail`, or `needs-human`) plus its findings, evidence, and spec-conformance field. A malformed verdict, unreadable referenced design doc, or verifier infrastructure / permission failure is `needs-human`, never a silent pass.
    - Follow the "Verification gate" subsection below, which folds the independent Verifier verdict together with hosted checks from `gh pr checks <pr>` and deterministic local gates from `loopcoder verify-local --repo . --pr-number <pr>`.
    - Use `gh pr diff <pr> --name-only` and, when needed, `gh pr diff <pr>` as supporting evidence for changed files and unrelated-change checks; the primary adversarial findings come from `loopreview`.
@@ -265,15 +272,14 @@ Bounds and scrutiny:
 
 7. Report progress and final status.
    - Report meaningful state changes in chat: issues published, workers dispatched, PRs opened, checks passed/failed, verifier verdicts, blocked items, and unblocked dependents.
-   - Every worker-dispatch progress report and final summary must include one
-     Worker attestation line per dispatched issue: issue number and PR, Worker
-     provider, model with `model_source`, reasoning depth / effort, permission,
-     duration, token usage as input / output / total, and `verified`. Render
-     any absent token field as `not reported`.
-   - Keep Worker and Verifier attestations separate. Continue reporting the
-     Verifier provider, model, effort, permission, duration, token usage, and
-     `verified` from `loopreview` output; do not sum Worker and Verifier
-     tokens.
+   - Every worker-dispatch progress report and final summary must relay the
+     pretty attestation block verbatim from the command's stderr, one block per
+     Worker and one block per Verifier. The relayed block is the source of truth
+     for the human form; it renders `unset` or omits absent fields according to
+     the pretty renderer.
+   - Keep Worker and Verifier pretty blocks separate. Do not merge them into
+     one synthetic record and do not sum Worker and Verifier tokens. Existing
+     fail-closed attestation behavior remains unchanged.
    - Continue until the DAG is drained or blocked.
    - Run the learning review from "Learnings (self-improvement)": collect
      worker-returned candidates, draft any proposed learning entries for human
@@ -283,8 +289,9 @@ Bounds and scrutiny:
      or a recurring failure class, offer the optional deeper pass from
      "Improvement review" and stop after its candidate report unless the human
      approves issue creation.
-   - End with a final summary listing issues, PRs, Worker attestation facts,
-     verifier status, check status, and any human decisions still needed.
+   - End with a final summary listing issues, PRs, relayed Worker and Verifier
+     pretty attestation blocks, verifier status, check status, and any human
+     decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
 ## Verification gate

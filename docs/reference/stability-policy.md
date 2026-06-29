@@ -3,6 +3,8 @@
 This living reference describes loopcoder's 0.x compatibility policy for
 project configuration, documented commands, and documented GitHub labels.
 
+Current stable release: `0.3.4`.
+
 ## 0.x Stability Promise
 
 Within the 0.x release line, patch releases preserve compatibility for:
