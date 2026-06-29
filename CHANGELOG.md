@@ -5,24 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.3] - 2026-06-28
+## [0.3.3] - 2026-06-29
 
 ### Added
 
 - `loopreview` now builds a bounded review packet per [`docs/specs/0194-reliable-loopreview-verifier.md`](docs/specs/0194-reliable-loopreview-verifier.md) and #202, including bounded changed-file, issue, merged-spec, and diff excerpts with visible truncation markers. If the packet is insufficient for a safe verdict, `loopreview` returns `needs-human` without invoking the provider.
 - `codex` and `claude` are verified `loopreview` verifier providers in the mechanism sense per #205: each can return a valid structured verdict plus Verifier attestation within the timeout.
+- A tag-triggered release workflow builds Windows, macOS, and Linux binaries for amd64 and arm64 and publishes `SHA256SUMS` per [`docs/specs/0212-release-distribution-and-upgrade.md`](docs/specs/0212-release-distribution-and-upgrade.md).
+- No-Go install scripts, `scripts/install.sh` and `scripts/install.ps1`, install from GitHub Releases with checksum verification per spec 0212.
+- `loopcoder version` plus root `--version` and `-v` print the selected binary version, commit, build date, Go version, and platform.
+- `dispatch` now surfaces Worker attestation with the stable header, canonical JSON, and final result JSON `attestation` object per [`docs/specs/0218-surface-worker-attestation.md`](docs/specs/0218-surface-worker-attestation.md).
+- Human-readable attestation pretty rendering is available per [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md).
+- Optional `.delivery.yml` `verifier.model` and `verifier.reasoning_effort` settings configure the verifier role per [`docs/specs/0215-per-role-model-override.md`](docs/specs/0215-per-role-model-override.md).
+- Worker token usage captures input and output splits when the provider exposes them per spec 0218.
+- [`docs/reference/stability-policy.md`](docs/reference/stability-policy.md) documents the 0.x compatibility policy for `.delivery.yml`, CLI flags, and labels.
 
 ### Changed
 
 - Verifier provider invocation is read-only and headless-hardened per #204: `claude` uses `--print` with a `Read Grep Glob` allowlist and no plan mode, and `codex` uses `exec -s read-only`.
+- `.delivery.yml adapters.verifier` now uses the real `claude` provider instead of the invalid `opus` value per spec 0215.
 
 ### Fixed
 
 - Follow-up loopreview reliability polish from #208 and #209, including clearer documentation wording and visible omitted-file names when diff packet content is truncated.
+- `loopreview` no longer forces `needs-human` for a brand-new doc-first spec PR whose referenced spec is naturally absent from the base branch; code PRs with a missing merged spec still return `needs-human` per [`docs/specs/0220-loopreview-new-spec-not-a-blocker.md`](docs/specs/0220-loopreview-new-spec-not-a-blocker.md).
 
 ### Notes
 
 - The verified-provider proof is about the verifier mechanism, not deterministic model judgment. The LLM `pass` or `fail` verdict itself remains non-deterministic across otherwise valid runs.
+- This release line also accepted design specs 0212, 0214, 0215, 0218, and 0220.
 
 ## [0.3.2] - 2026-06-28
 
