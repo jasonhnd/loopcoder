@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -183,6 +184,67 @@ func TestAttestHelpDocumentsFlags(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestDoctorHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"doctor", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder doctor", "--repo"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestDoctorRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"-Repo", repo,
+	}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "0.3.1",
+			Commit:  "abc123",
+			Date:    "2026-06-29T00:00:00Z",
+		},
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if opts.BuildInfo.Version != "0.3.1" || opts.BuildInfo.Commit != "abc123" || opts.BuildInfo.Date != "2026-06-29T00:00:00Z" {
+				t.Fatalf("BuildInfo = %#v", opts.BuildInfo)
+			}
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:    "git",
+				Status:  doctor.StatusOK,
+				Message: "found",
+			}}}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if stdout.String() != "[ok] git: found\n" {
+		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
 
