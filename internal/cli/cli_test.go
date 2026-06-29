@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -245,6 +246,72 @@ func TestDoctorRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if stdout.String() != "[ok] git: found\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestInitHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"init", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder init", "--force", "--worker-model", "--worker-effort", "--verifier-model", "--verifier-effort"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"init",
+		"-Force",
+		"-WorkerModel", "gpt-5",
+		"-WorkerEffort", "high",
+		"-VerifierModel", "claude-sonnet",
+		"-VerifierEffort", "max",
+	}, &stdout, &stderr, Deps{
+		Init: func(_ context.Context, opts scaffold.Options) (scaffold.Result, error) {
+			called = true
+			if strings.TrimSpace(opts.RepoPath) == "" {
+				t.Fatal("RepoPath is empty")
+			}
+			if !opts.Force || opts.WorkerModel != "gpt-5" || opts.WorkerEffort != "high" || opts.VerifierModel != "claude-sonnet" || opts.VerifierEffort != "max" {
+				t.Fatalf("init opts = %#v", opts)
+			}
+			return scaffold.Result{
+				Files: []scaffold.FileResult{
+					{Path: ".delivery.yml", Status: scaffold.FileOverwritten},
+					{Path: "ROADMAP.md", Status: scaffold.FileExists},
+				},
+				Labels: []scaffold.LabelResult{
+					{Name: "delivery:unit", Status: scaffold.LabelCreated},
+				},
+				Warnings: []string{"gh label setup skipped: gh not found"},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Init dependency was not called")
+	}
+	for _, want := range []string{"loopcoder init complete", "overwritten .delivery.yml", "exists ROADMAP.md", "created label delivery:unit"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), "[loopcoder] warning: gh label setup skipped") {
+		t.Fatalf("stderr missing warning:\n%s", stderr.String())
 	}
 }
 

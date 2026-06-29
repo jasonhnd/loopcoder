@@ -23,6 +23,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -53,6 +54,7 @@ type Deps struct {
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
 	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
+	Init            func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
 	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
@@ -63,6 +65,7 @@ var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
+	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -114,6 +117,9 @@ func DefaultDeps() Deps {
 		},
 		Doctor: func(ctx context.Context, opts doctor.Options) doctor.Report {
 			return doctor.Run(ctx, opts, doctor.DefaultDeps())
+		},
+		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
+			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
 		StatePush: func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
@@ -169,6 +175,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "doctor" {
 		return runDoctor(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "init" {
+		return runInit(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
@@ -265,6 +274,13 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
+	}
+	if command.Name == "init" {
+		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
+		fmt.Fprintln(w, "  --worker-model string       optional first-run worker model to persist")
+		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
+		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
+		fmt.Fprintln(w, "  --verifier-effort string    optional first-run verifier reasoning effort to persist")
 	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -447,6 +463,100 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return report.ExitCode()
+}
+
+func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Init == nil {
+		deps.Init = DefaultDeps().Init
+	}
+
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts scaffold.Options
+	var forceAlias bool
+	var workerModelAlias string
+	var workerEffortAlias string
+	var verifierModelAlias string
+	var verifierEffortAlias string
+
+	fs.BoolVar(&opts.Force, "force", false, "overwrite existing files")
+	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing files")
+	fs.StringVar(&opts.WorkerModel, "worker-model", "", "worker model")
+	fs.StringVar(&workerModelAlias, "WorkerModel", "", "worker model")
+	fs.StringVar(&opts.WorkerEffort, "worker-effort", "", "worker reasoning effort")
+	fs.StringVar(&workerEffortAlias, "WorkerEffort", "", "worker reasoning effort")
+	fs.StringVar(&opts.VerifierModel, "verifier-model", "", "verifier model")
+	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
+	fs.StringVar(&opts.VerifierEffort, "verifier-effort", "", "verifier reasoning effort")
+	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier reasoning effort")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if forceAlias {
+		opts.Force = true
+	}
+	if workerModelAlias != "" {
+		opts.WorkerModel = workerModelAlias
+	}
+	if workerEffortAlias != "" {
+		opts.WorkerEffort = workerEffortAlias
+	}
+	if verifierModelAlias != "" {
+		opts.VerifierModel = verifierModelAlias
+	}
+	if verifierEffortAlias != "" {
+		opts.VerifierEffort = verifierEffortAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "init: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(".")
+	if err != nil {
+		fmt.Fprintf(stderr, "init: %v\n", err)
+		return 2
+	}
+	opts.RepoPath = resolvedRepo
+
+	result, err := deps.Init(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "init: %v\n", err)
+		return 1
+	}
+	renderInitResult(stdout, stderr, result)
+	return 0
+}
+
+func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
+	fmt.Fprintln(stdout, "loopcoder init complete")
+	for _, file := range result.Files {
+		switch file.Status {
+		case scaffold.FileCreated:
+			fmt.Fprintf(stdout, "  created %s\n", file.Path)
+		case scaffold.FileOverwritten:
+			fmt.Fprintf(stdout, "  overwritten %s\n", file.Path)
+		case scaffold.FileExists:
+			fmt.Fprintf(stdout, "  exists %s\n", file.Path)
+		default:
+			fmt.Fprintf(stdout, "  %s %s\n", file.Status, file.Path)
+		}
+	}
+	for _, label := range result.Labels {
+		switch label.Status {
+		case scaffold.LabelCreated:
+			fmt.Fprintf(stdout, "  created label %s\n", label.Name)
+		case scaffold.LabelExists:
+			fmt.Fprintf(stdout, "  exists label %s\n", label.Name)
+		default:
+			fmt.Fprintf(stdout, "  %s label %s\n", label.Status, label.Name)
+		}
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
 }
 
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
