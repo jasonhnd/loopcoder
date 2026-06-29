@@ -444,6 +444,8 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		RepoPath:   repo,
 		PRNumber:   152,
 		Provider:   "claude",
+		Model:      "claude-opus",
+		Effort:     "max",
 		BaseBranch: "main",
 	}, Deps{
 		Git: fakeGit,
@@ -500,6 +502,9 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 	if inv.WorktreePath == "" || inv.LogPath == "" {
 		t.Fatalf("agent invocation missing paths: %#v", inv)
+	}
+	if inv.Model != "claude-opus" || inv.Effort != "max" {
+		t.Fatalf("agent invocation model/effort = %#v", inv)
 	}
 	for _, want := range []string{
 		"independent loopcoder Verifier",

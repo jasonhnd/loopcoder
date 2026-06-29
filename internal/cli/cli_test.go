@@ -146,10 +146,31 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--timeout"} {
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"dispatch", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+	if strings.Contains(help, "Codex model") || strings.Contains(help, "Codex reasoning") {
+		t.Fatalf("dispatch help still describes model/effort as Codex-specific:\n%s", help)
 	}
 }
 
@@ -484,12 +505,17 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"-PrNumber", "152",
 		"-Provider", "claude",
 		"-BaseBranch", "trunk",
+		"-Model", "claude-opus",
+		"-Effort", "max",
 		"-Timeout", "15s",
 	}, &stdout, &stderr, Deps{
 		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			called = true
 			if opts.RepoPath != repo || opts.PRNumber != 152 || opts.Provider != "claude" || opts.BaseBranch != "trunk" || opts.Timeout != 15*time.Second {
 				t.Fatalf("loopreview opts = %#v", opts)
+			}
+			if opts.Model != "claude-opus" || opts.Effort != "max" {
+				t.Fatalf("loopreview opts model/effort = %#v", opts)
 			}
 			if opts.Stderr == nil {
 				t.Fatal("loopreview opts Stderr is nil")
@@ -596,6 +622,91 @@ func TestLoopreviewWarnsWhenVerifierMatchesConfiguredWorker(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `adapters.verifier "codex" matches adapters.worker`) {
 		t.Fatalf("stderr missing advisory warning: %q", stderr.String())
+	}
+}
+
+func TestLoopreviewUsesVerifierConfigModelEffortWhenFlagsAbsent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+adapters:
+  worker: codex
+verifier:
+  model: config-verifier-model
+  reasoning_effort: config-verifier-effort
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "claude",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			if opts.Model != "config-verifier-model" || opts.Effort != "config-verifier-effort" {
+				t.Fatalf("loopreview opts model/effort = %#v", opts)
+			}
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Findings:        []loopreview.Finding{},
+					Evidence:        "review passed",
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+}
+
+func TestLoopreviewFlagsOverrideVerifierConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+adapters:
+  worker: codex
+verifier:
+  model: config-verifier-model
+  reasoning_effort: config-verifier-effort
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "claude",
+		"--model", "flag-verifier-model",
+		"--effort", "flag-verifier-effort",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			called = true
+			if opts.Model != "flag-verifier-model" || opts.Effort != "flag-verifier-effort" {
+				t.Fatalf("loopreview opts model/effort = %#v", opts)
+			}
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Findings:        []loopreview.Finding{},
+					Evidence:        "review passed",
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Loopreview dependency was not called")
 	}
 }
 
@@ -928,6 +1039,102 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 		if _, ok := fields[key]; ok {
 			t.Fatalf("dispatch JSON unexpectedly contains %q: %s", key, lines[2])
 		}
+	}
+}
+
+func TestDispatchUsesWorkerConfigModelEffortWhenFlagsAbsent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+worker:
+  model: config-worker-model
+  reasoning_effort: config-worker-effort
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+		"--provider", "claude",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.Provider != "claude" {
+				t.Fatalf("provider = %q, want claude", opts.Provider)
+			}
+			if opts.Model != "config-worker-model" || opts.Effort != "config-worker-effort" {
+				t.Fatalf("dispatch opts model/effort = %#v", opts)
+			}
+			record := validDispatchAttestation()
+			record.Provider = opts.Provider
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-101",
+				RunID:       "run-test",
+				PR:          "https://github.com/owner/repo/pull/101",
+				Summary:     "Implemented dispatch.",
+				AttemptPath: "/repo/.loopcoder/runs/run-test/workers/job-101-1.attempt.json",
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    12,
+				Attestation: &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+}
+
+func TestDispatchFlagsOverrideWorkerConfigForSelectedProvider(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+worker:
+  model: config-worker-model
+  reasoning_effort: config-worker-effort
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+		"--provider", "claude",
+		"--model", "flag-worker-model",
+		"--effort", "flag-worker-effort",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.Provider != "claude" {
+				t.Fatalf("provider = %q, want claude", opts.Provider)
+			}
+			if opts.Model != "flag-worker-model" || opts.Effort != "flag-worker-effort" {
+				t.Fatalf("dispatch opts model/effort = %#v", opts)
+			}
+			record := validDispatchAttestation()
+			record.Provider = opts.Provider
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-101",
+				RunID:       "run-test",
+				PR:          "https://github.com/owner/repo/pull/101",
+				Summary:     "Implemented dispatch.",
+				AttemptPath: "/repo/.loopcoder/runs/run-test/workers/job-101-1.attempt.json",
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    12,
+				Attestation: &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
 }
 

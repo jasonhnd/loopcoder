@@ -251,8 +251,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --attempt int               attempt number (default 1)")
 		fmt.Fprintln(w, "  --recovery-context string   prior recovery context to append to the prompt")
 		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
-		fmt.Fprintln(w, "  --model string              optional Codex model pass-through")
-		fmt.Fprintln(w, "  --effort string             optional Codex reasoning effort pass-through")
+		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
+		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
 	}
 	if command.Name == "attest" {
@@ -304,14 +304,16 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --max-attempts int              retry limit (default 3)")
 		fmt.Fprintln(w, "  --backoff-seconds string        comma-separated retry backoff schedule (default \"10,30,120\")")
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
-		fmt.Fprintln(w, "  --model string                  optional Codex model pass-through")
-		fmt.Fprintln(w, "  --effort string                 optional Codex reasoning effort pass-through")
+		fmt.Fprintln(w, "  --model string                  optional worker model override for this run")
+		fmt.Fprintln(w, "  --effort string                 optional worker reasoning effort override for this run")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --pr-number int        pull request number to review (required)")
 		fmt.Fprintln(w, "  --provider string      verifier provider (required)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
+		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
+		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
 	}
 	if command.Name == "verify-local" {
@@ -328,8 +330,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --from-ready-set           read ready-set JSON from stdin")
 		fmt.Fprintln(w, "  --ready-set-path string    read ready-set JSON from a file")
 		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
-		fmt.Fprintln(w, "  --model string             optional Codex model pass-through")
-		fmt.Fprintln(w, "  --effort string            optional Codex reasoning effort pass-through")
+		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
+		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
 		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
@@ -1085,6 +1087,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
+	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -1136,6 +1140,27 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintln(stderr, "dispatch: --issue-title is required")
 		return 2
 	}
+
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+		return 2
+	}
+	opts.RepoPath = resolvedRepo
+
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+		return 1
+	}
+	opts.Model, opts.Effort = applyRoleModelEffort(
+		opts.Model,
+		opts.Effort,
+		modelFlagSet,
+		effortFlagSet,
+		cfg.Worker.Model,
+		cfg.Worker.ReasoningEffort,
+	)
 
 	result, err := deps.Dispatch(context.Background(), opts)
 	if err != nil {
@@ -1385,6 +1410,28 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 	return wasSet
 }
 
+func loadDeliveryConfig(repoPath string) (config.Config, error) {
+	cfg := config.Default()
+	loaded, err := config.Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err == nil {
+		return loaded, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return cfg, nil
+	}
+	return cfg, err
+}
+
+func applyRoleModelEffort(model, effort string, modelFlagSet, effortFlagSet bool, roleModel, roleEffort string) (string, string) {
+	if !modelFlagSet && strings.TrimSpace(model) == "" {
+		model = strings.TrimSpace(roleModel)
+	}
+	if !effortFlagSet && strings.TrimSpace(effort) == "" {
+		effort = strings.TrimSpace(roleEffort)
+	}
+	return model, effort
+}
+
 func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	defaults := DefaultDeps()
 	if deps.NewGitHubReader == nil {
@@ -1454,6 +1501,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
+	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if repoPath == "" {
 		repoPath = repoAlias
 	}
@@ -1544,14 +1593,19 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
-	if err == nil {
-		cfg = loaded
-	} else if !errors.Is(err, os.ErrNotExist) {
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
 		return 1
 	}
+	model, effort = applyRoleModelEffort(
+		model,
+		effort,
+		modelFlagSet,
+		effortFlagSet,
+		cfg.Worker.Model,
+		cfg.Worker.ReasoningEffort,
+	)
 
 	waveReport, err := orchestration.DispatchWave(context.Background(), orchestration.DispatchWaveOptions{
 		Reader:          deps.NewGitHubReader(resolvedRepo),
@@ -1638,6 +1692,8 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
+	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -1704,14 +1760,19 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.RepoPath = resolvedRepo
 
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
-	if err == nil {
-		cfg = loaded
-	} else if !errors.Is(err, os.ErrNotExist) {
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
 		fmt.Fprintf(stderr, "recover: %v\n", err)
 		return 1
 	}
+	opts.Model, opts.Effort = applyRoleModelEffort(
+		opts.Model,
+		opts.Effort,
+		modelFlagSet,
+		effortFlagSet,
+		cfg.Worker.Model,
+		cfg.Worker.ReasoningEffort,
+	)
 	opts.Budget = cfg.Guardrails.Budget
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
 
@@ -1744,6 +1805,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var prNumberAlias int
 	var providerAlias string
+	var modelAlias string
+	var effortAlias string
 	var baseBranchAlias string
 	var timeoutAlias time.Duration
 
@@ -1753,6 +1816,10 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&prNumberAlias, "PrNumber", 0, "pull request number")
 	fs.StringVar(&opts.Provider, "provider", "", "provider")
 	fs.StringVar(&providerAlias, "Provider", "", "provider")
+	fs.StringVar(&opts.Model, "model", "", "model")
+	fs.StringVar(&modelAlias, "Model", "", "model")
+	fs.StringVar(&opts.Effort, "effort", "", "effort")
+	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.DurationVar(&opts.Timeout, "timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
@@ -1761,6 +1828,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
+	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -1769,6 +1838,12 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if providerAlias != "" {
 		opts.Provider = providerAlias
+	}
+	if modelAlias != "" {
+		opts.Model = modelAlias
+	}
+	if effortAlias != "" {
+		opts.Effort = effortAlias
 	}
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias
@@ -1802,14 +1877,19 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.RepoPath = resolvedRepo
 	opts.Stderr = stderr
 
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
-	if err == nil {
-		cfg = loaded
-	} else if !errors.Is(err, os.ErrNotExist) {
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return 1
 	}
+	opts.Model, opts.Effort = applyRoleModelEffort(
+		opts.Model,
+		opts.Effort,
+		modelFlagSet,
+		effortFlagSet,
+		cfg.Verifier.Model,
+		cfg.Verifier.ReasoningEffort,
+	)
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   cfg.Adapters.Worker,
 		Verifier: opts.Provider,
