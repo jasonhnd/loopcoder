@@ -1,7 +1,7 @@
 ---
 id: 220
 title: loopreview Must Not Flag a Brand-New Doc-First Spec as needs-human
-status: draft
+status: accepted
 date: 2026-06-29
 issue: 220
 pr: null
