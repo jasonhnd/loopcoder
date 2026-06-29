@@ -126,7 +126,7 @@ func TestVersionPathsRejectInvalidVersionSegments(t *testing.T) {
 	}
 }
 
-func TestInstalledVersionsListsDirectoriesSorted(t *testing.T) {
+func TestInstalledVersionsListsCleanDirectoriesSorted(t *testing.T) {
 	layout := New(filepath.Join("home", ".loopcoder"))
 	var readPath string
 
@@ -149,9 +149,73 @@ func TestInstalledVersionsListsDirectoriesSorted(t *testing.T) {
 	if readPath != layout.VersionsDir() {
 		t.Fatalf("ReadDir path = %q, want %q", readPath, layout.VersionsDir())
 	}
-	want := []string{"0.3.0", "0.3.0-rc.1", "0.3.1"}
+	want := []string{"0.3.0-rc.1", "0.3.0", "0.3.1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("InstalledVersions() = %v, want %v", got, want)
+	}
+}
+
+func TestInstalledVersionsOrdersSemverAware(t *testing.T) {
+	layout := New(filepath.Join("home", ".loopcoder"))
+	tests := []struct {
+		name    string
+		entries []fs.DirEntry
+		want    []string
+	}{
+		{
+			name: "multi-digit patch",
+			entries: []fs.DirEntry{
+				fakeDirEntry{name: "0.3.10", dir: true},
+				fakeDirEntry{name: "0.3.2", dir: true},
+				fakeDirEntry{name: "0.3.9", dir: true},
+			},
+			want: []string{"0.3.2", "0.3.9", "0.3.10"},
+		},
+		{
+			name: "multi-digit minor",
+			entries: []fs.DirEntry{
+				fakeDirEntry{name: "0.10.0", dir: true},
+				fakeDirEntry{name: "0.9.12", dir: true},
+				fakeDirEntry{name: "0.3.0", dir: true},
+				fakeDirEntry{name: "0.9.5", dir: true},
+			},
+			want: []string{"0.3.0", "0.9.5", "0.9.12", "0.10.0"},
+		},
+		{
+			name: "leading v prefix",
+			entries: []fs.DirEntry{
+				fakeDirEntry{name: "v0.3.10", dir: true},
+				fakeDirEntry{name: "0.3.9", dir: true},
+				fakeDirEntry{name: "v0.3.2", dir: true},
+			},
+			want: []string{"v0.3.2", "0.3.9", "v0.3.10"},
+		},
+		{
+			name: "malformed entries sort before semver",
+			entries: []fs.DirEntry{
+				fakeDirEntry{name: "0.3.10", dir: true},
+				fakeDirEntry{name: "not-semver", dir: true},
+				fakeDirEntry{name: "0.3.2", dir: true},
+				fakeDirEntry{name: "0.3.0-rc.1", dir: true},
+			},
+			want: []string{"0.3.0-rc.1", "not-semver", "0.3.2", "0.3.10"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := layout.InstalledVersions(Deps{
+				ReadDir: func(string) ([]fs.DirEntry, error) {
+					return tt.entries, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("InstalledVersions returned error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("InstalledVersions() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
