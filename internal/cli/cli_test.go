@@ -408,6 +408,50 @@ func TestUpgradeRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 }
 
+func TestUpgradeRendersAlreadyLatest(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"upgrade"}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "0.3.3",
+			Commit:  "abc123",
+			Date:    "2026-06-29T00:00:00Z",
+		},
+		Upgrade: func(_ context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			if opts.CurrentVersion != "0.3.3" {
+				t.Fatalf("CurrentVersion = %q, want 0.3.3", opts.CurrentVersion)
+			}
+			return upgrade.Result{
+				CurrentPath:    "/home/.loopcoder/bin/loopcoder",
+				CurrentVersion: opts.CurrentVersion,
+				TargetVersion:  "v0.3.3",
+				Platform:       "linux/amd64",
+				AlreadyLatest:  true,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{
+		"Current selected binary: path=/home/.loopcoder/bin/loopcoder version=0.3.3",
+		"Resolved target version: v0.3.3",
+		"Already latest; no download needed.",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	for _, unwanted := range []string{"Installed versioned binary", "Stable selected binary", "After:"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("stdout included install line %q:\n%s", unwanted, stdout.String())
+		}
+	}
+}
+
 func TestAttestSuccessPaths(t *testing.T) {
 	now := time.Date(2026, 6, 28, 1, 2, 3, 0, time.UTC)
 	tests := []struct {

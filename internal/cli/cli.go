@@ -636,6 +636,10 @@ func renderUpgradeCurrent(w io.Writer, result upgrade.Result) {
 
 func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
 	fmt.Fprintf(w, "Resolved target version: %s\n", result.TargetVersion)
+	if result.AlreadyLatest {
+		fmt.Fprintln(w, "Already latest; no download needed.")
+		return
+	}
 	fmt.Fprintf(w, "Platform asset: %s (%s)\n", result.AssetName, result.Platform)
 	fmt.Fprintf(w, "Installed versioned binary: %s\n", result.VersionBinaryPath)
 	if result.Deferred {
