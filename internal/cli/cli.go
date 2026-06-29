@@ -47,6 +47,7 @@ type Deps struct {
 	NewGitHubReader func(repoPath string) orchestration.GitHubReader
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
+	IsTerminal      func(w io.Writer) bool
 	Stdin           io.Reader
 	BuildInfo       BuildInfo
 	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
@@ -107,6 +108,7 @@ func DefaultDeps() Deps {
 		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
+		IsTerminal:   isTerminalWriter,
 		Stdin:        os.Stdin,
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
@@ -275,6 +277,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+		fmt.Fprintln(w, "  --pretty                    render human-readable attestation on stderr")
 	}
 	if command.Name == "attest" {
 		fmt.Fprintln(w, "  --role string            attestation role (default \"conductor\")")
@@ -292,6 +295,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --total-tokens int       total token count")
 		fmt.Fprintln(w, "  --model-source string    ignored; forced to self-reported")
 		fmt.Fprintln(w, "  --verified               ignored; forced to false")
+		fmt.Fprintln(w, "  --pretty                 render human-readable attestation instead of durable output")
 	}
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
@@ -339,6 +343,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --pretty               render human-readable attestation on stderr")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -1138,6 +1143,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effortAlias string
 	var keepWorktreeAlias bool
+	var pretty bool
+	var prettyAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1165,6 +1172,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1208,6 +1217,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Effort = effortAlias
 	}
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	pretty = pretty || prettyAlias
 	opts.Stderr = stderr
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
@@ -1252,6 +1262,12 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := renderDispatch(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
+	}
+	if shouldRenderPretty(stderr, pretty, deps) {
+		if err := renderPrettyAttestation(stderr, *result.Attestation, prettyModeForTarget(stderr, deps)); err != nil {
+			fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
+			return 1
+		}
 	}
 	return 0
 }
@@ -1321,6 +1337,8 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var ignoredModelSourceAlias string
 	var ignoredVerified bool
 	var ignoredVerifiedAlias bool
+	var pretty bool
+	var prettyAlias bool
 
 	fs.StringVar(&role, "role", role, "role")
 	fs.StringVar(&roleAlias, "Role", "", "role")
@@ -1352,6 +1370,8 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&ignoredModelSourceAlias, "ModelSource", "", "model source")
 	fs.BoolVar(&ignoredVerified, "verified", false, "verified")
 	fs.BoolVar(&ignoredVerifiedAlias, "Verified", false, "verified")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1383,6 +1403,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if endedAtAlias != "" {
 		endedAt = endedAtAlias
 	}
+	pretty = pretty || prettyAlias
 
 	durationSet := flagWasSet(fs, "duration-ms")
 	if flagWasSet(fs, "DurationMs") {
@@ -1470,6 +1491,13 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
+	}
+	if pretty {
+		if err := renderPrettyAttestation(stdout, record, prettyModeForTarget(stdout, deps)); err != nil {
+			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if _, err := stdout.Write(append(canonical, '\n')); err != nil {
 		fmt.Fprintf(stderr, "attest: write output: %v\n", err)
@@ -1891,6 +1919,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var effortAlias string
 	var baseBranchAlias string
 	var timeoutAlias time.Duration
+	var pretty bool
+	var prettyAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1906,6 +1936,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.DurationVar(&opts.Timeout, "timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "verifier timeout")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1933,6 +1965,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if timeoutAlias != 0 {
 		opts.Timeout = timeoutAlias
 	}
+	pretty = pretty || prettyAlias
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "loopreview: --repo is required")
@@ -1987,6 +2020,12 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := loopreview.Render(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
 		return 1
+	}
+	if result.Verdict.Attestation != nil && shouldRenderPretty(stderr, pretty, deps) {
+		if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, prettyModeForTarget(stderr, deps)); err != nil {
+			fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
+			return 1
+		}
 	}
 	return result.ExitCode
 }
