@@ -127,6 +127,38 @@ func TestBuildPromptUsesBoundedReviewPacketContract(t *testing.T) {
 	}
 }
 
+func TestBuildPromptMarksDocFirstSpecAbsenceExpected(t *testing.T) {
+	specPath := "docs/specs/0220-loopreview-new-spec-not-a-blocker.md"
+	inputs := loopreviewPromptTestInputs()
+	inputs.Issue.Body = "Add the design in " + specPath + "."
+	inputs.ChangedFiles = []string{specPath}
+	inputs.Diff = loopreviewNewFileDiff(specPath, "+# Spec\n+\n+Acceptance criteria.\n")
+	inputs.Spec = classifySpecAbsence(specInput{
+		Path:      specPath,
+		Available: false,
+		Reason:    "path does not exist in origin/main",
+	}, "main", inputs.ChangedFiles, inputs.Diff)
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{})
+	if !packet.SpecExpectedAbsent {
+		t.Fatal("packet did not mark expected spec absence")
+	}
+	for _, want := range []string{
+		"Documentation-only: yes",
+		"Referenced spec changed in PR: yes",
+		"Referenced spec added in PR: yes",
+		"Status: expected absent from origin/main",
+		"Classification: expected/non-blocking",
+		"expected: this PR introduces the spec, so it is absent from origin/main",
+		"do not return \"needs-human\" solely for that expected absence",
+		"Spec conformance: not-applicable",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildReviewPacketTruncatesChangedFilesBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.ChangedFiles = []string{
@@ -485,6 +517,78 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 }
 
+func TestRunDocFirstNewSpecCanPassWithoutMergedSpec(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	specPath := "docs/specs/0220-loopreview-new-spec-not-a-blocker.md"
+	fakeGit := &loopreviewFakeGit{
+		showErr: errors.New("path does not exist in origin/main"),
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      228,
+			Title:       "Add loopreview new-spec classification fix spec",
+			HeadRefName: "loop/issue-228-doc",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 228,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 228,
+			Title:  "Add design spec",
+			Body:   "Add the doc-first design in " + specPath + ".",
+		},
+		diff:  loopreviewNewFileDiff(specPath, "+# Spec\n+\n+## Acceptance Criteria\n+\n+- Define the behavior.\n"),
+		files: []string{specPath},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"documentation-only PR introduces the referenced spec; base absence is expected and non-blocking","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   228,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want pass exit 0", result)
+	}
+	if result.Verdict.SpecConformance != SpecConformanceNotApplicable {
+		t.Fatalf("SpecConformance = %q, want not-applicable", result.Verdict.SpecConformance)
+	}
+	if len(result.Verdict.Findings) != 0 {
+		t.Fatalf("findings = %#v, want none", result.Verdict.Findings)
+	}
+	for _, want := range []string{
+		"Documentation-only: yes",
+		"Classification: expected/non-blocking",
+		"expected: this PR introduces the spec, so it is absent from origin/main",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+}
+
 func TestRunVerifierAttestation(t *testing.T) {
 	validSummary := `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`
 	tests := []struct {
@@ -600,7 +704,7 @@ func TestRunVerifierNonZeroExitReturnsNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestRunUnreadableSpecForcesNeedsHuman(t *testing.T) {
+func TestRunCodePRMissingMergedSpecStillNeedsHuman(t *testing.T) {
 	result := runWithAgentSummary(t, `{"verdict":"pass","findings":[],"evidence":"looks good","spec_conformance":"pass"}`, errors.New("missing spec"))
 	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
 		t.Fatalf("result = %#v, want needs-human exit 2", result)
@@ -719,6 +823,16 @@ func loopreviewDiffPatch(path, body string) string {
 		"--- a/" + path + "\n" +
 		"+++ b/" + path + "\n" +
 		"@@ -1 +1 @@\n" +
+		body
+}
+
+func loopreviewNewFileDiff(path, body string) string {
+	return "diff --git a/" + path + " b/" + path + "\n" +
+		"new file mode 100644\n" +
+		"index 0000000..1111111\n" +
+		"--- /dev/null\n" +
+		"+++ b/" + path + "\n" +
+		"@@ -0,0 +1 @@\n" +
 		body
 }
 
