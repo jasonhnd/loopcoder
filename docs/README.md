@@ -17,6 +17,7 @@ Every document is exactly one of these types:
 - [`BACKLOG.md`](BACKLOG.md): backlog and deferred work.
 - [`learnings.md`](learnings.md): append-only operational learnings.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
+- [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
 - [`reference/usage.md`](reference/usage.md): setup and end-to-end usage.
 - [`specs/`](specs/): accepted specs and historical design records.
