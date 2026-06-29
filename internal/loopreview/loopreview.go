@@ -45,6 +45,8 @@ type Options struct {
 	RepoPath   string
 	PRNumber   int
 	Provider   string
+	Model      string
+	Effort     string
 	BaseBranch string
 	Timeout    time.Duration
 	Stderr     io.Writer
@@ -207,6 +209,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	agentResult, agentErr := runner.Run(agentCtx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
+		Model:        opts.Model,
+		Effort:       opts.Effort,
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,

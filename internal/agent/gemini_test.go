@@ -100,6 +100,18 @@ func TestBuildGeminiArgs(t *testing.T) {
 	}
 }
 
+func TestGeminiEffortAdvisory(t *testing.T) {
+	got := geminiEffortAdvisory(" high ")
+	for _, want := range []string{"advisory", "gemini ignores effort \"high\"", "no reasoning-effort knob"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("advisory missing %q: %q", want, got)
+		}
+	}
+	if empty := geminiEffortAdvisory(" "); empty != "" {
+		t.Fatalf("empty effort advisory = %q, want empty", empty)
+	}
+}
+
 func TestGeminiReadOnlySettingsDisableTools(t *testing.T) {
 	if !strings.Contains(geminiReadOnlySettings, `"tools":{"core":[]}`) {
 		t.Fatalf("geminiReadOnlySettings does not disable tools:\n%s", geminiReadOnlySettings)

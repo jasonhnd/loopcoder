@@ -51,8 +51,8 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	defer logFile.Close()
 
-	if strings.TrimSpace(inv.Effort) != "" {
-		fmt.Fprintf(logFile, "[loopcoder] advisory: gemini ignores effort %q; Gemini CLI has no reasoning-effort knob\n", inv.Effort)
+	if advisory := geminiEffortAdvisory(inv.Effort); advisory != "" {
+		fmt.Fprintln(logFile, advisory)
 	}
 	if inv.ReadOnly {
 		if err := os.WriteFile(geminiReadOnlySettingsPath(inv.LogPath), []byte(geminiReadOnlySettings), 0o644); err != nil {
@@ -85,6 +85,14 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		return resultWithTiming(-1, summary, metadata, startedAt, endedAt), runErr
 	}
 	return resultWithTiming(0, summary, metadata, startedAt, endedAt), nil
+}
+
+func geminiEffortAdvisory(effort string) string {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return ""
+	}
+	return fmt.Sprintf("[loopcoder] advisory: gemini ignores effort %q; Gemini CLI has no reasoning-effort knob", effort)
 }
 
 func parseGeminiSummary(stdout []byte) string {
