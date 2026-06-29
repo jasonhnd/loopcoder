@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -333,6 +334,75 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "[loopcoder] warning: gh label setup skipped") {
 		t.Fatalf("stderr missing warning:\n%s", stderr.String())
+	}
+}
+
+func TestUpgradeHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"upgrade", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder upgrade", "--version", "latest stable"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestUpgradeRunsWithInjectedDepsAndAliases(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"upgrade",
+		"-Version", "v0.3.3",
+	}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "v0.3.2",
+			Commit:  "abc123",
+			Date:    "2026-06-29T00:00:00Z",
+		},
+		Upgrade: func(_ context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			called = true
+			if opts.RequestedVersion != "v0.3.3" || opts.CurrentVersion != "v0.3.2" {
+				t.Fatalf("upgrade opts = %#v", opts)
+			}
+			return upgrade.Result{
+				CurrentPath:       "/old/loopcoder",
+				CurrentVersion:    opts.CurrentVersion,
+				TargetVersion:     "v0.3.3",
+				Platform:          "linux/amd64",
+				AssetName:         "loopcoder_0.3.3_linux_amd64.tar.gz",
+				VersionBinaryPath: "/home/.loopcoder/versions/v0.3.3/loopcoder",
+				StableBinaryPath:  "/home/.loopcoder/bin/loopcoder",
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Upgrade dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{
+		"Current selected binary: path=/old/loopcoder version=v0.3.2",
+		"Resolved target version: v0.3.3",
+		"Before: path=/old/loopcoder version=v0.3.2",
+		"After: path=/home/.loopcoder/bin/loopcoder version=v0.3.3",
+		"Run: loopcoder doctor",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 
