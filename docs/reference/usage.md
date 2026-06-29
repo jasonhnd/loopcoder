@@ -16,18 +16,58 @@ GitHub, git worktrees, worker providers, and PR review.
 - At least one supported provider CLI on `PATH`. `codex` is the default worker,
   `codex` and `claude` are verified worker and verifier providers, and
   `gemini` is experimental and unverified end-to-end.
-- Go, for installing the native `loopcoder` binary with `go install`.
 - A GitHub repository with a configured remote.
+- For the no-Go installer: `curl`, `tar`, and `sha256sum` or `shasum` on
+  Unix-like systems, or PowerShell on Windows. Go is optional for developer
+  installs and local source builds.
 
 ## Install
 
-Install the native helper binary:
+The supported consumer distribution is GitHub Releases. Tagged releases publish
+Windows, macOS, and Linux archives for `amd64` and `arm64`, plus `SHA256SUMS`.
+The install scripts select the matching release asset, verify it against
+`SHA256SUMS`, install under `~/.loopcoder/bin`, and update or print PATH
+instructions. The scripts do not require Go.
+
+On Unix-like systems:
+
+```text
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+```
+
+To pin a version:
+
+```text
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.3
+```
+
+On Windows PowerShell:
+
+```text
+irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+```
+
+To pin a version on Windows:
+
+```text
+$env:LOOPCODER_VERSION = "0.3.3"
+irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+```
+
+After installation, confirm the selected binary and environment:
+
+```text
+loopcoder --version
+loopcoder doctor
+```
+
+`go install` remains available for users who already have Go:
 
 ```text
 go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
 ```
 
-From a source checkout, you can also build it locally:
+From a source checkout, you can also build a development binary locally:
 
 ```text
 go build ./cmd/loopcoder
@@ -35,26 +75,8 @@ go build ./cmd/loopcoder
 
 Make sure the installed or built binary is on `PATH`, or set `LOOPCODER_BIN` to
 its full path. The conductor uses this binary as its only mechanical backend.
-
-loopcoder is also installed as a Claude Code skill. Invoke it from Claude Code
-with:
-
-```text
-/loopcoder <need>
-```
-
-You can also just state a delivery need in chat; the skill is meant to activate
-when the request should be planned, split into GitHub issues, dispatched to
-workers, reviewed, and reported in chat.
-
-For a global install, copy or symlink this repository to:
-
-```text
-~/.claude/skills/loopcoder/
-```
-
-On Windows, a directory junction is also fine. Install automation is on the
-roadmap.
+Release and installation rationale lives in
+[`0212-release-distribution-and-upgrade.md`](../specs/0212-release-distribution-and-upgrade.md).
 
 ## Backend Selection
 
@@ -67,12 +89,49 @@ The conductor resolves the `loopcoder` binary before running mechanical work:
 Use the resolved binary for dispatch, ready-set scheduling, resume, recovery,
 local verification, state, and lease operations.
 
+## Repository Initialization
+
+Run `loopcoder init` from a repository root to scaffold the local loopcoder
+starting point:
+
+```text
+loopcoder init
+```
+
+`init` creates `.delivery.yml` and `ROADMAP.md` when they are absent and
+ensures the default GitHub labels used by loopcoder are present. Existing
+`.delivery.yml` and `ROADMAP.md` files are left untouched by default; use
+`--force` to overwrite those two files with the current scaffold:
+
+```text
+loopcoder init --force
+```
+
+Label setup is best-effort through `gh label list` and `gh label create`. If
+`gh` is unavailable or label creation fails, `init` reports a warning on stderr
+instead of treating file scaffolding as failed.
+
+The model and reasoning-effort flags are first-run persistence helpers. Use
+them only when you want the generated `.delivery.yml` to pin project defaults:
+
+```text
+loopcoder init \
+  --worker-model gpt-5.5 \
+  --worker-effort high \
+  --verifier-model claude-haiku-4-5-20251001 \
+  --verifier-effort medium
+```
+
+Omitting these flags leaves model and effort absent so each provider inherits
+its own global configuration.
+
 ## Per-Repo Setup
 
-Optionally add a `.delivery.yml` file at the repository root. If it is absent,
-loopcoder uses the v1 defaults from the current design: GitHub issues, git
-worktrees, the Codex worker adapter, GitHub PRs/checks/merges, independent
-`loopreview` verification, human merge gating, and chat reporting.
+Use `loopcoder init` or manually add a `.delivery.yml` file at the repository
+root. If it is absent, loopcoder uses the v1 defaults from the current design:
+GitHub issues, git worktrees, the Codex worker adapter, GitHub
+PRs/checks/merges, independent `loopreview` verification, human merge gating,
+and chat reporting.
 
 The current example is:
 
@@ -82,50 +141,105 @@ adapters:
   work_items: github      # Work items are GitHub issues.
   workspace: git-worktree # Work happens in git worktrees.
   conductor: codex-cli    # Transparency only: the human session that conducts.
-  worker: codex           # Default worker provider; claude is also verified.
+  worker: codex           # Default worker provider.
   vcs: github             # GitHub hosts PRs and checks.
-  verifier: claude        # Verified loopreview provider; should differ from worker.
+  verifier: claude        # Should differ from worker; provider registry key.
   gate: human-merge       # Humans choose what merges.
 worker:
-  # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
+  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.
   # model:
-  # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
+  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
+# verifier:
+#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
+#   # model:
+#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
+#   # reasoning_effort:
 ci:
   checks: []
 report:
   channel: chat
 ```
 
+For compatibility signals such as `min_loopcoder_version`, see
+[`stability-policy.md`](stability-policy.md).
+
 ## End-To-End Use
 
-1. State a delivery need, for example:
+1. In a new repository, run `loopcoder init` once, or add `.delivery.yml`
+   manually.
+
+2. State a delivery need, for example:
 
    ```text
    /loopcoder add usage docs for the project
    ```
 
-2. loopcoder inspects the repo context and drafts GitHub issues plus a
+3. loopcoder inspects the repo context and drafts GitHub issues plus a
    dependency DAG. It shows the proposed issues, blocked-by relationships, and
    worker setting in chat.
 
-3. You approve the plan before anything is published.
+4. You approve the plan before anything is published.
 
-4. loopcoder creates the approved GitHub issues and dispatches ready issues to
+5. loopcoder creates the approved GitHub issues and dispatches ready issues to
    workers through `loopcoder dispatch` / `loopcoder dispatch-wave`. The binary
    creates a fresh git worktree, runs the selected provider, commits the
    resulting changes, pushes the branch, opens a PR, and cleans up.
 
-5. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
+6. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
    `gh pr checks`, and reports progress, failures, risks, and final status in
    chat. `codex` and `claude` have real verifier smoke proof; ambiguous,
    malformed, timed-out, or incomplete verifier output is still reported as
    `needs-human`.
 
-6. You name which PRs to merge. loopcoder merges only those named PRs by running
+7. You name which PRs to merge. loopcoder merges only those named PRs by running
    `gh pr merge`, following `.delivery.yml` merge settings when present.
+
+## Version And Doctor
+
+Use any of these forms to print one line of build information:
+
+```text
+loopcoder version
+loopcoder --version
+loopcoder -v
+```
+
+The output includes the loopcoder version, commit, build date, Go runtime, and
+platform. The exact version, commit, and date values depend on the build
+metadata available to the binary; a local source build without injected metadata
+prints `version=dev commit=unknown date=unknown`.
+
+```text
+loopcoder version=<version> commit=<commit> date=<build-date> go=<go-version> platform=<os>/<arch>
+```
+
+`loopcoder doctor` is a read-only preflight for the current repository:
+
+```text
+loopcoder doctor --repo .
+```
+
+It reports `[ok]`, `[warn]`, or `[fail]` checks for:
+
+- `git` on `PATH`;
+- `gh` on `PATH` and `gh auth status`;
+- `.delivery.yml` presence and parse validity;
+- configured worker and verifier provider CLI availability;
+- repository `origin` and detectable default branch;
+- selected loopcoder binary path, version, commit, date, and release or
+  development track;
+- `.delivery.yml` schema version and `min_loopcoder_version` compatibility when
+  declared;
+- conductor runtime responsibility, which remains user-provided by the active
+  host.
+
+Provider authentication is reported only where loopcoder has a stable cheap
+probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
+does not invent provider-authentication status when the provider has no stable
+probe.
 
 ## Model And Speed
 
@@ -170,6 +284,17 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 Use the native `loopcoder` commands as the helper interface:
 
 ```text
+loopcoder version
+loopcoder --version
+loopcoder -v
+
+loopcoder doctor --repo .
+
+loopcoder init
+loopcoder init --force
+loopcoder init --worker-model <model> --worker-effort <effort>
+loopcoder init --verifier-model <model> --verifier-effort <effort>
+
 loopcoder ready-set --repo . --base-branch main --format text
 
 loopcoder dispatch \
@@ -204,10 +329,10 @@ loopcoder attest \
   --duration-ms <milliseconds> \
   --total-tokens <tokens>
 
-loopcoder state push --repo .
+loopcoder state push --repo . --run-id <run-id>
 loopcoder state pull --repo .
-loopcoder lease acquire --repo .
-loopcoder lease release --repo .
+loopcoder lease acquire --repo . --run-id <run-id>
+loopcoder lease release --repo . --run-id <run-id>
 ```
 
 ## Verifier Provider Status
@@ -248,6 +373,28 @@ permission, action, exit code, timing, and token usage. Missing required
 identity or usage fails closed: `dispatch` opens no PR, and `loopreview`
 returns `needs-human` with the incomplete-attestation finding.
 
+For every successful `loopcoder dispatch`, stdout contains three
+newline-terminated records in this order:
+
+1. The stable Worker attestation header from `record.Header()`.
+2. The Worker attestation canonical JSON from `record.CanonicalJSON()`.
+3. The dispatch result JSON, whose `attestation` object is the same validated
+   Worker attestation record.
+
+Example:
+
+```text
+[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #218" exit=0 dur=42s tokens=2447/4461|6908 verified=true
+{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}
+{"ok":true,"issue":218,"branch":"loop/issue-218","run_id":"run-218","pr":"https://github.com/owner/repo/pull/999","summary":"Worker summary","attempt_path":".loopcoder/runs/run-218/workers/job-218-1.attempt.json","status":"succeeded","exit_code":0,"log_bytes":12345,"attestation":{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}}
+```
+
+The final non-empty stdout line remains the dispatch result JSON. Consumers
+that need only the summary should parse the last line; conductors that need
+Worker attestation can read either the header or the nested `attestation`
+object. The canonical JSON line is the exact machine rendering of that same
+record and is not wrapped in Markdown on stdout.
+
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
 followed by the one-line `[attestation] ...` header, forces `model_source` to
 `self-reported`, and forces `verified` to `false` even if flags try to set other
@@ -255,7 +402,8 @@ values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
 
-Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
+Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md)
+and [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md).
 
 ## Limits
 
