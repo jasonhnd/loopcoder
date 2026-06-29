@@ -117,10 +117,12 @@ type reviewInputs struct {
 }
 
 type specInput struct {
-	Path      string
-	Content   string
-	Available bool
-	Reason    string
+	Path           string
+	Content        string
+	Available      bool
+	Reason         string
+	ExpectedAbsent bool
+	ExpectedReason string
 }
 
 func DefaultDeps() Deps {
@@ -230,7 +232,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		verdict = needsHumanVerdict("error", "", fmt.Sprintf("structured verdict parse failed: %v", err))
 		return resultWithAttestation(verdict, record), nil
 	}
-	if !inputs.Spec.Available {
+	if inputs.Spec.ExpectedAbsent {
+		verdict.SpecConformance = SpecConformanceNotApplicable
+	} else if !inputs.Spec.Available {
 		verdict.Verdict = VerdictNeedsHuman
 		verdict.SpecConformance = SpecConformanceNotApplicable
 		verdict.Findings = append(verdict.Findings, Finding{
@@ -366,6 +370,11 @@ type reviewPacket struct {
 	SpecPath                 string
 	SpecAvailable            bool
 	SpecReason               string
+	SpecExpectedAbsent       bool
+	SpecExpectedReason       string
+	DocumentationOnly        bool
+	SpecPathChanged          bool
+	SpecPathAdded            bool
 	SpecContent              packetSection
 	ChangedFiles             changedFilesSection
 	Diff                     packetSection
@@ -446,22 +455,30 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 	if inputs.Spec.Available {
 		specReason = ""
 	}
+	documentationOnly := docsOnlyChangedFiles(inputs.ChangedFiles)
+	specPathChanged := changedFilesContainPath(inputs.ChangedFiles, inputs.Spec.Path)
+	specPathAdded := diffAddsPath(inputs.Diff, inputs.Spec.Path)
 
 	return reviewPacket{
-		PRNumber:      opts.PRNumber,
-		PRTitle:       inputs.PR.Title,
-		HeadRef:       inputs.PR.HeadRefName,
-		BaseBranch:    baseBranch,
-		IssueNumber:   issueNumber,
-		IssueTitle:    issueTitle,
-		IssueBody:     truncatePacketSection(issueBody, limits.IssueBytes),
-		SpecPath:      specPath,
-		SpecAvailable: inputs.Spec.Available,
-		SpecReason:    specReason,
-		SpecContent:   truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
-		ChangedFiles:  buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
-		Diff:          buildDiffSection(inputs.Diff, limits.DiffBytes, limits.DiffFileBytes),
-		Limits:        limits,
+		PRNumber:           opts.PRNumber,
+		PRTitle:            inputs.PR.Title,
+		HeadRef:            inputs.PR.HeadRefName,
+		BaseBranch:         baseBranch,
+		IssueNumber:        issueNumber,
+		IssueTitle:         issueTitle,
+		IssueBody:          truncatePacketSection(issueBody, limits.IssueBytes),
+		SpecPath:           specPath,
+		SpecAvailable:      inputs.Spec.Available,
+		SpecReason:         specReason,
+		SpecExpectedAbsent: inputs.Spec.ExpectedAbsent,
+		SpecExpectedReason: inputs.Spec.ExpectedReason,
+		DocumentationOnly:  documentationOnly,
+		SpecPathChanged:    specPathChanged,
+		SpecPathAdded:      specPathAdded,
+		SpecContent:        truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
+		ChangedFiles:       buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
+		Diff:               buildDiffSection(inputs.Diff, limits.DiffBytes, limits.DiffFileBytes),
+		Limits:             limits,
 	}
 }
 
@@ -481,6 +498,8 @@ Return only JSON matching this schema:
 - Use "pass" only when the PR satisfies the issue and spec and you found no blocking concerns.
 - Use "fail" for concrete implementation defects, missing acceptance criteria, regressions, or test gaps that should be fixed by a worker.
 - Use "needs-human" when evidence is incomplete, ambiguous, unavailable, or unsafe to decide automatically.
+- If the packet classifies a missing merged spec as expected/non-blocking because a documentation-only PR introduces that referenced spec, do not return "needs-human" solely for that expected absence; keep spec_conformance "not-applicable" and decide from the issue and bounded packet.
+- For code PRs or mixed code/documentation PRs, an unavailable merged design/spec remains missing evidence and must be treated as "needs-human" when spec conformance cannot be checked safely.
 - Return "needs-human" if a TRUNCATED marker could hide a relevant acceptance criterion, risky changed file, or code needed for a safe decision. Cite the marker in evidence.
 - Prefer the packet over broad repository exploration. Inspect only changed files, files cited by the issue/spec, or files necessary to confirm a concrete finding.
 - Stop and return "needs-human" if deciding safely would require broad repository exploration or work beyond the bounded input/tool budget.
@@ -566,6 +585,9 @@ func formatReviewPacket(packet reviewPacket) string {
 
 	fmt.Fprintf(&out, "# Changed files\n")
 	fmt.Fprintf(&out, "Total changed files: %d\n", packet.ChangedFiles.TotalFiles)
+	fmt.Fprintf(&out, "Documentation-only: %s\n", yesNo(packet.DocumentationOnly))
+	fmt.Fprintf(&out, "Referenced spec changed in PR: %s\n", yesNo(packet.SpecPathChanged))
+	fmt.Fprintf(&out, "Referenced spec added in PR: %s\n", yesNo(packet.SpecPathAdded))
 	fmt.Fprintf(&out, "Budget: %d bytes\n", packet.Limits.ChangedFilesBytes)
 	fmt.Fprintf(&out, "%s\n\n", formatChangedFilesSection(packet.ChangedFiles))
 
@@ -586,8 +608,14 @@ func formatReviewPacket(packet reviewPacket) string {
 		fmt.Fprintf(&out, "Status: available\n")
 		fmt.Fprintf(&out, "Spec budget: %d bytes\n", packet.Limits.SpecBytes)
 		fmt.Fprintf(&out, "%s\n", formatPacketSection("merged spec", packet.SpecContent))
+	} else if packet.SpecExpectedAbsent {
+		fmt.Fprintf(&out, "Status: expected absent from origin/%s\n", packet.BaseBranch)
+		fmt.Fprintf(&out, "Classification: expected/non-blocking\n")
+		fmt.Fprintf(&out, "Reason: %s\n", packet.SpecExpectedReason)
+		fmt.Fprintf(&out, "Spec conformance: not-applicable\n")
 	} else {
 		fmt.Fprintf(&out, "Status: unavailable\n")
+		fmt.Fprintf(&out, "Classification: missing evidence\n")
 		fmt.Fprintf(&out, "Reason: %s\n", packet.SpecReason)
 	}
 	return out.String()
@@ -620,6 +648,13 @@ func formatChangedFilesSection(section changedFilesSection) string {
 		text += fmt.Sprintf("\n[TRUNCATED changed files: omitted %d files, %d bytes, %d lines]", section.OmittedFiles, section.OmittedBytes, section.OmittedLines)
 	}
 	return text
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
 }
 
 func buildChangedFilesSection(files []string, byteBudget int) changedFilesSection {
@@ -826,6 +861,7 @@ func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath 
 	inputs.Issue = issue
 	inputs.IssuePresent = present
 	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, opts.BaseBranch, specSearchTexts(issue, present, pr))
+	inputs.Spec = classifySpecAbsence(inputs.Spec, opts.BaseBranch, changedFiles, diff)
 	return inputs, nil
 }
 
@@ -867,6 +903,107 @@ func loadSpec(ctx context.Context, git GitClient, repoPath, baseBranch string, t
 		return specInput{Path: path, Available: false, Reason: "spec file is empty"}
 	}
 	return specInput{Path: path, Content: content, Available: true}
+}
+
+func classifySpecAbsence(spec specInput, baseBranch string, changedFiles []string, diff string) specInput {
+	if spec.Available || strings.TrimSpace(spec.Path) == "" {
+		return spec
+	}
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	if !isDocsSpecPath(spec.Path) || !docsOnlyChangedFiles(changedFiles) {
+		return spec
+	}
+	if !changedFilesContainPath(changedFiles, spec.Path) || !diffAddsPath(diff, spec.Path) {
+		return spec
+	}
+	spec.ExpectedAbsent = true
+	spec.ExpectedReason = fmt.Sprintf("expected: this PR introduces the spec, so it is absent from origin/%s", baseBranch)
+	return spec
+}
+
+func isDocsSpecPath(path string) bool {
+	return strings.HasPrefix(normalizeRepoPath(path), "docs/specs/")
+}
+
+func docsOnlyChangedFiles(files []string) bool {
+	seen := false
+	for _, file := range files {
+		normalized := normalizeRepoPath(file)
+		if normalized == "" {
+			continue
+		}
+		seen = true
+		if !strings.HasPrefix(normalized, "docs/") {
+			return false
+		}
+	}
+	return seen
+}
+
+func changedFilesContainPath(files []string, path string) bool {
+	target := normalizeRepoPath(path)
+	if target == "" {
+		return false
+	}
+	for _, file := range files {
+		if normalizeRepoPath(file) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func diffAddsPath(diff string, path string) bool {
+	target := normalizeRepoPath(path)
+	if target == "" || strings.TrimSpace(diff) == "" {
+		return false
+	}
+	for _, patch := range splitDiffPatches(diff) {
+		if normalizeRepoPath(patch.File) != target {
+			continue
+		}
+		if strings.Contains(patch.Text, "\nnew file mode ") || strings.HasPrefix(patch.Text, "new file mode ") {
+			return true
+		}
+		if diffPatchAddsTarget(patch.Text, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func diffPatchAddsTarget(patchText string, target string) bool {
+	fromDevNull := false
+	toTarget := false
+	for _, line := range strings.Split(patchText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "--- /dev/null" {
+			fromDevNull = true
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") && normalizeDiffPath(strings.TrimPrefix(line, "+++ ")) == target {
+			toTarget = true
+		}
+	}
+	return fromDevNull && toTarget
+}
+
+func normalizeDiffPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "/dev/null" {
+		return path
+	}
+	path = strings.TrimPrefix(path, "a/")
+	path = strings.TrimPrefix(path, "b/")
+	return normalizeRepoPath(path)
+}
+
+func normalizeRepoPath(path string) string {
+	path = strings.TrimSpace(strings.ReplaceAll(path, `\`, `/`))
+	path = strings.TrimPrefix(path, "./")
+	return path
 }
 
 func checkoutPRWorktree(ctx context.Context, deps Deps, repoPath, worktreePath string, prNumber int) error {
