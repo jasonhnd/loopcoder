@@ -160,16 +160,18 @@ func TestParseClaudeInvocation(t *testing.T) {
 		wantEffort string
 		wantInput  *int64
 		wantOutput *int64
+		wantTotal  *int64
 	}{
 		{
-			name: "captured json result with model usage key and split tokens",
+			name: "captured json result with model usage key and split plus total tokens",
 			output: []byte(`{
 				"type": "result",
 				"subtype": "success",
 				"result": "done",
 				"usage": {
 					"input_tokens": 1234,
-					"output_tokens": 567
+					"output_tokens": 567,
+					"total_tokens": 1801
 				},
 				"modelUsage": {
 					"claude-opus-4-20250514": {
@@ -183,9 +185,10 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantEffort: "high",
 			wantInput:  testInt64Ptr(1234),
 			wantOutput: testInt64Ptr(567),
+			wantTotal:  testInt64Ptr(1801),
 		},
 		{
-			name: "chooses primary model when Claude reports helper model usage too",
+			name: "split without total keeps input and output only",
 			output: []byte(`{
 				"type": "result",
 				"subtype": "success",
@@ -208,6 +211,22 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantModel:  "claude-opus-4-8[1m]",
 			wantInput:  testInt64Ptr(2447),
 			wantOutput: testInt64Ptr(71),
+		},
+		{
+			name: "total only leaves split absent",
+			output: []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"result": "done",
+				"usage": {
+					"total_tokens": 42
+				},
+				"modelUsage": {
+					"claude-opus-4-20250514": {}
+				}
+			}`),
+			wantModel: "claude-opus-4-20250514",
+			wantTotal: testInt64Ptr(42),
 		},
 		{
 			name:       "invalid json keeps invocation effort only",
@@ -236,7 +255,11 @@ func TestParseClaudeInvocation(t *testing.T) {
 			} else {
 				assertInt64Ptr(t, got.Usage.OutputTokens, *tt.wantOutput)
 			}
-			assertNilInt64Ptr(t, got.Usage.TotalTokens)
+			if tt.wantTotal == nil {
+				assertNilInt64Ptr(t, got.Usage.TotalTokens)
+			} else {
+				assertInt64Ptr(t, got.Usage.TotalTokens, *tt.wantTotal)
+			}
 		})
 	}
 }

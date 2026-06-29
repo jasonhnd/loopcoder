@@ -188,6 +188,30 @@ func TestParseGeminiInvocation(t *testing.T) {
 			wantTotal:  testInt64Ptr(1025),
 		},
 		{
+			name: "total only leaves split absent",
+			output: `{
+				"model": "gemini-2.5-pro",
+				"usage": {
+					"totalTokenCount": 2048
+				}
+			}`,
+			wantModel: "gemini-2.5-pro",
+			wantTotal: testInt64Ptr(2048),
+		},
+		{
+			name: "split without total keeps input and output only",
+			output: `{
+				"model": "gemini-2.5-pro",
+				"usage": {
+					"promptTokenCount": 90,
+					"candidatesTokenCount": 12
+				}
+			}`,
+			wantModel:  "gemini-2.5-pro",
+			wantInput:  testInt64Ptr(90),
+			wantOutput: testInt64Ptr(12),
+		},
+		{
 			name:   "non json output yields empty metadata",
 			output: "auth required",
 		},
