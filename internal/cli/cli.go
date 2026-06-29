@@ -57,6 +57,7 @@ type Deps struct {
 	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
 	Init            func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	Upgrade         func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	SkillInstall    func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
 	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
 	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
@@ -69,6 +70,7 @@ var commands = []Command{
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
+	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -126,6 +128,9 @@ func DefaultDeps() Deps {
 		},
 		Upgrade: func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error) {
 			return upgrade.Run(ctx, opts, upgrade.DefaultDeps())
+		},
+		SkillInstall: func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
+			return InstallSkill(ctx, opts, DefaultSkillInstallDeps())
 		},
 		StatePush: func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
@@ -188,6 +193,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "skill" {
+		return runSkill(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
 	}
@@ -243,6 +251,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "lease" {
 		printLeaseHelp(w)
+		return
+	}
+	if command.Name == "skill" {
+		printSkillHelp(w)
 		return
 	}
 
