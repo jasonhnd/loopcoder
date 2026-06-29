@@ -701,6 +701,7 @@ func TestReadySetRequiresRepo(t *testing.T) {
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
+	record := validDispatchAttestation()
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
@@ -735,6 +736,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 				Status:      "succeeded",
 				ExitCode:    0,
 				LogBytes:    12,
+				Attestation: &record,
 			}, nil
 		},
 	})
@@ -745,17 +747,87 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 
-	var got map[string]any
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	lines := nonEmptyLines(stdout.String())
+	if len(lines) != 3 {
+		t.Fatalf("stdout lines = %d, want 3:\n%s", len(lines), stdout.String())
 	}
-	for _, key := range []string{"ok", "issue", "branch", "run_id", "pr", "summary", "attempt_path", "status", "exit_code", "log_bytes"} {
-		if _, ok := got[key]; !ok {
-			t.Fatalf("dispatch JSON missing %q: %s", key, stdout.String())
+	var attestationLine attestation.AttestationRecord
+	if err := json.Unmarshal([]byte(lines[1]), &attestationLine); err != nil {
+		t.Fatalf("stdout second line is not attestation JSON: %v\n%s", err, stdout.String())
+	}
+	if err := attestationLine.Validate(); err != nil {
+		t.Fatalf("attestation JSON does not validate: %v", err)
+	}
+	if lines[0] != attestationLine.Header() {
+		t.Fatalf("stdout first line = %q, want %q", lines[0], attestationLine.Header())
+	}
+	canonical, err := attestationLine.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("CanonicalJSON returned error: %v", err)
+	}
+	if lines[1] != string(canonical) {
+		t.Fatalf("stdout second line = %q, want canonical %q", lines[1], string(canonical))
+	}
+
+	var got worker.Result
+	if err := json.Unmarshal([]byte(lines[2]), &got); err != nil {
+		t.Fatalf("stdout final line is not dispatch JSON: %v\n%s", err, stdout.String())
+	}
+	if !got.OK || got.Status != "succeeded" {
+		t.Fatalf("dispatch JSON has wrong success fields: %#v", got)
+	}
+	if got.Attestation == nil {
+		t.Fatalf("dispatch JSON missing attestation: %s", lines[2])
+	}
+	nestedCanonical, err := got.Attestation.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("nested attestation CanonicalJSON returned error: %v", err)
+	}
+	if string(nestedCanonical) != lines[1] {
+		t.Fatalf("nested attestation = %s, want %s", string(nestedCanonical), lines[1])
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(lines[2]), &fields); err != nil {
+		t.Fatalf("dispatch JSON invalid: %v", err)
+	}
+	for _, key := range []string{"ok", "issue", "branch", "run_id", "pr", "summary", "attempt_path", "status", "exit_code", "log_bytes", "attestation"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("dispatch JSON missing %q: %s", key, lines[2])
 		}
 	}
-	if got["ok"] != true || got["status"] != "succeeded" {
-		t.Fatalf("dispatch JSON has wrong success fields: %#v", got)
+	for _, key := range []string{"worker_model", "worker_tokens"} {
+		if _, ok := fields[key]; ok {
+			t.Fatalf("dispatch JSON unexpectedly contains %q: %s", key, lines[2])
+		}
+	}
+}
+
+func TestDispatchDoesNotRenderSuccessJSONWithoutAttestation(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			return worker.Result{
+				OK:     true,
+				Issue:  opts.IssueNumber,
+				Status: "succeeded",
+			}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "worker attestation is missing") {
+		t.Fatalf("stderr missing attestation error: %q", stderr.String())
 	}
 }
 
@@ -967,6 +1039,39 @@ func assertOptionalInt64(t *testing.T, name string, got, want *int64) {
 	}
 	if *got != *want {
 		t.Fatalf("%s tokens = %d, want %d", name, *got, *want)
+	}
+}
+
+func nonEmptyLines(output string) []string {
+	rawLines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	lines := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func validDispatchAttestation() attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    "codex",
+		Model:       "gpt-5.5",
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  attestation.PermissionWrite,
+		Action:      "implement issue #101",
+		ExitCode:    0,
+		StartedAt:   "2026-06-28T00:00:00Z",
+		EndedAt:     "2026-06-28T00:00:42Z",
+		DurationMS:  42000,
+		Usage: attestation.Usage{
+			InputTokens:  int64TestPtr(120),
+			OutputTokens: int64TestPtr(34),
+			TotalTokens:  int64TestPtr(154),
+		},
+		Verified: true,
 	}
 }
 

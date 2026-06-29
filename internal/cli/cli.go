@@ -975,16 +975,38 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	data, err := worker.MarshalResult(result)
-	if err != nil {
+	if err := renderDispatch(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if _, err := stdout.Write(append(data, '\n')); err != nil {
-		fmt.Fprintf(stderr, "dispatch: write output: %v\n", err)
-		return 1
-	}
 	return 0
+}
+
+func renderDispatch(w io.Writer, result worker.Result) error {
+	if result.Attestation == nil {
+		return errors.New("worker attestation is missing")
+	}
+	if err := result.Attestation.Validate(); err != nil {
+		return fmt.Errorf("validate worker attestation: %w", err)
+	}
+	canonical, err := result.Attestation.CanonicalJSON()
+	if err != nil {
+		return fmt.Errorf("render worker attestation JSON: %w", err)
+	}
+	data, err := worker.MarshalResult(result)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, result.Attestation.Header()); err != nil {
+		return err
+	}
+	if _, err := w.Write(append(canonical, '\n')); err != nil {
+		return err
+	}
+	if _, err := w.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return nil
 }
 
 func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
