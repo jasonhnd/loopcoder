@@ -89,3 +89,51 @@ higher-authority source and report the conflict.
 - Candidate improvement: the python fallback in that CI step has leading indentation that would error if it ever ran; yq is always present on ubuntu-latest so it is dormant, but dedent or simplify it in a future cleanup.
 - Confidence: high
 - Supersedes: none
+
+### 2026-06-29 - run 2026-06-29-v0.3.3 - Re-dispatch with a changed brief must sync the GitHub issue body
+
+- Scope: issue/PR #245 (CHANGELOG batch)
+- Role: conductor
+- Observed: A worker was re-dispatched with a corrected brief, but the GitHub issue body was left stale; the verifier judged the PR against the old acceptance criteria and returned a false fail.
+- Evidence: issue/PR #245 (CHANGELOG batch); fixed by `gh issue edit 242 --body-file <new>` then re-running loopreview -> pass.
+- Learning: The verifier reads the GitHub issue, not the local `--issue-body` passed to dispatch. When you change a brief on re-dispatch, you MUST sync the issue with `gh issue edit` or the verifier reviews against stale criteria.
+- Applies to: conductor, process
+- Candidate improvement: none
+- Confidence: high
+- Supersedes: none
+
+### 2026-06-29 - run 2026-06-29-v0.3.3 - Conductor must independently ground-truth factual claims
+
+- Scope: PR #251
+- Role: conductor
+- Observed: A verifier claimed three GitHub Actions (`checkout`/`setup-go`/`upload-artifact`/`download-artifact`) could not all be on their stated major versions (a lockstep assumption from pre-cutoff knowledge); ground-truthing showed all were current.
+- Evidence: PR #251; verified via `gh api repos/<action>/releases/latest`.
+- Learning: Both worker and verifier have knowledge cutoffs and will assert stale "facts" about versions/APIs. The conductor must independently verify factual claims with `gh api` / `git ls-remote` before trusting OR overriding either side.
+- Applies to: conductor, process
+- Candidate improvement: none
+- Confidence: high
+- Supersedes: none
+
+### 2026-06-29 - run 2026-06-29-v0.3.3 - Parallelize workers only on non-overlapping file regions
+
+- Scope: W8, issues #264 / #265
+- Role: conductor
+- Observed: Waves that put two issues touching `internal/cli/cli.go` in parallel risked merge conflict; splitting by file region ran clean.
+- Evidence: W8 ran #264 (`internal/cli/cli.go`) and #265 (`internal/orchestration/dispatch_wave.go`) in parallel and both merged with no conflict.
+- Learning: `cli.go` is a hot file; cap each parallel wave at <=1 issue that touches it and pick file-disjoint issues for the rest.
+- Applies to: conductor, scheduling
+- Candidate improvement: none
+- Confidence: high
+- Supersedes: none
+
+### 2026-06-29 - run 2026-06-29-v0.3.3 - Headless claude verifier model is non-deterministic; pin with --model
+
+- Scope: PR #266 / PR #267 verifier attestations
+- Role: verifier
+- Observed: In one session the claude verifier ran `claude-opus-4-8[1m]` for one PR and `claude-haiku-4-5` for the next, with no flag change.
+- Evidence: PR #266 vs PR #267 verifier attestations (same session).
+- Learning: When the verdict needs a known strong model, pass `loopcoder loopreview --model <id>` (per-role override, spec 0215) rather than relying on inherited default model selection.
+- Applies to: conductor, worker prompts
+- Candidate improvement: document the canonical strong-verifier model id once a deterministic pin string is confirmed.
+- Confidence: medium
+- Supersedes: none
