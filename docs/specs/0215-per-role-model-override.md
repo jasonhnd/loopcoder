@@ -1,7 +1,7 @@
 ---
 id: 215
 title: Per-Role Model and Effort Override
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 215
 pr: null

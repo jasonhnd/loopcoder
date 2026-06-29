@@ -1,7 +1,7 @@
 ---
 id: 218
 title: Surface Worker Attestation in Dispatch Output and Report
-status: draft
+status: accepted
 date: 2026-06-29
 issue: 218
 pr: null

@@ -1,7 +1,7 @@
 ---
 id: 214
 title: Human-Readable Attestation Rendering
-status: draft
+status: accepted
 date: 2026-06-28
 issue: 214
 pr: null
