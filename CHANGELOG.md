@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-06-29
+
+### Added
+
+- Tag-triggered release workflow builds Windows, macOS, and Linux binaries for `amd64` and `arm64`, plus `SHA256SUMS`.
+- No-Go install scripts for Unix-like systems (`scripts/install.sh`) and Windows (`scripts/install.ps1`) install from GitHub Releases with checksum verification.
+- `loopcoder version` and root `loopcoder --version` / `loopcoder -v` print build information.
+- `loopcoder dispatch` surfaces Worker attestation in stdout and final result JSON: the stable `[attestation]` header, canonical JSON, and an `attestation` object.
+- Human-readable attestation pretty renderer for interactive reports while preserving stable header and canonical JSON machine surfaces.
+- Optional `.delivery.yml` `verifier.model` and `verifier.reasoning_effort` fields for verifier-specific model and effort overrides.
+- Worker usage parsing captures input/output token splits when provider output reports them.
+- `docs/reference/stability-policy.md` documents 0.x compatibility promises and changelog discipline.
+
+### Changed
+
+- `.delivery.yml` `adapters.verifier` now names the real provider `claude` instead of the invalid stale value `opus`.
+
+### Fixed
+
+- `loopreview` no longer forces `needs-human` solely because a brand-new doc-first spec PR references a spec absent from the base branch; code PRs with a missing merged spec still return `needs-human`.
+
+### Notes
+
+- Accepted 0.3.x design specs in this line: 0212 release/distribution/isolation/upgrade, 0214 human-readable attestation rendering, 0215 per-role model/effort override, 0218 surface Worker attestation, and 0220 loopreview new-spec classification.
+
 ## [0.3.3] - 2026-06-28
 
 ### Added

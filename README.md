@@ -52,13 +52,29 @@ loop  > done. 2 PRs, you merged both, 0 blocked.
 
 ## Install
 
+Install from GitHub Releases with the platform script, then confirm the selected
+binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+loopcoder --version
+```
+
+```powershell
+irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+loopcoder --version
+```
+
+If you already use Go, `go install` remains supported:
+
 ```bash
 go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
+loopcoder --version
 ```
 
 Prerequisites on `PATH`: `git`, `gh` (authenticated), and at least one supported provider CLI. `codex` is the default worker, `codex` and `claude` are verified verifier providers, `claude` is also a verified worker provider, and `gemini` is experimental/unverified.
 
-Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
+Cross-platform: macOS, Linux, and Windows -- a single Go binary. See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage.
 
 ## Usage
 
