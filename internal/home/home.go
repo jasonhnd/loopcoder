@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -123,7 +124,12 @@ func (l Layout) VersionBinaryPath(version string) (string, error) {
 	return filepath.Join(versionDir, binaryFileName()), nil
 }
 
-// InstalledVersions lists installed version directories in sorted order.
+// InstalledVersions lists installed version directories in semver-aware order.
+//
+// Directory names that are clean path segments but not MAJOR.MINOR.PATCH
+// versions, with an optional leading v, sort lexically before valid semver
+// entries. That keeps ordering deterministic without letting malformed entries
+// become the latest version by taking the final position in the returned list.
 func (l Layout) InstalledVersions(deps Deps) ([]string, error) {
 	deps = normalizeDeps(deps)
 	entries, err := deps.ReadDir(l.VersionsDir())
@@ -145,8 +151,92 @@ func (l Layout) InstalledVersions(deps Deps) ([]string, error) {
 		}
 		versions = append(versions, name)
 	}
-	sort.Strings(versions)
+	sort.Slice(versions, func(i, j int) bool {
+		return compareInstalledVersion(versions[i], versions[j]) < 0
+	})
 	return versions, nil
+}
+
+type installedSemver struct {
+	major int
+	minor int
+	patch int
+}
+
+func compareInstalledVersion(a, b string) int {
+	av, aOK := parseInstalledSemver(a)
+	bv, bOK := parseInstalledSemver(b)
+	switch {
+	case aOK && bOK:
+		if cmp := compareInt(av.major, bv.major); cmp != 0 {
+			return cmp
+		}
+		if cmp := compareInt(av.minor, bv.minor); cmp != 0 {
+			return cmp
+		}
+		if cmp := compareInt(av.patch, bv.patch); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(a, b)
+	case aOK:
+		return 1
+	case bOK:
+		return -1
+	default:
+		return strings.Compare(a, b)
+	}
+}
+
+func parseInstalledSemver(version string) (installedSemver, bool) {
+	if strings.HasPrefix(version, "v") {
+		version = strings.TrimPrefix(version, "v")
+	}
+
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return installedSemver{}, false
+	}
+
+	major, ok := parseSemverNumber(parts[0])
+	if !ok {
+		return installedSemver{}, false
+	}
+	minor, ok := parseSemverNumber(parts[1])
+	if !ok {
+		return installedSemver{}, false
+	}
+	patch, ok := parseSemverNumber(parts[2])
+	if !ok {
+		return installedSemver{}, false
+	}
+	return installedSemver{major: major, minor: minor, patch: patch}, true
+}
+
+func parseSemverNumber(part string) (int, bool) {
+	if part == "" || (len(part) > 1 && part[0] == '0') {
+		return 0, false
+	}
+	for _, r := range part {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.Atoi(part)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func compareInt(a, b int) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func normalizeDeps(deps Deps) Deps {
