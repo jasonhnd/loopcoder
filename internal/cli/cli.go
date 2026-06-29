@@ -277,7 +277,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
-		fmt.Fprintln(w, "  --pretty                    render human-readable attestation on stderr")
+		fmt.Fprintln(w, "  --pretty                    force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                 suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "attest" {
 		fmt.Fprintln(w, "  --role string            attestation role (default \"conductor\")")
@@ -343,7 +344,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
-		fmt.Fprintln(w, "  --pretty               render human-readable attestation on stderr")
+		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty            suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -362,6 +364,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
 		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
+		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
@@ -1149,6 +1153,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var keepWorktreeAlias bool
 	var pretty bool
 	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1178,6 +1184,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1222,6 +1230,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
 	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
 	opts.Stderr = stderr
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
@@ -1267,8 +1276,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if result.Attestation != nil && shouldRenderPretty(stderr, pretty, deps) {
-		if err := renderPrettyAttestation(stderr, *result.Attestation, prettyModeForTarget(stderr, deps)); err != nil {
+	if result.Attestation != nil && shouldRenderPretty(noPretty) {
+		if err := renderPrettyAttestation(stderr, *result.Attestation, prettyModeForTarget(stderr, deps, pretty)); err != nil {
 			fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
 			return 1
 		}
@@ -1497,7 +1506,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if pretty {
-		if err := renderPrettyAttestation(stdout, record, prettyModeForTarget(stdout, deps)); err != nil {
+		if err := renderPrettyAttestation(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
 			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
 			return 1
 		}
@@ -1590,6 +1599,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var effortAlias string
 	var throttleLimit int
 	var throttleLimitAlias int
+	var pretty bool
+	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1611,6 +1624,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1645,6 +1662,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if throttleLimitAlias != 0 {
 		throttleLimit = throttleLimitAlias
 	}
+	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "dispatch-wave: --repo is required")
@@ -1748,6 +1767,18 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if _, err := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", err)
 		return 1
+	}
+	if shouldRenderPretty(noPretty) {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		for _, result := range waveReport.Results {
+			if result.Attestation == nil {
+				continue
+			}
+			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
+				fmt.Fprintf(stderr, "dispatch-wave: write pretty attestation: %v\n", err)
+				return 1
+			}
+		}
 	}
 	if orchestration.DispatchWaveHasFailures(waveReport) {
 		return 1
@@ -1925,6 +1956,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var timeoutAlias time.Duration
 	var pretty bool
 	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1942,6 +1975,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "verifier timeout")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1970,6 +2005,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Timeout = timeoutAlias
 	}
 	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "loopreview: --repo is required")
@@ -2025,8 +2061,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
 		return 1
 	}
-	if result.Verdict.Attestation != nil && shouldRenderPretty(stderr, pretty, deps) {
-		if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, prettyModeForTarget(stderr, deps)); err != nil {
+	if result.Verdict.Attestation != nil && shouldRenderPretty(noPretty) {
+		if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, prettyModeForTarget(stderr, deps, pretty)); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
 			return 1
 		}

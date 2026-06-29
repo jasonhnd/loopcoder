@@ -148,7 +148,7 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout", "--pretty"} {
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -166,13 +166,31 @@ func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--pretty"} {
+	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
 	}
 	if strings.Contains(help, "Codex model") || strings.Contains(help, "Codex reasoning") {
 		t.Fatalf("dispatch help still describes model/effort as Codex-specific:\n%s", help)
+	}
+}
+
+func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"dispatch-wave", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder dispatch-wave", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
 	}
 }
 
@@ -755,7 +773,7 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 }
 
-func TestLoopreviewPrettyDefaultNonInteractivePreservesStdout(t *testing.T) {
+func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -791,12 +809,25 @@ func TestLoopreviewPrettyDefaultNonInteractivePreservesStdout(t *testing.T) {
 	if stdout.String() != wantStdout {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	gotStderr := stderr.String()
+	for _, want := range []string{
+		"attestation: verified",
+		"  role        verifier",
+		"  permission  read-only",
+		"  action      \"review PR #152\"",
+	} {
+		if !strings.Contains(gotStderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"✅", "❌", "⚠"} {
+		if strings.Contains(gotStderr, disallowed) {
+			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		}
 	}
 }
 
-func TestLoopreviewPrettyFlagWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
+func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -835,19 +866,56 @@ func TestLoopreviewPrettyFlagWritesPlainToStderrWithoutChangingStdout(t *testing
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"attestation: verified",
-		"  role        verifier",
-		"  permission  read-only",
-		"  action      \"review PR #152\"",
+		"✅ attestation verified",
+		"   role        verifier",
+		"   permission  read-only",
+		"   action      \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
 		}
 	}
-	for _, disallowed := range []string{"✅", "❌", "⚠"} {
-		if strings.Contains(gotStderr, disallowed) {
-			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
-		}
+}
+
+func TestLoopreviewNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validLoopreviewAttestation()
+	result := loopreview.Result{
+		Verdict: loopreview.Verdict{
+			Verdict:         loopreview.VerdictPass,
+			Findings:        []loopreview.Finding{},
+			Evidence:        "review passed",
+			SpecConformance: loopreview.SpecConformancePass,
+			Attestation:     &record,
+		},
+		ExitCode: 0,
+	}
+	wantStdout := expectedLoopreviewStdout(t, result)
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--no-pretty",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "claude",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 
@@ -1282,6 +1350,7 @@ func TestReadySetRequiresRepo(t *testing.T) {
 }
 
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
+	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
 	record := validDispatchAttestation()
@@ -1326,8 +1395,21 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	gotStderr := stderr.String()
+	for _, want := range []string{
+		"attestation: verified",
+		"  role        worker",
+		"  permission  write",
+		"  action      \"implement issue #101\"",
+	} {
+		if !strings.Contains(gotStderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"✅", "❌", "⚠"} {
+		if strings.Contains(gotStderr, disallowed) {
+			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		}
 	}
 
 	lines := nonEmptyLines(stdout.String())
@@ -1385,6 +1467,50 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	}
 }
 
+func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchAttestation()
+	result := validDispatchResult(record)
+	wantStdout := expectedDispatchStdout(t, result)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	gotStderr := stderr.String()
+	for _, want := range []string{
+		"attestation: verified",
+		"  role        worker",
+		"  tokens      input=120 output=34 total=154",
+	} {
+		if !strings.Contains(gotStderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"✅", "❌", "⚠"} {
+		if strings.Contains(gotStderr, disallowed) {
+			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		}
+	}
+}
+
 func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -1436,7 +1562,7 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 	}
 }
 
-func TestDispatchPrettyEnvOptInWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
+func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	t.Setenv("LOOPCODER_PRETTY", "1")
 	var stdout, stderr bytes.Buffer
@@ -1477,17 +1603,12 @@ func TestDispatchPrettyEnvOptInWritesPlainToStderrWithoutChangingStdout(t *testi
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
 	for _, want := range []string{
-		"attestation: verified",
-		"  role        worker",
-		"  tokens      input=120 output=34 total=154",
+		"✅ attestation verified",
+		"   role        worker",
+		"   tokens      input=120 output=34 total=154",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
-		}
-	}
-	for _, disallowed := range []string{"✅", "❌", "⚠"} {
-		if strings.Contains(stderr.String(), disallowed) {
-			t.Fatalf("plain stderr contains %q:\n%s", disallowed, stderr.String())
 		}
 	}
 }
@@ -1535,6 +1656,107 @@ func TestDispatchPrettyFlagHonorsNoColorPlainFallback(t *testing.T) {
 		if strings.Contains(stderr.String(), disallowed) {
 			t.Fatalf("stderr contains %q despite NO_COLOR:\n%s", disallowed, stderr.String())
 		}
+	}
+}
+
+func TestDispatchNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchAttestation()
+	result := validDispatchResult(record)
+	wantStdout := expectedDispatchStdout(t, result)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--no-pretty",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestDispatchNoPrettyEnvSuppressesStderrWithoutChangingStdout(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv("LOOPCODER_PRETTY", "1")
+	t.Setenv("LOOPCODER_NO_PRETTY", "1")
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchAttestation()
+	result := validDispatchResult(record)
+	wantStdout := expectedDispatchStdout(t, result)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestDispatchNoPrettyFlagBeatsPrettyFlag(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchAttestation()
+	result := validDispatchResult(record)
+	wantStdout := expectedDispatchStdout(t, result)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--pretty",
+		"--no-pretty",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 
@@ -1740,6 +1962,129 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	}
 }
 
+func TestDispatchWavePrettyDefaultNonInteractiveWritesPlainBlocksWithoutChangingStdout(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	now := time.Date(2026, 6, 30, 1, 2, 3, 0, time.UTC)
+	record201 := validDispatchAttestation()
+	record201.Action = "implement issue #201"
+	record202 := validDispatchAttestation()
+	record202.Action = "implement issue #202"
+
+	expectedReport := orchestration.DispatchWaveReport{
+		Repo:            "owner/repo",
+		BaseBranch:      "main",
+		RunID:           "run-test-wave",
+		IssuesRequested: []int{201, 202},
+		StartedAt:       now.UTC().Format(time.RFC3339),
+		FinishedAt:      now.UTC().Format(time.RFC3339),
+		Results: []orchestration.DispatchWaveIssueResult{
+			{
+				Issue:       201,
+				Status:      orchestration.DispatchWaveStatusSucceeded,
+				Branch:      "loop/issue-201",
+				PR:          "https://github.com/owner/repo/pull/201",
+				AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-201.attempt.json",
+				Attestation: &record201,
+			},
+			{
+				Issue:       202,
+				Status:      orchestration.DispatchWaveStatusSucceeded,
+				Branch:      "loop/issue-202",
+				PR:          "https://github.com/owner/repo/pull/202",
+				AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-202.attempt.json",
+				Attestation: &record202,
+			},
+		},
+	}
+	wantStdout := orchestration.RenderDispatchWaveText(expectedReport)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--repo", repo,
+		"--issue-numbers", "201,202",
+		"--run-id", "run-test-wave",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Now: func() time.Time {
+			return now
+		},
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				views: map[int]gh.Issue{
+					201: {Number: 201, Title: "Wave 201", Body: "Body 201"},
+					202: {Number: 202, Title: "Wave 202", Body: "Body 202"},
+				},
+			}
+		},
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			return report.ReadySetReport{
+				Repo:       "owner/repo",
+				BaseBranch: "main",
+				Ready: []report.ReadyIssue{
+					{Issue: 201, Title: "Wave 201", Reason: "ready"},
+					{Issue: 202, Title: "Wave 202", Reason: "ready"},
+				},
+			}, nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			switch opts.IssueNumber {
+			case 201:
+				return worker.Result{
+					OK:          true,
+					Issue:       opts.IssueNumber,
+					Branch:      "loop/issue-201",
+					RunID:       opts.RunID,
+					PR:          "https://github.com/owner/repo/pull/201",
+					AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-201.attempt.json",
+					Status:      "succeeded",
+					Attestation: &record201,
+				}, nil
+			case 202:
+				return worker.Result{
+					OK:          true,
+					Issue:       opts.IssueNumber,
+					Branch:      "loop/issue-202",
+					RunID:       opts.RunID,
+					PR:          "https://github.com/owner/repo/pull/202",
+					AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-202.attempt.json",
+					Status:      "succeeded",
+					Attestation: &record202,
+				}, nil
+			default:
+				t.Fatalf("unexpected issue number %d", opts.IssueNumber)
+				return worker.Result{}, nil
+			}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	}
+	gotStderr := stderr.String()
+	if count := strings.Count(gotStderr, "attestation: verified"); count != 2 {
+		t.Fatalf("stderr pretty block count = %d, want 2:\n%s", count, gotStderr)
+	}
+	for _, want := range []string{
+		"  action      \"implement issue #201\"",
+		"  action      \"implement issue #202\"",
+	} {
+		if !strings.Contains(gotStderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"✅", "❌", "⚠"} {
+		if strings.Contains(gotStderr, disallowed) {
+			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		}
+	}
+}
+
 func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -1863,7 +2208,7 @@ func TestResumeRequiresRepo(t *testing.T) {
 
 func clearPrettyEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"LOOPCODER_PRETTY", "LOOPCODER_NO_EMOJI", "LOOPCODER_PLAIN", "NO_COLOR"} {
+	for _, name := range []string{"LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "LOOPCODER_NO_EMOJI", "LOOPCODER_PLAIN", "NO_COLOR"} {
 		name := name
 		old, ok := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
@@ -1949,6 +2294,22 @@ func validDispatchAttestation() attestation.AttestationRecord {
 			TotalTokens:  int64TestPtr(154),
 		},
 		Verified: true,
+	}
+}
+
+func validDispatchResult(record attestation.AttestationRecord) worker.Result {
+	return worker.Result{
+		OK:          true,
+		Issue:       101,
+		Branch:      "loop/issue-101",
+		RunID:       "run-test",
+		PR:          "https://github.com/owner/repo/pull/101",
+		Summary:     "Implemented dispatch.",
+		AttemptPath: "/repo/.loopcoder/runs/run-test/workers/job-101-1.attempt.json",
+		Status:      "succeeded",
+		ExitCode:    0,
+		LogBytes:    12,
+		Attestation: &record,
 	}
 }
 

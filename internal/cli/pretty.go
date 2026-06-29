@@ -21,15 +21,21 @@ func isTerminalWriter(w io.Writer) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-func shouldRenderPretty(w io.Writer, explicit bool, deps Deps) bool {
-	return explicit || envFlag("LOOPCODER_PRETTY") || prettyTargetInteractive(w, deps)
+func shouldRenderPretty(suppress bool) bool {
+	return !(suppress || envFlag("LOOPCODER_NO_PRETTY"))
 }
 
-func prettyModeForTarget(w io.Writer, deps Deps) attestation.PrettyMode {
-	if plainPrettyForced() || !prettyTargetInteractive(w, deps) {
+func prettyModeForTarget(w io.Writer, deps Deps, forceEmoji bool) attestation.PrettyMode {
+	if plainPrettyForced() {
 		return attestation.PrettyModePlain
 	}
-	return attestation.PrettyModeEmoji
+	if forceEmoji || envFlag("LOOPCODER_PRETTY") {
+		return attestation.PrettyModeEmoji
+	}
+	if prettyTargetInteractive(w, deps) {
+		return attestation.PrettyModeEmoji
+	}
+	return attestation.PrettyModePlain
 }
 
 func renderPrettyAttestation(w io.Writer, record attestation.AttestationRecord, mode attestation.PrettyMode) error {
