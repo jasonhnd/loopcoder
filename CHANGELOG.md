@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-06-30
+
+### Changed
+
+- `dispatch`, `loopreview`, and `dispatch-wave` now emit the human-readable pretty attestation block to stderr by default per [`docs/specs/0282-default-pretty-attestation.md`](docs/specs/0282-default-pretty-attestation.md). The default uses emoji on a TTY and plain ASCII on non-TTY output.
+- `--pretty` and `LOOPCODER_PRETTY` force emoji pretty output even on non-TTY output; `--no-pretty` and `LOOPCODER_NO_PRETTY` suppress pretty output and win over force.
+- `dispatch-wave` emits one pretty Worker attestation block per dispatched issue.
+- The conductor playbook now relays Worker and Verifier pretty attestation blocks verbatim from command stderr instead of hand-formatting attestation report lines.
+
+### Notes
+
+- Machine contracts are unchanged: canonical JSON, `Header()` / `[attestation] ...`, PR bodies, verifier JSON, and fail-closed attestation validation keep their existing behavior.
+
 ## [0.3.3] - 2026-06-29
 
 ### Added

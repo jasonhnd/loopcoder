@@ -103,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/ins
 To pin a version:
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.3
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.4
 ```
 
 On Windows PowerShell:
@@ -115,7 +115,7 @@ irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps
 To pin a version on Windows:
 
 ```text
-$env:LOOPCODER_VERSION = "0.3.3"
+$env:LOOPCODER_VERSION = "0.3.4"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
@@ -477,17 +477,22 @@ Worker attestation can read either the header or the nested `attestation`
 object. The canonical JSON line is the exact machine rendering of that same
 record and is not wrapped in Markdown on stdout.
 
-When `dispatch` runs in an interactive terminal, it also renders the same
-validated Worker attestation in a human-readable form on stderr. This display
-never appears between the three stdout records. Redirected or piped dispatch
-runs emit no pretty output unless the caller opts in with `--pretty` or
-`LOOPCODER_PRETTY=1`; opt-in pretty output still goes to stderr, and stdout
-keeps the same three records.
+`loopcoder dispatch`, `loopcoder loopreview`, and `loopcoder dispatch-wave`
+emit the human-readable pretty attestation block to stderr by default. The
+default block uses emoji on an interactive TTY and plain ASCII on a non-TTY.
+`dispatch-wave` emits one Worker block per dispatched issue.
 
-`loopcoder loopreview` follows the same interactive display rule for the
-Verifier attestation: the verdict JSON remains stdout, and any pretty
-attestation display is stderr-only. Use `--pretty` or `LOOPCODER_PRETTY=1` to
-request the display in non-interactive runs.
+`--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
+output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
+and wins over any force or default setting. When pretty output is shown,
+`NO_COLOR`, `LOOPCODER_PLAIN=1`, or `LOOPCODER_NO_EMOJI=1` forces the plain
+ASCII form.
+
+Pretty output is diagnostic stderr only. It never appears between the three
+`dispatch` stdout records, and it does not change `loopreview` verdict JSON,
+PR bodies, canonical JSON, or the stable `Header()` / `[attestation] ...`
+contracts. The conductor relays the stderr block verbatim for human reporting;
+machine consumers should continue to parse canonical JSON or stable headers.
 
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
 followed by the one-line `[attestation] ...` header, forces `model_source` to
@@ -501,8 +506,8 @@ comments, merge commit bodies, and PR notes. Use `loopcoder attest --pretty`
 only for direct human reading; it prints the pretty rendering to stdout instead
 of the canonical JSON plus header.
 
-Interactive pretty output uses emoji when the target is an interactive terminal
-and emoji is not disabled:
+Pretty output uses emoji when the target is an interactive terminal, or when
+emoji is forced, and emoji is not disabled:
 
 ```text
 ✅ attestation verified
@@ -520,8 +525,8 @@ and emoji is not disabled:
    verified    true
 ```
 
-Non-interactive output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
-`LOOPCODER_PLAIN=1` forces the plain ASCII form with the same fields:
+Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
+`LOOPCODER_PLAIN=1` uses the plain ASCII form with the same fields:
 
 ```text
 attestation: verified
@@ -541,7 +546,8 @@ attestation: verified
 
 Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md),
 [`../specs/0214-human-readable-attestation.md`](../specs/0214-human-readable-attestation.md),
-and [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md).
+[`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md),
+and [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md).
 
 ## Limits
 

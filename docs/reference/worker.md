@@ -159,6 +159,8 @@ deterministic and in the conductor's hands:
 | `--model` | No | unset | Optional provider-specific model override. Passed only when set. |
 | `--effort` | No | unset | Optional provider-specific reasoning effort override. `codex` and `claude` honor it; `gemini` logs an advisory and ignores it. |
 | `--keep-worktree` | No | false | Keeps the worktree and scratch directory for inspection instead of cleaning them up. |
+| `--pretty` | No | false | Forces the human-readable pretty attestation block to stderr in emoji form, even on non-TTY output; absent still uses the default pretty behavior. |
+| `--no-pretty` | No | false | Suppresses the human-readable pretty attestation block. This wins over `--pretty` and `LOOPCODER_PRETTY`. |
 
 ## Model And Effort
 
@@ -213,6 +215,22 @@ The dispatch result fields are:
 - `attestation`: the same validated Worker `AttestationRecord` emitted in the
   first two stdout records.
 
-When stderr is an interactive terminal, or when the caller sets `--pretty` or
-`LOOPCODER_PRETTY=1`, `dispatch` also writes the human-readable pretty
-attestation to stderr. This never changes or reorders the three stdout records.
+As of 0.3.4, `dispatch` writes the human-readable pretty attestation block to
+stderr by default. The default block uses emoji on an interactive TTY and plain
+ASCII on a non-TTY. This never changes or reorders the three stdout records,
+the PR body, the stable `Header()` / `[attestation] ...` line, or the canonical
+JSON.
+
+`--pretty` or `LOOPCODER_PRETTY=1` forces emoji pretty output even on non-TTY
+stderr. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses pretty output and
+wins over force. When pretty output is shown, `NO_COLOR`, `LOOPCODER_PLAIN=1`,
+or `LOOPCODER_NO_EMOJI=1` forces the plain ASCII form.
+
+The same default-on stderr pretty rule applies to `loopcoder loopreview` and
+`loopcoder dispatch-wave`: `loopreview` keeps verdict JSON on stdout, and
+`dispatch-wave` keeps its stdout text report while emitting one Worker pretty
+block per dispatched issue. Pretty output is for human diagnostics and
+conductor relay, not for machine parsing.
+
+Design rationale:
+[`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md).
