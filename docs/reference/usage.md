@@ -8,6 +8,71 @@ Use it when you want one conductor chat to plan, dispatch, review, and merge a
 small batch of repository work without manually relaying every step between
 GitHub, git worktrees, worker providers, and PR review.
 
+## Quickstart (new project)
+
+Use this flow to onboard an existing repository from zero to a driven
+loopcoder loop. One installed binary can serve many local repositories; each
+repository keeps its own `.delivery.yml` and loopcoder run state.
+
+Per-project prerequisites: `git`, authenticated `gh`, at least one
+authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
+push access.
+
+1. Install the binary once per machine, shared across all local projects.
+
+   Unix-like systems:
+
+   ```text
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+   ```
+
+   Windows PowerShell:
+
+   ```text
+   irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+   ```
+
+   The installer puts `loopcoder` under `~/.loopcoder/bin`. Keep that directory
+   on `PATH`, or set `LOOPCODER_BIN` to the full binary path.
+
+2. Verify the install and global environment.
+
+   ```text
+   loopcoder --version
+   loopcoder doctor
+   ```
+
+3. Install the conductor playbook once per agent home so Claude Code and Codex
+   know how to act as conductor.
+
+   ```text
+   loopcoder skill install
+   ```
+
+   This writes the bundled `SKILL.md` plus the Codex `AGENTS.md` entrypoint to
+   the Claude Code loopcoder skill directory.
+
+4. Initialize each consumer repository.
+
+   ```text
+   cd <repo>
+   loopcoder init
+   loopcoder doctor
+   ```
+
+   `loopcoder init` scaffolds `.delivery.yml`, `ROADMAP.md`, and the GitHub
+   labels loopcoder uses. The follow-up `loopcoder doctor` confirms `git`, `gh`
+   auth, provider CLIs, `origin`, and the default branch for that repository.
+
+5. Drive the loop from a conductor session in the repository.
+
+   ```text
+   /loopcoder <your need>
+   ```
+
+   The conductor plans the work, dispatches workers, runs `loopreview`, and
+   reports merge-ready pull requests. You remain the merge gate.
+
 ## Prerequisites
 
 - A conductor host session that follows `SKILL.md`, `AGENTS.md`, or `GEMINI.md`.
