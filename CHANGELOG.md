@@ -16,15 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `loopcoder version` plus root `--version` and `-v` print the selected binary version, commit, build date, Go version, and platform.
 - `loopcoder doctor` runs a read-only preflight reporting `git`, `gh` authentication, configured provider CLIs, the origin remote and detected default branch, `.delivery.yml` validity, binary version and `min_loopcoder_version` compatibility, and conductor-runtime ownership per [`docs/specs/0212-release-distribution-and-upgrade.md`](docs/specs/0212-release-distribution-and-upgrade.md).
 - `dispatch` now surfaces Worker attestation with the stable header, canonical JSON, and final result JSON `attestation` object per [`docs/specs/0218-surface-worker-attestation.md`](docs/specs/0218-surface-worker-attestation.md).
-- Human-readable attestation pretty rendering is available per [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md).
+- Human-readable attestation pretty rendering, including `--pretty` on `dispatch`, `loopreview`, and `attest`, per [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md). `dispatch` and `loopreview` keep machine stdout stable and write the pretty display to stderr; `attest --pretty` is an explicit opt-in and the default durable output is unchanged.
 - Optional `.delivery.yml` `verifier.model` and `verifier.reasoning_effort` settings configure the verifier role per [`docs/specs/0215-per-role-model-override.md`](docs/specs/0215-per-role-model-override.md).
 - Worker token usage captures input and output splits when the provider exposes them per spec 0218.
 - [`docs/reference/stability-policy.md`](docs/reference/stability-policy.md) documents the 0.x compatibility policy for `.delivery.yml`, CLI flags, and labels.
+- `loopcoder init` scaffolds `.delivery.yml` and `ROADMAP.md`, ensures the default labels, and can persist first-run worker and verifier model and effort defaults per spec 0212 and [`docs/specs/0215-per-role-model-override.md`](docs/specs/0215-per-role-model-override.md).
+- The conductor playbook (`SKILL.md` and `AGENTS.md`) is embedded in the binary, and `loopcoder skill install` writes it to the Claude skill directory per spec 0212.
+- `loopcoder upgrade [--version]` self-updates from GitHub Releases with checksum-before-install verification, an atomic swap, and a Windows deferred-swap fallback per spec 0212.
+- A `~/.loopcoder` home with a versioned binary store, `LOOPCODER_HOME` and `LOOPCODER_BIN` resolution, and semver-aware version ordering per spec 0212.
+- `dispatch` and `loopreview` accept provider-agnostic `--model` and `--effort` overrides for per-run model and reasoning-effort selection per spec 0215.
+- `dispatch-wave` surfaces each worker's attestation facts (provider, model, effort, permission, duration, token usage, and verified) per spec 0218.
+- A "Quickstart (new project)" guide in [`docs/reference/usage.md`](docs/reference/usage.md) documents install, `doctor`, `skill install`, per-repo `init`, and driving the loop per spec 0212.
 
 ### Changed
 
 - Verifier provider invocation is read-only and headless-hardened per #204: `claude` uses `--print` with a `Read Grep Glob` allowlist and no plan mode, and `codex` uses `exec -s read-only`.
 - `.delivery.yml adapters.verifier` now uses the real `claude` provider instead of the invalid `opus` value per spec 0215.
+- Release and CI workflows use GitHub Action versions that no longer rely on the deprecated Node 20 runtime per spec 0212.
 
 ### Fixed
 

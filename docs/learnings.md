@@ -106,7 +106,7 @@ higher-authority source and report the conflict.
 
 - Scope: PR #251
 - Role: conductor
-- Observed: A verifier claimed three GitHub Actions (`checkout`/`setup-go`/`upload-artifact`/`download-artifact`) could not all be on their stated major versions (a lockstep assumption from pre-cutoff knowledge); ground-truthing showed all were current.
+- Observed: A verifier claimed four GitHub Actions (`checkout`/`setup-go`/`upload-artifact`/`download-artifact`) could not all be on their stated major versions (a lockstep assumption from pre-cutoff knowledge); ground-truthing showed all were current.
 - Evidence: PR #251; verified via `gh api repos/<action>/releases/latest`.
 - Learning: Both worker and verifier have knowledge cutoffs and will assert stale "facts" about versions/APIs. The conductor must independently verify factual claims with `gh api` / `git ls-remote` before trusting OR overriding either side.
 - Applies to: conductor, process
