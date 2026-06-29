@@ -26,6 +26,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -55,6 +56,7 @@ type Deps struct {
 	Verify          func(ctx context.Context, opts verify.Options) verify.Result
 	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
 	Init            func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade         func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
 	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
 	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
@@ -66,6 +68,7 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
+	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -120,6 +123,9 @@ func DefaultDeps() Deps {
 		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
+		},
+		Upgrade: func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			return upgrade.Run(ctx, opts, upgrade.DefaultDeps())
 		},
 		StatePush: func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
@@ -178,6 +184,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "init" {
 		return runInit(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "upgrade" {
+		return runUpgrade(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
@@ -281,6 +290,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
 		fmt.Fprintln(w, "  --verifier-effort string    optional first-run verifier reasoning effort to persist")
+	}
+	if command.Name == "upgrade" {
+		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
 	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -559,6 +571,64 @@ func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
+}
+
+func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Upgrade == nil {
+		deps.Upgrade = DefaultDeps().Upgrade
+	}
+
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var requestedVersion string
+	var requestedVersionAlias string
+	fs.StringVar(&requestedVersion, "version", "", "release version")
+	fs.StringVar(&requestedVersionAlias, "Version", "", "release version")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if requestedVersionAlias != "" {
+		requestedVersion = requestedVersionAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "upgrade: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	build := normalizeBuildInfo(deps.BuildInfo)
+	result, err := deps.Upgrade(context.Background(), upgrade.Options{
+		RequestedVersion: requestedVersion,
+		CurrentVersion:   build.Version,
+	})
+	if result.CurrentPath != "" || result.CurrentVersion != "" {
+		renderUpgradeCurrent(stdout, result)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "upgrade: %v\n", err)
+		return 1
+	}
+	renderUpgradeSuccess(stdout, result)
+	return 0
+}
+
+func renderUpgradeCurrent(w io.Writer, result upgrade.Result) {
+	fmt.Fprintf(w, "Current selected binary: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
+}
+
+func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
+	fmt.Fprintf(w, "Resolved target version: %s\n", result.TargetVersion)
+	fmt.Fprintf(w, "Platform asset: %s (%s)\n", result.AssetName, result.Platform)
+	fmt.Fprintf(w, "Installed versioned binary: %s\n", result.VersionBinaryPath)
+	if result.Deferred {
+		fmt.Fprintf(w, "Stable selected binary: %s (deferred Windows swap from %s)\n", result.StableBinaryPath, result.PendingPath)
+	} else {
+		fmt.Fprintf(w, "Stable selected binary: %s\n", result.StableBinaryPath)
+	}
+	fmt.Fprintf(w, "Before: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
+	fmt.Fprintf(w, "After: path=%s version=%s\n", result.StableBinaryPath, result.TargetVersion)
+	fmt.Fprintln(w, "Run: loopcoder doctor")
 }
 
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
