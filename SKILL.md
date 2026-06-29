@@ -221,7 +221,11 @@ Bounds and scrutiny:
    - Dispatch one ready wave with `loopcoder dispatch-wave --repo . --base-branch <base-branch> --run-id <run-id> ...`, or dispatch one issue with `loopcoder dispatch ...`. Then recompute as PRs merge. Repeat until the DAG is drained or blocked.
    - `loopcoder dispatch` and `loopcoder dispatch-wave` preserve git worktree creation serialization, so independent ready issues can be dispatched concurrently safely.
    - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
-   - Capture each worker's output, job handle, PR URL, and failure details.
+   - Capture each worker's output, job handle, PR URL, failure details, and
+     Worker attestation. Read the final dispatch result line and its
+     `attestation` object; dispatch also surfaces the same record as the stable
+     `[attestation] ...` header plus canonical JSON, symmetric with the
+     Verifier attestation from `loopreview`.
 
    Example shape:
 
@@ -261,6 +265,15 @@ Bounds and scrutiny:
 
 7. Report progress and final status.
    - Report meaningful state changes in chat: issues published, workers dispatched, PRs opened, checks passed/failed, verifier verdicts, blocked items, and unblocked dependents.
+   - Every worker-dispatch progress report and final summary must include one
+     Worker attestation line per dispatched issue: issue number and PR, Worker
+     provider, model with `model_source`, reasoning depth / effort, permission,
+     duration, token usage as input / output / total, and `verified`. Render
+     any absent token field as `not reported`.
+   - Keep Worker and Verifier attestations separate. Continue reporting the
+     Verifier provider, model, effort, permission, duration, token usage, and
+     `verified` from `loopreview` output; do not sum Worker and Verifier
+     tokens.
    - Continue until the DAG is drained or blocked.
    - Run the learning review from "Learnings (self-improvement)": collect
      worker-returned candidates, draft any proposed learning entries for human
@@ -270,7 +283,8 @@ Bounds and scrutiny:
      or a recurring failure class, offer the optional deeper pass from
      "Improvement review" and stop after its candidate report unless the human
      approves issue creation.
-   - End with a final summary listing issues, PRs, verifier status, check status, and any human decisions still needed.
+   - End with a final summary listing issues, PRs, Worker attestation facts,
+     verifier status, check status, and any human decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
 ## Verification gate

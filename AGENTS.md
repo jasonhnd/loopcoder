@@ -18,6 +18,7 @@ Codex host specifics:
 - Do not choose model or effort settings for the user. Follow the configured
   `adapters.worker` and any explicit user overrides exactly as described in
   [`SKILL.md`](SKILL.md).
+- Report worker-dispatch attestations exactly as required by [`SKILL.md`](SKILL.md).
 - Verification still delegates the primary adversarial review to
   `loopcoder loopreview`; the verifier provider SHOULD differ from the worker
   provider, and human merge remains the final gate.
