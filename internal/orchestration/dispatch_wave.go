@@ -432,6 +432,9 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 			if strings.TrimSpace(result.PR) != "" {
 				fmt.Fprintf(&out, "  pr: %s\n", result.PR)
 			}
+			if result.Attestation != nil {
+				fmt.Fprintf(&out, "  attestation: %s\n", formatDispatchWaveAttestation(*result.Attestation))
+			}
 			if strings.TrimSpace(result.AttemptPath) != "" {
 				fmt.Fprintf(&out, "  attempt: %s\n", filepath.ToSlash(result.AttemptPath))
 			}
@@ -449,6 +452,33 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 	fmt.Fprintln(&out, "- Recover failed attempts before retrying the issue.")
 	fmt.Fprintln(&out, "- Run resume after human review, merge, or interruption.")
 	return out.String()
+}
+
+func formatDispatchWaveAttestation(record attestation.AttestationRecord) string {
+	return fmt.Sprintf(
+		"provider=%s model=%s(%s) effort=%s permission=%s duration=%s tokens input=%s output=%s total=%s verified=%t",
+		record.Provider,
+		record.Model,
+		record.ModelSource,
+		record.Effort,
+		record.Permission,
+		formatDispatchWaveDuration(record.DurationMS),
+		formatDispatchWaveToken(record.Usage.InputTokens),
+		formatDispatchWaveToken(record.Usage.OutputTokens),
+		formatDispatchWaveToken(record.Usage.TotalTokens),
+		record.Verified,
+	)
+}
+
+func formatDispatchWaveDuration(durationMS int64) string {
+	return (time.Duration(durationMS) * time.Millisecond).String()
+}
+
+func formatDispatchWaveToken(value *int64) string {
+	if value == nil {
+		return "not reported"
+	}
+	return fmt.Sprintf("%d", *value)
 }
 
 func DispatchWaveHasFailures(report DispatchWaveReport) bool {

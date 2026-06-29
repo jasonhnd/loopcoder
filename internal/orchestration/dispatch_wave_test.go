@@ -237,6 +237,77 @@ func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
 	}
 }
 
+func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
+	split := waveSplitAttestation(21, 2447, 4461, 6908)
+	split.Provider = "claude"
+	split.Model = "claude-sonnet-4-5"
+	split.Effort = "high"
+	split.DurationMS = 42000
+
+	totalOnly := waveAttestation(22, 102585)
+	totalOnly.Provider = "codex"
+	totalOnly.Model = "gpt-5.5"
+	totalOnly.Effort = "xhigh"
+	totalOnly.DurationMS = 42000
+
+	report := DispatchWaveReport{
+		Repo:            "owner/repo",
+		RepoPath:        "/repo",
+		BaseBranch:      "main",
+		RunID:           "run-test-wave",
+		IssuesRequested: []int{21, 22, 23},
+		StartedAt:       "2026-06-29T00:00:00Z",
+		FinishedAt:      "2026-06-29T00:00:42Z",
+		Results: []DispatchWaveIssueResult{
+			{
+				Issue:       21,
+				Status:      DispatchWaveStatusSucceeded,
+				Branch:      "loop/issue-21",
+				PR:          "https://github.com/owner/repo/pull/21",
+				AttemptPath: ".loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
+				Attestation: split,
+			},
+			{
+				Issue:       22,
+				Status:      DispatchWaveStatusSucceeded,
+				Branch:      "loop/issue-22",
+				PR:          "https://github.com/owner/repo/pull/22",
+				AttemptPath: ".loopcoder/runs/run-test-wave/workers/job-22.attempt.json",
+				Attestation: totalOnly,
+			},
+			{
+				Issue:  23,
+				Status: DispatchWaveStatusSkipped,
+				Error:  "issue was not ready during preflight",
+			},
+		},
+	}
+
+	text := RenderDispatchWaveText(report)
+	for _, want := range []string{
+		"- #21 succeeded",
+		"  branch: loop/issue-21",
+		"  pr: https://github.com/owner/repo/pull/21",
+		"  attestation: provider=claude model=claude-sonnet-4-5(parsed) effort=high permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
+		"  attempt: .loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
+		"- #22 succeeded",
+		"  attestation: provider=codex model=gpt-5.5(parsed) effort=xhigh permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
+		"- #23 skipped",
+		"  error: issue was not ready during preflight",
+		"Verify successful PRs",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rendered dispatch wave missing %q:\n%s", want, text)
+		}
+	}
+	if got := strings.Count(text, "  attestation: "); got != 2 {
+		t.Fatalf("rendered %d attestation lines, want 2:\n%s", got, text)
+	}
+	if strings.Contains(text, "attestation: not reported") {
+		t.Fatalf("nil attestation result should omit attestation line:\n%s", text)
+	}
+}
+
 func TestDispatchWaveSharedRunIDPropagation(t *testing.T) {
 	var mu sync.Mutex
 	var runIDs []string
@@ -461,6 +532,13 @@ func waveAttestation(issue int, totalTokens int64) *attestation.AttestationRecor
 		},
 		Verified: true,
 	}
+}
+
+func waveSplitAttestation(issue int, inputTokens, outputTokens, totalTokens int64) *attestation.AttestationRecord {
+	record := waveAttestation(issue, totalTokens)
+	record.Usage.InputTokens = &inputTokens
+	record.Usage.OutputTokens = &outputTokens
+	return record
 }
 
 func noAttempts(string, string) ([]state.Attempt, error) {
