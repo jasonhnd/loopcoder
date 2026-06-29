@@ -36,6 +36,9 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Resilience.Worker.RetryBackoffSeconds, []int{10, 30, 120}) {
 		t.Fatalf("RetryBackoffSeconds = %v, want [10 30 120]", cfg.Resilience.Worker.RetryBackoffSeconds)
 	}
+	if cfg.Verifier.Model != "" || cfg.Verifier.ReasoningEffort != "" {
+		t.Fatalf("Verifier = %#v, want inherited empty config", cfg.Verifier)
+	}
 }
 
 func TestParseReadsConfiguredSections(t *testing.T) {
@@ -47,13 +50,16 @@ adapters:
   conductor: opus
   worker: codex
   vcs: github
-  verifier: opus
+  verifier: claude
   gate: human-merge
 worker:
   base_branch: trunk
   model: gpt-test
   reasoning_effort: high
   command_hint: implement and test
+verifier:
+  model: claude-test
+  reasoning_effort: xhigh
 ci:
   checks: [verify, go]
   tests:
@@ -100,7 +106,7 @@ guardrails:
 	if cfg.Adapters.Conductor != "opus" || cfg.Adapters.Worker != "codex" {
 		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
 	}
-	if cfg.Adapters.VCS != "github" || cfg.Adapters.Verifier != "opus" {
+	if cfg.Adapters.VCS != "github" || cfg.Adapters.Verifier != "claude" {
 		t.Fatalf("Adapters parsed incorrectly: %#v", cfg.Adapters)
 	}
 	if cfg.Adapters.Gate != "human-merge" {
@@ -111,6 +117,9 @@ guardrails:
 	}
 	if cfg.Worker.ReasoningEffort != "high" || cfg.Worker.CommandHint != "implement and test" {
 		t.Fatalf("Worker parsed incorrectly: %#v", cfg.Worker)
+	}
+	if cfg.Verifier.Model != "claude-test" || cfg.Verifier.ReasoningEffort != "xhigh" {
+		t.Fatalf("Verifier parsed incorrectly: %#v", cfg.Verifier)
 	}
 	if !reflect.DeepEqual(cfg.CI.Checks, []string{"verify", "go"}) {
 		t.Fatalf("CI.Checks = %v, want [verify go]", cfg.CI.Checks)
@@ -171,6 +180,41 @@ guardrails:
 	}
 	if cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts == nil || *cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts != 3 {
 		t.Fatalf("Guardrails.CircuitBreaker.MaxNoProgressAttempts = %#v, want 3", cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts)
+	}
+}
+
+func TestParseTreatsEmptyVerifierFieldsAsAbsent(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "quoted empty strings",
+			body: `verifier:
+  model: ""
+  reasoning_effort: ""
+`,
+		},
+		{
+			name: "empty scalars",
+			body: `verifier:
+  model:
+  reasoning_effort:
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("Parse returned error: %v", err)
+			}
+
+			if cfg.Verifier.Model != "" || cfg.Verifier.ReasoningEffort != "" {
+				t.Fatalf("Verifier = %#v, want inherited empty config", cfg.Verifier)
+			}
+		})
 	}
 }
 
@@ -264,7 +308,7 @@ func TestReviewerNotWorkerWarning(t *testing.T) {
 			name: "different providers empty",
 			adapters: Adapters{
 				Worker:   "codex",
-				Verifier: "opus",
+				Verifier: "claude",
 			},
 			want: "",
 		},

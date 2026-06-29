@@ -5,7 +5,7 @@ adapters:
   conductor: opus         # Transparency only: the human session that conducts.
   worker: codex           # Codex implements each issue.
   vcs: github             # GitHub hosts PRs and checks.
-  verifier: opus          # SHOULD differ from worker; conductor self-reviews until loopreview lands.
+  verifier: claude        # SHOULD differ from worker; provider registry key.
   gate: human-merge       # Humans choose what merges.
 worker:
   # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
@@ -14,6 +14,11 @@ worker:
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
+# verifier:
+#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets these on its own; they appear only when you state a permanent preference.
+#   # model:
+#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets these on its own; they appear only when you state a permanent preference.
+#   # reasoning_effort:
 # resilience:
 #   worker:
 #     Optional. Absent = 15; expected worker heartbeat cadence in seconds.
