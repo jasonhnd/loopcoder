@@ -221,6 +221,73 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	}
 }
 
+func TestReplaceStableBinaryWindowsSchedulesDeferredReplaceWhenAtomicAndBackupRenamesFail(t *testing.T) {
+	fsys := newFakeFS()
+	stablePath := filepath.Join("home", ".loopcoder", "bin", "loopcoder.exe")
+	tmpPath := filepath.Join("home", ".loopcoder", "bin", ".loopcoder.v0.3.3.tmp")
+	backupPath := stablePath + ".old"
+	pendingPath := stablePath + ".new"
+	oldBinary := []byte("old running binary")
+	newBinary := []byte("new loopcoder binary")
+	if err := fsys.WriteFile(stablePath, oldBinary, 0o755); err != nil {
+		t.Fatalf("WriteFile stable returned error: %v", err)
+	}
+	if err := fsys.WriteFile(tmpPath, newBinary, 0o755); err != nil {
+		t.Fatalf("WriteFile tmp returned error: %v", err)
+	}
+
+	atomicErr := errors.New("running executable blocks atomic replace")
+	backupErr := errors.New("running executable blocks backup rename")
+	fsys.failRename(tmpPath, stablePath, atomicErr)
+	fsys.failRename(stablePath, backupPath, backupErr)
+	var scheduled [][2]string
+
+	deferred, pending, err := replaceStableBinary(Deps{
+		Rename: fsys.Rename,
+		Remove: fsys.Remove,
+		ScheduleReplace: func(source string, target string) error {
+			scheduled = append(scheduled, [2]string{source, target})
+			return nil
+		},
+		RuntimeGOOS: "windows",
+	}, tmpPath, stablePath)
+	if err != nil {
+		t.Fatalf("replaceStableBinary returned error: %v", err)
+	}
+	if !deferred {
+		t.Fatal("deferred = false, want true")
+	}
+	if pending != pendingPath {
+		t.Fatalf("pending = %q, want %q", pending, pendingPath)
+	}
+	if got := string(fsys.files[stablePath]); got != string(oldBinary) {
+		t.Fatalf("stable binary bytes = %q, want preserved old binary %q", got, oldBinary)
+	}
+	if got := string(fsys.files[pendingPath]); got != string(newBinary) {
+		t.Fatalf("pending binary bytes = %q, want staged new binary %q", got, newBinary)
+	}
+	if _, ok := fsys.files[tmpPath]; ok {
+		t.Fatalf("tmp binary %q still exists after staging pending replacement", tmpPath)
+	}
+	if _, ok := fsys.files[backupPath]; ok {
+		t.Fatalf("backup binary %q exists even though backup rename failed", backupPath)
+	}
+	if !reflect.DeepEqual(scheduled, [][2]string{{pendingPath, stablePath}}) {
+		t.Fatalf("scheduled replacements = %#v, want pending replacement %#v", scheduled, [][2]string{{pendingPath, stablePath}})
+	}
+	wantAttempts := [][2]string{
+		{tmpPath, stablePath},
+		{stablePath, backupPath},
+		{tmpPath, pendingPath},
+	}
+	if !reflect.DeepEqual(fsys.renameAttempts, wantAttempts) {
+		t.Fatalf("rename attempts = %#v, want %#v", fsys.renameAttempts, wantAttempts)
+	}
+	if !reflect.DeepEqual(fsys.renames, [][2]string{{tmpPath, pendingPath}}) {
+		t.Fatalf("successful renames = %#v, want pending stage rename", fsys.renames)
+	}
+}
+
 func releaseJSON(t *testing.T, rel release) []byte {
 	t.Helper()
 	data, err := json.Marshal(rel)
@@ -261,17 +328,20 @@ func wantBinaryFileName() string {
 }
 
 type fakeFS struct {
-	dirs    map[string]bool
-	files   map[string][]byte
-	modes   map[string]fs.FileMode
-	renames [][2]string
+	dirs           map[string]bool
+	files          map[string][]byte
+	modes          map[string]fs.FileMode
+	renameErrs     map[[2]string]error
+	renameAttempts [][2]string
+	renames        [][2]string
 }
 
 func newFakeFS() *fakeFS {
 	return &fakeFS{
-		dirs:  map[string]bool{},
-		files: map[string][]byte{},
-		modes: map[string]fs.FileMode{},
+		dirs:       map[string]bool{},
+		files:      map[string][]byte{},
+		modes:      map[string]fs.FileMode{},
+		renameErrs: map[[2]string]error{},
 	}
 }
 
@@ -296,7 +366,18 @@ func (f *fakeFS) Chmod(path string, mode fs.FileMode) error {
 	return nil
 }
 
+func (f *fakeFS) failRename(oldPath string, newPath string, err error) {
+	if err == nil {
+		err = errors.New("rename failed")
+	}
+	f.renameErrs[[2]string{oldPath, newPath}] = err
+}
+
 func (f *fakeFS) Rename(oldPath string, newPath string) error {
+	f.renameAttempts = append(f.renameAttempts, [2]string{oldPath, newPath})
+	if err, ok := f.renameErrs[[2]string{oldPath, newPath}]; ok {
+		return err
+	}
 	data, ok := f.files[oldPath]
 	if !ok {
 		return errors.New("missing source")
