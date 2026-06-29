@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -33,11 +34,18 @@ type Command struct {
 	Summary string
 }
 
+type BuildInfo struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
 type Deps struct {
 	NewGitHubReader func(repoPath string) orchestration.GitHubReader
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
 	Stdin           io.Reader
+	BuildInfo       BuildInfo
 	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
@@ -51,6 +59,7 @@ type Deps struct {
 
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
+	{Name: "version", Summary: "print version and build information"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -72,6 +81,12 @@ func Commands() []Command {
 // Run executes the CLI and returns a process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
+}
+
+func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) int {
+	deps := DefaultDeps()
+	deps.BuildInfo = build
+	return RunWithDeps(args, stdout, stderr, deps)
 }
 
 func DefaultDeps() Deps {
@@ -114,6 +129,14 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		PrintRootHelp(stdout)
 		return 0
 	}
+	if isRootVersion(args[0]) {
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "version: unexpected argument %q\n", args[1])
+			return 2
+		}
+		printVersion(stdout, deps.BuildInfo)
+		return 0
+	}
 
 	command, ok := findCommand(args[0])
 	if !ok {
@@ -134,6 +157,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "version" {
+		return runVersion(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "resume" {
 		return runResume(args[1:], stdout, stderr, deps)
@@ -171,6 +197,8 @@ func PrintRootHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder <command> [flags]")
 	fmt.Fprintln(w, "  loopcoder --help")
+	fmt.Fprintln(w, "  loopcoder --version")
+	fmt.Fprintln(w, "  loopcoder -v")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	for _, command := range commands {
@@ -323,11 +351,58 @@ func isHelp(arg string) bool {
 	return arg == "-h" || arg == "--help" || arg == "help"
 }
 
+func isRootVersion(arg string) bool {
+	return arg == "-v" || arg == "--version"
+}
+
 func sentenceCase(s string) string {
 	if s == "" {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:] + "."
+}
+
+func runVersion(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "version: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	printVersion(stdout, deps.BuildInfo)
+	return 0
+}
+
+func printVersion(w io.Writer, build BuildInfo) {
+	build = normalizeBuildInfo(build)
+	fmt.Fprintf(
+		w,
+		"loopcoder version=%s commit=%s date=%s go=%s platform=%s/%s\n",
+		build.Version,
+		build.Commit,
+		build.Date,
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
+}
+
+func normalizeBuildInfo(build BuildInfo) BuildInfo {
+	if strings.TrimSpace(build.Version) == "" {
+		build.Version = "dev"
+	}
+	if strings.TrimSpace(build.Commit) == "" {
+		build.Commit = "unknown"
+	}
+	if strings.TrimSpace(build.Date) == "" {
+		build.Date = "unknown"
+	}
+	return build
 }
 
 func runState(args []string, stdout, stderr io.Writer, deps Deps) int {
