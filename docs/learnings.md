@@ -137,3 +137,15 @@ higher-authority source and report the conflict.
 - Candidate improvement: document the canonical strong-verifier model id once a deterministic pin string is confirmed.
 - Confidence: medium
 - Supersedes: none
+
+### 2026-06-29 - run 2026-06-29-v0.3.3 - Distribution correctness lives outside the test suite -- verify the published artifact
+
+- Scope: PRs #278 / #279 (release `-ldflags` version stamping); v0.3.3 re-cut
+- Role: conductor
+- Observed: The published v0.3.3 binaries passed the full unit suite and both CI checks, yet a downloaded release binary reported `version=dev commit=unknown date=unknown`. Root cause: `.github/workflows/release.yml` built with `-trimpath` but no `-ldflags`, so the `cmd/loopcoder/main.go` version/commit/date vars kept their defaults. This broke `loopcoder version`, `doctor` version / min-version reporting, and `upgrade`'s already-latest detection for every consumer.
+- Evidence: Downloaded `loopcoder_0.3.3_windows_amd64.zip` from the GitHub release, verified its SHA256 against `SHA256SUMS`, and ran the binary: `--version` showed `version=dev` before the fix and `version=0.3.3 commit=<sha> date=<ts>` after PRs #278 / #279; `upgrade` then reported "Already latest; no download needed."
+- Learning: Green unit tests and green CI do not prove distribution correctness. Version stamping, archive packaging, checksums, and install/upgrade behavior only hold in the real released artifact. After every release cut, download at least one published platform binary, verify its checksum, and run `loopcoder version` and `loopcoder upgrade` to confirm the binary self-reports its real version and recognizes itself as already-latest -- act as a consumer, do not trust green CI alone.
+- Applies to: conductor, scripts, process
+- Candidate improvement: Partially mitigated -- `release.yml` now smokes the native linux/amd64 build's `--version` and fails on `version=dev`. A follow-up could add a post-publish download-and-verify step (checksum + `--version`) to the release workflow.
+- Confidence: high
+- Supersedes: none
