@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,11 @@ func TestRootHelpListsSubcommands(t *testing.T) {
 	}
 
 	help := stdout.String()
+	for _, want := range []string{"loopcoder --version", "loopcoder -v"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("root help missing %q:\n%s", want, help)
+		}
+	}
 	for _, command := range Commands() {
 		if !strings.Contains(help, command.Name) {
 			t.Fatalf("root help does not list %q:\n%s", command.Name, help)
@@ -60,6 +66,70 @@ func TestSubcommandHelpWorks(t *testing.T) {
 				t.Fatalf("command help missing --help flag:\n%s", help)
 			}
 		})
+	}
+}
+
+func TestVersionCommandAndRootFlagsPrintBuildInfo(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "subcommand", args: []string{"version"}},
+		{name: "root long flag", args: []string{"--version"}},
+		{name: "root short flag", args: []string{"-v"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, Deps{
+				BuildInfo: BuildInfo{
+					Version: "v0.3.1",
+					Commit:  "abc123",
+					Date:    "2026-06-29T00:00:00Z",
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+
+			output := stdout.String()
+			for _, want := range []string{
+				"loopcoder",
+				"version=v0.3.1",
+				"commit=abc123",
+				"date=2026-06-29T00:00:00Z",
+				"go=" + runtime.Version(),
+				"platform=" + runtime.GOOS + "/" + runtime.GOARCH,
+			} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("version output missing %q:\n%s", want, output)
+				}
+			}
+		})
+	}
+}
+
+func TestVersionDefaultsToDevBuildInfo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"version"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	output := stdout.String()
+	for _, want := range []string{"version=dev", "commit=unknown", "date=unknown"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("version output missing %q:\n%s", want, output)
+		}
 	}
 }
 
