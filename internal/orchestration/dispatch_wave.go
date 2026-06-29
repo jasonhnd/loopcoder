@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -70,6 +71,7 @@ type DispatchWaveIssueResult struct {
 	AttemptPath         string
 	RecoveryContextPath string
 	Error               string
+	Attestation         *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 
 func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveReport, error) {
@@ -368,6 +370,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	if err != nil {
 		result.Status = DispatchWaveStatusFailed
 		result.Error = err.Error()
+		result.Attestation = dispatchResult.Attestation
 		enrichDispatchWaveFailure(&result, opts)
 		return result
 	}
@@ -375,6 +378,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	result.Branch = dispatchResult.Branch
 	result.PR = dispatchResult.PR
 	result.AttemptPath = dispatchResult.AttemptPath
+	result.Attestation = dispatchResult.Attestation
 	return result
 }
 
