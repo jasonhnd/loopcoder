@@ -127,6 +127,11 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 	}
 
 	metadata.Model = claudePrimaryModel(payload.ModelUsage)
+	if inv.Model != "" {
+		if _, ok := payload.ModelUsage[inv.Model]; ok {
+			metadata.Model = inv.Model
+		}
+	}
 	if inputTokens, ok := parseRawInt64(payload.Usage.InputTokens); ok {
 		metadata.Usage.InputTokens = inputTokens
 	}
