@@ -123,3 +123,6 @@ jobs:
 
       - name: Go test
         run: go test ./...
+
+      - name: Go test (race detector)
+        run: go test -race ./...
