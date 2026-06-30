@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-06-30
+
+### Fixed
+
+- `loopcoder skill install` now updates a stale managed skill file instead of silently skipping it; `loopcoder upgrade` refreshes the bundled conductor skill from the newly selected binary; and `loopcoder doctor` warns on stale or partial installs per [`docs/specs/0291-skill-propagation-on-upgrade.md`](docs/specs/0291-skill-propagation-on-upgrade.md). Upgrading the binary now propagates the conductor playbook.
+- Claude attestation now reports the pinned/configured model when that model is present in the provider's reported usage, instead of attributing the invocation to a token-dominant auxiliary model per [`docs/specs/0300-model-attribution.md`](docs/specs/0300-model-attribution.md).
+
+### Changed
+
+- The human-readable attestation block now shows the provider vendor (OpenAI/Anthropic/Google) plus the CLI `tool`, renders model source as `(detected)` or `(self-reported)`, uses host-local timestamps to the second, reports duration in seconds, and uses thousands-separated token counts with a derived total when only input/output are reported per [`docs/specs/0296-attestation-display-polish.md`](docs/specs/0296-attestation-display-polish.md).
+- `.delivery.yml` pins the verifier model and effort with `model: "claude-opus-4-8[1m]"` and `reasoning_effort: max`.
+
+### Notes
+
+- Machine contracts are unchanged: canonical JSON, the `[attestation]` header, validation, and fail-closed behavior keep their existing behavior.
+
 ## [0.3.4] - 2026-06-30
 
 ### Changed

@@ -103,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/ins
 To pin a version:
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.4
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.5
 ```
 
 On Windows PowerShell:
@@ -115,7 +115,7 @@ irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps
 To pin a version on Windows:
 
 ```text
-$env:LOOPCODER_VERSION = "0.3.4"
+$env:LOOPCODER_VERSION = "0.3.5"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
@@ -228,6 +228,15 @@ report:
   channel: chat
 ```
 
+The verifier role has its own optional model and reasoning-effort settings.
+Quote model IDs that contain YAML-special characters such as `[1m]`:
+
+```yaml
+verifier:
+  model: "claude-opus-4-8[1m]"
+  reasoning_effort: max
+```
+
 For compatibility signals such as `min_loopcoder_version`, see
 [`stability-policy.md`](stability-policy.md).
 
@@ -332,6 +341,20 @@ from now on default to high
 
 Only then should loopcoder write `worker.reasoning_effort` or `worker.model`
 into `.delivery.yml`.
+
+Verifier model and effort are configured separately under `verifier:`. For
+example, this pins the independent verifier to the configured Claude model and
+maximum effort for every `loopcoder loopreview` run that uses the repo config:
+
+```yaml
+verifier:
+  model: "claude-opus-4-8[1m]"
+  reasoning_effort: max
+```
+
+The `[1m]` suffix must be quoted in YAML. One-off `loopreview --model` and
+`--effort` overrides remain per-run overrides; `.delivery.yml` is the durable
+project default.
 
 ## Doc-First Process
 
@@ -451,9 +474,12 @@ headless authentication.
 
 Worker and verifier invocations carry binary-stamped attestation records with
 `verified: true`, `model_source: parsed`, provider, real parsed model, effort,
-permission, action, exit code, timing, and token usage. Missing required
-identity or usage fails closed: `dispatch` opens no PR, and `loopreview`
-returns `needs-human` with the incomplete-attestation finding.
+permission, action, exit code, timing, and token usage. For Claude runs with an
+explicit pinned model, the attested model is the pinned/configured model when
+that exact model appears in provider-reported usage; a token-dominant auxiliary
+model does not override it. Missing required identity or usage fails closed:
+`dispatch` opens no PR, and `loopreview` returns `needs-human` with the
+incomplete-attestation finding.
 
 For every successful `loopcoder dispatch`, stdout contains three
 newline-terminated records in this order:
@@ -481,6 +507,16 @@ record and is not wrapped in Markdown on stdout.
 emit the human-readable pretty attestation block to stderr by default. The
 default block uses emoji on an interactive TTY and plain ASCII on a non-TTY.
 `dispatch-wave` emits one Worker block per dispatched issue.
+
+As of v0.3.5, the pretty block displays the provider vendor (`OpenAI`,
+`Anthropic`, or `Google`) plus a separate `tool` line with the canonical CLI
+adapter (`codex`, `claude`, or `gemini`). It renders parsed model sources as
+`(detected)` and Conductor self-attestation as `(self-reported)`, displays
+`started` and `ended` in the host local timezone to whole seconds, reports
+duration as human seconds plus total seconds, and groups token counts with
+thousands separators. When input and output tokens are present without a total,
+the pretty display derives `total=<input+output>` for display only; canonical
+JSON and the stable `[attestation]` header are unchanged.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
@@ -512,16 +548,17 @@ emoji is forced, and emoji is not disabled:
 ```text
 ✅ attestation verified
    role        worker
-   provider    codex
-   model       gpt-5.5 (source=parsed)
+   provider    OpenAI
+   tool        codex
+   model       gpt-5.5 (detected)
    effort      xhigh
    permission  write
    action      "implement issue #218"
    exit        0
-   duration    42s (42000 ms)
-   started     2026-06-29T00:00:00Z
-   ended       2026-06-29T00:00:42Z
-   tokens      input=2447 output=4461 total=6908
+   started     2026-06-30 14:25:21 JST
+   ended       2026-06-30 14:33:15 JST
+   duration    7m53.9s (473.9 s)
+   tokens      total=165,268
    verified    true
 ```
 
@@ -530,24 +567,27 @@ Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
 
 ```text
 attestation: verified
-  role        worker
-  provider    codex
-  model       gpt-5.5 (source=parsed)
-  effort      xhigh
-  permission  write
-  action      "implement issue #218"
+  role        verifier
+  provider    Anthropic
+  tool        claude
+  model       claude-opus-4-8[1m] (detected)
+  effort      max
+  permission  read-only
+  action      "review PR #295"
   exit        0
-  duration    42s (42000 ms)
-  started     2026-06-29T00:00:00Z
-  ended       2026-06-29T00:00:42Z
-  tokens      input=2447 output=4461 total=6908
+  started     2026-06-30 14:33:51 JST
+  ended       2026-06-30 14:35:58 JST
+  duration    2m7.0s (127.0 s)
+  tokens      input=2,447  output=9,844  total=12,291
   verified    true
 ```
 
 Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md),
 [`../specs/0214-human-readable-attestation.md`](../specs/0214-human-readable-attestation.md),
 [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md),
-and [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md).
+[`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),
+[`../specs/0296-attestation-display-polish.md`](../specs/0296-attestation-display-polish.md),
+and [`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md).
 
 ## Limits
 

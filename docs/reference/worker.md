@@ -74,6 +74,12 @@ the provider output with `role: worker`, the selected provider, the real parsed
 model and effort, `model_source: parsed`, `permission: write`, the issue action,
 exit code, timestamps, duration, token usage, and `verified: true`.
 
+For Claude invocations with an explicit configured model, the attested model is
+the pinned/configured model when that exact model appears in Claude's reported
+model usage. Auxiliary models can still appear in provider usage, but a larger
+auxiliary token count does not relabel the Worker or Verifier attestation away
+from the configured model that the provider reported.
+
 The PR body carries the one-line attestation header plus a fenced canonical JSON
 block:
 
@@ -185,6 +191,22 @@ own setting by default, and
 principle: configuration and command-line overrides should reflect only what the
 user has explicitly requested.
 
+## Verifier Model And Effort Config
+
+The independent verifier uses its own role-scoped `.delivery.yml` settings.
+This keeps verifier choice separate from the worker provider and lets projects
+pin a stronger review model without changing the worker default:
+
+```yaml
+verifier:
+  model: "claude-opus-4-8[1m]"
+  reasoning_effort: max
+```
+
+The `[1m]` suffix must be quoted in YAML. When these fields are present,
+`loopcoder loopreview` passes the configured model and effort to the verifier
+provider; one-off `--model` and `--effort` flags remain per-run overrides.
+
 ## Output
 
 On success, `loopcoder dispatch` prints three newline-terminated stdout records:
@@ -215,11 +237,35 @@ The dispatch result fields are:
 - `attestation`: the same validated Worker `AttestationRecord` emitted in the
   first two stdout records.
 
-As of 0.3.4, `dispatch` writes the human-readable pretty attestation block to
-stderr by default. The default block uses emoji on an interactive TTY and plain
-ASCII on a non-TTY. This never changes or reorders the three stdout records,
+As of 0.3.5, `dispatch` writes the human-readable pretty attestation block to
+stderr by default with the polished display format. The default block uses
+emoji on an interactive TTY and plain ASCII on a non-TTY. It shows the provider
+vendor plus the CLI `tool`, renders the model source as `(detected)` or
+`(self-reported)`, uses host-local timestamps to whole seconds, reports
+duration in seconds, and groups token counts with thousands separators. When
+input and output tokens are present without a total, the pretty block derives a
+display-only total. This never changes or reorders the three stdout records,
 the PR body, the stable `Header()` / `[attestation] ...` line, or the canonical
 JSON.
+
+Example pretty block:
+
+```text
+attestation: verified
+  role        worker
+  provider    OpenAI
+  tool        codex
+  model       gpt-5.5 (detected)
+  effort      xhigh
+  permission  write
+  action      "implement issue #293"
+  exit        0
+  started     2026-06-30 14:25:21 JST
+  ended       2026-06-30 14:33:15 JST
+  duration    7m53.9s (473.9 s)
+  tokens      total=165,268
+  verified    true
+```
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces emoji pretty output even on non-TTY
 stderr. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses pretty output and
@@ -233,4 +279,6 @@ block per dispatched issue. Pretty output is for human diagnostics and
 conductor relay, not for machine parsing.
 
 Design rationale:
-[`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md).
+[`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),
+[`../specs/0296-attestation-display-polish.md`](../specs/0296-attestation-display-polish.md),
+and [`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md).
