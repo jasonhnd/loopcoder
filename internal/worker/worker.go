@@ -280,13 +280,14 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	}
 
 	attestationRecord := buildWorkerAttestation(opts, agentResult)
+	tracker.setAttestation(attestationRecord)
+	tracker.writeAttempt()
 	if err := attestationRecord.Validate(); err != nil {
 		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
 	}
 	tracker.setUsage(attestationRecord.Usage)
 	tracker.writeAttempt()
-	attestationJSON, err := attestationRecord.CanonicalJSON()
-	if err != nil {
+	if _, err := attestationRecord.CanonicalJSON(); err != nil {
 		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
 	}
 
@@ -309,7 +310,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		return Result{}, fmt.Errorf("git add -A: %w", err)
 	}
 	activePhase = "committed"
-	if err := deps.Git.Commit(ctx, worktreePath, fmt.Sprintf("%s (closes #%d)", opts.IssueTitle, opts.IssueNumber)); err != nil {
+	if err := deps.Git.Commit(ctx, worktreePath, buildCommitMessage(opts.IssueTitle, opts.IssueNumber)); err != nil {
 		return Result{}, fmt.Errorf("git commit: %w", err)
 	}
 	tracker.transition(activePhase, "running", tracker.exitCode, nil)
@@ -321,7 +322,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	tracker.transition(activePhase, "running", tracker.exitCode, nil)
 
 	activePhase = "pr_opened"
-	body := buildPRBody(opts.IssueNumber, summary, attestationRecord, attestationJSON)
+	body := buildPRBody(opts.IssueNumber, summary)
 	prURL, err := github.CreatePR(ctx, opts.Branch, opts.BaseBranch, opts.IssueTitle, body)
 	if err != nil {
 		return Result{}, fmt.Errorf("gh pr create: %w", err)
@@ -398,8 +399,12 @@ func buildWorkerAttestation(opts Options, result agent.Result) attestation.Attes
 	}
 }
 
-func buildPRBody(issueNumber int, summary string, record attestation.AttestationRecord, canonicalJSON []byte) string {
-	return fmt.Sprintf("Closes #%d\n\n%s\n\n%s\n\n```json\n%s\n```", issueNumber, summary, record.Header(), string(canonicalJSON))
+func buildCommitMessage(title string, issueNumber int) string {
+	return fmt.Sprintf("%s (closes #%d)", title, issueNumber)
+}
+
+func buildPRBody(issueNumber int, summary string) string {
+	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
 }
 
 func MarshalResult(result Result) ([]byte, error) {
@@ -504,6 +509,7 @@ type attemptTracker struct {
 	exitCode       *int
 	errorMessage   *string
 	usage          *attestation.Usage
+	attestation    *attestation.AttestationRecord
 	now            func() time.Time
 	warnings       io.Writer
 	attemptPath    string
@@ -533,6 +539,10 @@ func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
 
 func (t *attemptTracker) setUsage(usage attestation.Usage) {
 	t.usage = cloneUsage(&usage)
+}
+
+func (t *attemptTracker) setAttestation(record attestation.AttestationRecord) {
+	t.attestation = cloneAttestation(&record)
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
@@ -596,10 +606,20 @@ func (t *attemptTracker) writeAttempt() {
 		ExitCode:       t.exitCode,
 		Error:          t.errorMessage,
 		Usage:          cloneUsage(t.usage),
+		Attestation:    cloneAttestation(t.attestation),
 	}
 	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
 	}
+}
+
+func cloneAttestation(record *attestation.AttestationRecord) *attestation.AttestationRecord {
+	if record == nil {
+		return nil
+	}
+	clone := *record
+	clone.Usage = *cloneUsage(&record.Usage)
+	return &clone
 }
 
 func cloneUsage(usage *attestation.Usage) *attestation.Usage {

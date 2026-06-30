@@ -123,9 +123,13 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CanonicalJSON returned error: %v", err)
 	}
-	for _, want := range []string{
+	if want := "Closes #101\n\nImplemented dispatch."; fakeGitHub.lastPRBody != want {
+		t.Fatalf("PR body = %q, want %q", fakeGitHub.lastPRBody, want)
+	}
+	for _, forbidden := range []string{
 		result.Attestation.Header(),
 		string(canonicalAttestation),
+		"[attestation]",
 		"```json\n",
 		`"role":"worker"`,
 		`"provider":"codex"`,
@@ -134,12 +138,12 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		`"action":"implement issue #101"`,
 		`"usage":{"input_tokens":120,"output_tokens":34,"total_tokens":154}`,
 	} {
-		if !strings.Contains(fakeGitHub.lastPRBody, want) {
-			t.Fatalf("PR body missing %q:\n%s", want, fakeGitHub.lastPRBody)
+		if strings.Contains(fakeGitHub.lastPRBody, forbidden) {
+			t.Fatalf("PR body contains forbidden attestation text %q:\n%s", forbidden, fakeGitHub.lastPRBody)
 		}
 	}
-	if strings.Contains(fakeGitHub.lastPRBody, "worker: codex") {
-		t.Fatalf("PR body still contains bare worker line:\n%s", fakeGitHub.lastPRBody)
+	if fakeGit.lastCommitMessage != "Implement dispatch (closes #101)" {
+		t.Fatalf("commit message = %q", fakeGit.lastCommitMessage)
 	}
 
 	data, err := MarshalResult(result)
@@ -190,6 +194,15 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if attempts[0].Usage == nil || attempts[0].Usage.TotalTokens == nil || *attempts[0].Usage.TotalTokens != 154 {
 		t.Fatalf("attempt usage = %#v, want total tokens 154", attempts[0].Usage)
 	}
+	if attempts[0].Attestation == nil {
+		t.Fatal("attempt missing persisted attestation")
+	}
+	if err := attempts[0].Attestation.Validate(); err != nil {
+		t.Fatalf("attempt attestation does not validate: %v", err)
+	}
+	if attempts[0].Attestation.Header() != result.Attestation.Header() {
+		t.Fatalf("attempt attestation header = %q, want %q", attempts[0].Attestation.Header(), result.Attestation.Header())
+	}
 	eventCount, err := state.CountEvents(repo, "run-test")
 	if err != nil {
 		t.Fatalf("CountEvents returned error: %v", err)
@@ -199,6 +212,31 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if fakeAgent.invocation.WorktreePath == "" || fakeAgent.invocation.Prompt == "" || fakeAgent.invocation.LogPath == "" {
 		t.Fatalf("agent invocation missing required fields: %#v", fakeAgent.invocation)
+	}
+}
+
+func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
+	record := buildWorkerAttestation(Options{
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		Provider:    "codex",
+	}, validWorkerAgentResult("Implemented dispatch.", 0))
+	if err := record.Validate(); err != nil {
+		t.Fatalf("test attestation does not validate: %v", err)
+	}
+
+	surfaces := map[string]string{
+		"pr body":        buildPRBody(101, "Implemented dispatch."),
+		"commit message": buildCommitMessage("Implement dispatch", 101),
+	}
+	for name, text := range surfaces {
+		assertNoAttestationFootprint(t, name, text, record)
+	}
+	if surfaces["pr body"] != "Closes #101\n\nImplemented dispatch." {
+		t.Fatalf("PR body surface = %q", surfaces["pr body"])
+	}
+	if surfaces["commit message"] != "Implement dispatch (closes #101)" {
+		t.Fatalf("commit message surface = %q", surfaces["commit message"])
 	}
 }
 
@@ -400,12 +438,26 @@ func validWorkerAgentResult(summary string, exitCode int) agent.Result {
 	}
 }
 
+func assertNoAttestationFootprint(t *testing.T, surface, text string, record attestation.AttestationRecord) {
+	t.Helper()
+	canonical, err := record.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("CanonicalJSON returned error: %v", err)
+	}
+	for _, forbidden := range []string{record.Header(), string(canonical), "[attestation]"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("%s contains forbidden attestation text %q:\n%s", surface, forbidden, text)
+		}
+	}
+}
+
 type workerFakeGit struct {
-	status      string
-	err         error
-	addAllCalls int
-	commitCalls int
-	pushCalls   int
+	status            string
+	err               error
+	addAllCalls       int
+	commitCalls       int
+	pushCalls         int
+	lastCommitMessage string
 }
 
 func (f *workerFakeGit) FetchOriginBase(context.Context, string, string) error {
@@ -435,8 +487,9 @@ func (f *workerFakeGit) AddAll(context.Context, string) error {
 	return f.err
 }
 
-func (f *workerFakeGit) Commit(context.Context, string, string) error {
+func (f *workerFakeGit) Commit(_ context.Context, _, message string) error {
 	f.commitCalls++
+	f.lastCommitMessage = message
 	return f.err
 }
 

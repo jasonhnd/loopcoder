@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +117,7 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
   "heartbeat_at": "2026-06-26T12:01:00Z",
   "last_progress_at": "2026-06-26T12:01:00Z",
   "usage": {"input_tokens": 10, "output_tokens": 5},
+  "attestation": {"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #42","exit_code":0,"started_at":"2026-06-28T00:00:00Z","ended_at":"2026-06-28T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":10,"output_tokens":5},"verified":true},
   "cost_usd": "1.25",
   "exit_code": null
 }`)
@@ -158,6 +160,15 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	if got.Usage == nil || got.Usage.InputTokens == nil || *got.Usage.InputTokens != 10 ||
 		got.Usage.OutputTokens == nil || *got.Usage.OutputTokens != 5 {
 		t.Fatalf("Usage = %#v, want input=10 output=5", got.Usage)
+	}
+	if got.Attestation == nil {
+		t.Fatal("Attestation = nil, want persisted record")
+	}
+	if err := got.Attestation.Validate(); err != nil {
+		t.Fatalf("Attestation does not validate: %v", err)
+	}
+	if got.Attestation.Action != "implement issue #42" {
+		t.Fatalf("Attestation.Action = %q", got.Attestation.Action)
 	}
 	if got.CostUSD == nil || *got.CostUSD != 1.25 {
 		t.Fatalf("CostUSD = %#v, want 1.25", got.CostUSD)
@@ -202,6 +213,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	errText := "failed password=hunter2"
 	totalTokens := int64(154)
 	costUSD := 0.42
+	attestationRecord := validAttemptAttestation(101, totalTokens)
 
 	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
 		Version:        1,
@@ -220,6 +232,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		ExitCode:       &exitCode,
 		Error:          &errText,
 		Usage:          &attestation.Usage{TotalTokens: &totalTokens},
+		Attestation:    &attestationRecord,
 		CostUSD:        &costUSD,
 	})
 	if err != nil {
@@ -240,13 +253,20 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("attempt JSON invalid: %v", err)
 	}
-	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "cost_usd"} {
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "attestation", "cost_usd"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
 		}
 	}
 	if got["branch"] != "loop/issue-101-retry-2" {
 		t.Fatalf("branch = %#v", got["branch"])
+	}
+	attestationField, ok := got["attestation"].(map[string]any)
+	if !ok {
+		t.Fatalf("attestation = %#v", got["attestation"])
+	}
+	if attestationField["action"] != "implement issue #101" || attestationField["role"] != "worker" {
+		t.Fatalf("attestation field = %#v", attestationField)
 	}
 }
 
@@ -291,5 +311,25 @@ func TestAppendEventWritesCompactJSONLine(t *testing.T) {
 	}
 	if got["error"] != nil {
 		t.Fatalf("error = %#v, want nil", got["error"])
+	}
+}
+
+func validAttemptAttestation(issue int, totalTokens int64) attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    "codex",
+		Model:       "gpt-5.5",
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "xhigh",
+		Permission:  attestation.PermissionWrite,
+		Action:      "implement issue #" + strconv.Itoa(issue),
+		ExitCode:    0,
+		StartedAt:   "2026-06-28T00:00:00Z",
+		EndedAt:     "2026-06-28T00:00:42Z",
+		DurationMS:  42000,
+		Usage: attestation.Usage{
+			TotalTokens: &totalTokens,
+		},
+		Verified: true,
 	}
 }
