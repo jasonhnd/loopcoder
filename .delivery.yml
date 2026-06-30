@@ -15,6 +15,7 @@ worker:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
 verifier:
+  model: "claude-opus-4-8[1m]"
   reasoning_effort: max
 # resilience:
 #   worker:
