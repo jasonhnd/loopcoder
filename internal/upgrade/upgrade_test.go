@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/skill"
 )
 
 func TestResolveReleaseLatestAndPinned(t *testing.T) {
@@ -214,6 +215,7 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	sumsURL := "https://download.example.test/SHA256SUMS"
 	fsys := newFakeFS()
 	layout := home.New(filepath.Join("home", ".loopcoder"))
+	skillRefreshCalled := false
 
 	result, err := Run(context.Background(), Options{
 		RequestedVersion: "v0.3.3",
@@ -260,11 +262,24 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 			}
 			return binaryBytes, nil
 		},
-		MkdirAll:      fsys.MkdirAll,
-		WriteFile:     fsys.WriteFile,
-		Chmod:         fsys.Chmod,
-		Rename:        fsys.Rename,
-		Remove:        fsys.Remove,
+		MkdirAll:  fsys.MkdirAll,
+		WriteFile: fsys.WriteFile,
+		Chmod:     fsys.Chmod,
+		Rename:    fsys.Rename,
+		Remove:    fsys.Remove,
+		InstallSkill: func(_ context.Context, opts skill.InstallOptions) (skill.InstallResult, error) {
+			skillRefreshCalled = true
+			if opts.Dir != "" || opts.Force {
+				t.Fatalf("skill refresh opts = %#v, want default stale-aware install", opts)
+			}
+			return skill.InstallResult{
+				Dir: filepath.Join("home", ".claude", "skills", "loopcoder"),
+				Files: []skill.FileResult{
+					{Path: filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md"), Status: skill.FileUpdated},
+					{Path: filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md"), Status: skill.FileUnchanged},
+				},
+			}, nil
+		},
 		RuntimeGOOS:   runtime.GOOS,
 		RuntimeGOARCH: runtime.GOARCH,
 	})
@@ -294,6 +309,96 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	}
 	if len(fsys.renames) != 1 || fsys.renames[0][1] != stablePath {
 		t.Fatalf("renames = %#v, want one atomic rename to %q", fsys.renames, stablePath)
+	}
+	if !skillRefreshCalled {
+		t.Fatal("InstallSkill was not called after successful upgrade")
+	}
+	if result.SkillRefresh == nil {
+		t.Fatal("SkillRefresh = nil, want refresh summary")
+	}
+	if len(result.SkillRefresh.Files) != 2 {
+		t.Fatalf("SkillRefresh files = %#v, want two managed files", result.SkillRefresh.Files)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Warnings = %#v, want empty on successful refresh", result.Warnings)
+	}
+}
+
+func TestRunSkillRefreshFailureWarnsWithoutFailingUpgrade(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	binaryBytes := []byte("new loopcoder binary")
+	assetName := platformAssetName(t, "0.3.3")
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	fsys := newFakeFS()
+	layout := home.New(filepath.Join("home", ".loopcoder"))
+
+	result, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.3.3",
+		CurrentVersion:   "v0.3.2",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		HomeLayout: func() (home.Layout, error) {
+			return layout, nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+				},
+			}),
+			assetURL: archiveBytes,
+			sumsURL:  checksums,
+		}),
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			return binaryBytes, nil
+		},
+		MkdirAll:  fsys.MkdirAll,
+		WriteFile: fsys.WriteFile,
+		Chmod:     fsys.Chmod,
+		Rename:    fsys.Rename,
+		Remove:    fsys.Remove,
+		InstallSkill: func(context.Context, skill.InstallOptions) (skill.InstallResult, error) {
+			return skill.InstallResult{}, errors.New("permission denied")
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.StableBinaryPath == "" || result.VersionBinaryPath == "" {
+		t.Fatalf("binary install fields were not populated: %#v", result)
+	}
+	if result.SkillRefresh != nil {
+		t.Fatalf("SkillRefresh = %#v, want nil on refresh failure", result.SkillRefresh)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("Warnings = %#v, want one skill refresh warning", result.Warnings)
+	}
+	for _, want := range []string{"skill refresh failed", "permission denied", "run: loopcoder skill install"} {
+		if !strings.Contains(result.Warnings[0], want) {
+			t.Fatalf("warning missing %q: %q", want, result.Warnings[0])
+		}
 	}
 }
 

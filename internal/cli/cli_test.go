@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
+	"github.com/jasonhnd/loopcoder/internal/skill"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -467,6 +468,48 @@ func TestUpgradeRendersAlreadyLatest(t *testing.T) {
 		if strings.Contains(stdout.String(), unwanted) {
 			t.Fatalf("stdout included install line %q:\n%s", unwanted, stdout.String())
 		}
+	}
+}
+
+func TestUpgradeRendersSkillRefreshSummaryAndWarnings(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"upgrade"}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{Version: "v0.3.2"},
+		Upgrade: func(_ context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			return upgrade.Result{
+				CurrentPath:       "/old/loopcoder",
+				CurrentVersion:    opts.CurrentVersion,
+				TargetVersion:     "v0.3.3",
+				Platform:          "linux/amd64",
+				AssetName:         "loopcoder_0.3.3_linux_amd64.tar.gz",
+				VersionBinaryPath: "/home/.loopcoder/versions/v0.3.3/loopcoder",
+				StableBinaryPath:  "/home/.loopcoder/bin/loopcoder",
+				SkillRefresh: &skill.InstallResult{
+					Dir: "/home/.claude/skills/loopcoder",
+					Files: []skill.FileResult{
+						{Path: "/home/.claude/skills/loopcoder/SKILL.md", Status: skill.FileUpdated},
+						{Path: "/home/.claude/skills/loopcoder/AGENTS.md", Status: skill.FileUnchanged},
+					},
+				},
+				Warnings: []string{"skill refresh failed after retry; run: loopcoder skill install"},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"Skill refresh: /home/.claude/skills/loopcoder",
+		"updated /home/.claude/skills/loopcoder/SKILL.md",
+		"unchanged /home/.claude/skills/loopcoder/AGENTS.md",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), "[loopcoder] warning: skill refresh failed after retry; run: loopcoder skill install") {
+		t.Fatalf("stderr missing skill refresh warning:\n%s", stderr.String())
 	}
 }
 

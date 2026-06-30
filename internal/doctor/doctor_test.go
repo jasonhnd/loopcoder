@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 )
@@ -35,6 +38,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"repository origin",
 		"default branch",
 		"loopcoder binary",
+		"loopcoder skill",
 		"version compatibility",
 		"conductor runtime",
 	} {
@@ -48,6 +52,60 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+}
+
+func TestRunWarnsWhenInstalledSkillStale(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.skillFiles[filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md")] = []byte("stale skill\n")
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	check := requireCheck(t, report, "loopcoder skill")
+	if check.Status != StatusWarn {
+		t.Fatalf("loopcoder skill status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"differs from embedded skill content", "SKILL.md", "run: loopcoder skill install"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("loopcoder skill message missing %q: %q", want, check.Message)
+		}
+	}
+}
+
+func TestRunReportsCurrentInstalledSkillWithoutWarning(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "loopcoder skill")
+	if check.Status != StatusOK {
+		t.Fatalf("loopcoder skill status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if strings.Contains(check.Message, "run: loopcoder skill install") {
+		t.Fatalf("loopcoder skill current message should not include remediation: %q", check.Message)
+	}
+}
+
+func TestRunReportsAbsentInstalledSkillAsInfo(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.skillFiles = map[string][]byte{}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	check := requireCheck(t, report, "loopcoder skill")
+	if check.Status != StatusInfo {
+		t.Fatalf("loopcoder skill status = %s, want info (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"not installed", "run: loopcoder skill install"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("loopcoder skill message missing %q: %q", want, check.Message)
+		}
 	}
 }
 
@@ -271,6 +329,12 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			},
 		},
 		file:           []byte("version: 1\nmin_loopcoder_version: 0.3.0\n"),
+		skillMarkdown:  []byte("skill content\n"),
+		agentsMarkdown: []byte("agents content\n"),
+		skillFiles: map[string][]byte{
+			filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md"):  []byte("skill content\n"),
+			filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md"): []byte("agents content\n"),
+		},
 		executablePath: "/bin/loopcoder",
 	}
 }
@@ -282,6 +346,9 @@ type fakeDoctorEnv struct {
 	configErr      error
 	file           []byte
 	fileErr        error
+	skillMarkdown  []byte
+	agentsMarkdown []byte
+	skillFiles     map[string][]byte
 	executablePath string
 }
 
@@ -308,17 +375,52 @@ func (f *fakeDoctorEnv) deps() Deps {
 			}
 			return f.cfg, nil
 		},
-		ReadFile: func(string) ([]byte, error) {
-			if f.fileErr != nil {
-				return nil, f.fileErr
+		ReadFile: func(path string) ([]byte, error) {
+			if strings.HasSuffix(filepath.Clean(path), filepath.Clean(".delivery.yml")) {
+				if f.fileErr != nil {
+					return nil, f.fileErr
+				}
+				return f.file, nil
 			}
-			return f.file, nil
+			data, ok := f.skillFiles[filepath.Clean(path)]
+			if !ok {
+				return nil, &fs.PathError{Op: "read", Path: path, Err: fs.ErrNotExist}
+			}
+			return append([]byte(nil), data...), nil
+		},
+		UserHomeDir: func() (string, error) {
+			return "home", nil
+		},
+		Stat: func(path string) (fs.FileInfo, error) {
+			data, ok := f.skillFiles[filepath.Clean(path)]
+			if !ok {
+				return nil, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
+			}
+			return fakeDoctorInfo{name: filepath.Base(path), size: int64(len(data))}, nil
+		},
+		SkillMarkdown: func() ([]byte, error) {
+			return append([]byte(nil), f.skillMarkdown...), nil
+		},
+		AgentsMarkdown: func() ([]byte, error) {
+			return append([]byte(nil), f.agentsMarkdown...), nil
 		},
 		ExecutablePath: func() (string, error) {
 			return f.executablePath, nil
 		},
 	}
 }
+
+type fakeDoctorInfo struct {
+	name string
+	size int64
+}
+
+func (f fakeDoctorInfo) Name() string       { return f.name }
+func (f fakeDoctorInfo) Size() int64        { return f.size }
+func (f fakeDoctorInfo) Mode() fs.FileMode  { return 0o644 }
+func (f fakeDoctorInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeDoctorInfo) IsDir() bool        { return false }
+func (f fakeDoctorInfo) Sys() any           { return nil }
 
 func execNotFound(file string) error {
 	return &os.PathError{Op: "exec", Path: file, Err: os.ErrNotExist}

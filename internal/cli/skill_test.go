@@ -48,8 +48,8 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 			return SkillInstallResult{
 				Dir: target,
 				Files: []SkillInstallFileResult{
-					{Path: filepath.Join(target, skillFilename), Status: SkillInstallFileOverwritten},
-					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileCreated},
+					{Path: filepath.Join(target, skillFilename), Status: SkillInstallFileUpdated},
+					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileUnchanged},
 				},
 			}, nil
 		},
@@ -66,8 +66,8 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 	for _, want := range []string{
 		"loopcoder skill install complete",
 		"directory " + target,
-		"overwritten " + filepath.Join(target, skillFilename),
-		"created " + filepath.Join(target, agentsFilename),
+		"updated " + filepath.Join(target, skillFilename),
+		"unchanged " + filepath.Join(target, agentsFilename),
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
@@ -100,44 +100,77 @@ func TestInstallSkillWritesDefaultClaudeSkillDir(t *testing.T) {
 	}
 }
 
-func TestInstallSkillDoesNotClobberWithoutForce(t *testing.T) {
+func TestInstallSkillUpdatesStaleFilesWithoutForce(t *testing.T) {
 	fsys := newSkillFakeFS()
 	target := filepath.Join("skills", "loopcoder")
 	fsys.mustWrite(filepath.Join(target, skillFilename), []byte("custom skill"))
 	fsys.mustWrite(filepath.Join(target, agentsFilename), []byte("custom agents"))
+	fsys.mustWrite(filepath.Join(target, "local-note.md"), []byte("operator note"))
 
 	result, err := InstallSkill(context.Background(), SkillInstallOptions{Dir: target}, skillDepsForTest(fsys))
 	if err != nil {
 		t.Fatalf("InstallSkill returned error: %v", err)
 	}
 
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileExists)
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileExists)
-	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "custom skill" {
-		t.Fatalf("SKILL.md = %q, want original content", got)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileUpdated)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileUpdated)
+	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "skill content\n" {
+		t.Fatalf("SKILL.md = %q, want embedded skill content", got)
 	}
-	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "custom agents" {
-		t.Fatalf("AGENTS.md = %q, want original content", got)
+	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "agents content\n" {
+		t.Fatalf("AGENTS.md = %q, want embedded agents content", got)
+	}
+	if got := string(fsys.read(t, filepath.Join(target, "local-note.md"))); got != "operator note" {
+		t.Fatalf("unrelated file = %q, want preserved", got)
+	}
+}
+
+func TestInstallSkillReportsUnchangedForMatchingFiles(t *testing.T) {
+	fsys := newSkillFakeFS()
+	target := filepath.Join("skills", "loopcoder")
+	fsys.mustWrite(filepath.Join(target, skillFilename), []byte("skill content\n"))
+	fsys.mustWrite(filepath.Join(target, agentsFilename), []byte("agents content\n"))
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{Dir: target}, skillDepsForTest(fsys))
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileUnchanged)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileUnchanged)
+	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "skill content\n" {
+		t.Fatalf("SKILL.md = %q, want unchanged embedded skill content", got)
+	}
+	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "agents content\n" {
+		t.Fatalf("AGENTS.md = %q, want unchanged embedded agents content", got)
 	}
 }
 
 func TestInstallSkillForceOverwritesExistingFiles(t *testing.T) {
 	fsys := newSkillFakeFS()
 	target := filepath.Join("skills", "loopcoder")
-	fsys.mustWrite(filepath.Join(target, skillFilename), []byte("custom skill"))
-	fsys.mustWrite(filepath.Join(target, agentsFilename), []byte("custom agents"))
+	skillPath := filepath.Join(target, skillFilename)
+	agentsPath := filepath.Join(target, agentsFilename)
+	fsys.mustWrite(skillPath, []byte("skill content\n"))
+	fsys.mustWrite(agentsPath, []byte("agents content\n"))
 
 	result, err := InstallSkill(context.Background(), SkillInstallOptions{Dir: target, Force: true}, skillDepsForTest(fsys))
 	if err != nil {
 		t.Fatalf("InstallSkill returned error: %v", err)
 	}
 
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileOverwritten)
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileOverwritten)
-	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "skill content\n" {
+	assertSkillInstallStatus(t, result.Files, skillPath, SkillInstallFileOverwritten)
+	assertSkillInstallStatus(t, result.Files, agentsPath, SkillInstallFileOverwritten)
+	if fsys.writes[filepath.Clean(skillPath)] != 2 {
+		t.Fatalf("SKILL.md write count = %d, want force rewrite", fsys.writes[filepath.Clean(skillPath)])
+	}
+	if fsys.writes[filepath.Clean(agentsPath)] != 2 {
+		t.Fatalf("AGENTS.md write count = %d, want force rewrite", fsys.writes[filepath.Clean(agentsPath)])
+	}
+	if got := string(fsys.read(t, skillPath)); got != "skill content\n" {
 		t.Fatalf("SKILL.md = %q, want embedded skill content", got)
 	}
-	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "agents content\n" {
+	if got := string(fsys.read(t, agentsPath)); got != "agents content\n" {
 		t.Fatalf("AGENTS.md = %q, want embedded agents content", got)
 	}
 }
@@ -187,6 +220,7 @@ func skillDepsForTest(fsys *skillFakeFS) SkillInstallDeps {
 		},
 		Stat:      fsys.Stat,
 		MkdirAll:  fsys.MkdirAll,
+		ReadFile:  fsys.ReadFile,
 		WriteFile: fsys.WriteFile,
 		SkillMarkdown: func() ([]byte, error) {
 			return []byte("skill content\n"), nil
@@ -215,14 +249,16 @@ type skillFakeFS struct {
 	dirs     map[string]bool
 	files    map[string][]byte
 	modes    map[string]fs.FileMode
+	writes   map[string]int
 	mkdirErr error
 }
 
 func newSkillFakeFS() *skillFakeFS {
 	return &skillFakeFS{
-		dirs:  map[string]bool{},
-		files: map[string][]byte{},
-		modes: map[string]fs.FileMode{},
+		dirs:   map[string]bool{},
+		files:  map[string][]byte{},
+		modes:  map[string]fs.FileMode{},
+		writes: map[string]int{},
 	}
 }
 
@@ -251,7 +287,16 @@ func (f *skillFakeFS) WriteFile(path string, data []byte, mode fs.FileMode) erro
 	copied := append([]byte(nil), data...)
 	f.files[clean] = copied
 	f.modes[clean] = mode
+	f.writes[clean]++
 	return nil
+}
+
+func (f *skillFakeFS) ReadFile(path string) ([]byte, error) {
+	data, ok := f.files[filepath.Clean(path)]
+	if !ok {
+		return nil, &fs.PathError{Op: "read", Path: path, Err: fs.ErrNotExist}
+	}
+	return append([]byte(nil), data...), nil
 }
 
 func (f *skillFakeFS) mustWrite(path string, data []byte) {

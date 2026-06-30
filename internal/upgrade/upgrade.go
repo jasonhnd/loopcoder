@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/skill"
 )
 
 const (
@@ -54,6 +55,8 @@ type Result struct {
 	StableBinaryPath  string
 	Deferred          bool
 	PendingPath       string
+	SkillRefresh      *skill.InstallResult
+	Warnings          []string
 }
 
 type Deps struct {
@@ -68,6 +71,7 @@ type Deps struct {
 	Rename          func(string, string) error
 	Remove          func(string) error
 	ScheduleReplace func(source string, target string) error
+	InstallSkill    func(context.Context, skill.InstallOptions) (skill.InstallResult, error)
 	RuntimeGOOS     string
 	RuntimeGOARCH   string
 }
@@ -143,8 +147,11 @@ func DefaultDeps() Deps {
 		Rename:          os.Rename,
 		Remove:          os.Remove,
 		ScheduleReplace: scheduleReplace,
-		RuntimeGOOS:     runtime.GOOS,
-		RuntimeGOARCH:   runtime.GOARCH,
+		InstallSkill: func(ctx context.Context, opts skill.InstallOptions) (skill.InstallResult, error) {
+			return skill.Install(ctx, opts, skill.DefaultInstallDeps())
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
 	}
 }
 
@@ -239,6 +246,12 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	result.StableBinaryPath = installed.StableBinaryPath
 	result.Deferred = installed.Deferred
 	result.PendingPath = installed.PendingPath
+	refresh, refreshErr := deps.InstallSkill(ctx, skill.InstallOptions{})
+	if refreshErr != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("skill refresh failed: %v; run: loopcoder skill install", refreshErr))
+		return result, nil
+	}
+	result.SkillRefresh = &refresh
 	return result, nil
 }
 
@@ -276,6 +289,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ScheduleReplace == nil {
 		deps.ScheduleReplace = defaults.ScheduleReplace
+	}
+	if deps.InstallSkill == nil {
+		deps.InstallSkill = defaults.InstallSkill
 	}
 	if strings.TrimSpace(deps.RuntimeGOOS) == "" {
 		deps.RuntimeGOOS = defaults.RuntimeGOOS

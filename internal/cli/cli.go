@@ -631,6 +631,9 @@ func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	renderUpgradeSuccess(stdout, result)
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
 	return 0
 }
 
@@ -653,6 +656,12 @@ func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
 	}
 	fmt.Fprintf(w, "Before: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
 	fmt.Fprintf(w, "After: path=%s version=%s\n", result.StableBinaryPath, result.TargetVersion)
+	if result.SkillRefresh != nil {
+		fmt.Fprintf(w, "Skill refresh: %s\n", result.SkillRefresh.Dir)
+		for _, file := range result.SkillRefresh.Files {
+			renderSkillInstallFileResult(w, file)
+		}
+	}
 	fmt.Fprintln(w, "Run: loopcoder doctor")
 }
 

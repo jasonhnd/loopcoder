@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,12 +14,14 @@ import (
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/skill"
 	"gopkg.in/yaml.v3"
 )
 
 type Status string
 
 const (
+	StatusInfo Status = "info"
 	StatusOK   Status = "ok"
 	StatusWarn Status = "warn"
 	StatusFail Status = "fail"
@@ -40,6 +43,10 @@ type Deps struct {
 	RunCommand     func(ctx context.Context, dir string, name string, args ...string) (CommandResult, error)
 	LoadConfig     func(path string) (config.Config, error)
 	ReadFile       func(path string) ([]byte, error)
+	UserHomeDir    func() (string, error)
+	Stat           func(string) (fs.FileInfo, error)
+	SkillMarkdown  func() ([]byte, error)
+	AgentsMarkdown func() ([]byte, error)
 	ExecutablePath func() (string, error)
 }
 
@@ -93,6 +100,10 @@ func DefaultDeps() Deps {
 		RunCommand:     execRunCommand,
 		LoadConfig:     config.Load,
 		ReadFile:       os.ReadFile,
+		UserHomeDir:    os.UserHomeDir,
+		Stat:           os.Stat,
+		SkillMarkdown:  skill.DefaultInstallDeps().SkillMarkdown,
+		AgentsMarkdown: skill.DefaultInstallDeps().AgentsMarkdown,
 		ExecutablePath: os.Executable,
 	}
 }
@@ -126,6 +137,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkDefaultBranch(ctx, deps, repoPath, gitPresent, originPresent))
 
 	checks = append(checks, checkBinary(build, deps))
+	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkCompatibility(delivery, build))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
@@ -149,6 +161,18 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ReadFile == nil {
 		deps.ReadFile = defaults.ReadFile
+	}
+	if deps.UserHomeDir == nil {
+		deps.UserHomeDir = defaults.UserHomeDir
+	}
+	if deps.Stat == nil {
+		deps.Stat = defaults.Stat
+	}
+	if deps.SkillMarkdown == nil {
+		deps.SkillMarkdown = defaults.SkillMarkdown
+	}
+	if deps.AgentsMarkdown == nil {
+		deps.AgentsMarkdown = defaults.AgentsMarkdown
 	}
 	if deps.ExecutablePath == nil {
 		deps.ExecutablePath = defaults.ExecutablePath
@@ -469,6 +493,51 @@ func checkBinary(build BuildInfo, deps Deps) Check {
 			selectedTrack(build.Version),
 		),
 	}
+}
+
+func checkInstalledSkill(deps Deps) Check {
+	result, err := skill.InspectInstalled(skill.InspectOptions{}, skill.InstallDeps{
+		UserHomeDir:    deps.UserHomeDir,
+		Stat:           deps.Stat,
+		ReadFile:       deps.ReadFile,
+		SkillMarkdown:  deps.SkillMarkdown,
+		AgentsMarkdown: deps.AgentsMarkdown,
+	})
+	if err != nil {
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect installed skill: %v; run: loopcoder skill install", err),
+		}
+	}
+	switch result.Status {
+	case skill.InspectCurrent:
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("installed managed skill files match embedded content at %s", result.Dir),
+		}
+	case skill.InspectStale:
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("installed loopcoder skill differs from embedded skill content (%s); run: loopcoder skill install", strings.Join(baseNames(result.StaleFiles), ", ")),
+		}
+	default:
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("not installed at %s; run: loopcoder skill install", result.Dir),
+		}
+	}
+}
+
+func baseNames(paths []string) []string {
+	names := make([]string, 0, len(paths))
+	for _, path := range paths {
+		names = append(names, filepath.Base(path))
+	}
+	return names
 }
 
 func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
