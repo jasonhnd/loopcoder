@@ -3,23 +3,26 @@ package attestation
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrettyVerifiedEmoji(t *testing.T) {
+	setPrettyTestLocalTime(t)
 	record := validRecord()
 
 	const want = `✅ attestation verified
    role        worker
-   provider    codex
-   model       gpt-5.5 (source=parsed)
+   provider    OpenAI
+   tool        codex
+   model       gpt-5.5 (detected)
    effort      xhigh
    permission  write
    action      "implement issue #172"
    exit        0
-   duration    42s (42000 ms)
-   started     2026-06-28T00:00:00Z
-   ended       2026-06-28T00:00:42Z
-   tokens      input=120 output=34 total=154
+   started     2026-06-28 09:00:00 JST
+   ended       2026-06-28 09:00:42 JST
+   duration    42.0s (42.0 s)
+   tokens      input=120  output=34  total=154
    verified    true`
 	if got := record.Pretty(PrettyOptions{}); got != want {
 		t.Fatalf("Pretty() = %q, want %q", got, want)
@@ -27,6 +30,7 @@ func TestPrettyVerifiedEmoji(t *testing.T) {
 }
 
 func TestPrettyFailedStatusHasPriority(t *testing.T) {
+	setPrettyTestLocalTime(t)
 	record := validRecord()
 	record.Role = RoleVerifier
 	record.Provider = "claude"
@@ -48,10 +52,13 @@ func TestPrettyFailedStatusHasPriority(t *testing.T) {
 		t.Fatalf("Pretty() status = %q, want failed", firstLine(got))
 	}
 	for _, want := range []string{
+		"   provider    Anthropic",
+		"   tool        claude",
 		"   effort      unset",
 		"   exit        1",
-		"   duration    3.2s (3200 ms)",
-		"   tokens      input=2447 output=4947 total=unset",
+		"   ended       2026-06-28 09:00:03 JST",
+		"   duration    3.2s (3.2 s)",
+		"   tokens      input=2,447  output=4,947  total=7,394",
 		"   verified    true",
 	} {
 		if !strings.Contains(got, want) {
@@ -61,6 +68,7 @@ func TestPrettyFailedStatusHasPriority(t *testing.T) {
 }
 
 func TestPrettySelfReportedPlainTotalOnly(t *testing.T) {
+	setPrettyTestLocalTime(t)
 	record := validRecord()
 	record.Role = RoleConductor
 	record.Provider = "codex-cli"
@@ -78,22 +86,64 @@ func TestPrettySelfReportedPlainTotalOnly(t *testing.T) {
 	const want = `attestation: self-reported
   role        conductor
   provider    codex-cli
-  model       gpt-5 (source=self-reported)
+  tool        codex-cli
+  model       gpt-5 (self-reported)
   effort      xhigh
   permission  orchestrate
   action      "merge PR #214"
   exit        0
-  duration    1m12s (72000 ms)
-  started     2026-06-28T00:00:00Z
-  ended       2026-06-28T00:01:12Z
-  tokens      total=18266
+  started     2026-06-28 09:00:00 JST
+  ended       2026-06-28 09:01:12 JST
+  duration    1m12.0s (72.0 s)
+  tokens      total=18,266
   verified    false`
 	if got := record.Pretty(PrettyOptions{Mode: PrettyModePlain}); got != want {
 		t.Fatalf("Pretty(plain) = %q, want %q", got, want)
 	}
 }
 
+func TestPrettyProviderVendorMappingAndToolLine(t *testing.T) {
+	setPrettyTestLocalTime(t)
+	tests := []struct {
+		provider string
+		vendor   string
+	}{
+		{provider: "codex", vendor: "OpenAI"},
+		{provider: "claude", vendor: "Anthropic"},
+		{provider: "gemini", vendor: "Google"},
+		{provider: "custom-cli", vendor: "custom-cli"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			record := validRecord()
+			record.Provider = tt.provider
+
+			got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
+			for _, want := range []string{
+				"  provider    " + tt.vendor,
+				"  tool        " + tt.provider,
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("Pretty() missing %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestPrettyTimestampFallbackKeepsRawValue(t *testing.T) {
+	record := validRecord()
+	record.StartedAt = "not-rfc3339"
+
+	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
+	if !strings.Contains(got, "  started     not-rfc3339") {
+		t.Fatalf("Pretty() missing raw fallback timestamp:\n%s", got)
+	}
+}
+
 func TestPrettyEscapesActionControlCharacters(t *testing.T) {
+	setPrettyTestLocalTime(t)
 	record := validRecord()
 	record.Action = "first line\nsecond line\t\"quoted\"\x00done"
 
@@ -102,8 +152,8 @@ func TestPrettyEscapesActionControlCharacters(t *testing.T) {
 	if !strings.Contains(got, wantAction) {
 		t.Fatalf("Pretty() missing escaped action %q:\n%s", wantAction, got)
 	}
-	if lineCount(got) != 13 {
-		t.Fatalf("Pretty() rendered %d lines, want 13:\n%s", lineCount(got), got)
+	if lineCount(got) != 14 {
+		t.Fatalf("Pretty() rendered %d lines, want 14:\n%s", lineCount(got), got)
 	}
 	if strings.Contains(got, "second line\t") {
 		t.Fatalf("Pretty() contains an unescaped tab/newline action fragment:\n%s", got)
@@ -111,6 +161,7 @@ func TestPrettyEscapesActionControlCharacters(t *testing.T) {
 }
 
 func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
+	setPrettyTestLocalTime(t)
 	record := validRecord()
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
@@ -122,22 +173,55 @@ func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
 	for _, want := range []string{
 		"attestation: verified",
 		"  role        worker",
-		"  provider    codex",
-		"  model       gpt-5.5 (source=parsed)",
+		"  provider    OpenAI",
+		"  tool        codex",
+		"  model       gpt-5.5 (detected)",
 		"  effort      xhigh",
 		"  permission  write",
 		"  action      \"implement issue #172\"",
 		"  exit        0",
-		"  duration    42s (42000 ms)",
-		"  started     2026-06-28T00:00:00Z",
-		"  ended       2026-06-28T00:00:42Z",
-		"  tokens      input=120 output=34 total=154",
+		"  started     2026-06-28 09:00:00 JST",
+		"  ended       2026-06-28 09:00:42 JST",
+		"  duration    42.0s (42.0 s)",
+		"  tokens      input=120  output=34  total=154",
 		"  verified    true",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty(plain) missing %q:\n%s", want, got)
 		}
 	}
+}
+
+func TestPrettyDoesNotChangeCanonicalContracts(t *testing.T) {
+	record := validRecord()
+
+	data, err := record.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("CanonicalJSON returned error: %v", err)
+	}
+
+	const wantCanonical = `{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #172","exit_code":0,"started_at":"2026-06-28T00:00:00Z","ended_at":"2026-06-28T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":120,"output_tokens":34,"total_tokens":154},"verified":true}`
+	if string(data) != wantCanonical {
+		t.Fatalf("CanonicalJSON() = %s, want %s", string(data), wantCanonical)
+	}
+
+	const wantHeader = `[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #172" exit=0 dur=42s tokens=120/34|154 verified=true`
+	if got := record.Header(); got != wantHeader {
+		t.Fatalf("Header() = %q, want %q", got, wantHeader)
+	}
+}
+
+func setPrettyTestLocalTime(t *testing.T) {
+	t.Helper()
+	location, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Fatalf("LoadLocation(Asia/Tokyo) returned error: %v", err)
+	}
+	previous := time.Local
+	time.Local = location
+	t.Cleanup(func() {
+		time.Local = previous
+	})
 }
 
 func firstLine(value string) string {
