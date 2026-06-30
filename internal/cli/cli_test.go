@@ -600,8 +600,8 @@ func TestAttestPrettyRendersEmojiWhenInteractive(t *testing.T) {
 	for _, want := range []string{
 		"⚠️ attestation self-reported",
 		"   role        conductor",
-		"   model       gpt-5 (source=self-reported)",
-		"   tokens      total=18266",
+		"   model       gpt-5 (self-reported)",
+		"   tokens      total=18,266",
 		"   verified    false",
 	} {
 		if !strings.Contains(got, want) {
@@ -643,8 +643,8 @@ func TestAttestPrettyRendersPlainWhenNonInteractive(t *testing.T) {
 	for _, want := range []string{
 		"attestation: self-reported",
 		"  role        conductor",
-		"  model       gpt-5 (source=self-reported)",
-		"  tokens      total=12345",
+		"  model       gpt-5 (self-reported)",
+		"  tokens      total=12,345",
 		"  verified    false",
 	} {
 		if !strings.Contains(got, want) {
@@ -1498,7 +1498,7 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	for _, want := range []string{
 		"attestation: verified",
 		"  role        worker",
-		"  tokens      input=120 output=34 total=154",
+		"  tokens      input=120  output=34  total=154",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -1605,7 +1605,7 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 	for _, want := range []string{
 		"✅ attestation verified",
 		"   role        worker",
-		"   tokens      input=120 output=34 total=154",
+		"   tokens      input=120  output=34  total=154",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())

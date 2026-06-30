@@ -14,11 +14,8 @@ worker:
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
-# verifier:
-#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets these on its own; they appear only when you state a permanent preference.
-#   # model:
-#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets these on its own; they appear only when you state a permanent preference.
-#   # reasoning_effort:
+verifier:
+  reasoning_effort: max
 # resilience:
 #   worker:
 #     Optional. Absent = 15; expected worker heartbeat cadence in seconds.
