@@ -6,7 +6,8 @@ date: 2026-06-30
 issue: 282
 pr: null
 supersedes: []
-superseded_by: []
+superseded_by:
+  - docs/specs/0306-local-only-attestation.md
 ---
 
 # Default Pretty Attestation On Both Surfaces And Conductor Relay

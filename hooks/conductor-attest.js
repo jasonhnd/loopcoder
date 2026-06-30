@@ -69,7 +69,7 @@ function runHook(inputText, deps = {}) {
   return block([
     'loopcoder conductor attestation is required before completing this delivery turn.',
     'Run `loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action "<delivery action>" --duration-ms <ms> --total-tokens <tokens>` with the actual host model and usage, then finish the turn.',
-    'Stamp the emitted attestation header or canonical JSON into durable artifacts you produce, such as PR merge comments or merge commit messages.',
+    'Keep the emitted attestation local: use command output and gitignored .loopcoder/ run records for recovery; do not copy it into PR bodies, comments, merge commits, or merge comments.',
   ].join('\n'));
 }
 

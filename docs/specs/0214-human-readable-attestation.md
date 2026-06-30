@@ -6,7 +6,8 @@ date: 2026-06-28
 issue: 214
 pr: null
 supersedes: []
-superseded_by: []
+superseded_by:
+  - docs/specs/0306-local-only-attestation.md
 ---
 
 # Human-Readable Attestation Rendering

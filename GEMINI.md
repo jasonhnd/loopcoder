@@ -24,10 +24,10 @@ Gemini host specifics:
 - Before completing a delivery or merge turn, run
   `loopcoder attest --role conductor ...` at least once per active host session
   with the real Gemini host model,
-  timing, action, and usage available for the session. Stamp the emitted
-  `[attestation] ...` header or canonical JSON into durable artifacts the
-  Conductor produces, such as PR merge comments or merge commit messages; chat
-  alone is not durable enough.
+  timing, action, and usage available for the session. Treat the emitted
+  attestation as local-only: keep it in command output and gitignored
+  `.loopcoder/` run records for recovery, and do not copy it into PR bodies,
+  comments, merge commits, or merge comments.
 - Gemini hook enforcement is best-effort in this repository. Gemini CLI exposes
   `AfterTool` and `AfterAgent` hooks, and `hooks/conductor-attest.js` accepts
   those event names when wired in, but this repository ships and tests the

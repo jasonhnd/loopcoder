@@ -68,11 +68,11 @@ producing a successful result.
 
 ## Attestation
 
-A successful dispatch stamps the Worker `AttestationRecord` after the provider
-exits and before commit, push, or PR creation. The record is binary-stamped from
-the provider output with `role: worker`, the selected provider, the real parsed
-model and effort, `model_source: parsed`, `permission: write`, the issue action,
-exit code, timestamps, duration, token usage, and `verified: true`.
+A successful dispatch creates the Worker `AttestationRecord` after the provider
+exits and before commit, push, or PR creation. The record is derived from the
+provider output and carries `role: worker`, the selected provider, the real
+parsed model and effort, `model_source: parsed`, `permission: write`, the issue
+action, exit code, timing, duration, token usage, and `verified: true`.
 
 For Claude invocations with an explicit configured model, the attested model is
 the pinned/configured model when that exact model appears in Claude's reported
@@ -80,20 +80,10 @@ model usage. Auxiliary models can still appear in provider usage, but a larger
 auxiliary token count does not relabel the Worker or Verifier attestation away
 from the configured model that the provider reported.
 
-The PR body carries the one-line attestation header plus a fenced canonical JSON
-block:
-
-````text
-Closes #<issue>
-
-<provider summary>
-
-[attestation] role=worker provider=<provider> model=<model>(parsed) effort=<effort> perm=write action="implement issue #<issue>" exit=0 dur=<duration> tokens=<usage> verified=true
-
-```json
-{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #185","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}
-```
-````
+Worker attestation is surfaced locally only: the `dispatch` stdout records, the
+dispatch result JSON `attestation` object, stderr pretty output, and gitignored
+`.loopcoder/` run records. The PR body does not carry attestation; it should
+contain delivery text such as the issue closing line and provider summary.
 
 This replaces the older bare `worker: <provider>` line. If attestation
 validation fails, including missing model identity or token usage, dispatch
@@ -245,8 +235,8 @@ vendor plus the CLI `tool`, renders the model source as `(detected)` or
 duration in seconds, and groups token counts with thousands separators. When
 input and output tokens are present without a total, the pretty block derives a
 display-only total. This never changes or reorders the three stdout records,
-the PR body, the stable `Header()` / `[attestation] ...` line, or the canonical
-JSON.
+the stable `Header()` / `[attestation] ...` line, or the canonical JSON, and it
+never adds attestation to PR bodies.
 
 Example pretty block:
 

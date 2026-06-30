@@ -6,7 +6,8 @@ date: 2026-06-29
 issue: 218
 pr: null
 supersedes: []
-superseded_by: []
+superseded_by:
+  - docs/specs/0306-local-only-attestation.md
 ---
 
 # Surface Worker Attestation in Dispatch Output and Report
