@@ -213,6 +213,61 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantOutput: testInt64Ptr(71),
 		},
 		{
+			name: "pinned model present wins over higher token auxiliary",
+			output: []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"result": "done",
+				"modelUsage": {
+					"claude-haiku-4-5-20251001": {
+						"inputTokens": 1000,
+						"outputTokens": 200
+					},
+					"claude-opus-4-8[1m]": {
+						"inputTokens": 100,
+						"outputTokens": 10
+					}
+				}
+			}`),
+			inv:       Invocation{Model: "claude-opus-4-8[1m]"},
+			wantModel: "claude-opus-4-8[1m]",
+		},
+		{
+			name: "pinned model absent falls back to primary model",
+			output: []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"result": "done",
+				"modelUsage": {
+					"claude-haiku-4-5-20251001": {
+						"inputTokens": 1000,
+						"outputTokens": 200
+					}
+				}
+			}`),
+			inv:       Invocation{Model: "claude-opus-4-8[1m]"},
+			wantModel: "claude-haiku-4-5-20251001",
+		},
+		{
+			name: "unset model uses primary model",
+			output: []byte(`{
+				"type": "result",
+				"subtype": "success",
+				"result": "done",
+				"modelUsage": {
+					"claude-haiku-4-5-20251001": {
+						"inputTokens": 1000,
+						"outputTokens": 200
+					},
+					"claude-opus-4-8[1m]": {
+						"inputTokens": 100,
+						"outputTokens": 10
+					}
+				}
+			}`),
+			wantModel: "claude-haiku-4-5-20251001",
+		},
+		{
 			name: "total only leaves split absent",
 			output: []byte(`{
 				"type": "result",
