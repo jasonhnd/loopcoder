@@ -60,9 +60,9 @@ Before completing a delivery or merge turn, run a real Conductor attestation:
 loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action "<delivery action>" --duration-ms <ms> --total-tokens <tokens>
 ```
 
-Then stamp either the emitted `[attestation] ...` header or the canonical JSON
-into durable artifacts the Conductor produces, such as PR merge comments or
-merge commit messages.
+The emitted attestation is local-only. Keep it in command output and
+gitignored `.loopcoder/` run records for recovery; do not copy it into PR
+bodies, comments, merge commits, or merge comments.
 
 ## Test
 

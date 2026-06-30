@@ -56,11 +56,12 @@ snippet in [`hooks/README.md`](hooks/README.md). Codex and Gemini host notes in
 best-effort hook story. If the active host is not actually enforcing the hook,
 the manual attestation step is still mandatory and must be reported honestly.
 
-The emitted `[attestation] ...` header or canonical JSON must be stamped into
-durable artifacts the Conductor produces, not only chat. For merge work, include
-it in the PR merge comment, merge commit body, or equivalent durable merge
-artifact so a later Conductor can recover the attestation after compaction or
-session transfer.
+The emitted Conductor attestation is local-only. Keep it visible in command
+output and ensure recovery uses gitignored `.loopcoder/` run records; do not
+copy it into PR bodies, issue or PR comments, merge comments, merge commit
+bodies, commit messages, or other repository-visible artifacts. A later
+Conductor recovers attestation from `.loopcoder/` records and command result
+JSON, never GitHub artifacts.
 
 ## Backend selection
 
@@ -227,8 +228,10 @@ Bounds and scrutiny:
      failure details, final dispatch result, and Worker pretty attestation
      block from stderr. Relay that block verbatim, one per Worker. The stable
      `[attestation] ...` header, canonical JSON, and final result
-     `attestation` object remain the machine contracts, symmetric with the
-     Verifier attestation from `loopreview`.
+     `attestation` object remain local machine contracts, symmetric with the
+     Verifier attestation from `loopreview`, and must not be copied into PR
+     bodies, comments, commits, merge bodies, or other repository-visible
+     artifacts.
 
    Example shape:
 

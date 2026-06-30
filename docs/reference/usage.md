@@ -472,7 +472,7 @@ headless authentication.
 
 ## Attestation
 
-Worker and verifier invocations carry binary-stamped attestation records with
+Worker and verifier invocations carry validated attestation records with
 `verified: true`, `model_source: parsed`, provider, real parsed model, effort,
 permission, action, exit code, timing, and token usage. For Claude runs with an
 explicit pinned model, the attested model is the pinned/configured model when
@@ -499,9 +499,9 @@ Example:
 
 The final non-empty stdout line remains the dispatch result JSON. Consumers
 that need only the summary should parse the last line; conductors that need
-Worker attestation can read either the header or the nested `attestation`
-object. The canonical JSON line is the exact machine rendering of that same
-record and is not wrapped in Markdown on stdout.
+Worker attestation can read either the local header or the nested
+`attestation` object. The canonical JSON line is the exact machine rendering of
+that same record and is not wrapped in Markdown on stdout.
 
 `loopcoder dispatch`, `loopcoder loopreview`, and `loopcoder dispatch-wave`
 emit the human-readable pretty attestation block to stderr by default. The
@@ -526,9 +526,11 @@ ASCII form.
 
 Pretty output is diagnostic stderr only. It never appears between the three
 `dispatch` stdout records, and it does not change `loopreview` verdict JSON,
-PR bodies, canonical JSON, or the stable `Header()` / `[attestation] ...`
-contracts. The conductor relays the stderr block verbatim for human reporting;
-machine consumers should continue to parse canonical JSON or stable headers.
+canonical JSON, or the stable `Header()` / `[attestation] ...` contracts. It is
+not copied into PR bodies, comments, commits, merge bodies, or other
+repository-visible artifacts. The conductor relays the stderr block verbatim
+for human reporting; machine consumers should continue to parse local
+canonical JSON or stable headers.
 
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
 followed by the one-line `[attestation] ...` header, forces `model_source` to
@@ -537,10 +539,12 @@ values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
 
-Keep the default `loopcoder attest` output for durable artifacts such as merge
-comments, merge commit bodies, and PR notes. Use `loopcoder attest --pretty`
-only for direct human reading; it prints the pretty rendering to stdout instead
-of the canonical JSON plus header.
+Keep the default `loopcoder attest` output for local machine-readable
+Conductor attestation. Use `loopcoder attest --pretty` only for direct human
+reading; it prints the pretty rendering to stdout instead of the canonical JSON
+plus header. Conductor recovery after compaction or same-host session transfer
+reads gitignored `.loopcoder/` run records and local command results, never
+GitHub artifacts.
 
 Pretty output uses emoji when the target is an interactive terminal, or when
 emoji is forced, and emoji is not disabled:
