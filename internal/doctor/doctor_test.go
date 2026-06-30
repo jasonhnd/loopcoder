@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,6 +37,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"default branch",
 		"loopcoder binary",
 		"version compatibility",
+		"loopcoder skill",
 		"conductor runtime",
 	} {
 		check := requireCheck(t, report, name)
@@ -48,6 +50,79 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+}
+
+func TestRunChecksInstalledSkillState(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(*fakeDoctorEnv)
+		want     Status
+		contains []string
+	}{
+		{
+			name: "current",
+			want: StatusOK,
+			contains: []string{
+				"match selected binary embedded content",
+			},
+		},
+		{
+			name: "stale",
+			setup: func(env *fakeDoctorEnv) {
+				env.skillFiles[doctorSkillPath(env.userHome, "SKILL.md")] = []byte("old skill\n")
+			},
+			want: StatusWarn,
+			contains: []string{
+				"stale or partial",
+				"stale SKILL.md",
+				"run: loopcoder skill install",
+			},
+		},
+		{
+			name: "absent",
+			setup: func(env *fakeDoctorEnv) {
+				env.skillFiles = map[string][]byte{}
+			},
+			want: StatusInfo,
+			contains: []string{
+				"not installed",
+				"run: loopcoder skill install",
+			},
+		},
+		{
+			name: "partial",
+			setup: func(env *fakeDoctorEnv) {
+				delete(env.skillFiles, doctorSkillPath(env.userHome, "AGENTS.md"))
+			},
+			want: StatusWarn,
+			contains: []string{
+				"stale or partial",
+				"missing AGENTS.md",
+				"run: loopcoder skill install",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := healthyDoctorEnv()
+			if tt.setup != nil {
+				tt.setup(env)
+			}
+
+			report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+			check := requireCheck(t, report, "loopcoder skill")
+			if check.Status != tt.want {
+				t.Fatalf("status = %s, want %s (%s)", check.Status, tt.want, check.Message)
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(check.Message, want) {
+					t.Fatalf("message = %q, want containing %q", check.Message, want)
+				}
+			}
+		})
 	}
 }
 
@@ -272,6 +347,11 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 		},
 		file:           []byte("version: 1\nmin_loopcoder_version: 0.3.0\n"),
 		executablePath: "/bin/loopcoder",
+		userHome:       filepath.Join("home", "user"),
+		skillFiles: map[string][]byte{
+			doctorSkillPath(filepath.Join("home", "user"), "SKILL.md"):  []byte("skill content\n"),
+			doctorSkillPath(filepath.Join("home", "user"), "AGENTS.md"): []byte("agents content\n"),
+		},
 	}
 }
 
@@ -283,10 +363,12 @@ type fakeDoctorEnv struct {
 	file           []byte
 	fileErr        error
 	executablePath string
+	userHome       string
+	skillFiles     map[string][]byte
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
-	return Deps{
+	deps := Deps{
 		LookPath: func(file string) (string, error) {
 			if path, ok := f.paths[file]; ok {
 				return path, nil
@@ -309,15 +391,41 @@ func (f *fakeDoctorEnv) deps() Deps {
 			return f.cfg, nil
 		},
 		ReadFile: func(string) ([]byte, error) {
-			if f.fileErr != nil {
-				return nil, f.fileErr
-			}
-			return f.file, nil
+			panic("unreachable")
 		},
 		ExecutablePath: func() (string, error) {
 			return f.executablePath, nil
 		},
+		UserHomeDir: func() (string, error) {
+			return f.userHome, nil
+		},
+		SkillMarkdown: func() ([]byte, error) {
+			return []byte("skill content\n"), nil
+		},
+		AgentsMarkdown: func() ([]byte, error) {
+			return []byte("agents content\n"), nil
+		},
 	}
+	deps.ReadFile = func(path string) ([]byte, error) {
+		clean := filepath.Clean(path)
+		if data, ok := f.skillFiles[clean]; ok {
+			return append([]byte(nil), data...), nil
+		}
+		for _, name := range []string{"SKILL.md", "AGENTS.md"} {
+			if clean == doctorSkillPath(f.userHome, name) {
+				return nil, os.ErrNotExist
+			}
+		}
+		if f.fileErr != nil {
+			return nil, f.fileErr
+		}
+		return f.file, nil
+	}
+	return deps
+}
+
+func doctorSkillPath(home string, name string) string {
+	return filepath.Clean(filepath.Join(home, ".claude", "skills", "loopcoder", name))
 }
 
 func execNotFound(file string) error {

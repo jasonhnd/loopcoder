@@ -29,6 +29,7 @@ type SkillInstallDeps struct {
 	UserHomeDir    func() (string, error)
 	Stat           func(string) (fs.FileInfo, error)
 	MkdirAll       func(string, fs.FileMode) error
+	ReadFile       func(string) ([]byte, error)
 	WriteFile      func(string, []byte, fs.FileMode) error
 	SkillMarkdown  func() ([]byte, error)
 	AgentsMarkdown func() ([]byte, error)
@@ -38,7 +39,8 @@ type SkillInstallFileStatus string
 
 const (
 	SkillInstallFileCreated     SkillInstallFileStatus = "created"
-	SkillInstallFileExists      SkillInstallFileStatus = "exists"
+	SkillInstallFileUpdated     SkillInstallFileStatus = "updated"
+	SkillInstallFileUnchanged   SkillInstallFileStatus = "unchanged"
 	SkillInstallFileOverwritten SkillInstallFileStatus = "overwritten"
 )
 
@@ -57,6 +59,7 @@ func DefaultSkillInstallDeps() SkillInstallDeps {
 		UserHomeDir:    os.UserHomeDir,
 		Stat:           os.Stat,
 		MkdirAll:       os.MkdirAll,
+		ReadFile:       os.ReadFile,
 		WriteFile:      os.WriteFile,
 		SkillMarkdown:  loopcoder.SkillMarkdown,
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
@@ -114,6 +117,9 @@ func normalizeSkillInstallDeps(deps SkillInstallDeps) SkillInstallDeps {
 	if deps.MkdirAll == nil {
 		deps.MkdirAll = defaults.MkdirAll
 	}
+	if deps.ReadFile == nil {
+		deps.ReadFile = defaults.ReadFile
+	}
 	if deps.WriteFile == nil {
 		deps.WriteFile = defaults.WriteFile
 	}
@@ -159,13 +165,21 @@ func writeSkillInstallFile(deps SkillInstallDeps, path string, data []byte, forc
 		if info.IsDir() {
 			return SkillInstallFileResult{}, fmt.Errorf("%s is a directory", path)
 		}
+		status := SkillInstallFileOverwritten
 		if !force {
-			return SkillInstallFileResult{Path: path, Status: SkillInstallFileExists}, nil
+			current, err := deps.ReadFile(path)
+			if err != nil {
+				return SkillInstallFileResult{}, fmt.Errorf("read %s: %w", path, err)
+			}
+			if bytes.Equal(current, data) {
+				return SkillInstallFileResult{Path: path, Status: SkillInstallFileUnchanged}, nil
+			}
+			status = SkillInstallFileUpdated
 		}
 		if err := deps.WriteFile(path, data, 0o644); err != nil {
 			return SkillInstallFileResult{}, fmt.Errorf("write %s: %w", path, err)
 		}
-		return SkillInstallFileResult{Path: path, Status: SkillInstallFileOverwritten}, nil
+		return SkillInstallFileResult{Path: path, Status: status}, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, os.ErrNotExist) {
 		return SkillInstallFileResult{}, fmt.Errorf("stat %s: %w", path, err)
@@ -252,10 +266,12 @@ func renderSkillInstallResult(w io.Writer, result SkillInstallResult) {
 		switch file.Status {
 		case SkillInstallFileCreated:
 			fmt.Fprintf(w, "  created %s\n", file.Path)
+		case SkillInstallFileUpdated:
+			fmt.Fprintf(w, "  updated %s\n", file.Path)
+		case SkillInstallFileUnchanged:
+			fmt.Fprintf(w, "  unchanged %s\n", file.Path)
 		case SkillInstallFileOverwritten:
 			fmt.Fprintf(w, "  overwritten %s\n", file.Path)
-		case SkillInstallFileExists:
-			fmt.Fprintf(w, "  exists %s\n", file.Path)
 		default:
 			fmt.Fprintf(w, "  %s %s\n", file.Status, file.Path)
 		}

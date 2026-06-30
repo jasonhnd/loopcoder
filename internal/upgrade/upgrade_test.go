@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -214,6 +215,8 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	sumsURL := "https://download.example.test/SHA256SUMS"
 	fsys := newFakeFS()
 	layout := home.New(filepath.Join("home", ".loopcoder"))
+	stablePath := layout.StableBinaryPath()
+	refreshCalled := false
 
 	result, err := Run(context.Background(), Options{
 		RequestedVersion: "v0.3.3",
@@ -260,11 +263,26 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 			}
 			return binaryBytes, nil
 		},
-		MkdirAll:      fsys.MkdirAll,
-		WriteFile:     fsys.WriteFile,
-		Chmod:         fsys.Chmod,
-		Rename:        fsys.Rename,
-		Remove:        fsys.Remove,
+		MkdirAll:  fsys.MkdirAll,
+		WriteFile: fsys.WriteFile,
+		Chmod:     fsys.Chmod,
+		Rename:    fsys.Rename,
+		Remove:    fsys.Remove,
+		RunCommand: func(_ context.Context, name string, args ...string) (CommandResult, error) {
+			refreshCalled = true
+			if name != stablePath {
+				t.Fatalf("refresh binary = %q, want selected stable binary %q", name, stablePath)
+			}
+			if !reflect.DeepEqual(args, []string{"skill", "install"}) {
+				t.Fatalf("refresh args = %#v, want skill install", args)
+			}
+			return CommandResult{
+				Stdout: "loopcoder skill install complete\n" +
+					"  directory " + filepath.Join("home", ".claude", "skills", "loopcoder") + "\n" +
+					"  created " + filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md") + "\n" +
+					"  unchanged " + filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md") + "\n",
+			}, nil
+		},
 		RuntimeGOOS:   runtime.GOOS,
 		RuntimeGOARCH: runtime.GOARCH,
 	})
@@ -276,7 +294,6 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VersionBinaryPath returned error: %v", err)
 	}
-	stablePath := layout.StableBinaryPath()
 	if result.TargetVersion != "v0.3.3" || result.AssetName != assetName {
 		t.Fatalf("result release fields = %#v", result)
 	}
@@ -294,6 +311,214 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 	}
 	if len(fsys.renames) != 1 || fsys.renames[0][1] != stablePath {
 		t.Fatalf("renames = %#v, want one atomic rename to %q", fsys.renames, stablePath)
+	}
+	if !refreshCalled {
+		t.Fatal("skill refresh command was not called")
+	}
+	if result.SkillRefresh.BinaryPath != stablePath {
+		t.Fatalf("SkillRefresh.BinaryPath = %q, want %q", result.SkillRefresh.BinaryPath, stablePath)
+	}
+	if result.SkillRefresh.Warning != "" {
+		t.Fatalf("SkillRefresh.Warning = %q, want empty", result.SkillRefresh.Warning)
+	}
+	assertSkillRefreshStatus(t, result.SkillRefresh.Files, filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md"), SkillRefreshFileCreated)
+	assertSkillRefreshStatus(t, result.SkillRefresh.Files, filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md"), SkillRefreshFileUnchanged)
+}
+
+func TestRunReportsSkillRefreshFailureAsWarning(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	binaryBytes := []byte("new loopcoder binary")
+	assetName := platformAssetName(t, "0.3.3")
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	fsys := newFakeFS()
+	layout := home.New(filepath.Join("home", ".loopcoder"))
+
+	result, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.3.3",
+		CurrentVersion:   "v0.3.2",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		HomeLayout: func() (home.Layout, error) {
+			return layout, nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+				},
+			}),
+			assetURL: archiveBytes,
+			sumsURL:  checksums,
+		}),
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			return binaryBytes, nil
+		},
+		MkdirAll:      fsys.MkdirAll,
+		WriteFile:     fsys.WriteFile,
+		Chmod:         fsys.Chmod,
+		Rename:        fsys.Rename,
+		Remove:        fsys.Remove,
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+		RunCommand: func(context.Context, string, ...string) (CommandResult, error) {
+			return CommandResult{Stderr: "permission denied", ExitCode: 1}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.VersionBinaryPath == "" || result.StableBinaryPath == "" {
+		t.Fatalf("binary upgrade did not succeed: %#v", result)
+	}
+	if result.SkillRefresh.Warning == "" {
+		t.Fatalf("SkillRefresh.Warning is empty, want refresh warning")
+	}
+	if !strings.Contains(result.SkillRefresh.Warning, "permission denied") {
+		t.Fatalf("SkillRefresh.Warning = %q, want permission detail", result.SkillRefresh.Warning)
+	}
+}
+
+func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
+	helperPath := buildSkillInstallHelper(t)
+	helperBytes, err := os.ReadFile(helperPath)
+	if err != nil {
+		t.Fatalf("read helper binary: %v", err)
+	}
+
+	archiveBytes := []byte("archive bytes")
+	assetName := platformAssetName(t, "0.3.3")
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	loopcoderHome := filepath.Join(t.TempDir(), ".loopcoder")
+	layout := home.New(loopcoderHome)
+	userHome := t.TempDir()
+	skillDir := filepath.Join(userHome, ".claude", "skills", "loopcoder")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("create stale skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("old skill\n"), 0o644); err != nil {
+		t.Fatalf("write stale skill: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "AGENTS.md"), []byte("old agents\n"), 0o644); err != nil {
+		t.Fatalf("write stale agents: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "README.md"), []byte("user note\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
+
+	stablePath := layout.StableBinaryPath()
+	result, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.3.3",
+		CurrentVersion:   "v0.3.2",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		HomeLayout: func() (home.Layout, error) {
+			return layout, nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+				},
+			}),
+			assetURL: archiveBytes,
+			sumsURL:  checksums,
+		}),
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			return helperBytes, nil
+		},
+		MkdirAll: os.MkdirAll,
+		WriteFile: func(path string, data []byte, mode fs.FileMode) error {
+			return os.WriteFile(path, data, mode)
+		},
+		Chmod:  os.Chmod,
+		Rename: os.Rename,
+		Remove: func(path string) error {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+		RunCommand: func(ctx context.Context, name string, args ...string) (CommandResult, error) {
+			if name != stablePath {
+				t.Fatalf("refresh binary = %q, want newly selected stable binary %q", name, stablePath)
+			}
+			cmd := exec.CommandContext(ctx, name, args...)
+			cmd.Env = append(os.Environ(), "HOME="+userHome, "USERPROFILE="+userHome)
+			var stdout strings.Builder
+			var stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			result := CommandResult{Stdout: stdout.String(), Stderr: stderr.String()}
+			if err == nil {
+				return result, nil
+			}
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				result.ExitCode = exitErr.ExitCode()
+				return result, nil
+			}
+			return result, err
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.SkillRefresh.Warning != "" {
+		t.Fatalf("SkillRefresh.Warning = %q, want empty", result.SkillRefresh.Warning)
+	}
+	assertSkillRefreshStatus(t, result.SkillRefresh.Files, filepath.Join(skillDir, "SKILL.md"), SkillRefreshFileUpdated)
+	assertSkillRefreshStatus(t, result.SkillRefresh.Files, filepath.Join(skillDir, "AGENTS.md"), SkillRefreshFileUpdated)
+	if got := readFileString(t, filepath.Join(skillDir, "SKILL.md")); got != "new skill content\n" {
+		t.Fatalf("SKILL.md = %q, want new binary skill content", got)
+	}
+	if got := readFileString(t, filepath.Join(skillDir, "AGENTS.md")); got != "new agents content\n" {
+		t.Fatalf("AGENTS.md = %q, want new binary agents content", got)
+	}
+	if got := readFileString(t, filepath.Join(skillDir, "README.md")); got != "user note\n" {
+		t.Fatalf("unrelated file = %q, want preserved", got)
 	}
 }
 
@@ -401,6 +626,105 @@ func wantBinaryFileName() string {
 		return "loopcoder.exe"
 	}
 	return "loopcoder"
+}
+
+func assertSkillRefreshStatus(t *testing.T, files []SkillRefreshFileResult, path string, status SkillRefreshFileStatus) {
+	t.Helper()
+	clean := filepath.Clean(path)
+	for _, file := range files {
+		if filepath.Clean(file.Path) == clean {
+			if file.Status != status {
+				t.Fatalf("%s status = %s, want %s", path, file.Status, status)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s not found in skill refresh results: %#v", path, files)
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func buildSkillInstallHelper(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "main.go")
+	binaryPath := filepath.Join(dir, "loopcoder-helper"+executableSuffix())
+	source := `package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	if len(os.Args) != 3 || os.Args[1] != "skill" || os.Args[2] != "install" {
+		fmt.Fprintf(os.Stderr, "unexpected args: %v\n", os.Args[1:])
+		os.Exit(2)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "user home: %v\n", err)
+		os.Exit(1)
+	}
+	dir := filepath.Join(home, ".claude", "skills", "loopcoder")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("loopcoder skill install complete")
+	fmt.Println("  directory " + dir)
+	writeManaged(filepath.Join(dir, "SKILL.md"), []byte("new skill content\n"))
+	writeManaged(filepath.Join(dir, "AGENTS.md"), []byte("new agents content\n"))
+}
+
+func writeManaged(path string, data []byte) {
+	status := "updated"
+	current, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			status = "created"
+		} else {
+			fmt.Fprintf(os.Stderr, "read %s: %v\n", path, err)
+			os.Exit(1)
+		}
+	} else if bytes.Equal(current, data) {
+		status = "unchanged"
+	}
+	if status != "unchanged" {
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write %s: %v\n", path, err)
+			os.Exit(1)
+		}
+	}
+	fmt.Printf("  %s %s\n", status, path)
+}
+`
+	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
+		t.Fatalf("write helper source: %v", err)
+	}
+	cmd := exec.Command("go", "build", "-o", binaryPath, sourcePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build helper binary: %v\n%s", err, string(output))
+	}
+	return binaryPath
+}
+
+func executableSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }
 
 type fakeFS struct {
