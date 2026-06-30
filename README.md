@@ -4,7 +4,7 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.3.5-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.3.6-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
@@ -32,7 +32,7 @@ flowchart LR
 ```
 
 The conductor is a configured agent session. The worker defaults to `codex`;
-`codex` and `claude` are the verified worker providers for v0.3.5. The
+`codex` and `claude` are the verified worker providers for v0.3.6. The
 `gemini` worker adapter is present and registered, but experimental and
 unverified end-to-end because the Gemini CLI was not usable in the development
 environment. The verifier is configured separately and should normally differ
@@ -100,11 +100,13 @@ loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check com
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
-`dispatch`, `loopreview`, and `dispatch-wave` emit human-readable pretty
-attestation blocks to stderr by default while keeping machine stdout stable.
-Use `--pretty` to force emoji output and `--no-pretty` to suppress the display;
-`attest --pretty` remains the direct human-readable Conductor self-attestation
-form.
+`dispatch`, `loopreview`, and `dispatch-wave` emit local-only human-readable
+pretty attestation blocks to stderr by default while keeping machine stdout
+stable. The durable local machine surfaces are the `dispatch` / `loopreview`
+result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge
+artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress
+the display; `attest --pretty` remains the direct human-readable Conductor
+self-attestation form.
 
 ## How it works
 
@@ -122,9 +124,9 @@ form.
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, with `codex` and `claude` provider verification proven by real smoke runs.
-- Attestation -- worker and verifier invocations are binary-stamped with `verified: true` records covering provider, real parsed model, effort, permission, duration, and token usage. `dispatch`, `loopreview`, and `dispatch-wave` emit human-readable pretty attestation blocks to stderr by default without replacing durable machine output; the display shows provider vendor plus CLI tool, detected/self-reported model source, host-local timestamps, seconds duration, and grouped token counts. `--pretty` forces emoji and `--no-pretty` suppresses the display. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md), and [`docs/specs/0282-default-pretty-attestation.md`](docs/specs/0282-default-pretty-attestation.md).
+- Attestation -- worker and verifier invocations produce validated local-only records with `verified: true` covering provider, real parsed model, effort, permission, duration, and token usage. `dispatch`, `loopreview`, and `dispatch-wave` emit human-readable pretty attestation blocks to stderr by default; the durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge comments do not carry attestation headers or canonical JSON. The display shows provider vendor plus CLI tool, detected/self-reported model source, host-local timestamps, seconds duration, and grouped token counts. `--pretty` forces emoji and `--no-pretty` suppresses the display. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md), [`docs/specs/0282-default-pretty-attestation.md`](docs/specs/0282-default-pretty-attestation.md), and [`docs/specs/0306-local-only-attestation.md`](docs/specs/0306-local-only-attestation.md).
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
-- Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including its v0.2.0 rewrite from PowerShell to Go, its v0.3.0 multi-provider worker layer, its v0.3.1 attestation layer, its v0.3.2 delivery guardrails, its v0.3.3 loopreview reliability hardening, its v0.3.4 default-on pretty attestation relay, and its v0.3.5 skill propagation, attestation display polish, honest model attribution, and verifier model pin.
+- Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including the rewrite from PowerShell to Go, multi-provider workers, attestation, delivery guardrails, loopreview reliability hardening, default-on pretty attestation relay, skill propagation, attestation display polish, honest model attribution, verifier model pin, and the local-only attestation contract.
 
 ## Design
 
@@ -144,7 +146,7 @@ form.
 
 ## Status
 
-v0.3.5 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview` with bounded review packets and a timeout safety net, `.delivery.yml` role slots including a pinned Claude verifier model and effort, human-merge gate, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are binary-stamped, their pretty attestation blocks emit to stderr by default for conductor relay, stale installed conductor skills can be refreshed by install/upgrade/doctor flows, the Conductor record is self-attested, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` mechanism proof exists for `codex` and `claude`, and required identity, usage, or guardrail evidence fails closed. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation plus a background or cloud conductor tick remain documented targets rather than current behavior.
+v0.3.6 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview` with bounded review packets and a timeout safety net, `.delivery.yml` role slots including a pinned Claude verifier model and effort, human-merge gate, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Stale installed conductor skills can be refreshed by install/upgrade/doctor flows, the Conductor record is self-attested, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` mechanism proof exists for `codex` and `claude`, and required identity, usage, or guardrail evidence fails closed. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation plus a background or cloud conductor tick remain documented targets rather than current behavior.
 
 ## License
 

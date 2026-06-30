@@ -103,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/ins
 To pin a version:
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.5
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.6
 ```
 
 On Windows PowerShell:
@@ -115,7 +115,7 @@ irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps
 To pin a version on Windows:
 
 ```text
-$env:LOOPCODER_VERSION = "0.3.5"
+$env:LOOPCODER_VERSION = "0.3.6"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
@@ -472,14 +472,17 @@ headless authentication.
 
 ## Attestation
 
-Worker and verifier invocations carry validated attestation records with
+Worker and verifier invocations produce validated local-only attestation records with
 `verified: true`, `model_source: parsed`, provider, real parsed model, effort,
 permission, action, exit code, timing, and token usage. For Claude runs with an
 explicit pinned model, the attested model is the pinned/configured model when
 that exact model appears in provider-reported usage; a token-dominant auxiliary
 model does not override it. Missing required identity or usage fails closed:
 `dispatch` opens no PR, and `loopreview` returns `needs-human` with the
-incomplete-attestation finding.
+incomplete-attestation finding. Attestation surfaces are local-only: stderr
+pretty blocks, `dispatch` / `loopreview` result JSON, and gitignored
+`.loopcoder/` run records. PR bodies, merge commits, and merge comments are not
+attestation surfaces and must not contain attestation headers or canonical JSON.
 
 For every successful `loopcoder dispatch`, stdout contains three
 newline-terminated records in this order:
@@ -508,15 +511,15 @@ emit the human-readable pretty attestation block to stderr by default. The
 default block uses emoji on an interactive TTY and plain ASCII on a non-TTY.
 `dispatch-wave` emits one Worker block per dispatched issue.
 
-As of v0.3.5, the pretty block displays the provider vendor (`OpenAI`,
-`Anthropic`, or `Google`) plus a separate `tool` line with the canonical CLI
-adapter (`codex`, `claude`, or `gemini`). It renders parsed model sources as
-`(detected)` and Conductor self-attestation as `(self-reported)`, displays
-`started` and `ended` in the host local timezone to whole seconds, reports
-duration as human seconds plus total seconds, and groups token counts with
-thousands separators. When input and output tokens are present without a total,
-the pretty display derives `total=<input+output>` for display only; canonical
-JSON and the stable `[attestation]` header are unchanged.
+The pretty block displays the provider vendor (`OpenAI`, `Anthropic`, or
+`Google`) plus a separate `tool` line with the canonical CLI adapter (`codex`,
+`claude`, or `gemini`). It renders parsed model sources as `(detected)` and
+Conductor self-attestation as `(self-reported)`, displays `started` and `ended`
+in the host local timezone to whole seconds, reports duration as human seconds
+plus total seconds, and groups token counts with thousands separators. When
+input and output tokens are present without a total, the pretty display derives
+`total=<input+output>` for display only; canonical JSON and the stable
+`[attestation]` header are unchanged.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
@@ -526,11 +529,13 @@ ASCII form.
 
 Pretty output is diagnostic stderr only. It never appears between the three
 `dispatch` stdout records, and it does not change `loopreview` verdict JSON,
-canonical JSON, or the stable `Header()` / `[attestation] ...` contracts. It is
-not copied into PR bodies, comments, commits, merge bodies, or other
-repository-visible artifacts. The conductor relays the stderr block verbatim
-for human reporting; machine consumers should continue to parse local
-canonical JSON or stable headers.
+canonical JSON, or the stable `Header()` / `[attestation] ...` contracts.
+Together with result JSON and gitignored `.loopcoder/` run records, it is a
+local attestation surface only. It is not copied into PR bodies, comments,
+commits, merge commit bodies, merge comments, or other repository-visible
+artifacts. The conductor relays the stderr block verbatim for human reporting;
+machine consumers should continue to parse local canonical JSON or stable
+headers.
 
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
 followed by the one-line `[attestation] ...` header, forces `model_source` to
@@ -591,7 +596,8 @@ Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md)
 [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md),
 [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),
 [`../specs/0296-attestation-display-polish.md`](../specs/0296-attestation-display-polish.md),
-and [`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md).
+[`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md),
+and [`../specs/0306-local-only-attestation.md`](../specs/0306-local-only-attestation.md).
 
 ## Limits
 
