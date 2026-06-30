@@ -401,6 +401,14 @@ func TestUpgradeRunsWithInjectedDepsAndAliases(t *testing.T) {
 				AssetName:         "loopcoder_0.3.3_linux_amd64.tar.gz",
 				VersionBinaryPath: "/home/.loopcoder/versions/v0.3.3/loopcoder",
 				StableBinaryPath:  "/home/.loopcoder/bin/loopcoder",
+				SkillRefresh: upgrade.SkillRefreshResult{
+					BinaryPath: "/home/.loopcoder/bin/loopcoder",
+					Dir:        "/home/.claude/skills/loopcoder",
+					Files: []upgrade.SkillRefreshFileResult{
+						{Path: "/home/.claude/skills/loopcoder/SKILL.md", Status: upgrade.SkillRefreshFileUpdated},
+						{Path: "/home/.claude/skills/loopcoder/AGENTS.md", Status: upgrade.SkillRefreshFileUnchanged},
+					},
+				},
 			}, nil
 		},
 	})
@@ -418,10 +426,49 @@ func TestUpgradeRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"Resolved target version: v0.3.3",
 		"Before: path=/old/loopcoder version=v0.3.2",
 		"After: path=/home/.loopcoder/bin/loopcoder version=v0.3.3",
+		"Skill refresh: /home/.loopcoder/bin/loopcoder skill install",
+		"updated /home/.claude/skills/loopcoder/SKILL.md",
+		"unchanged /home/.claude/skills/loopcoder/AGENTS.md",
 		"Run: loopcoder doctor",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestUpgradeRendersSkillRefreshWarning(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"upgrade"}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "v0.3.2",
+		},
+		Upgrade: func(_ context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			return upgrade.Result{
+				CurrentPath:       "/old/loopcoder",
+				CurrentVersion:    opts.CurrentVersion,
+				TargetVersion:     "v0.3.3",
+				Platform:          "linux/amd64",
+				AssetName:         "loopcoder_0.3.3_linux_amd64.tar.gz",
+				VersionBinaryPath: "/home/.loopcoder/versions/v0.3.3/loopcoder",
+				StableBinaryPath:  "/home/.loopcoder/bin/loopcoder",
+				SkillRefresh: upgrade.SkillRefreshResult{
+					BinaryPath: "/home/.loopcoder/bin/loopcoder",
+					Warning:    "permission denied",
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Skill refresh: /home/.loopcoder/bin/loopcoder skill install") {
+		t.Fatalf("stdout missing skill refresh line:\n%s", stdout.String())
+	}
+	for _, want := range []string{"[loopcoder] warning: skill refresh failed after upgrade", "permission denied", "run: loopcoder skill install"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
 		}
 	}
 }

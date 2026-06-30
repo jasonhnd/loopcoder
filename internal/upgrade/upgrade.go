@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -54,6 +55,28 @@ type Result struct {
 	StableBinaryPath  string
 	Deferred          bool
 	PendingPath       string
+	SkillRefresh      SkillRefreshResult
+}
+
+type SkillRefreshFileStatus string
+
+const (
+	SkillRefreshFileCreated     SkillRefreshFileStatus = "created"
+	SkillRefreshFileUpdated     SkillRefreshFileStatus = "updated"
+	SkillRefreshFileUnchanged   SkillRefreshFileStatus = "unchanged"
+	SkillRefreshFileOverwritten SkillRefreshFileStatus = "overwritten"
+)
+
+type SkillRefreshFileResult struct {
+	Path   string
+	Status SkillRefreshFileStatus
+}
+
+type SkillRefreshResult struct {
+	BinaryPath string
+	Dir        string
+	Files      []SkillRefreshFileResult
+	Warning    string
 }
 
 type Deps struct {
@@ -68,8 +91,15 @@ type Deps struct {
 	Rename          func(string, string) error
 	Remove          func(string) error
 	ScheduleReplace func(source string, target string) error
+	RunCommand      func(ctx context.Context, name string, args ...string) (CommandResult, error)
 	RuntimeGOOS     string
 	RuntimeGOARCH   string
+}
+
+type CommandResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
 }
 
 type releaseConfig struct {
@@ -143,6 +173,7 @@ func DefaultDeps() Deps {
 		Rename:          os.Rename,
 		Remove:          os.Remove,
 		ScheduleReplace: scheduleReplace,
+		RunCommand:      execRunCommand,
 		RuntimeGOOS:     runtime.GOOS,
 		RuntimeGOARCH:   runtime.GOARCH,
 	}
@@ -239,6 +270,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	result.StableBinaryPath = installed.StableBinaryPath
 	result.Deferred = installed.Deferred
 	result.PendingPath = installed.PendingPath
+	result.SkillRefresh = refreshSkill(ctx, deps, skillRefreshBinaryPath(installed))
 	return result, nil
 }
 
@@ -277,6 +309,9 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.ScheduleReplace == nil {
 		deps.ScheduleReplace = defaults.ScheduleReplace
 	}
+	if deps.RunCommand == nil {
+		deps.RunCommand = defaults.RunCommand
+	}
 	if strings.TrimSpace(deps.RuntimeGOOS) == "" {
 		deps.RuntimeGOOS = defaults.RuntimeGOOS
 	}
@@ -284,6 +319,28 @@ func normalizeDeps(deps Deps) Deps {
 		deps.RuntimeGOARCH = defaults.RuntimeGOARCH
 	}
 	return deps
+}
+
+func execRunCommand(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	result := CommandResult{}
+	err := cmd.Run()
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	if err == nil {
+		return result, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.ExitCode = exitErr.ExitCode()
+		return result, nil
+	}
+	return result, err
 }
 
 func releaseConfigFromEnv(deps Deps) releaseConfig {
@@ -549,6 +606,85 @@ func installBinary(deps Deps, layout home.Layout, version string, binary []byte)
 	result.Deferred = deferred
 	result.PendingPath = pendingPath
 	return result, nil
+}
+
+func skillRefreshBinaryPath(installed installResult) string {
+	if strings.TrimSpace(installed.StableBinaryPath) != "" && !installed.Deferred {
+		return installed.StableBinaryPath
+	}
+	if strings.TrimSpace(installed.VersionBinaryPath) != "" {
+		return installed.VersionBinaryPath
+	}
+	if strings.TrimSpace(installed.PendingPath) != "" {
+		return installed.PendingPath
+	}
+	return installed.StableBinaryPath
+}
+
+func refreshSkill(ctx context.Context, deps Deps, binaryPath string) SkillRefreshResult {
+	result := SkillRefreshResult{BinaryPath: binaryPath}
+	if strings.TrimSpace(binaryPath) == "" {
+		result.Warning = "selected binary path is empty"
+		return result
+	}
+
+	commandResult, err := deps.RunCommand(ctx, binaryPath, "skill", "install")
+	if err != nil {
+		result.Warning = fmt.Sprintf("run %s skill install: %v", binaryPath, err)
+		return result
+	}
+	if commandResult.ExitCode != 0 {
+		detail := strings.TrimSpace(commandResult.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(commandResult.Stdout)
+		}
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", commandResult.ExitCode)
+		}
+		result.Warning = fmt.Sprintf("%s skill install failed: %s", binaryPath, detail)
+		return result
+	}
+
+	dir, files, err := parseSkillInstallOutput(commandResult.Stdout)
+	if err != nil {
+		result.Warning = fmt.Sprintf("parse %s skill install output: %v", binaryPath, err)
+		return result
+	}
+	result.Dir = dir
+	result.Files = files
+	return result
+}
+
+func parseSkillInstallOutput(output string) (string, []SkillRefreshFileResult, error) {
+	var dir string
+	var files []SkillRefreshFileResult
+	for _, rawLine := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || line == "loopcoder skill install complete" {
+			continue
+		}
+		if strings.HasPrefix(line, "directory ") {
+			dir = strings.TrimSpace(strings.TrimPrefix(line, "directory "))
+			continue
+		}
+		status, path, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		status = strings.TrimSpace(status)
+		path = strings.TrimSpace(path)
+		switch SkillRefreshFileStatus(status) {
+		case SkillRefreshFileCreated, SkillRefreshFileUpdated, SkillRefreshFileUnchanged, SkillRefreshFileOverwritten:
+			files = append(files, SkillRefreshFileResult{Path: path, Status: SkillRefreshFileStatus(status)})
+		}
+	}
+	if dir == "" {
+		return "", nil, errors.New("missing directory line")
+	}
+	if len(files) == 0 {
+		return "", nil, errors.New("missing managed file status lines")
+	}
+	return dir, files, nil
 }
 
 func replaceStableBinary(deps Deps, tmpPath string, stablePath string) (bool, string, error) {

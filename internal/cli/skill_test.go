@@ -49,7 +49,7 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 				Dir: target,
 				Files: []SkillInstallFileResult{
 					{Path: filepath.Join(target, skillFilename), Status: SkillInstallFileOverwritten},
-					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileCreated},
+					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileUpdated},
 				},
 			}, nil
 		},
@@ -67,7 +67,7 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"loopcoder skill install complete",
 		"directory " + target,
 		"overwritten " + filepath.Join(target, skillFilename),
-		"created " + filepath.Join(target, agentsFilename),
+		"updated " + filepath.Join(target, agentsFilename),
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
@@ -100,25 +100,47 @@ func TestInstallSkillWritesDefaultClaudeSkillDir(t *testing.T) {
 	}
 }
 
-func TestInstallSkillDoesNotClobberWithoutForce(t *testing.T) {
+func TestInstallSkillUpdatesStaleFilesWithoutForce(t *testing.T) {
 	fsys := newSkillFakeFS()
 	target := filepath.Join("skills", "loopcoder")
 	fsys.mustWrite(filepath.Join(target, skillFilename), []byte("custom skill"))
 	fsys.mustWrite(filepath.Join(target, agentsFilename), []byte("custom agents"))
+	fsys.mustWrite(filepath.Join(target, "README.md"), []byte("user note"))
 
 	result, err := InstallSkill(context.Background(), SkillInstallOptions{Dir: target}, skillDepsForTest(fsys))
 	if err != nil {
 		t.Fatalf("InstallSkill returned error: %v", err)
 	}
 
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileExists)
-	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileExists)
-	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "custom skill" {
-		t.Fatalf("SKILL.md = %q, want original content", got)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileUpdated)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileUpdated)
+	if got := string(fsys.read(t, filepath.Join(target, skillFilename))); got != "skill content\n" {
+		t.Fatalf("SKILL.md = %q, want embedded skill content", got)
 	}
-	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "custom agents" {
-		t.Fatalf("AGENTS.md = %q, want original content", got)
+	if got := string(fsys.read(t, filepath.Join(target, agentsFilename))); got != "agents content\n" {
+		t.Fatalf("AGENTS.md = %q, want embedded agents content", got)
 	}
+	if got := string(fsys.read(t, filepath.Join(target, "README.md"))); got != "user note" {
+		t.Fatalf("unrelated file = %q, want preserved user note", got)
+	}
+	if len(result.Files) != 2 {
+		t.Fatalf("file results = %#v, want only managed files", result.Files)
+	}
+}
+
+func TestInstallSkillReportsUnchangedWhenManagedFilesMatch(t *testing.T) {
+	fsys := newSkillFakeFS()
+	target := filepath.Join("skills", "loopcoder")
+	fsys.mustWrite(filepath.Join(target, skillFilename), []byte("skill content\n"))
+	fsys.mustWrite(filepath.Join(target, agentsFilename), []byte("agents content\n"))
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{Dir: target}, skillDepsForTest(fsys))
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, skillFilename), SkillInstallFileUnchanged)
+	assertSkillInstallStatus(t, result.Files, filepath.Join(target, agentsFilename), SkillInstallFileUnchanged)
 }
 
 func TestInstallSkillForceOverwritesExistingFiles(t *testing.T) {
@@ -187,6 +209,7 @@ func skillDepsForTest(fsys *skillFakeFS) SkillInstallDeps {
 		},
 		Stat:      fsys.Stat,
 		MkdirAll:  fsys.MkdirAll,
+		ReadFile:  fsys.ReadFile,
 		WriteFile: fsys.WriteFile,
 		SkillMarkdown: func() ([]byte, error) {
 			return []byte("skill content\n"), nil
@@ -244,6 +267,14 @@ func (f *skillFakeFS) MkdirAll(path string, _ fs.FileMode) error {
 	}
 	f.dirs[filepath.Clean(path)] = true
 	return nil
+}
+
+func (f *skillFakeFS) ReadFile(path string) ([]byte, error) {
+	data, ok := f.files[filepath.Clean(path)]
+	if !ok {
+		return nil, &fs.PathError{Op: "read", Path: path, Err: fs.ErrNotExist}
+	}
+	return append([]byte(nil), data...), nil
 }
 
 func (f *skillFakeFS) WriteFile(path string, data []byte, mode fs.FileMode) error {

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -19,6 +21,7 @@ import (
 type Status string
 
 const (
+	StatusInfo Status = "info"
 	StatusOK   Status = "ok"
 	StatusWarn Status = "warn"
 	StatusFail Status = "fail"
@@ -41,6 +44,9 @@ type Deps struct {
 	LoadConfig     func(path string) (config.Config, error)
 	ReadFile       func(path string) ([]byte, error)
 	ExecutablePath func() (string, error)
+	UserHomeDir    func() (string, error)
+	SkillMarkdown  func() ([]byte, error)
+	AgentsMarkdown func() ([]byte, error)
 }
 
 type CommandResult struct {
@@ -94,6 +100,9 @@ func DefaultDeps() Deps {
 		LoadConfig:     config.Load,
 		ReadFile:       os.ReadFile,
 		ExecutablePath: os.Executable,
+		UserHomeDir:    os.UserHomeDir,
+		SkillMarkdown:  loopcoder.SkillMarkdown,
+		AgentsMarkdown: loopcoder.AgentsMarkdown,
 	}
 }
 
@@ -127,6 +136,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
+	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
 		Status:  StatusOK,
@@ -152,6 +162,15 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ExecutablePath == nil {
 		deps.ExecutablePath = defaults.ExecutablePath
+	}
+	if deps.UserHomeDir == nil {
+		deps.UserHomeDir = defaults.UserHomeDir
+	}
+	if deps.SkillMarkdown == nil {
+		deps.SkillMarkdown = defaults.SkillMarkdown
+	}
+	if deps.AgentsMarkdown == nil {
+		deps.AgentsMarkdown = defaults.AgentsMarkdown
 	}
 	return deps
 }
@@ -529,6 +548,105 @@ func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
 	return Check{Name: "version compatibility", Status: status, Message: strings.Join(parts, "; ")}
 }
 
+func checkInstalledSkill(deps Deps) Check {
+	dir, err := defaultSkillDir(deps.UserHomeDir)
+	if err != nil {
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve installed skill directory: %v; run: loopcoder skill install", err),
+		}
+	}
+
+	managed := []struct {
+		name string
+		read func() ([]byte, error)
+	}{
+		{name: "SKILL.md", read: deps.SkillMarkdown},
+		{name: "AGENTS.md", read: deps.AgentsMarkdown},
+	}
+
+	missing := make([]string, 0, len(managed))
+	stale := make([]string, 0, len(managed))
+	for _, file := range managed {
+		embedded, err := readEmbeddedSkill(file.name, file.read)
+		if err != nil {
+			return Check{
+				Name:    "loopcoder skill",
+				Status:  StatusWarn,
+				Message: fmt.Sprintf("could not read embedded %s: %v; run: loopcoder skill install", file.name, err),
+			}
+		}
+		path := filepath.Join(dir, file.name)
+		installed, err := deps.ReadFile(path)
+		if err != nil {
+			if isNotExist(err) {
+				missing = append(missing, file.name)
+				continue
+			}
+			return Check{
+				Name:    "loopcoder skill",
+				Status:  StatusWarn,
+				Message: fmt.Sprintf("could not inspect installed %s: %v; run: loopcoder skill install", file.name, err),
+			}
+		}
+		if !bytes.Equal(installed, embedded) {
+			stale = append(stale, file.name)
+		}
+	}
+
+	if len(missing) == len(managed) {
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("not installed at %s; run: loopcoder skill install", dir),
+		}
+	}
+	if len(missing) > 0 || len(stale) > 0 {
+		details := make([]string, 0, 2)
+		if len(stale) > 0 {
+			details = append(details, "stale "+strings.Join(stale, ", "))
+		}
+		if len(missing) > 0 {
+			details = append(details, "missing "+strings.Join(missing, ", "))
+		}
+		return Check{
+			Name:    "loopcoder skill",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("installed loopcoder skill is stale or partial compared with selected binary embedded content (%s); run: loopcoder skill install", strings.Join(details, "; ")),
+		}
+	}
+
+	return Check{
+		Name:    "loopcoder skill",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("installed managed files match selected binary embedded content at %s", dir),
+	}
+}
+
+func defaultSkillDir(userHomeDir func() (string, error)) (string, error) {
+	homeDir, err := userHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home: %w", err)
+	}
+	homeDir = strings.TrimSpace(homeDir)
+	if homeDir == "" {
+		return "", errors.New("empty user home")
+	}
+	return filepath.Join(homeDir, ".claude", "skills", "loopcoder"), nil
+}
+
+func readEmbeddedSkill(name string, read func() ([]byte, error)) ([]byte, error) {
+	data, err := read()
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, errors.New("embedded content is empty")
+	}
+	return data, nil
+}
+
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
 	if strings.TrimSpace(build.Version) == "" {
 		build.Version = "dev"
@@ -555,6 +673,10 @@ func commandDetail(result CommandResult) string {
 		detail = strings.TrimSpace(result.Stdout)
 	}
 	return detail
+}
+
+func isNotExist(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist)
 }
 
 func firstNonEmptyLine(text string) string {

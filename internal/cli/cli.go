@@ -631,6 +631,9 @@ func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	renderUpgradeSuccess(stdout, result)
+	if result.SkillRefresh.Warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: skill refresh failed after upgrade: %s; run: loopcoder skill install\n", result.SkillRefresh.Warning)
+	}
 	return 0
 }
 
@@ -653,7 +656,24 @@ func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
 	}
 	fmt.Fprintf(w, "Before: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
 	fmt.Fprintf(w, "After: path=%s version=%s\n", result.StableBinaryPath, result.TargetVersion)
+	renderUpgradeSkillRefresh(w, result.SkillRefresh)
 	fmt.Fprintln(w, "Run: loopcoder doctor")
+}
+
+func renderUpgradeSkillRefresh(w io.Writer, result upgrade.SkillRefreshResult) {
+	if strings.TrimSpace(result.BinaryPath) == "" {
+		return
+	}
+	fmt.Fprintf(w, "Skill refresh: %s skill install\n", result.BinaryPath)
+	if result.Warning != "" {
+		return
+	}
+	if result.Dir != "" {
+		fmt.Fprintf(w, "  directory %s\n", result.Dir)
+	}
+	for _, file := range result.Files {
+		fmt.Fprintf(w, "  %s %s\n", file.Status, file.Path)
+	}
 }
 
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
