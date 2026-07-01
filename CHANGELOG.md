@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-07-01
+
+### Added
+
+- Conductor local enforcement per [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md): the `conductor-relay-guard` hook backstops hidden Worker and Verifier attestation blocks from `dispatch` and `loopreview`, while `conductor-attest` remains the Conductor self-attestation gate before a delivery or merge turn completes.
+- `loopcoder status` renders read-only delivery run status from gitignored `.loopcoder/` state so conductors report a program-rendered local surface instead of a hand-typed table.
+
+### Changed
+
+- `loopcoder skill install --repo <project>` now wires both conductor hooks into project `.claude/settings.json`, preserving unrelated settings, and `loopcoder doctor` warns when either conductor hook is missing.
+
+### Notes
+
+- Attestation and status remain local-only. The relay guard, status output, and Conductor attestation records have no PR body, issue, comment, commit, merge artifact, docs, fixture, or tracked-file footprint.
+
 ## [0.3.6] - 2026-07-01
 
 ### Changed

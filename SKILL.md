@@ -32,7 +32,9 @@ this loop.
 - Do not implement work items in the conductor. Dispatch implementation through
   the `loopcoder` binary (`loopcoder dispatch`); the binary owns worktree ->
   worker agent -> commit -> push -> PR.
-- Keep a compact in-chat state table: issue, dependencies, status, worker job, PR, check status, verifier notes.
+- Report run status by running `loopcoder status` and relaying its
+  program-rendered local output; do not replace it with a hand-typed status
+  table.
 - Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
 
 ## Conductor attestation
@@ -50,8 +52,11 @@ available in the host session. The Conductor record is self-reported and must
 remain visibly different from binary-verified Worker or Verifier records.
 
 Claude Code enforcement is provided by the project hook in
-[`hooks/conductor-attest.js`](hooks/conductor-attest.js); install it with the
-snippet in [`hooks/README.md`](hooks/README.md). Codex and Gemini host notes in
+[`hooks/conductor-attest.js`](hooks/conductor-attest.js). Install the conductor
+hooks into the active project `.claude/settings.json` with
+`loopcoder skill install --repo <project>`; the install merges both
+`conductor-attest.js` and `conductor-relay-guard.js`, and `loopcoder doctor`
+warns when either hook is missing. Codex and Gemini host notes in
 [`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md) describe their current
 best-effort hook story. If the active host is not actually enforcing the hook,
 the manual attestation step is still mandatory and must be reported honestly.
@@ -62,6 +67,30 @@ copy it into PR bodies, issue or PR comments, merge comments, merge commit
 bodies, commit messages, or other repository-visible artifacts. A later
 Conductor recovers attestation from `.loopcoder/` records and command result
 JSON, never GitHub artifacts.
+
+## Local-only relay and status
+
+Per [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md),
+Worker and Verifier attestation relay is a local visible-output obligation.
+Never swallow the attestation block: do not redirect, hide, or suppress stderr
+from `loopcoder dispatch`, `loopcoder dispatch-wave`, or
+`loopcoder loopreview`. Each Worker and Verifier pretty attestation block must
+appear verbatim in local visible command output and must be relayed verbatim,
+never summarized, merged, rewrapped, or hand-reformatted.
+
+Claude Code enforcement is provided by
+[`hooks/conductor-relay-guard.js`](hooks/conductor-relay-guard.js), which uses
+gitignored local relay state to backstop hidden Worker blocks from
+`loopcoder dispatch` and hidden Verifier blocks from `loopcoder loopreview`.
+These blocks remain local-only; do not copy attestation or `loopcoder status`
+output into PR bodies, issue or PR comments, commit messages, merge artifacts,
+docs, examples, fixtures, or any other tracked file.
+
+For delivery progress and final run state, run `loopcoder status --repo .`
+or `loopcoder status --repo . --run <run-id>` and relay the command's local
+output. The status command reads gitignored `.loopcoder/` run records and is
+the reporting surface for run status; do not reconstruct an equivalent table
+from memory.
 
 ## Backend selection
 
@@ -224,9 +253,10 @@ Bounds and scrutiny:
    - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
    - Invoke `loopcoder dispatch` and `loopcoder dispatch-wave` with
      `LOOPCODER_PRETTY=1` or `--pretty` so stderr includes the emoji pretty
-     attestation block. Capture each worker's output, job handle, PR URL,
-     failure details, final dispatch result, and Worker pretty attestation
-     block from stderr. Relay that block verbatim, one per Worker. The stable
+     attestation block. Keep command stderr visible; do not redirect, hide, or
+     suppress it. Capture each worker's output, job handle, PR URL, failure
+     details, final dispatch result, and Worker pretty attestation block from
+     stderr. Relay that block verbatim, one per Worker. The stable
      `[attestation] ...` header, canonical JSON, and final result
      `attestation` object remain local machine contracts, symmetric with the
      Verifier attestation from `loopreview`, and must not be copied into PR
@@ -275,6 +305,9 @@ Bounds and scrutiny:
 
 7. Report progress and final status.
    - Report meaningful state changes in chat: issues published, workers dispatched, PRs opened, checks passed/failed, verifier verdicts, blocked items, and unblocked dependents.
+   - Report run status with `loopcoder status --repo .` or
+     `loopcoder status --repo . --run <run-id>`. Relay the command output
+     locally instead of maintaining a hand-typed status table.
    - Every worker-dispatch progress report and final summary must relay the
      pretty attestation block verbatim from the command's stderr, one block per
      Worker and one block per Verifier. The relayed block is the source of truth
