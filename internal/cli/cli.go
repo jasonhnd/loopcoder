@@ -23,6 +23,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -74,6 +75,7 @@ var commands = []Command{
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
+	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
@@ -179,6 +181,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "status" {
+		return runStatus(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
@@ -317,6 +322,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
+	}
+	if command.Name == "status" {
+		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string    local run id to inspect (default latest modified local run)")
 	}
 	if command.Name == "resume" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -2230,6 +2239,53 @@ func readReadySetJSON(r io.Reader) (*report.ReadySetReport, error) {
 		return nil, fmt.Errorf("read ready-set JSON: %w", err)
 	}
 	return &readySet, nil
+}
+
+func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	var runID string
+	var runIDAlias string
+
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&runID, "run", "", "run id")
+	fs.StringVar(&runIDAlias, "Run", "", "run id")
+	fs.StringVar(&runIDAlias, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "status: %v\n", err)
+		return 2
+	}
+
+	report, err := runstatus.Load(runstatus.Options{
+		RepoPath: resolvedRepo,
+		RunID:    runID,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "status: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {

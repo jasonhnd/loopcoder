@@ -1,0 +1,203 @@
+package runstatus
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/state"
+)
+
+func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test"
+	writeAttempt(t, repo, runID, 101, 1, "job-101-1", workerAttestation(101, usageSplit(100, 50, 150)))
+	writeEventLine(t, repo, runID, `{"ts":"2026-07-01T00:00:43Z","run_id":"run-test","job_id":"job-101-1","issue":101,"phase":"pr_created","status":"succeeded","pr":"https://github.com/owner/repo/pull/501"}`)
+	writeVerifierRecord(t, repo, runID, map[string]any{
+		"issue":       101,
+		"pr":          "https://github.com/owner/repo/pull/501",
+		"verdict":     "pass",
+		"attestation": verifierAttestation(501, usageSplit(20, 10, 30)),
+	})
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+
+	for _, want := range []string{
+		"RUN STATUS",
+		"RunId: run-test (requested run)",
+		"Events: 1",
+		"Verifier records: 1",
+		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
+		"status is read-only and local-only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderTotalOnlyTokensAsNotReportedSplit(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-total"
+	writeAttempt(t, repo, runID, 102, 1, "job-102-1", workerAttestation(102, usageTotal(102585)))
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+
+	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | codex_exited | succeeded | not reported |"
+	if !strings.Contains(got, want) {
+		t.Fatalf("rendered status missing total-only token row %q:\n%s", want, got)
+	}
+}
+
+func TestLoadMissingAndEmptyRunReturnClearErrors(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := Load(Options{RepoPath: repo, RunID: "run-missing"}); err == nil || !strings.Contains(err.Error(), `run "run-missing" not found`) {
+		t.Fatalf("missing run error = %v", err)
+	}
+
+	if err := os.MkdirAll(state.RunPath(repo, "run-empty"), 0o755); err != nil {
+		t.Fatalf("MkdirAll empty run: %v", err)
+	}
+	if _, err := Load(Options{RepoPath: repo, RunID: "run-empty"}); err == nil || !strings.Contains(err.Error(), `run "run-empty" has no local status records`) {
+		t.Fatalf("empty run error = %v", err)
+	}
+}
+
+func TestLoadWithoutRunSelectsLatestModifiedRun(t *testing.T) {
+	repo := t.TempDir()
+	writeAttempt(t, repo, "run-old", 201, 1, "job-201-1", workerAttestation(201, usageTotal(2010)))
+	writeAttempt(t, repo, "run-new", 202, 1, "job-202-1", workerAttestation(202, usageTotal(2020)))
+
+	oldTime := time.Date(2026, 7, 1, 1, 0, 0, 0, time.UTC)
+	newTime := time.Date(2026, 7, 1, 2, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(state.RunPath(repo, "run-old"), oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes old run: %v", err)
+	}
+	if err := os.Chtimes(state.RunPath(repo, "run-new"), newTime, newTime); err != nil {
+		t.Fatalf("Chtimes new run: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if report.RunID != "run-new" || report.RunNote != "latest modified run selected" {
+		t.Fatalf("selected run = %q (%s), want run-new latest note", report.RunID, report.RunNote)
+	}
+	if got := Render(report); !strings.Contains(got, "| #202 | job-202-1 |") {
+		t.Fatalf("latest run output missing #202 row:\n%s", got)
+	}
+}
+
+func writeAttempt(t *testing.T, repo, runID string, issue, attempt int, jobID string, record attestation.AttestationRecord) {
+	t.Helper()
+	exitCode := 0
+	_, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          jobID,
+		Issue:          issue,
+		Attempt:        attempt,
+		Provider:       string(record.Provider),
+		PID:            12345,
+		Phase:          "codex_exited",
+		Status:         "succeeded",
+		StartedAt:      record.StartedAt,
+		HeartbeatAt:    record.EndedAt,
+		LastProgressAt: record.EndedAt,
+		LogBytes:       1234,
+		ExitCode:       &exitCode,
+		Attestation:    &record,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+}
+
+func writeEventLine(t *testing.T, repo, runID, line string) {
+	t.Helper()
+	path := state.EventsPath(repo, runID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll events: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile events: %v", err)
+	}
+}
+
+func writeVerifierRecord(t *testing.T, repo, runID string, record map[string]any) {
+	t.Helper()
+	path := filepath.Join(state.RunPath(repo, runID), "verifiers", "pr-501.loopreview.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll verifier: %v", err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal verifier: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile verifier: %v", err)
+	}
+}
+
+func workerAttestation(issue int, usage attestation.Usage) attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleWorker,
+		Provider:    "codex",
+		Model:       "gpt-5.5",
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "xhigh",
+		Permission:  attestation.PermissionWrite,
+		Action:      "implement issue #" + strconv.Itoa(issue),
+		ExitCode:    0,
+		StartedAt:   "2026-07-01T00:00:00Z",
+		EndedAt:     "2026-07-01T00:00:42Z",
+		DurationMS:  42000,
+		Usage:       usage,
+		Verified:    true,
+	}
+}
+
+func verifierAttestation(pr int, usage attestation.Usage) attestation.AttestationRecord {
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleVerifier,
+		Provider:    "claude",
+		Model:       "claude-sonnet-4-5",
+		ModelSource: attestation.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  attestation.PermissionReadOnly,
+		Action:      "review PR #" + strconv.Itoa(pr),
+		ExitCode:    0,
+		StartedAt:   "2026-07-01T00:01:00Z",
+		EndedAt:     "2026-07-01T00:01:07Z",
+		DurationMS:  7000,
+		Usage:       usage,
+		Verified:    true,
+	}
+}
+
+func usageSplit(input, output, total int64) attestation.Usage {
+	return attestation.Usage{
+		InputTokens:  &input,
+		OutputTokens: &output,
+		TotalTokens:  &total,
+	}
+}
+
+func usageTotal(total int64) attestation.Usage {
+	return attestation.Usage{
+		TotalTokens: &total,
+	}
+}

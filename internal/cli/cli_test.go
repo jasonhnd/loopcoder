@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -152,6 +153,84 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestStatusHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"status", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder status", "--repo", "--run", "latest modified local run"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestStatusRendersLocalRunState(t *testing.T) {
+	repo := t.TempDir()
+	record := validDispatchAttestation()
+	exitCode := 0
+	if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-101-1",
+		Issue:          101,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            1234,
+		Phase:          "codex_exited",
+		Status:         "succeeded",
+		StartedAt:      record.StartedAt,
+		HeartbeatAt:    record.EndedAt,
+		LastProgressAt: record.EndedAt,
+		LogBytes:       55,
+		ExitCode:       &exitCode,
+		Attestation:    &record,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	gotExit := Run([]string{"status", "--repo", repo, "--run", "run-test"}, &stdout, &stderr)
+	if gotExit != 0 {
+		t.Fatalf("Run returned exit code %d, stderr=%q", gotExit, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"RUN STATUS",
+		"RunId: run-test (requested run)",
+		"| #101 | job-101-1 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | codex_exited | succeeded |",
+		"status is read-only and local-only",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("status output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestStatusMissingRunReturnsClearError(t *testing.T) {
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"status", "--repo", repo, "--run", "run-missing"}, &stdout, &stderr)
+	if exitCode != 1 {
+		t.Fatalf("Run returned exit code %d, want 1", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `status: run "run-missing" not found`) {
+		t.Fatalf("stderr missing clear status error:\n%s", stderr.String())
 	}
 }
 
