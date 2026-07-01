@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -953,6 +954,58 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	}
 }
 
+func TestLoopreviewWritesRelayLedger(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	record := validLoopreviewAttestation()
+	result := loopreview.Result{
+		Verdict: loopreview.Verdict{
+			Verdict:         loopreview.VerdictPass,
+			Findings:        []loopreview.Finding{},
+			Evidence:        "review passed",
+			SpecConformance: loopreview.SpecConformancePass,
+			Attestation:     &record,
+		},
+		ExitCode: 0,
+	}
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "claude",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time {
+			return now
+		},
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+
+	pattern := filepath.Join(repo, ".loopcoder", "relay", "loopreview-pr-152", "loopreview-pr-152-*.attest")
+	ledger := readSingleFile(t, pattern)
+	for _, want := range []string{
+		"# command=loopreview",
+		"# role=verifier",
+		"# pr_number=152",
+		record.Header(),
+		record.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain}),
+	} {
+		if !strings.Contains(ledger, want) {
+			t.Fatalf("relay ledger missing %q:\n%s", want, ledger)
+		}
+	}
+}
+
 func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -1633,6 +1686,50 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	for _, disallowed := range []string{"✅", "❌", "⚠"} {
 		if strings.Contains(gotStderr, disallowed) {
 			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		}
+	}
+}
+
+func TestDispatchWritesRelayLedger(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	record := validDispatchAttestation()
+	result := validDispatchResult(record)
+	result.AttemptPath = filepath.Join(repo, ".loopcoder", "runs", result.RunID, "workers", "job-101-1.attempt.json")
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time {
+			return now
+		},
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+
+	ledger := readSingleFile(t, filepath.Join(repo, ".loopcoder", "relay", result.RunID, "job-101-1.attest"))
+	for _, want := range []string{
+		"# command=dispatch",
+		"# role=worker",
+		"# run_id=run-test",
+		"# issue=101",
+		record.Header(),
+		record.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain}),
+	} {
+		if !strings.Contains(ledger, want) {
+			t.Fatalf("relay ledger missing %q:\n%s", want, ledger)
 		}
 	}
 }
@@ -2399,6 +2496,22 @@ func nonEmptyLines(output string) []string {
 		}
 	}
 	return lines
+}
+
+func readSingleFile(t *testing.T, pattern string) string {
+	t.Helper()
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob %q: %v", pattern, err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("glob %q matched %d files, want 1: %#v", pattern, len(matches), matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read %s: %v", matches[0], err)
+	}
+	return string(data)
 }
 
 func validDispatchAttestation() attestation.AttestationRecord {

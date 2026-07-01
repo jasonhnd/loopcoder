@@ -22,6 +22,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -1162,6 +1163,9 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Dispatch == nil {
 		deps.Dispatch = DefaultDeps().Dispatch
 	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
 
 	fs := flag.NewFlagSet("dispatch", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1305,13 +1309,63 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if result.Attestation != nil && shouldRenderPretty(noPretty) {
-		if err := renderPrettyAttestation(stderr, *result.Attestation, prettyModeForTarget(stderr, deps, pretty)); err != nil {
-			fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
+	if result.Attestation != nil {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := writeDispatchRelayLedger(opts, result, *result.Attestation, mode, deps.Now()); err != nil {
+			fmt.Fprintf(stderr, "dispatch: write relay ledger: %v\n", err)
 			return 1
+		}
+		if shouldRenderPretty(noPretty) {
+			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
+				return 1
+			}
 		}
 	}
 	return 0
+}
+
+func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
+	invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
+	if invocationID == "" {
+		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
+	}
+	_, err := relay.Write(relay.Entry{
+		RepoPath:     opts.RepoPath,
+		RunID:        result.RunID,
+		InvocationID: invocationID,
+		Command:      "dispatch",
+		Role:         attestation.RoleWorker,
+		Issue:        result.Issue,
+		PR:           result.PR,
+		CreatedAt:    now,
+		Header:       record.Header(),
+		Pretty:       record.Pretty(attestation.PrettyOptions{Mode: mode}),
+	})
+	return err
+}
+
+func relayInvocationIDFromAttemptPath(attemptPath string) string {
+	base := filepath.Base(strings.TrimSpace(attemptPath))
+	if base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	return strings.TrimSuffix(base, ".attempt.json")
+}
+
+func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
+	_, err := relay.Write(relay.Entry{
+		RepoPath:     opts.RepoPath,
+		RunID:        fmt.Sprintf("loopreview-pr-%d", opts.PRNumber),
+		InvocationID: fmt.Sprintf("loopreview-pr-%d-%d", opts.PRNumber, now.UTC().UnixNano()),
+		Command:      "loopreview",
+		Role:         attestation.RoleVerifier,
+		PRNumber:     opts.PRNumber,
+		CreatedAt:    now,
+		Header:       record.Header(),
+		Pretty:       record.Pretty(attestation.PrettyOptions{Mode: mode}),
+	})
+	return err
 }
 
 func renderDispatch(w io.Writer, result worker.Result) error {
@@ -1971,6 +2025,9 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Loopreview == nil {
 		deps.Loopreview = DefaultDeps().Loopreview
 	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
 
 	fs := flag.NewFlagSet("loopreview", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -2090,10 +2147,17 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
 		return 1
 	}
-	if result.Verdict.Attestation != nil && shouldRenderPretty(noPretty) {
-		if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, prettyModeForTarget(stderr, deps, pretty)); err != nil {
-			fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
+	if result.Verdict.Attestation != nil {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Attestation, mode, deps.Now()); err != nil {
+			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
 			return 1
+		}
+		if shouldRenderPretty(noPretty) {
+			if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, mode); err != nil {
+				fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
+				return 1
+			}
 		}
 	}
 	return result.ExitCode
