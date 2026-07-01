@@ -42,15 +42,16 @@ push access.
    loopcoder doctor
    ```
 
-3. Install the conductor playbook once per agent home so Claude Code and Codex
-   know how to act as conductor.
+3. Install the conductor playbook once per agent home and wire project
+   conductor hooks into the repository's Claude Code settings.
 
    ```text
-   loopcoder skill install
+   loopcoder skill install --repo <repo>
    ```
 
    This writes the bundled `SKILL.md` plus the Codex `AGENTS.md` entrypoint to
-   the Claude Code loopcoder skill directory.
+   the Claude Code loopcoder skill directory and merges the loopcoder conductor
+   hooks into `<repo>/.claude/settings.json`.
 
 4. Initialize each consumer repository.
 
@@ -62,7 +63,8 @@ push access.
 
    `loopcoder init` scaffolds `.delivery.yml`, `ROADMAP.md`, and the GitHub
    labels loopcoder uses. The follow-up `loopcoder doctor` confirms `git`, `gh`
-   auth, provider CLIs, `origin`, and the default branch for that repository.
+   auth, provider CLIs, `origin`, the default branch, and project conductor
+   hook settings for that repository.
 
 5. Drive the loop from a conductor session in the repository.
 
@@ -103,7 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/ins
 To pin a version:
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.6
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.7
 ```
 
 On Windows PowerShell:
@@ -115,7 +117,7 @@ irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps
 To pin a version on Windows:
 
 ```text
-$env:LOOPCODER_VERSION = "0.3.6"
+$env:LOOPCODER_VERSION = "0.3.7"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
@@ -151,8 +153,42 @@ The conductor resolves the `loopcoder` binary before running mechanical work:
 2. `loopcoder` found on `PATH`.
 3. Otherwise, `loopcoder` is required on all platforms.
 
-Use the resolved binary for dispatch, ready-set scheduling, resume, recovery,
-local verification, state, and lease operations.
+Use the resolved binary for dispatch, ready-set scheduling, status reporting,
+resume, recovery, local verification, state, and lease operations.
+
+## Conductor Hooks And Status
+
+Install or refresh the Claude Code playbook and project conductor hooks with:
+
+```text
+loopcoder skill install --repo <project>
+```
+
+The command writes the bundled `SKILL.md` and `AGENTS.md` files to the Claude
+Code loopcoder skill directory and merges two hook scripts into
+`<project>/.claude/settings.json`: `hooks/conductor-attest.js` and
+`hooks/conductor-relay-guard.js`. The merge is project-scoped and preserves
+unrelated settings and hooks. `loopcoder doctor --repo <project>` warns when
+either conductor hook is missing.
+
+`conductor-attest.js` enforces the local Conductor self-attestation step before
+a delivery or merge turn can finish. `conductor-relay-guard.js` enforces local
+visible relay of Worker and Verifier attestation from `loopcoder dispatch` and
+`loopcoder loopreview`. Do not redirect, hide, or suppress those commands'
+stderr; the same verbatim relay obligation applies to `loopcoder dispatch-wave`
+whenever it emits per-Worker blocks.
+
+Report delivery run state with the program-rendered local status command:
+
+```text
+loopcoder status --repo .
+loopcoder status --repo . --run <run-id>
+```
+
+When `--run` is omitted, `status` selects the latest modified local run. The
+output is read-only and local-only: it reads gitignored `.loopcoder/` state and
+must not be copied into PR bodies, issues, comments, commits, merge artifacts,
+docs, examples, fixtures, or tracked files.
 
 ## Repository Initialization
 
@@ -263,10 +299,11 @@ For compatibility signals such as `min_loopcoder_version`, see
    resulting changes, pushes the branch, opens a PR, and cleans up.
 
 6. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
-   `gh pr checks`, and reports progress, failures, risks, and final status in
-   chat. `codex` and `claude` have real verifier smoke proof; ambiguous,
-   malformed, timed-out, or incomplete verifier output is still reported as
-   `needs-human`.
+   `gh pr checks`, relays Worker and Verifier attestation blocks verbatim, and
+   reports progress, failures, risks, and final run state through
+   `loopcoder status`. `codex` and `claude` have real verifier smoke proof;
+   ambiguous, malformed, timed-out, or incomplete verifier output is still
+   reported as `needs-human`.
 
 7. You name which PRs to merge. loopcoder merges only those named PRs by running
    `gh pr merge`, following `.delivery.yml` merge settings when present.
@@ -307,6 +344,8 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   development track;
 - `.delivery.yml` schema version and `min_loopcoder_version` compatibility when
   declared;
+- project Claude Code conductor hook settings, warning when
+  `conductor-attest.js` or `conductor-relay-guard.js` is missing;
 - conductor runtime responsibility, which remains user-provided by the active
   host.
 
@@ -378,6 +417,8 @@ loopcoder -v
 
 loopcoder doctor --repo .
 
+loopcoder skill install --repo .
+
 loopcoder init
 loopcoder init --force
 loopcoder init --worker-model <model> --worker-effort <effort>
@@ -401,6 +442,9 @@ loopcoder dispatch \
   --pretty
 
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2>
+
+loopcoder status --repo .
+loopcoder status --repo . --run <run-id>
 
 loopcoder resume --repo . --run-id <run-id>
 
@@ -533,8 +577,11 @@ canonical JSON, or the stable `Header()` / `[attestation] ...` contracts.
 Together with result JSON and gitignored `.loopcoder/` run records, it is a
 local attestation surface only. It is not copied into PR bodies, comments,
 commits, merge commit bodies, merge comments, or other repository-visible
-artifacts. The conductor relays the stderr block verbatim for human reporting;
-machine consumers should continue to parse local canonical JSON or stable
+artifacts. The conductor must keep `dispatch`, `dispatch-wave`, and
+`loopreview` stderr visible and relay each Worker or Verifier pretty block
+verbatim for human reporting; `conductor-relay-guard` locally backstops hidden
+or suppressed `dispatch` and `loopreview` blocks where hooks are active.
+Machine consumers should continue to parse local canonical JSON or stable
 headers.
 
 `loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
@@ -597,15 +644,16 @@ Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md)
 [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),
 [`../specs/0296-attestation-display-polish.md`](../specs/0296-attestation-display-polish.md),
 [`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md),
-and [`../specs/0306-local-only-attestation.md`](../specs/0306-local-only-attestation.md).
+[`../specs/0306-local-only-attestation.md`](../specs/0306-local-only-attestation.md),
+and [`../specs/0316-conductor-local-enforcement.md`](../specs/0316-conductor-local-enforcement.md).
 
 ## Limits
 
 loopcoder v1 is intentionally small-batch and single-session. It is meant for a
 handful of issues in one open conductor session, not large unattended roadmaps.
 
-State lives in GitHub plus the conductor's in-chat state table and dependency
-DAG. If the session ends, a later session can re-read GitHub state, but v1 does
-not provide a fully stateless background conductor that automatically adopts
-orphaned workers. See [`architecture.md`](architecture.md) for the current
-architecture and limits.
+State lives in GitHub plus local `.loopcoder/` run records rendered by
+`loopcoder status` and the conductor's dependency DAG. If the session ends, a
+later session can re-read GitHub state, but v1 does not provide a fully
+stateless background conductor that automatically adopts orphaned workers. See
+[`architecture.md`](architecture.md) for the current architecture and limits.
