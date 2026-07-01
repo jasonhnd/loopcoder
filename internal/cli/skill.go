@@ -19,6 +19,14 @@ import (
 const (
 	skillFilename  = "SKILL.md"
 	agentsFilename = "AGENTS.md"
+
+	// conductorWorkspaceMarkerRelPath is the project-relative path to the
+	// marker that activates auto-enforcement of the conductor hooks in an
+	// installed repo.
+	conductorWorkspaceMarkerRelPath = ".loopcoder/conductor-workspace"
+	// conductorWorkspaceMarkerContent is a small stable JSON body written to
+	// the marker. Keep it stable so idempotent installs do not churn it.
+	conductorWorkspaceMarkerContent = `{"marker":"loopcoder-conductor-workspace","source":"loopcoder skill install"}` + "\n"
 )
 
 type SkillInstallOptions struct {
@@ -52,9 +60,10 @@ type SkillInstallFileResult struct {
 }
 
 type SkillInstallResult struct {
-	Dir          string
-	Files        []SkillInstallFileResult
-	HookSettings *SkillInstallFileResult
+	Dir             string
+	Files           []SkillInstallFileResult
+	HookSettings    *SkillInstallFileResult
+	WorkspaceMarker *SkillInstallFileResult
 }
 
 func DefaultSkillInstallDeps() SkillInstallDeps {
@@ -111,6 +120,12 @@ func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInsta
 		return result, err
 	}
 	result.HookSettings = &hookSettings
+
+	marker, err := writeConductorWorkspaceMarker(deps, opts.ProjectDir)
+	if err != nil {
+		return result, err
+	}
+	result.WorkspaceMarker = &marker
 
 	return result, nil
 }
@@ -235,6 +250,45 @@ func writeConductorHookSettings(deps SkillInstallDeps, projectDir string) (Skill
 	return SkillInstallFileResult{Path: path, Status: status}, nil
 }
 
+// writeConductorWorkspaceMarker writes the conductor-workspace marker into the
+// project's .loopcoder directory. Its presence activates auto-enforcement of the
+// conductor hooks. It reports created / unchanged / updated honestly so a
+// re-install does not falsely claim it created the marker again.
+func writeConductorWorkspaceMarker(deps SkillInstallDeps, projectDir string) (SkillInstallFileResult, error) {
+	projectDir = strings.TrimSpace(projectDir)
+	if projectDir == "" {
+		projectDir = "."
+	}
+	path := filepath.Join(projectDir, conductorWorkspaceMarkerRelPath)
+	dir := filepath.Dir(path)
+	if err := deps.MkdirAll(dir, 0o755); err != nil {
+		return SkillInstallFileResult{}, fmt.Errorf("create loopcoder workspace directory %s: %w", dir, err)
+	}
+
+	data := []byte(conductorWorkspaceMarkerContent)
+	status := SkillInstallFileCreated
+	if info, err := deps.Stat(path); err == nil {
+		if info.IsDir() {
+			return SkillInstallFileResult{}, fmt.Errorf("%s is a directory", path)
+		}
+		current, err := deps.ReadFile(path)
+		if err != nil {
+			return SkillInstallFileResult{}, fmt.Errorf("read conductor workspace marker %s: %w", path, err)
+		}
+		if bytes.Equal(current, data) {
+			return SkillInstallFileResult{Path: path, Status: SkillInstallFileUnchanged}, nil
+		}
+		status = SkillInstallFileUpdated
+	} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, os.ErrNotExist) {
+		return SkillInstallFileResult{}, fmt.Errorf("stat conductor workspace marker %s: %w", path, err)
+	}
+
+	if err := deps.WriteFile(path, data, 0o644); err != nil {
+		return SkillInstallFileResult{}, fmt.Errorf("write conductor workspace marker %s: %w", path, err)
+	}
+	return SkillInstallFileResult{Path: path, Status: status}, nil
+}
+
 func runSkill(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "skill: expected subcommand")
@@ -330,5 +384,8 @@ func renderSkillInstallResult(w io.Writer, result SkillInstallResult) {
 	}
 	if result.HookSettings != nil {
 		fmt.Fprintf(w, "  hooks %s %s\n", result.HookSettings.Status, result.HookSettings.Path)
+	}
+	if result.WorkspaceMarker != nil {
+		fmt.Fprintf(w, "  marker %s %s\n", result.WorkspaceMarker.Status, result.WorkspaceMarker.Path)
 	}
 }

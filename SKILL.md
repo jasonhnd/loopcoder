@@ -51,12 +51,12 @@ Use the actual host provider, model, effort, action, timing, and token usage
 available in the host session. The Conductor record is self-reported and must
 remain visibly different from binary-verified Worker or Verifier records.
 
-Claude Code enforcement is provided by the project hook in
-[`hooks/conductor-attest.js`](hooks/conductor-attest.js). Install the conductor
-hooks into the active project `.claude/settings.json` with
+Claude Code enforcement is provided by the project hook
+`loopcoder hook conductor-attest`, embedded in the loopcoder binary. Install the
+conductor hooks into the active project `.claude/settings.json` with
 `loopcoder skill install --repo <project>`; the install merges both
-`conductor-attest.js` and `conductor-relay-guard.js`, and `loopcoder doctor`
-warns when either hook is missing. Codex and Gemini host notes in
+`loopcoder hook conductor-attest` and `loopcoder hook conductor-relay-guard`,
+and `loopcoder doctor` warns when either hook command is missing. Codex and Gemini host notes in
 [`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md) describe their current
 best-effort hook story. If the active host is not actually enforcing the hook,
 the manual attestation step is still mandatory and must be reported honestly.
@@ -79,8 +79,8 @@ appear verbatim in local visible command output and must be relayed verbatim,
 never summarized, merged, rewrapped, or hand-reformatted.
 
 Claude Code enforcement is provided by
-[`hooks/conductor-relay-guard.js`](hooks/conductor-relay-guard.js), which uses
-gitignored local relay state to backstop hidden Worker blocks from
+`loopcoder hook conductor-relay-guard`, embedded in the loopcoder binary, which
+uses gitignored local relay state to backstop hidden Worker blocks from
 `loopcoder dispatch` and hidden Verifier blocks from `loopcoder loopreview`.
 These blocks remain local-only; do not copy attestation or `loopcoder status`
 output into PR bodies, issue or PR comments, commit messages, merge artifacts,

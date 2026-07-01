@@ -41,14 +41,14 @@ Gemini host specifics:
   `conductor-attest` where hooks are active.
 - Install conductor hooks into the active project `.claude/settings.json` with
   `loopcoder skill install --repo <project>`. The install path wires both
-  `hooks/conductor-attest.js` and `hooks/conductor-relay-guard.js`;
-  `loopcoder doctor` warns when either hook is missing.
+  `loopcoder hook conductor-attest` and `loopcoder hook conductor-relay-guard`;
+  `loopcoder doctor` warns when either hook command is missing or when
+  `loopcoder` does not resolve on `PATH`.
 - Gemini hook enforcement is best-effort in this repository. Gemini CLI exposes
-  `AfterTool` and `AfterAgent` hooks, and the conductor hook scripts accept
+  `AfterTool` and `AfterAgent` hooks, and the conductor hook commands accept
   those event names when wired in, but this repository ships and tests the
   Claude Code registration only. If you opt in to Gemini hooks manually,
-  register both commands for shell-tool `AfterTool` and `AfterAgent` events
-  from the repo root:
+  register both commands for shell-tool `AfterTool` and `AfterAgent` events:
 
   ```json
   {
@@ -59,12 +59,12 @@ Gemini host specifics:
           "hooks": [
             {
               "type": "command",
-              "command": "node hooks/conductor-attest.js",
+              "command": "loopcoder hook conductor-attest",
               "timeout": 10
             },
             {
               "type": "command",
-              "command": "node hooks/conductor-relay-guard.js",
+              "command": "loopcoder hook conductor-relay-guard",
               "timeout": 10
             }
           ]
@@ -75,12 +75,12 @@ Gemini host specifics:
           "hooks": [
             {
               "type": "command",
-              "command": "node hooks/conductor-attest.js",
+              "command": "loopcoder hook conductor-attest",
               "timeout": 10
             },
             {
               "type": "command",
-              "command": "node hooks/conductor-relay-guard.js",
+              "command": "loopcoder hook conductor-relay-guard",
               "timeout": 10
             }
           ]

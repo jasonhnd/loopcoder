@@ -77,8 +77,8 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 			want: StatusWarn,
 			contains: []string{
 				"active Claude Code settings not found",
-				"conductor-attest.js",
-				"conductor-relay-guard.js",
+				"conductor-attest",
+				"conductor-relay-guard",
 				"run: loopcoder skill install",
 			},
 		},
@@ -89,15 +89,25 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 				if err != nil || !changed {
 					t.Fatalf("MergeSettings returned changed=%v err=%v", changed, err)
 				}
-				env.settingsFile = bytes.ReplaceAll(settings, []byte(`node hooks/conductor-relay-guard.js`), []byte(`node hooks/other.js`))
+				env.settingsFile = bytes.ReplaceAll(settings, []byte(`loopcoder hook conductor-relay-guard`), []byte(`loopcoder hook other`))
 			},
 			want: StatusWarn,
 			contains: []string{
 				"missing loopcoder conductor hooks",
-				"conductor-relay-guard.js",
+				"conductor-relay-guard",
 				"PostToolUse",
 				"Stop",
 				"run: loopcoder skill install",
+			},
+		},
+		{
+			name: "hooks present but loopcoder missing from PATH",
+			setup: func(env *fakeDoctorEnv) {
+				delete(env.paths, "loopcoder")
+			},
+			want: StatusWarn,
+			contains: []string{
+				"loopcoder binary is not on PATH",
 			},
 		},
 	}
@@ -393,10 +403,11 @@ func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 func healthyDoctorEnv() *fakeDoctorEnv {
 	return &fakeDoctorEnv{
 		paths: map[string]string{
-			"git":    "/bin/git",
-			"gh":     "/bin/gh",
-			"codex":  "/bin/codex",
-			"claude": "/bin/claude",
+			"git":       "/bin/git",
+			"gh":        "/bin/gh",
+			"codex":     "/bin/codex",
+			"claude":    "/bin/claude",
+			"loopcoder": "/bin/loopcoder",
 		},
 		commands: map[string]CommandResult{
 			cmdKey("gh", "auth", "status"): {

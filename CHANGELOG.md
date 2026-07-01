@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-07-01
+
+### Changed
+
+- Conductor hooks are now invoked via `loopcoder hook <name>` (embedded in the binary) instead of `node hooks/*.js`, fixing hooks that never resolved in consumer repos because `loopcoder skill install` never copied the `.js` files. The hook logic is a faithful Go port (package `internal/conductorhooks`); the `node` scripts are removed. `loopcoder doctor` now verifies the hook command form and that `loopcoder` resolves on `PATH` instead of only matching the command string, and `loopcoder skill install` merges an idempotent upgrade that strips stale `node hooks/*.js` entries and writes a gitignored `.loopcoder/conductor-workspace` marker that activates auto-enforcement in installed repos.
+
 ## [0.3.7] - 2026-07-01
 
 ### Added

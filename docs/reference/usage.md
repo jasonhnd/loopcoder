@@ -165,15 +165,21 @@ loopcoder skill install --repo <project>
 ```
 
 The command writes the bundled `SKILL.md` and `AGENTS.md` files to the Claude
-Code loopcoder skill directory and merges two hook scripts into
-`<project>/.claude/settings.json`: `hooks/conductor-attest.js` and
-`hooks/conductor-relay-guard.js`. The merge is project-scoped and preserves
-unrelated settings and hooks. `loopcoder doctor --repo <project>` warns when
-either conductor hook is missing.
+Code loopcoder skill directory and merges two hook commands into
+`<project>/.claude/settings.json`: `loopcoder hook conductor-attest` and
+`loopcoder hook conductor-relay-guard`. The hooks are embedded in the loopcoder
+binary and invoked as subcommands, so they resolve regardless of the working
+directory and need no Node dependency; the merge upgrades any stale
+`node hooks/*.js` entries idempotently. The merge is project-scoped and
+preserves unrelated settings and hooks, and writes a gitignored
+`.loopcoder/conductor-workspace` marker that activates auto-enforcement in the
+installed repo. `loopcoder doctor --repo <project>` warns when either conductor
+hook command is missing or when `loopcoder` does not resolve on `PATH`.
 
-`conductor-attest.js` enforces the local Conductor self-attestation step before
-a delivery or merge turn can finish. `conductor-relay-guard.js` enforces local
-visible relay of Worker and Verifier attestation from `loopcoder dispatch` and
+`loopcoder hook conductor-attest` enforces the local Conductor self-attestation
+step before a delivery or merge turn can finish.
+`loopcoder hook conductor-relay-guard` enforces local visible relay of Worker
+and Verifier attestation from `loopcoder dispatch` and
 `loopcoder loopreview`. Do not redirect, hide, or suppress those commands'
 stderr; the same verbatim relay obligation applies to `loopcoder dispatch-wave`
 whenever it emits per-Worker blocks.
@@ -344,8 +350,9 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   development track;
 - `.delivery.yml` schema version and `min_loopcoder_version` compatibility when
   declared;
-- project Claude Code conductor hook settings, warning when
-  `conductor-attest.js` or `conductor-relay-guard.js` is missing;
+- project Claude Code conductor hook settings, warning when the
+  `loopcoder hook conductor-attest` or `loopcoder hook conductor-relay-guard`
+  command is missing or when `loopcoder` does not resolve on `PATH`;
 - conductor runtime responsibility, which remains user-provided by the active
   host.
 

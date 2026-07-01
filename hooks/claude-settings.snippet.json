@@ -6,12 +6,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node hooks/conductor-attest.js",
+            "command": "loopcoder hook conductor-attest",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "node hooks/conductor-relay-guard.js",
+            "command": "loopcoder hook conductor-relay-guard",
             "timeout": 10
           }
         ]
@@ -22,12 +22,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node hooks/conductor-attest.js",
+            "command": "loopcoder hook conductor-attest",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "node hooks/conductor-relay-guard.js",
+            "command": "loopcoder hook conductor-relay-guard",
             "timeout": 10
           }
         ]

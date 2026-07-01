@@ -17,9 +17,22 @@ const (
 	hookTimeout = 10
 )
 
-var requiredScripts = []string{
-	"hooks/conductor-attest.js",
-	"hooks/conductor-relay-guard.js",
+// requiredHookNames are the conductor hook subcommands wired into a project's
+// Claude Code settings. They run through the loopcoder binary
+// (loopcoder hook <name>) so they resolve regardless of the host's working
+// directory and stay in lockstep with the installed binary, instead of a
+// relative node hooks/*.js path that only resolved inside loopcoder's own repo.
+var requiredHookNames = []string{
+	"conductor-attest",
+	"conductor-relay-guard",
+}
+
+// deprecatedCommands are the legacy conductor hook command strings from the
+// pre-binary node hooks/*.js mechanism. The settings merge strips them so an
+// upgrade does not leave behind broken, unresolved hook entries.
+var deprecatedCommands = []string{
+	"node hooks/conductor-attest.js",
+	"node hooks/conductor-relay-guard.js",
 }
 
 // RequiredHook describes one required Claude Code hook registration.
@@ -41,18 +54,18 @@ func SettingsPath(projectDir string) string {
 
 // RequiredHooks returns the hook entries loopcoder needs in project settings.
 func RequiredHooks() []RequiredHook {
-	hooks := make([]RequiredHook, 0, len(requiredScripts)*2)
-	for _, script := range requiredScripts {
-		command := commandForScript(script)
+	hooks := make([]RequiredHook, 0, len(requiredHookNames)*2)
+	for _, name := range requiredHookNames {
+		command := commandForHook(name)
 		hooks = append(hooks, RequiredHook{
 			Event:   "PostToolUse",
 			Matcher: "Bash",
-			Script:  script,
+			Script:  name,
 			Command: command,
 		})
 		hooks = append(hooks, RequiredHook{
 			Event:   "Stop",
-			Script:  script,
+			Script:  name,
 			Command: command,
 		})
 	}
@@ -92,6 +105,10 @@ func MergeSettings(data []byte) ([]byte, bool, error) {
 			return nil, false, err
 		}
 		changed = changed || didChange
+	}
+
+	if pruneDeprecatedHooks(hooks) {
+		changed = true
 	}
 
 	out, err := json.MarshalIndent(settings, "", "  ")
@@ -423,6 +440,78 @@ func commandHook(command string) map[string]any {
 	}
 }
 
-func commandForScript(script string) string {
-	return "node " + script
+func commandForHook(name string) string {
+	return "loopcoder hook " + name
+}
+
+// pruneDeprecatedHooks removes legacy conductor hook command entries (the
+// pre-binary "node hooks/*.js" commands) from the PostToolUse and Stop events.
+// A hook entry whose command list becomes empty as a result is dropped, and an
+// event whose entry list becomes empty is removed. It reports whether anything
+// changed. This makes reinstalling over an old install a clean upgrade instead
+// of leaving broken, unresolved commands alongside the new ones.
+func pruneDeprecatedHooks(hooks map[string]any) bool {
+	changed := false
+	for _, event := range []string{"PostToolUse", "Stop"} {
+		entries, ok := hooks[event].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(entries))
+		for _, raw := range entries {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				kept = append(kept, raw)
+				continue
+			}
+			if pruneEntryCommands(entry) {
+				changed = true
+			}
+			if commands, had := entry["hooks"].([]any); had && len(commands) == 0 {
+				// We emptied an entry by removing its deprecated commands; drop it.
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		if len(kept) == 0 {
+			delete(hooks, event)
+		} else {
+			hooks[event] = kept
+		}
+	}
+	return changed
+}
+
+func pruneEntryCommands(entry map[string]any) bool {
+	commands, ok := entry["hooks"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	filtered := make([]any, 0, len(commands))
+	for _, raw := range commands {
+		command, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if value, _ := command["command"].(string); isDeprecatedCommand(value) {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	if changed {
+		entry["hooks"] = filtered
+	}
+	return changed
+}
+
+func isDeprecatedCommand(command string) bool {
+	for _, deprecated := range deprecatedCommands {
+		if command == deprecated {
+			return true
+		}
+	}
+	return false
 }
