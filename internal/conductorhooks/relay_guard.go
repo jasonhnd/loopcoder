@@ -92,6 +92,11 @@ func RunRelayGuard(input []byte, opts Options) (res Result) {
 		return handleToolComplete(in, statePath, now())
 	}
 	if isStopEvent(in.HookEventName) {
+		// Honor Claude Code's stop-loop escape valve as a safety net; the guard
+		// also self-clears each record after printing it once.
+		if in.StopHookActive {
+			return allow()
+		}
 		return handleStop(statePath, now())
 	}
 	return allow()

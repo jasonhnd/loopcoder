@@ -552,6 +552,35 @@ marker and all hook, relay, and status state remain under gitignored
 `.loopcoder/` and never appear in PR bodies, issue bodies, comments, commits,
 merge artifacts, docs, or tracked files.
 
+## Amendment 2026-07-02: Delivery-Scoped, One-Shot Conductor-Attest Gate
+
+Activating `conductor-attest` in the binary-invoked form (previous amendment)
+exposed a design flaw in the original gate: it required a Conductor
+self-attestation before *every* `Stop` in a conductor workspace, and it never
+honored Claude Code's `stop_hook_active` escape valve. In a real conductor
+session that blocked ordinary planning and chat turns, and any turn where the
+attestation was not recorded could hard-lock the conversation with no escape.
+
+The gate is refined as follows, without changing the local-only invariant or the
+attestation schema:
+
+1. **Delivery-scoped.** The hook watches completed shell commands for a delivery
+   or merge action (`loopcoder dispatch` / `dispatch-wave` / `loopreview`, or
+   `gh pr merge`) and records `delivery_seen` in its per-session state. The Stop
+   gate applies only when a delivery or merge actually occurred; planning and
+   chat turns are never gated.
+2. **One-shot.** On a delivery turn without a Conductor self-attestation, the
+   hook blocks at most once to surface the reminder, then marks the session
+   `reminded` and self-clears, so it cannot loop even if the Conductor never
+   attests.
+3. **Escape valve.** Both `conductor-attest` and `conductor-relay-guard` honor
+   `stop_hook_active`: if Claude Code signals the session is already inside a
+   Stop-hook block loop, the hooks allow completion.
+
+This keeps the Conductor self-attestation reminder on genuine delivery and merge
+turns while making the gate structurally incapable of blocking a non-delivery
+turn or looping.
+
 ## Relationship To Existing Specs
 
 - [`0146-attestation.md`](0146-attestation.md) defines the shared
