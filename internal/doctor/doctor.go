@@ -658,10 +658,21 @@ func checkConductorHooks(repoPath string, deps Deps) Check {
 			Message: fmt.Sprintf("active Claude Code settings at %s are missing loopcoder conductor hooks: %s; run: loopcoder skill install", path, claudehooks.FormatMissing(missing)),
 		}
 	}
+	// The hooks are registered, but Claude Code runs them as `loopcoder hook
+	// <name>`, so a healthy install also requires the loopcoder binary to resolve
+	// on PATH. Only checking that the command string is present in settings is
+	// exactly the false-positive that hid the earlier broken install.
+	if _, err := deps.LookPath("loopcoder"); err != nil {
+		return Check{
+			Name:    "conductor hooks",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("active Claude Code settings at %s include loopcoder conductor hooks, but the loopcoder binary is not on PATH, so Claude Code cannot run them; install loopcoder on PATH", path),
+		}
+	}
 	return Check{
 		Name:    "conductor hooks",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("active Claude Code settings include loopcoder conductor hooks at %s", path),
+		Message: fmt.Sprintf("active Claude Code settings include loopcoder conductor hooks at %s and the loopcoder binary resolves on PATH", path),
 	}
 }
 

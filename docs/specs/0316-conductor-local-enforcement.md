@@ -502,6 +502,56 @@ issues:
 - No change to reviewer-not-worker guidance.
 - No new repository-visible or GitHub-hosted attestation or status surface.
 
+## Amendment 2026-07-01: Binary-Invoked Hooks
+
+This amendment records a delivery-mechanism correction made after the follow-on
+implementation shipped. It does not change any decision or contract in the spec
+body above; it only replaces how the hook logic is delivered and invoked.
+
+### Problem
+
+Decision 4's Settings Merge required a command value that "runs the hook from
+the repo root with Node" (`node hooks/conductor-attest.js` and
+`node hooks/conductor-relay-guard.js`). That command form implicitly assumed the
+hook scripts sit at the repo root, which is true only in loopcoder's own
+repository. `loopcoder skill install` merged the settings command into consumer
+repositories but never installed the `.js` scripts there, so in every consumer
+repo the hooks failed to resolve (`Cannot find module`) on every event. Because
+doctor's readiness check matched only the command string, it reported the hooks
+healthy even though they never ran.
+
+### Amendment
+
+1. **Binary-invoked hooks.** The hook logic is embedded in the loopcoder binary
+   and invoked as `loopcoder hook conductor-attest` and
+   `loopcoder hook conductor-relay-guard`. There is no Node dependency and no
+   `.js` hook file. The commands resolve regardless of the current working
+   directory as long as `loopcoder` is on `PATH`, so they work in any consumer
+   repository, not just loopcoder's own.
+2. **Idempotent upgrade of stale entries.** The settings merge upgrades any
+   pre-existing `node hooks/*.js` conductor entries to the new command form. The
+   merge stays idempotent: re-running install neither duplicates entries nor
+   leaves stale Node commands behind.
+3. **Doctor verifies command and PATH.** `loopcoder doctor` verifies the new
+   command form is present in the active Claude Code settings AND that
+   `loopcoder` resolves on `PATH`, instead of matching the command string only.
+   This closes the false-healthy gap where a registered command pointed at a
+   binary or script that could not run.
+4. **Marker-based auto-enforcement.** Auto-enforcement detection adds a
+   gitignored `.loopcoder/conductor-workspace` marker file that
+   `loopcoder skill install` writes into installed repositories. Detection
+   recognizes this marker in addition to the existing conductor-workspace
+   signals, so enforcement actually fires in installed consumer repos rather
+   than only in workspaces that already carry the loopcoder Conductor playbook
+   or entrypoint configuration.
+
+### Invariant Preserved
+
+The local-only invariant is unchanged. The `.loopcoder/conductor-workspace`
+marker and all hook, relay, and status state remain under gitignored
+`.loopcoder/` and never appear in PR bodies, issue bodies, comments, commits,
+merge artifacts, docs, or tracked files.
+
 ## Relationship To Existing Specs
 
 - [`0146-attestation.md`](0146-attestation.md) defines the shared

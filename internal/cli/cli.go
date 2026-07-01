@@ -84,6 +84,7 @@ var commands = []Command{
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
+	{Name: "hook", Summary: "run an embedded loopcoder conductor hook (used by Claude Code hook settings)"},
 }
 
 // Commands returns the registered subcommands in root help order.
@@ -227,6 +228,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "dispatch-wave" {
 		return runDispatchWave(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "hook" {
+		return runHook(args[1:], stdout, stderr, deps)
 	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)
@@ -376,6 +380,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+	}
+	if command.Name == "hook" {
+		fmt.Fprintln(w, "  <name>    hook to run: conductor-attest or conductor-relay-guard")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Reads the hook payload from stdin and runs the named embedded conductor hook.")
+		fmt.Fprintln(w, "Wired into Claude Code settings; unknown or missing names fail open (exit 0).")
 	}
 	fmt.Fprintln(w, "  --help    show command help")
 }
