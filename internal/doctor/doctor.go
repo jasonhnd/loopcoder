@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
+	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -137,6 +138,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
 	checks = append(checks, checkInstalledSkill(deps))
+	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
 		Status:  StatusOK,
@@ -621,6 +623,45 @@ func checkInstalledSkill(deps Deps) Check {
 		Name:    "loopcoder skill",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("installed managed files match selected binary embedded content at %s", dir),
+	}
+}
+
+func checkConductorHooks(repoPath string, deps Deps) Check {
+	path := claudehooks.SettingsPath(repoPath)
+	data, err := deps.ReadFile(path)
+	if err != nil {
+		if isNotExist(err) {
+			return Check{
+				Name:    "conductor hooks",
+				Status:  StatusWarn,
+				Message: fmt.Sprintf("active Claude Code settings not found at %s; missing loopcoder conductor hooks: %s; run: loopcoder skill install", path, claudehooks.FormatMissing(claudehooks.RequiredHooks())),
+			}
+		}
+		return Check{
+			Name:    "conductor hooks",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect active Claude Code settings at %s: %v; run: loopcoder skill install", path, err),
+		}
+	}
+	missing, err := claudehooks.MissingHooks(data)
+	if err != nil {
+		return Check{
+			Name:    "conductor hooks",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect active Claude Code hooks at %s: %v; run: loopcoder skill install", path, err),
+		}
+	}
+	if len(missing) > 0 {
+		return Check{
+			Name:    "conductor hooks",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("active Claude Code settings at %s are missing loopcoder conductor hooks: %s; run: loopcoder skill install", path, claudehooks.FormatMissing(missing)),
+		}
+	}
+	return Check{
+		Name:    "conductor hooks",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("active Claude Code settings include loopcoder conductor hooks at %s", path),
 	}
 }
 
