@@ -105,6 +105,18 @@ func (r *AttestationRecord) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r AttestationRecord) HasDurationMS() bool {
+	return !r.presence.Known || r.presence.DurationMS
+}
+
+func (r AttestationRecord) HasUsage() bool {
+	return !r.presence.Known || r.presence.Usage
+}
+
+func (r AttestationRecord) HasVerified() bool {
+	return !r.presence.Known || r.presence.Verified
+}
+
 func fieldPresent(fields map[string]json.RawMessage, name string) bool {
 	raw, ok := fields[name]
 	if !ok {
