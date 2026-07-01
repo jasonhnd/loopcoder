@@ -59,26 +59,42 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 
 	// 3. THE REGRESSION CHECK: the exact installed command must resolve to a
 	// real, working subcommand. Strip the leading binary token and drive the
-	// rest through the CLI with a Stop payload. With the marker present and no
-	// prior attestation, the attest hook must BLOCK (exit 2) — proving the
-	// installed command is wired to live logic, not a dangling file reference.
+	// rest through the CLI. Under the D gate the conductor-attest hook only
+	// blocks on a delivery/merge turn, so first feed a delivery PostToolUse,
+	// then a Stop: with the marker present and no attestation it must BLOCK
+	// (exit 2) — proving the installed command is wired to live logic, not a
+	// dangling file reference.
 	fields := strings.Fields(command)
 	if len(fields) < 2 || fields[0] != "loopcoder" {
 		t.Fatalf("installed command %q is not a loopcoder subcommand invocation", command)
 	}
 	args := fields[1:] // ["hook", "conductor-attest"]
 
+	deliveryPayload := mustJSONBytes(t, map[string]any{
+		"session_id":      "e2e-session",
+		"cwd":             project,
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "Bash",
+		"tool_input":      map[string]any{"command": "loopcoder dispatch --repo ."},
+		"tool_response":   map[string]any{"exit_code": 0},
+	})
+	var d0, d1 bytes.Buffer
+	deliveryDeps := DefaultDeps()
+	deliveryDeps.Stdin = bytes.NewReader(deliveryPayload)
+	if code := RunWithDeps(args, &d0, &d1, deliveryDeps); code != 0 {
+		t.Fatalf("delivery PostToolUse exit = %d, want 0; stderr=%q", code, d1.String())
+	}
+
 	stopPayload := mustJSONBytes(t, map[string]any{
 		"session_id":      "e2e-session",
 		"cwd":             project,
 		"hook_event_name": "Stop",
 	})
-
 	var stdout, stderr bytes.Buffer
 	deps := DefaultDeps()
 	deps.Stdin = bytes.NewReader(stopPayload)
 	if code := RunWithDeps(args, &stdout, &stderr, deps); code != 2 {
-		t.Fatalf("installed hook command exit = %d, want 2 (blocking Stop); stderr=%q", code, stderr.String())
+		t.Fatalf("installed hook command exit = %d, want 2 (blocking delivery Stop); stderr=%q", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "conductor attestation is required") {
 		t.Fatalf("hook stderr = %q, want the conductor attestation prompt", stderr.String())

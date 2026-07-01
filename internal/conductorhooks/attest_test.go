@@ -32,27 +32,28 @@ func mustJSON(t *testing.T, v any) []byte {
 	return data
 }
 
-func TestAttestDeniesStopUntilRecordedThenAllows(t *testing.T) {
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "state")
-	env := attestHookEnv(stateDir)
-
-	stopInput := map[string]any{
+func attestStop(root string, stopHookActive bool) map[string]any {
+	return map[string]any{
 		"session_id":       "session-1",
 		"cwd":              root,
 		"hook_event_name":  "Stop",
-		"stop_hook_active": false,
+		"stop_hook_active": stopHookActive,
 	}
+}
 
-	firstStop := RunAttest(mustJSON(t, stopInput), Options{Env: mapEnv(env)})
-	if firstStop.ExitCode != 2 {
-		t.Fatalf("expected first Stop exit 2, got %d", firstStop.ExitCode)
+func attestDispatchPost(root string) map[string]any {
+	return map[string]any{
+		"session_id":      "session-1",
+		"cwd":             root,
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "Bash",
+		"tool_input":      map[string]any{"command": `loopcoder dispatch --repo . --issue-number 10`},
+		"tool_response":   map[string]any{"stdout": "dispatch completed\n", "exit_code": 0},
 	}
-	if !regexp.MustCompile(`loopcoder conductor attestation is required`).MatchString(firstStop.Stderr) {
-		t.Fatalf("expected required-attestation message, got %q", firstStop.Stderr)
-	}
+}
 
-	postTool := RunAttest(mustJSON(t, map[string]any{
+func attestAttestPost(root string) map[string]any {
+	return map[string]any{
 		"session_id":      "session-1",
 		"cwd":             root,
 		"hook_event_name": "PostToolUse",
@@ -66,17 +67,66 @@ func TestAttestDeniesStopUntilRecordedThenAllows(t *testing.T) {
 			"interrupted": false,
 			"isImage":     false,
 		},
-	}), Options{Env: mapEnv(env)})
-	if postTool.ExitCode != 0 {
-		t.Fatalf("expected PostToolUse exit 0, got %d (stderr=%q)", postTool.ExitCode, postTool.Stderr)
 	}
+}
 
-	secondStop := RunAttest(mustJSON(t, stopInput), Options{Env: mapEnv(env)})
-	if secondStop.ExitCode != 0 {
-		t.Fatalf("expected second Stop exit 0, got %d", secondStop.ExitCode)
+// A planning / chat turn (no delivery command observed) must never block, even
+// in a conductor workspace. This is the core fix for the v0.3.8 over-blocking.
+func TestAttestNoDeliveryDoesNotBlock(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
+	res := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if res.ExitCode != 0 {
+		t.Fatalf("expected no-delivery Stop to allow (exit 0), got %d (stderr=%q)", res.ExitCode, res.Stderr)
 	}
-	if secondStop.Stderr != "" {
-		t.Fatalf("expected empty stderr, got %q", secondStop.Stderr)
+}
+
+// A delivery turn blocks exactly once (reminder) and then self-clears, so the
+// gate can never loop even if the Conductor never attests.
+func TestAttestDeliveryBlocksOnceThenSelfClears(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
+
+	if r := RunAttest(mustJSON(t, attestDispatchPost(root)), opts); r.ExitCode != 0 {
+		t.Fatalf("dispatch PostToolUse exit = %d", r.ExitCode)
+	}
+	first := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if first.ExitCode != 2 {
+		t.Fatalf("expected first Stop after delivery to block (exit 2), got %d", first.ExitCode)
+	}
+	if !regexp.MustCompile(`conductor attestation is required`).MatchString(first.Stderr) {
+		t.Fatalf("expected reminder message, got %q", first.Stderr)
+	}
+	second := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if second.ExitCode != 0 {
+		t.Fatalf("expected second Stop to self-clear (exit 0), got %d", second.ExitCode)
+	}
+}
+
+// A delivery turn followed by a Conductor attestation clears the gate.
+func TestAttestDeliveryThenAttestAllows(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
+
+	RunAttest(mustJSON(t, attestDispatchPost(root)), opts)
+	if r := RunAttest(mustJSON(t, attestAttestPost(root)), opts); r.ExitCode != 0 {
+		t.Fatalf("attest PostToolUse exit = %d (stderr=%q)", r.ExitCode, r.Stderr)
+	}
+	stop := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if stop.ExitCode != 0 {
+		t.Fatalf("expected Stop after attest to allow (exit 0), got %d (stderr=%q)", stop.ExitCode, stop.Stderr)
+	}
+}
+
+// stop_hook_active is an escape valve: even an unattested delivery turn must not
+// block when Claude Code signals we are already in a stop-loop.
+func TestAttestStopHookActiveEscape(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
+	RunAttest(mustJSON(t, attestDispatchPost(root)), opts)
+	res := RunAttest(mustJSON(t, attestStop(root, true)), opts)
+	if res.ExitCode != 0 {
+		t.Fatalf("expected stop_hook_active to escape (exit 0), got %d", res.ExitCode)
 	}
 }
 
@@ -118,37 +168,87 @@ func TestIsConductorAttestCommandRecognition(t *testing.T) {
 	}
 }
 
-// TestAttestConductorWorkspaceMarker verifies the NEW marker-file signal in
-// auto scope: with <cwd>/.loopcoder/conductor-workspace present the attest hook
-// enforces (Stop without prior attest => exit 2); without it (and no other
-// signal) it allows.
+func TestDeliveryOrMergeCommandRecognition(t *testing.T) {
+	cases := []struct {
+		command string
+		want    bool
+	}{
+		{`loopcoder dispatch --repo .`, true},
+		{`loopcoder dispatch-wave --repo .`, true},
+		{`loopcoder loopreview --pr-number 12`, true},
+		{`"C:\Tools\loopcoder.exe" dispatch --repo .`, true},
+		{`$env:LOOPCODER_BIN loopreview --pr-number 9`, true},
+		{`gh pr merge 330 --squash`, true},
+		{`gh pr view 330`, false},
+		{`loopcoder attest --role conductor`, false},
+		{`loopcoder status`, false},
+		{`git commit -m x`, false},
+		{`echo run loopcoder dispatch later`, false},
+		{`git status && loopcoder dispatch --repo .`, true},
+		{`gh --repo o/r pr merge 5`, true},
+	}
+	for _, tc := range cases {
+		if got := deliveryOrMergeCommand(tc.command); got != tc.want {
+			t.Errorf("deliveryOrMergeCommand(%q) = %v, want %v", tc.command, got, tc.want)
+		}
+	}
+}
+
+// TestAttestConductorWorkspaceMarker verifies the marker-file signal activates
+// the gate in auto scope: with the marker AND a delivery, Stop blocks once;
+// with the marker but no delivery it allows; without the marker it is not a
+// conductor workspace so it allows.
 func TestAttestConductorWorkspaceMarker(t *testing.T) {
-	// With the marker: auto scope enforces.
+	writeMarker := func(dir string) {
+		markerDir := filepath.Join(dir, ".loopcoder")
+		if err := os.MkdirAll(markerDir, 0o755); err != nil {
+			t.Fatalf("mkdir marker dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(markerDir, "conductor-workspace"), []byte(""), 0o644); err != nil {
+			t.Fatalf("write marker: %v", err)
+		}
+	}
+	autoScope := Options{Env: mapEnv(map[string]string{})} // no SCOPE => auto; state under cwd/.loopcoder
+
+	// Marker + delivery => auto scope enforces (blocks once).
 	withMarker := t.TempDir()
-	markerDir := filepath.Join(withMarker, ".loopcoder")
-	if err := os.MkdirAll(markerDir, 0o755); err != nil {
-		t.Fatalf("mkdir marker dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(markerDir, "conductor-workspace"), []byte(""), 0o644); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	// No SCOPE env => auto scope; no STATE_DIR => default under cwd.
-	res := RunAttest(mustJSON(t, map[string]any{
-		"session_id":      "session-marker",
+	writeMarker(withMarker)
+	RunAttest(mustJSON(t, map[string]any{
+		"session_id":      "s-marker",
+		"cwd":             withMarker,
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "Bash",
+		"tool_input":      map[string]any{"command": "loopcoder dispatch --repo ."},
+		"tool_response":   map[string]any{"exit_code": 0},
+	}), autoScope)
+	blocked := RunAttest(mustJSON(t, map[string]any{
+		"session_id":      "s-marker",
 		"cwd":             withMarker,
 		"hook_event_name": "Stop",
-	}), Options{Env: mapEnv(map[string]string{})})
-	if res.ExitCode != 2 {
-		t.Fatalf("expected marker workspace to enforce (exit 2), got %d", res.ExitCode)
+	}), autoScope)
+	if blocked.ExitCode != 2 {
+		t.Fatalf("expected marker+delivery to enforce (exit 2), got %d", blocked.ExitCode)
 	}
 
-	// Without the marker (and no other signal): auto scope allows.
+	// Marker but no delivery => allows.
+	markerNoDelivery := t.TempDir()
+	writeMarker(markerNoDelivery)
+	res := RunAttest(mustJSON(t, map[string]any{
+		"session_id":      "s-marker-nodelivery",
+		"cwd":             markerNoDelivery,
+		"hook_event_name": "Stop",
+	}), autoScope)
+	if res.ExitCode != 0 {
+		t.Fatalf("expected marker without delivery to allow (exit 0), got %d", res.ExitCode)
+	}
+
+	// No marker (not a conductor workspace) => allows.
 	noMarker := t.TempDir()
 	res2 := RunAttest(mustJSON(t, map[string]any{
-		"session_id":      "session-nomarker",
+		"session_id":      "s-nomarker",
 		"cwd":             noMarker,
 		"hook_event_name": "Stop",
-	}), Options{Env: mapEnv(map[string]string{})})
+	}), autoScope)
 	if res2.ExitCode != 0 {
 		t.Fatalf("expected no-marker workspace to allow (exit 0), got %d", res2.ExitCode)
 	}
