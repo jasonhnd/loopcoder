@@ -3,12 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 )
 
 func TestSkillInstallHelpDocumentsFlags(t *testing.T) {
@@ -22,7 +25,7 @@ func TestSkillInstallHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder skill install", "--dir", "~/.claude/skills/loopcoder", "--force"} {
+	for _, want := range []string{"loopcoder skill install", "--dir", "~/.claude/skills/loopcoder", "--repo", "--force"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -32,17 +35,19 @@ func TestSkillInstallHelpDocumentsFlags(t *testing.T) {
 func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	target := filepath.Join("home", ".claude", "skills", "loopcoder")
+	project := filepath.Join("work", "repo")
 	called := false
 
 	exitCode := RunWithDeps([]string{
 		"skill",
 		"install",
 		"-Dir", target,
+		"-Repo", project,
 		"-Force",
 	}, &stdout, &stderr, Deps{
 		SkillInstall: func(_ context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
 			called = true
-			if opts.Dir != target || !opts.Force {
+			if opts.Dir != target || opts.ProjectDir != project || !opts.Force {
 				t.Fatalf("skill install opts = %#v", opts)
 			}
 			return SkillInstallResult{
@@ -97,6 +102,118 @@ func TestInstallSkillWritesDefaultClaudeSkillDir(t *testing.T) {
 	}
 	if got := string(fsys.read(t, filepath.Join(wantDir, agentsFilename))); got != "agents content\n" {
 		t.Fatalf("AGENTS.md = %q, want embedded agents content", got)
+	}
+	if result.HookSettings == nil {
+		t.Fatal("HookSettings is nil, want project hook settings result")
+	}
+	if result.HookSettings.Path != claudehooks.SettingsPath(".") {
+		t.Fatalf("HookSettings.Path = %q, want default project settings", result.HookSettings.Path)
+	}
+}
+
+func TestInstallSkillMergesHookSettingsFreshAndIdempotent(t *testing.T) {
+	fsys := newSkillFakeFS()
+	project := "repo"
+	settingsPath := claudehooks.SettingsPath(project)
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, skillDepsForTest(fsys))
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+	if result.HookSettings == nil {
+		t.Fatal("HookSettings is nil")
+	}
+	if result.HookSettings.Path != settingsPath || result.HookSettings.Status != SkillInstallFileCreated {
+		t.Fatalf("HookSettings = %#v, want created %s", result.HookSettings, settingsPath)
+	}
+	first := fsys.read(t, settingsPath)
+	assertNoMissingRequiredHooks(t, first)
+	assertHookCommandCounts(t, first, 2)
+
+	result, err = InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, skillDepsForTest(fsys))
+	if err != nil {
+		t.Fatalf("second InstallSkill returned error: %v", err)
+	}
+	if result.HookSettings == nil || result.HookSettings.Status != SkillInstallFileUnchanged {
+		t.Fatalf("second HookSettings = %#v, want unchanged", result.HookSettings)
+	}
+	second := fsys.read(t, settingsPath)
+	if !bytes.Equal(first, second) {
+		t.Fatalf("settings changed on idempotent re-run:\nfirst=%s\nsecond=%s", first, second)
+	}
+	assertHookCommandCounts(t, second, 2)
+}
+
+func TestInstallSkillPreservesExistingClaudeSettings(t *testing.T) {
+	fsys := newSkillFakeFS()
+	project := "repo"
+	settingsPath := claudehooks.SettingsPath(project)
+	fsys.mustWrite(settingsPath, []byte(`{
+  "permissions": {
+    "allow": ["Bash(git status)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/user-hook.js",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/pre-existing.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}`))
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, skillDepsForTest(fsys))
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+	if result.HookSettings == nil || result.HookSettings.Status != SkillInstallFileUpdated {
+		t.Fatalf("HookSettings = %#v, want updated", result.HookSettings)
+	}
+
+	data := fsys.read(t, settingsPath)
+	assertNoMissingRequiredHooks(t, data)
+	assertHookCommandCounts(t, data, 2)
+	if !strings.Contains(string(data), "Bash(git status)") {
+		t.Fatalf("settings lost unrelated permissions:\n%s", data)
+	}
+	if !strings.Contains(string(data), "node hooks/user-hook.js") || !strings.Contains(string(data), "node hooks/pre-existing.js") {
+		t.Fatalf("settings lost unrelated hooks:\n%s", data)
+	}
+}
+
+func TestInstallSkillRejectsMalformedClaudeSettings(t *testing.T) {
+	fsys := newSkillFakeFS()
+	project := "repo"
+	settingsPath := claudehooks.SettingsPath(project)
+	fsys.mustWrite(settingsPath, []byte(`{"hooks":`))
+
+	_, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, skillDepsForTest(fsys))
+	if err == nil {
+		t.Fatal("InstallSkill returned nil error, want malformed settings failure")
+	}
+	if !strings.Contains(err.Error(), "merge Claude Code settings") || !strings.Contains(err.Error(), "parse Claude Code settings JSON") {
+		t.Fatalf("error = %v, want clear settings parse failure", err)
+	}
+	if got := string(fsys.read(t, settingsPath)); got != `{"hooks":` {
+		t.Fatalf("malformed settings were rewritten: %q", got)
 	}
 }
 
@@ -232,6 +349,33 @@ func assertSkillInstallStatus(t *testing.T, files []SkillInstallFileResult, path
 		}
 	}
 	t.Fatalf("%s not found in file results: %#v", path, files)
+}
+
+func assertNoMissingRequiredHooks(t *testing.T, data []byte) {
+	t.Helper()
+	missing, err := claudehooks.MissingHooks(data)
+	if err != nil {
+		t.Fatalf("MissingHooks returned error: %v\n%s", err, data)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing hooks: %s\n%s", claudehooks.FormatMissing(missing), data)
+	}
+}
+
+func assertHookCommandCounts(t *testing.T, data []byte, wantEach int) {
+	t.Helper()
+	for _, command := range []string{
+		"node hooks/conductor-attest.js",
+		"node hooks/conductor-relay-guard.js",
+	} {
+		if got := strings.Count(string(data), command); got != wantEach {
+			t.Fatalf("%s count = %d, want %d\n%s", command, got, wantEach, data)
+		}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("settings are not valid JSON: %v\n%s", err, data)
+	}
 }
 
 type skillFakeFS struct {

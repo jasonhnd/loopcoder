@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 )
 
@@ -38,6 +39,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"loopcoder binary",
 		"version compatibility",
 		"loopcoder skill",
+		"conductor hooks",
 		"conductor runtime",
 	} {
 		check := requireCheck(t, report, name)
@@ -50,6 +52,75 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+}
+
+func TestRunChecksConductorHookSettings(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(*fakeDoctorEnv)
+		want     Status
+		contains []string
+	}{
+		{
+			name: "present",
+			want: StatusOK,
+			contains: []string{
+				"include loopcoder conductor hooks",
+			},
+		},
+		{
+			name: "missing settings file",
+			setup: func(env *fakeDoctorEnv) {
+				env.settingsFile = nil
+			},
+			want: StatusWarn,
+			contains: []string{
+				"active Claude Code settings not found",
+				"conductor-attest.js",
+				"conductor-relay-guard.js",
+				"run: loopcoder skill install",
+			},
+		},
+		{
+			name: "missing relay hook",
+			setup: func(env *fakeDoctorEnv) {
+				settings, changed, err := claudehooks.MergeSettings(nil)
+				if err != nil || !changed {
+					t.Fatalf("MergeSettings returned changed=%v err=%v", changed, err)
+				}
+				env.settingsFile = bytes.ReplaceAll(settings, []byte(`node hooks/conductor-relay-guard.js`), []byte(`node hooks/other.js`))
+			},
+			want: StatusWarn,
+			contains: []string{
+				"missing loopcoder conductor hooks",
+				"conductor-relay-guard.js",
+				"PostToolUse",
+				"Stop",
+				"run: loopcoder skill install",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := healthyDoctorEnv()
+			if tt.setup != nil {
+				tt.setup(env)
+			}
+
+			report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+			check := requireCheck(t, report, "conductor hooks")
+			if check.Status != tt.want {
+				t.Fatalf("status = %s, want %s (%s)", check.Status, tt.want, check.Message)
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(check.Message, want) {
+					t.Fatalf("message = %q, want containing %q", check.Message, want)
+				}
+			}
+		})
 	}
 }
 
@@ -346,6 +417,7 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			},
 		},
 		file:           []byte("version: 1\nmin_loopcoder_version: 0.3.0\n"),
+		settingsFile:   healthyClaudeSettings(),
 		executablePath: "/bin/loopcoder",
 		userHome:       filepath.Join("home", "user"),
 		skillFiles: map[string][]byte{
@@ -362,6 +434,8 @@ type fakeDoctorEnv struct {
 	configErr      error
 	file           []byte
 	fileErr        error
+	settingsFile   []byte
+	settingsErr    error
 	executablePath string
 	userHome       string
 	skillFiles     map[string][]byte
@@ -416,6 +490,15 @@ func (f *fakeDoctorEnv) deps() Deps {
 				return nil, os.ErrNotExist
 			}
 		}
+		if clean == filepath.Clean(claudehooks.SettingsPath("/repo")) {
+			if f.settingsErr != nil {
+				return nil, f.settingsErr
+			}
+			if f.settingsFile == nil {
+				return nil, os.ErrNotExist
+			}
+			return append([]byte(nil), f.settingsFile...), nil
+		}
 		if f.fileErr != nil {
 			return nil, f.fileErr
 		}
@@ -426,6 +509,14 @@ func (f *fakeDoctorEnv) deps() Deps {
 
 func doctorSkillPath(home string, name string) string {
 	return filepath.Clean(filepath.Join(home, ".claude", "skills", "loopcoder", name))
+}
+
+func healthyClaudeSettings() []byte {
+	settings, _, err := claudehooks.MergeSettings(nil)
+	if err != nil {
+		panic(err)
+	}
+	return settings
 }
 
 func execNotFound(file string) error {

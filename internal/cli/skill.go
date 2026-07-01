@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
+	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 )
 
 const (
@@ -21,8 +22,9 @@ const (
 )
 
 type SkillInstallOptions struct {
-	Dir   string
-	Force bool
+	Dir        string
+	Force      bool
+	ProjectDir string
 }
 
 type SkillInstallDeps struct {
@@ -50,8 +52,9 @@ type SkillInstallFileResult struct {
 }
 
 type SkillInstallResult struct {
-	Dir   string
-	Files []SkillInstallFileResult
+	Dir          string
+	Files        []SkillInstallFileResult
+	HookSettings *SkillInstallFileResult
 }
 
 func DefaultSkillInstallDeps() SkillInstallDeps {
@@ -102,6 +105,12 @@ func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInsta
 		}
 		result.Files = append(result.Files, fileResult)
 	}
+
+	hookSettings, err := writeConductorHookSettings(deps, opts.ProjectDir)
+	if err != nil {
+		return result, err
+	}
+	result.HookSettings = &hookSettings
 
 	return result, nil
 }
@@ -190,6 +199,42 @@ func writeSkillInstallFile(deps SkillInstallDeps, path string, data []byte, forc
 	return SkillInstallFileResult{Path: path, Status: SkillInstallFileCreated}, nil
 }
 
+func writeConductorHookSettings(deps SkillInstallDeps, projectDir string) (SkillInstallFileResult, error) {
+	path := claudehooks.SettingsPath(projectDir)
+	dir := filepath.Dir(path)
+	if err := deps.MkdirAll(dir, 0o755); err != nil {
+		return SkillInstallFileResult{}, fmt.Errorf("create Claude Code settings directory %s: %w", dir, err)
+	}
+
+	status := SkillInstallFileCreated
+	var current []byte
+	info, err := deps.Stat(path)
+	if err == nil {
+		if info.IsDir() {
+			return SkillInstallFileResult{}, fmt.Errorf("%s is a directory", path)
+		}
+		status = SkillInstallFileUpdated
+		current, err = deps.ReadFile(path)
+		if err != nil {
+			return SkillInstallFileResult{}, fmt.Errorf("read Claude Code settings %s: %w", path, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, os.ErrNotExist) {
+		return SkillInstallFileResult{}, fmt.Errorf("stat Claude Code settings %s: %w", path, err)
+	}
+
+	merged, changed, err := claudehooks.MergeSettings(current)
+	if err != nil {
+		return SkillInstallFileResult{}, fmt.Errorf("merge Claude Code settings %s: %w", path, err)
+	}
+	if !changed && status == SkillInstallFileUpdated {
+		return SkillInstallFileResult{Path: path, Status: SkillInstallFileUnchanged}, nil
+	}
+	if err := deps.WriteFile(path, merged, 0o644); err != nil {
+		return SkillInstallFileResult{}, fmt.Errorf("write Claude Code settings %s: %w", path, err)
+	}
+	return SkillInstallFileResult{Path: path, Status: status}, nil
+}
+
 func runSkill(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "skill: expected subcommand")
@@ -218,9 +263,12 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var opts SkillInstallOptions
 	var dirAlias string
+	var projectDirAlias string
 	var forceAlias bool
 	fs.StringVar(&opts.Dir, "dir", "", "Claude Code loopcoder skill directory")
 	fs.StringVar(&dirAlias, "Dir", "", "Claude Code loopcoder skill directory")
+	fs.StringVar(&opts.ProjectDir, "repo", ".", "project directory for Claude Code .claude/settings.json")
+	fs.StringVar(&projectDirAlias, "Repo", "", "project directory for Claude Code .claude/settings.json")
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing skill files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing skill files")
 
@@ -229,6 +277,9 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if dirAlias != "" {
 		opts.Dir = dirAlias
+	}
+	if projectDirAlias != "" {
+		opts.ProjectDir = projectDirAlias
 	}
 	if forceAlias {
 		opts.Force = true
@@ -255,6 +306,7 @@ func printSkillHelp(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --dir string    Claude Code loopcoder skill directory (default \"~/.claude/skills/loopcoder\")")
+	fmt.Fprintln(w, "  --repo string   project directory for Claude Code .claude/settings.json (default \".\")")
 	fmt.Fprintln(w, "  --force         overwrite existing skill files")
 	fmt.Fprintln(w, "  --help          show command help")
 }
@@ -275,5 +327,8 @@ func renderSkillInstallResult(w io.Writer, result SkillInstallResult) {
 		default:
 			fmt.Fprintf(w, "  %s %s\n", file.Status, file.Path)
 		}
+	}
+	if result.HookSettings != nil {
+		fmt.Fprintf(w, "  hooks %s %s\n", result.HookSettings.Status, result.HookSettings.Path)
 	}
 }
