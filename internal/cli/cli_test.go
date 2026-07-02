@@ -1973,6 +1973,104 @@ func TestTickNeedsHumanExitCode(t *testing.T) {
 	}
 }
 
+func TestTriggerCronRunsTickWithExplicitRepo(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"cron",
+		"--repo", repo,
+		"--schedule", "@hourly",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("tick RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if opts.RunID == "" {
+				t.Fatal("tick RunID is empty")
+			}
+			return cliTriggerTickReport(opts, orchestration.TickStatusSucceeded, orchestration.TickStopCompleted), nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	var got orchestration.TriggerReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not trigger JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Kind != orchestration.TriggerKindCron || got.Schedule != "@hourly" || got.Status != orchestration.TriggerStatusSucceeded || got.Iterations != 1 {
+		t.Fatalf("trigger report = %#v", got)
+	}
+	for _, want := range []string{"TRIGGER", "Kind: cron", "Schedule: @hourly", "Ticks"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestTriggerGoalLoopMaxIterationsAliasRoutesNeedsHuman(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := 0
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"goal-loop",
+		"--repo", repo,
+		"--max_iterations", "2",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called++
+			return cliTriggerTickReport(opts, orchestration.TickStatusSucceeded, orchestration.TickStopCompleted), nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if called != 2 {
+		t.Fatalf("tick calls = %d, want 2", called)
+	}
+	var got orchestration.TriggerReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not trigger JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.TriggerStatusNeedsHuman || got.StopReason != orchestration.TriggerStopMaxIterations || got.Iterations != 2 {
+		t.Fatalf("trigger report = %#v", got)
+	}
+}
+
+func TestTriggerHookRequiresEvent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"hook",
+		"--repo", t.TempDir(),
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--event is required") {
+		t.Fatalf("stderr missing required event message: %q", stderr.String())
+	}
+}
+
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -2969,6 +3067,31 @@ func readSingleFile(t *testing.T, pattern string) string {
 		t.Fatalf("read %s: %v", matches[0], err)
 	}
 	return string(data)
+}
+
+func cliTriggerTickReport(opts orchestration.TickOptions, status, stopReason string) orchestration.TickReport {
+	baseBranch := opts.BaseBranch
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	preProdBranch := opts.PreProdBranch
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
+	return orchestration.TickReport{
+		Version:       orchestration.TickReportVersion,
+		Repo:          "owner/repo",
+		RepoPath:      opts.RepoPath,
+		BaseBranch:    baseBranch,
+		PreProdBranch: preProdBranch,
+		RunID:         opts.RunID,
+		Status:        status,
+		StopReason:    stopReason,
+		StartedAt:     "2026-07-02T12:00:00Z",
+		FinishedAt:    "2026-07-02T12:00:00Z",
+		NeedsHuman:    []orchestration.TickIssue{},
+		Failures:      []orchestration.TickIssue{},
+	}
 }
 
 func validDispatchAttestation() attestation.AttestationRecord {

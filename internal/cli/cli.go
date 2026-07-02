@@ -84,6 +84,7 @@ var commands = []Command{
 	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
 	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
 	{Name: "tick", Summary: "run one unattended delivery pass"},
+	{Name: "trigger", Summary: "run automation triggers for tick"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
@@ -242,6 +243,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "tick" {
 		return runTick(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "trigger" {
+		return runTrigger(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "promote" {
 		return runPromote(args[1:], stdout, stderr, deps)
 	}
@@ -383,6 +387,17 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
 		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
 		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+	}
+	if command.Name == "trigger" {
+		fmt.Fprintln(w, "  <kind>                           trigger kind: cron, goal-loop, or hook")
+		fmt.Fprintln(w, "  --repo string                    repository path (required)")
+		fmt.Fprintln(w, "  --schedule string                cron schedule metadata (cron)")
+		fmt.Fprintln(w, "  --event string                   event name (hook)")
+		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
+		fmt.Fprintln(w, "  --max-iterations int             maximum tick firings before needs-human (goal-loop)")
+		fmt.Fprintln(w, "  --max_iterations int             alias for --max-iterations")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -1071,6 +1086,252 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 	}
 	return orchestration.TickExitCode(tickReport)
+}
+
+func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "trigger: expected trigger kind: cron, goal-loop, or hook")
+		return 2
+	}
+	kind := strings.TrimSpace(args[0])
+	if kind == "" {
+		fmt.Fprintln(stderr, "trigger: expected trigger kind: cron, goal-loop, or hook")
+		return 2
+	}
+
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.NewPreProdWriter == nil {
+		deps.NewPreProdWriter = defaults.NewPreProdWriter
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = defaults.ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+	if deps.IsTerminal == nil {
+		deps.IsTerminal = defaults.IsTerminal
+	}
+	if deps.Tick == nil {
+		deps.Tick = defaults.Tick
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = defaults.ComputeReadySet
+	}
+	if deps.Dispatch == nil {
+		deps.Dispatch = defaults.Dispatch
+	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = defaults.Loopreview
+	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+
+	fs := flag.NewFlagSet("trigger "+kind, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var schedule string
+	var scheduleAlias string
+	var event string
+	var eventAlias string
+	var goal string
+	var goalAlias string
+	var maxIterations int
+	var maxIterationsAlias int
+	var maxIterationsSnakeAlias int
+	var pretty bool
+	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&schedule, "schedule", "", "cron schedule")
+	fs.StringVar(&scheduleAlias, "Schedule", "", "cron schedule")
+	fs.StringVar(&event, "event", "", "hook event")
+	fs.StringVar(&eventAlias, "Event", "", "hook event")
+	fs.StringVar(&goal, "goal", "roadmap-exhausted", "goal predicate")
+	fs.StringVar(&goalAlias, "Goal", "", "goal predicate")
+	fs.IntVar(&maxIterations, "max-iterations", 0, "max iterations")
+	fs.IntVar(&maxIterationsSnakeAlias, "max_iterations", 0, "max iterations")
+	fs.IntVar(&maxIterationsAlias, "MaxIterations", 0, "max iterations")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if scheduleAlias != "" {
+		schedule = scheduleAlias
+	}
+	if eventAlias != "" {
+		event = eventAlias
+	}
+	if goalAlias != "" {
+		goal = goalAlias
+	}
+	if maxIterationsSnakeAlias != 0 {
+		maxIterations = maxIterationsSnakeAlias
+	}
+	if maxIterationsAlias != 0 {
+		maxIterations = maxIterationsAlias
+	}
+	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "trigger %s: unexpected argument %q\n", kind, fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintf(stderr, "trigger %s: --repo is required\n", kind)
+		return 2
+	}
+	if kind == orchestration.TriggerKindCron && strings.TrimSpace(schedule) == "" {
+		fmt.Fprintln(stderr, "trigger cron: --schedule is required")
+		return 2
+	}
+	if kind == orchestration.TriggerKindHook && strings.TrimSpace(event) == "" {
+		fmt.Fprintln(stderr, "trigger hook: --event is required")
+		return 2
+	}
+	if kind == orchestration.TriggerKindGoalLoop && maxIterations <= 0 {
+		fmt.Fprintln(stderr, "trigger goal-loop: --max-iterations is required and must be greater than zero")
+		return 2
+	}
+	if kind == orchestration.TriggerKindGoalLoop {
+		normalizedGoal := strings.TrimSpace(goal)
+		if normalizedGoal != "" && normalizedGoal != "roadmap-exhausted" && normalizedGoal != "no-ready-work" {
+			fmt.Fprintf(stderr, "trigger goal-loop: unsupported --goal %q\n", goal)
+			return 2
+		}
+	}
+	if kind != orchestration.TriggerKindCron && kind != orchestration.TriggerKindGoalLoop && kind != orchestration.TriggerKindHook {
+		fmt.Fprintf(stderr, "trigger: unknown trigger kind %q\n", kind)
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg)
+	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
+		Worker:   tickOptions.WorkerProvider,
+		Verifier: tickOptions.VerifierProvider,
+	}); warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	triggerReport, err := orchestration.RunTrigger(context.Background(), orchestration.TriggerOptions{
+		Kind:          kind,
+		RepoPath:      resolvedRepo,
+		Schedule:      schedule,
+		Event:         event,
+		Goal:          goal,
+		MaxIterations: maxIterations,
+		TickOptions:   tickOptions,
+		Tick:          deps.Tick,
+		Clock:         deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	data, err := orchestration.MarshalTriggerJSON(triggerReport)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "trigger %s: write output: %v\n", kind, err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderTriggerText(triggerReport))); err != nil {
+		fmt.Fprintf(stderr, "trigger %s: write summary: %v\n", kind, err)
+		return 1
+	}
+	if shouldRenderPretty(noPretty) {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := renderTriggerPrettyAttestations(stderr, triggerReport, mode); err != nil {
+			fmt.Fprintf(stderr, "trigger %s: write pretty attestation: %v\n", kind, err)
+			return 1
+		}
+	}
+	return orchestration.TriggerExitCode(triggerReport)
+}
+
+func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config) orchestration.TickOptions {
+	baseBranch := strings.TrimSpace(cfg.Worker.BaseBranch)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	preProdBranch := strings.TrimSpace(cfg.Environment.PreProdBranch)
+	if preProdBranch == "" {
+		preProdBranch = "pre-prod"
+	}
+	return orchestration.TickOptions{
+		Reader:             deps.NewGitHubReader(repoPath),
+		IssueWriter:        deps.NewIssueWriter(repoPath),
+		RepoPath:           repoPath,
+		BaseBranch:         baseBranch,
+		PreProdBranch:      preProdBranch,
+		WorkerProvider:     strings.TrimSpace(cfg.Adapters.Worker),
+		WorkerModel:        strings.TrimSpace(cfg.Worker.Model),
+		WorkerEffort:       strings.TrimSpace(cfg.Worker.ReasoningEffort),
+		VerifierProvider:   strings.TrimSpace(cfg.Adapters.Verifier),
+		VerifierModel:      strings.TrimSpace(cfg.Verifier.Model),
+		VerifierEffort:     strings.TrimSpace(cfg.Verifier.ReasoningEffort),
+		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
+		ThrottleLimit:      4,
+		RequiredChecks:     cfg.CI.Checks,
+		ConfiguredEvidence: cfg.Evidence.Artifacts(),
+		Thresholds:         cfg.Resilience.Worker,
+		Budget:             cfg.Guardrails.Budget,
+		CircuitBreaker:     cfg.Guardrails.CircuitBreaker,
+		ProcessAlive:       deps.ProcessAlive,
+		Clock:              deps.Now,
+		Stderr:             stderr,
+		Compile:            deps.Compile,
+		ComputeReadySet:    deps.ComputeReadySet,
+		Dispatch:           deps.Dispatch,
+		Loopreview:         deps.Loopreview,
+		Recover:            deps.Recover,
+		PreProdWriter:      deps.NewPreProdWriter(repoPath),
+		StatePush:          deps.StatePush,
+	}
+}
+
+func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerReport, mode attestation.PrettyMode) error {
+	for _, tick := range report.Ticks {
+		if err := renderTickPrettyAttestations(w, tick, mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
