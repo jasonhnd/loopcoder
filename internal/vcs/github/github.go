@@ -943,7 +943,7 @@ func labelDescription(label string) string {
 	case lower == "delivery:unit":
 		return "loopcoder work unit"
 	case lower == "epic":
-		return "loopcoder epic issue"
+		return "loopcoder epic work"
 	case lower == needsHumanLabel:
 		return "human decision required"
 	case strings.HasPrefix(lower, "blocked-by:#"):

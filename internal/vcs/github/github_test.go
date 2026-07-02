@@ -485,7 +485,7 @@ func TestCreateIssueRunsGhIssueCreate(t *testing.T) {
 func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00label\x00create\x00epic\x00--color\x005319e7\x00--description\x00loopcoder epic issue":                                              nil,
+			"repo\x00gh\x00label\x00create\x00epic\x00--color\x005319e7\x00--description\x00loopcoder epic work":                                               nil,
 			"repo\x00gh\x00issue\x00edit\x007\x00--title\x00Epic: Add feature\x00--body\x00New body\x00--add-label\x00epic\x00--remove-label\x00blocked-by:#1": nil,
 			"repo\x00gh\x00issue\x00view\x007\x00--json\x00number,title,body,state,stateReason,labels,closedByPullRequestsReferences":                          []byte(`{"number":7,"title":"Epic: Add feature","body":"New body","state":"OPEN","labels":[{"name":"delivery:unit"},{"name":"epic"}]}`),
 			"repo\x00gh\x00issue\x00close\x007\x00--reason\x00not planned":                                                                                     nil,

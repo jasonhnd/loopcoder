@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,10 +25,13 @@ import (
 const (
 	RoadmapFilename       = "ROADMAP.md"
 	ReportVersion         = 1
+	EpicDAGVersion        = 1
 	largeChangeThreshold  = 5
 	referenceScheme       = "slice refs are <unit-slug>/<kind>-<n>; within the same unit, <kind>-<n> is accepted"
 	baseDeliveryUnitLabel = "delivery:unit"
 	epicLabel             = "epic"
+	epicDAGRelDir         = ".loopcoder/epics"
+	isolationInvariant    = "Every slice must be implementable and testable in isolation; slice along ownership/module boundaries."
 )
 
 type IssueWriter interface {
@@ -47,21 +51,24 @@ type Options struct {
 type Deps struct {
 	ReadFile  func(name string) ([]byte, error)
 	WriteFile func(name string, data []byte, perm fs.FileMode) error
+	MkdirAll  func(path string, perm fs.FileMode) error
+	Stat      func(name string) (fs.FileInfo, error)
 }
 
 type Report struct {
-	Version              int          `json:"version"`
-	Repo                 string       `json:"repo"`
-	RepoPath             string       `json:"repo_path"`
-	RoadmapPath          string       `json:"roadmap_path"`
-	GeneratedAt          string       `json:"generated_at"`
-	PlanApprovalRequired bool         `json:"plan_approval_required"`
-	ReferenceScheme      string       `json:"reference_scheme"`
-	Created              []IssueEntry `json:"created"`
-	Updated              []IssueEntry `json:"updated"`
-	Unchanged            []IssueEntry `json:"unchanged"`
-	Closed               []IssueEntry `json:"closed"`
-	Summary              Summary      `json:"summary"`
+	Version              int            `json:"version"`
+	Repo                 string         `json:"repo"`
+	RepoPath             string         `json:"repo_path"`
+	RoadmapPath          string         `json:"roadmap_path"`
+	GeneratedAt          string         `json:"generated_at"`
+	PlanApprovalRequired bool           `json:"plan_approval_required"`
+	ReferenceScheme      string         `json:"reference_scheme"`
+	Created              []IssueEntry   `json:"created"`
+	Updated              []IssueEntry   `json:"updated"`
+	Unchanged            []IssueEntry   `json:"unchanged"`
+	Closed               []IssueEntry   `json:"closed"`
+	EpicDAGs             []EpicDAGEntry `json:"epic_dags"`
+	Summary              Summary        `json:"summary"`
 }
 
 type IssueEntry struct {
@@ -69,8 +76,51 @@ type IssueEntry struct {
 	ID        string `json:"id"`
 	Ref       string `json:"ref"`
 	Kind      string `json:"kind"`
+	EpicID    string `json:"epic_id,omitempty"`
 	Title     string `json:"title"`
 	BlockedBy []int  `json:"blocked_by"`
+}
+
+type EpicDAGEntry struct {
+	EpicID               string   `json:"epic_id"`
+	EpicRef              string   `json:"epic_ref"`
+	EpicTitle            string   `json:"epic_title"`
+	ArtifactPath         string   `json:"artifact_path"`
+	PlanApprovalRequired bool     `json:"plan_approval_required"`
+	ChurnedMergedSlices  []string `json:"churned_merged_slices"`
+}
+
+type EpicSliceDAGArtifact struct {
+	Version             int             `json:"version"`
+	EpicID              string          `json:"epic_id"`
+	EpicRef             string          `json:"epic_ref"`
+	EpicTitle           string          `json:"epic_title"`
+	RoadmapPath         string          `json:"roadmap_path"`
+	GeneratedAt         string          `json:"generated_at"`
+	ReferenceScheme     string          `json:"reference_scheme"`
+	AcceptanceInvariant string          `json:"acceptance_invariant"`
+	Nodes               []EpicSliceNode `json:"nodes"`
+	Edges               []EpicSliceEdge `json:"edges"`
+}
+
+type EpicSliceNode struct {
+	ID                       string   `json:"id"`
+	Ref                      string   `json:"ref"`
+	Kind                     string   `json:"kind"`
+	Title                    string   `json:"title"`
+	Issue                    int      `json:"issue,omitempty"`
+	State                    string   `json:"state,omitempty"`
+	StateReason              string   `json:"state_reason,omitempty"`
+	Completed                bool     `json:"completed"`
+	ImplementableAndTestable bool     `json:"implementable_and_testable"`
+	IsolationNotes           string   `json:"isolation_notes"`
+	DependsOn                []string `json:"depends_on"`
+}
+
+type EpicSliceEdge struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Reason string `json:"reason"`
 }
 
 type Summary struct {
@@ -132,12 +182,17 @@ type planItem struct {
 	desiredLabels  []string
 	existing       *gh.Issue
 	createdThisRun bool
+	epicID         string
+	epicRef        string
+	epicTitle      string
 }
 
 func DefaultDeps() Deps {
 	return Deps{
 		ReadFile:  os.ReadFile,
 		WriteFile: os.WriteFile,
+		MkdirAll:  os.MkdirAll,
+		Stat:      os.Stat,
 	}
 }
 
@@ -240,6 +295,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				return Report{}, fmt.Errorf("update issue #%d for %s: %w", item.issueNumber, item.ref, err)
 			}
 			item.issueNumber = issue.Number
+			copyIssue := issue
+			item.existing = &copyIssue
 			updated = append(updated, item.entry())
 			continue
 		}
@@ -274,7 +331,12 @@ func Run(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		ClosedCount:    len(report.Closed),
 		TotalCount:     len(items),
 	}
-	report.PlanApprovalRequired = planApprovalRequired(doc, report)
+	epicDAGs, epicPlanApproval, err := patchEpicSliceDAGs(opts, deps, doc, items, existingIssues, roadmapPath)
+	if err != nil {
+		return Report{}, err
+	}
+	report.EpicDAGs = normalizeEpicDAGEntries(epicDAGs)
+	report.PlanApprovalRequired = planApprovalRequired(doc, report) || epicPlanApproval
 	return report, nil
 }
 
@@ -346,6 +408,12 @@ func withDefaults(deps Deps) Deps {
 	if deps.WriteFile == nil {
 		deps.WriteFile = defaults.WriteFile
 	}
+	if deps.MkdirAll == nil {
+		deps.MkdirAll = defaults.MkdirAll
+	}
+	if deps.Stat == nil {
+		deps.Stat = defaults.Stat
+	}
 	return deps
 }
 
@@ -407,7 +475,7 @@ func parseRoadmap(text string) (*roadmapDoc, error) {
 			}
 			continue
 		}
-		if current == nil || current.epic {
+		if current == nil {
 			continue
 		}
 		if matches := slicePattern.FindStringSubmatch(line); len(matches) == 3 {
@@ -588,18 +656,6 @@ func (d *roadmapDoc) render() string {
 func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 	var items []*planItem
 	for _, unit := range doc.units {
-		if unit.epic {
-			items = append(items, &planItem{
-				id:         unit.marker,
-				ref:        unit.slug + "/epic-1",
-				kind:       "epic",
-				title:      unit.title,
-				unitTitle:  unit.title,
-				unitIntent: unit.intent,
-				order:      unit.order,
-			})
-			continue
-		}
 		var docs []*roadmapSlice
 		var codes []*roadmapSlice
 		for _, slice := range unit.slices {
@@ -609,6 +665,9 @@ func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 			case "code":
 				codes = append(codes, slice)
 			}
+		}
+		if unit.epic && len(docs)+len(codes) == 0 {
+			docs = append(docs, fallbackEpicDocSlice(unit))
 		}
 		for _, slice := range append(docs, codes...) {
 			item := &planItem{
@@ -621,6 +680,11 @@ func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 				sliceText:  slice.text,
 				order:      slice.order,
 			}
+			if unit.epic {
+				item.epicID = unit.marker
+				item.epicRef = unit.slug + "/epic-1"
+				item.epicTitle = unit.title
+			}
 			if slice.needsSpecified {
 				item.depIDs = append(item.depIDs, slice.needs...)
 			} else if slice.kind == "code" {
@@ -632,6 +696,224 @@ func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 		}
 	}
 	return items, nil
+}
+
+func fallbackEpicDocSlice(unit *roadmapUnit) *roadmapSlice {
+	return &roadmapSlice{
+		unit:    unit,
+		kind:    "doc",
+		text:    "Decompose " + unit.title + " into implementable, testable slices",
+		marker:  unit.marker + ":doc-1",
+		order:   unit.order,
+		ordinal: 1,
+		ref:     unit.slug + "/doc-1",
+	}
+}
+
+func patchEpicSliceDAGs(opts Options, deps Deps, doc *roadmapDoc, items []*planItem, existingIssues []gh.Issue, roadmapPath string) ([]EpicDAGEntry, bool, error) {
+	itemsByEpic := map[string][]*planItem{}
+	for _, item := range items {
+		if item.epicID == "" {
+			continue
+		}
+		itemsByEpic[item.epicID] = append(itemsByEpic[item.epicID], item)
+	}
+	if len(itemsByEpic) == 0 {
+		return nil, false, nil
+	}
+
+	existingByID := issuesByMarker(existingIssues)
+	var entries []EpicDAGEntry
+	approvalRequired := false
+	for _, unit := range doc.units {
+		if !unit.epic {
+			continue
+		}
+		epicItems := append([]*planItem(nil), itemsByEpic[unit.marker]...)
+		if len(epicItems) == 0 {
+			continue
+		}
+		sortItemsByOrder(epicItems)
+		path := epicDAGArtifactPath(opts.RepoPath, unit.marker)
+		existing, exists, err := readEpicDAGArtifact(path, deps)
+		if err != nil {
+			return nil, false, fmt.Errorf("read epic DAG artifact for %s: %w", unit.title, err)
+		}
+		desired := buildEpicDAGArtifact(unit, epicItems, roadmapPath, opts.Now)
+		churned := []string{}
+		if exists {
+			churned = churnedMergedSlices(existing, desired, existingByID)
+			if epicDAGArtifactsEqual(existing, desired) {
+				desired.GeneratedAt = existing.GeneratedAt
+			}
+		}
+		needsApproval := !exists || len(churned) > 0
+		approvalRequired = approvalRequired || needsApproval
+
+		if !exists || !epicDAGArtifactsEqual(existing, desired) {
+			desired.GeneratedAt = opts.Now.Format(time.RFC3339)
+			data, err := marshalEpicDAGArtifact(desired)
+			if err != nil {
+				return nil, false, fmt.Errorf("marshal epic DAG artifact for %s: %w", unit.title, err)
+			}
+			if err := deps.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return nil, false, fmt.Errorf("create epic DAG artifact directory: %w", err)
+			}
+			if err := deps.WriteFile(path, data, 0o644); err != nil {
+				return nil, false, fmt.Errorf("write epic DAG artifact for %s: %w", unit.title, err)
+			}
+		}
+
+		entries = append(entries, EpicDAGEntry{
+			EpicID:               unit.marker,
+			EpicRef:              unit.slug + "/epic-1",
+			EpicTitle:            unit.title,
+			ArtifactPath:         filepath.ToSlash(path),
+			PlanApprovalRequired: needsApproval,
+			ChurnedMergedSlices:  normalizeStrings(churned),
+		})
+	}
+	return entries, approvalRequired, nil
+}
+
+func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath string, now time.Time) EpicSliceDAGArtifact {
+	nodes := make([]EpicSliceNode, 0, len(items))
+	edges := make([]EpicSliceEdge, 0)
+	for _, item := range items {
+		node := EpicSliceNode{
+			ID:                       item.id,
+			Ref:                      item.ref,
+			Kind:                     item.kind,
+			Title:                    item.title,
+			Issue:                    item.issueNumber,
+			ImplementableAndTestable: true,
+			IsolationNotes:           isolationInvariant,
+			DependsOn:                append([]string(nil), item.depIDs...),
+		}
+		sort.Strings(node.DependsOn)
+		if item.existing != nil {
+			node.State = item.existing.State
+			node.StateReason = item.existing.StateReason
+			node.Completed = isIssueCompleted(*item.existing)
+		}
+		nodes = append(nodes, node)
+		for _, depID := range item.depIDs {
+			edges = append(edges, EpicSliceEdge{
+				From:   depID,
+				To:     item.id,
+				Reason: "roadmap dependency or doc-first dependency",
+			})
+		}
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From == edges[j].From {
+			return edges[i].To < edges[j].To
+		}
+		return edges[i].From < edges[j].From
+	})
+	return EpicSliceDAGArtifact{
+		Version:             EpicDAGVersion,
+		EpicID:              unit.marker,
+		EpicRef:             unit.slug + "/epic-1",
+		EpicTitle:           unit.title,
+		RoadmapPath:         filepath.ToSlash(roadmapPath),
+		GeneratedAt:         now.Format(time.RFC3339),
+		ReferenceScheme:     referenceScheme,
+		AcceptanceInvariant: isolationInvariant,
+		Nodes:               nodes,
+		Edges:               edges,
+	}
+}
+
+func readEpicDAGArtifact(path string, deps Deps) (EpicSliceDAGArtifact, bool, error) {
+	if _, err := deps.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+			return EpicSliceDAGArtifact{}, false, nil
+		}
+		return EpicSliceDAGArtifact{}, false, err
+	}
+	data, err := deps.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
+			return EpicSliceDAGArtifact{}, false, nil
+		}
+		return EpicSliceDAGArtifact{}, false, err
+	}
+	var artifact EpicSliceDAGArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return EpicSliceDAGArtifact{}, false, err
+	}
+	return artifact, true, nil
+}
+
+func marshalEpicDAGArtifact(artifact EpicSliceDAGArtifact) ([]byte, error) {
+	if artifact.Nodes == nil {
+		artifact.Nodes = []EpicSliceNode{}
+	}
+	if artifact.Edges == nil {
+		artifact.Edges = []EpicSliceEdge{}
+	}
+	data, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func epicDAGArtifactPath(repoPath, epicID string) string {
+	return filepath.Join(repoPath, epicDAGRelDir, sanitizeFilePart(epicID, "epic")+".slice_dag.json")
+}
+
+func epicDAGArtifactsEqual(a, b EpicSliceDAGArtifact) bool {
+	a.GeneratedAt = ""
+	b.GeneratedAt = ""
+	return reflect.DeepEqual(a, b)
+}
+
+func churnedMergedSlices(existing, desired EpicSliceDAGArtifact, existingByID map[string]gh.Issue) []string {
+	desiredByID := map[string]EpicSliceNode{}
+	for _, node := range desired.Nodes {
+		desiredByID[node.ID] = node
+	}
+	seen := map[string]bool{}
+	var churned []string
+	for _, oldNode := range existing.Nodes {
+		if !nodeWasCompleted(oldNode, existingByID) {
+			continue
+		}
+		newNode, ok := desiredByID[oldNode.ID]
+		if !ok || !epicNodeSignatureEqual(oldNode, newNode) {
+			ref := firstNonEmpty(oldNode.Ref, oldNode.ID)
+			if !seen[ref] {
+				seen[ref] = true
+				churned = append(churned, ref)
+			}
+		}
+	}
+	sort.Strings(churned)
+	return churned
+}
+
+func nodeWasCompleted(node EpicSliceNode, existingByID map[string]gh.Issue) bool {
+	if issue, ok := existingByID[node.ID]; ok {
+		return isIssueCompleted(issue)
+	}
+	return node.Completed
+}
+
+func epicNodeSignatureEqual(a, b EpicSliceNode) bool {
+	return a.ID == b.ID &&
+		a.Ref == b.Ref &&
+		a.Kind == b.Kind &&
+		a.Title == b.Title &&
+		reflect.DeepEqual(sortedStrings(a.DependsOn), sortedStrings(b.DependsOn)) &&
+		a.ImplementableAndTestable == b.ImplementableAndTestable
+}
+
+func isIssueCompleted(issue gh.Issue) bool {
+	stateValue := strings.ToUpper(strings.TrimSpace(issue.State))
+	stateReason := strings.ToUpper(strings.TrimSpace(issue.StateReason))
+	return stateValue == "CLOSED" && (stateReason == "COMPLETED" || len(issue.ClosedByPullRequestsReferences) > 0)
 }
 
 func resolveDependencies(items []*planItem) error {
@@ -780,6 +1062,10 @@ func issueBody(item *planItem) string {
 	fmt.Fprintf(&out, "Roadmap ref: `%s`\n", item.ref)
 	fmt.Fprintf(&out, "Kind: %s\n", item.kind)
 	fmt.Fprintf(&out, "Unit: %s\n", item.unitTitle)
+	if item.epicID != "" {
+		fmt.Fprintf(&out, "Epic: %s\n", item.epicTitle)
+		fmt.Fprintf(&out, "Epic ref: `%s`\n", item.epicRef)
+	}
 	if len(item.blockedBy) == 0 {
 		fmt.Fprintln(&out, "Blocked by: none")
 	} else {
@@ -794,17 +1080,22 @@ func issueBody(item *planItem) string {
 		fmt.Fprintln(&out)
 		fmt.Fprintln(&out, "## Slice")
 		fmt.Fprintln(&out, item.sliceText)
+		if item.epicID != "" {
+			fmt.Fprintln(&out)
+			fmt.Fprintln(&out, "## Isolation")
+			fmt.Fprintln(&out, isolationInvariant)
+		}
 	} else {
 		fmt.Fprintln(&out)
 		fmt.Fprintln(&out, "## Epic")
-		fmt.Fprintln(&out, "This roadmap unit is marked as an epic. Create one epic issue only; decomposition is a later Planner slice.")
+		fmt.Fprintln(&out, "This roadmap unit is marked as a legacy epic. New epic entries compile into slice DAG artifacts and slice issues.")
 	}
 	return out.String()
 }
 
 func issueLabels(item *planItem) []string {
 	labels := []string{baseDeliveryUnitLabel}
-	if item.kind == "epic" {
+	if item.kind == "epic" || item.epicID != "" {
 		labels = append(labels, epicLabel)
 	}
 	for _, dep := range item.blockedBy {
@@ -904,6 +1195,7 @@ func (item *planItem) entry() IssueEntry {
 		ID:        item.id,
 		Ref:       item.ref,
 		Kind:      item.kind,
+		EpicID:    item.epicID,
 		Title:     item.desiredTitle,
 		BlockedBy: append([]int(nil), item.blockedBy...),
 	}
@@ -962,11 +1254,22 @@ func normalizeEntries(entries []IssueEntry) []IssueEntry {
 	return entries
 }
 
+func normalizeEpicDAGEntries(entries []EpicDAGEntry) []EpicDAGEntry {
+	if entries == nil {
+		return []EpicDAGEntry{}
+	}
+	for i := range entries {
+		entries[i].ChurnedMergedSlices = normalizeStrings(entries[i].ChurnedMergedSlices)
+	}
+	return entries
+}
+
 func normalizeReport(report Report) Report {
 	report.Created = normalizeEntries(report.Created)
 	report.Updated = normalizeEntries(report.Updated)
 	report.Unchanged = normalizeEntries(report.Unchanged)
 	report.Closed = normalizeEntries(report.Closed)
+	report.EpicDAGs = normalizeEpicDAGEntries(report.EpicDAGs)
 	return report
 }
 
@@ -1002,6 +1305,48 @@ func slugify(value string) string {
 		}
 	}
 	return strings.Trim(out.String(), "-")
+}
+
+func sanitizeFilePart(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	var out strings.Builder
+	lastDash := false
+	for _, r := range value {
+		keep := (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '_' || r == '-'
+		if keep {
+			out.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			out.WriteByte('-')
+			lastDash = true
+		}
+	}
+	clean := strings.Trim(out.String(), "-.")
+	if clean == "" {
+		return fallback
+	}
+	return clean
+}
+
+func sortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
+}
+
+func normalizeStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func firstNonEmpty(values ...string) string {

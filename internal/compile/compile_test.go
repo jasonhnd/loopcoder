@@ -2,7 +2,9 @@ package compile
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -102,29 +104,129 @@ Build the login path.
 	}
 }
 
-func TestCompileEpicCreatesSingleEpicIssue(t *testing.T) {
+func TestCompileEpicEmitsSliceDAGArtifact(t *testing.T) {
 	roadmap := `# ROADMAP
 
 ## [epic] Replace storage engine
 Move storage behind a new backend.
 
-- doc: This should remain part of epic intent, not a separate slice.
-- code: This should not become a code issue.
+- doc: Design storage seam
+- code: Add storage adapter
 `
 	writer := newFakeIssueWriter()
-	report, _ := runCompileTest(t, writer, roadmap)
+	report, _, files := runCompileTestFiles(t, writer, roadmap)
 
-	if len(report.Created) != 1 {
-		t.Fatalf("created count = %d, want single epic issue: %#v", len(report.Created), report.Created)
+	if !report.PlanApprovalRequired {
+		t.Fatal("PlanApprovalRequired = false, want true for first epic DAG")
 	}
-	if report.Created[0].Kind != "epic" || report.Created[0].Title != "Epic: Replace storage engine" {
-		t.Fatalf("created epic entry = %#v", report.Created[0])
+	if len(report.Created) != 2 {
+		t.Fatalf("created count = %d, want two epic slices: %#v", len(report.Created), report.Created)
 	}
-	if !writer.issueHasLabel(1, "epic") {
-		t.Fatalf("epic issue missing epic label")
+	if report.Created[0].Kind != "doc" || report.Created[0].EpicID == "" {
+		t.Fatalf("created doc slice = %#v, want epic doc slice", report.Created[0])
 	}
-	if strings.Contains(writer.issues[1].Title, "This should") {
-		t.Fatalf("epic was decomposed unexpectedly: %#v", writer.issues[1])
+	if report.Created[1].Kind != "code" || !reflect.DeepEqual(report.Created[1].BlockedBy, []int{1}) {
+		t.Fatalf("created code slice = %#v, want code blocked by doc issue #1", report.Created[1])
+	}
+	if !writer.issueHasLabel(1, "epic") || !writer.issueHasLabel(2, "epic") {
+		t.Fatalf("epic slice issues missing epic label")
+	}
+	if !writer.issueHasLabel(2, "blocked-by:#1") {
+		t.Fatalf("epic code slice missing blocked-by doc label")
+	}
+	if len(report.EpicDAGs) != 1 || !report.EpicDAGs[0].PlanApprovalRequired {
+		t.Fatalf("epic DAG report = %#v, want one approval-gated artifact", report.EpicDAGs)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if artifact.Version != EpicDAGVersion || artifact.EpicTitle != "Replace storage engine" {
+		t.Fatalf("artifact header = %#v", artifact)
+	}
+	if len(artifact.Nodes) != 2 || len(artifact.Edges) != 1 {
+		t.Fatalf("artifact graph nodes=%d edges=%d: %#v", len(artifact.Nodes), len(artifact.Edges), artifact)
+	}
+	if !artifact.Nodes[0].ImplementableAndTestable || !strings.Contains(artifact.Nodes[0].IsolationNotes, "implementable and testable") {
+		t.Fatalf("artifact node missing isolation invariant: %#v", artifact.Nodes[0])
+	}
+	if artifact.Edges[0].From != artifact.Nodes[0].ID || artifact.Edges[0].To != artifact.Nodes[1].ID {
+		t.Fatalf("artifact edge = %#v, want doc node -> code node", artifact.Edges[0])
+	}
+}
+
+func TestCompileEpicDAGRerunPatchesWithoutApproval(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Replace storage engine
+Move storage behind a new backend.
+
+- doc: Design storage seam
+- code: Add storage adapter
+`
+	writer := newFakeIssueWriter()
+	_, _, files := runCompileTestFiles(t, writer, roadmap)
+	files[filepath.Join("repo", RoadmapFilename)] = strings.Replace(files[filepath.Join("repo", RoadmapFilename)], "Add storage adapter", "Add durable storage adapter", 1)
+	writer.resetCalls()
+
+	report := runCompileTestWithFiles(t, writer, files)
+	if report.PlanApprovalRequired {
+		t.Fatal("PlanApprovalRequired = true, want false for non-merged epic DAG patch")
+	}
+	if len(report.Updated) != 1 || report.Updated[0].Issue != 2 {
+		t.Fatalf("updated = %#v, want code slice issue #2 patched", report.Updated)
+	}
+	if len(report.EpicDAGs) != 1 || report.EpicDAGs[0].PlanApprovalRequired {
+		t.Fatalf("epic DAG report = %#v, want patched without approval", report.EpicDAGs)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if artifact.Nodes[1].Title != "Add durable storage adapter" {
+		t.Fatalf("patched artifact code title = %q", artifact.Nodes[1].Title)
+	}
+}
+
+func TestCompileEpicDAGChurnMergedSliceReescalates(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Replace storage engine
+Move storage behind a new backend.
+
+- doc: Design storage seam
+- code: Add storage adapter
+`
+	writer := newFakeIssueWriter()
+	_, _, files := runCompileTestFiles(t, writer, roadmap)
+	merged := writer.issues[2]
+	merged.State = "CLOSED"
+	merged.StateReason = "COMPLETED"
+	writer.issues[2] = merged
+	files[filepath.Join("repo", RoadmapFilename)] = strings.Replace(files[filepath.Join("repo", RoadmapFilename)], "Add storage adapter", "Replace storage adapter", 1)
+	writer.resetCalls()
+
+	report := runCompileTestWithFiles(t, writer, files)
+	if !report.PlanApprovalRequired {
+		t.Fatal("PlanApprovalRequired = false, want true when patch churns merged slice")
+	}
+	if len(report.EpicDAGs) != 1 || !reflect.DeepEqual(report.EpicDAGs[0].ChurnedMergedSlices, []string{"replace-storage-engine/code-1"}) {
+		t.Fatalf("epic DAG report = %#v, want merged code slice churn", report.EpicDAGs)
+	}
+}
+
+func TestCompileEmptyEpicEmitsFallbackDecompositionSlice(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Replace storage engine
+Move storage behind a new backend.
+`
+	writer := newFakeIssueWriter()
+	report, _, files := runCompileTestFiles(t, writer, roadmap)
+
+	if len(report.Created) != 1 || report.Created[0].Kind != "doc" || report.Created[0].EpicID == "" {
+		t.Fatalf("created = %#v, want one epic fallback doc slice", report.Created)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if len(artifact.Nodes) != 1 || artifact.Nodes[0].Ref != "replace-storage-engine/doc-1" {
+		t.Fatalf("artifact = %#v, want one fallback doc node", artifact)
+	}
+	if !strings.Contains(artifact.Nodes[0].Title, "Decompose Replace storage engine") {
+		t.Fatalf("fallback title = %q", artifact.Nodes[0].Title)
 	}
 }
 
@@ -176,24 +278,92 @@ func TestCompileExplicitNeedsReferenceScheme(t *testing.T) {
 
 func runCompileTest(t *testing.T, writer *fakeIssueWriter, roadmap string) (Report, string) {
 	t.Helper()
-	written := roadmap
+	report, written, _ := runCompileTestFiles(t, writer, roadmap)
+	return report, written
+}
+
+func runCompileTestFiles(t *testing.T, writer *fakeIssueWriter, roadmap string) (Report, string, map[string]string) {
+	t.Helper()
+	files := map[string]string{
+		filepath.Join("repo", RoadmapFilename): roadmap,
+	}
+	report := runCompileTestWithFiles(t, writer, files)
+	return report, files[filepath.Join("repo", RoadmapFilename)], files
+}
+
+func runCompileTestWithFiles(t *testing.T, writer *fakeIssueWriter, files map[string]string) Report {
+	t.Helper()
 	report, err := Run(context.Background(), Options{
 		RepoPath: "repo",
 		Writer:   writer,
 		Now:      time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
 	}, Deps{
-		ReadFile: func(string) ([]byte, error) {
-			return []byte(written), nil
+		ReadFile: func(name string) ([]byte, error) {
+			data, ok := files[name]
+			if !ok {
+				return nil, fs.ErrNotExist
+			}
+			return []byte(data), nil
 		},
-		WriteFile: func(_ string, data []byte, _ fs.FileMode) error {
-			written = string(data)
+		WriteFile: func(name string, data []byte, _ fs.FileMode) error {
+			files[name] = string(data)
 			return nil
+		},
+		MkdirAll: func(string, fs.FileMode) error {
+			return nil
+		},
+		Stat: func(name string) (fs.FileInfo, error) {
+			if _, ok := files[name]; !ok {
+				return nil, fs.ErrNotExist
+			}
+			return fakeFileInfo{name: filepath.Base(name)}, nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	return report, written
+	return report
+}
+
+func readEpicArtifactTest(t *testing.T, files map[string]string, entry EpicDAGEntry) EpicSliceDAGArtifact {
+	t.Helper()
+	data, ok := files[filepath.FromSlash(entry.ArtifactPath)]
+	if !ok {
+		t.Fatalf("artifact %q was not written; files=%#v", entry.ArtifactPath, files)
+	}
+	var artifact EpicSliceDAGArtifact
+	if err := json.Unmarshal([]byte(data), &artifact); err != nil {
+		t.Fatalf("artifact %q is not valid JSON: %v\n%s", entry.ArtifactPath, err, data)
+	}
+	return artifact
+}
+
+type fakeFileInfo struct {
+	name string
+}
+
+func (f fakeFileInfo) Name() string {
+	return f.name
+}
+
+func (fakeFileInfo) Size() int64 {
+	return 0
+}
+
+func (fakeFileInfo) Mode() fs.FileMode {
+	return 0o644
+}
+
+func (fakeFileInfo) ModTime() time.Time {
+	return time.Time{}
+}
+
+func (fakeFileInfo) IsDir() bool {
+	return false
+}
+
+func (fakeFileInfo) Sys() any {
+	return nil
 }
 
 type fakeIssueWriter struct {
