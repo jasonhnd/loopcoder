@@ -1086,7 +1086,7 @@ func patchEpicSliceDAGs(ctx context.Context, opts Options, deps Deps, doc *roadm
 
 	backbone, err := deps.GoListBackbone(ctx, opts.RepoPath)
 	if err != nil {
-		return nil, false, err
+		backbone = unavailableGoListBackbone()
 	}
 	existingByID := issuesByMarker(existingIssues)
 	var entries []EpicDAGEntry

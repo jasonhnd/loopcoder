@@ -17,13 +17,7 @@ import (
 )
 
 func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone, error) {
-	backbone := GoListBackbone{
-		Tool:      "go list",
-		Pattern:   "./...",
-		Available: false,
-		Packages:  []GoListPackage{},
-		Edges:     []GoListEdge{},
-	}
+	backbone := unavailableGoListBackbone()
 	if _, err := os.Stat(filepath.Join(repoPath, "go.mod")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return backbone, nil
@@ -33,17 +27,26 @@ func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone
 
 	cmd := exec.CommandContext(ctx, "go", "list", "-json", "./...")
 	cmd.Dir = repoPath
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.Discard
 	data, err := cmd.Output()
 	if err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = err.Error()
-		}
-		return GoListBackbone{}, fmt.Errorf("extract go list backbone: %s", detail)
+		return backbone, nil
 	}
-	return parseGoListBackbone(repoPath, data)
+	parsed, err := parseGoListBackbone(repoPath, data)
+	if err != nil {
+		return backbone, nil
+	}
+	return parsed, nil
+}
+
+func unavailableGoListBackbone() GoListBackbone {
+	return GoListBackbone{
+		Tool:      "go list",
+		Pattern:   "./...",
+		Available: false,
+		Packages:  []GoListPackage{},
+		Edges:     []GoListEdge{},
+	}
 }
 
 type goListPackageJSON struct {
@@ -152,36 +155,56 @@ type EpicDAGArtifactFile struct {
 	Artifact EpicSliceDAGArtifact
 }
 
+type EpicDAGArtifactLoadError struct {
+	Path     string
+	Artifact EpicSliceDAGArtifact
+	Err      error
+}
+
+func (e EpicDAGArtifactLoadError) Error() string {
+	return fmt.Sprintf("%s: %v", e.Path, e.Err)
+}
+
+func (e EpicDAGArtifactLoadError) Unwrap() error {
+	return e.Err
+}
+
 func LoadEpicSliceDAGArtifacts(repoPath string) ([]EpicDAGArtifactFile, error) {
+	artifacts, loadErrors, err := LoadEpicSliceDAGArtifactsBestEffort(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(loadErrors) > 0 {
+		return nil, loadErrors[0]
+	}
+	return artifacts, nil
+}
+
+func LoadEpicSliceDAGArtifactsBestEffort(repoPath string) ([]EpicDAGArtifactFile, []EpicDAGArtifactLoadError, error) {
 	root := filepath.Join(repoPath, epicDAGRelDir)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read epic DAG artifacts: %w", err)
+		return nil, nil, fmt.Errorf("read epic DAG artifacts: %w", err)
 	}
 
 	var artifacts []EpicDAGArtifactFile
+	var loadErrors []EpicDAGArtifactLoadError
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".slice_dag.json") {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
-		data, err := os.ReadFile(path)
+		artifact, err := loadEpicSliceDAGArtifact(path)
 		if err != nil {
-			return nil, fmt.Errorf("read epic DAG artifact %s: %w", path, err)
-		}
-		var artifact EpicSliceDAGArtifact
-		if err := json.Unmarshal(data, &artifact); err != nil {
-			return nil, fmt.Errorf("parse epic DAG artifact %s: %w", path, err)
-		}
-		if artifact.Ordering == nil {
-			ordering, err := computeEpicOrdering(artifact.Nodes)
-			if err != nil {
-				return nil, fmt.Errorf("order epic DAG artifact %s: %w", path, err)
-			}
-			artifact.Ordering = &ordering
+			loadErrors = append(loadErrors, EpicDAGArtifactLoadError{
+				Path:     filepath.ToSlash(path),
+				Artifact: artifact,
+				Err:      err,
+			})
+			continue
 		}
 		artifacts = append(artifacts, EpicDAGArtifactFile{
 			Path:     filepath.ToSlash(path),
@@ -191,7 +214,29 @@ func LoadEpicSliceDAGArtifacts(repoPath string) ([]EpicDAGArtifactFile, error) {
 	sort.Slice(artifacts, func(i, j int) bool {
 		return artifacts[i].Path < artifacts[j].Path
 	})
-	return artifacts, nil
+	sort.Slice(loadErrors, func(i, j int) bool {
+		return loadErrors[i].Path < loadErrors[j].Path
+	})
+	return artifacts, loadErrors, nil
+}
+
+func loadEpicSliceDAGArtifact(path string) (EpicSliceDAGArtifact, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return EpicSliceDAGArtifact{}, fmt.Errorf("read epic DAG artifact: %w", err)
+	}
+	var artifact EpicSliceDAGArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return artifact, fmt.Errorf("parse epic DAG artifact: %w", err)
+	}
+	if artifact.Ordering == nil {
+		ordering, err := computeEpicOrdering(artifact.Nodes)
+		if err != nil {
+			return artifact, fmt.Errorf("order epic DAG artifact: %w", err)
+		}
+		artifact.Ordering = &ordering
+	}
+	return artifact, nil
 }
 
 func condensePlanItemCycles(items []*planItem) []*planItem {
@@ -438,6 +483,9 @@ func computeEpicOrdering(nodes []EpicSliceNode) (EpicDAGOrdering, error) {
 			return nodeLess(nodeByID, indexByID, dependents[id][i], dependents[id][j])
 		})
 	}
+	if hasEpicOrderingCycle(remaining, dependents) {
+		return EpicDAGOrdering{}, errors.New("epic slice DAG contains a cycle after SCC condensation")
+	}
 
 	criticalPath := epicCriticalPath(remaining, dependents, nodeByID, indexByID)
 	onCritical := map[string]bool{}
@@ -527,6 +575,33 @@ func computeEpicOrdering(nodes []EpicSliceNode) (EpicDAGOrdering, error) {
 		ordering.Ready = layers[0].Nodes
 	}
 	return ordering, nil
+}
+
+func hasEpicOrderingCycle(remaining []string, dependents map[string][]string) bool {
+	state := map[string]int{}
+	var visit func(string) bool
+	visit = func(id string) bool {
+		switch state[id] {
+		case 1:
+			return true
+		case 2:
+			return false
+		}
+		state[id] = 1
+		for _, dependent := range dependents[id] {
+			if visit(dependent) {
+				return true
+			}
+		}
+		state[id] = 2
+		return false
+	}
+	for _, id := range remaining {
+		if visit(id) {
+			return true
+		}
+	}
+	return false
 }
 
 func epicCriticalPath(remaining []string, dependents map[string][]string, nodeByID map[string]EpicSliceNode, indexByID map[string]int) []string {

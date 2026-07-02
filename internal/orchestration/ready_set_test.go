@@ -429,7 +429,85 @@ func TestComputeReadySetOrdersEpicReadyLayerFromSliceDAG(t *testing.T) {
 	}
 }
 
+func TestComputeReadySetIsolatesBadEpicArtifacts(t *testing.T) {
+	repo := t.TempDir()
+	writeEpicOrderingArtifactNamed(t, repo, "valid.slice_dag.json", compiler.EpicSliceDAGArtifact{
+		Version:   compiler.EpicDAGVersion,
+		EpicID:    "valid-epic",
+		EpicTitle: "Valid migration",
+		Nodes: []compiler.EpicSliceNode{
+			{ID: "a", Ref: "valid/a", Issue: 10},
+			{ID: "b", Ref: "valid/b", Issue: 20},
+		},
+		Ordering: &compiler.EpicDAGOrdering{
+			Ready: []compiler.EpicDAGOrderNode{
+				{ID: "b", Ref: "valid/b", Issue: 20, UnblockCount: 1, OnCriticalPath: true},
+				{ID: "a", Ref: "valid/a", Issue: 10},
+			},
+			Layers: []compiler.EpicDAGLayer{
+				{Index: 0, Nodes: []compiler.EpicDAGOrderNode{
+					{ID: "b", Ref: "valid/b", Issue: 20, UnblockCount: 1, OnCriticalPath: true},
+					{ID: "a", Ref: "valid/a", Issue: 10},
+				}},
+			},
+			CriticalPath:    []string{"valid/b"},
+			CriticalPathETA: 1,
+		},
+	})
+	writeEpicOrderingArtifactNamed(t, repo, "cycle.slice_dag.json", compiler.EpicSliceDAGArtifact{
+		Version:   compiler.EpicDAGVersion,
+		EpicID:    "bad-epic",
+		EpicTitle: "Bad migration",
+		Nodes: []compiler.EpicSliceNode{
+			{ID: "bad-a", Ref: "bad/a", Issue: 40, DependsOn: []string{"bad-b"}},
+			{ID: "bad-b", Ref: "bad/b", DependsOn: []string{"bad-a"}},
+		},
+	})
+	root := filepath.Join(repo, ".loopcoder", "epics")
+	if err := os.WriteFile(filepath.Join(root, "broken.slice_dag.json"), []byte("{not-json\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile corrupt epic artifact: %v", err)
+	}
+
+	result, err := ComputeReadySet(context.Background(), Options{
+		Reader: fakeReader{
+			repo: "owner/repo",
+			issues: []gh.Issue{
+				{Number: 10, Title: "A", State: "OPEN"},
+				{Number: 20, Title: "B", State: "OPEN"},
+				{Number: 40, Title: "Bad A", State: "OPEN"},
+			},
+		},
+		RepoPath:     repo,
+		BaseBranch:   "main",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeReadySet returned error: %v", err)
+	}
+
+	if len(result.Ready) != 2 || result.Ready[0].Issue != 20 || result.Ready[1].Issue != 10 {
+		t.Fatalf("ready = %#v, want valid epic issues ordered before corrupt artifact fallout", result.Ready)
+	}
+	if len(result.EpicOrdering) != 1 || result.EpicOrdering[0].EpicID != "valid-epic" {
+		t.Fatalf("epic ordering = %#v, want only valid epic summary", result.EpicOrdering)
+	}
+	if len(result.Blocked) != 1 || result.Blocked[0].Issue != 40 || result.Blocked[0].Classification != "needs-human" {
+		t.Fatalf("blocked = %#v, want bad epic issue marked needs-human", result.Blocked)
+	}
+	if !strings.Contains(result.Blocked[0].Reason, "cycle.slice_dag.json") ||
+		!strings.Contains(result.Blocked[0].Reason, "epic slice DAG contains a cycle") {
+		t.Fatalf("bad artifact reason = %q", result.Blocked[0].Reason)
+	}
+}
+
 func writeEpicOrderingArtifact(t *testing.T, repo string, artifact compiler.EpicSliceDAGArtifact) {
+	t.Helper()
+	writeEpicOrderingArtifactNamed(t, repo, "epic-1.slice_dag.json", artifact)
+}
+
+func writeEpicOrderingArtifactNamed(t *testing.T, repo, name string, artifact compiler.EpicSliceDAGArtifact) {
 	t.Helper()
 	root := filepath.Join(repo, ".loopcoder", "epics")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -439,7 +517,7 @@ func writeEpicOrderingArtifact(t *testing.T, repo string, artifact compiler.Epic
 	if err != nil {
 		t.Fatalf("Marshal epic artifact: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "epic-1.slice_dag.json"), append(data, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, name), append(data, '\n'), 0o644); err != nil {
 		t.Fatalf("WriteFile epic artifact: %v", err)
 	}
 }
