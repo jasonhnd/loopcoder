@@ -28,6 +28,15 @@ type Writer interface {
 	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (PreProdRevertResult, error)
 }
 
+// ProductionWriter is the human-only production promotion write surface. It is
+// intentionally separate from Writer so unattended tick dependencies cannot gain
+// a main-merge method by interface widening.
+type ProductionWriter interface {
+	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error)
+	PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error)
+	SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error)
+}
+
 // IssueWriter is the GitHub issue mutation surface used by compile. Tests can
 // inject a fake implementation so no real gh credentials are required.
 type IssueWriter interface {
@@ -113,6 +122,31 @@ type PreProdRevertResult struct {
 	RevertedSHA string `json:"reverted_sha"`
 	SHA         string `json:"sha,omitempty"`
 	URL         string `json:"url,omitempty"`
+}
+
+type PreProdKickBackResult struct {
+	Item        string `json:"item"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	Branch      string `json:"branch"`
+	RevertedSHA string `json:"reverted_sha"`
+	SHA         string `json:"sha,omitempty"`
+	URL         string `json:"url,omitempty"`
+}
+
+type MainPromotionResult struct {
+	PreProdBranch   string `json:"pre_prod_branch"`
+	MainBranch      string `json:"main_branch"`
+	Head            string `json:"head"`
+	SHA             string `json:"sha,omitempty"`
+	URL             string `json:"url,omitempty"`
+	AlreadyUpToDate bool   `json:"already_up_to_date,omitempty"`
+}
+
+type PreProdSyncResult struct {
+	PreProdBranch string `json:"pre_prod_branch"`
+	MainBranch    string `json:"main_branch"`
+	SHA           string `json:"sha,omitempty"`
+	URL           string `json:"url,omitempty"`
 }
 
 // New returns a gh-backed reader rooted at repoPath.
@@ -374,6 +408,145 @@ func (c *CLI) RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, 
 	if mergeSHA == "" {
 		return PreProdRevertResult{}, fmt.Errorf("merge commit SHA is required")
 	}
+	return c.revertPreProdCommit(ctx, prNumber, preProdBranch, mergeSHA)
+}
+
+func (c *CLI) KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error) {
+	item = strings.TrimSpace(item)
+	preProdBranch = strings.TrimSpace(preProdBranch)
+	if item == "" {
+		return PreProdKickBackResult{}, fmt.Errorf("kick-back item is required")
+	}
+	if preProdBranch == "" {
+		return PreProdKickBackResult{}, fmt.Errorf("pre-prod branch is required")
+	}
+	if isReservedProductionBranch(preProdBranch) {
+		return PreProdKickBackResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
+	}
+
+	mergeSHA, prNumber, err := c.resolvePreProdKickBackCommit(ctx, item, preProdBranch)
+	if err != nil {
+		return PreProdKickBackResult{}, err
+	}
+	reverted, err := c.revertPreProdCommit(ctx, prNumber, preProdBranch, mergeSHA)
+	if err != nil {
+		return PreProdKickBackResult{}, err
+	}
+	return PreProdKickBackResult{
+		Item:        item,
+		PRNumber:    prNumber,
+		Branch:      reverted.Branch,
+		RevertedSHA: reverted.RevertedSHA,
+		SHA:         reverted.SHA,
+		URL:         reverted.URL,
+	}, nil
+}
+
+func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error) {
+	preProdBranch = strings.TrimSpace(preProdBranch)
+	if preProdBranch == "" {
+		return MainPromotionResult{}, fmt.Errorf("pre-prod branch is required")
+	}
+	if isReservedProductionBranch(preProdBranch) {
+		return MainPromotionResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
+	}
+	repo, err := c.RepoName(ctx)
+	if err != nil {
+		return MainPromotionResult{}, err
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return MainPromotionResult{}, fmt.Errorf("repository name is required")
+	}
+
+	var payload struct {
+		SHA     string `json:"sha"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := c.runJSON(ctx, []string{
+		"api",
+		"--method", "POST",
+		"repos/" + repo + "/merges",
+		"-f", "base=main",
+		"-f", "head=" + preProdBranch,
+		"-f", "commit_message=loopcoder promote " + preProdBranch + " to main",
+	}, &payload); err != nil {
+		return MainPromotionResult{}, err
+	}
+	return MainPromotionResult{
+		PreProdBranch:   preProdBranch,
+		MainBranch:      "main",
+		Head:            preProdBranch,
+		SHA:             payload.SHA,
+		URL:             payload.HTMLURL,
+		AlreadyUpToDate: strings.TrimSpace(payload.SHA) == "",
+	}, nil
+}
+
+func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error) {
+	preProdBranch = strings.TrimSpace(preProdBranch)
+	if preProdBranch == "" {
+		return PreProdSyncResult{}, fmt.Errorf("pre-prod branch is required")
+	}
+	if isReservedProductionBranch(preProdBranch) {
+		return PreProdSyncResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
+	}
+	if _, err := c.run(ctx, "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
+		return PreProdSyncResult{}, err
+	}
+	shaBytes, err := c.run(ctx, "git", "rev-parse", "refs/remotes/origin/main")
+	if err != nil {
+		return PreProdSyncResult{}, err
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+	if sha == "" {
+		return PreProdSyncResult{}, fmt.Errorf("main branch sync produced an empty commit SHA")
+	}
+	if _, err := c.run(ctx, "git", "push", "origin", "refs/remotes/origin/main:refs/heads/"+preProdBranch); err != nil {
+		return PreProdSyncResult{}, err
+	}
+	return PreProdSyncResult{
+		PreProdBranch: preProdBranch,
+		MainBranch:    "main",
+		SHA:           sha,
+		URL:           commitURL(ctx, c, sha),
+	}, nil
+}
+
+func (c *CLI) resolvePreProdKickBackCommit(ctx context.Context, item, preProdBranch string) (string, int, error) {
+	if isGitSHAish(item) {
+		return item, parseKickBackPRNumber(item), nil
+	}
+	prNumber := parseKickBackPRNumber(item)
+	if prNumber <= 0 {
+		return "", 0, fmt.Errorf("kick-back item %q must be a PR number or merge commit SHA", item)
+	}
+	refspec := "+refs/heads/" + preProdBranch + ":refs/remotes/origin/" + preProdBranch
+	if _, err := c.run(ctx, "git", "fetch", "origin", refspec); err != nil {
+		return "", 0, err
+	}
+	output, err := c.run(ctx, "git", "log", "--format=%H%x00%s", "refs/remotes/origin/"+preProdBranch)
+	if err != nil {
+		return "", 0, err
+	}
+	needle := fmt.Sprintf("PR #%d", prNumber)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		parts := strings.SplitN(line, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if strings.Contains(parts[1], needle) {
+			sha := strings.TrimSpace(parts[0])
+			if sha == "" {
+				return "", 0, fmt.Errorf("pre-prod merge commit for PR #%d had an empty SHA", prNumber)
+			}
+			return sha, prNumber, nil
+		}
+	}
+	return "", 0, fmt.Errorf("pre-prod merge commit for PR #%d was not found on %s", prNumber, preProdBranch)
+}
+
+func (c *CLI) revertPreProdCommit(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (PreProdRevertResult, error) {
 	if isReservedProductionBranch(preProdBranch) {
 		return PreProdRevertResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
 	}
@@ -785,6 +958,44 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func parseKickBackPRNumber(item string) int {
+	item = strings.ToLower(strings.TrimSpace(item))
+	item = strings.TrimPrefix(item, "pr:")
+	item = strings.TrimPrefix(item, "pr#")
+	item = strings.TrimPrefix(item, "pr-")
+	item = strings.TrimPrefix(item, "#")
+	if item == "" {
+		return 0
+	}
+	for _, ch := range item {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+	}
+	var number int
+	for _, ch := range item {
+		number = number*10 + int(ch-'0')
+	}
+	return number
+}
+
+func isGitSHAish(item string) bool {
+	item = strings.TrimSpace(item)
+	if len(item) < 7 || len(item) > 40 {
+		return false
+	}
+	for _, ch := range item {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'a' && ch <= 'f':
+		case ch >= 'A' && ch <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isReservedProductionBranch(branch string) bool {

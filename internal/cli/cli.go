@@ -51,6 +51,7 @@ type Deps struct {
 	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
 	NewIssueWriter   func(repoPath string) compiler.IssueWriter
 	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
 	ProcessAlive     func(pid int) bool
 	Now              func() time.Time
 	IsTerminal       func(w io.Writer) bool
@@ -62,6 +63,7 @@ type Deps struct {
 	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote          func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
 	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify           func(ctx context.Context, opts verify.Options) verify.Result
 	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
@@ -82,6 +84,7 @@ var commands = []Command{
 	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
 	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
 	{Name: "tick", Summary: "run one unattended delivery pass"},
+	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
@@ -126,6 +129,9 @@ func DefaultDeps() Deps {
 		NewPreProdWriter: func(repoPath string) orchestration.PreProdWriter {
 			return gh.New(repoPath)
 		},
+		NewPromoteWriter: func(repoPath string) orchestration.PromotionWriter {
+			return gh.New(repoPath)
+		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
 		IsTerminal:   isTerminalWriter,
@@ -147,6 +153,9 @@ func DefaultDeps() Deps {
 		},
 		Loopreview: func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
+		},
+		Promote: func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			return orchestration.Promote(ctx, opts)
 		},
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
@@ -232,6 +241,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "tick" {
 		return runTick(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "promote" {
+		return runPromote(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
@@ -373,6 +385,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+	}
+	if command.Name == "promote" {
+		fmt.Fprintln(w, "  --repo string              repository path (required)")
+		fmt.Fprintln(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintln(w, "  --kick-back string         item to revert out of pre-prod before promoting; repeatable")
 	}
 	if command.Name == "upgrade" {
 		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
@@ -1045,6 +1062,97 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 	}
 	return orchestration.TickExitCode(tickReport)
+}
+
+func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewPromoteWriter == nil {
+		deps.NewPromoteWriter = defaults.NewPromoteWriter
+	}
+	if deps.Promote == nil {
+		deps.Promote = defaults.Promote
+	}
+
+	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var preProdBranch string
+	var preProdBranchAlias string
+	var kickBack repeatStringFlag
+	var kickBackAlias repeatStringFlag
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&preProdBranch, "pre-prod-branch", "", "pre-prod branch")
+	fs.StringVar(&preProdBranchAlias, "PreProdBranch", "", "pre-prod branch")
+	fs.Var(&kickBack, "kick-back", "kick-back item")
+	fs.Var(&kickBackAlias, "KickBack", "kick-back item")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	preProdBranchFlagSet := flagWasSet(fs, "pre-prod-branch") || flagWasSet(fs, "PreProdBranch")
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if preProdBranchAlias != "" {
+		preProdBranch = preProdBranchAlias
+	}
+	kickBack = append(kickBack, kickBackAlias...)
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "promote: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "promote: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	if !preProdBranchFlagSet && strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
+	}
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
+
+	report, err := deps.Promote(context.Background(), orchestration.PromoteOptions{
+		Writer:        deps.NewPromoteWriter(resolvedRepo),
+		RepoPath:      resolvedRepo,
+		PreProdBranch: preProdBranch,
+		Gate:          cfg.Adapters.Gate,
+		KickBackItems: []string(kickBack),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	data, err := orchestration.MarshalPromoteJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "promote: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderPromoteText(report))); err != nil {
+		fmt.Fprintf(stderr, "promote: write summary: %v\n", err)
+		return 1
+	}
+	return orchestration.PromoteExitCode(report)
 }
 
 func renderTickPrettyAttestations(w io.Writer, report orchestration.TickReport, mode attestation.PrettyMode) error {
@@ -2108,6 +2216,24 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 		}
 	})
 	return wasSet
+}
+
+type repeatStringFlag []string
+
+func (f *repeatStringFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(*f, ",")
+}
+
+func (f *repeatStringFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("value must not be empty")
+	}
+	*f = append(*f, value)
+	return nil
 }
 
 func loadDeliveryConfig(repoPath string) (config.Config, error) {

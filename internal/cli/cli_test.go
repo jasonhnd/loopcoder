@@ -1676,6 +1676,110 @@ func TestTickHelpDocumentsFlags(t *testing.T) {
 	}
 }
 
+func TestPromoteHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"promote", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder promote", "--repo", "--pre-prod-branch", "--kick-back"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestPromoteRunsWithConfigDefaultsAndKickBacks(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`version: 1
+adapters:
+  gate: human-merge
+environment:
+  pre_prod_branch: staging
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{"promote", "--repo", repo, "--kick-back", "#101", "--kick-back", "merge-sha"}, &stdout, &stderr, Deps{
+		NewPromoteWriter: func(path string) orchestration.PromotionWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return cliFakePromotionWriter{}
+		},
+		Promote: func(_ context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			called = true
+			if opts.RepoPath != repo || opts.PreProdBranch != "staging" || opts.Gate != "human-merge" {
+				t.Fatalf("promote opts = %#v", opts)
+			}
+			if !reflect.DeepEqual(opts.KickBackItems, []string{"#101", "merge-sha"}) {
+				t.Fatalf("kick-back items = %#v", opts.KickBackItems)
+			}
+			if opts.Writer == nil {
+				t.Fatal("promotion writer was not set")
+			}
+			return orchestration.PromoteReport{
+				Version:       orchestration.PromoteReportVersion,
+				RepoPath:      opts.RepoPath,
+				PreProdBranch: opts.PreProdBranch,
+				MainBranch:    "main",
+				Gate:          opts.Gate,
+				Status:        orchestration.PromoteStatusSucceeded,
+				KickedBack: []orchestration.PromoteKickBackResult{{
+					Item:        "#101",
+					PRNumber:    101,
+					Branch:      opts.PreProdBranch,
+					RevertedSHA: "merge-sha",
+					SHA:         "revert-sha",
+					Status:      orchestration.PromoteStatusSucceeded,
+				}},
+				Promoted: orchestration.PromoteMainResult{
+					PreProdBranch: opts.PreProdBranch,
+					MainBranch:    "main",
+					Head:          opts.PreProdBranch,
+					SHA:           "main-sha",
+					Status:        orchestration.PromoteStatusSucceeded,
+				},
+				Sync: orchestration.PromoteSyncResult{
+					PreProdBranch: opts.PreProdBranch,
+					MainBranch:    "main",
+					SHA:           "main-sha",
+					Status:        orchestration.PromoteStatusSucceeded,
+				},
+				Summary: orchestration.PromoteSummary{
+					KickedBackCount: 1,
+					PromotedCount:   1,
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Promote dependency was not called")
+	}
+	var got orchestration.PromoteReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not promote JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.PromoteStatusSucceeded || got.Summary.PromotedCount != 1 {
+		t.Fatalf("promote report = %#v", got)
+	}
+	for _, want := range []string{"PROMOTE", "Status: succeeded", "Kicked back", "Promoted", "Pre-prod sync"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestTickRunsWithDualReadOutputAndConfigDefaults(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -2885,6 +2989,20 @@ func validLoopreviewAttestation() attestation.AttestationRecord {
 
 func int64TestPtr(value int64) *int64 {
 	return &value
+}
+
+type cliFakePromotionWriter struct{}
+
+func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, string) (gh.PreProdKickBackResult, error) {
+	return gh.PreProdKickBackResult{}, nil
+}
+
+func (cliFakePromotionWriter) PromotePreProdToMain(context.Context, string) (gh.MainPromotionResult, error) {
+	return gh.MainPromotionResult{}, nil
+}
+
+func (cliFakePromotionWriter) SyncPreProdFromMain(context.Context, string) (gh.PreProdSyncResult, error) {
+	return gh.PreProdSyncResult{}, nil
 }
 
 type cliFakeReader struct {

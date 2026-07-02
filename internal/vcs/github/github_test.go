@@ -198,6 +198,75 @@ func TestRevertOnPreProdRejectsProductionBranches(t *testing.T) {
 	}
 }
 
+func TestPromotePreProdToMainMergesAndSyncsPreProd(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner": []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=main\x00-f\x00head=pre-prod\x00-f\x00commit_message=loopcoder promote pre-prod to main": []byte(`{"sha":"main-merge-sha","html_url":"https://github.com/owner/repo/commit/main-merge-sha"}`),
+			"repo\x00git\x00fetch\x00origin\x00+refs/heads/main:refs/remotes/origin/main":                                                                                           nil,
+			"repo\x00git\x00rev-parse\x00refs/remotes/origin/main":                                                                                                                  []byte("main-head-sha\n"),
+			"repo\x00git\x00push\x00origin\x00refs/remotes/origin/main:refs/heads/pre-prod":                                                                                         nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	promoted, err := client.PromotePreProdToMain(context.Background(), "pre-prod")
+	if err != nil {
+		t.Fatalf("PromotePreProdToMain returned error: %v", err)
+	}
+	if promoted.PreProdBranch != "pre-prod" || promoted.MainBranch != "main" || promoted.Head != "pre-prod" || promoted.SHA != "main-merge-sha" {
+		t.Fatalf("PromotePreProdToMain result = %#v", promoted)
+	}
+	synced, err := client.SyncPreProdFromMain(context.Background(), "pre-prod")
+	if err != nil {
+		t.Fatalf("SyncPreProdFromMain returned error: %v", err)
+	}
+	if synced.PreProdBranch != "pre-prod" || synced.MainBranch != "main" || synced.SHA != "main-head-sha" {
+		t.Fatalf("SyncPreProdFromMain result = %#v", synced)
+	}
+
+	want := [][]string{
+		{"repo", "gh", "repo", "view", "--json", "nameWithOwner"},
+		{"repo", "gh", "api", "--method", "POST", "repos/owner/repo/merges", "-f", "base=main", "-f", "head=pre-prod", "-f", "commit_message=loopcoder promote pre-prod to main"},
+		{"repo", "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"},
+		{"repo", "git", "rev-parse", "refs/remotes/origin/main"},
+		{"repo", "git", "push", "origin", "refs/remotes/origin/main:refs/heads/pre-prod"},
+		{"repo", "gh", "repo", "view", "--json", "nameWithOwner"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestKickBackFromPreProdResolvesPRMergeAndReverts(t *testing.T) {
+	runner := &preProdKickBackRunner{}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.KickBackFromPreProd(context.Background(), "#101", "pre-prod")
+	if err != nil {
+		t.Fatalf("KickBackFromPreProd returned error: %v", err)
+	}
+	if got.Item != "#101" || got.PRNumber != 101 || got.Branch != "pre-prod" || got.RevertedSHA != "merge-sha" || got.SHA != "revert-sha" {
+		t.Fatalf("KickBackFromPreProd result = %#v", got)
+	}
+
+	var sawLog, sawRevert, sawPush bool
+	for _, call := range runner.calls {
+		if reflect.DeepEqual(call, []string{"repo", "git", "log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"}) {
+			sawLog = true
+		}
+		if len(call) >= 7 && call[1] == "git" && call[2] == "revert" && reflect.DeepEqual(call[3:], []string{"-m", "1", "--no-edit", "merge-sha"}) {
+			sawRevert = true
+		}
+		if len(call) == 5 && call[1] == "git" && reflect.DeepEqual(call[2:], []string{"push", "origin", "HEAD:pre-prod"}) {
+			sawPush = true
+		}
+	}
+	if !sawLog || !sawRevert || !sawPush {
+		t.Fatalf("calls missing log=%t revert=%t push=%t: %#v", sawLog, sawRevert, sawPush, runner.calls)
+	}
+}
+
 func TestWriterHasNoMergeToMainMethod(t *testing.T) {
 	writer := reflect.TypeOf((*Writer)(nil)).Elem()
 	for i := 0; i < writer.NumMethod(); i++ {
@@ -333,6 +402,25 @@ type preProdRevertRunner struct {
 func (r *preProdRevertRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
 	call := append([]string{dir, name}, args...)
 	r.calls = append(r.calls, call)
+	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+		return []byte("revert-sha\n"), nil
+	}
+	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
+		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
+	}
+	return nil, nil
+}
+
+type preProdKickBackRunner struct {
+	calls [][]string
+}
+
+func (r *preProdKickBackRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+	call := append([]string{dir, name}, args...)
+	r.calls = append(r.calls, call)
+	if dir == "repo" && name == "git" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"}) {
+		return []byte("other-sha\x00loopcoder pre-prod merge PR #100\nmerge-sha\x00loopcoder pre-prod merge PR #101\n"), nil
+	}
 	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
 		return []byte("revert-sha\n"), nil
 	}
