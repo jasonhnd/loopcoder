@@ -25,6 +25,16 @@ type Writer interface {
 	ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error)
 }
 
+// IssueWriter is the GitHub issue mutation surface used by compile. Tests can
+// inject a fake implementation so no real gh credentials are required.
+type IssueWriter interface {
+	RepoName(ctx context.Context) (string, error)
+	ListIssues(ctx context.Context, state string) ([]Issue, error)
+	CreateIssue(ctx context.Context, title, body string, labels []string) (Issue, error)
+	UpdateIssue(ctx context.Context, number int, title, body string, addLabels, removeLabels []string) (Issue, error)
+	CloseIssue(ctx context.Context, number int) error
+}
+
 type Runner interface {
 	Run(ctx context.Context, dir, name string, args ...string) ([]byte, error)
 }
@@ -149,7 +159,7 @@ func (c *CLI) ListIssues(ctx context.Context, state string) ([]Issue, error) {
 		"issue", "list",
 		"--state", state,
 		"--limit", "1000",
-		"--json", "number,title,labels,state,stateReason",
+		"--json", "number,title,body,labels,state,stateReason",
 	}, &issues)
 	return issues, err
 }
@@ -240,6 +250,72 @@ func (c *CLI) ListHeadPRs(ctx context.Context, branch string) ([]PullRequestRefe
 	return prs, err
 }
 
+func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []string) (Issue, error) {
+	labels = normalizeLabelArgs(labels)
+	if err := c.ensureLabels(ctx, labels); err != nil {
+		return Issue{}, err
+	}
+
+	args := []string{"issue", "create", "--title", title, "--body", body}
+	for _, label := range labels {
+		args = append(args, "--label", label)
+	}
+	output, err := c.run(ctx, "gh", args...)
+	if err != nil {
+		return Issue{}, err
+	}
+	number := issueNumberFromURL(strings.TrimSpace(string(output)))
+	if number <= 0 {
+		return Issue{}, fmt.Errorf("gh issue create returned no issue number: %s", strings.TrimSpace(string(output)))
+	}
+	issue, viewErr := c.ViewIssue(ctx, number)
+	if viewErr != nil {
+		return Issue{
+			Number: number,
+			Title:  title,
+			Body:   body,
+			State:  "OPEN",
+			Labels: labelsFromNames(labels),
+		}, nil
+	}
+	return issue, nil
+}
+
+func (c *CLI) UpdateIssue(ctx context.Context, number int, title, body string, addLabels, removeLabels []string) (Issue, error) {
+	addLabels = normalizeLabelArgs(addLabels)
+	removeLabels = normalizeLabelArgs(removeLabels)
+	if err := c.ensureLabels(ctx, addLabels); err != nil {
+		return Issue{}, err
+	}
+
+	args := []string{"issue", "edit", fmt.Sprintf("%d", number), "--title", title, "--body", body}
+	for _, label := range addLabels {
+		args = append(args, "--add-label", label)
+	}
+	for _, label := range removeLabels {
+		args = append(args, "--remove-label", label)
+	}
+	if _, err := c.run(ctx, "gh", args...); err != nil {
+		return Issue{}, err
+	}
+	issue, err := c.ViewIssue(ctx, number)
+	if err != nil {
+		return Issue{
+			Number: number,
+			Title:  title,
+			Body:   body,
+			State:  "OPEN",
+			Labels: labelsFromNames(addLabels),
+		}, nil
+	}
+	return issue, nil
+}
+
+func (c *CLI) CloseIssue(ctx context.Context, number int) error {
+	_, err := c.run(ctx, "gh", "issue", "close", fmt.Sprintf("%d", number), "--reason", "not planned")
+	return err
+}
+
 func (c *CLI) runJSON(ctx context.Context, args []string, target any) error {
 	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
@@ -256,6 +332,16 @@ func (c *CLI) run(ctx context.Context, name string, args ...string) ([]byte, err
 		return nil, fmt.Errorf("github client is not configured")
 	}
 	return c.runner.Run(ctx, c.repoPath, name, args...)
+}
+
+func (c *CLI) ensureLabels(ctx context.Context, labels []string) error {
+	for _, label := range labels {
+		output, err := c.run(ctx, "gh", "label", "create", label, "--color", labelColor(label), "--description", labelDescription(label))
+		if err != nil && !labelAlreadyExists(err, output) {
+			return fmt.Errorf("ensure label %q: %w", label, err)
+		}
+	}
+	return nil
 }
 
 func (c *CLI) gitRemote(ctx context.Context) (string, error) {
@@ -314,6 +400,7 @@ func trimToJSON(output []byte) []byte {
 }
 
 var githubRemotePattern = regexp.MustCompile(`github\.com[:/]([^/]+)/(.+?)(?:\.git)?$`)
+var issueURLPattern = regexp.MustCompile(`/issues/(\d+)(?:\D*)$`)
 
 func parseGitHubRemote(remote string) string {
 	matches := githubRemotePattern.FindStringSubmatch(strings.TrimSpace(remote))
@@ -321,4 +408,73 @@ func parseGitHubRemote(remote string) string {
 		return ""
 	}
 	return matches[1] + "/" + matches[2]
+}
+
+func issueNumberFromURL(url string) int {
+	matches := issueURLPattern.FindStringSubmatch(strings.TrimSpace(url))
+	if len(matches) != 2 {
+		return 0
+	}
+	var number int
+	if _, err := fmt.Sscanf(matches[1], "%d", &number); err != nil {
+		return 0
+	}
+	return number
+}
+
+func normalizeLabelArgs(labels []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func labelsFromNames(names []string) []Label {
+	labels := make([]Label, 0, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) != "" {
+			labels = append(labels, Label{Name: name})
+		}
+	}
+	return labels
+}
+
+func labelAlreadyExists(err error, output []byte) bool {
+	text := strings.ToLower(err.Error() + "\n" + string(output))
+	return strings.Contains(text, "already exists") || strings.Contains(text, "name has already been taken")
+}
+
+func labelColor(label string) string {
+	lower := strings.ToLower(strings.TrimSpace(label))
+	switch {
+	case lower == "delivery:unit":
+		return "0e8a16"
+	case lower == "epic":
+		return "5319e7"
+	case strings.HasPrefix(lower, "blocked-by:#"):
+		return "fbca04"
+	default:
+		return "ededed"
+	}
+}
+
+func labelDescription(label string) string {
+	lower := strings.ToLower(strings.TrimSpace(label))
+	switch {
+	case lower == "delivery:unit":
+		return "loopcoder work unit"
+	case lower == "epic":
+		return "loopcoder epic issue"
+	case strings.HasPrefix(lower, "blocked-by:#"):
+		return "loopcoder dependency edge"
+	default:
+		return "loopcoder compile label"
+	}
 }

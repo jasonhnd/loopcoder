@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -1528,6 +1529,55 @@ func TestReadySetRequiresRepo(t *testing.T) {
 	}
 }
 
+func TestCompileRunsWithDualReadOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "ROADMAP.md"), []byte(`# ROADMAP
+
+## Auth Flow
+- doc: Design auth
+`), 0o644); err != nil {
+		t.Fatalf("write ROADMAP.md: %v", err)
+	}
+	writer := newCLIFakeIssueWriter()
+
+	exitCode := RunWithDeps([]string{"compile", "--repo", repo}, &stdout, &stderr, Deps{
+		NewIssueWriter: func(string) compiler.IssueWriter {
+			return writer
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got compiler.Report
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not compile JSON: %v\n%s", err, stdout.String())
+	}
+	if !got.PlanApprovalRequired || len(got.Created) != 1 || got.Created[0].Issue != 1 {
+		t.Fatalf("compile report = %#v, want one created issue and approval required", got)
+	}
+	for _, want := range []string{"COMPILE", "Plan approval required: yes", "Created: 1"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestCompileRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"compile"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -2591,4 +2641,88 @@ func (f cliFakeReader) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
 
 func (f cliFakeReader) PRChecks(context.Context, int) ([]gh.Check, error) {
 	return nil, nil
+}
+
+type cliFakeIssueWriter struct {
+	issues     map[int]gh.Issue
+	nextNumber int
+}
+
+func newCLIFakeIssueWriter() *cliFakeIssueWriter {
+	return &cliFakeIssueWriter{
+		issues:     map[int]gh.Issue{},
+		nextNumber: 1,
+	}
+}
+
+func (f *cliFakeIssueWriter) RepoName(context.Context) (string, error) {
+	return "owner/repo", nil
+}
+
+func (f *cliFakeIssueWriter) ListIssues(context.Context, string) ([]gh.Issue, error) {
+	out := make([]gh.Issue, 0, len(f.issues))
+	for _, issue := range f.issues {
+		out = append(out, issue)
+	}
+	return out, nil
+}
+
+func (f *cliFakeIssueWriter) CreateIssue(_ context.Context, title, body string, labels []string) (gh.Issue, error) {
+	number := f.nextNumber
+	f.nextNumber++
+	issue := gh.Issue{
+		Number: number,
+		Title:  title,
+		Body:   body,
+		State:  "OPEN",
+		Labels: cliLabels(labels),
+	}
+	f.issues[number] = issue
+	return issue, nil
+}
+
+func (f *cliFakeIssueWriter) UpdateIssue(_ context.Context, number int, title, body string, addLabels, removeLabels []string) (gh.Issue, error) {
+	issue := f.issues[number]
+	issue.Title = title
+	issue.Body = body
+	issue.Labels = cliApplyLabelChanges(issue.Labels, addLabels, removeLabels)
+	f.issues[number] = issue
+	return issue, nil
+}
+
+func (f *cliFakeIssueWriter) CloseIssue(_ context.Context, number int) error {
+	issue := f.issues[number]
+	issue.State = "CLOSED"
+	f.issues[number] = issue
+	return nil
+}
+
+func cliLabels(names []string) []gh.Label {
+	labels := make([]gh.Label, 0, len(names))
+	for _, name := range names {
+		labels = append(labels, gh.Label{Name: name})
+	}
+	return labels
+}
+
+func cliApplyLabelChanges(labels []gh.Label, addLabels, removeLabels []string) []gh.Label {
+	remove := map[string]bool{}
+	for _, label := range removeLabels {
+		remove[label] = true
+	}
+	seen := map[string]bool{}
+	out := make([]gh.Label, 0, len(labels)+len(addLabels))
+	for _, label := range labels {
+		if remove[label.Name] {
+			continue
+		}
+		seen[label.Name] = true
+		out = append(out, label)
+	}
+	for _, label := range addLabels {
+		if !seen[label] {
+			out = append(out, gh.Label{Name: label})
+		}
+	}
+	return out
 }

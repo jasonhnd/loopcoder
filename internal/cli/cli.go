@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
@@ -47,12 +48,14 @@ type BuildInfo struct {
 
 type Deps struct {
 	NewGitHubReader func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter  func(repoPath string) compiler.IssueWriter
 	ProcessAlive    func(pid int) bool
 	Now             func() time.Time
 	IsTerminal      func(w io.Writer) bool
 	Stdin           io.Reader
 	BuildInfo       BuildInfo
 	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Compile         func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
@@ -72,6 +75,7 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
+	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
@@ -110,12 +114,18 @@ func DefaultDeps() Deps {
 		NewGitHubReader: func(repoPath string) orchestration.GitHubReader {
 			return gh.New(repoPath)
 		},
+		NewIssueWriter: func(repoPath string) compiler.IssueWriter {
+			return gh.New(repoPath)
+		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
 		IsTerminal:   isTerminalWriter,
 		Stdin:        os.Stdin,
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
+		},
+		Compile: func(ctx context.Context, opts compiler.Options) (compiler.Report, error) {
+			return compiler.Run(ctx, opts, compiler.DefaultDeps())
 		},
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
@@ -198,6 +208,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "init" {
 		return runInit(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "compile" {
+		return runCompile(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
@@ -317,6 +330,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
 		fmt.Fprintln(w, "  --verifier-effort string    optional first-run verifier reasoning effort to persist")
+	}
+	if command.Name == "compile" {
+		fmt.Fprintln(w, "  --repo string   repository path (required)")
 	}
 	if command.Name == "upgrade" {
 		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
@@ -582,6 +598,71 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	renderInitResult(stdout, stderr, result)
+	return 0
+}
+
+func runCompile(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+
+	fs := flag.NewFlagSet("compile", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "compile: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "compile: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 2
+	}
+	report, err := deps.Compile(context.Background(), compiler.Options{
+		RepoPath: resolvedRepo,
+		Writer:   deps.NewIssueWriter(resolvedRepo),
+		Now:      deps.Now(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 1
+	}
+	data, err := compiler.MarshalReportJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "compile: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(compiler.RenderText(report))); err != nil {
+		fmt.Fprintf(stderr, "compile: write summary: %v\n", err)
+		return 1
+	}
 	return 0
 }
 

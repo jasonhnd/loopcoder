@@ -53,12 +53,15 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 	}
 
 	roadmap := string(fsys.read(t, filepath.Join("repo", RoadmapFilename)))
-	if !strings.Contains(roadmap, "docs-example") || !strings.Contains(roadmap, "checks-example") {
+	if !strings.Contains(roadmap, "## Example docs page") || !strings.Contains(roadmap, "- doc:") || !strings.Contains(roadmap, "## [epic] Example migration") {
 		t.Fatalf("ROADMAP.md missing template examples:\n%s", roadmap)
 	}
 
 	if !gh.createdLabel("delivery:unit") {
 		t.Fatalf("delivery:unit label was not created; calls=%#v", gh.calls)
+	}
+	if !gh.createdLabel("epic") {
+		t.Fatalf("epic label was not created; calls=%#v", gh.calls)
 	}
 	if gh.createdLabel("status:ready") {
 		t.Fatalf("status:ready already existed but was created; calls=%#v", gh.calls)
