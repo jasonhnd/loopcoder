@@ -81,6 +81,7 @@ type LabelSpec struct {
 
 var defaultLabels = []LabelSpec{
 	{Name: "delivery:unit", Color: "0e8a16", Description: "loopcoder work unit"},
+	{Name: "epic", Color: "5319e7", Description: "loopcoder epic issue"},
 	{Name: "status:ready", Color: "1d76db", Description: "ready for worker dispatch"},
 	{Name: "status:implementing", Color: "fbca04", Description: "worker implementation in progress"},
 	{Name: "status:in-review", Color: "5319e7", Description: "pull request awaiting verification"},
@@ -257,27 +258,29 @@ const RoadmapTemplate = `# ROADMAP
 <!--
 Template for loopcoder work units.
 
-Fields:
-- id: Stable short identifier used by depends_on.
-- title: Short human-readable work unit title.
-- scope: Brief description of what is included in the work unit.
-- depends_on: List of work unit ids that must finish first; use [] when none.
+Format:
+- Each ## heading is one topic or unit.
+- Each "- doc:" or "- code:" list item is one slice and becomes one issue.
+- code slices depend on the doc slices in the same unit unless "(needs: ...)" is set.
+- Slice refs are <unit-slug>/<kind>-<n>; within the same unit, <kind>-<n> works.
+- Use "## [epic] ..." for one epic issue that compile will not decompose.
 
 The example below is illustrative only, not a real roadmap.
 -->
 
-` + "```yaml" + `
-- id: docs-example
-  title: Add example docs page
-  scope: Create a short documentation page for one workflow.
-  depends_on: []
+## Example docs page
+Create a short documentation page for one workflow.
 
-- id: checks-example
-  title: Add docs link check
-  scope: Add a lightweight check that verifies the docs page is linked.
-  depends_on:
-    - docs-example
-` + "```" + `
+- doc: Design the example docs page
+- code: Add the example docs page
+
+## Example checks
+Add a lightweight check that verifies the docs page is linked.
+
+- code: Add docs link check (needs: example-docs-page/code-1)
+
+## [epic] Example migration
+Describe one large task here. compile will create exactly one epic issue.
 `
 
 func ensureLabels(ctx context.Context, repoPath string, runner GitHubRunner) ([]LabelResult, []string) {

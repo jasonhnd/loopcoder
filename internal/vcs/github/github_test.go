@@ -87,6 +87,49 @@ func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	}
 }
 
+func TestCreateIssueRunsGhIssueCreate(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00label\x00create\x00delivery:unit\x00--color\x000e8a16\x00--description\x00loopcoder work unit":                             nil,
+			"repo\x00gh\x00label\x00create\x00blocked-by:#1\x00--color\x00fbca04\x00--description\x00loopcoder dependency edge":                       nil,
+			"repo\x00gh\x00issue\x00create\x00--title\x00Code: Add feature\x00--body\x00Body\x00--label\x00delivery:unit\x00--label\x00blocked-by:#1": []byte("https://github.com/owner/repo/issues/7\n"),
+			"repo\x00gh\x00issue\x00view\x007\x00--json\x00number,title,body,state,stateReason,labels,closedByPullRequestsReferences":                 []byte(`{"number":7,"title":"Code: Add feature","body":"Body","state":"OPEN","labels":[{"name":"delivery:unit"},{"name":"blocked-by:#1"}]}`),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	created, err := client.CreateIssue(context.Background(), "Code: Add feature", "Body", []string{"delivery:unit", "blocked-by:#1"})
+	if err != nil {
+		t.Fatalf("CreateIssue returned error: %v", err)
+	}
+	if created.Number != 7 || len(created.Labels) != 2 {
+		t.Fatalf("created issue = %#v", created)
+	}
+}
+
+func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00label\x00create\x00epic\x00--color\x005319e7\x00--description\x00loopcoder epic issue":                                              nil,
+			"repo\x00gh\x00issue\x00edit\x007\x00--title\x00Epic: Add feature\x00--body\x00New body\x00--add-label\x00epic\x00--remove-label\x00blocked-by:#1": nil,
+			"repo\x00gh\x00issue\x00view\x007\x00--json\x00number,title,body,state,stateReason,labels,closedByPullRequestsReferences":                          []byte(`{"number":7,"title":"Epic: Add feature","body":"New body","state":"OPEN","labels":[{"name":"delivery:unit"},{"name":"epic"}]}`),
+			"repo\x00gh\x00issue\x00close\x007\x00--reason\x00not planned":                                                                                     nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	updated, err := client.UpdateIssue(context.Background(), 7, "Epic: Add feature", "New body", []string{"epic"}, []string{"blocked-by:#1"})
+	if err != nil {
+		t.Fatalf("UpdateIssue returned error: %v", err)
+	}
+	if updated.Title != "Epic: Add feature" || len(updated.Labels) != 2 {
+		t.Fatalf("updated issue = %#v", updated)
+	}
+	if err := client.CloseIssue(context.Background(), 7); err != nil {
+		t.Fatalf("CloseIssue returned error: %v", err)
+	}
+}
+
 func TestViewPRAndDiffRunGhCommands(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
