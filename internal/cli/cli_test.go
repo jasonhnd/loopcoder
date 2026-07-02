@@ -1687,7 +1687,7 @@ func TestPromoteHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder promote", "--repo", "--pre-prod-branch", "--kick-back"} {
+	for _, want := range []string{"loopcoder promote", "--repo", "--pre-prod-branch", "--run-id", "--kick-back"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1707,7 +1707,7 @@ environment:
 	}
 
 	called := false
-	exitCode := RunWithDeps([]string{"promote", "--repo", repo, "--kick-back", "#101", "--kick-back", "merge-sha"}, &stdout, &stderr, Deps{
+	exitCode := RunWithDeps([]string{"promote", "--repo", repo, "--run-id", "run-test-promote", "--kick-back", "#101", "--kick-back", "merge-sha"}, &stdout, &stderr, Deps{
 		NewPromoteWriter: func(path string) orchestration.PromotionWriter {
 			if path != repo {
 				t.Fatalf("writer repo = %q, want %q", path, repo)
@@ -1716,7 +1716,7 @@ environment:
 		},
 		Promote: func(_ context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
 			called = true
-			if opts.RepoPath != repo || opts.PreProdBranch != "staging" || opts.Gate != "human-merge" {
+			if opts.RepoPath != repo || opts.RunID != "run-test-promote" || opts.PreProdBranch != "staging" || opts.Gate != "human-merge" {
 				t.Fatalf("promote opts = %#v", opts)
 			}
 			if !reflect.DeepEqual(opts.KickBackItems, []string{"#101", "merge-sha"}) {
@@ -1725,9 +1725,13 @@ environment:
 			if opts.Writer == nil {
 				t.Fatal("promotion writer was not set")
 			}
+			if opts.Clock == nil || opts.StatePush == nil {
+				t.Fatalf("promote opts missing clock or state push: %#v", opts)
+			}
 			return orchestration.PromoteReport{
 				Version:       orchestration.PromoteReportVersion,
 				RepoPath:      opts.RepoPath,
+				RunID:         opts.RunID,
 				PreProdBranch: opts.PreProdBranch,
 				MainBranch:    "main",
 				Gate:          opts.Gate,

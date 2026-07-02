@@ -76,6 +76,9 @@ type Event struct {
 	LogBytes  int64   `json:"log_bytes"`
 	ExitCode  *int    `json:"exit_code"`
 	Error     *string `json:"error"`
+	Event     string  `json:"event,omitempty"`
+	Outcome   string  `json:"outcome,omitempty"`
+	Details   any     `json:"details,omitempty"`
 }
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.

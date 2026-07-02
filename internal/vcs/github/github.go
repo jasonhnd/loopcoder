@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -974,9 +975,9 @@ func parseKickBackPRNumber(item string) int {
 			return 0
 		}
 	}
-	var number int
-	for _, ch := range item {
-		number = number*10 + int(ch-'0')
+	number, err := strconv.Atoi(item)
+	if err != nil || number <= 0 {
+		return 0
 	}
 	return number
 }
@@ -986,16 +987,19 @@ func isGitSHAish(item string) bool {
 	if len(item) < 7 || len(item) > 40 {
 		return false
 	}
+	hasHexLetter := false
 	for _, ch := range item {
 		switch {
 		case ch >= '0' && ch <= '9':
 		case ch >= 'a' && ch <= 'f':
+			hasHexLetter = true
 		case ch >= 'A' && ch <= 'F':
+			hasHexLetter = true
 		default:
 			return false
 		}
 	}
-	return true
+	return hasHexLetter
 }
 
 func isReservedProductionBranch(branch string) bool {

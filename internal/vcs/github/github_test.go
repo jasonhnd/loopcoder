@@ -238,6 +238,27 @@ func TestPromotePreProdToMainMergesAndSyncsPreProd(t *testing.T) {
 	}
 }
 
+func TestPromotePreProdToMainEmptyMergeResponseIsAlreadyUpToDate(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner": []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=main\x00-f\x00head=pre-prod\x00-f\x00commit_message=loopcoder promote pre-prod to main": nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	promoted, err := client.PromotePreProdToMain(context.Background(), "pre-prod")
+	if err != nil {
+		t.Fatalf("PromotePreProdToMain returned error: %v", err)
+	}
+	if promoted.PreProdBranch != "pre-prod" || promoted.MainBranch != "main" || promoted.Head != "pre-prod" {
+		t.Fatalf("PromotePreProdToMain identity = %#v", promoted)
+	}
+	if !promoted.AlreadyUpToDate || promoted.SHA != "" || promoted.URL != "" {
+		t.Fatalf("PromotePreProdToMain empty body = %#v, want already-up-to-date without SHA", promoted)
+	}
+}
+
 func TestKickBackFromPreProdResolvesPRMergeAndReverts(t *testing.T) {
 	runner := &preProdKickBackRunner{}
 	client := NewWithRunner("repo", runner)
@@ -264,6 +285,47 @@ func TestKickBackFromPreProdResolvesPRMergeAndReverts(t *testing.T) {
 	}
 	if !sawLog || !sawRevert || !sawPush {
 		t.Fatalf("calls missing log=%t revert=%t push=%t: %#v", sawLog, sawRevert, sawPush, runner.calls)
+	}
+}
+
+func TestResolvePreProdKickBackCommitTreatsBareNumericAsPRNumber(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00fetch\x00origin\x00+refs/heads/pre-prod:refs/remotes/origin/pre-prod": nil,
+			"repo\x00git\x00log\x00--format=%H%x00%s\x00refs/remotes/origin/pre-prod":             []byte("numeric-merge-sha\x00loopcoder pre-prod merge PR #1234567\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "1234567", "pre-prod")
+	if err != nil {
+		t.Fatalf("resolvePreProdKickBackCommit returned error: %v", err)
+	}
+	if sha != "numeric-merge-sha" || prNumber != 1234567 {
+		t.Fatalf("resolved sha=%q pr=%d, want numeric PR lookup", sha, prNumber)
+	}
+	want := [][]string{
+		{"repo", "git", "fetch", "origin", "+refs/heads/pre-prod:refs/remotes/origin/pre-prod"},
+		{"repo", "git", "log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want PR-resolution calls %#v", runner.calls, want)
+	}
+}
+
+func TestResolvePreProdKickBackCommitAcceptsSHAWithoutLogLookup(t *testing.T) {
+	runner := &fakeRunner{outputs: map[string][]byte{}}
+	client := NewWithRunner("repo", runner)
+
+	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "abc1234", "pre-prod")
+	if err != nil {
+		t.Fatalf("resolvePreProdKickBackCommit returned error: %v", err)
+	}
+	if sha != "abc1234" || prNumber != 0 {
+		t.Fatalf("resolved sha=%q pr=%d, want direct SHA branch", sha, prNumber)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SHA branch should not fetch or scan pre-prod log, calls=%#v", runner.calls)
 	}
 }
 

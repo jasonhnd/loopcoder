@@ -389,6 +389,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "promote" {
 		fmt.Fprintln(w, "  --repo string              repository path (required)")
 		fmt.Fprintln(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintln(w, "  --run-id string            run id for the promote ledger (default generated)")
 		fmt.Fprintln(w, "  --kick-back string         item to revert out of pre-prod before promoting; repeatable")
 	}
 	if command.Name == "upgrade" {
@@ -1072,6 +1073,12 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Promote == nil {
 		deps.Promote = defaults.Promote
 	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
 
 	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1080,6 +1087,8 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var preProdBranch string
 	var preProdBranchAlias string
+	var runID string
+	var runIDAlias string
 	var kickBack repeatStringFlag
 	var kickBackAlias repeatStringFlag
 
@@ -1087,6 +1096,8 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&preProdBranch, "pre-prod-branch", "", "pre-prod branch")
 	fs.StringVar(&preProdBranchAlias, "PreProdBranch", "", "pre-prod branch")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.Var(&kickBack, "kick-back", "kick-back item")
 	fs.Var(&kickBackAlias, "KickBack", "kick-back item")
 
@@ -1099,6 +1110,9 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if preProdBranchAlias != "" {
 		preProdBranch = preProdBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
 	}
 	kickBack = append(kickBack, kickBackAlias...)
 
@@ -1131,9 +1145,12 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	report, err := deps.Promote(context.Background(), orchestration.PromoteOptions{
 		Writer:        deps.NewPromoteWriter(resolvedRepo),
 		RepoPath:      resolvedRepo,
+		RunID:         runID,
 		PreProdBranch: preProdBranch,
 		Gate:          cfg.Adapters.Gate,
 		KickBackItems: []string(kickBack),
+		Clock:         deps.Now,
+		StatePush:     deps.StatePush,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
