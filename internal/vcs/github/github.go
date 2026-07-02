@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -34,6 +35,7 @@ type Writer interface {
 // a main-merge method by interface widening.
 type ProductionWriter interface {
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error)
+	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error)
 	SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error)
 }
@@ -132,6 +134,13 @@ type PreProdKickBackResult struct {
 	RevertedSHA string `json:"reverted_sha"`
 	SHA         string `json:"sha,omitempty"`
 	URL         string `json:"url,omitempty"`
+}
+
+type NeedsHumanRouteResult struct {
+	PRNumber     int    `json:"pr_number,omitempty"`
+	IssueNumbers []int  `json:"issue_numbers,omitempty"`
+	PRLabeled    bool   `json:"pr_labeled,omitempty"`
+	Label        string `json:"label,omitempty"`
 }
 
 type MainPromotionResult struct {
@@ -443,6 +452,38 @@ func (c *CLI) KickBackFromPreProd(ctx context.Context, item, preProdBranch strin
 	}, nil
 }
 
+func (c *CLI) RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (NeedsHumanRouteResult, error) {
+	if prNumber <= 0 {
+		return NeedsHumanRouteResult{}, fmt.Errorf("pull request number is required")
+	}
+	pr, err := c.ViewPR(ctx, prNumber)
+	if err != nil {
+		return NeedsHumanRouteResult{}, err
+	}
+	result := NeedsHumanRouteResult{
+		PRNumber: prNumber,
+		Label:    needsHumanLabel,
+	}
+	issueNumbers := linkedIssueNumbers(pr)
+	if err := c.ensureLabels(ctx, []string{needsHumanLabel}); err != nil {
+		return result, err
+	}
+	if len(issueNumbers) == 0 {
+		if _, err := c.run(ctx, "gh", "pr", "edit", fmt.Sprintf("%d", prNumber), "--add-label", needsHumanLabel); err != nil {
+			return result, err
+		}
+		result.PRLabeled = true
+		return result, nil
+	}
+	for _, issueNumber := range issueNumbers {
+		if _, err := c.run(ctx, "gh", "issue", "edit", fmt.Sprintf("%d", issueNumber), "--add-label", needsHumanLabel); err != nil {
+			return result, err
+		}
+	}
+	result.IssueNumbers = issueNumbers
+	return result, nil
+}
+
 func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error) {
 	preProdBranch = strings.TrimSpace(preProdBranch)
 	if preProdBranch == "" {
@@ -516,7 +557,7 @@ func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (Pr
 
 func (c *CLI) resolvePreProdKickBackCommit(ctx context.Context, item, preProdBranch string) (string, int, error) {
 	if isGitSHAish(item) {
-		return item, parseKickBackPRNumber(item), nil
+		return strings.TrimSpace(item), 0, nil
 	}
 	prNumber := parseKickBackPRNumber(item)
 	if prNumber <= 0 {
@@ -530,13 +571,12 @@ func (c *CLI) resolvePreProdKickBackCommit(ctx context.Context, item, preProdBra
 	if err != nil {
 		return "", 0, err
 	}
-	needle := fmt.Sprintf("PR #%d", prNumber)
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		parts := strings.SplitN(line, "\x00", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		if strings.Contains(parts[1], needle) {
+		if preProdMergeSubjectPRNumber(parts[1]) == prNumber {
 			sha := strings.TrimSpace(parts[0])
 			if sha == "" {
 				return "", 0, fmt.Errorf("pre-prod merge commit for PR #%d had an empty SHA", prNumber)
@@ -826,6 +866,11 @@ func trimToJSON(output []byte) []byte {
 
 var githubRemotePattern = regexp.MustCompile(`github\.com[:/]([^/]+)/(.+?)(?:\.git)?$`)
 var issueURLPattern = regexp.MustCompile(`/issues/(\d+)(?:\D*)$`)
+var preProdMergePRPattern = regexp.MustCompile(`(?i)\bPR\s*#(\d+)(?:\D|$)`)
+var branchIssuePattern = regexp.MustCompile(`(?i)(?:^|[/_-])issue[/_-]?(\d+)(?:\D|$)`)
+var hashIssuePattern = regexp.MustCompile(`#(\d+)`)
+
+const needsHumanLabel = "needs-human"
 
 func parseGitHubRemote(remote string) string {
 	matches := githubRemotePattern.FindStringSubmatch(strings.TrimSpace(remote))
@@ -883,6 +928,8 @@ func labelColor(label string) string {
 		return "0e8a16"
 	case lower == "epic":
 		return "5319e7"
+	case lower == needsHumanLabel:
+		return "b60205"
 	case strings.HasPrefix(lower, "blocked-by:#"):
 		return "fbca04"
 	default:
@@ -897,6 +944,8 @@ func labelDescription(label string) string {
 		return "loopcoder work unit"
 	case lower == "epic":
 		return "loopcoder epic issue"
+	case lower == needsHumanLabel:
+		return "human decision required"
 	case strings.HasPrefix(lower, "blocked-by:#"):
 		return "loopcoder dependency edge"
 	default:
@@ -987,19 +1036,61 @@ func isGitSHAish(item string) bool {
 	if len(item) < 7 || len(item) > 40 {
 		return false
 	}
-	hasHexLetter := false
 	for _, ch := range item {
 		switch {
 		case ch >= '0' && ch <= '9':
 		case ch >= 'a' && ch <= 'f':
-			hasHexLetter = true
 		case ch >= 'A' && ch <= 'F':
-			hasHexLetter = true
 		default:
 			return false
 		}
 	}
-	return hasHexLetter
+	return true
+}
+
+func preProdMergeSubjectPRNumber(subject string) int {
+	matches := preProdMergePRPattern.FindStringSubmatch(subject)
+	if len(matches) != 2 {
+		return 0
+	}
+	number, err := strconv.Atoi(matches[1])
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
+}
+
+func linkedIssueNumbers(pr PullRequest) []int {
+	seen := map[int]bool{}
+	for _, ref := range pr.ClosingIssuesReferences {
+		if ref.Number > 0 {
+			seen[ref.Number] = true
+		}
+	}
+	if number := linkedIssueNumberFromText(pr.HeadRefName); number > 0 {
+		seen[number] = true
+	}
+	out := make([]int, 0, len(seen))
+	for number := range seen {
+		out = append(out, number)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func linkedIssueNumberFromText(text string) int {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+	if matches := branchIssuePattern.FindStringSubmatch(text); len(matches) == 2 {
+		number, _ := strconv.Atoi(matches[1])
+		return number
+	}
+	if matches := hashIssuePattern.FindStringSubmatch(text); len(matches) == 2 {
+		number, _ := strconv.Atoi(matches[1])
+		return number
+	}
+	return 0
 }
 
 func isReservedProductionBranch(branch string) bool {

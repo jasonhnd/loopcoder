@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,7 +76,7 @@ func TestPromoteKickBackRevertsItemsBeforePromotingRemainder(t *testing.T) {
 	if report.Status != PromoteStatusSucceeded {
 		t.Fatalf("status = %s, want succeeded", report.Status)
 	}
-	wantCalls := []string{"kick:#101:pre-prod", "kick:merge-sha:pre-prod", "promote:pre-prod", "sync:pre-prod"}
+	wantCalls := []string{"kick:#101:pre-prod", "route:101", "kick:merge-sha:pre-prod", "route:101", "promote:pre-prod", "sync:pre-prod"}
 	if !reflect.DeepEqual(writer.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", writer.calls, wantCalls)
 	}
@@ -89,7 +90,7 @@ func TestPromoteKickBackRevertsItemsBeforePromotingRemainder(t *testing.T) {
 		t.Fatalf("needs-human routing = %#v summary=%#v", report.NeedsHuman, report.Summary)
 	}
 	rendered := RenderPromoteText(report)
-	if !strings.Contains(rendered, "Needs human") || !strings.Contains(rendered, "return item to needs-human") {
+	if !strings.Contains(rendered, "Needs human") || !strings.Contains(rendered, "applied needs-human label") {
 		t.Fatalf("rendered report missing needs-human routing:\n%s", rendered)
 	}
 }
@@ -155,9 +156,99 @@ func TestPromoteAlreadyUpToDateIsLedgeredAsSkipped(t *testing.T) {
 	}
 }
 
+func TestPromotePreconditionRejectionsAreLedgeredAsFailed(t *testing.T) {
+	tests := []struct {
+		name          string
+		writer        PromotionWriter
+		preProdBranch string
+		gate          string
+		wantErr       string
+	}{
+		{
+			name:          "nil-writer",
+			writer:        nil,
+			preProdBranch: "pre-prod",
+			gate:          "human-merge",
+			wantErr:       "promotion writer is required",
+		},
+		{
+			name:          "empty-pre-prod",
+			writer:        &recordingPromotionWriter{},
+			preProdBranch: "",
+			gate:          "human-merge",
+			wantErr:       "pre-prod branch is required",
+		},
+		{
+			name:          "reserved-main",
+			writer:        &recordingPromotionWriter{},
+			preProdBranch: "main",
+			gate:          "human-merge",
+			wantErr:       "reserved for human promotion",
+		},
+		{
+			name:          "reserved-production",
+			writer:        &recordingPromotionWriter{},
+			preProdBranch: "production",
+			gate:          "human-merge",
+			wantErr:       "reserved for human promotion",
+		},
+		{
+			name:          "non-human-gate",
+			writer:        &recordingPromotionWriter{},
+			preProdBranch: "pre-prod",
+			gate:          "auto",
+			wantErr:       "requires adapters.gate human-merge",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runID := "run-test-promote-" + tt.name
+
+			report, err := Promote(context.Background(), PromoteOptions{
+				Writer:        tt.writer,
+				RepoPath:      repo,
+				RunID:         runID,
+				PreProdBranch: tt.preProdBranch,
+				Gate:          tt.gate,
+				Clock:         fixedPromoteClock,
+				StatePush:     promoteTestStatePush(t, repo, runID),
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Promote error = %v, want %q", err, tt.wantErr)
+			}
+			if report.Status != PromoteStatusFailed || report.Summary.FailureCount == 0 {
+				t.Fatalf("report = %#v, want failed with a failure count", report)
+			}
+			if report.StatePush == nil || !report.StatePush.Pushed {
+				t.Fatalf("state push = %#v, want pushed ledger", report.StatePush)
+			}
+			if writer, ok := tt.writer.(*recordingPromotionWriter); ok && len(writer.calls) != 0 {
+				t.Fatalf("writer calls = %#v, want none", writer.calls)
+			}
+			event := readPromoteEvents(t, repo, runID)
+			for _, want := range []string{`"event":"promote.attempt"`, `"outcome":"failed"`, tt.wantErr} {
+				if !strings.Contains(event, want) {
+					t.Fatalf("precondition ledger missing %q:\n%s", want, event)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeKickBackItemsCanonicalizesPRFormsAndNumericSHA(t *testing.T) {
+	got := normalizeKickBackItems([]string{" #101 ", "101", "pr:101", "PR#101", "abcdef0", "ABCDEF0", "1234567", "1234567"})
+	want := []string{"#101", "abcdef0", "1234567"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeKickBackItems = %#v, want %#v", got, want)
+	}
+}
+
 type recordingPromotionWriter struct {
 	calls           []string
 	kickErr         error
+	routeErr        error
 	alreadyUpToDate bool
 }
 
@@ -172,6 +263,18 @@ func (w *recordingPromotionWriter) KickBackFromPreProd(_ context.Context, item, 
 		Branch:      preProdBranch,
 		RevertedSHA: "merge-" + item,
 		SHA:         "revert-" + item,
+	}, nil
+}
+
+func (w *recordingPromotionWriter) RouteKickBackToNeedsHuman(_ context.Context, prNumber int) (gh.NeedsHumanRouteResult, error) {
+	w.calls = append(w.calls, "route:"+strconv.Itoa(prNumber))
+	if w.routeErr != nil {
+		return gh.NeedsHumanRouteResult{}, w.routeErr
+	}
+	return gh.NeedsHumanRouteResult{
+		PRNumber:     prNumber,
+		IssueNumbers: []int{prNumber},
+		Label:        "needs-human",
 	}, nil
 }
 

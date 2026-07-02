@@ -288,20 +288,43 @@ func TestKickBackFromPreProdResolvesPRMergeAndReverts(t *testing.T) {
 	}
 }
 
-func TestResolvePreProdKickBackCommitTreatsBareNumericAsPRNumber(t *testing.T) {
+func TestKickBackFromPreProdResolvesCollidingPRNumberBoundary(t *testing.T) {
+	runner := &preProdKickBackCollisionRunner{}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.KickBackFromPreProd(context.Background(), "#35", "pre-prod")
+	if err != nil {
+		t.Fatalf("KickBackFromPreProd returned error: %v", err)
+	}
+	if got.PRNumber != 35 || got.RevertedSHA != "merge-35" {
+		t.Fatalf("KickBackFromPreProd result = %#v, want PR #35 merge", got)
+	}
+
+	for _, call := range runner.calls {
+		if len(call) >= 7 && call[1] == "git" && call[2] == "revert" {
+			if !reflect.DeepEqual(call[3:], []string{"-m", "1", "--no-edit", "merge-35"}) {
+				t.Fatalf("revert call = %#v, want merge-35 not a colliding PR", call)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing git revert call: %#v", runner.calls)
+}
+
+func TestResolvePreProdKickBackCommitTreatsShortBareNumericAsPRNumber(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
 			"repo\x00git\x00fetch\x00origin\x00+refs/heads/pre-prod:refs/remotes/origin/pre-prod": nil,
-			"repo\x00git\x00log\x00--format=%H%x00%s\x00refs/remotes/origin/pre-prod":             []byte("numeric-merge-sha\x00loopcoder pre-prod merge PR #1234567\n"),
+			"repo\x00git\x00log\x00--format=%H%x00%s\x00refs/remotes/origin/pre-prod":             []byte("numeric-merge-sha\x00loopcoder pre-prod merge PR #123\n"),
 		},
 	}
 	client := NewWithRunner("repo", runner)
 
-	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "1234567", "pre-prod")
+	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "123", "pre-prod")
 	if err != nil {
 		t.Fatalf("resolvePreProdKickBackCommit returned error: %v", err)
 	}
-	if sha != "numeric-merge-sha" || prNumber != 1234567 {
+	if sha != "numeric-merge-sha" || prNumber != 123 {
 		t.Fatalf("resolved sha=%q pr=%d, want numeric PR lookup", sha, prNumber)
 	}
 	want := [][]string{
@@ -310,6 +333,22 @@ func TestResolvePreProdKickBackCommitTreatsBareNumericAsPRNumber(t *testing.T) {
 	}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("calls = %#v, want PR-resolution calls %#v", runner.calls, want)
+	}
+}
+
+func TestResolvePreProdKickBackCommitTreatsLongBareNumericAsSHAWithoutLogLookup(t *testing.T) {
+	runner := &fakeRunner{outputs: map[string][]byte{}}
+	client := NewWithRunner("repo", runner)
+
+	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "1234567", "pre-prod")
+	if err != nil {
+		t.Fatalf("resolvePreProdKickBackCommit returned error: %v", err)
+	}
+	if sha != "1234567" || prNumber != 0 {
+		t.Fatalf("resolved sha=%q pr=%d, want direct numeric SHA branch", sha, prNumber)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("numeric SHA branch should not fetch or scan pre-prod log, calls=%#v", runner.calls)
 	}
 }
 
@@ -326,6 +365,86 @@ func TestResolvePreProdKickBackCommitAcceptsSHAWithoutLogLookup(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("SHA branch should not fetch or scan pre-prod log, calls=%#v", runner.calls)
+	}
+}
+
+func TestRouteKickBackToNeedsHumanLabelsLinkedIssues(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"loop/issue-35","closingIssuesReferences":[{"number":35}]}`),
+			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":  nil,
+			"repo\x00gh\x00issue\x00edit\x0035\x00--add-label\x00needs-human":                                                nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.RouteKickBackToNeedsHuman(context.Background(), 101)
+	if err != nil {
+		t.Fatalf("RouteKickBackToNeedsHuman returned error: %v", err)
+	}
+	if got.PRNumber != 101 || got.PRLabeled || !reflect.DeepEqual(got.IssueNumbers, []int{35}) || got.Label != "needs-human" {
+		t.Fatalf("route result = %#v, want issue #35 label", got)
+	}
+
+	want := [][]string{
+		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "label", "create", "needs-human", "--color", "b60205", "--description", "human decision required"},
+		{"repo", "gh", "issue", "edit", "35", "--add-label", "needs-human"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestRouteKickBackToNeedsHumanLabelsPRWhenNoLinkedIssue(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"feature"}`),
+			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":  nil,
+			"repo\x00gh\x00pr\x00edit\x00101\x00--add-label\x00needs-human":                                                  nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.RouteKickBackToNeedsHuman(context.Background(), 101)
+	if err != nil {
+		t.Fatalf("RouteKickBackToNeedsHuman returned error: %v", err)
+	}
+	if got.PRNumber != 101 || !got.PRLabeled || len(got.IssueNumbers) != 0 {
+		t.Fatalf("route result = %#v, want PR label fallback", got)
+	}
+}
+
+func TestProductionPromotionMethodsRejectProductionBranches(t *testing.T) {
+	methods := map[string]func(context.Context, *CLI, string) error{
+		"KickBackFromPreProd": func(ctx context.Context, client *CLI, branch string) error {
+			_, err := client.KickBackFromPreProd(ctx, "#101", branch)
+			return err
+		},
+		"PromotePreProdToMain": func(ctx context.Context, client *CLI, branch string) error {
+			_, err := client.PromotePreProdToMain(ctx, branch)
+			return err
+		},
+		"SyncPreProdFromMain": func(ctx context.Context, client *CLI, branch string) error {
+			_, err := client.SyncPreProdFromMain(ctx, branch)
+			return err
+		},
+	}
+	for name, method := range methods {
+		for _, branch := range []string{"main", "master", "prod", "production"} {
+			t.Run(name+"/"+branch, func(t *testing.T) {
+				runner := &fakeRunner{outputs: map[string][]byte{}}
+				client := NewWithRunner("repo", runner)
+
+				err := method(context.Background(), client, branch)
+				if err == nil || !strings.Contains(err.Error(), "reserved for human promotion") {
+					t.Fatalf("%s(%q) error = %v, want reserved rejection", name, branch, err)
+				}
+				if len(runner.calls) != 0 {
+					t.Fatalf("%s(%q) calls = %#v, want none", name, branch, runner.calls)
+				}
+			})
+		}
 	}
 }
 
@@ -482,6 +601,29 @@ func (r *preProdKickBackRunner) Run(_ context.Context, dir, name string, args ..
 	r.calls = append(r.calls, call)
 	if dir == "repo" && name == "git" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"}) {
 		return []byte("other-sha\x00loopcoder pre-prod merge PR #100\nmerge-sha\x00loopcoder pre-prod merge PR #101\n"), nil
+	}
+	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+		return []byte("revert-sha\n"), nil
+	}
+	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
+		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
+	}
+	return nil, nil
+}
+
+type preProdKickBackCollisionRunner struct {
+	calls [][]string
+}
+
+func (r *preProdKickBackCollisionRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+	call := append([]string{dir, name}, args...)
+	r.calls = append(r.calls, call)
+	if dir == "repo" && name == "git" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"}) {
+		return []byte(strings.Join([]string{
+			"merge-352\x00loopcoder pre-prod merge PR #352",
+			"merge-350\x00loopcoder pre-prod merge PR #350",
+			"merge-35\x00loopcoder pre-prod merge PR #35",
+		}, "\n") + "\n"), nil
 	}
 	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
 		return []byte("revert-sha\n"), nil

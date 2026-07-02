@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ const (
 
 type PromotionWriter interface {
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error)
+	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (gh.NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (gh.MainPromotionResult, error)
 	SyncPreProdFromMain(ctx context.Context, preProdBranch string) (gh.PreProdSyncResult, error)
 }
@@ -94,10 +96,12 @@ type PromoteSyncResult struct {
 }
 
 type PromoteNeedsHuman struct {
-	Step     string `json:"step"`
-	Item     string `json:"item,omitempty"`
-	PRNumber int    `json:"pr_number,omitempty"`
-	Detail   string `json:"detail"`
+	Step         string `json:"step"`
+	Item         string `json:"item,omitempty"`
+	PRNumber     int    `json:"pr_number,omitempty"`
+	Label        string `json:"label,omitempty"`
+	RoutedIssues []int  `json:"routed_issues,omitempty"`
+	Detail       string `json:"detail"`
 }
 
 type PromoteStatePush struct {
@@ -153,18 +157,31 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		}
 		return normalizePromoteReport(report), nil
 	}
+	failBeforeMain := func(err error) (PromoteReport, error) {
+		report.Status = PromoteStatusFailed
+		report.Summary.FailureCount++
+		report.Promoted = PromoteMainResult{
+			PreProdBranch: opts.PreProdBranch,
+			MainBranch:    "main",
+			Head:          opts.PreProdBranch,
+			Status:        PromoteStatusFailed,
+			Error:         err.Error(),
+		}
+		finished, _ := finish()
+		return finished, err
+	}
 
 	if opts.Writer == nil {
-		return report, errors.New("promotion writer is required")
+		return failBeforeMain(errors.New("promotion writer is required"))
 	}
 	if opts.PreProdBranch == "" {
-		return report, errors.New("pre-prod branch is required")
+		return failBeforeMain(errors.New("pre-prod branch is required"))
 	}
-	if strings.EqualFold(opts.PreProdBranch, "main") {
-		return report, errors.New("pre-prod branch must not be main")
+	if isReservedPromotionBranch(opts.PreProdBranch) {
+		return failBeforeMain(fmt.Errorf("pre-prod branch %q is reserved for human promotion", opts.PreProdBranch))
 	}
 	if opts.Gate != "human-merge" {
-		return report, fmt.Errorf("promote requires adapters.gate human-merge, got %q", opts.Gate)
+		return failBeforeMain(fmt.Errorf("promote requires adapters.gate human-merge, got %q", opts.Gate))
 	}
 
 	for _, item := range normalizeKickBackItems(opts.KickBackItems) {
@@ -188,13 +205,35 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		kick.SHA = kicked.SHA
 		kick.URL = kicked.URL
 		report.KickedBack = append(report.KickedBack, kick)
-		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+		report.Summary.KickedBackCount++
+
+		needsHuman := PromoteNeedsHuman{
 			Step:     "kick-back",
 			Item:     item,
 			PRNumber: kicked.PRNumber,
-			Detail:   "kicked back from pre-prod; return item to needs-human before a future promotion",
-		})
-		report.Summary.KickedBackCount++
+			Detail:   "kicked back from pre-prod; needs-human route could not be applied because no PR number was resolved",
+		}
+		if kicked.PRNumber > 0 {
+			routed, err := opts.Writer.RouteKickBackToNeedsHuman(ctx, kicked.PRNumber)
+			if err != nil {
+				needsHuman.Detail = "kicked back from pre-prod, but needs-human routing failed: " + err.Error()
+				report.NeedsHuman = append(report.NeedsHuman, needsHuman)
+				report.Status = PromoteStatusFailed
+				report.Summary.FailureCount++
+				report.Promoted = PromoteMainResult{
+					PreProdBranch: opts.PreProdBranch,
+					MainBranch:    "main",
+					Head:          opts.PreProdBranch,
+					Status:        PromoteStatusFailed,
+					Error:         fmt.Sprintf("route kick-back PR #%d to needs-human: %v", kicked.PRNumber, err),
+				}
+				return finish()
+			}
+			needsHuman.Label = firstNonEmpty(routed.Label, "needs-human")
+			needsHuman.RoutedIssues = append([]int(nil), routed.IssueNumbers...)
+			needsHuman.Detail = promoteNeedsHumanRouteDetail(routed)
+		}
+		report.NeedsHuman = append(report.NeedsHuman, needsHuman)
 	}
 
 	promoted, err := opts.Writer.PromotePreProdToMain(ctx, opts.PreProdBranch)
@@ -512,12 +551,118 @@ func normalizeKickBackItems(items []string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if item == "" || seen[item] {
+		item = normalizeKickBackItem(item)
+		key := strings.ToLower(item)
+		if item == "" || seen[key] {
 			continue
 		}
-		seen[item] = true
+		seen[key] = true
 		out = append(out, item)
 	}
 	return out
+}
+
+func normalizeKickBackItem(item string) string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return ""
+	}
+	if number := parsePrefixedKickBackPRNumber(item); number > 0 {
+		return fmt.Sprintf("#%d", number)
+	}
+	if isKickBackSHAish(item) {
+		return strings.ToLower(item)
+	}
+	if number := parseBareKickBackPRNumber(item); number > 0 {
+		return fmt.Sprintf("#%d", number)
+	}
+	return item
+}
+
+func parsePrefixedKickBackPRNumber(item string) int {
+	lower := strings.ToLower(strings.TrimSpace(item))
+	for _, prefix := range []string{"pr:", "pr#", "pr-", "#"} {
+		if strings.HasPrefix(lower, prefix) {
+			return parsePositiveDecimal(lower[len(prefix):])
+		}
+	}
+	return 0
+}
+
+func parseBareKickBackPRNumber(item string) int {
+	item = strings.TrimSpace(item)
+	if len(item) >= 7 {
+		return 0
+	}
+	return parsePositiveDecimal(item)
+}
+
+func parsePositiveDecimal(item string) int {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return 0
+	}
+	for _, ch := range item {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+	}
+	number, err := strconv.Atoi(item)
+	if err != nil {
+		return 0
+	}
+	if number <= 0 {
+		return 0
+	}
+	return number
+}
+
+func isKickBackSHAish(item string) bool {
+	item = strings.TrimSpace(item)
+	if len(item) < 7 || len(item) > 40 {
+		return false
+	}
+	for _, ch := range item {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'a' && ch <= 'f':
+		case ch >= 'A' && ch <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isReservedPromotionBranch(branch string) bool {
+	switch strings.ToLower(strings.TrimSpace(branch)) {
+	case "main", "master", "prod", "production":
+		return true
+	default:
+		return false
+	}
+}
+
+func promoteNeedsHumanRouteDetail(routed gh.NeedsHumanRouteResult) string {
+	label := firstNonEmpty(routed.Label, "needs-human")
+	if len(routed.IssueNumbers) > 0 {
+		return fmt.Sprintf("kicked back from pre-prod; applied %s label to %s", label, formatPromoteIssueRefs(routed.IssueNumbers))
+	}
+	if routed.PRLabeled {
+		return fmt.Sprintf("kicked back from pre-prod; applied %s label to PR #%d", label, routed.PRNumber)
+	}
+	return fmt.Sprintf("kicked back from pre-prod; applied %s needs-human route", label)
+}
+
+func formatPromoteIssueRefs(numbers []int) string {
+	parts := make([]string, 0, len(numbers))
+	for _, number := range numbers {
+		if number > 0 {
+			parts = append(parts, fmt.Sprintf("#%d", number))
+		}
+	}
+	if len(parts) == 0 {
+		return "no issues"
+	}
+	return strings.Join(parts, ", ")
 }

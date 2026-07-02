@@ -3001,6 +3001,10 @@ func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, strin
 	return gh.PreProdKickBackResult{}, nil
 }
 
+func (cliFakePromotionWriter) RouteKickBackToNeedsHuman(context.Context, int) (gh.NeedsHumanRouteResult, error) {
+	return gh.NeedsHumanRouteResult{}, nil
+}
+
 func (cliFakePromotionWriter) PromotePreProdToMain(context.Context, string) (gh.MainPromotionResult, error) {
 	return gh.MainPromotionResult{}, nil
 }
