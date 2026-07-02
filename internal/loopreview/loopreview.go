@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -879,10 +880,66 @@ func loadIssue(ctx context.Context, github GitHubClient, pr gh.PullRequest) (gh.
 			return issue, true
 		}
 	}
+	for _, number := range fallbackIssueNumbers(pr) {
+		issue, err := github.ViewIssue(ctx, number)
+		if err == nil {
+			return issue, true
+		}
+	}
 	return gh.Issue{
 		Title: pr.Title,
 		Body:  pr.Body,
 	}, false
+}
+
+func fallbackIssueNumbers(pr gh.PullRequest) []int {
+	numbers := []int{}
+	seen := map[int]bool{}
+	add := func(number int) {
+		if number <= 0 || seen[number] {
+			return
+		}
+		seen[number] = true
+		numbers = append(numbers, number)
+	}
+	if number := loopIssueBranchNumber(pr.HeadRefName); number > 0 {
+		add(number)
+	}
+	for _, number := range bodyIssueReferenceNumbers(pr.Body) {
+		add(number)
+	}
+	return numbers
+}
+
+func loopIssueBranchNumber(branch string) int {
+	match := loopIssueBranchPattern.FindStringSubmatch(strings.TrimSpace(branch))
+	if len(match) != 2 {
+		return 0
+	}
+	return atoiPositive(match[1])
+}
+
+func bodyIssueReferenceNumbers(body string) []int {
+	numbers := []int{}
+	for _, match := range closingIssueBodyPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 2 {
+			numbers = append(numbers, atoiPositive(match[1]))
+		}
+	}
+	for _, match := range bareIssueBodyPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 2 {
+			numbers = append(numbers, atoiPositive(match[1]))
+		}
+	}
+	return numbers
+}
+
+func atoiPositive(value string) int {
+	number, err := strconv.Atoi(value)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
 }
 
 func specSearchTexts(issue gh.Issue, issuePresent bool, pr gh.PullRequest) []string {
@@ -1161,7 +1218,12 @@ func nonNilFindings(findings []Finding) []Finding {
 	return findings
 }
 
-var specPathPattern = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
+var (
+	specPathPattern         = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
+	loopIssueBranchPattern  = regexp.MustCompile(`^loop/issue-(\d+)(?:$|[-_/].*)`)
+	closingIssueBodyPattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b`)
+	bareIssueBodyPattern    = regexp.MustCompile(`#(\d+)\b`)
+)
 
 func discoverSpecPath(texts ...string) string {
 	seen := map[string]bool{}
