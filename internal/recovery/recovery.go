@@ -362,7 +362,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 
 		nextAttempt := priorAttempts + 1
 		localPriorAttempts = nextAttempt
-		strategy := strategyForAttempt(nextAttempt)
+		strategy := strategyForAttempt(nextAttempt, opts.MaxAttempts)
 		model, effort := modelEffortForStrategy(opts, strategy)
 		retryBranch := fmt.Sprintf("loop/issue-%d-retry-%d", opts.IssueNumber, nextAttempt)
 		backoffSeconds := selectBackoffSeconds(priorAttempts, opts.BackoffSeconds)
@@ -756,8 +756,11 @@ func selectBackoffSeconds(priorAttempts int, backoff []int) int {
 	return backoff[index]
 }
 
-func strategyForAttempt(attempt int) string {
-	if attempt >= 3 {
+func strategyForAttempt(attempt, maxAttempts int) string {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	if attempt >= maxAttempts {
 		return AttemptStrategyUpgradedConfig
 	}
 	return AttemptStrategySameConfig
