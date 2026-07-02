@@ -17,6 +17,7 @@ type Config struct {
 	Verification Verification `yaml:"verification"`
 	Resilience   Resilience   `yaml:"resilience"`
 	Guardrails   Guardrails   `yaml:"guardrails"`
+	Environment  Environment  `yaml:"environment"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -85,6 +86,10 @@ type Report struct {
 	Channel string `yaml:"channel"`
 }
 
+type Environment struct {
+	PreProdBranch string `yaml:"pre_prod_branch"`
+}
+
 type Guardrails struct {
 	Budget         GuardrailBudget         `yaml:"budget"`
 	CircuitBreaker GuardrailCircuitBreaker `yaml:"circuit_breaker"`
@@ -132,6 +137,9 @@ func Default() Config {
 				MaxAttempts:              3,
 				RetryBackoffSeconds:      []int{10, 30, 120},
 			},
+		},
+		Environment: Environment{
+			PreProdBranch: "pre-prod",
 		},
 	}
 }

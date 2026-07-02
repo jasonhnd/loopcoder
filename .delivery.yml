@@ -14,6 +14,8 @@ worker:
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
+environment:
+  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.
 verifier:
   model: "claude-opus-4-8[1m]"
   reasoning_effort: max

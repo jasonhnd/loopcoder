@@ -35,7 +35,9 @@ this loop.
 - Report run status by running `loopcoder status` and relaying its
   program-rendered local output; do not replace it with a hand-typed status
   table.
-- Never auto-merge. Merge only PRs the user names, via `gh pr merge`.
+- Never auto-merge to `main`/production. `tick` may auto-merge only clean,
+  risk-gate-passing PRs into the configured pre-prod branch; production merges
+  happen only for PRs or batches the user names, via `gh pr merge`.
 
 ## Conductor attestation
 
@@ -299,7 +301,12 @@ Bounds and scrutiny:
 
 6. Merge ordering.
    - Follow the observe-at-merge ordering and conflict eviction rules in [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md).
-   - Never auto-merge. A `pass` verdict means merge-eligible only; it never calls `gh pr merge`. When the user names PRs to merge, read each named ready PR's real changed files with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run `gh pr merge` only for those named PRs that remain merge-eligible.
+   - Never auto-merge to `main`/production. A `pass` verdict is eligible for
+     the configured pre-prod branch only after the deterministic risk gate is
+     clean; it never authorizes production. When the user names PRs or a
+     pre-prod batch to promote, read each named ready PR's real changed files
+     with `gh pr diff <pr> --name-only`, group PRs by file-set overlap, and run
+     `gh pr merge` only for those named PRs that remain merge-eligible.
    - Non-overlapping PRs may merge in any order. Overlapping PRs merge serially: merge the first, rebase the next onto updated `main`, verify it remains acceptable, then merge it.
    - If an overlapping PR cannot rebase cleanly, evict it from the merge group, capture the changed files, conflicting paths, rebase output, and PRs that landed, then narrow the scope and re-dispatch a worker with that context instead of blindly retrying.
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +85,59 @@ func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Number != 5 || got[0].URL != "https://github.com/owner/repo/pull/5" {
 		t.Fatalf("ListHeadPRs = %#v", got)
+	}
+}
+
+func TestMergeToPreProdRunsGitHubMergeAPI(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences":                                                                []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner":                                                                                                                         []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=pre-prod\x00-f\x00head=loop/issue-101\x00-f\x00commit_message=loopcoder pre-prod merge PR #101": []byte(`{"sha":"abc123","html_url":"https://github.com/owner/repo/commit/abc123"}`),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.MergeToPreProd(context.Background(), 101, "pre-prod")
+	if err != nil {
+		t.Fatalf("MergeToPreProd returned error: %v", err)
+	}
+	if got.PRNumber != 101 || got.Branch != "pre-prod" || got.Head != "loop/issue-101" || got.SHA != "abc123" {
+		t.Fatalf("MergeToPreProd result = %#v", got)
+	}
+
+	want := [][]string{
+		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "repo", "view", "--json", "nameWithOwner"},
+		{"repo", "gh", "api", "--method", "POST", "repos/owner/repo/merges", "-f", "base=pre-prod", "-f", "head=loop/issue-101", "-f", "commit_message=loopcoder pre-prod merge PR #101"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestMergeToPreProdRejectsProductionBranches(t *testing.T) {
+	client := NewWithRunner("repo", &fakeRunner{outputs: map[string][]byte{}})
+
+	for _, branch := range []string{"main", "master", "prod", "production"} {
+		_, err := client.MergeToPreProd(context.Background(), 101, branch)
+		if err == nil {
+			t.Fatalf("MergeToPreProd(%q) returned nil error, want rejection", branch)
+		}
+	}
+}
+
+func TestWriterHasNoMergeToMainMethod(t *testing.T) {
+	writer := reflect.TypeOf((*Writer)(nil)).Elem()
+	for i := 0; i < writer.NumMethod(); i++ {
+		method := writer.Method(i)
+		name := strings.ToLower(method.Name)
+		if strings.Contains(name, "main") {
+			t.Fatalf("github Writer exposes merge-to-main shaped method: %s", method.Name)
+		}
+		if strings.Contains(name, "merge") && !strings.Contains(name, "preprod") {
+			t.Fatalf("github Writer merge method is not pre-prod scoped: %s", method.Name)
+		}
 	}
 }
 

@@ -40,6 +40,7 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		"work_items: github",
 		"worker: codex",
 		"verifier: claude",
+		"pre_prod_branch: pre-prod",
 		"checks: []",
 		"# model:",
 		"# reasoning_effort:",

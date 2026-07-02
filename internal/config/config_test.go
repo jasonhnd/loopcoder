@@ -39,6 +39,9 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	if cfg.Verifier.Model != "" || cfg.Verifier.ReasoningEffort != "" {
 		t.Fatalf("Verifier = %#v, want inherited empty config", cfg.Verifier)
 	}
+	if cfg.Environment.PreProdBranch != "pre-prod" {
+		t.Fatalf("Environment.PreProdBranch = %q, want pre-prod", cfg.Environment.PreProdBranch)
+	}
 }
 
 func TestParseReadsConfiguredSections(t *testing.T) {
@@ -84,6 +87,8 @@ resilience:
     retry_backoff_seconds: [1, 2, 3]
 report:
   channel: chat
+environment:
+  pre_prod_branch: staging
 guardrails:
   budget:
     max_runs: 3
@@ -162,6 +167,9 @@ guardrails:
 	}
 	if cfg.Report.Channel != "chat" {
 		t.Fatalf("Report.Channel = %q, want chat", cfg.Report.Channel)
+	}
+	if cfg.Environment.PreProdBranch != "staging" {
+		t.Fatalf("Environment.PreProdBranch = %q, want staging", cfg.Environment.PreProdBranch)
 	}
 	if cfg.Guardrails.Budget.MaxRuns == nil || *cfg.Guardrails.Budget.MaxRuns != 3 {
 		t.Fatalf("Guardrails.Budget.MaxRuns = %#v, want 3", cfg.Guardrails.Budget.MaxRuns)
