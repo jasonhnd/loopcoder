@@ -32,6 +32,14 @@ const (
 	epicLabel             = "epic"
 	epicDAGRelDir         = ".loopcoder/epics"
 	isolationInvariant    = "Every slice must be implementable and testable in isolation; slice along ownership/module boundaries."
+
+	EpicSliceTypeSeam           = "seam"
+	EpicSliceTypeImplementation = "implementation"
+	EpicSliceTypeFlipDelete     = "flip+delete"
+	EpicSliceTypeCleanup        = "cleanup"
+
+	EpicToggleStateOff = "off"
+	EpicToggleStateOn  = "on"
 )
 
 type IssueWriter interface {
@@ -111,19 +119,30 @@ type EpicSliceDAGArtifact struct {
 }
 
 type EpicSliceNode struct {
-	ID                       string             `json:"id"`
-	Ref                      string             `json:"ref"`
-	Kind                     string             `json:"kind"`
-	Title                    string             `json:"title"`
-	Issue                    int                `json:"issue,omitempty"`
-	State                    string             `json:"state,omitempty"`
-	StateReason              string             `json:"state_reason,omitempty"`
-	Completed                bool               `json:"completed"`
-	ImplementableAndTestable bool               `json:"implementable_and_testable"`
-	IsolationNotes           string             `json:"isolation_notes"`
-	DependsOn                []string           `json:"depends_on"`
-	Atomic                   bool               `json:"atomic,omitempty"`
-	AtomicMembers            []EpicAtomicMember `json:"atomic_members,omitempty"`
+	ID                       string              `json:"id"`
+	Ref                      string              `json:"ref"`
+	Kind                     string              `json:"kind"`
+	SliceType                string              `json:"slice_type,omitempty"`
+	Title                    string              `json:"title"`
+	Issue                    int                 `json:"issue,omitempty"`
+	State                    string              `json:"state,omitempty"`
+	StateReason              string              `json:"state_reason,omitempty"`
+	Completed                bool                `json:"completed"`
+	ImplementableAndTestable bool                `json:"implementable_and_testable"`
+	IsolationNotes           string              `json:"isolation_notes"`
+	BuildTagToggle           *EpicBuildTagToggle `json:"build_tag_toggle,omitempty"`
+	Dark                     bool                `json:"dark,omitempty"`
+	DarkReason               string              `json:"dark_reason,omitempty"`
+	DependsOn                []string            `json:"depends_on"`
+	Atomic                   bool                `json:"atomic,omitempty"`
+	AtomicMembers            []EpicAtomicMember  `json:"atomic_members,omitempty"`
+}
+
+type EpicBuildTagToggle struct {
+	Name         string `json:"name"`
+	BuildTag     string `json:"build_tag"`
+	DefaultState string `json:"default_state"`
+	State        string `json:"state"`
 }
 
 type EpicSliceEdge struct {
@@ -219,6 +238,7 @@ type roadmapUnit struct {
 type roadmapSlice struct {
 	unit           *roadmapUnit
 	kind           string
+	sliceType      string
 	text           string
 	marker         string
 	line           int
@@ -251,6 +271,8 @@ type planItem struct {
 	epicTitle      string
 	atomic         bool
 	atomicMembers  []EpicAtomicMember
+	sliceType      string
+	buildTagToggle *EpicBuildTagToggle
 }
 
 func DefaultDeps() Deps {
@@ -575,9 +597,11 @@ func parseRoadmap(text string) (*roadmapDoc, error) {
 		if matches := slicePattern.FindStringSubmatch(line); len(matches) == 3 {
 			text, marker := parseMarkedText(matches[2])
 			text, needs, needsSpecified := parseNeeds(text)
+			sliceType, text := parseSliceTypePrefix(text)
 			slice := &roadmapSlice{
 				unit:           current,
 				kind:           strings.ToLower(matches[1]),
+				sliceType:      sliceType,
 				text:           firstNonEmpty(text, "Untitled slice"),
 				marker:         marker,
 				line:           i,
@@ -699,6 +723,22 @@ func parseNeeds(text string) (string, []string, bool) {
 	return clean, needs, true
 }
 
+func parseSliceTypePrefix(text string) (string, string) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "[") {
+		return "", text
+	}
+	end := strings.Index(text, "]")
+	if end <= 1 {
+		return "", text
+	}
+	sliceType := normalizeEpicSliceType(text[1:end])
+	if sliceType == "" {
+		return "", text
+	}
+	return sliceType, strings.TrimSpace(text[end+1:])
+}
+
 func uniqueMarker(seed string, used map[string]int) string {
 	for i := 0; ; i++ {
 		candidateSeed := seed
@@ -763,11 +803,22 @@ func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 		if unit.epic && len(docs)+len(codes) == 0 {
 			docs = append(docs, fallbackEpicDocSlice(unit))
 		}
+		migration := isMigrationEpic(unit)
+		if unit.epic {
+			for _, slice := range append(docs, codes...) {
+				slice.sliceType = inferEpicSliceType(unit, slice, migration)
+			}
+		}
+		if migration {
+			docs, codes = ensureMigrationDisciplineSlices(unit, docs, codes)
+		}
+		var unitItems []*planItem
 		for _, slice := range append(docs, codes...) {
 			item := &planItem{
 				id:         slice.marker,
 				ref:        slice.ref,
 				kind:       slice.kind,
+				sliceType:  slice.sliceType,
 				title:      slice.text,
 				unitTitle:  unit.title,
 				unitIntent: unit.intent,
@@ -786,8 +837,15 @@ func buildPlanItems(doc *roadmapDoc) ([]*planItem, error) {
 					item.depIDs = append(item.depIDs, docSlice.marker)
 				}
 			}
-			items = append(items, item)
+			if item.epicID != "" && item.sliceType == EpicSliceTypeImplementation {
+				item.buildTagToggle = buildTagToggleForSlice(item)
+			}
+			unitItems = append(unitItems, item)
 		}
+		if migration {
+			applyMigrationDisciplineDependencies(unitItems)
+		}
+		items = append(items, unitItems...)
 	}
 	return items, nil
 }
@@ -802,6 +860,216 @@ func fallbackEpicDocSlice(unit *roadmapUnit) *roadmapSlice {
 		ordinal: 1,
 		ref:     unit.slug + "/doc-1",
 	}
+}
+
+func isMigrationEpic(unit *roadmapUnit) bool {
+	if unit == nil || !unit.epic {
+		return false
+	}
+	text := strings.ToLower(unit.title + "\n" + unit.intent)
+	for _, keyword := range []string{
+		"migration",
+		"migrate",
+		"rewrite",
+		"refactor",
+		"strangler",
+		"branch by abstraction",
+		"branch-by-abstraction",
+		"go->rust",
+		"go to rust",
+	} {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func inferEpicSliceType(unit *roadmapUnit, slice *roadmapSlice, migration bool) string {
+	if slice == nil {
+		return ""
+	}
+	if normalized := normalizeEpicSliceType(slice.sliceType); normalized != "" {
+		return normalized
+	}
+	if !unit.epic {
+		return ""
+	}
+	if !migration {
+		if slice.kind == "code" {
+			return EpicSliceTypeImplementation
+		}
+		return ""
+	}
+	text := strings.ToLower(slice.text)
+	switch {
+	case containsAny(text, "cleanup", "clean up", "remove toggle", "remove build tag", "remove abstraction", "abstraction removal", "toggle removal"):
+		return EpicSliceTypeCleanup
+	case containsAny(text, "flip+delete", "flip and delete", "flip-delete", "flip/delete", "cutover", "switch over", "delete legacy", "remove legacy", "delete old", "remove old"):
+		return EpicSliceTypeFlipDelete
+	case containsAny(text, "seam", "facade", "adapter", "abstraction", "interface", "strangler"):
+		return EpicSliceTypeSeam
+	case slice.kind == "code":
+		return EpicSliceTypeImplementation
+	case migration:
+		return EpicSliceTypeSeam
+	default:
+		return ""
+	}
+}
+
+func normalizeEpicSliceType(value string) string {
+	key := strings.ToLower(strings.TrimSpace(value))
+	key = strings.ReplaceAll(key, "_", "-")
+	key = strings.ReplaceAll(key, " ", "-")
+	switch key {
+	case "seam":
+		return EpicSliceTypeSeam
+	case "impl", "implementation", "implement":
+		return EpicSliceTypeImplementation
+	case "flip+delete", "flip-delete", "flip/delete", "flip", "delete", "cutover":
+		return EpicSliceTypeFlipDelete
+	case "cleanup", "clean-up":
+		return EpicSliceTypeCleanup
+	default:
+		return ""
+	}
+}
+
+func ensureMigrationDisciplineSlices(unit *roadmapUnit, docs, codes []*roadmapSlice) ([]*roadmapSlice, []*roadmapSlice) {
+	all := append(append([]*roadmapSlice{}, docs...), codes...)
+	present := map[string]bool{}
+	maxCodeOrdinal := 0
+	maxOrder := unit.order
+	for _, slice := range all {
+		if slice == nil {
+			continue
+		}
+		present[slice.sliceType] = true
+		if slice.kind == "code" && slice.ordinal > maxCodeOrdinal {
+			maxCodeOrdinal = slice.ordinal
+		}
+		if slice.order > maxOrder {
+			maxOrder = slice.order
+		}
+	}
+	for _, sliceType := range []string{EpicSliceTypeSeam, EpicSliceTypeImplementation, EpicSliceTypeFlipDelete, EpicSliceTypeCleanup} {
+		if present[sliceType] {
+			continue
+		}
+		maxCodeOrdinal++
+		maxOrder++
+		codes = append(codes, fallbackMigrationCodeSlice(unit, sliceType, maxCodeOrdinal, maxOrder))
+		present[sliceType] = true
+	}
+	return docs, codes
+}
+
+func fallbackMigrationCodeSlice(unit *roadmapUnit, sliceType string, ordinal, order int) *roadmapSlice {
+	return &roadmapSlice{
+		unit:      unit,
+		kind:      "code",
+		sliceType: sliceType,
+		text:      fallbackMigrationSliceTitle(unit, sliceType),
+		marker:    fmt.Sprintf("%s:%s-%d", unit.marker, sanitizeFilePart(sliceType, "slice"), ordinal),
+		order:     order,
+		ordinal:   ordinal,
+		ref:       fmt.Sprintf("%s/code-%d", unit.slug, ordinal),
+	}
+}
+
+func fallbackMigrationSliceTitle(unit *roadmapUnit, sliceType string) string {
+	switch sliceType {
+	case EpicSliceTypeSeam:
+		return "Add Branch-by-Abstraction seam for " + unit.title
+	case EpicSliceTypeImplementation:
+		return "Implement dark migration slice for " + unit.title
+	case EpicSliceTypeFlipDelete:
+		return "Flip completed migration and delete superseded path for " + unit.title
+	case EpicSliceTypeCleanup:
+		return "Remove migration toggle and abstraction cleanup for " + unit.title
+	default:
+		return "Implement migration slice for " + unit.title
+	}
+}
+
+func applyMigrationDisciplineDependencies(items []*planItem) {
+	byType := map[string][]*planItem{}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		byType[item.sliceType] = append(byType[item.sliceType], item)
+	}
+	for _, item := range byType[EpicSliceTypeImplementation] {
+		addPlanItemDeps(item, byType[EpicSliceTypeSeam])
+	}
+	for _, item := range byType[EpicSliceTypeFlipDelete] {
+		addPlanItemDeps(item, byType[EpicSliceTypeImplementation])
+	}
+	cleanupDeps := byType[EpicSliceTypeFlipDelete]
+	if len(cleanupDeps) == 0 {
+		cleanupDeps = byType[EpicSliceTypeImplementation]
+	}
+	for _, item := range byType[EpicSliceTypeCleanup] {
+		addPlanItemDeps(item, cleanupDeps)
+	}
+}
+
+func addPlanItemDeps(item *planItem, deps []*planItem) {
+	seen := map[string]bool{}
+	for _, depID := range item.depIDs {
+		seen[depID] = true
+	}
+	for _, dep := range deps {
+		if dep == nil || dep.id == item.id || seen[dep.id] {
+			continue
+		}
+		seen[dep.id] = true
+		item.depIDs = append(item.depIDs, dep.id)
+	}
+}
+
+func buildTagToggleForSlice(item *planItem) *EpicBuildTagToggle {
+	tag := buildTagForSliceRef(firstNonEmpty(item.ref, item.id))
+	return &EpicBuildTagToggle{
+		Name:         firstNonEmpty(item.ref, item.id),
+		BuildTag:     tag,
+		DefaultState: EpicToggleStateOff,
+		State:        EpicToggleStateOff,
+	}
+}
+
+func buildTagForSliceRef(ref string) string {
+	ref = strings.ToLower(strings.TrimSpace(ref))
+	var out strings.Builder
+	lastUnderscore := false
+	for _, r := range ref {
+		keep := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if keep {
+			out.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			out.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	clean := strings.Trim(out.String(), "_")
+	if clean == "" {
+		clean = "slice"
+	}
+	return "lc_" + clean
+}
+
+func containsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func patchEpicSliceDAGs(ctx context.Context, opts Options, deps Deps, doc *roadmapDoc, items []*planItem, existingIssues []gh.Issue, roadmapPath string) ([]EpicDAGEntry, bool, error) {
@@ -831,7 +1099,7 @@ func patchEpicSliceDAGs(ctx context.Context, opts Options, deps Deps, doc *roadm
 		if len(epicItems) == 0 {
 			continue
 		}
-		sortItemsByOrder(epicItems)
+		sortEpicItemsForArtifact(epicItems)
 		path := epicDAGArtifactPath(opts.RepoPath, unit.marker)
 		existing, exists, err := readEpicDAGArtifact(path, deps)
 		if err != nil {
@@ -889,10 +1157,12 @@ func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath stri
 			ID:                       item.id,
 			Ref:                      item.ref,
 			Kind:                     item.kind,
+			SliceType:                item.sliceType,
 			Title:                    item.title,
 			Issue:                    item.issueNumber,
 			ImplementableAndTestable: true,
 			IsolationNotes:           isolationInvariant,
+			BuildTagToggle:           cloneBuildTagToggle(item.buildTagToggle),
 			DependsOn:                append([]string(nil), item.depIDs...),
 			Atomic:                   item.atomic,
 			AtomicMembers:            append([]EpicAtomicMember(nil), item.atomicMembers...),
@@ -912,6 +1182,7 @@ func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath stri
 			})
 		}
 	}
+	applyEpicDarkState(nodes)
 	sort.Slice(edges, func(i, j int) bool {
 		if edges[i].From == edges[j].From {
 			return edges[i].To < edges[j].To
@@ -997,6 +1268,41 @@ func marshalEpicDAGArtifact(artifact EpicSliceDAGArtifact) ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
+func cloneBuildTagToggle(toggle *EpicBuildTagToggle) *EpicBuildTagToggle {
+	if toggle == nil {
+		return nil
+	}
+	copied := *toggle
+	return &copied
+}
+
+func applyEpicDarkState(nodes []EpicSliceNode) {
+	complete := len(nodes) > 0
+	for _, node := range nodes {
+		if !node.Completed {
+			complete = false
+			break
+		}
+	}
+	for i := range nodes {
+		if nodes[i].BuildTagToggle == nil {
+			continue
+		}
+		toggle := *nodes[i].BuildTagToggle
+		if complete {
+			toggle.State = EpicToggleStateOn
+			nodes[i].BuildTagToggle = &toggle
+			nodes[i].Dark = false
+			nodes[i].DarkReason = ""
+			continue
+		}
+		toggle.State = EpicToggleStateOff
+		nodes[i].BuildTagToggle = &toggle
+		nodes[i].Dark = true
+		nodes[i].DarkReason = "epic is not complete; implementation slice remains toggled off in pre-prod"
+	}
+}
+
 func epicDAGArtifactPath(repoPath, epicID string) string {
 	return filepath.Join(repoPath, epicDAGRelDir, sanitizeFilePart(epicID, "epic")+".slice_dag.json")
 }
@@ -1042,11 +1348,22 @@ func epicNodeSignatureEqual(a, b EpicSliceNode) bool {
 	return a.ID == b.ID &&
 		a.Ref == b.Ref &&
 		a.Kind == b.Kind &&
+		a.SliceType == b.SliceType &&
 		a.Title == b.Title &&
+		buildTagToggleSignatureEqual(a.BuildTagToggle, b.BuildTagToggle) &&
 		reflect.DeepEqual(sortedStrings(a.DependsOn), sortedStrings(b.DependsOn)) &&
 		a.ImplementableAndTestable == b.ImplementableAndTestable &&
 		a.Atomic == b.Atomic &&
 		reflect.DeepEqual(sortedAtomicMembers(a.AtomicMembers), sortedAtomicMembers(b.AtomicMembers))
+}
+
+func buildTagToggleSignatureEqual(a, b *EpicBuildTagToggle) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Name == b.Name &&
+		a.BuildTag == b.BuildTag &&
+		a.DefaultState == b.DefaultState
 }
 
 func isIssueCompleted(issue gh.Issue) bool {
@@ -1149,6 +1466,35 @@ func sortItemsByOrder(items []*planItem) {
 	})
 }
 
+func sortEpicItemsForArtifact(items []*planItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		leftRank := epicSliceTypeRank(items[i].sliceType)
+		rightRank := epicSliceTypeRank(items[j].sliceType)
+		if leftRank != rightRank && (leftRank > 0 || rightRank > 0) {
+			return leftRank < rightRank
+		}
+		if items[i].order != items[j].order {
+			return items[i].order < items[j].order
+		}
+		return items[i].id < items[j].id
+	})
+}
+
+func epicSliceTypeRank(sliceType string) int {
+	switch sliceType {
+	case EpicSliceTypeSeam:
+		return 1
+	case EpicSliceTypeImplementation:
+		return 2
+	case EpicSliceTypeFlipDelete:
+		return 3
+	case EpicSliceTypeCleanup:
+		return 4
+	default:
+		return 0
+	}
+}
+
 func issuesByMarker(issues []gh.Issue) map[string]gh.Issue {
 	out := map[string]gh.Issue{}
 	for _, issue := range issues {
@@ -1200,6 +1546,9 @@ func issueBody(item *planItem) string {
 	fmt.Fprintf(&out, "<!-- lc:u=%s -->\n", item.id)
 	fmt.Fprintf(&out, "Roadmap ref: `%s`\n", item.ref)
 	fmt.Fprintf(&out, "Kind: %s\n", item.kind)
+	if strings.TrimSpace(item.sliceType) != "" {
+		fmt.Fprintf(&out, "Slice type: %s\n", item.sliceType)
+	}
 	fmt.Fprintf(&out, "Unit: %s\n", item.unitTitle)
 	if item.epicID != "" {
 		fmt.Fprintf(&out, "Epic: %s\n", item.epicTitle)
@@ -1228,6 +1577,14 @@ func issueBody(item *planItem) string {
 			fmt.Fprintln(&out)
 			fmt.Fprintln(&out, "## Isolation")
 			fmt.Fprintln(&out, isolationInvariant)
+		}
+		if item.buildTagToggle != nil {
+			fmt.Fprintln(&out)
+			fmt.Fprintln(&out, "## Build-tag toggle")
+			fmt.Fprintf(&out, "Build tag: `%s`\n", item.buildTagToggle.BuildTag)
+			fmt.Fprintf(&out, "Default state: %s\n", item.buildTagToggle.DefaultState)
+			fmt.Fprintln(&out, "Use this build-tag toggle as the revert net: a bad pre-prod slice is toggled off, not manually rolled back.")
+			fmt.Fprintln(&out, "Leave the slice dark while the epic is unfinished; cleanup slices remove this toggle and abstraction after flip+delete.")
 		}
 	} else {
 		fmt.Fprintln(&out)

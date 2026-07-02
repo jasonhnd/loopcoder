@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -153,6 +154,63 @@ func TestPromoteAlreadyUpToDateIsLedgeredAsSkipped(t *testing.T) {
 	event := readPromoteEvents(t, repo, runID)
 	if !strings.Contains(event, `"outcome":"skipped-as-done"`) || !strings.Contains(event, `"already_up_to_date":true`) {
 		t.Fatalf("already-up-to-date ledger missing skipped outcome:\n%s", event)
+	}
+}
+
+func TestPromoteDarkEpicSlicesDoNotBlockPromotion(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test-promote-dark"
+	writeEpicOrderingArtifact(t, repo, compiler.EpicSliceDAGArtifact{
+		Version:   compiler.EpicDAGVersion,
+		EpicID:    "epic-1",
+		EpicTitle: "Rewrite billing engine",
+		Nodes: []compiler.EpicSliceNode{
+			{
+				ID:        "impl",
+				Ref:       "rewrite-billing-engine/code-2",
+				Issue:     20,
+				Completed: true,
+				SliceType: compiler.EpicSliceTypeImplementation,
+				BuildTagToggle: &compiler.EpicBuildTagToggle{
+					Name:         "rewrite-billing-engine/code-2",
+					BuildTag:     "lc_rewrite_billing_engine_code_2",
+					DefaultState: compiler.EpicToggleStateOff,
+					State:        compiler.EpicToggleStateOff,
+				},
+				Dark:       true,
+				DarkReason: "epic is not complete; implementation slice remains toggled off in pre-prod",
+			},
+		},
+	})
+	writer := &recordingPromotionWriter{}
+
+	report, err := Promote(context.Background(), PromoteOptions{
+		Writer:        writer,
+		RepoPath:      repo,
+		RunID:         runID,
+		PreProdBranch: "pre-prod",
+		Gate:          "human-merge",
+		Clock:         fixedPromoteClock,
+		StatePush:     promoteTestStatePush(t, repo, runID),
+	})
+	if err != nil {
+		t.Fatalf("Promote returned error: %v", err)
+	}
+	if report.Status != PromoteStatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", report.Status)
+	}
+	if !reflect.DeepEqual(writer.calls, []string{"promote:pre-prod", "sync:pre-prod"}) {
+		t.Fatalf("calls = %#v, want promotion to continue despite dark slice", writer.calls)
+	}
+	if len(report.ToggleInventory.LeaveDark) != 1 || report.ToggleInventory.LeaveDark[0].SliceRef != "rewrite-billing-engine/code-2" {
+		t.Fatalf("toggle inventory = %#v, want one dark slice", report.ToggleInventory)
+	}
+	if report.Summary.PromotedCount != 1 || report.Summary.FailureCount != 0 {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+	rendered := RenderPromoteText(report)
+	if !strings.Contains(rendered, "leave_dark rewrite-billing-engine/code-2") {
+		t.Fatalf("rendered report missing dark toggle inventory:\n%s", rendered)
 	}
 }
 
