@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -346,6 +348,48 @@ func TestTickPendingPromotionKickBackLedgerRemovesOnlyKickedItem(t *testing.T) {
 	}
 }
 
+func TestTickPendingPromotionLedgerUsesFileWriteOrderForSameTimestamp(t *testing.T) {
+	repo := t.TempDir()
+	timestamp := "2026-07-02T12:00:00Z"
+	pendingRunID := "run-z-pending"
+	promoteRunID := "run-a-promote"
+
+	appendPendingPromotionEvent(t, repo, pendingRunID, timestamp, TickPendingPromotion{
+		Issue:    47,
+		PRNumber: 470,
+		Branch:   "pre-prod",
+		SHA:      "merge-sha",
+		Status:   tickStatusPendingPromotion,
+	})
+	appendPromoteAttemptEvent(t, repo, promoteRunID, timestamp, PromoteReport{
+		Version:       PromoteReportVersion,
+		RepoPath:      repo,
+		RunID:         promoteRunID,
+		PreProdBranch: "pre-prod",
+		MainBranch:    "main",
+		Status:        PromoteStatusSucceeded,
+		Promoted: PromoteMainResult{
+			PreProdBranch: "pre-prod",
+			MainBranch:    "main",
+			Status:        PromoteStatusSucceeded,
+			SHA:           "main-sha",
+		},
+	})
+	pendingTime := time.Date(2026, 7, 2, 12, 0, 0, 100, time.UTC)
+	promoteTime := pendingTime.Add(time.Millisecond)
+	if err := os.Chtimes(state.EventsPath(repo, pendingRunID), pendingTime, pendingTime); err != nil {
+		t.Fatalf("Chtimes pending event: %v", err)
+	}
+	if err := os.Chtimes(state.EventsPath(repo, promoteRunID), promoteTime, promoteTime); err != nil {
+		t.Fatalf("Chtimes promote event: %v", err)
+	}
+
+	pending := loadTickPendingPromotionLedger(repo, "pre-prod")
+	if len(pending) != 0 {
+		t.Fatalf("pending promotion = %#v, want cleared by later promote event with identical timestamp", pending)
+	}
+}
+
 func TestTickHumanDecisionSectionsSurfaceInJSONAndText(t *testing.T) {
 	evidence := []config.EvidenceArtifact{{ProjectType: "cli", TestResults: "go test ./... passed"}}
 	report := normalizeTickReport(TickReport{
@@ -448,6 +492,59 @@ func TestTickGuardrailBlockedStopsBeforeReview(t *testing.T) {
 		t.Fatal("state push was not called after dispatch-wave produced run state")
 	}
 	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Issue != 2 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+}
+
+func TestTickGuardrailFrozenReadySetStopsBeforeDispatch(t *testing.T) {
+	dispatchCalled := false
+	statePushCalled := false
+
+	report, err := Tick(context.Background(), TickOptions{
+		Reader:           fakeReader{},
+		IssueWriter:      noopTickIssueWriter{},
+		RepoPath:         t.TempDir(),
+		RunID:            "run-test-wave",
+		VerifierProvider: "claude",
+		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
+			return tickCompileReport(false), nil
+		},
+		LoadAttempts: noAttempts,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return report.ReadySetReport{
+				Repo:       "owner/repo",
+				BaseBranch: "main",
+				Ready:      []report.ReadyIssue{},
+				Blocked: []report.BlockedIssue{{
+					Issue:          24,
+					Title:          "Frozen",
+					Classification: "guardrail-frozen",
+					Reason:         "guardrail circuit is frozen",
+				}},
+			}, nil
+		},
+		DispatchWave: func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
+			dispatchCalled = true
+			return DispatchWaveReport{}, nil
+		},
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			statePushCalled = true
+			return statebranch.PushResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopGuardrailFrozen {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if dispatchCalled {
+		t.Fatal("dispatch-wave was called for guardrail-frozen ready-set")
+	}
+	if statePushCalled {
+		t.Fatal("state push was called before dispatch-created run state")
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "ready-set" || report.NeedsHuman[0].Issue != 24 {
 		t.Fatalf("needs-human = %#v", report.NeedsHuman)
 	}
 }
@@ -856,6 +953,169 @@ func TestTickAutoRevertsPreProdWhenMergedCommitTurnsCIRed(t *testing.T) {
 	}
 	if report.Summary.PreProdMergeCount != 1 || report.Summary.PreProdRevertCount != 1 || report.Summary.NeedsHumanCount != 1 {
 		t.Fatalf("summary = %#v", report.Summary)
+	}
+}
+
+func TestTickLeavesPendingPreProdCIForLaterTick(t *testing.T) {
+	tests := []struct {
+		name   string
+		checks []gh.Check
+	}{
+		{name: "no check runs yet", checks: nil},
+		{name: "pending check run", checks: []gh.Check{{Name: "verify", Bucket: "pending"}}},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prNumber := 240 + i
+			opts := reviewReadyTickOptions(t.TempDir(), 24+i, "https://github.com/owner/repo/pull/"+strconv.Itoa(prNumber))
+			opts.Reader = fakeReader{
+				checks:    map[int][]gh.Check{prNumber: passChecks()},
+				diffFiles: map[int][]string{prNumber: {"README.md"}},
+				diffs:     map[int]string{prNumber: modifiedDiff("README.md")},
+				branchChecks: map[string]gh.BranchChecksResult{
+					"pre-prod": {
+						Branch:  "pre-prod",
+						HeadSHA: "merge-sha",
+						Checks:  tt.checks,
+					},
+				},
+			}
+			writer := &recordingPreProdWriter{
+				mergeResult:  gh.PreProdMergeResult{PRNumber: prNumber, Branch: "pre-prod", Head: "loop/issue-24", SHA: "merge-sha"},
+				revertResult: gh.PreProdRevertResult{PRNumber: prNumber, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+			}
+			opts.PreProdWriter = writer
+
+			report, err := Tick(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("Tick returned error: %v", err)
+			}
+			if report.Status != TickStatusSucceeded || report.StopReason != TickStopCompleted {
+				t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+			}
+			if writer.mergeCalls != 1 || writer.revertCalls != 0 {
+				t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+			}
+			if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusPending {
+				t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
+			}
+			if len(report.NeedsHuman) != 0 || len(report.Failures) != 0 {
+				t.Fatalf("needs-human=%#v failures=%#v", report.NeedsHuman, report.Failures)
+			}
+			if len(report.PreProdReverts) != 0 {
+				t.Fatalf("pre-prod reverts = %#v", report.PreProdReverts)
+			}
+		})
+	}
+}
+
+func TestTickDoesNotRevertWhenPreProdRedIsNotAtMergeSHA(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 25, "https://github.com/owner/repo/pull/250")
+	opts.Reader = fakeReader{
+		checks:    map[int][]gh.Check{250: passChecks()},
+		diffFiles: map[int][]string{250: {"README.md"}},
+		diffs:     map[int]string{250: modifiedDiff("README.md")},
+		branchChecks: map[string]gh.BranchChecksResult{
+			"pre-prod": {
+				Branch:  "pre-prod",
+				HeadSHA: "newer-preprod-head",
+				Checks:  []gh.Check{{Name: "verify", Bucket: "fail"}},
+			},
+		},
+	}
+	writer := &recordingPreProdWriter{
+		mergeResult:  gh.PreProdMergeResult{PRNumber: 250, Branch: "pre-prod", Head: "loop/issue-25", SHA: "merge-sha"},
+		revertResult: gh.PreProdRevertResult{PRNumber: 250, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+	}
+	opts.PreProdWriter = writer
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopPreProdNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if writer.mergeCalls != 1 || writer.revertCalls != 0 {
+		t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+	}
+	if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusRed || report.PreProdHealth[0].HeadSHA != "newer-preprod-head" {
+		t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "pre-prod-health" {
+		t.Fatalf("needs-human=%#v failures=%#v", report.NeedsHuman, report.Failures)
+	}
+	if len(report.Failures) != 0 {
+		t.Fatalf("failures = %#v", report.Failures)
+	}
+}
+
+func TestTickPreProdRevertFailureIsReportedAsFailure(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 26, "https://github.com/owner/repo/pull/260")
+	opts.Reader = fakeReader{
+		checks:    map[int][]gh.Check{260: passChecks()},
+		diffFiles: map[int][]string{260: {"README.md"}},
+		diffs:     map[int]string{260: modifiedDiff("README.md")},
+		branchChecks: map[string]gh.BranchChecksResult{
+			"pre-prod": {
+				Branch:  "pre-prod",
+				HeadSHA: "merge-sha",
+				Checks:  []gh.Check{{Name: "verify", Bucket: "fail"}},
+			},
+		},
+	}
+	writer := &recordingPreProdWriter{
+		mergeResult: gh.PreProdMergeResult{PRNumber: 260, Branch: "pre-prod", Head: "loop/issue-26", SHA: "merge-sha"},
+		revertErr:   errors.New("revert failed"),
+	}
+	opts.PreProdWriter = writer
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusFailed || report.StopReason != TickStopReviewFailed {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if writer.mergeCalls != 1 || writer.revertCalls != 1 {
+		t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+	}
+	if len(report.PreProdReverts) != 1 || report.PreProdReverts[0].Status != TickStatusFailed || report.PreProdReverts[0].Error != "revert failed" {
+		t.Fatalf("pre-prod reverts = %#v", report.PreProdReverts)
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Step != "pre-prod-revert" {
+		t.Fatalf("failures = %#v", report.Failures)
+	}
+	if len(report.NeedsHuman) != 0 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+}
+
+func TestTickNeedsHumanWhenReaderCannotReadPreProdBranchChecks(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 27, "https://github.com/owner/repo/pull/270")
+	opts.Reader = tickReaderWithoutBranchChecks{fake: cleanRiskReader(270, "README.md")}
+	writer := &recordingPreProdWriter{
+		mergeResult:  gh.PreProdMergeResult{PRNumber: 270, Branch: "pre-prod", Head: "loop/issue-27", SHA: "merge-sha"},
+		revertResult: gh.PreProdRevertResult{PRNumber: 270, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+	}
+	opts.PreProdWriter = writer
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopPreProdNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if writer.mergeCalls != 1 || writer.revertCalls != 0 {
+		t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+	}
+	if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusUnknown {
+		t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "pre-prod-health" {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
 	}
 }
 
@@ -1367,3 +1627,35 @@ func (noopTickIssueWriter) UpdateIssue(context.Context, int, string, string, []s
 	return gh.Issue{}, nil
 }
 func (noopTickIssueWriter) CloseIssue(context.Context, int) error { return nil }
+
+type tickReaderWithoutBranchChecks struct {
+	fake fakeReader
+}
+
+func (r tickReaderWithoutBranchChecks) RepoName(ctx context.Context) (string, error) {
+	return r.fake.RepoName(ctx)
+}
+
+func (r tickReaderWithoutBranchChecks) ListIssues(ctx context.Context, state string) ([]gh.Issue, error) {
+	return r.fake.ListIssues(ctx, state)
+}
+
+func (r tickReaderWithoutBranchChecks) ViewIssue(ctx context.Context, number int) (gh.Issue, error) {
+	return r.fake.ViewIssue(ctx, number)
+}
+
+func (r tickReaderWithoutBranchChecks) ListOpenPRs(ctx context.Context) ([]gh.PullRequest, error) {
+	return r.fake.ListOpenPRs(ctx)
+}
+
+func (r tickReaderWithoutBranchChecks) PRChecks(ctx context.Context, number int) ([]gh.Check, error) {
+	return r.fake.PRChecks(ctx, number)
+}
+
+func (r tickReaderWithoutBranchChecks) PRDiff(ctx context.Context, number int) (string, error) {
+	return r.fake.PRDiff(ctx, number)
+}
+
+func (r tickReaderWithoutBranchChecks) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) {
+	return r.fake.PRDiffNameOnly(ctx, number)
+}

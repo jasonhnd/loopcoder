@@ -101,6 +101,11 @@ type TickOptions struct {
 	LoadAttempts    LoadAttemptsFunc
 }
 
+// TickReport intentionally has no top-level conductor AttestationRecord. The
+// 0.4.0 tick path is deterministic Go orchestration, not an LLM conductor
+// invocation, so there is no real provider/model/usage record to stamp. Worker
+// dispatch and verifier loopreview attestations remain surfaced on their own
+// report entries.
 type TickReport struct {
 	Version          int                       `json:"version"`
 	Repo             string                    `json:"repo"`
@@ -298,7 +303,6 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		tickReport.FinishedAt = state.FormatTimestamp(finished)
 		attachTickConfiguredEvidence(&tickReport, opts.ConfiguredEvidence)
 		tickReport.PendingPromotion = loadTickPendingPromotionLedger(opts.RepoPath, opts.PreProdBranch)
-		tickReport.Summary = summarizeTick(tickReport)
 		return normalizeTickReport(tickReport), nil
 	}
 
@@ -418,7 +422,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	}
 	if len(tickReport.Failures) > 0 {
 		pushTickState(ctx, opts, &tickReport)
-		if len(tickReport.Failures) > 0 && hasStatePushFailure(tickReport.Failures) {
+		if hasStatePushFailure(tickReport.Failures) {
 			return finish(TickStatusFailed, TickStopStatePushFailed)
 		}
 		return finish(TickStatusFailed, TickStopDispatchFailed)
@@ -1101,6 +1105,8 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 			PR:     item.PR,
 			Detail: detail,
 		})
+	case PreProdHealthStatusPending:
+		return
 	default:
 		detail := "pre-prod CI is not green: " + strings.Join(health.Problems, ", ")
 		if len(health.Problems) == 0 {
@@ -1854,10 +1860,11 @@ type tickLedgerEvent struct {
 }
 
 type tickLedgerRecord struct {
-	event tickLedgerEvent
-	path  string
-	index int
-	line  string
+	event   tickLedgerEvent
+	path    string
+	index   int
+	line    string
+	modTime time.Time
 }
 
 func recordTickPendingPromotionLedger(opts TickOptions, report *TickReport) error {
@@ -1953,6 +1960,10 @@ func readTickLedgerRecords(repoPath string) []tickLedgerRecord {
 	seenLines := map[string]bool{}
 	records := make([]tickLedgerRecord, 0)
 	for _, path := range paths {
+		var modTime time.Time
+		if info, err := os.Stat(path); err == nil {
+			modTime = info.ModTime()
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -1968,7 +1979,7 @@ func readTickLedgerRecords(repoPath string) []tickLedgerRecord {
 			if err := json.Unmarshal([]byte(line), &event); err != nil {
 				continue
 			}
-			records = append(records, tickLedgerRecord{event: event, path: path, index: i, line: line})
+			records = append(records, tickLedgerRecord{event: event, path: path, index: i, line: line, modTime: modTime})
 		}
 	}
 	sort.SliceStable(records, func(i, j int) bool {
@@ -1977,11 +1988,19 @@ func readTickLedgerRecords(repoPath string) []tickLedgerRecord {
 		if leftOK && rightOK && !leftTime.Equal(rightTime) {
 			return leftTime.Before(rightTime)
 		}
+		if leftOK && rightOK {
+			if before, ok := tickLedgerRecordModTimeBefore(records[i], records[j]); ok {
+				return before
+			}
+		}
 		if leftOK != rightOK {
 			return leftOK
 		}
 		if records[i].event.Timestamp != records[j].event.Timestamp {
 			return records[i].event.Timestamp < records[j].event.Timestamp
+		}
+		if before, ok := tickLedgerRecordModTimeBefore(records[i], records[j]); ok {
+			return before
 		}
 		if records[i].event.RunID != records[j].event.RunID {
 			return records[i].event.RunID < records[j].event.RunID
@@ -1992,6 +2011,13 @@ func readTickLedgerRecords(repoPath string) []tickLedgerRecord {
 		return records[i].index < records[j].index
 	})
 	return records
+}
+
+func tickLedgerRecordModTimeBefore(left, right tickLedgerRecord) (bool, bool) {
+	if left.modTime.IsZero() || right.modTime.IsZero() || left.modTime.Equal(right.modTime) {
+		return false, false
+	}
+	return left.modTime.Before(right.modTime), true
 }
 
 func tickLedgerEventPaths(repoPath string) []string {
