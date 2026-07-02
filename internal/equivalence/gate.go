@@ -70,14 +70,14 @@ type GateSummary struct {
 }
 
 type CaseReport struct {
-	ID                     string     `json:"id"`
-	Status                 string     `json:"status"`
-	Detail                 string     `json:"detail,omitempty"`
-	NoiseBaseline          Comparison `json:"noise_baseline"`
-	GoldenComparison       Comparison `json:"golden_comparison,omitempty"`
-	DifferentialComparison Comparison `json:"differential_comparison"`
-	OriginalRuns           int        `json:"original_runs"`
-	CandidateRuns          int        `json:"candidate_runs"`
+	ID                     string      `json:"id"`
+	Status                 string      `json:"status"`
+	Detail                 string      `json:"detail,omitempty"`
+	NoiseBaseline          Comparison  `json:"noise_baseline"`
+	GoldenComparison       *Comparison `json:"golden_comparison,omitempty"`
+	DifferentialComparison Comparison  `json:"differential_comparison"`
+	OriginalRuns           int         `json:"original_runs"`
+	CandidateRuns          int         `json:"candidate_runs"`
 }
 
 func RunGate(ctx context.Context, opts GateOptions) (GateReport, error) {
@@ -164,8 +164,9 @@ func runCase(ctx context.Context, contract Contract, executor Executor, tc Case)
 	golden := oldFirst.Value
 	if tc.Golden != nil {
 		golden = tc.Golden
-		report.GoldenComparison = Compare(contract, tc.Golden, oldFirst.Value, noise)
-		if !report.GoldenComparison.WithinTolerance {
+		goldenComparison := Compare(contract, tc.Golden, oldFirst.Value, noise)
+		report.GoldenComparison = &goldenComparison
+		if !goldenComparison.WithinTolerance {
 			report.Status = StatusNeedsHuman
 			report.Detail = "golden master drift exceeds contract tolerance and noise baseline"
 			return report
