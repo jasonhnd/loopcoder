@@ -15,6 +15,11 @@ const (
 	RiskGateStatusClean      = "clean"
 	RiskGateStatusNeedsHuman = "needs-human"
 
+	PreProdHealthStatusGreen   = "green"
+	PreProdHealthStatusRed     = "red"
+	PreProdHealthStatusPending = "pending"
+	PreProdHealthStatusUnknown = "unknown"
+
 	RiskRedLineDestructive = "destructive-change"
 	RiskRedLineBuild       = "build-not-green"
 	RiskRedLineCore        = "loopcoder-core"
@@ -34,6 +39,11 @@ type RiskGateReader interface {
 
 type PreProdWriter interface {
 	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (gh.PreProdMergeResult, error)
+	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (gh.PreProdRevertResult, error)
+}
+
+type PreProdHealthReader interface {
+	BranchChecks(ctx context.Context, branch string) (gh.BranchChecksResult, error)
 }
 
 type RiskGateFunc func(ctx context.Context, opts RiskGateOptions) (RiskGateDecision, error)
@@ -251,6 +261,20 @@ func checkPassed(check gh.Check) bool {
 	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
 	state := strings.ToLower(strings.TrimSpace(check.State))
 	return bucket == "pass" || state == "success" || state == "passed"
+}
+
+func checkFailed(check gh.Check) bool {
+	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
+	state := strings.ToLower(strings.TrimSpace(check.State))
+	switch bucket {
+	case "fail", "failed", "cancel", "cancelled", "error", "timed_out":
+		return true
+	}
+	switch state {
+	case "failure", "failed", "error", "cancelled", "timed_out", "action_required":
+		return true
+	}
+	return false
 }
 
 func checkStatus(check gh.Check) string {

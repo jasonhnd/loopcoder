@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -24,6 +25,7 @@ type Writer interface {
 	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
 	ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error)
 	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (PreProdMergeResult, error)
+	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (PreProdRevertResult, error)
 }
 
 // IssueWriter is the GitHub issue mutation surface used by compile. Tests can
@@ -90,12 +92,26 @@ type Check struct {
 	Bucket string `json:"bucket"`
 }
 
+type BranchChecksResult struct {
+	Branch  string  `json:"branch"`
+	HeadSHA string  `json:"head_sha"`
+	Checks  []Check `json:"checks"`
+}
+
 type PreProdMergeResult struct {
 	PRNumber int    `json:"pr_number"`
 	Branch   string `json:"branch"`
 	Head     string `json:"head"`
 	SHA      string `json:"sha,omitempty"`
 	URL      string `json:"url,omitempty"`
+}
+
+type PreProdRevertResult struct {
+	PRNumber    int    `json:"pr_number"`
+	Branch      string `json:"branch"`
+	RevertedSHA string `json:"reverted_sha"`
+	SHA         string `json:"sha,omitempty"`
+	URL         string `json:"url,omitempty"`
 }
 
 // New returns a gh-backed reader rooted at repoPath.
@@ -237,6 +253,40 @@ func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {
 	return checks, nil
 }
 
+func (c *CLI) BranchChecks(ctx context.Context, branch string) (BranchChecksResult, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return BranchChecksResult{}, fmt.Errorf("branch is required")
+	}
+	sha, err := c.branchHeadSHA(ctx, branch)
+	if err != nil {
+		return BranchChecksResult{}, err
+	}
+	repo, err := c.RepoName(ctx)
+	if err != nil {
+		return BranchChecksResult{}, err
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return BranchChecksResult{}, fmt.Errorf("repository name is required")
+	}
+
+	checks, err := c.checkRunsForCommit(ctx, repo, sha)
+	if err != nil {
+		return BranchChecksResult{}, err
+	}
+	statuses, err := c.statusChecksForCommit(ctx, repo, sha)
+	if err != nil {
+		return BranchChecksResult{}, err
+	}
+	checks = append(checks, statuses...)
+	return BranchChecksResult{
+		Branch:  branch,
+		HeadSHA: sha,
+		Checks:  checks,
+	}, nil
+}
+
 func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {
 	output, err := c.run(ctx, "gh", "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body)
 	if err != nil {
@@ -308,6 +358,72 @@ func (c *CLI) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch st
 		Head:     head,
 		SHA:      payload.SHA,
 		URL:      payload.HTMLURL,
+	}, nil
+}
+
+func (c *CLI) RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (PreProdRevertResult, error) {
+	preProdBranch = strings.TrimSpace(preProdBranch)
+	mergeSHA = strings.TrimSpace(mergeSHA)
+	if prNumber <= 0 {
+		return PreProdRevertResult{}, fmt.Errorf("pull request number is required")
+	}
+	if preProdBranch == "" {
+		return PreProdRevertResult{}, fmt.Errorf("pre-prod branch is required")
+	}
+	if mergeSHA == "" {
+		return PreProdRevertResult{}, fmt.Errorf("merge commit SHA is required")
+	}
+	if isReservedProductionBranch(preProdBranch) {
+		return PreProdRevertResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
+	}
+
+	refspec := "+refs/heads/" + preProdBranch + ":refs/remotes/origin/" + preProdBranch
+	if _, err := c.run(ctx, "git", "fetch", "origin", refspec); err != nil {
+		return PreProdRevertResult{}, err
+	}
+
+	worktree, err := os.MkdirTemp("", "loopcoder-preprod-revert-*")
+	if err != nil {
+		return PreProdRevertResult{}, fmt.Errorf("create temporary pre-prod worktree: %w", err)
+	}
+	if err := os.RemoveAll(worktree); err != nil {
+		return PreProdRevertResult{}, fmt.Errorf("prepare temporary pre-prod worktree path: %w", err)
+	}
+	defer os.RemoveAll(worktree)
+
+	addedWorktree := false
+	defer func() {
+		if addedWorktree {
+			_, _ = c.run(ctx, "git", "worktree", "remove", "--force", worktree)
+		}
+	}()
+
+	if _, err := c.run(ctx, "git", "worktree", "add", "--detach", worktree, "refs/remotes/origin/"+preProdBranch); err != nil {
+		return PreProdRevertResult{}, err
+	}
+	addedWorktree = true
+
+	if _, err := c.runner.Run(ctx, worktree, "git", "revert", "-m", "1", "--no-edit", mergeSHA); err != nil {
+		return PreProdRevertResult{}, err
+	}
+	revertSHABytes, err := c.runner.Run(ctx, worktree, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return PreProdRevertResult{}, err
+	}
+	revertSHA := strings.TrimSpace(string(revertSHABytes))
+	if revertSHA == "" {
+		return PreProdRevertResult{}, fmt.Errorf("pre-prod revert produced an empty commit SHA")
+	}
+	if _, err := c.runner.Run(ctx, worktree, "git", "push", "origin", "HEAD:"+preProdBranch); err != nil {
+		return PreProdRevertResult{}, err
+	}
+
+	return PreProdRevertResult{
+		PRNumber:    prNumber,
+		Branch:      preProdBranch,
+		RevertedSHA: mergeSHA,
+		SHA:         revertSHA,
+		URL:         commitURL(ctx, c, revertSHA),
 	}, nil
 }
 
@@ -393,6 +509,79 @@ func (c *CLI) run(ctx context.Context, name string, args ...string) ([]byte, err
 		return nil, fmt.Errorf("github client is not configured")
 	}
 	return c.runner.Run(ctx, c.repoPath, name, args...)
+}
+
+func (c *CLI) branchHeadSHA(ctx context.Context, branch string) (string, error) {
+	output, err := c.run(ctx, "git", "ls-remote", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		return "", fmt.Errorf("branch %q was not found on origin", branch)
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 || strings.TrimSpace(fields[0]) == "" {
+		return "", fmt.Errorf("could not resolve head SHA for branch %q", branch)
+	}
+	return strings.TrimSpace(fields[0]), nil
+}
+
+func (c *CLI) checkRunsForCommit(ctx context.Context, repo, sha string) ([]Check, error) {
+	var payload struct {
+		CheckRuns []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := c.runJSON(ctx, []string{
+		"api",
+		"repos/" + repo + "/commits/" + sha + "/check-runs?per_page=100",
+	}, &payload); err != nil {
+		return nil, err
+	}
+	checks := make([]Check, 0, len(payload.CheckRuns))
+	for _, run := range payload.CheckRuns {
+		name := strings.TrimSpace(run.Name)
+		if name == "" {
+			continue
+		}
+		checks = append(checks, Check{
+			Name:   name,
+			State:  firstNonEmptyString(run.Conclusion, run.Status),
+			Bucket: checkRunBucket(run.Status, run.Conclusion),
+		})
+	}
+	return checks, nil
+}
+
+func (c *CLI) statusChecksForCommit(ctx context.Context, repo, sha string) ([]Check, error) {
+	var payload struct {
+		Statuses []struct {
+			Context string `json:"context"`
+			State   string `json:"state"`
+		} `json:"statuses"`
+	}
+	if err := c.runJSON(ctx, []string{
+		"api",
+		"repos/" + repo + "/commits/" + sha + "/status",
+	}, &payload); err != nil {
+		return nil, err
+	}
+	checks := make([]Check, 0, len(payload.Statuses))
+	for _, status := range payload.Statuses {
+		name := strings.TrimSpace(status.Context)
+		if name == "" {
+			continue
+		}
+		checks = append(checks, Check{
+			Name:   name,
+			State:  strings.TrimSpace(status.State),
+			Bucket: statusBucket(status.State),
+		})
+	}
+	return checks, nil
 }
 
 func (c *CLI) ensureLabels(ctx context.Context, labels []string) error {
@@ -538,6 +727,63 @@ func labelDescription(label string) string {
 	default:
 		return "loopcoder compile label"
 	}
+}
+
+func checkRunBucket(status, conclusion string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	conclusion = strings.ToLower(strings.TrimSpace(conclusion))
+	if status != "completed" {
+		if status == "" {
+			return "pending"
+		}
+		return "pending"
+	}
+	switch conclusion {
+	case "success":
+		return "pass"
+	case "neutral", "skipped":
+		return "skipping"
+	case "cancelled":
+		return "cancel"
+	case "failure", "timed_out", "action_required", "startup_failure", "stale":
+		return "fail"
+	default:
+		return "pending"
+	}
+}
+
+func statusBucket(state string) string {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "success":
+		return "pass"
+	case "failure", "error":
+		return "fail"
+	case "pending":
+		return "pending"
+	default:
+		return "unknown"
+	}
+}
+
+func commitURL(ctx context.Context, c *CLI, sha string) string {
+	repo, err := c.RepoName(ctx)
+	if err != nil {
+		return ""
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" || strings.TrimSpace(sha) == "" {
+		return ""
+	}
+	return "https://github.com/" + repo + "/commit/" + strings.TrimSpace(sha)
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func isReservedProductionBranch(branch string) bool {

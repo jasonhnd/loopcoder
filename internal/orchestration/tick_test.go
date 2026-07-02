@@ -376,6 +376,94 @@ func TestTickRejectsMainAsPreProdBranchBeforeMerge(t *testing.T) {
 	}
 }
 
+func TestTickAutoRevertsPreProdWhenMergedCommitTurnsCIRed(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 22, "https://github.com/owner/repo/pull/220")
+	opts.Reader = fakeReader{
+		checks:    map[int][]gh.Check{220: passChecks()},
+		diffFiles: map[int][]string{220: {"README.md"}},
+		diffs:     map[int]string{220: modifiedDiff("README.md")},
+		branchChecks: map[string]gh.BranchChecksResult{
+			"pre-prod": {
+				Branch:  "pre-prod",
+				HeadSHA: "merge-sha",
+				Checks:  []gh.Check{{Name: "verify", Bucket: "fail"}},
+			},
+		},
+	}
+	writer := &recordingPreProdWriter{
+		mergeResult:  gh.PreProdMergeResult{PRNumber: 220, Branch: "pre-prod", Head: "loop/issue-22", SHA: "merge-sha"},
+		revertResult: gh.PreProdRevertResult{PRNumber: 220, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+	}
+	opts.PreProdWriter = writer
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopPreProdNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if writer.mergeCalls != 1 || writer.revertCalls != 1 {
+		t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+	}
+	if writer.revertBranch != "pre-prod" || writer.revertSHA != "merge-sha" {
+		t.Fatalf("revert target branch=%q sha=%q", writer.revertBranch, writer.revertSHA)
+	}
+	if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusRed {
+		t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
+	}
+	if len(report.PreProdReverts) != 1 || report.PreProdReverts[0].Status != TickStatusSucceeded || report.PreProdReverts[0].RevertedSHA != "merge-sha" {
+		t.Fatalf("pre-prod reverts = %#v", report.PreProdReverts)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "pre-prod-revert" || report.NeedsHuman[0].Issue != 22 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+	if report.Summary.PreProdMergeCount != 1 || report.Summary.PreProdRevertCount != 1 || report.Summary.NeedsHumanCount != 1 {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+}
+
+func TestTickDoesNotRevertWhenPreProdCIStaysGreen(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 23, "https://github.com/owner/repo/pull/230")
+	opts.Reader = fakeReader{
+		checks:    map[int][]gh.Check{230: passChecks()},
+		diffFiles: map[int][]string{230: {"README.md"}},
+		diffs:     map[int]string{230: modifiedDiff("README.md")},
+		branchChecks: map[string]gh.BranchChecksResult{
+			"pre-prod": {
+				Branch:  "pre-prod",
+				HeadSHA: "merge-sha",
+				Checks:  passChecks(),
+			},
+		},
+	}
+	writer := &recordingPreProdWriter{
+		mergeResult:  gh.PreProdMergeResult{PRNumber: 230, Branch: "pre-prod", Head: "loop/issue-23", SHA: "merge-sha"},
+		revertResult: gh.PreProdRevertResult{PRNumber: 230, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+	}
+	opts.PreProdWriter = writer
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusSucceeded || report.StopReason != TickStopCompleted {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if writer.mergeCalls != 1 || writer.revertCalls != 0 {
+		t.Fatalf("writer calls merge=%d revert=%d", writer.mergeCalls, writer.revertCalls)
+	}
+	if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusGreen {
+		t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
+	}
+	if len(report.PreProdReverts) != 0 {
+		t.Fatalf("pre-prod reverts = %#v", report.PreProdReverts)
+	}
+	if len(report.NeedsHuman) != 0 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+}
+
 func TestRiskGateAdditionalRedLinesCanOnlyRaiseRisk(t *testing.T) {
 	reader := cleanRiskReader(301, "README.md")
 
@@ -695,6 +783,33 @@ type tickPreProdWriterFunc func(context.Context, int, string) (gh.PreProdMergeRe
 
 func (f tickPreProdWriterFunc) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (gh.PreProdMergeResult, error) {
 	return f(ctx, prNumber, preProdBranch)
+}
+
+func (f tickPreProdWriterFunc) RevertOnPreProd(context.Context, int, string, string) (gh.PreProdRevertResult, error) {
+	return gh.PreProdRevertResult{}, nil
+}
+
+type recordingPreProdWriter struct {
+	mergeResult  gh.PreProdMergeResult
+	mergeErr     error
+	revertResult gh.PreProdRevertResult
+	revertErr    error
+	mergeCalls   int
+	revertCalls  int
+	revertBranch string
+	revertSHA    string
+}
+
+func (w *recordingPreProdWriter) MergeToPreProd(context.Context, int, string) (gh.PreProdMergeResult, error) {
+	w.mergeCalls++
+	return w.mergeResult, w.mergeErr
+}
+
+func (w *recordingPreProdWriter) RevertOnPreProd(_ context.Context, _ int, branch, mergeSHA string) (gh.PreProdRevertResult, error) {
+	w.revertCalls++
+	w.revertBranch = branch
+	w.revertSHA = mergeSHA
+	return w.revertResult, w.revertErr
 }
 
 func cleanRiskReader(prNumber int, files ...string) fakeReader {

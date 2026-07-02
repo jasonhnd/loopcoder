@@ -321,7 +321,10 @@ For compatibility signals such as `min_loopcoder_version`, see
 7. After `loopreview = pass`, `tick` runs a deterministic risk gate. Clean PRs
    auto-merge into `environment.pre_prod_branch`; red-line PRs, red/missing CI,
    loopcoder-core changes, and verifier non-pass results are reported as
-   `needs-human` and do not merge.
+   `needs-human` and do not merge. After a pre-prod merge, `tick` reads the
+   configured CI checks on the pre-prod branch head; if that head is the
+   just-created merge commit and a required check is red, `tick` reverts that
+   commit on pre-prod and records the PR as `needs-human`.
 
 8. You name which pre-prod batch or PRs to promote to production/main.
    loopcoder merges only those named targets by running the human-directed merge
