@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/equivalence"
+	"github.com/jasonhnd/loopcoder/internal/kickback"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -69,12 +69,58 @@ type PromoteReport struct {
 	FinishedAt      string                  `json:"finished_at"`
 	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
 	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
-	ToggleInventory PromoteToggleInventory  `json:"toggle_inventory"`
+	ToggleInventory PromoteToggleInventory  `json:"toggle_inventory,omitempty"`
 	GoNoGoPanel     *PromoteGoNoGoPanel     `json:"go_no_go_panel,omitempty"`
 	Promoted        PromoteMainResult       `json:"promoted"`
 	Sync            PromoteSyncResult       `json:"sync"`
 	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
 	Summary         PromoteSummary          `json:"summary"`
+}
+
+type promoteReportJSON struct {
+	Version         int                     `json:"version"`
+	RepoPath        string                  `json:"repo_path"`
+	RunID           string                  `json:"run_id"`
+	PreProdBranch   string                  `json:"pre_prod_branch"`
+	MainBranch      string                  `json:"main_branch"`
+	Gate            string                  `json:"gate"`
+	Status          string                  `json:"status"`
+	StartedAt       string                  `json:"started_at"`
+	FinishedAt      string                  `json:"finished_at"`
+	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
+	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
+	ToggleInventory *PromoteToggleInventory `json:"toggle_inventory,omitempty"`
+	GoNoGoPanel     *PromoteGoNoGoPanel     `json:"go_no_go_panel,omitempty"`
+	Promoted        PromoteMainResult       `json:"promoted"`
+	Sync            PromoteSyncResult       `json:"sync"`
+	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
+	Summary         PromoteSummary          `json:"summary"`
+}
+
+func (report PromoteReport) MarshalJSON() ([]byte, error) {
+	wire := promoteReportJSON{
+		Version:       report.Version,
+		RepoPath:      report.RepoPath,
+		RunID:         report.RunID,
+		PreProdBranch: report.PreProdBranch,
+		MainBranch:    report.MainBranch,
+		Gate:          report.Gate,
+		Status:        report.Status,
+		StartedAt:     report.StartedAt,
+		FinishedAt:    report.FinishedAt,
+		KickedBack:    report.KickedBack,
+		NeedsHuman:    report.NeedsHuman,
+		GoNoGoPanel:   report.GoNoGoPanel,
+		Promoted:      report.Promoted,
+		Sync:          report.Sync,
+		StatePush:     report.StatePush,
+		Summary:       report.Summary,
+	}
+	if promoteToggleInventoryHasItems(report.ToggleInventory) {
+		inventory := report.ToggleInventory
+		wire.ToggleInventory = &inventory
+	}
+	return json.Marshal(wire)
 }
 
 type PromoteGoNoGoPanel struct {
@@ -178,7 +224,6 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		if err := recordPromoteAttempt(ctx, opts, &report); err != nil {
 			report.Status = PromoteStatusFailed
 			report.Summary.FailureCount++
-			report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
 			if report.StatePush == nil {
 				report.StatePush = &PromoteStatePush{Files: []string{}, Error: err.Error()}
 			} else if strings.TrimSpace(report.StatePush.Error) == "" && strings.TrimSpace(report.StatePush.PushError) == "" {
@@ -808,75 +853,7 @@ func normalizeKickBackItems(items []string) []string {
 }
 
 func normalizeKickBackItem(item string) string {
-	item = strings.TrimSpace(item)
-	if item == "" {
-		return ""
-	}
-	if number := parsePrefixedKickBackPRNumber(item); number > 0 {
-		return fmt.Sprintf("#%d", number)
-	}
-	if isKickBackSHAish(item) {
-		return strings.ToLower(item)
-	}
-	if number := parseBareKickBackPRNumber(item); number > 0 {
-		return fmt.Sprintf("#%d", number)
-	}
-	return item
-}
-
-func parsePrefixedKickBackPRNumber(item string) int {
-	lower := strings.ToLower(strings.TrimSpace(item))
-	for _, prefix := range []string{"pr:", "pr#", "pr-", "#"} {
-		if strings.HasPrefix(lower, prefix) {
-			return parsePositiveDecimal(lower[len(prefix):])
-		}
-	}
-	return 0
-}
-
-func parseBareKickBackPRNumber(item string) int {
-	item = strings.TrimSpace(item)
-	if len(item) >= 7 {
-		return 0
-	}
-	return parsePositiveDecimal(item)
-}
-
-func parsePositiveDecimal(item string) int {
-	item = strings.TrimSpace(item)
-	if item == "" {
-		return 0
-	}
-	for _, ch := range item {
-		if ch < '0' || ch > '9' {
-			return 0
-		}
-	}
-	number, err := strconv.Atoi(item)
-	if err != nil {
-		return 0
-	}
-	if number <= 0 {
-		return 0
-	}
-	return number
-}
-
-func isKickBackSHAish(item string) bool {
-	item = strings.TrimSpace(item)
-	if len(item) < 7 || len(item) > 40 {
-		return false
-	}
-	for _, ch := range item {
-		switch {
-		case ch >= '0' && ch <= '9':
-		case ch >= 'a' && ch <= 'f':
-		case ch >= 'A' && ch <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
+	return kickback.CanonicalizeItem(item)
 }
 
 func isReservedPromotionBranch(branch string) bool {

@@ -311,6 +311,42 @@ func TestKickBackFromPreProdResolvesCollidingPRNumberBoundary(t *testing.T) {
 	t.Fatalf("missing git revert call: %#v", runner.calls)
 }
 
+func TestKickBackFromPreProdSkipsAlreadyRevertedCommit(t *testing.T) {
+	runner := &preProdKickBackAlreadyRevertedRunner{}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.KickBackFromPreProd(context.Background(), "#101", "pre-prod")
+	if err != nil {
+		t.Fatalf("KickBackFromPreProd returned error: %v", err)
+	}
+	if got.PRNumber != 101 || got.RevertedSHA != "merge-sha" || got.SHA != "existing-revert-sha" {
+		t.Fatalf("KickBackFromPreProd result = %#v, want existing revert", got)
+	}
+	for _, call := range runner.calls {
+		if len(call) >= 3 && call[1] == "git" && (call[2] == "revert" || call[2] == "push" || call[2] == "worktree") {
+			t.Fatalf("already-reverted kick-back should not mutate pre-prod, saw call %#v", call)
+		}
+	}
+}
+
+func TestResolvePreProdKickBackCommitAcceptsOddPRPrefix(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00fetch\x00origin\x00+refs/heads/pre-prod:refs/remotes/origin/pre-prod": nil,
+			"repo\x00git\x00log\x00--format=%H%x00%s\x00refs/remotes/origin/pre-prod":             []byte("merge-sha\x00loopcoder pre-prod merge PR #101\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	sha, prNumber, err := client.resolvePreProdKickBackCommit(context.Background(), "pr:#101", "pre-prod")
+	if err != nil {
+		t.Fatalf("resolvePreProdKickBackCommit returned error: %v", err)
+	}
+	if sha != "merge-sha" || prNumber != 101 {
+		t.Fatalf("resolved sha=%q pr=%d, want PR #101 merge", sha, prNumber)
+	}
+}
+
 func TestResolvePreProdKickBackCommitTreatsShortBareNumericAsPRNumber(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
@@ -627,6 +663,25 @@ func (r *preProdKickBackCollisionRunner) Run(_ context.Context, dir, name string
 	}
 	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
 		return []byte("revert-sha\n"), nil
+	}
+	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
+		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
+	}
+	return nil, nil
+}
+
+type preProdKickBackAlreadyRevertedRunner struct {
+	calls [][]string
+}
+
+func (r *preProdKickBackAlreadyRevertedRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+	call := append([]string{dir, name}, args...)
+	r.calls = append(r.calls, call)
+	if dir == "repo" && name == "git" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%s", "refs/remotes/origin/pre-prod"}) {
+		return []byte("merge-sha\x00loopcoder pre-prod merge PR #101\n"), nil
+	}
+	if dir == "repo" && name == "git" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%B%x1e", "refs/remotes/origin/pre-prod"}) {
+		return []byte("existing-revert-sha\x00Revert \"loopcoder pre-prod merge PR #101\"\n\nThis reverts commit merge-sha.\x1e"), nil
 	}
 	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
 		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
