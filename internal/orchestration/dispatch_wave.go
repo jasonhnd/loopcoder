@@ -71,6 +71,7 @@ type DispatchWaveIssueResult struct {
 	AttemptPath         string
 	RecoveryContextPath string
 	Error               string
+	ConfiguredEvidence  []config.EvidenceArtifact      `json:"configured_evidence,omitempty"`
 	Attestation         *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 

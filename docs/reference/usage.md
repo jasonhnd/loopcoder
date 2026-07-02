@@ -262,6 +262,18 @@ worker:
   command_hint: "implement the issue, run relevant checks, commit"
 environment:
   pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.
+# evidence:
+#   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.
+#   website:
+#     preview_url: https://preview.example.com
+#   cli:
+#     example_output: |
+#       $ loopcoder --version
+#       version=dev commit=unknown date=unknown
+#   library:
+#     test_results: go test ./...
+#   app:
+#     preview_build: dist/app-preview.zip
 # verifier:
 #   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
 #   # model:
@@ -276,6 +288,12 @@ report:
 `environment.pre_prod_branch` defaults to `pre-prod`. If that branch is absent,
 empty, reserved as `main`/production, or cannot accept the merge, `tick` skips
 auto-merge, records `needs-human`, and leaves production untouched.
+
+`evidence` is optional. When present, it is keyed by project type (`website`,
+`cli`, `library`, or `app`) and supports simple proof fields such as
+`preview_url`, `example_output`, `test_results`, and `preview_build`. `tick`
+copies those configured artifacts into the JSON report and the human-readable
+summary for dispatched, pending, and pre-prod items.
 
 The verifier role has its own optional model and reasoning-effort settings.
 Quote model IDs that contain YAML-special characters such as `[1m]`:

@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -18,6 +19,7 @@ type Config struct {
 	Resilience   Resilience   `yaml:"resilience"`
 	Guardrails   Guardrails   `yaml:"guardrails"`
 	Environment  Environment  `yaml:"environment"`
+	Evidence     Evidence     `yaml:"evidence"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -88,6 +90,52 @@ type Report struct {
 
 type Environment struct {
 	PreProdBranch string `yaml:"pre_prod_branch"`
+}
+
+type Evidence struct {
+	Website EvidenceArtifact `yaml:"website"`
+	CLI     EvidenceArtifact `yaml:"cli"`
+	Library EvidenceArtifact `yaml:"library"`
+	App     EvidenceArtifact `yaml:"app"`
+}
+
+type EvidenceArtifact struct {
+	ProjectType   string `yaml:"-" json:"project_type"`
+	PreviewURL    string `yaml:"preview_url" json:"preview_url,omitempty"`
+	ExampleOutput string `yaml:"example_output" json:"example_output,omitempty"`
+	TestResults   string `yaml:"test_results" json:"test_results,omitempty"`
+	PreviewBuild  string `yaml:"preview_build" json:"preview_build,omitempty"`
+}
+
+func (e Evidence) Artifacts() []EvidenceArtifact {
+	artifacts := make([]EvidenceArtifact, 0, 4)
+	for _, candidate := range []EvidenceArtifact{
+		e.artifact("website", e.Website),
+		e.artifact("cli", e.CLI),
+		e.artifact("library", e.Library),
+		e.artifact("app", e.App),
+	} {
+		if !candidate.empty() {
+			artifacts = append(artifacts, candidate)
+		}
+	}
+	return artifacts
+}
+
+func (e Evidence) artifact(projectType string, artifact EvidenceArtifact) EvidenceArtifact {
+	artifact.ProjectType = projectType
+	artifact.PreviewURL = strings.TrimSpace(artifact.PreviewURL)
+	artifact.ExampleOutput = strings.TrimSpace(artifact.ExampleOutput)
+	artifact.TestResults = strings.TrimSpace(artifact.TestResults)
+	artifact.PreviewBuild = strings.TrimSpace(artifact.PreviewBuild)
+	return artifact
+}
+
+func (a EvidenceArtifact) empty() bool {
+	return strings.TrimSpace(a.PreviewURL) == "" &&
+		strings.TrimSpace(a.ExampleOutput) == "" &&
+		strings.TrimSpace(a.TestResults) == "" &&
+		strings.TrimSpace(a.PreviewBuild) == ""
 }
 
 type Guardrails struct {
