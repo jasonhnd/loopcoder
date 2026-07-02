@@ -166,6 +166,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 			Title:   firstNonEmpty(issue.Title, title),
 			Failure: failure,
 		})
+		tracked[failure.Signature] = existingIssue{Number: issue.Number}
 	}
 
 	report.Summary = Summary{
@@ -356,6 +357,9 @@ func issueBody(failure Failure) string {
 func trackedFailures(issues []gh.Issue) map[string]existingIssue {
 	out := map[string]existingIssue{}
 	for _, issue := range issues {
+		if strings.EqualFold(issue.State, "CLOSED") {
+			continue
+		}
 		signature := markerFromText(issue.Body)
 		if signature == "" {
 			continue
@@ -363,9 +367,6 @@ func trackedFailures(issues []gh.Issue) map[string]existingIssue {
 		existing := existingIssue{
 			Number: issue.Number,
 			Held:   labelHeld(issue.Labels),
-		}
-		if prior, ok := out[signature]; ok && !strings.EqualFold(issue.State, "OPEN") && prior.Number > 0 {
-			continue
 		}
 		out[signature] = existing
 	}
@@ -384,8 +385,7 @@ func heldIssueNumbers(issues []gh.Issue) map[int]string {
 }
 
 func markerFromText(text string) string {
-	re := regexp.MustCompile(`<!--\s*lc:d1=([A-Za-z0-9._:-]+)\s*-->`)
-	matches := re.FindStringSubmatch(text)
+	matches := failureMarkerPattern.FindStringSubmatch(text)
 	if len(matches) != 2 {
 		return ""
 	}
@@ -422,11 +422,21 @@ func checkFailed(check gh.Check) bool {
 	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
 	state := strings.ToLower(strings.TrimSpace(check.State))
 	switch bucket {
-	case "fail", "cancel", "cancelled", "timed_out", "timed-out":
+	case "cancel", "cancelled", "canceled", "superseded":
+		return false
+	}
+	switch state {
+	case "cancel", "cancelled", "canceled", "superseded":
+		return false
+	}
+	switch bucket {
+	case "fail", "timed_out", "timed-out":
 		return true
 	}
 	switch state {
-	case "failure", "failed", "error", "cancelled", "canceled", "timed_out", "timed-out", "action_required":
+	// A timed-out check consumed CI and needs repair; cancellation and
+	// superseded states are handled above because they can be normal PR churn.
+	case "failure", "failed", "error", "timed_out", "timed-out", "action_required":
 		return true
 	default:
 		return false
@@ -470,8 +480,9 @@ func linkedIssueNumbers(pr gh.PullRequest) []int {
 }
 
 var (
-	branchIssuePattern = regexp.MustCompile(`(?i)(?:^|[/_-])issue[/_-]?(\d+)(?:\D|$)`)
-	hashIssuePattern   = regexp.MustCompile(`#(\d+)`)
+	failureMarkerPattern = regexp.MustCompile(`<!--\s*lc:d1=([A-Za-z0-9._:-]+)\s*-->`)
+	branchIssuePattern   = regexp.MustCompile(`(?i)(?:^|[/_-])issue[/_-]?(\d+)(?:\D|$)`)
+	hashIssuePattern     = regexp.MustCompile(`#(\d+)`)
 )
 
 func issueNumberFromText(text string) int {

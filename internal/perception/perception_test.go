@@ -97,6 +97,93 @@ func TestDiscoverRerunSkipsAlreadyTrackedFailure(t *testing.T) {
 	}
 }
 
+func TestDiscoverRefilesClosedTrackedFailure(t *testing.T) {
+	ci := fakeCIReader{
+		prs: []gh.PullRequest{{Number: 30, Title: "Regression"}},
+		checks: map[int][]gh.Check{
+			30: {{Name: "verify", Bucket: "fail"}},
+		},
+	}
+	writer := newFakeIssueWriter()
+	signature := failureSignature(Failure{
+		Source:    "github-pr-check",
+		PRNumber:  30,
+		CheckName: "verify",
+	})
+	writer.issues[7] = gh.Issue{
+		Number: 7,
+		Body:   "<!-- lc:d1=" + signature + " -->",
+		State:  "CLOSED",
+	}
+	writer.nextNumber = 8
+
+	report := runDiscoverTest(t, ci, writer)
+	if len(report.Created) != 1 || report.Created[0].Issue != 8 {
+		t.Fatalf("created = %#v, want one new issue #8", report.Created)
+	}
+	if len(report.SkippedDuplicate) != 0 {
+		t.Fatalf("skipped duplicate = %#v, want none for closed tracker", report.SkippedDuplicate)
+	}
+}
+
+func TestDiscoverDedupsDuplicateCheckNamesWithinRun(t *testing.T) {
+	ci := fakeCIReader{
+		prs: []gh.PullRequest{{Number: 31, Title: "Duplicate check names"}},
+		checks: map[int][]gh.Check{
+			31: {
+				{Name: "verify", Bucket: "fail", State: "failure"},
+				{Name: "verify", Bucket: "fail", State: "error"},
+			},
+		},
+	}
+	writer := newFakeIssueWriter()
+
+	report := runDiscoverTest(t, ci, writer)
+	if len(report.Created) != 1 || report.Created[0].Issue != 1 {
+		t.Fatalf("created = %#v, want one issue #1", report.Created)
+	}
+	if len(report.SkippedDuplicate) != 1 || report.SkippedDuplicate[0].TrackingIssue != 1 {
+		t.Fatalf("skipped duplicate = %#v, want duplicate tracked by issue #1", report.SkippedDuplicate)
+	}
+	if writer.nextNumber != 2 {
+		t.Fatalf("next issue = %d, want one issue created", writer.nextNumber)
+	}
+}
+
+func TestCheckFailedExcludesCancelledAndSuperseded(t *testing.T) {
+	tests := []struct {
+		name  string
+		check gh.Check
+		want  bool
+	}{
+		{name: "failure bucket", check: gh.Check{Bucket: "fail"}, want: true},
+		{name: "timed out bucket", check: gh.Check{Bucket: "timed_out"}, want: true},
+		{name: "timed out state", check: gh.Check{State: "timed-out"}, want: true},
+		{name: "action required state", check: gh.Check{State: "action_required"}, want: true},
+		{name: "cancel bucket", check: gh.Check{Bucket: "cancel"}, want: false},
+		{name: "cancel state", check: gh.Check{Bucket: "fail", State: "cancel"}, want: false},
+		{name: "cancelled state", check: gh.Check{Bucket: "fail", State: "cancelled"}, want: false},
+		{name: "canceled state", check: gh.Check{Bucket: "fail", State: "canceled"}, want: false},
+		{name: "superseded bucket", check: gh.Check{Bucket: "superseded"}, want: false},
+		{name: "superseded state", check: gh.Check{Bucket: "fail", State: "superseded"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkFailed(tt.check); got != tt.want {
+				t.Fatalf("checkFailed(%#v) = %v, want %v", tt.check, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMarkerFromTextExtractsFailureMarker(t *testing.T) {
+	text := "before\n<!--  lc:d1=abc-123._:xyz  -->\nafter"
+	if got := markerFromText(text); got != "abc-123._:xyz" {
+		t.Fatalf("markerFromText() = %q, want marker value", got)
+	}
+}
+
 func runDiscoverTest(t *testing.T, ci fakeCIReader, writer *fakeIssueWriter) Report {
 	t.Helper()
 	report, err := Run(context.Background(), Options{
