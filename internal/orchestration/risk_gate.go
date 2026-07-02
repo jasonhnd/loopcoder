@@ -301,7 +301,7 @@ func corePathRedLines(changedFiles []string) []RiskRedLine {
 	}
 	return []RiskRedLine{{
 		Category: RiskRedLineCore,
-		Detail:   "loopcoder core paths changed: " + strings.Join(matches, ", "),
+		Detail:   "loopcoder core paths changed: " + strings.Join(matches, ", ") + "; human rebuild and tick restart required before changes take effect",
 	}}
 }
 
@@ -332,11 +332,14 @@ func isLoopcoderCorePath(file string) bool {
 	prefixes := []string{
 		"cmd/loopcoder/",
 		"hooks/",
+		"internal/agent/",
+		"internal/attestation/",
 		"internal/compile/",
+		"internal/config/",
 		"internal/conductorhooks/",
 		"internal/guardrails/",
 		"internal/loopreview/",
-		"internal/vcs/github/",
+		"internal/vcs/",
 		"internal/verify/",
 		"internal/worker/",
 	}
