@@ -150,6 +150,12 @@ Move storage behind a new backend.
 	if artifact.Edges[0].From != artifact.Nodes[0].ID || artifact.Edges[0].To != artifact.Nodes[1].ID {
 		t.Fatalf("artifact edge = %#v, want doc node -> code node", artifact.Edges[0])
 	}
+	if artifact.Ordering == nil || artifact.Ordering.CriticalPathETA != 2 {
+		t.Fatalf("artifact ordering = %#v, want critical path ETA 2", artifact.Ordering)
+	}
+	if got := orderNodeRefs(artifact.Ordering.Ready); !reflect.DeepEqual(got, []string{"replace-storage-engine/doc-1"}) {
+		t.Fatalf("artifact ready = %#v, want doc slice first", got)
+	}
 }
 
 func TestCompileEpicDAGRerunPatchesWithoutApproval(t *testing.T) {
@@ -276,6 +282,104 @@ func TestCompileExplicitNeedsReferenceScheme(t *testing.T) {
 	}
 }
 
+func TestCompileEpicCondensesCycleIntoAtomicSlice(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Untangle modules
+- code: Move module A (needs: code-2)
+- code: Move module B (needs: code-1)
+- code: Move module C (needs: code-1)
+`
+	writer := newFakeIssueWriter()
+	report, _, files := runCompileTestFiles(t, writer, roadmap)
+
+	if len(report.Created) != 2 {
+		t.Fatalf("created = %#v, want atomic cycle issue plus dependent issue", report.Created)
+	}
+	if !strings.Contains(report.Created[0].Title, "Atomic slice") {
+		t.Fatalf("first issue title = %q, want atomic slice", report.Created[0].Title)
+	}
+	if !reflect.DeepEqual(report.Created[1].BlockedBy, []int{1}) {
+		t.Fatalf("dependent blocked_by = %#v, want atomic issue #1", report.Created[1].BlockedBy)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if len(artifact.Nodes) != 2 || !artifact.Nodes[0].Atomic {
+		t.Fatalf("artifact nodes = %#v, want first node as atomic cycle", artifact.Nodes)
+	}
+	if got := memberRefs(artifact.Nodes[0].AtomicMembers); !reflect.DeepEqual(got, []string{"untangle-modules/code-1", "untangle-modules/code-2"}) {
+		t.Fatalf("atomic members = %#v", got)
+	}
+	if artifact.Ordering == nil || len(artifact.Ordering.AtomicSlices) != 1 {
+		t.Fatalf("ordering atomic slices = %#v, want one atomic slice", artifact.Ordering)
+	}
+	if got := report.EpicDAGs[0].AtomicSlices; len(got) != 1 || !strings.Contains(got[0], "code-1") || !strings.Contains(got[0], "code-2") {
+		t.Fatalf("report atomic slices = %#v, want member refs surfaced", got)
+	}
+}
+
+func TestComputeEpicOrderingReadySetCriticalPathAndTieBreaks(t *testing.T) {
+	ordering, err := computeEpicOrdering([]EpicSliceNode{
+		{ID: "z", Ref: "epic/z", Completed: true},
+		{ID: "a", Ref: "epic/a"},
+		{ID: "b", Ref: "epic/b"},
+		{ID: "c", Ref: "epic/c", DependsOn: []string{"z"}},
+		{ID: "d", Ref: "epic/d"},
+		{ID: "a1", Ref: "epic/a1", DependsOn: []string{"a"}},
+		{ID: "b1", Ref: "epic/b1", DependsOn: []string{"b"}},
+		{ID: "b2", Ref: "epic/b2", DependsOn: []string{"b1"}},
+	})
+	if err != nil {
+		t.Fatalf("computeEpicOrdering returned error: %v", err)
+	}
+
+	if got, want := orderNodeRefs(ordering.Ready), []string{"epic/b", "epic/a", "epic/c", "epic/d"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ready order = %#v, want %#v", got, want)
+	}
+	if got, want := ordering.CriticalPath, []string{"epic/b", "epic/b1", "epic/b2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("critical path = %#v, want %#v", got, want)
+	}
+	if ordering.CriticalPathETA != 3 {
+		t.Fatalf("critical path ETA = %d, want 3", ordering.CriticalPathETA)
+	}
+	if len(ordering.Layers) != 3 {
+		t.Fatalf("layers = %#v, want three Kahn layers", ordering.Layers)
+	}
+}
+
+func TestCompileEpicIncludesMockedGoListBackbone(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Replace storage engine
+- code: Add storage adapter
+`
+	writer := newFakeIssueWriter()
+	files := map[string]string{
+		filepath.Join("repo", RoadmapFilename): roadmap,
+	}
+	report := runCompileTestWithDeps(t, writer, files, Deps{
+		GoListBackbone: func(context.Context, string) (GoListBackbone, error) {
+			return GoListBackbone{
+				Tool:      "go list",
+				Pattern:   "./...",
+				Available: true,
+				Packages: []GoListPackage{
+					{ImportPath: "example.com/repo/internal/storage", Dir: "internal/storage", Name: "storage"},
+					{ImportPath: "example.com/repo/internal/api", Dir: "internal/api", Name: "api"},
+				},
+				Edges: []GoListEdge{{From: "example.com/repo/internal/storage", To: "example.com/repo/internal/api"}},
+			}, nil
+		},
+	})
+
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if artifact.GoListBackbone == nil || !artifact.GoListBackbone.Available {
+		t.Fatalf("go list backbone = %#v, want available mocked backbone", artifact.GoListBackbone)
+	}
+	if len(artifact.GoListBackbone.Packages) != 2 || len(artifact.GoListBackbone.Edges) != 1 {
+		t.Fatalf("go list backbone = %#v, want two packages and one edge", artifact.GoListBackbone)
+	}
+}
+
 func runCompileTest(t *testing.T, writer *fakeIssueWriter, roadmap string) (Report, string) {
 	t.Helper()
 	report, written, _ := runCompileTestFiles(t, writer, roadmap)
@@ -293,11 +397,19 @@ func runCompileTestFiles(t *testing.T, writer *fakeIssueWriter, roadmap string) 
 
 func runCompileTestWithFiles(t *testing.T, writer *fakeIssueWriter, files map[string]string) Report {
 	t.Helper()
+	return runCompileTestWithDeps(t, writer, files, Deps{})
+}
+
+func runCompileTestWithDeps(t *testing.T, writer *fakeIssueWriter, files map[string]string, extra Deps) Report {
+	t.Helper()
+	deps := Deps{
+		GoListBackbone: extra.GoListBackbone,
+	}
 	report, err := Run(context.Background(), Options{
 		RepoPath: "repo",
 		Writer:   writer,
 		Now:      time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
-	}, Deps{
+	}, mergeTestDeps(deps, Deps{
 		ReadFile: func(name string) ([]byte, error) {
 			data, ok := files[name]
 			if !ok {
@@ -318,11 +430,30 @@ func runCompileTestWithFiles(t *testing.T, writer *fakeIssueWriter, files map[st
 			}
 			return fakeFileInfo{name: filepath.Base(name)}, nil
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	return report
+}
+
+func mergeTestDeps(first, second Deps) Deps {
+	if first.ReadFile == nil {
+		first.ReadFile = second.ReadFile
+	}
+	if first.WriteFile == nil {
+		first.WriteFile = second.WriteFile
+	}
+	if first.MkdirAll == nil {
+		first.MkdirAll = second.MkdirAll
+	}
+	if first.Stat == nil {
+		first.Stat = second.Stat
+	}
+	if first.GoListBackbone == nil {
+		first.GoListBackbone = second.GoListBackbone
+	}
+	return first
 }
 
 func readEpicArtifactTest(t *testing.T, files map[string]string, entry EpicDAGEntry) EpicSliceDAGArtifact {
@@ -500,4 +631,12 @@ func insertLineAfterContaining(text, needle, newLine string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func memberRefs(members []EpicAtomicMember) []string {
+	out := make([]string, 0, len(members))
+	for _, member := range members {
+		out = append(out, member.Ref)
+	}
+	return out
 }

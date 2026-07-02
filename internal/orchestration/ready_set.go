@@ -247,18 +247,24 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 			Reason: "dependencies completed; no open PR; no live local attempt",
 		})
 	}
+	epicOrdering, orderingHints, err := loadEpicOrderingHints(opts.RepoPath)
+	if err != nil {
+		return report.ReadySetReport{}, err
+	}
+	applyEpicOrderingHints(ready, orderingHints)
 
 	runID := runIDPtr(opts.RunID)
 	return report.ReadySetReport{
-		Version:     1,
-		Repo:        repoName,
-		RepoPath:    filepath.ToSlash(opts.RepoPath),
-		BaseBranch:  opts.BaseBranch,
-		RunID:       runID,
-		GeneratedAt: state.FormatTimestamp(opts.Now),
-		Ready:       ready,
-		Blocked:     blocked,
-		Summary:     summarizeReadySet(ready, blocked),
+		Version:      1,
+		Repo:         repoName,
+		RepoPath:     filepath.ToSlash(opts.RepoPath),
+		BaseBranch:   opts.BaseBranch,
+		RunID:        runID,
+		GeneratedAt:  state.FormatTimestamp(opts.Now),
+		Ready:        ready,
+		Blocked:      blocked,
+		EpicOrdering: epicOrdering,
+		Summary:      summarizeReadySet(ready, blocked),
 	}, nil
 }
 
