@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -50,6 +51,9 @@ const (
 	TickStopAttemptLoadFailed         = "attempt-load-failed"
 	TickStopDispatchWaveFailed        = "dispatch-wave-failed"
 	TickStopNoReviewablePRsDispatched = "no-reviewable-prs-dispatched"
+
+	tickPendingPromotionEvent  = "tick.pending_promotion"
+	tickStatusPendingPromotion = "pending-promotion"
 )
 
 type CompileFunc func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
@@ -94,28 +98,29 @@ type TickOptions struct {
 }
 
 type TickReport struct {
-	Version        int                       `json:"version"`
-	Repo           string                    `json:"repo"`
-	RepoPath       string                    `json:"repo_path"`
-	BaseBranch     string                    `json:"base_branch"`
-	PreProdBranch  string                    `json:"pre_prod_branch"`
-	RunID          string                    `json:"run_id"`
-	Status         string                    `json:"status"`
-	StopReason     string                    `json:"stop_reason"`
-	StartedAt      string                    `json:"started_at"`
-	FinishedAt     string                    `json:"finished_at"`
-	Compile        compiler.Report           `json:"compile"`
-	ReadySet       report.ReadySetReport     `json:"ready_set"`
-	DispatchWave   *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
-	Reviews        []TickReviewResult        `json:"reviews"`
-	RiskGates      []TickRiskGateResult      `json:"risk_gates"`
-	PreProdMerges  []TickPreProdMergeResult  `json:"pre_prod_merges"`
-	PreProdHealth  []TickPreProdHealthResult `json:"pre_prod_health"`
-	PreProdReverts []TickPreProdRevertResult `json:"pre_prod_reverts"`
-	NeedsHuman     []TickIssue               `json:"needs_human"`
-	Failures       []TickIssue               `json:"failures"`
-	StatePush      *TickStatePush            `json:"state_push,omitempty"`
-	Summary        TickSummary               `json:"summary"`
+	Version          int                       `json:"version"`
+	Repo             string                    `json:"repo"`
+	RepoPath         string                    `json:"repo_path"`
+	BaseBranch       string                    `json:"base_branch"`
+	PreProdBranch    string                    `json:"pre_prod_branch"`
+	RunID            string                    `json:"run_id"`
+	Status           string                    `json:"status"`
+	StopReason       string                    `json:"stop_reason"`
+	StartedAt        string                    `json:"started_at"`
+	FinishedAt       string                    `json:"finished_at"`
+	Compile          compiler.Report           `json:"compile"`
+	ReadySet         report.ReadySetReport     `json:"ready_set"`
+	DispatchWave     *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
+	Reviews          []TickReviewResult        `json:"reviews"`
+	RiskGates        []TickRiskGateResult      `json:"risk_gates"`
+	PreProdMerges    []TickPreProdMergeResult  `json:"pre_prod_merges"`
+	PreProdHealth    []TickPreProdHealthResult `json:"pre_prod_health"`
+	PreProdReverts   []TickPreProdRevertResult `json:"pre_prod_reverts"`
+	PendingPromotion []TickPendingPromotion    `json:"pending_promotion,omitempty"`
+	NeedsHuman       []TickIssue               `json:"needs_human"`
+	Failures         []TickIssue               `json:"failures"`
+	StatePush        *TickStatePush            `json:"state_push,omitempty"`
+	Summary          TickSummary               `json:"summary"`
 }
 
 type TickReviewResult struct {
@@ -136,6 +141,20 @@ type TickIssue struct {
 	Issue              int                       `json:"issue,omitempty"`
 	PR                 string                    `json:"pr,omitempty"`
 	Detail             string                    `json:"detail"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
+}
+
+type TickPendingPromotion struct {
+	RunID              string                    `json:"run_id,omitempty"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	PRNumber           int                       `json:"pr_number,omitempty"`
+	Branch             string                    `json:"branch,omitempty"`
+	Head               string                    `json:"head,omitempty"`
+	SHA                string                    `json:"sha,omitempty"`
+	URL                string                    `json:"url,omitempty"`
+	Status             string                    `json:"status,omitempty"`
+	Evidence           string                    `json:"evidence,omitempty"`
 	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
@@ -218,6 +237,7 @@ type TickSummary struct {
 	RiskGateNeedsHumanCount int `json:"risk_gate_needs_human_count"`
 	PreProdMergeCount       int `json:"pre_prod_merge_count"`
 	PreProdRevertCount      int `json:"pre_prod_revert_count"`
+	PendingPromotionCount   int `json:"pending_promotion_count,omitempty"`
 	NeedsHumanCount         int `json:"needs_human_count"`
 	FailureCount            int `json:"failure_count"`
 }
@@ -264,6 +284,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		tickReport.StopReason = stopReason
 		tickReport.FinishedAt = state.FormatTimestamp(finished)
 		attachTickConfiguredEvidence(&tickReport, opts.ConfiguredEvidence)
+		tickReport.PendingPromotion = loadTickPendingPromotionLedger(opts.RepoPath, opts.PreProdBranch)
 		tickReport.Summary = summarizeTick(tickReport)
 		return normalizeTickReport(tickReport), nil
 	}
@@ -890,6 +911,9 @@ func tickNeedsHumanStopReason(items []TickIssue) string {
 }
 
 func pushTickState(ctx context.Context, opts TickOptions, tickReport *TickReport) {
+	if err := recordTickPendingPromotionLedger(opts, tickReport); err != nil {
+		tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "state-push", Detail: err.Error()})
+	}
 	result, err := opts.StatePush(ctx, statebranch.PushOptions{
 		RepoPath: opts.RepoPath,
 		RunID:    opts.RunID,
@@ -947,6 +971,36 @@ func RenderTickText(report TickReport) string {
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Ready set")
 	fmt.Fprintf(&out, "- ready=%d blocked=%d\n", report.Summary.ReadyCount, report.Summary.BlockedCount)
+
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Pending promotion")
+	if len(report.PendingPromotion) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, item := range report.PendingPromotion {
+			fmt.Fprintf(&out, "- %s %s", formatTickPendingPromotionTarget(item), firstNonEmpty(item.Status, tickStatusPendingPromotion))
+			if strings.TrimSpace(item.Branch) != "" {
+				fmt.Fprintf(&out, " branch=%s", item.Branch)
+			}
+			fmt.Fprintln(&out)
+			if strings.TrimSpace(item.RunID) != "" {
+				fmt.Fprintf(&out, "  run_id: %s\n", item.RunID)
+			}
+			if strings.TrimSpace(item.Head) != "" {
+				fmt.Fprintf(&out, "  head: %s\n", item.Head)
+			}
+			if strings.TrimSpace(item.SHA) != "" {
+				fmt.Fprintf(&out, "  sha: %s\n", item.SHA)
+			}
+			if strings.TrimSpace(item.URL) != "" {
+				fmt.Fprintf(&out, "  url: %s\n", item.URL)
+			}
+			if strings.TrimSpace(item.Evidence) != "" {
+				fmt.Fprintf(&out, "  evidence: %s\n", item.Evidence)
+			}
+			renderTickConfiguredEvidence(&out, item.ConfiguredEvidence)
+		}
+	}
 
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Dispatch")
@@ -1198,6 +1252,7 @@ func normalizeTickReport(report TickReport) TickReport {
 	if report.PreProdReverts == nil {
 		report.PreProdReverts = []TickPreProdRevertResult{}
 	}
+	report.PendingPromotion = normalizeTickPendingPromotionItems(report.PendingPromotion, report.PreProdBranch, "")
 	if report.NeedsHuman == nil {
 		report.NeedsHuman = []TickIssue{}
 	}
@@ -1219,6 +1274,7 @@ func summarizeTick(report TickReport) TickSummary {
 		CompiledClosedCount:    report.Compile.Summary.ClosedCount,
 		ReadyCount:             len(report.ReadySet.Ready),
 		BlockedCount:           len(report.ReadySet.Blocked),
+		PendingPromotionCount:  len(report.PendingPromotion),
 		NeedsHumanCount:        len(report.NeedsHuman),
 		FailureCount:           len(report.Failures),
 	}
@@ -1396,6 +1452,441 @@ func renderTickIssueSection(out *bytes.Buffer, title string, issues []TickIssue)
 		fmt.Fprintf(out, "- %s: %s\n", target, item.Detail)
 		renderTickConfiguredEvidence(out, item.ConfiguredEvidence)
 	}
+}
+
+type tickPendingPromotionLedgerDetails struct {
+	Version          int                    `json:"version,omitempty"`
+	Repo             string                 `json:"repo,omitempty"`
+	RepoPath         string                 `json:"repo_path,omitempty"`
+	RunID            string                 `json:"run_id,omitempty"`
+	PreProdBranch    string                 `json:"pre_prod_branch,omitempty"`
+	PendingPromotion []TickPendingPromotion `json:"pending_promotion,omitempty"`
+}
+
+type tickLedgerEvent struct {
+	Timestamp string          `json:"ts"`
+	RunID     string          `json:"run_id"`
+	Event     string          `json:"event,omitempty"`
+	Outcome   string          `json:"outcome,omitempty"`
+	Status    string          `json:"status,omitempty"`
+	Details   json.RawMessage `json:"details,omitempty"`
+}
+
+type tickLedgerRecord struct {
+	event tickLedgerEvent
+	path  string
+	index int
+	line  string
+}
+
+func recordTickPendingPromotionLedger(opts TickOptions, report *TickReport) error {
+	attachTickConfiguredEvidence(report, opts.ConfiguredEvidence)
+	pending := tickPendingPromotionFromReport(*report)
+	if len(pending) == 0 {
+		return nil
+	}
+	detailsJSON, err := json.Marshal(tickPendingPromotionLedgerDetails{
+		Version:          1,
+		Repo:             report.Repo,
+		RepoPath:         filepath.ToSlash(opts.RepoPath),
+		RunID:            report.RunID,
+		PreProdBranch:    report.PreProdBranch,
+		PendingPromotion: pending,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal pending-promotion ledger event: %w", err)
+	}
+	timestamp := firstNonEmpty(report.FinishedAt, report.StartedAt)
+	if err := state.AppendEvent(opts.RepoPath, report.RunID, state.Event{
+		Timestamp: timestamp,
+		RunID:     report.RunID,
+		JobID:     "tick",
+		Issue:     0,
+		Phase:     "report",
+		Status:    tickStatusPendingPromotion,
+		LogBytes:  0,
+		Event:     tickPendingPromotionEvent,
+		Outcome:   tickStatusPendingPromotion,
+		Details:   json.RawMessage(detailsJSON),
+	}); err != nil {
+		return fmt.Errorf("append pending-promotion ledger event: %w", err)
+	}
+	return nil
+}
+
+func loadTickPendingPromotionLedger(repoPath, preProdBranch string) []TickPendingPromotion {
+	records := readTickLedgerRecords(repoPath)
+	if len(records) == 0 {
+		return nil
+	}
+
+	pending := map[string]TickPendingPromotion{}
+	for _, record := range records {
+		eventName := strings.TrimSpace(record.event.Event)
+		switch eventName {
+		case tickPendingPromotionEvent:
+			var details tickPendingPromotionLedgerDetails
+			if !unmarshalTickLedgerDetails(record.event.Details, &details) {
+				continue
+			}
+			if !sameTickPreProdBranch(firstNonEmpty(details.PreProdBranch, preProdBranch), preProdBranch) {
+				continue
+			}
+			runID := firstNonEmpty(details.RunID, record.event.RunID)
+			for _, item := range normalizeTickPendingPromotionItems(details.PendingPromotion, firstNonEmpty(details.PreProdBranch, preProdBranch), runID) {
+				pending[tickPendingPromotionKey(item)] = item
+			}
+		case promoteLedgerEvent:
+			var report PromoteReport
+			if !unmarshalTickLedgerDetails(record.event.Details, &report) {
+				continue
+			}
+			if !sameTickPreProdBranch(report.PreProdBranch, preProdBranch) {
+				continue
+			}
+			if tickPromoteClearsPending(record.event, report) {
+				pending = map[string]TickPendingPromotion{}
+				continue
+			}
+			for _, kicked := range report.KickedBack {
+				if kicked.Status == PromoteStatusSucceeded {
+					removeTickPendingPromotion(pending, kicked)
+				}
+			}
+		}
+	}
+
+	out := make([]TickPendingPromotion, 0, len(pending))
+	for _, item := range pending {
+		out = append(out, item)
+	}
+	sortTickPendingPromotion(out)
+	return out
+}
+
+func readTickLedgerRecords(repoPath string) []tickLedgerRecord {
+	paths := tickLedgerEventPaths(repoPath)
+	if len(paths) == 0 {
+		return nil
+	}
+	seenLines := map[string]bool{}
+	records := make([]tickLedgerRecord, 0)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		for i, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || seenLines[line] {
+				continue
+			}
+			seenLines[line] = true
+			var event tickLedgerEvent
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				continue
+			}
+			records = append(records, tickLedgerRecord{event: event, path: path, index: i, line: line})
+		}
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		leftTime, leftOK := parseTickLedgerTimestamp(records[i].event.Timestamp)
+		rightTime, rightOK := parseTickLedgerTimestamp(records[j].event.Timestamp)
+		if leftOK && rightOK && !leftTime.Equal(rightTime) {
+			return leftTime.Before(rightTime)
+		}
+		if leftOK != rightOK {
+			return leftOK
+		}
+		if records[i].event.Timestamp != records[j].event.Timestamp {
+			return records[i].event.Timestamp < records[j].event.Timestamp
+		}
+		if records[i].event.RunID != records[j].event.RunID {
+			return records[i].event.RunID < records[j].event.RunID
+		}
+		if records[i].path != records[j].path {
+			return records[i].path < records[j].path
+		}
+		return records[i].index < records[j].index
+	})
+	return records
+}
+
+func tickLedgerEventPaths(repoPath string) []string {
+	roots := []string{state.RunsRoot(repoPath)}
+	stateBranchRoot := filepath.Join(repoPath, ".loopcoder", "state-branch")
+	if entries, err := os.ReadDir(stateBranchRoot); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				roots = append(roots, filepath.Join(stateBranchRoot, entry.Name(), "runs"))
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	paths := make([]string, 0)
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(root, entry.Name(), "events.jsonl")
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func parseTickLedgerTimestamp(value string) (time.Time, bool) {
+	t, err := state.ParseTimestamp(value)
+	return t, err == nil
+}
+
+func unmarshalTickLedgerDetails(data json.RawMessage, target any) bool {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false
+	}
+	return json.Unmarshal(data, target) == nil
+}
+
+func tickPromoteClearsPending(event tickLedgerEvent, report PromoteReport) bool {
+	switch strings.TrimSpace(firstNonEmpty(event.Outcome, report.Promoted.Status)) {
+	case PromoteOutcomePromoted, PromoteOutcomeSkippedAsDone:
+		return true
+	}
+	return report.Status == PromoteStatusSucceeded &&
+		(report.Promoted.Status == PromoteStatusSucceeded || report.Promoted.AlreadyUpToDate)
+}
+
+func removeTickPendingPromotion(pending map[string]TickPendingPromotion, kicked PromoteKickBackResult) {
+	for key, item := range pending {
+		if tickKickBackMatchesPending(kicked, item) {
+			delete(pending, key)
+		}
+	}
+}
+
+func tickKickBackMatchesPending(kicked PromoteKickBackResult, item TickPendingPromotion) bool {
+	if kicked.PRNumber > 0 && item.PRNumber > 0 {
+		return kicked.PRNumber == item.PRNumber
+	}
+	kickItem := normalizeKickBackItem(kicked.Item)
+	if kickItem != "" {
+		if item.PRNumber > 0 && kickItem == fmt.Sprintf("#%d", item.PRNumber) {
+			return true
+		}
+		if strings.EqualFold(kickItem, normalizeKickBackItem(item.PR)) {
+			return true
+		}
+		if strings.EqualFold(kickItem, strings.TrimSpace(item.SHA)) || strings.EqualFold(kickItem, strings.TrimSpace(item.Head)) {
+			return true
+		}
+	}
+	if strings.TrimSpace(kicked.SHA) != "" && sameGitSHA(kicked.SHA, item.SHA) {
+		return true
+	}
+	return strings.TrimSpace(kicked.RevertedSHA) != "" && sameGitSHA(kicked.RevertedSHA, item.SHA)
+}
+
+func tickPendingPromotionFromReport(report TickReport) []TickPendingPromotion {
+	if len(report.PreProdMerges) == 0 {
+		return nil
+	}
+	pending := make([]TickPendingPromotion, 0, len(report.PreProdMerges))
+	for _, merged := range report.PreProdMerges {
+		if merged.Status != TickStatusSucceeded || tickPreProdMergeReverted(report, merged) || !tickPreProdMergeReady(report, merged) {
+			continue
+		}
+		item := TickPendingPromotion{
+			RunID:              report.RunID,
+			Issue:              merged.Issue,
+			PR:                 merged.PR,
+			PRNumber:           merged.PRNumber,
+			Branch:             firstNonEmpty(merged.Branch, report.PreProdBranch),
+			Head:               merged.Head,
+			SHA:                merged.SHA,
+			URL:                merged.URL,
+			Status:             tickStatusPendingPromotion,
+			ConfiguredEvidence: copyConfiguredEvidence(merged.ConfiguredEvidence),
+		}
+		if review, ok := tickReviewForPreProdMerge(report.Reviews, merged); ok {
+			item.Evidence = review.Evidence
+			if len(item.ConfiguredEvidence) == 0 {
+				item.ConfiguredEvidence = copyConfiguredEvidence(review.ConfiguredEvidence)
+			}
+		}
+		pending = append(pending, item)
+	}
+	return normalizeTickPendingPromotionItems(pending, report.PreProdBranch, report.RunID)
+}
+
+func tickPreProdMergeReverted(report TickReport, merged TickPreProdMergeResult) bool {
+	for _, reverted := range report.PreProdReverts {
+		if reverted.Status != TickStatusSucceeded {
+			continue
+		}
+		if tickReportTargetsMatch(merged.Issue, merged.PR, merged.PRNumber, reverted.Issue, reverted.PR, reverted.PRNumber) {
+			return true
+		}
+		if strings.TrimSpace(merged.SHA) != "" && sameGitSHA(merged.SHA, reverted.RevertedSHA) {
+			return true
+		}
+	}
+	return false
+}
+
+func tickPreProdMergeReady(report TickReport, merged TickPreProdMergeResult) bool {
+	seen := false
+	for _, health := range report.PreProdHealth {
+		if !tickReportTargetsMatch(merged.Issue, merged.PR, merged.PRNumber, health.Issue, health.PR, health.PRNumber) {
+			continue
+		}
+		seen = true
+		if health.Status == PreProdHealthStatusGreen {
+			return true
+		}
+	}
+	return !seen
+}
+
+func tickReviewForPreProdMerge(reviews []TickReviewResult, merged TickPreProdMergeResult) (TickReviewResult, bool) {
+	for _, review := range reviews {
+		if tickReportTargetsMatch(merged.Issue, merged.PR, merged.PRNumber, review.Issue, review.PR, review.PRNumber) {
+			return review, true
+		}
+	}
+	return TickReviewResult{}, false
+}
+
+func normalizeTickPendingPromotionItems(items []TickPendingPromotion, preProdBranch, runID string) []TickPendingPromotion {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]TickPendingPromotion, 0, len(items))
+	for _, item := range items {
+		item.RunID = strings.TrimSpace(firstNonEmpty(item.RunID, runID))
+		item.PR = strings.TrimSpace(item.PR)
+		item.Branch = strings.TrimSpace(firstNonEmpty(item.Branch, preProdBranch))
+		item.Head = strings.TrimSpace(item.Head)
+		item.SHA = strings.TrimSpace(item.SHA)
+		item.URL = strings.TrimSpace(item.URL)
+		item.Status = strings.TrimSpace(firstNonEmpty(item.Status, tickStatusPendingPromotion))
+		item.Evidence = strings.TrimSpace(item.Evidence)
+		item.ConfiguredEvidence = normalizeConfiguredEvidence(item.ConfiguredEvidence)
+		if item.PRNumber == 0 {
+			if number, ok := parseTickPRNumber(item.PR); ok {
+				item.PRNumber = number
+			}
+		}
+		if item.Issue <= 0 && item.PRNumber <= 0 && item.PR == "" && item.SHA == "" && item.Head == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	sortTickPendingPromotion(out)
+	return out
+}
+
+func sortTickPendingPromotion(items []TickPendingPromotion) {
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].PRNumber != items[j].PRNumber {
+			if items[i].PRNumber == 0 {
+				return false
+			}
+			if items[j].PRNumber == 0 {
+				return true
+			}
+			return items[i].PRNumber < items[j].PRNumber
+		}
+		if items[i].Issue != items[j].Issue {
+			if items[i].Issue == 0 {
+				return false
+			}
+			if items[j].Issue == 0 {
+				return true
+			}
+			return items[i].Issue < items[j].Issue
+		}
+		if items[i].RunID != items[j].RunID {
+			return items[i].RunID < items[j].RunID
+		}
+		return tickPendingPromotionKey(items[i]) < tickPendingPromotionKey(items[j])
+	})
+}
+
+func tickPendingPromotionKey(item TickPendingPromotion) string {
+	branch := strings.ToLower(strings.TrimSpace(item.Branch))
+	if item.PRNumber > 0 {
+		return branch + "|pr|" + strconv.Itoa(item.PRNumber)
+	}
+	if strings.TrimSpace(item.PR) != "" {
+		return branch + "|pr|" + strings.ToLower(strings.TrimSpace(item.PR))
+	}
+	if item.Issue > 0 {
+		return branch + "|issue|" + strconv.Itoa(item.Issue)
+	}
+	if strings.TrimSpace(item.SHA) != "" {
+		return branch + "|sha|" + strings.ToLower(strings.TrimSpace(item.SHA))
+	}
+	return branch + "|head|" + strings.ToLower(strings.TrimSpace(item.Head))
+}
+
+func tickReportTargetsMatch(leftIssue int, leftPR string, leftPRNumber int, rightIssue int, rightPR string, rightPRNumber int) bool {
+	if leftPRNumber == 0 {
+		if number, ok := parseTickPRNumber(leftPR); ok {
+			leftPRNumber = number
+		}
+	}
+	if rightPRNumber == 0 {
+		if number, ok := parseTickPRNumber(rightPR); ok {
+			rightPRNumber = number
+		}
+	}
+	if leftPRNumber > 0 && rightPRNumber > 0 {
+		return leftPRNumber == rightPRNumber
+	}
+	if strings.TrimSpace(leftPR) != "" && strings.TrimSpace(rightPR) != "" {
+		return strings.EqualFold(strings.TrimSpace(leftPR), strings.TrimSpace(rightPR))
+	}
+	return leftIssue > 0 && rightIssue > 0 && leftIssue == rightIssue
+}
+
+func sameTickPreProdBranch(left, right string) bool {
+	right = strings.TrimSpace(right)
+	if right == "" {
+		return true
+	}
+	left = strings.TrimSpace(left)
+	return left == "" || strings.EqualFold(left, right)
+}
+
+func formatTickPendingPromotionTarget(item TickPendingPromotion) string {
+	target := strings.TrimSpace(item.PR)
+	if item.PRNumber > 0 {
+		target = fmt.Sprintf("PR #%d", item.PRNumber)
+	} else if target != "" {
+		target = "PR " + target
+	} else if item.Issue > 0 {
+		target = fmt.Sprintf("issue #%d", item.Issue)
+	} else if strings.TrimSpace(item.SHA) != "" {
+		target = "commit " + item.SHA
+	} else {
+		target = "item"
+	}
+	if item.Issue > 0 && !strings.EqualFold(target, fmt.Sprintf("issue #%d", item.Issue)) {
+		target += fmt.Sprintf(" issue #%d", item.Issue)
+	}
+	return target
 }
 
 type tickReviewCandidate struct {

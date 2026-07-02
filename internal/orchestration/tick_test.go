@@ -13,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -193,6 +194,210 @@ func TestTickConfiguredEvidenceAbsentOmitsJSONAndText(t *testing.T) {
 	text := RenderTickText(report)
 	if strings.Contains(text, "configured_evidence") {
 		t.Fatalf("tick text unexpectedly contains configured_evidence:\n%s", text)
+	}
+}
+
+func TestTickPendingPromotionSurfacesLedgerStateInJSONAndText(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 33, "https://github.com/owner/repo/pull/330")
+	opts.ConfiguredEvidence = []config.EvidenceArtifact{
+		{ProjectType: "website", PreviewURL: "https://preview.example.com/pr-330"},
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if len(report.PendingPromotion) != 1 {
+		t.Fatalf("pending promotion = %#v, want one item", report.PendingPromotion)
+	}
+	pending := report.PendingPromotion[0]
+	if pending.Issue != 33 || pending.PRNumber != 330 || pending.Branch != "pre-prod" || pending.Status != tickStatusPendingPromotion {
+		t.Fatalf("pending promotion item = %#v", pending)
+	}
+	if pending.Evidence != "review passed" {
+		t.Fatalf("pending evidence = %q, want review evidence", pending.Evidence)
+	}
+	if !reflect.DeepEqual(pending.ConfiguredEvidence, opts.ConfiguredEvidence) {
+		t.Fatalf("pending configured evidence = %#v, want %#v", pending.ConfiguredEvidence, opts.ConfiguredEvidence)
+	}
+	if report.Summary.PendingPromotionCount != 1 {
+		t.Fatalf("summary pending count = %d, want 1", report.Summary.PendingPromotionCount)
+	}
+
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	for _, want := range []string{
+		`"pending_promotion"`,
+		`"pr_number": 330`,
+		`"status": "pending-promotion"`,
+		`"evidence": "review passed"`,
+		`"preview_url": "https://preview.example.com/pr-330"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing %q:\n%s", want, string(data))
+		}
+	}
+
+	text := RenderTickText(report)
+	for _, want := range []string{
+		"Pending promotion",
+		"PR #330 issue #33 pending-promotion branch=pre-prod",
+		"evidence: review passed",
+		"configured_evidence: website preview_url=https://preview.example.com/pr-330",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("tick text missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestTickPendingPromotionAbsentOmitsJSON(t *testing.T) {
+	report := normalizeTickReport(TickReport{
+		Version:       TickReportVersion,
+		Repo:          "owner/repo",
+		RepoPath:      "/repo",
+		BaseBranch:    "main",
+		PreProdBranch: "pre-prod",
+		RunID:         "run-test-empty",
+		Status:        TickStatusNoReadyWork,
+		StopReason:    TickStopNoReadyWork,
+	})
+
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	if strings.Contains(string(data), "pending_promotion") || strings.Contains(string(data), "pending_promotion_count") {
+		t.Fatalf("tick JSON unexpectedly contains pending promotion fields:\n%s", string(data))
+	}
+	text := RenderTickText(report)
+	if !strings.Contains(text, "Pending promotion\n- none") {
+		t.Fatalf("tick text missing empty pending promotion section:\n%s", text)
+	}
+}
+
+func TestTickPendingPromotionPromoteLedgerClearsDurablePending(t *testing.T) {
+	repo := t.TempDir()
+	appendPendingPromotionEvent(t, repo, "run-20260702T120000Z-wave", "2026-07-02T12:00:00Z", TickPendingPromotion{
+		RunID:    "run-20260702T120000Z-wave",
+		Issue:    44,
+		PR:       "https://github.com/owner/repo/pull/440",
+		PRNumber: 440,
+		Branch:   "pre-prod",
+		SHA:      "merge-sha",
+		Status:   tickStatusPendingPromotion,
+		Evidence: "ready for promotion",
+	})
+	appendPromoteAttemptEvent(t, repo, "run-20260702T130000Z-wave", "2026-07-02T13:00:00Z", PromoteReport{
+		Version:       PromoteReportVersion,
+		RepoPath:      repo,
+		RunID:         "run-20260702T130000Z-wave",
+		PreProdBranch: "pre-prod",
+		MainBranch:    "main",
+		Status:        PromoteStatusSucceeded,
+		Promoted: PromoteMainResult{
+			PreProdBranch: "pre-prod",
+			MainBranch:    "main",
+			Status:        PromoteStatusSucceeded,
+			SHA:           "main-sha",
+		},
+	})
+
+	pending := loadTickPendingPromotionLedger(repo, "pre-prod")
+	if len(pending) != 0 {
+		t.Fatalf("pending promotion = %#v, want cleared by promote ledger", pending)
+	}
+}
+
+func TestTickPendingPromotionKickBackLedgerRemovesOnlyKickedItem(t *testing.T) {
+	repo := t.TempDir()
+	appendPendingPromotionEvent(t, repo, "run-20260702T120000Z-wave", "2026-07-02T12:00:00Z",
+		TickPendingPromotion{Issue: 45, PRNumber: 450, Branch: "pre-prod", SHA: "merge-a", Status: tickStatusPendingPromotion},
+		TickPendingPromotion{Issue: 46, PRNumber: 460, Branch: "pre-prod", SHA: "merge-b", Status: tickStatusPendingPromotion},
+	)
+	appendPromoteAttemptEvent(t, repo, "run-20260702T130000Z-wave", "2026-07-02T13:00:00Z", PromoteReport{
+		Version:       PromoteReportVersion,
+		RepoPath:      repo,
+		RunID:         "run-20260702T130000Z-wave",
+		PreProdBranch: "pre-prod",
+		MainBranch:    "main",
+		Status:        PromoteStatusFailed,
+		KickedBack: []PromoteKickBackResult{{
+			Item:        "#450",
+			PRNumber:    450,
+			Branch:      "pre-prod",
+			RevertedSHA: "merge-a",
+			Status:      PromoteStatusSucceeded,
+		}},
+		Promoted: PromoteMainResult{
+			PreProdBranch: "pre-prod",
+			MainBranch:    "main",
+			Status:        PromoteStatusFailed,
+			Error:         "promotion failed",
+		},
+	})
+
+	pending := loadTickPendingPromotionLedger(repo, "pre-prod")
+	if len(pending) != 1 || pending[0].PRNumber != 460 {
+		t.Fatalf("pending promotion = %#v, want only PR #460 after kick-back", pending)
+	}
+}
+
+func TestTickHumanDecisionSectionsSurfaceInJSONAndText(t *testing.T) {
+	evidence := []config.EvidenceArtifact{{ProjectType: "cli", TestResults: "go test ./... passed"}}
+	report := normalizeTickReport(TickReport{
+		Version:       TickReportVersion,
+		Repo:          "owner/repo",
+		RepoPath:      "/repo",
+		BaseBranch:    "main",
+		PreProdBranch: "pre-prod",
+		RunID:         "run-test-sections",
+		Status:        TickStatusNeedsHuman,
+		StopReason:    TickStopReviewNeedsHuman,
+		NeedsHuman: []TickIssue{{
+			Step:               "loopreview",
+			Issue:              70,
+			PR:                 "https://github.com/owner/repo/pull/700",
+			Detail:             "manual review required",
+			ConfiguredEvidence: evidence,
+		}},
+		Failures: []TickIssue{{
+			Step:               "dispatch-wave",
+			Issue:              71,
+			Detail:             "worker failed",
+			ConfiguredEvidence: evidence,
+		}},
+	})
+
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	for _, want := range []string{
+		`"needs_human"`,
+		`"failures"`,
+		`"detail": "manual review required"`,
+		`"detail": "worker failed"`,
+		`"test_results": "go test ./... passed"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing %q:\n%s", want, string(data))
+		}
+	}
+
+	text := RenderTickText(report)
+	for _, want := range []string{
+		"Needs human",
+		"- loopreview #70 https://github.com/owner/repo/pull/700: manual review required",
+		"Failures",
+		"- dispatch-wave #71: worker failed",
+		"configured_evidence: cli test_results=go test ./... passed",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("tick text missing %q:\n%s", want, text)
+		}
 	}
 }
 
@@ -849,6 +1054,57 @@ func reviewReadyTickOptions(repo string, issue int, pr string) TickOptions {
 				Pushed: true,
 			}, nil
 		},
+	}
+}
+
+func appendPendingPromotionEvent(t *testing.T, repo, runID, timestamp string, pending ...TickPendingPromotion) {
+	t.Helper()
+	details, err := json.Marshal(tickPendingPromotionLedgerDetails{
+		Version:          1,
+		Repo:             "owner/repo",
+		RepoPath:         repo,
+		RunID:            runID,
+		PreProdBranch:    "pre-prod",
+		PendingPromotion: pending,
+	})
+	if err != nil {
+		t.Fatalf("Marshal pending-promotion details: %v", err)
+	}
+	if err := state.AppendEvent(repo, runID, state.Event{
+		Timestamp: timestamp,
+		RunID:     runID,
+		JobID:     "tick",
+		Phase:     "report",
+		Status:    tickStatusPendingPromotion,
+		LogBytes:  0,
+		Event:     tickPendingPromotionEvent,
+		Outcome:   tickStatusPendingPromotion,
+		Details:   json.RawMessage(details),
+	}); err != nil {
+		t.Fatalf("AppendEvent pending promotion: %v", err)
+	}
+}
+
+func appendPromoteAttemptEvent(t *testing.T, repo, runID, timestamp string, report PromoteReport) {
+	t.Helper()
+	report.RunID = runID
+	report.FinishedAt = timestamp
+	reportJSON, err := json.Marshal(normalizePromoteReport(report))
+	if err != nil {
+		t.Fatalf("Marshal promote report: %v", err)
+	}
+	if err := state.AppendEvent(repo, runID, state.Event{
+		Timestamp: timestamp,
+		RunID:     runID,
+		JobID:     "promote",
+		Phase:     "promote",
+		Status:    promoteLedgerOutcome(report),
+		LogBytes:  0,
+		Event:     promoteLedgerEvent,
+		Outcome:   promoteLedgerOutcome(report),
+		Details:   json.RawMessage(reportJSON),
+	}); err != nil {
+		t.Fatalf("AppendEvent promote attempt: %v", err)
 	}
 }
 
