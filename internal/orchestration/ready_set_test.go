@@ -212,6 +212,34 @@ func TestComputeReadySetUnknownDependencyFailsClosed(t *testing.T) {
 	}
 }
 
+func TestComputeReadySetNeedsHumanLabelIsNonReady(t *testing.T) {
+	result, err := ComputeReadySet(context.Background(), Options{
+		Reader: fakeReader{
+			repo: "owner/repo",
+			issues: []gh.Issue{
+				{Number: 35, Title: "Kicked back", State: "OPEN", Labels: []gh.Label{{Name: "needs-human"}}},
+			},
+		},
+		RepoPath:     "C:/repo",
+		BaseBranch:   "main",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeReadySet returned error: %v", err)
+	}
+	if len(result.Ready) != 0 {
+		t.Fatalf("ready = %#v, want none", result.Ready)
+	}
+	if len(result.Blocked) != 1 || result.Blocked[0].Classification != "needs-human" {
+		t.Fatalf("blocked = %#v, want needs-human", result.Blocked)
+	}
+	if !strings.Contains(result.Blocked[0].Reason, "needs-human") {
+		t.Fatalf("reason = %q, want needs-human label", result.Blocked[0].Reason)
+	}
+}
+
 func TestComputeReadySetHungAttemptWithLivePidBlocksAsLive(t *testing.T) {
 	pid := 2222
 	result, err := ComputeReadySet(context.Background(), Options{
