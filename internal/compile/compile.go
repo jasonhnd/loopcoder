@@ -49,10 +49,11 @@ type Options struct {
 }
 
 type Deps struct {
-	ReadFile  func(name string) ([]byte, error)
-	WriteFile func(name string, data []byte, perm fs.FileMode) error
-	MkdirAll  func(path string, perm fs.FileMode) error
-	Stat      func(name string) (fs.FileInfo, error)
+	ReadFile       func(name string) ([]byte, error)
+	WriteFile      func(name string, data []byte, perm fs.FileMode) error
+	MkdirAll       func(path string, perm fs.FileMode) error
+	Stat           func(name string) (fs.FileInfo, error)
+	GoListBackbone func(ctx context.Context, repoPath string) (GoListBackbone, error)
 }
 
 type Report struct {
@@ -88,39 +89,102 @@ type EpicDAGEntry struct {
 	ArtifactPath         string   `json:"artifact_path"`
 	PlanApprovalRequired bool     `json:"plan_approval_required"`
 	ChurnedMergedSlices  []string `json:"churned_merged_slices"`
+	Ready                []string `json:"ready"`
+	CriticalPath         []string `json:"critical_path"`
+	CriticalPathETA      int      `json:"critical_path_eta"`
+	AtomicSlices         []string `json:"atomic_slices"`
 }
 
 type EpicSliceDAGArtifact struct {
-	Version             int             `json:"version"`
-	EpicID              string          `json:"epic_id"`
-	EpicRef             string          `json:"epic_ref"`
-	EpicTitle           string          `json:"epic_title"`
-	RoadmapPath         string          `json:"roadmap_path"`
-	GeneratedAt         string          `json:"generated_at"`
-	ReferenceScheme     string          `json:"reference_scheme"`
-	AcceptanceInvariant string          `json:"acceptance_invariant"`
-	Nodes               []EpicSliceNode `json:"nodes"`
-	Edges               []EpicSliceEdge `json:"edges"`
+	Version             int              `json:"version"`
+	EpicID              string           `json:"epic_id"`
+	EpicRef             string           `json:"epic_ref"`
+	EpicTitle           string           `json:"epic_title"`
+	RoadmapPath         string           `json:"roadmap_path"`
+	GeneratedAt         string           `json:"generated_at"`
+	ReferenceScheme     string           `json:"reference_scheme"`
+	AcceptanceInvariant string           `json:"acceptance_invariant"`
+	Nodes               []EpicSliceNode  `json:"nodes"`
+	Edges               []EpicSliceEdge  `json:"edges"`
+	GoListBackbone      *GoListBackbone  `json:"go_list_backbone,omitempty"`
+	Ordering            *EpicDAGOrdering `json:"ordering,omitempty"`
 }
 
 type EpicSliceNode struct {
-	ID                       string   `json:"id"`
-	Ref                      string   `json:"ref"`
-	Kind                     string   `json:"kind"`
-	Title                    string   `json:"title"`
-	Issue                    int      `json:"issue,omitempty"`
-	State                    string   `json:"state,omitempty"`
-	StateReason              string   `json:"state_reason,omitempty"`
-	Completed                bool     `json:"completed"`
-	ImplementableAndTestable bool     `json:"implementable_and_testable"`
-	IsolationNotes           string   `json:"isolation_notes"`
-	DependsOn                []string `json:"depends_on"`
+	ID                       string             `json:"id"`
+	Ref                      string             `json:"ref"`
+	Kind                     string             `json:"kind"`
+	Title                    string             `json:"title"`
+	Issue                    int                `json:"issue,omitempty"`
+	State                    string             `json:"state,omitempty"`
+	StateReason              string             `json:"state_reason,omitempty"`
+	Completed                bool               `json:"completed"`
+	ImplementableAndTestable bool               `json:"implementable_and_testable"`
+	IsolationNotes           string             `json:"isolation_notes"`
+	DependsOn                []string           `json:"depends_on"`
+	Atomic                   bool               `json:"atomic,omitempty"`
+	AtomicMembers            []EpicAtomicMember `json:"atomic_members,omitempty"`
 }
 
 type EpicSliceEdge struct {
 	From   string `json:"from"`
 	To     string `json:"to"`
 	Reason string `json:"reason"`
+}
+
+type EpicAtomicMember struct {
+	ID    string `json:"id"`
+	Ref   string `json:"ref"`
+	Kind  string `json:"kind"`
+	Title string `json:"title"`
+}
+
+type GoListBackbone struct {
+	Tool      string          `json:"tool"`
+	Pattern   string          `json:"pattern"`
+	Available bool            `json:"available"`
+	Packages  []GoListPackage `json:"packages"`
+	Edges     []GoListEdge    `json:"edges"`
+}
+
+type GoListPackage struct {
+	ImportPath string `json:"import_path"`
+	Dir        string `json:"dir"`
+	Name       string `json:"name"`
+}
+
+type GoListEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type EpicDAGOrdering struct {
+	Ready           []EpicDAGOrderNode `json:"ready"`
+	Layers          []EpicDAGLayer     `json:"layers"`
+	CriticalPath    []string           `json:"critical_path"`
+	CriticalPathETA int                `json:"critical_path_eta"`
+	AtomicSlices    []EpicAtomicSlice  `json:"atomic_slices"`
+}
+
+type EpicDAGLayer struct {
+	Index int                `json:"index"`
+	Nodes []EpicDAGOrderNode `json:"nodes"`
+}
+
+type EpicDAGOrderNode struct {
+	ID             string   `json:"id"`
+	Ref            string   `json:"ref"`
+	Issue          int      `json:"issue,omitempty"`
+	UnblockCount   int      `json:"unblock_count"`
+	OnCriticalPath bool     `json:"on_critical_path"`
+	DependsOn      []string `json:"depends_on"`
+}
+
+type EpicAtomicSlice struct {
+	ID      string             `json:"id"`
+	Ref     string             `json:"ref"`
+	Issue   int                `json:"issue,omitempty"`
+	Members []EpicAtomicMember `json:"members"`
 }
 
 type Summary struct {
@@ -185,14 +249,17 @@ type planItem struct {
 	epicID         string
 	epicRef        string
 	epicTitle      string
+	atomic         bool
+	atomicMembers  []EpicAtomicMember
 }
 
 func DefaultDeps() Deps {
 	return Deps{
-		ReadFile:  os.ReadFile,
-		WriteFile: os.WriteFile,
-		MkdirAll:  os.MkdirAll,
-		Stat:      os.Stat,
+		ReadFile:       os.ReadFile,
+		WriteFile:      os.WriteFile,
+		MkdirAll:       os.MkdirAll,
+		Stat:           os.Stat,
+		GoListBackbone: ExtractGoListBackbone,
 	}
 }
 
@@ -232,6 +299,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	if err := resolveDependencies(items); err != nil {
 		return Report{}, err
 	}
+	items = condensePlanItemCycles(items)
 	ordered, err := topologicalItems(items)
 	if err != nil {
 		return Report{}, err
@@ -331,7 +399,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		ClosedCount:    len(report.Closed),
 		TotalCount:     len(items),
 	}
-	epicDAGs, epicPlanApproval, err := patchEpicSliceDAGs(opts, deps, doc, items, existingIssues, roadmapPath)
+	epicDAGs, epicPlanApproval, err := patchEpicSliceDAGs(ctx, opts, deps, doc, items, existingIssues, roadmapPath)
 	if err != nil {
 		return Report{}, err
 	}
@@ -369,6 +437,7 @@ func RenderText(report Report) string {
 	renderEntrySection(&out, "Updated", report.Updated)
 	renderEntrySection(&out, "Unchanged", report.Unchanged)
 	renderEntrySection(&out, "Closed", report.Closed)
+	renderEpicDAGSection(&out, report.EpicDAGs)
 
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Next")
@@ -400,6 +469,28 @@ func renderEntrySection(out *bytes.Buffer, title string, entries []IssueEntry) {
 	}
 }
 
+func renderEpicDAGSection(out *bytes.Buffer, entries []EpicDAGEntry) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Epic DAGs")
+	if len(entries) == 0 {
+		fmt.Fprintln(out, "- none")
+		return
+	}
+	for _, entry := range entries {
+		fmt.Fprintf(out, "- %s\n", entry.EpicTitle)
+		fmt.Fprintf(out, "  artifact: %s\n", entry.ArtifactPath)
+		if entry.PlanApprovalRequired {
+			fmt.Fprintln(out, "  plan_approval_required: yes")
+		} else {
+			fmt.Fprintln(out, "  plan_approval_required: no")
+		}
+		fmt.Fprintf(out, "  ready: %s\n", formatStringList(entry.Ready))
+		fmt.Fprintf(out, "  critical_path_eta: %d\n", entry.CriticalPathETA)
+		fmt.Fprintf(out, "  critical_path: %s\n", formatStringList(entry.CriticalPath))
+		fmt.Fprintf(out, "  atomic_slices: %s\n", formatStringList(entry.AtomicSlices))
+	}
+}
+
 func withDefaults(deps Deps) Deps {
 	defaults := DefaultDeps()
 	if deps.ReadFile == nil {
@@ -413,6 +504,9 @@ func withDefaults(deps Deps) Deps {
 	}
 	if deps.Stat == nil {
 		deps.Stat = defaults.Stat
+	}
+	if deps.GoListBackbone == nil {
+		deps.GoListBackbone = defaults.GoListBackbone
 	}
 	return deps
 }
@@ -710,7 +804,7 @@ func fallbackEpicDocSlice(unit *roadmapUnit) *roadmapSlice {
 	}
 }
 
-func patchEpicSliceDAGs(opts Options, deps Deps, doc *roadmapDoc, items []*planItem, existingIssues []gh.Issue, roadmapPath string) ([]EpicDAGEntry, bool, error) {
+func patchEpicSliceDAGs(ctx context.Context, opts Options, deps Deps, doc *roadmapDoc, items []*planItem, existingIssues []gh.Issue, roadmapPath string) ([]EpicDAGEntry, bool, error) {
 	itemsByEpic := map[string][]*planItem{}
 	for _, item := range items {
 		if item.epicID == "" {
@@ -722,6 +816,10 @@ func patchEpicSliceDAGs(opts Options, deps Deps, doc *roadmapDoc, items []*planI
 		return nil, false, nil
 	}
 
+	backbone, err := deps.GoListBackbone(ctx, opts.RepoPath)
+	if err != nil {
+		return nil, false, err
+	}
 	existingByID := issuesByMarker(existingIssues)
 	var entries []EpicDAGEntry
 	approvalRequired := false
@@ -739,7 +837,10 @@ func patchEpicSliceDAGs(opts Options, deps Deps, doc *roadmapDoc, items []*planI
 		if err != nil {
 			return nil, false, fmt.Errorf("read epic DAG artifact for %s: %w", unit.title, err)
 		}
-		desired := buildEpicDAGArtifact(unit, epicItems, roadmapPath, opts.Now)
+		desired, err := buildEpicDAGArtifact(unit, epicItems, roadmapPath, opts.Now, backbone)
+		if err != nil {
+			return nil, false, fmt.Errorf("order epic DAG artifact for %s: %w", unit.title, err)
+		}
 		churned := []string{}
 		if exists {
 			churned = churnedMergedSlices(existing, desired, existingByID)
@@ -771,12 +872,16 @@ func patchEpicSliceDAGs(opts Options, deps Deps, doc *roadmapDoc, items []*planI
 			ArtifactPath:         filepath.ToSlash(path),
 			PlanApprovalRequired: needsApproval,
 			ChurnedMergedSlices:  normalizeStrings(churned),
+			Ready:                orderNodeRefs(desired.Ordering.Ready),
+			CriticalPath:         normalizeStrings(desired.Ordering.CriticalPath),
+			CriticalPathETA:      desired.Ordering.CriticalPathETA,
+			AtomicSlices:         atomicSliceRefs(desired.Ordering.AtomicSlices),
 		})
 	}
 	return entries, approvalRequired, nil
 }
 
-func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath string, now time.Time) EpicSliceDAGArtifact {
+func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath string, now time.Time, backbone GoListBackbone) (EpicSliceDAGArtifact, error) {
 	nodes := make([]EpicSliceNode, 0, len(items))
 	edges := make([]EpicSliceEdge, 0)
 	for _, item := range items {
@@ -789,6 +894,8 @@ func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath stri
 			ImplementableAndTestable: true,
 			IsolationNotes:           isolationInvariant,
 			DependsOn:                append([]string(nil), item.depIDs...),
+			Atomic:                   item.atomic,
+			AtomicMembers:            append([]EpicAtomicMember(nil), item.atomicMembers...),
 		}
 		sort.Strings(node.DependsOn)
 		if item.existing != nil {
@@ -811,7 +918,11 @@ func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath stri
 		}
 		return edges[i].From < edges[j].From
 	})
-	return EpicSliceDAGArtifact{
+	ordering, err := computeEpicOrdering(nodes)
+	if err != nil {
+		return EpicSliceDAGArtifact{}, err
+	}
+	artifact := EpicSliceDAGArtifact{
 		Version:             EpicDAGVersion,
 		EpicID:              unit.marker,
 		EpicRef:             unit.slug + "/epic-1",
@@ -822,7 +933,13 @@ func buildEpicDAGArtifact(unit *roadmapUnit, items []*planItem, roadmapPath stri
 		AcceptanceInvariant: isolationInvariant,
 		Nodes:               nodes,
 		Edges:               edges,
+		Ordering:            &ordering,
 	}
+	if backbone.Tool != "" || backbone.Available || len(backbone.Packages) > 0 || len(backbone.Edges) > 0 {
+		copied := backbone
+		artifact.GoListBackbone = &copied
+	}
+	return artifact, nil
 }
 
 func readEpicDAGArtifact(path string, deps Deps) (EpicSliceDAGArtifact, bool, error) {
@@ -852,6 +969,26 @@ func marshalEpicDAGArtifact(artifact EpicSliceDAGArtifact) ([]byte, error) {
 	}
 	if artifact.Edges == nil {
 		artifact.Edges = []EpicSliceEdge{}
+	}
+	if artifact.GoListBackbone != nil {
+		if artifact.GoListBackbone.Packages == nil {
+			artifact.GoListBackbone.Packages = []GoListPackage{}
+		}
+		if artifact.GoListBackbone.Edges == nil {
+			artifact.GoListBackbone.Edges = []GoListEdge{}
+		}
+	}
+	if artifact.Ordering != nil {
+		if artifact.Ordering.Ready == nil {
+			artifact.Ordering.Ready = []EpicDAGOrderNode{}
+		}
+		if artifact.Ordering.Layers == nil {
+			artifact.Ordering.Layers = []EpicDAGLayer{}
+		}
+		artifact.Ordering.CriticalPath = normalizeStrings(artifact.Ordering.CriticalPath)
+		if artifact.Ordering.AtomicSlices == nil {
+			artifact.Ordering.AtomicSlices = []EpicAtomicSlice{}
+		}
 	}
 	data, err := json.MarshalIndent(artifact, "", "  ")
 	if err != nil {
@@ -907,7 +1044,9 @@ func epicNodeSignatureEqual(a, b EpicSliceNode) bool {
 		a.Kind == b.Kind &&
 		a.Title == b.Title &&
 		reflect.DeepEqual(sortedStrings(a.DependsOn), sortedStrings(b.DependsOn)) &&
-		a.ImplementableAndTestable == b.ImplementableAndTestable
+		a.ImplementableAndTestable == b.ImplementableAndTestable &&
+		a.Atomic == b.Atomic &&
+		reflect.DeepEqual(sortedAtomicMembers(a.AtomicMembers), sortedAtomicMembers(b.AtomicMembers))
 }
 
 func isIssueCompleted(issue gh.Issue) bool {
@@ -1078,8 +1217,13 @@ func issueBody(item *planItem) string {
 	}
 	if item.kind != "epic" {
 		fmt.Fprintln(&out)
-		fmt.Fprintln(&out, "## Slice")
-		fmt.Fprintln(&out, item.sliceText)
+		if item.atomic {
+			fmt.Fprintln(&out, "## Atomic slice")
+			fmt.Fprintln(&out, item.sliceText)
+		} else {
+			fmt.Fprintln(&out, "## Slice")
+			fmt.Fprintln(&out, item.sliceText)
+		}
 		if item.epicID != "" {
 			fmt.Fprintln(&out)
 			fmt.Fprintln(&out, "## Isolation")
@@ -1260,6 +1404,9 @@ func normalizeEpicDAGEntries(entries []EpicDAGEntry) []EpicDAGEntry {
 	}
 	for i := range entries {
 		entries[i].ChurnedMergedSlices = normalizeStrings(entries[i].ChurnedMergedSlices)
+		entries[i].Ready = normalizeStrings(entries[i].Ready)
+		entries[i].CriticalPath = normalizeStrings(entries[i].CriticalPath)
+		entries[i].AtomicSlices = normalizeStrings(entries[i].AtomicSlices)
 	}
 	return entries
 }

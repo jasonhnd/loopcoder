@@ -2,11 +2,15 @@ package orchestration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -363,5 +367,79 @@ func TestComputeReadySetMarksGuardrailFrozenIssueNonReady(t *testing.T) {
 		if !strings.Contains(result.Blocked[0].Reason, want) {
 			t.Fatalf("reason missing %q:\n%s", want, result.Blocked[0].Reason)
 		}
+	}
+}
+
+func TestComputeReadySetOrdersEpicReadyLayerFromSliceDAG(t *testing.T) {
+	repo := t.TempDir()
+	writeEpicOrderingArtifact(t, repo, compiler.EpicSliceDAGArtifact{
+		Version:   compiler.EpicDAGVersion,
+		EpicID:    "epic-1",
+		EpicTitle: "Migration",
+		Nodes: []compiler.EpicSliceNode{
+			{ID: "a", Ref: "migration/a", Issue: 10},
+			{ID: "b", Ref: "migration/b", Issue: 20},
+			{ID: "c", Ref: "migration/c", Issue: 30, DependsOn: []string{"b"}},
+		},
+		Ordering: &compiler.EpicDAGOrdering{
+			Ready: []compiler.EpicDAGOrderNode{
+				{ID: "b", Ref: "migration/b", Issue: 20, UnblockCount: 1, OnCriticalPath: true},
+				{ID: "a", Ref: "migration/a", Issue: 10, UnblockCount: 0},
+			},
+			Layers: []compiler.EpicDAGLayer{
+				{Index: 0, Nodes: []compiler.EpicDAGOrderNode{
+					{ID: "b", Ref: "migration/b", Issue: 20, UnblockCount: 1, OnCriticalPath: true},
+					{ID: "a", Ref: "migration/a", Issue: 10, UnblockCount: 0},
+				}},
+				{Index: 1, Nodes: []compiler.EpicDAGOrderNode{
+					{ID: "c", Ref: "migration/c", Issue: 30, DependsOn: []string{"b"}},
+				}},
+			},
+			CriticalPath:    []string{"migration/b", "migration/c"},
+			CriticalPathETA: 2,
+		},
+	})
+
+	result, err := ComputeReadySet(context.Background(), Options{
+		Reader: fakeReader{
+			repo: "owner/repo",
+			issues: []gh.Issue{
+				{Number: 10, Title: "A", State: "OPEN"},
+				{Number: 20, Title: "B", State: "OPEN"},
+			},
+		},
+		RepoPath:     repo,
+		BaseBranch:   "main",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeReadySet returned error: %v", err)
+	}
+
+	if len(result.Ready) != 2 || result.Ready[0].Issue != 20 || result.Ready[1].Issue != 10 {
+		t.Fatalf("ready = %#v, want issue #20 before #10 from epic ordering", result.Ready)
+	}
+	if !result.Ready[0].OnCriticalPath || result.Ready[0].SliceRef != "migration/b" {
+		t.Fatalf("first ready issue missing epic hint: %#v", result.Ready[0])
+	}
+	if len(result.EpicOrdering) != 1 || result.EpicOrdering[0].CriticalPathETA != 2 {
+		t.Fatalf("epic ordering summary = %#v, want ETA 2", result.EpicOrdering)
+	}
+}
+
+func writeEpicOrderingArtifact(t *testing.T, repo string, artifact compiler.EpicSliceDAGArtifact) {
+	t.Helper()
+	root := filepath.Join(repo, ".loopcoder", "epics")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll epic dir: %v", err)
+	}
+	data, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		t.Fatalf("Marshal epic artifact: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "epic-1.slice_dag.json"), append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("WriteFile epic artifact: %v", err)
 	}
 }

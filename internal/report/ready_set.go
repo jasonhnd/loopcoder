@@ -4,24 +4,33 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 type ReadySetReport struct {
-	Version     int             `json:"version"`
-	Repo        string          `json:"repo"`
-	RepoPath    string          `json:"repo_path"`
-	BaseBranch  string          `json:"base_branch"`
-	RunID       *string         `json:"run_id"`
-	GeneratedAt string          `json:"generated_at"`
-	Ready       []ReadyIssue    `json:"ready"`
-	Blocked     []BlockedIssue  `json:"blocked"`
-	Summary     ReadySetSummary `json:"summary"`
+	Version      int                   `json:"version"`
+	Repo         string                `json:"repo"`
+	RepoPath     string                `json:"repo_path"`
+	BaseBranch   string                `json:"base_branch"`
+	RunID        *string               `json:"run_id"`
+	GeneratedAt  string                `json:"generated_at"`
+	Ready        []ReadyIssue          `json:"ready"`
+	Blocked      []BlockedIssue        `json:"blocked"`
+	EpicOrdering []EpicOrderingSummary `json:"epic_ordering,omitempty"`
+	Summary      ReadySetSummary       `json:"summary"`
 }
 
 type ReadyIssue struct {
-	Issue  int    `json:"issue"`
-	Title  string `json:"title"`
-	Reason string `json:"reason"`
+	Issue          int      `json:"issue"`
+	Title          string   `json:"title"`
+	Reason         string   `json:"reason"`
+	EpicID         string   `json:"epic_id,omitempty"`
+	EpicTitle      string   `json:"epic_title,omitempty"`
+	SliceID        string   `json:"slice_id,omitempty"`
+	SliceRef       string   `json:"slice_ref,omitempty"`
+	UnblockCount   int      `json:"unblock_count,omitempty"`
+	OnCriticalPath bool     `json:"on_critical_path,omitempty"`
+	DependsOn      []string `json:"depends_on,omitempty"`
 }
 
 type BlockedIssue struct {
@@ -62,6 +71,22 @@ type ReadySetSummary struct {
 	RecoveryNeededCount       int `json:"recovery_needed_count"`
 }
 
+type EpicOrderingSummary struct {
+	EpicID          string               `json:"epic_id"`
+	EpicTitle       string               `json:"epic_title"`
+	ArtifactPath    string               `json:"artifact_path"`
+	Ready           []string             `json:"ready"`
+	CriticalPath    []string             `json:"critical_path"`
+	CriticalPathETA int                  `json:"critical_path_eta"`
+	AtomicSlices    []AtomicSliceSummary `json:"atomic_slices"`
+}
+
+type AtomicSliceSummary struct {
+	Ref     string   `json:"ref"`
+	Issue   int      `json:"issue,omitempty"`
+	Members []string `json:"members"`
+}
+
 func MarshalReadySetJSON(readySet ReadySetReport) ([]byte, error) {
 	readySet = normalizeReadySet(readySet)
 	data, err := json.MarshalIndent(readySet, "", "  ")
@@ -91,6 +116,12 @@ func RenderReadySetText(report ReadySetReport) string {
 		for _, item := range report.Ready {
 			fmt.Fprintf(&out, "- #%d %s\n", item.Issue, item.Title)
 			fmt.Fprintf(&out, "  reason: %s\n", item.Reason)
+			if item.SliceRef != "" {
+				fmt.Fprintf(&out, "  epic_slice: %s\n", item.SliceRef)
+			}
+			if item.OnCriticalPath {
+				fmt.Fprintln(&out, "  critical_path: yes")
+			}
 		}
 	}
 
@@ -103,6 +134,25 @@ func RenderReadySetText(report ReadySetReport) string {
 			fmt.Fprintf(&out, "- #%d %s\n", item.Issue, item.Title)
 			fmt.Fprintf(&out, "  classification: %s\n", item.Classification)
 			fmt.Fprintf(&out, "  reason: %s\n", item.Reason)
+		}
+	}
+
+	if len(report.EpicOrdering) > 0 {
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "Epic ordering")
+		for _, epic := range report.EpicOrdering {
+			fmt.Fprintf(&out, "- %s\n", epic.EpicTitle)
+			fmt.Fprintf(&out, "  artifact: %s\n", epic.ArtifactPath)
+			fmt.Fprintf(&out, "  ready: %s\n", renderStringList(epic.Ready))
+			fmt.Fprintf(&out, "  critical_path_eta: %d\n", epic.CriticalPathETA)
+			fmt.Fprintf(&out, "  critical_path: %s\n", renderStringList(epic.CriticalPath))
+			if len(epic.AtomicSlices) == 0 {
+				fmt.Fprintln(&out, "  atomic_slices: none")
+			} else {
+				for _, atomic := range epic.AtomicSlices {
+					fmt.Fprintf(&out, "  atomic_slice: %s (%s)\n", atomic.Ref, renderStringList(atomic.Members))
+				}
+			}
 		}
 	}
 
@@ -119,6 +169,9 @@ func normalizeReadySet(readySet ReadySetReport) ReadySetReport {
 	if readySet.Blocked == nil {
 		readySet.Blocked = []BlockedIssue{}
 	}
+	if readySet.EpicOrdering == nil {
+		readySet.EpicOrdering = []EpicOrderingSummary{}
+	}
 	for i := range readySet.Blocked {
 		if readySet.Blocked[i].Dependencies == nil {
 			readySet.Blocked[i].Dependencies = []int{}
@@ -131,4 +184,11 @@ func normalizeReadySet(readySet ReadySetReport) ReadySetReport {
 		}
 	}
 	return readySet
+}
+
+func renderStringList(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	return strings.Join(values, ", ")
 }
