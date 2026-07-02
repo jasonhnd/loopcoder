@@ -247,11 +247,12 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 			Reason: "dependencies completed; no open PR; no live local attempt",
 		})
 	}
-	epicOrdering, orderingHints, err := loadEpicOrderingHints(opts.RepoPath)
+	epicOrdering, orderingHints, badEpicIssues, err := loadEpicOrderingHints(opts.RepoPath)
 	if err != nil {
 		return report.ReadySetReport{}, err
 	}
 	applyEpicOrderingHints(ready, orderingHints)
+	ready, blocked = isolateBadEpicIssues(ready, blocked, badEpicIssues)
 
 	runID := runIDPtr(opts.RunID)
 	return report.ReadySetReport{

@@ -19,13 +19,23 @@ type epicOrderingHint struct {
 	DependsOn      []string
 }
 
-func loadEpicOrderingHints(repoPath string) ([]report.EpicOrderingSummary, map[int]epicOrderingHint, error) {
-	files, err := compiler.LoadEpicSliceDAGArtifacts(repoPath)
+func loadEpicOrderingHints(repoPath string) ([]report.EpicOrderingSummary, map[int]epicOrderingHint, map[int]string, error) {
+	files, loadErrors, err := compiler.LoadEpicSliceDAGArtifactsBestEffort(repoPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load epic DAG ordering: %w", err)
+		return nil, nil, nil, fmt.Errorf("load epic DAG ordering: %w", err)
 	}
 	summaries := make([]report.EpicOrderingSummary, 0, len(files))
 	hints := map[int]epicOrderingHint{}
+	needsHuman := map[int]string{}
+	for _, loadErr := range loadErrors {
+		reason := fmt.Sprintf("epic DAG artifact %s is unreadable or invalid: %v", loadErr.Path, loadErr.Err)
+		for _, node := range loadErr.Artifact.Nodes {
+			if node.Issue <= 0 {
+				continue
+			}
+			needsHuman[node.Issue] = reason
+		}
+	}
 	for _, file := range files {
 		artifact := file.Artifact
 		if artifact.Ordering == nil {
@@ -65,7 +75,7 @@ func loadEpicOrderingHints(repoPath string) ([]report.EpicOrderingSummary, map[i
 		}
 		return summaries[i].EpicTitle < summaries[j].EpicTitle
 	})
-	return summaries, hints, nil
+	return summaries, hints, needsHuman, nil
 }
 
 func applyEpicOrderingHints(ready []report.ReadyIssue, hints map[int]epicOrderingHint) {
@@ -104,6 +114,33 @@ func applyEpicOrderingHints(ready []report.ReadyIssue, hints map[int]epicOrderin
 		}
 		return ready[i].Issue < ready[j].Issue
 	})
+}
+
+func isolateBadEpicIssues(ready []report.ReadyIssue, blocked []report.BlockedIssue, needsHuman map[int]string) ([]report.ReadyIssue, []report.BlockedIssue) {
+	if len(needsHuman) == 0 {
+		return ready, blocked
+	}
+	filtered := make([]report.ReadyIssue, 0, len(ready))
+	for _, item := range ready {
+		reason, ok := needsHuman[item.Issue]
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		blocked = append(blocked, report.BlockedIssue{
+			Issue:          item.Issue,
+			Title:          item.Title,
+			Classification: "needs-human",
+			Reason:         reason,
+			Dependencies:   []int{},
+			OpenPRs:        []report.OpenPRSummary{},
+			Attempts:       []report.AttemptSummary{},
+		})
+	}
+	sort.Slice(blocked, func(i, j int) bool {
+		return blocked[i].Issue < blocked[j].Issue
+	})
+	return filtered, blocked
 }
 
 func orderNodeRefsForReport(nodes []compiler.EpicDAGOrderNode) []string {

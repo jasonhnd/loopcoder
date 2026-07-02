@@ -3,7 +3,9 @@ package compile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -377,6 +379,59 @@ func TestCompileEpicIncludesMockedGoListBackbone(t *testing.T) {
 	}
 	if len(artifact.GoListBackbone.Packages) != 2 || len(artifact.GoListBackbone.Edges) != 1 {
 		t.Fatalf("go list backbone = %#v, want two packages and one edge", artifact.GoListBackbone)
+	}
+}
+
+func TestExtractGoListBackboneFailureUnavailable(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/repo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "repo.go"), []byte("package repo\n"), 0o644); err != nil {
+		t.Fatalf("write repo.go: %v", err)
+	}
+	t.Setenv("GOFLAGS", "-doesnotexist")
+
+	backbone, err := ExtractGoListBackbone(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ExtractGoListBackbone returned error: %v", err)
+	}
+	if backbone.Available {
+		t.Fatalf("Available = true, want false for failed go list: %#v", backbone)
+	}
+	if backbone.Tool != "go list" || backbone.Pattern != "./..." {
+		t.Fatalf("backbone identity = %#v, want go list ./...", backbone)
+	}
+	if len(backbone.Packages) != 0 || len(backbone.Edges) != 0 {
+		t.Fatalf("backbone packages=%#v edges=%#v, want empty unavailable metadata", backbone.Packages, backbone.Edges)
+	}
+}
+
+func TestCompileEpicUsesUnavailableBackboneWhenExtractorFails(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Replace storage engine
+- code: Add storage adapter
+`
+	writer := newFakeIssueWriter()
+	files := map[string]string{
+		filepath.Join("repo", RoadmapFilename): roadmap,
+	}
+	report := runCompileTestWithDeps(t, writer, files, Deps{
+		GoListBackbone: func(context.Context, string) (GoListBackbone, error) {
+			return GoListBackbone{}, errors.New("go list failed")
+		},
+	})
+
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if artifact.GoListBackbone == nil {
+		t.Fatal("go list backbone missing, want unavailable backbone recorded")
+	}
+	if artifact.GoListBackbone.Available {
+		t.Fatalf("go list backbone = %#v, want unavailable fallback", artifact.GoListBackbone)
+	}
+	if artifact.GoListBackbone.Tool != "go list" || artifact.GoListBackbone.Pattern != "./..." {
+		t.Fatalf("go list backbone = %#v, want fallback identity", artifact.GoListBackbone)
 	}
 }
 
