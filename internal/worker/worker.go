@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -81,6 +82,7 @@ type Deps struct {
 	PID         func() int
 	MkdirTemp   func(dir, pattern string) (string, error)
 	RemoveAll   func(path string) error
+	RepoSkills  func(repoPath string) (string, error)
 }
 
 func DefaultDeps() Deps {
@@ -97,6 +99,9 @@ func DefaultDeps() Deps {
 		PID:       os.Getpid,
 		MkdirTemp: os.MkdirTemp,
 		RemoveAll: os.RemoveAll,
+		RepoSkills: func(repoPath string) (string, error) {
+			return skills.BuildPromptSection(skills.PromptSectionOptions{RepoPath: repoPath})
+		},
 	}
 }
 
@@ -244,12 +249,17 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	tracker.transition(activePhase, "running", nil, nil)
 
 	activePhase = "prompt_written"
+	repoSkills, err := deps.RepoSkills(worktreePath)
+	if err != nil {
+		return Result{}, fmt.Errorf("read repo skills: %w", err)
+	}
 	prompt := BuildPrompt(PromptOptions{
 		IssueNumber:     opts.IssueNumber,
 		IssueTitle:      opts.IssueTitle,
 		IssueBody:       opts.IssueBody,
 		Branch:          opts.Branch,
 		RecoveryContext: opts.RecoveryContext,
+		RepoSkills:      repoSkills,
 	})
 	if err := os.WriteFile(promptPath, []byte(prompt), 0o644); err != nil {
 		return Result{}, fmt.Errorf("write prompt: %w", err)
@@ -353,6 +363,7 @@ type PromptOptions struct {
 	IssueBody       string
 	Branch          string
 	RecoveryContext string
+	RepoSkills      string
 }
 
 func BuildPrompt(opts PromptOptions) string {
@@ -369,6 +380,13 @@ func BuildPrompt(opts PromptOptions) string {
 - You may read files and run commands, but do NOT run git commit or git push — the harness commits and opens the PR.
 - When finished, print a 2-4 sentence final summary in English describing exactly what you changed.
 `, opts.IssueNumber, opts.Branch, opts.IssueTitle, opts.IssueBody)
+
+	if strings.TrimSpace(opts.RepoSkills) != "" {
+		prompt += fmt.Sprintf(`
+
+%s
+`, opts.RepoSkills)
+	}
 
 	if strings.TrimSpace(opts.RecoveryContext) != "" {
 		prompt += fmt.Sprintf(`
@@ -436,6 +454,9 @@ func withDefaults(deps Deps) Deps {
 	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = defaults.RemoveAll
+	}
+	if deps.RepoSkills == nil {
+		deps.RepoSkills = defaults.RepoSkills
 	}
 	return deps
 }
