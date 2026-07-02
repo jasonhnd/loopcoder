@@ -251,8 +251,10 @@ feature. Epic support is a generalization: any epic decomposes into a dependency
 tree of slices, each a normal slice PR through the loop above; migration/rewrite
 epics additionally require behavioral equivalence. This section builds on
 `compile`, the risk gate, evidence, and promotion; it adds decomposition, an
-equivalence gate, and an incremental-migration discipline. Design reference:
-`0161-epic-research-reference.md` (industry practice, verified sources).
+equivalence gate, and an incremental-migration discipline. It is grounded in industry practice on autonomous decomposition and
+behavioral-equivalence verification (Anthropic long-running harness, LangChain
+plan-and-execute, Google LLM migration, Strangler Fig, GitHub Scientist, Zalando
+parallel-run, Kahn's algorithm with SCC condensation).
 
 ### Decomposition (compile as Planner over an epic)
 
