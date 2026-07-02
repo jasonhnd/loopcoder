@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -1579,6 +1580,67 @@ func TestCompileRequiresRepo(t *testing.T) {
 	}
 }
 
+func TestDiscoverRunsWithDualReadOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	writer := newCLIFakeIssueWriter()
+
+	exitCode := RunWithDeps([]string{"discover", "--repo", repo}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(path string) orchestration.GitHubReader {
+			if path != repo {
+				t.Fatalf("reader repo = %q, want %q", path, repo)
+			}
+			return cliFakeReader{
+				prs: []gh.PullRequest{{
+					Number:      44,
+					Title:       "Fix failure",
+					URL:         "https://github.com/owner/repo/pull/44",
+					HeadRefName: "loop/issue-44",
+				}},
+				checks: map[int][]gh.Check{
+					44: {{Name: "verify", Bucket: "fail"}},
+				},
+			}
+		},
+		NewIssueWriter: func(path string) compiler.IssueWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return writer
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got perception.Report
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not discover JSON: %v\n%s", err, stdout.String())
+	}
+	if len(got.Created) != 1 || got.Created[0].Issue != 1 || got.Summary.CreatedCount != 1 {
+		t.Fatalf("discover report = %#v, want one created issue", got)
+	}
+	for _, want := range []string{"DISCOVER", "Created: 1", "Skipped held: 0", "Skipped duplicate: 0"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestDiscoverRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"discover"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
 func TestTickHelpDocumentsFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
@@ -2828,6 +2890,8 @@ func int64TestPtr(value int64) *int64 {
 type cliFakeReader struct {
 	issues []gh.Issue
 	views  map[int]gh.Issue
+	prs    []gh.PullRequest
+	checks map[int][]gh.Check
 }
 
 func (f cliFakeReader) RepoName(context.Context) (string, error) {
@@ -2846,11 +2910,11 @@ func (f cliFakeReader) ViewIssue(_ context.Context, number int) (gh.Issue, error
 }
 
 func (f cliFakeReader) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
-	return nil, nil
+	return append([]gh.PullRequest(nil), f.prs...), nil
 }
 
-func (f cliFakeReader) PRChecks(context.Context, int) ([]gh.Check, error) {
-	return nil, nil
+func (f cliFakeReader) PRChecks(_ context.Context, number int) ([]gh.Check, error) {
+	return append([]gh.Check(nil), f.checks[number]...), nil
 }
 
 type cliFakeIssueWriter struct {

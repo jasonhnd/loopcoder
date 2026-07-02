@@ -81,6 +81,7 @@ type PullRequest struct {
 	URL                     string           `json:"url"`
 	HeadRefName             string           `json:"headRefName"`
 	IsDraft                 bool             `json:"isDraft"`
+	Labels                  []Label          `json:"labels"`
 	ClosingIssuesReferences []IssueReference `json:"closingIssuesReferences"`
 }
 
@@ -188,7 +189,7 @@ func (c *CLI) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
 		"pr", "list",
 		"--state", "open",
 		"--limit", "1000",
-		"--json", "number,title,url,headRefName,isDraft,closingIssuesReferences",
+		"--json", "number,title,url,headRefName,isDraft,labels,closingIssuesReferences",
 	}, &prs)
 	return prs, err
 }
