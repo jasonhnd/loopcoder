@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/equivalence"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -36,15 +37,24 @@ type PromotionWriter interface {
 }
 
 type PromoteOptions struct {
-	Writer          PromotionWriter
-	RepoPath        string
-	RunID           string
-	PreProdBranch   string
-	Gate            string
-	KickBackItems   []string
-	Clock           func() time.Time
-	StatePush       StatePushFunc
-	ToggleInventory PromoteToggleInventoryFunc
+	Writer               PromotionWriter
+	RepoPath             string
+	RunID                string
+	PreProdBranch        string
+	Gate                 string
+	KickBackItems        []string
+	Clock                func() time.Time
+	StatePush            StatePushFunc
+	ToggleInventory      PromoteToggleInventoryFunc
+	ParallelRun          *PromoteParallelRunConfig
+	ReconcileParallelRun PromoteParallelRunReconcileFunc
+}
+
+type PromoteParallelRunReconcileFunc func(equivalence.Contract, equivalence.ParallelRunInput) (equivalence.ParallelRunReport, error)
+
+type PromoteParallelRunConfig struct {
+	Contract equivalence.Contract
+	Input    equivalence.ParallelRunInput
 }
 
 type PromoteReport struct {
@@ -60,10 +70,26 @@ type PromoteReport struct {
 	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
 	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
 	ToggleInventory PromoteToggleInventory  `json:"toggle_inventory"`
+	GoNoGoPanel     *PromoteGoNoGoPanel     `json:"go_no_go_panel,omitempty"`
 	Promoted        PromoteMainResult       `json:"promoted"`
 	Sync            PromoteSyncResult       `json:"sync"`
 	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
 	Summary         PromoteSummary          `json:"summary"`
+}
+
+type PromoteGoNoGoPanel struct {
+	Reconciliation  *equivalence.ParallelRunReport `json:"reconciliation,omitempty"`
+	ToggleInventory *PromoteToggleInventory        `json:"toggle_inventory,omitempty"`
+	NeedsHuman      []PromoteNeedsHuman            `json:"needs_human,omitempty"`
+	Failed          []PromoteFailedItem            `json:"failed,omitempty"`
+}
+
+type PromoteFailedItem struct {
+	Step     string `json:"step"`
+	Item     string `json:"item,omitempty"`
+	PRNumber int    `json:"pr_number,omitempty"`
+	Status   string `json:"status"`
+	Detail   string `json:"detail"`
 }
 
 type PromoteKickBackResult struct {
@@ -147,15 +173,18 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	finish := func() (PromoteReport, error) {
 		report.FinishedAt = state.FormatTimestamp(opts.Clock().UTC())
 		report.Summary.NeedsHumanCount = len(report.NeedsHuman)
+		report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
 		report = normalizePromoteReport(report)
 		if err := recordPromoteAttempt(ctx, opts, &report); err != nil {
 			report.Status = PromoteStatusFailed
 			report.Summary.FailureCount++
+			report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
 			if report.StatePush == nil {
 				report.StatePush = &PromoteStatePush{Files: []string{}, Error: err.Error()}
 			} else if strings.TrimSpace(report.StatePush.Error) == "" && strings.TrimSpace(report.StatePush.PushError) == "" {
 				report.StatePush.Error = err.Error()
 			}
+			report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
 		}
 		return normalizePromoteReport(report), nil
 	}
@@ -184,6 +213,18 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	}
 	if opts.Gate != "human-merge" {
 		return failBeforeMain(fmt.Errorf("promote requires adapters.gate human-merge, got %q", opts.Gate))
+	}
+
+	if opts.ParallelRun != nil {
+		reconciliation, err := opts.ReconcileParallelRun(opts.ParallelRun.Contract, opts.ParallelRun.Input)
+		if err != nil {
+			report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+				Step:   "parallel-run-reconciliation",
+				Detail: "parallel-run reconciliation could not be loaded: " + err.Error(),
+			})
+		} else {
+			report.GoNoGoPanel = &PromoteGoNoGoPanel{Reconciliation: &reconciliation}
+		}
 	}
 
 	inventory, err := opts.ToggleInventory(ctx, opts.RepoPath)
@@ -304,6 +345,9 @@ func withPromoteDefaults(opts PromoteOptions) PromoteOptions {
 	if opts.ToggleInventory == nil {
 		opts.ToggleInventory = BuildPromoteToggleInventory
 	}
+	if opts.ReconcileParallelRun == nil {
+		opts.ReconcileParallelRun = equivalence.ReconcileParallelRun
+	}
 	return opts
 }
 
@@ -396,6 +440,105 @@ func promoteReportError(report PromoteReport) string {
 	return "promote failed"
 }
 
+func assemblePromoteGoNoGoPanel(report PromoteReport) *PromoteGoNoGoPanel {
+	panel := PromoteGoNoGoPanel{}
+	if report.GoNoGoPanel != nil {
+		panel = *report.GoNoGoPanel
+	}
+	if promoteToggleInventoryHasItems(report.ToggleInventory) {
+		inventory := normalizePromoteToggleInventory(report.ToggleInventory)
+		panel.ToggleInventory = &inventory
+	}
+	if len(report.NeedsHuman) > 0 {
+		panel.NeedsHuman = append([]PromoteNeedsHuman(nil), report.NeedsHuman...)
+	}
+	if failed := promoteFailedItems(report); len(failed) > 0 {
+		panel.Failed = failed
+	}
+	return normalizePromoteGoNoGoPanel(panel)
+}
+
+func normalizePromoteGoNoGoPanel(panel PromoteGoNoGoPanel) *PromoteGoNoGoPanel {
+	if panel.Reconciliation != nil && !parallelRunReportHasEvidence(*panel.Reconciliation) {
+		panel.Reconciliation = nil
+	}
+	if panel.ToggleInventory != nil {
+		inventory := normalizePromoteToggleInventory(*panel.ToggleInventory)
+		if promoteToggleInventoryHasItems(inventory) {
+			panel.ToggleInventory = &inventory
+		} else {
+			panel.ToggleInventory = nil
+		}
+	}
+	if len(panel.NeedsHuman) == 0 {
+		panel.NeedsHuman = nil
+	}
+	if len(panel.Failed) == 0 {
+		panel.Failed = nil
+	}
+	if panel.Reconciliation == nil && panel.ToggleInventory == nil && len(panel.NeedsHuman) == 0 && len(panel.Failed) == 0 {
+		return nil
+	}
+	return &panel
+}
+
+func parallelRunReportHasEvidence(report equivalence.ParallelRunReport) bool {
+	return report.Version != 0 ||
+		strings.TrimSpace(report.Status) != "" ||
+		report.MatchedCount != 0 ||
+		report.OldOnlyCount != 0 ||
+		report.NewOnlyCount != 0 ||
+		report.MismatchCount != 0 ||
+		len(report.Matched) != 0 ||
+		len(report.Unmatched) != 0
+}
+
+func promoteToggleInventoryHasItems(inventory PromoteToggleInventory) bool {
+	return len(inventory.FlipOn) > 0 || len(inventory.LeaveDark) > 0
+}
+
+func promoteFailedItems(report PromoteReport) []PromoteFailedItem {
+	var failed []PromoteFailedItem
+	for _, kicked := range report.KickedBack {
+		if !promoteResultFailed(kicked.Status, kicked.Error) {
+			continue
+		}
+		failed = append(failed, PromoteFailedItem{
+			Step:     "kick-back",
+			Item:     kicked.Item,
+			PRNumber: kicked.PRNumber,
+			Status:   firstNonEmpty(kicked.Status, PromoteStatusFailed),
+			Detail:   firstNonEmpty(kicked.Error, "kick-back failed"),
+		})
+	}
+	if promoteResultFailed(report.Promoted.Status, report.Promoted.Error) {
+		failed = append(failed, PromoteFailedItem{
+			Step:   "promote",
+			Status: firstNonEmpty(report.Promoted.Status, PromoteStatusFailed),
+			Detail: firstNonEmpty(report.Promoted.Error, "promote failed"),
+		})
+	}
+	if promoteResultFailed(report.Sync.Status, report.Sync.Error) {
+		failed = append(failed, PromoteFailedItem{
+			Step:   "pre-prod-sync",
+			Status: firstNonEmpty(report.Sync.Status, PromoteStatusFailed),
+			Detail: firstNonEmpty(report.Sync.Error, "pre-prod sync failed"),
+		})
+	}
+	if report.StatePush != nil && promoteResultFailed("", firstNonEmpty(report.StatePush.Error, report.StatePush.PushError)) {
+		failed = append(failed, PromoteFailedItem{
+			Step:   "state-push",
+			Status: PromoteStatusFailed,
+			Detail: firstNonEmpty(report.StatePush.Error, report.StatePush.PushError),
+		})
+	}
+	return failed
+}
+
+func promoteResultFailed(status, detail string) bool {
+	return status == PromoteStatusFailed || strings.TrimSpace(detail) != ""
+}
+
 func MarshalPromoteJSON(report PromoteReport) ([]byte, error) {
 	report = normalizePromoteReport(report)
 	data, err := json.MarshalIndent(report, "", "  ")
@@ -422,6 +565,8 @@ func RenderPromoteText(report PromoteReport) string {
 	if strings.TrimSpace(report.FinishedAt) != "" {
 		fmt.Fprintf(&out, "Finished at: %s\n", report.FinishedAt)
 	}
+
+	renderPromoteGoNoGoPanel(&out, report.GoNoGoPanel)
 
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Kicked back")
@@ -534,6 +679,65 @@ func RenderPromoteText(report PromoteReport) string {
 	return out.String()
 }
 
+func renderPromoteGoNoGoPanel(out *bytes.Buffer, panel *PromoteGoNoGoPanel) {
+	if panel == nil {
+		return
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Go/no-go panel")
+	if panel.Reconciliation != nil {
+		report := panel.Reconciliation
+		fmt.Fprintf(out, "- reconciliation status=%s matched=%d old_only=%d new_only=%d mismatches=%d\n",
+			report.Status,
+			report.MatchedCount,
+			report.OldOnlyCount,
+			report.NewOnlyCount,
+			report.MismatchCount,
+		)
+		for _, unmatched := range report.Unmatched {
+			fmt.Fprintf(out, "  unmatched %s side=%s: %s\n", unmatched.Key, unmatched.Side, unmatched.Detail)
+		}
+		for _, matched := range report.Matched {
+			if matched.Status == "" || matched.Status == equivalence.StatusPass {
+				continue
+			}
+			fmt.Fprintf(out, "  matched %s status=%s\n", matched.Key, matched.Status)
+		}
+	}
+	if panel.ToggleInventory != nil {
+		fmt.Fprintf(out, "- toggle inventory flip_on=%d leave_dark=%d\n", len(panel.ToggleInventory.FlipOn), len(panel.ToggleInventory.LeaveDark))
+		for _, item := range panel.ToggleInventory.FlipOn {
+			fmt.Fprintf(out, "  flip_on %s build_tag=%s\n", item.SliceRef, item.BuildTag)
+		}
+		for _, item := range panel.ToggleInventory.LeaveDark {
+			fmt.Fprintf(out, "  leave_dark %s build_tag=%s\n", item.SliceRef, item.BuildTag)
+			if strings.TrimSpace(item.Reason) != "" {
+				fmt.Fprintf(out, "    reason: %s\n", item.Reason)
+			}
+		}
+	}
+	if len(panel.NeedsHuman) > 0 {
+		fmt.Fprintf(out, "- needs-human items=%d\n", len(panel.NeedsHuman))
+		for _, item := range panel.NeedsHuman {
+			target := item.Item
+			if item.PRNumber > 0 {
+				target = fmt.Sprintf("PR #%d", item.PRNumber)
+			}
+			fmt.Fprintf(out, "  %s %s: %s\n", item.Step, target, item.Detail)
+		}
+	}
+	if len(panel.Failed) > 0 {
+		fmt.Fprintf(out, "- failed items=%d\n", len(panel.Failed))
+		for _, item := range panel.Failed {
+			target := item.Item
+			if item.PRNumber > 0 {
+				target = fmt.Sprintf("PR #%d", item.PRNumber)
+			}
+			fmt.Fprintf(out, "  %s %s %s: %s\n", item.Step, target, item.Status, item.Detail)
+		}
+	}
+}
+
 func PromoteExitCode(report PromoteReport) int {
 	if report.Status == PromoteStatusSucceeded {
 		return 0
@@ -556,6 +760,11 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 		report.NeedsHuman = []PromoteNeedsHuman{}
 	}
 	report.ToggleInventory = normalizePromoteToggleInventory(report.ToggleInventory)
+	if report.GoNoGoPanel != nil {
+		report.GoNoGoPanel = normalizePromoteGoNoGoPanel(*report.GoNoGoPanel)
+	} else {
+		report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
+	}
 	if strings.TrimSpace(report.Promoted.PreProdBranch) == "" {
 		report.Promoted.PreProdBranch = report.PreProdBranch
 	}

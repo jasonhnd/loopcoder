@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/equivalence"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -214,6 +216,166 @@ func TestPromoteDarkEpicSlicesDoNotBlockPromotion(t *testing.T) {
 	}
 }
 
+func TestPromoteGoNoGoPanelCombinesReconciliationToggleNeedsHumanAndFailures(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test-promote-panel"
+	writeEpicOrderingArtifact(t, repo, compiler.EpicSliceDAGArtifact{
+		Version:   compiler.EpicDAGVersion,
+		EpicID:    "epic-1",
+		EpicTitle: "Rewrite billing engine",
+		Nodes: []compiler.EpicSliceNode{
+			{
+				ID:        "flip",
+				Ref:       "rewrite-billing-engine/flip",
+				Completed: true,
+				BuildTagToggle: &compiler.EpicBuildTagToggle{
+					Name:     "rewrite-billing-engine/flip",
+					BuildTag: "lc_rewrite_billing_engine_flip",
+					State:    compiler.EpicToggleStateOn,
+				},
+			},
+			{
+				ID:        "dark",
+				Ref:       "rewrite-billing-engine/dark",
+				Completed: true,
+				BuildTagToggle: &compiler.EpicBuildTagToggle{
+					Name:     "rewrite-billing-engine/dark",
+					BuildTag: "lc_rewrite_billing_engine_dark",
+					State:    compiler.EpicToggleStateOff,
+				},
+				Dark:       true,
+				DarkReason: "epic is not complete; leave dark",
+			},
+		},
+	})
+	writer := &recordingPromotionWriter{routeErr: errors.New("label failed")}
+
+	report, err := Promote(context.Background(), PromoteOptions{
+		Writer:        writer,
+		RepoPath:      repo,
+		RunID:         runID,
+		PreProdBranch: "pre-prod",
+		Gate:          "human-merge",
+		KickBackItems: []string{"#101"},
+		Clock:         fixedPromoteClock,
+		StatePush:     promoteTestStatePush(t, repo, runID),
+		ParallelRun: &PromoteParallelRunConfig{
+			Contract: promoteTestParallelRunContract(),
+			Input: equivalence.ParallelRunInput{
+				Old: []equivalence.ParallelRunRecord{
+					{Key: "request-1", Value: map[string]any{"score": 1.0}},
+					{Key: "request-2", Value: map[string]any{"score": 2.0}},
+				},
+				New: []equivalence.ParallelRunRecord{
+					{Key: "request-1", Value: map[string]any{"score": 1.05}},
+					{Key: "request-3", Value: map[string]any{"score": 3.0}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Promote returned error: %v", err)
+	}
+	if report.Status != PromoteStatusFailed {
+		t.Fatalf("status = %s, want failed", report.Status)
+	}
+	if report.GoNoGoPanel == nil {
+		t.Fatal("go/no-go panel was not assembled")
+	}
+	panel := report.GoNoGoPanel
+	if panel.Reconciliation == nil || panel.Reconciliation.Status != equivalence.StatusNeedsHuman || panel.Reconciliation.OldOnlyCount != 1 || panel.Reconciliation.NewOnlyCount != 1 {
+		t.Fatalf("reconciliation panel = %#v", panel.Reconciliation)
+	}
+	if panel.ToggleInventory == nil || len(panel.ToggleInventory.FlipOn) != 1 || len(panel.ToggleInventory.LeaveDark) != 1 {
+		t.Fatalf("toggle inventory panel = %#v", panel.ToggleInventory)
+	}
+	if len(panel.NeedsHuman) != 1 || !strings.Contains(panel.NeedsHuman[0].Detail, "routing failed") {
+		t.Fatalf("needs-human panel = %#v", panel.NeedsHuman)
+	}
+	if len(panel.Failed) == 0 || panel.Failed[0].Step != "promote" || !strings.Contains(panel.Failed[0].Detail, "route kick-back PR #101") {
+		t.Fatalf("failed panel = %#v", panel.Failed)
+	}
+	data, err := MarshalPromoteJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalPromoteJSON: %v", err)
+	}
+	for _, want := range []string{`"go_no_go_panel"`, `"reconciliation"`, `"toggle_inventory"`, `"needs_human"`, `"failed"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("promote JSON missing %q:\n%s", want, data)
+		}
+	}
+	rendered := RenderPromoteText(report)
+	for _, want := range []string{"Go/no-go panel", "reconciliation status=needs-human", "toggle inventory flip_on=1 leave_dark=1", "needs-human items=1", "failed items="} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered report missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestPromoteGoNoGoPanelOmitsAbsentSections(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test-promote-panel-partial"
+	writer := &recordingPromotionWriter{}
+
+	report, err := Promote(context.Background(), PromoteOptions{
+		Writer:        writer,
+		RepoPath:      repo,
+		RunID:         runID,
+		PreProdBranch: "pre-prod",
+		Gate:          "human-merge",
+		Clock:         fixedPromoteClock,
+		StatePush:     promoteTestStatePush(t, repo, runID),
+		ParallelRun: &PromoteParallelRunConfig{
+			Contract: promoteTestParallelRunContract(),
+			Input: equivalence.ParallelRunInput{
+				Old: []equivalence.ParallelRunRecord{{Key: "request-1", Value: map[string]any{"score": 1.0}}},
+				New: []equivalence.ParallelRunRecord{{Key: "request-1", Value: map[string]any{"score": 1.0}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Promote returned error: %v", err)
+	}
+	if report.Status != PromoteStatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", report.Status)
+	}
+	if report.GoNoGoPanel == nil || report.GoNoGoPanel.Reconciliation == nil {
+		t.Fatalf("go/no-go panel = %#v, want reconciliation only", report.GoNoGoPanel)
+	}
+	if report.GoNoGoPanel.ToggleInventory != nil || len(report.GoNoGoPanel.NeedsHuman) != 0 || len(report.GoNoGoPanel.Failed) != 0 {
+		t.Fatalf("go/no-go panel has absent sections: %#v", report.GoNoGoPanel)
+	}
+	data, err := MarshalPromoteJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalPromoteJSON: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("Unmarshal promote JSON: %v\n%s", err, data)
+	}
+	panel, ok := wire["go_no_go_panel"].(map[string]any)
+	if !ok {
+		t.Fatalf("go_no_go_panel missing or malformed in JSON:\n%s", data)
+	}
+	if _, ok := panel["reconciliation"]; !ok {
+		t.Fatalf("go_no_go_panel missing reconciliation:\n%s", data)
+	}
+	for _, absent := range []string{"toggle_inventory", "needs_human", "failed"} {
+		if _, ok := panel[absent]; ok {
+			t.Fatalf("go_no_go_panel included absent section %q:\n%s", absent, data)
+		}
+	}
+	rendered := RenderPromoteText(report)
+	if !strings.Contains(rendered, "Go/no-go panel") || !strings.Contains(rendered, "reconciliation status=pass") {
+		t.Fatalf("rendered report missing partial panel:\n%s", rendered)
+	}
+	for _, absent := range []string{"needs-human items=", "failed items="} {
+		if strings.Contains(rendered, absent) {
+			t.Fatalf("rendered partial panel included absent section %q:\n%s", absent, rendered)
+		}
+	}
+}
+
 func TestPromotePreconditionRejectionsAreLedgeredAsFailed(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -362,6 +524,21 @@ func (w *recordingPromotionWriter) SyncPreProdFromMain(_ context.Context, prePro
 
 func fixedPromoteClock() time.Time {
 	return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+}
+
+func promoteTestParallelRunContract() equivalence.Contract {
+	return equivalence.Contract{
+		Version: equivalence.ContractVersion,
+		Partition: equivalence.Partition{
+			ReadSlices: []string{"reader-api"},
+		},
+		Tolerance: equivalence.ToleranceRules{
+			FloatPrecision: &equivalence.FloatPrecision{
+				Absolute: 0.1,
+				Paths:    []string{"$.score"},
+			},
+		},
+	}
 }
 
 func promoteTestStatePush(t *testing.T, repo, runID string) StatePushFunc {
