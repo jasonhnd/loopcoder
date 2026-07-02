@@ -152,7 +152,10 @@ after `loopreview = pass`, it checks the PR diff, required CI, and loopcoder-cor
 paths deterministically. Clean PRs can merge only to
 `.delivery.yml environment.pre_prod_branch` (default `pre-prod`); red lines,
 missing/unavailable pre-prod branch setup, or any non-pass verifier result route
-to `needs-human`. No `tick` path can merge to `main`.
+to `needs-human`. After a pre-prod merge, `tick` reads the configured CI checks
+on the pre-prod branch head; if that head is the just-created merge commit and a
+required check is red, `tick` reverts the commit on pre-prod and records the PR
+as `needs-human`. No `tick` path can merge to `main`.
 
 ### Resilience
 

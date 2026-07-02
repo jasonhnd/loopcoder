@@ -127,6 +127,77 @@ func TestMergeToPreProdRejectsProductionBranches(t *testing.T) {
 	}
 }
 
+func TestBranchChecksReadsHeadCheckRunsAndStatuses(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00ls-remote\x00origin\x00refs/heads/pre-prod":                    []byte("abc123\trefs/heads/pre-prod\n"),
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner":                        []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00api\x00repos/owner/repo/commits/abc123/check-runs?per_page=100": []byte(`{"check_runs":[{"name":"verify","status":"completed","conclusion":"success"},{"name":"go","status":"completed","conclusion":"failure"}]}`),
+			"repo\x00gh\x00api\x00repos/owner/repo/commits/abc123/status":                  []byte(`{"statuses":[{"context":"legacy","state":"success"}]}`),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.BranchChecks(context.Background(), "pre-prod")
+	if err != nil {
+		t.Fatalf("BranchChecks returned error: %v", err)
+	}
+	if got.Branch != "pre-prod" || got.HeadSHA != "abc123" {
+		t.Fatalf("BranchChecks identity = %#v", got)
+	}
+	if !reflect.DeepEqual(got.Checks, []Check{
+		{Name: "verify", State: "success", Bucket: "pass"},
+		{Name: "go", State: "failure", Bucket: "fail"},
+		{Name: "legacy", State: "success", Bucket: "pass"},
+	}) {
+		t.Fatalf("BranchChecks checks = %#v", got.Checks)
+	}
+}
+
+func TestRevertOnPreProdUsesTemporaryWorktreeAndPushesOnlyPreProd(t *testing.T) {
+	runner := &preProdRevertRunner{}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.RevertOnPreProd(context.Background(), 101, "pre-prod", "merge-sha")
+	if err != nil {
+		t.Fatalf("RevertOnPreProd returned error: %v", err)
+	}
+	if got.PRNumber != 101 || got.Branch != "pre-prod" || got.RevertedSHA != "merge-sha" || got.SHA != "revert-sha" {
+		t.Fatalf("RevertOnPreProd result = %#v", got)
+	}
+
+	var sawFetch, sawRevert, sawPush bool
+	for _, call := range runner.calls {
+		joined := strings.Join(call, "\x00")
+		if strings.Contains(strings.ToLower(joined), "main") {
+			t.Fatalf("RevertOnPreProd touched main-shaped target: %#v", call)
+		}
+		if reflect.DeepEqual(call, []string{"repo", "git", "fetch", "origin", "+refs/heads/pre-prod:refs/remotes/origin/pre-prod"}) {
+			sawFetch = true
+		}
+		if len(call) >= 7 && call[1] == "git" && call[2] == "revert" && reflect.DeepEqual(call[3:], []string{"-m", "1", "--no-edit", "merge-sha"}) {
+			sawRevert = true
+		}
+		if len(call) == 5 && call[1] == "git" && reflect.DeepEqual(call[2:], []string{"push", "origin", "HEAD:pre-prod"}) {
+			sawPush = true
+		}
+	}
+	if !sawFetch || !sawRevert || !sawPush {
+		t.Fatalf("calls missing fetch=%t revert=%t push=%t: %#v", sawFetch, sawRevert, sawPush, runner.calls)
+	}
+}
+
+func TestRevertOnPreProdRejectsProductionBranches(t *testing.T) {
+	client := NewWithRunner("repo", &fakeRunner{outputs: map[string][]byte{}})
+
+	for _, branch := range []string{"main", "master", "prod", "production"} {
+		_, err := client.RevertOnPreProd(context.Background(), 101, branch, "merge-sha")
+		if err == nil {
+			t.Fatalf("RevertOnPreProd(%q) returned nil error, want rejection", branch)
+		}
+	}
+}
+
 func TestWriterHasNoMergeToMainMethod(t *testing.T) {
 	writer := reflect.TypeOf((*Writer)(nil)).Elem()
 	for i := 0; i < writer.NumMethod(); i++ {
@@ -253,4 +324,20 @@ func (f *fakeRunner) Run(_ context.Context, dir, name string, args ...string) ([
 		key += "\x00" + arg
 	}
 	return f.outputs[key], nil
+}
+
+type preProdRevertRunner struct {
+	calls [][]string
+}
+
+func (r *preProdRevertRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+	call := append([]string{dir, name}, args...)
+	r.calls = append(r.calls, call)
+	if name == "git" && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+		return []byte("revert-sha\n"), nil
+	}
+	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
+		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
+	}
+	return nil, nil
 }

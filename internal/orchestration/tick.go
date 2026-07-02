@@ -43,6 +43,7 @@ const (
 	TickStopReviewFailed              = "review-failed"
 	TickStopReviewNeedsHuman          = "review-needs-human"
 	TickStopRiskGateNeedsHuman        = "risk-gate-needs-human"
+	TickStopPreProdNeedsHuman         = "pre-prod-needs-human"
 	TickStopStatePushFailed           = "state-push-failed"
 	TickStopCompileFailed             = "compile-failed"
 	TickStopReadySetFailed            = "ready-set-failed"
@@ -92,26 +93,28 @@ type TickOptions struct {
 }
 
 type TickReport struct {
-	Version       int                      `json:"version"`
-	Repo          string                   `json:"repo"`
-	RepoPath      string                   `json:"repo_path"`
-	BaseBranch    string                   `json:"base_branch"`
-	PreProdBranch string                   `json:"pre_prod_branch"`
-	RunID         string                   `json:"run_id"`
-	Status        string                   `json:"status"`
-	StopReason    string                   `json:"stop_reason"`
-	StartedAt     string                   `json:"started_at"`
-	FinishedAt    string                   `json:"finished_at"`
-	Compile       compiler.Report          `json:"compile"`
-	ReadySet      report.ReadySetReport    `json:"ready_set"`
-	DispatchWave  *DispatchWaveReport      `json:"dispatch_wave,omitempty"`
-	Reviews       []TickReviewResult       `json:"reviews"`
-	RiskGates     []TickRiskGateResult     `json:"risk_gates"`
-	PreProdMerges []TickPreProdMergeResult `json:"pre_prod_merges"`
-	NeedsHuman    []TickIssue              `json:"needs_human"`
-	Failures      []TickIssue              `json:"failures"`
-	StatePush     *TickStatePush           `json:"state_push,omitempty"`
-	Summary       TickSummary              `json:"summary"`
+	Version        int                       `json:"version"`
+	Repo           string                    `json:"repo"`
+	RepoPath       string                    `json:"repo_path"`
+	BaseBranch     string                    `json:"base_branch"`
+	PreProdBranch  string                    `json:"pre_prod_branch"`
+	RunID          string                    `json:"run_id"`
+	Status         string                    `json:"status"`
+	StopReason     string                    `json:"stop_reason"`
+	StartedAt      string                    `json:"started_at"`
+	FinishedAt     string                    `json:"finished_at"`
+	Compile        compiler.Report           `json:"compile"`
+	ReadySet       report.ReadySetReport     `json:"ready_set"`
+	DispatchWave   *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
+	Reviews        []TickReviewResult        `json:"reviews"`
+	RiskGates      []TickRiskGateResult      `json:"risk_gates"`
+	PreProdMerges  []TickPreProdMergeResult  `json:"pre_prod_merges"`
+	PreProdHealth  []TickPreProdHealthResult `json:"pre_prod_health"`
+	PreProdReverts []TickPreProdRevertResult `json:"pre_prod_reverts"`
+	NeedsHuman     []TickIssue               `json:"needs_human"`
+	Failures       []TickIssue               `json:"failures"`
+	StatePush      *TickStatePush            `json:"state_push,omitempty"`
+	Summary        TickSummary               `json:"summary"`
 }
 
 type TickReviewResult struct {
@@ -157,6 +160,32 @@ type TickPreProdMergeResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type TickPreProdHealthResult struct {
+	Issue          int        `json:"issue,omitempty"`
+	PR             string     `json:"pr,omitempty"`
+	PRNumber       int        `json:"pr_number,omitempty"`
+	Branch         string     `json:"branch"`
+	HeadSHA        string     `json:"head_sha,omitempty"`
+	MergeSHA       string     `json:"merge_sha,omitempty"`
+	Status         string     `json:"status"`
+	RequiredChecks []string   `json:"required_checks"`
+	Checks         []gh.Check `json:"checks"`
+	Problems       []string   `json:"problems"`
+	Error          string     `json:"error,omitempty"`
+}
+
+type TickPreProdRevertResult struct {
+	Issue       int    `json:"issue,omitempty"`
+	PR          string `json:"pr,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	Branch      string `json:"branch"`
+	RevertedSHA string `json:"reverted_sha,omitempty"`
+	SHA         string `json:"sha,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Status      string `json:"status"`
+	Error       string `json:"error,omitempty"`
+}
+
 type TickStatePush struct {
 	Branch    string   `json:"branch"`
 	Remote    string   `json:"remote"`
@@ -181,6 +210,7 @@ type TickSummary struct {
 	RiskGateCleanCount      int `json:"risk_gate_clean_count"`
 	RiskGateNeedsHumanCount int `json:"risk_gate_needs_human_count"`
 	PreProdMergeCount       int `json:"pre_prod_merge_count"`
+	PreProdRevertCount      int `json:"pre_prod_revert_count"`
 	NeedsHumanCount         int `json:"needs_human_count"`
 	FailureCount            int `json:"failure_count"`
 }
@@ -206,18 +236,20 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	}
 
 	tickReport := TickReport{
-		Version:       TickReportVersion,
-		Repo:          filepath.ToSlash(opts.RepoPath),
-		RepoPath:      filepath.ToSlash(opts.RepoPath),
-		BaseBranch:    opts.BaseBranch,
-		PreProdBranch: opts.PreProdBranch,
-		RunID:         opts.RunID,
-		StartedAt:     state.FormatTimestamp(started),
-		Reviews:       []TickReviewResult{},
-		RiskGates:     []TickRiskGateResult{},
-		PreProdMerges: []TickPreProdMergeResult{},
-		NeedsHuman:    []TickIssue{},
-		Failures:      []TickIssue{},
+		Version:        TickReportVersion,
+		Repo:           filepath.ToSlash(opts.RepoPath),
+		RepoPath:       filepath.ToSlash(opts.RepoPath),
+		BaseBranch:     opts.BaseBranch,
+		PreProdBranch:  opts.PreProdBranch,
+		RunID:          opts.RunID,
+		StartedAt:      state.FormatTimestamp(started),
+		Reviews:        []TickReviewResult{},
+		RiskGates:      []TickRiskGateResult{},
+		PreProdMerges:  []TickPreProdMergeResult{},
+		PreProdHealth:  []TickPreProdHealthResult{},
+		PreProdReverts: []TickPreProdRevertResult{},
+		NeedsHuman:     []TickIssue{},
+		Failures:       []TickIssue{},
 	}
 	finish := func(status, stopReason string) (TickReport, error) {
 		finished := opts.Clock().UTC()
@@ -609,6 +641,142 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	mergeResult.SHA = merged.SHA
 	mergeResult.URL = merged.URL
 	tickReport.PreProdMerges = append(tickReport.PreProdMerges, mergeResult)
+	runTickPreProdKeepsGreen(ctx, opts, tickReport, item, prNumber, mergeResult)
+}
+
+func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, prNumber int, mergeResult TickPreProdMergeResult) {
+	healthReader, ok := opts.Reader.(PreProdHealthReader)
+	if !ok {
+		detail := "github reader does not support pre-prod branch CI status reads"
+		tickReport.PreProdHealth = append(tickReport.PreProdHealth, TickPreProdHealthResult{
+			Issue:    item.Issue,
+			PR:       item.PR,
+			PRNumber: prNumber,
+			Branch:   opts.PreProdBranch,
+			MergeSHA: mergeResult.SHA,
+			Status:   PreProdHealthStatusUnknown,
+			Error:    detail,
+		})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-health",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+		return
+	}
+	if strings.TrimSpace(mergeResult.SHA) == "" {
+		detail := "pre-prod merge did not return a merge commit SHA"
+		tickReport.PreProdHealth = append(tickReport.PreProdHealth, TickPreProdHealthResult{
+			Issue:    item.Issue,
+			PR:       item.PR,
+			PRNumber: prNumber,
+			Branch:   opts.PreProdBranch,
+			Status:   PreProdHealthStatusUnknown,
+			Error:    detail,
+		})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-health",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+		return
+	}
+
+	branchChecks, err := healthReader.BranchChecks(ctx, opts.PreProdBranch)
+	health := TickPreProdHealthResult{
+		Issue:          item.Issue,
+		PR:             item.PR,
+		PRNumber:       prNumber,
+		Branch:         firstNonEmpty(branchChecks.Branch, opts.PreProdBranch),
+		HeadSHA:        branchChecks.HeadSHA,
+		MergeSHA:       mergeResult.SHA,
+		RequiredChecks: normalizeRequiredChecks(opts.RequiredChecks),
+		Checks:         append([]gh.Check(nil), branchChecks.Checks...),
+		Problems:       []string{},
+	}
+	if err != nil {
+		health.Status = PreProdHealthStatusUnknown
+		health.Error = err.Error()
+		tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-health",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: err.Error(),
+		})
+		return
+	}
+	health.Status, health.Problems = preProdHealthStatus(health.RequiredChecks, health.Checks)
+	tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
+	switch health.Status {
+	case PreProdHealthStatusGreen:
+		return
+	case PreProdHealthStatusRed:
+		if sameGitSHA(health.HeadSHA, mergeResult.SHA) {
+			runTickPreProdRevert(ctx, opts, tickReport, item, prNumber, mergeResult, health)
+			return
+		}
+		detail := fmt.Sprintf("pre-prod CI is red at %s, not the just-merged commit %s", firstNonEmpty(health.HeadSHA, "unknown"), mergeResult.SHA)
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-health",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+	default:
+		detail := "pre-prod CI is not green: " + strings.Join(health.Problems, ", ")
+		if len(health.Problems) == 0 {
+			detail = "pre-prod CI status is " + health.Status
+		}
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-health",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+	}
+}
+
+func runTickPreProdRevert(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, prNumber int, mergeResult TickPreProdMergeResult, health TickPreProdHealthResult) {
+	reverted, err := opts.PreProdWriter.RevertOnPreProd(ctx, prNumber, opts.PreProdBranch, mergeResult.SHA)
+	revertResult := TickPreProdRevertResult{
+		Issue:       item.Issue,
+		PR:          item.PR,
+		PRNumber:    prNumber,
+		Branch:      opts.PreProdBranch,
+		RevertedSHA: mergeResult.SHA,
+		Status:      TickStatusSucceeded,
+	}
+	if err != nil {
+		revertResult.Status = TickStatusFailed
+		revertResult.Error = err.Error()
+		tickReport.PreProdReverts = append(tickReport.PreProdReverts, revertResult)
+		tickReport.Failures = append(tickReport.Failures, TickIssue{
+			Step:   "pre-prod-revert",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: err.Error(),
+		})
+		return
+	}
+	revertResult.Branch = firstNonEmpty(reverted.Branch, opts.PreProdBranch)
+	revertResult.RevertedSHA = firstNonEmpty(reverted.RevertedSHA, mergeResult.SHA)
+	revertResult.SHA = reverted.SHA
+	revertResult.URL = reverted.URL
+	tickReport.PreProdReverts = append(tickReport.PreProdReverts, revertResult)
+
+	detail := fmt.Sprintf("pre-prod CI red after merge %s; reverted on %s", mergeResult.SHA, revertResult.Branch)
+	if len(health.Problems) > 0 {
+		detail += ": " + strings.Join(health.Problems, ", ")
+	}
+	tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+		Step:   "pre-prod-revert",
+		Issue:  item.Issue,
+		PR:     item.PR,
+		Detail: detail,
+	})
 }
 
 func preProdBranchProblem(preProdBranch, baseBranch string) string {
@@ -624,6 +792,62 @@ func preProdBranchProblem(preProdBranch, baseBranch string) string {
 		return fmt.Sprintf("pre-prod branch %q must differ from base branch %q", branch, strings.TrimSpace(baseBranch))
 	}
 	return ""
+}
+
+func preProdHealthStatus(requiredChecks []string, checks []gh.Check) (string, []string) {
+	if len(requiredChecks) == 0 {
+		return PreProdHealthStatusUnknown, []string{"no required CI checks configured for pre-prod health"}
+	}
+
+	byName := map[string]gh.Check{}
+	for _, check := range checks {
+		name := strings.TrimSpace(check.Name)
+		if name == "" {
+			continue
+		}
+		if existing, ok := byName[name]; ok && checkFailed(existing) {
+			continue
+		}
+		byName[name] = check
+	}
+
+	status := PreProdHealthStatusGreen
+	var problems []string
+	for _, requiredCheck := range requiredChecks {
+		check, ok := byName[requiredCheck]
+		if !ok {
+			if status == PreProdHealthStatusGreen {
+				status = PreProdHealthStatusPending
+			}
+			problems = append(problems, requiredCheck+" missing")
+			continue
+		}
+		if checkPassed(check) {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("%s %s", requiredCheck, checkStatus(check)))
+		if checkFailed(check) {
+			status = PreProdHealthStatusRed
+		} else if status == PreProdHealthStatusGreen {
+			status = PreProdHealthStatusPending
+		}
+	}
+	return status, problems
+}
+
+func sameGitSHA(a, b string) bool {
+	left := strings.ToLower(strings.TrimSpace(a))
+	right := strings.ToLower(strings.TrimSpace(b))
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	if len(left) >= 7 && strings.HasPrefix(right, left) {
+		return true
+	}
+	return len(right) >= 7 && strings.HasPrefix(left, right)
 }
 
 func formatRiskRedLines(lines []RiskRedLine) string {
@@ -649,6 +873,9 @@ func tickNeedsHumanStopReason(items []TickIssue) string {
 	for _, item := range items {
 		if item.Step == "risk-gate" || item.Step == "pre-prod-merge" {
 			return TickStopRiskGateNeedsHuman
+		}
+		if item.Step == "pre-prod-health" || item.Step == "pre-prod-revert" {
+			return TickStopPreProdNeedsHuman
 		}
 	}
 	return TickStopReviewNeedsHuman
@@ -807,6 +1034,61 @@ func RenderTickText(report TickReport) string {
 		}
 	}
 
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Pre-prod health")
+	if len(report.PreProdHealth) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, health := range report.PreProdHealth {
+			target := health.PR
+			if health.PRNumber > 0 {
+				target = fmt.Sprintf("#%d", health.PRNumber)
+			}
+			fmt.Fprintf(&out, "- PR %s issue #%d %s branch=%s\n", target, health.Issue, health.Status, health.Branch)
+			if strings.TrimSpace(health.HeadSHA) != "" {
+				fmt.Fprintf(&out, "  head_sha: %s\n", health.HeadSHA)
+			}
+			if strings.TrimSpace(health.MergeSHA) != "" {
+				fmt.Fprintf(&out, "  merge_sha: %s\n", health.MergeSHA)
+			}
+			if len(health.RequiredChecks) > 0 {
+				fmt.Fprintf(&out, "  required_checks: %s\n", strings.Join(health.RequiredChecks, ", "))
+			}
+			if len(health.Problems) > 0 {
+				fmt.Fprintf(&out, "  problems: %s\n", strings.Join(health.Problems, ", "))
+			}
+			if strings.TrimSpace(health.Error) != "" {
+				fmt.Fprintf(&out, "  error: %s\n", health.Error)
+			}
+		}
+	}
+
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Pre-prod reverts")
+	if len(report.PreProdReverts) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, reverted := range report.PreProdReverts {
+			target := reverted.PR
+			if reverted.PRNumber > 0 {
+				target = fmt.Sprintf("#%d", reverted.PRNumber)
+			}
+			fmt.Fprintf(&out, "- PR %s issue #%d %s branch=%s\n", target, reverted.Issue, reverted.Status, reverted.Branch)
+			if strings.TrimSpace(reverted.RevertedSHA) != "" {
+				fmt.Fprintf(&out, "  reverted_sha: %s\n", reverted.RevertedSHA)
+			}
+			if strings.TrimSpace(reverted.SHA) != "" {
+				fmt.Fprintf(&out, "  sha: %s\n", reverted.SHA)
+			}
+			if strings.TrimSpace(reverted.URL) != "" {
+				fmt.Fprintf(&out, "  url: %s\n", reverted.URL)
+			}
+			if strings.TrimSpace(reverted.Error) != "" {
+				fmt.Fprintf(&out, "  error: %s\n", reverted.Error)
+			}
+		}
+	}
+
 	renderTickIssueSection(&out, "Needs human", report.NeedsHuman)
 	renderTickIssueSection(&out, "Failures", report.Failures)
 
@@ -885,6 +1167,23 @@ func normalizeTickReport(report TickReport) TickReport {
 	if report.PreProdMerges == nil {
 		report.PreProdMerges = []TickPreProdMergeResult{}
 	}
+	if report.PreProdHealth == nil {
+		report.PreProdHealth = []TickPreProdHealthResult{}
+	}
+	for i := range report.PreProdHealth {
+		if report.PreProdHealth[i].RequiredChecks == nil {
+			report.PreProdHealth[i].RequiredChecks = []string{}
+		}
+		if report.PreProdHealth[i].Checks == nil {
+			report.PreProdHealth[i].Checks = []gh.Check{}
+		}
+		if report.PreProdHealth[i].Problems == nil {
+			report.PreProdHealth[i].Problems = []string{}
+		}
+	}
+	if report.PreProdReverts == nil {
+		report.PreProdReverts = []TickPreProdRevertResult{}
+	}
 	if report.NeedsHuman == nil {
 		report.NeedsHuman = []TickIssue{}
 	}
@@ -937,6 +1236,11 @@ func summarizeTick(report TickReport) TickSummary {
 	for _, merged := range report.PreProdMerges {
 		if merged.Status == TickStatusSucceeded {
 			summary.PreProdMergeCount++
+		}
+	}
+	for _, reverted := range report.PreProdReverts {
+		if reverted.Status == TickStatusSucceeded {
+			summary.PreProdRevertCount++
 		}
 	}
 	return summary

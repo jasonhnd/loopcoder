@@ -14,16 +14,18 @@ import (
 )
 
 type fakeReader struct {
-	repo      string
-	issues    []gh.Issue
-	views     map[int]gh.Issue
-	viewErrs  map[int]error
-	prs       []gh.PullRequest
-	checks    map[int][]gh.Check
-	checkErrs map[int]error
-	diffFiles map[int][]string
-	diffs     map[int]string
-	diffErrs  map[int]error
+	repo            string
+	issues          []gh.Issue
+	views           map[int]gh.Issue
+	viewErrs        map[int]error
+	prs             []gh.PullRequest
+	checks          map[int][]gh.Check
+	checkErrs       map[int]error
+	branchChecks    map[string]gh.BranchChecksResult
+	branchCheckErrs map[string]error
+	diffFiles       map[int][]string
+	diffs           map[int]string
+	diffErrs        map[int]error
 }
 
 func (f fakeReader) RepoName(context.Context) (string, error) {
@@ -50,6 +52,17 @@ func (f fakeReader) PRChecks(_ context.Context, number int) ([]gh.Check, error) 
 		return nil, err
 	}
 	return append([]gh.Check(nil), f.checks[number]...), nil
+}
+
+func (f fakeReader) BranchChecks(_ context.Context, branch string) (gh.BranchChecksResult, error) {
+	if err := f.branchCheckErrs[branch]; err != nil {
+		return gh.BranchChecksResult{}, err
+	}
+	if result, ok := f.branchChecks[branch]; ok {
+		result.Checks = append([]gh.Check(nil), result.Checks...)
+		return result, nil
+	}
+	return gh.BranchChecksResult{Branch: branch, HeadSHA: "abc123", Checks: passChecks()}, nil
 }
 
 func (f fakeReader) PRDiff(_ context.Context, number int) (string, error) {
