@@ -111,6 +111,108 @@ func TestDiscoverSpecPathPrefersSpecsInNewLayout(t *testing.T) {
 	}
 }
 
+func TestLoadIssueResolvesFallbackFromLoopIssueBranch(t *testing.T) {
+	fakeGitHub := &loopreviewFakeGitHub{
+		issues: map[int]gh.Issue{
+			101: {Number: 101, Title: "Issue 101", Body: "Implement per docs/specs/design.md."},
+		},
+	}
+
+	issue, present := loadIssue(context.Background(), fakeGitHub, gh.PullRequest{
+		Title:       "Worker PR",
+		Body:        "Worker-authored PR body without a spec path.",
+		HeadRefName: "loop/issue-101",
+	})
+
+	if !present {
+		t.Fatal("loadIssue did not resolve an issue")
+	}
+	if issue.Number != 101 {
+		t.Fatalf("issue number = %d, want 101", issue.Number)
+	}
+	assertViewedIssues(t, fakeGitHub, 101)
+}
+
+func TestLoadIssueResolvesFallbackFromPRBodyReference(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "closing keyword", body: "Worker-authored PR body.\n\nCloses #101"},
+		{name: "bare reference", body: "Worker-authored PR body for #101."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeGitHub := &loopreviewFakeGitHub{
+				issues: map[int]gh.Issue{
+					101: {Number: 101, Title: "Issue 101", Body: "Implement per docs/specs/design.md."},
+				},
+			}
+
+			issue, present := loadIssue(context.Background(), fakeGitHub, gh.PullRequest{
+				Title:       "Worker PR",
+				Body:        tt.body,
+				HeadRefName: "worker/feature",
+			})
+
+			if !present {
+				t.Fatal("loadIssue did not resolve an issue")
+			}
+			if issue.Number != 101 {
+				t.Fatalf("issue number = %d, want 101", issue.Number)
+			}
+			assertViewedIssues(t, fakeGitHub, 101)
+		})
+	}
+}
+
+func TestLoadIssueKeepsClosingIssueReferencesPreferred(t *testing.T) {
+	fakeGitHub := &loopreviewFakeGitHub{
+		issues: map[int]gh.Issue{
+			101: {Number: 101, Title: "Branch issue", Body: "Branch body."},
+			202: {Number: 202, Title: "Closing issue", Body: "Implement per docs/specs/design.md."},
+			303: {Number: 303, Title: "Body issue", Body: "Body reference."},
+		},
+	}
+
+	issue, present := loadIssue(context.Background(), fakeGitHub, gh.PullRequest{
+		Title:       "Worker PR",
+		Body:        "Closes #303",
+		HeadRefName: "loop/issue-101",
+		ClosingIssuesReferences: []gh.IssueReference{{
+			Number: 202,
+		}},
+	})
+
+	if !present {
+		t.Fatal("loadIssue did not resolve an issue")
+	}
+	if issue.Number != 202 {
+		t.Fatalf("issue number = %d, want 202", issue.Number)
+	}
+	assertViewedIssues(t, fakeGitHub, 202)
+}
+
+func TestLoadIssueKeepsNoReferenceFallback(t *testing.T) {
+	fakeGitHub := &loopreviewFakeGitHub{}
+	pr := gh.PullRequest{
+		Title:       "Worker PR",
+		Body:        "Worker-authored PR body without a spec path.",
+		HeadRefName: "worker/feature",
+	}
+
+	issue, present := loadIssue(context.Background(), fakeGitHub, pr)
+
+	if present {
+		t.Fatal("loadIssue unexpectedly resolved an issue")
+	}
+	if issue.Title != pr.Title || issue.Body != pr.Body {
+		t.Fatalf("fallback issue = %#v, want PR title/body", issue)
+	}
+	assertViewedIssues(t, fakeGitHub)
+}
+
 func TestBuildPromptUsesBoundedReviewPacketContract(t *testing.T) {
 	prompt, _ := buildPromptWithLimits(loopreviewPromptTestOptions(), loopreviewPromptTestInputs(), ReviewPacketLimits{})
 	for _, want := range []string{
@@ -924,6 +1026,18 @@ func int64Ptr(value int64) *int64 {
 	return &value
 }
 
+func assertViewedIssues(t *testing.T, fakeGitHub *loopreviewFakeGitHub, want ...int) {
+	t.Helper()
+	if len(fakeGitHub.viewedIssues) != len(want) {
+		t.Fatalf("viewed issues = %#v, want %#v", fakeGitHub.viewedIssues, want)
+	}
+	for i := range want {
+		if fakeGitHub.viewedIssues[i] != want[i] {
+			t.Fatalf("viewed issues = %#v, want %#v", fakeGitHub.viewedIssues, want)
+		}
+	}
+}
+
 type loopreviewFakeGit struct {
 	fetchBase string
 	fetchPR   int
@@ -961,17 +1075,31 @@ func (f *loopreviewFakeGit) Show(_ context.Context, _ string, revPath string) (s
 }
 
 type loopreviewFakeGitHub struct {
-	pr    gh.PullRequest
-	issue gh.Issue
-	diff  string
-	files []string
+	pr           gh.PullRequest
+	issue        gh.Issue
+	issues       map[int]gh.Issue
+	issueErrors  map[int]error
+	viewedIssues []int
+	diff         string
+	files        []string
 }
 
 func (f *loopreviewFakeGitHub) ViewPR(context.Context, int) (gh.PullRequest, error) {
 	return f.pr, nil
 }
 
-func (f *loopreviewFakeGitHub) ViewIssue(context.Context, int) (gh.Issue, error) {
+func (f *loopreviewFakeGitHub) ViewIssue(_ context.Context, number int) (gh.Issue, error) {
+	f.viewedIssues = append(f.viewedIssues, number)
+	if err := f.issueErrors[number]; err != nil {
+		return gh.Issue{}, err
+	}
+	if f.issues != nil {
+		issue, ok := f.issues[number]
+		if !ok {
+			return gh.Issue{}, errors.New("issue not found")
+		}
+		return issue, nil
+	}
 	return f.issue, nil
 }
 
