@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -97,6 +98,9 @@ func TestRunGateWithinTolerancePasses(t *testing.T) {
 	}
 	if len(report.Cases) != 1 || report.Cases[0].OriginalRuns != 2 || report.Cases[0].CandidateRuns != 1 {
 		t.Fatalf("case report = %#v, want old/old/new execution", report.Cases)
+	}
+	if report.Cases[0].GoldenComparison == nil || !report.Cases[0].GoldenComparison.WithinTolerance {
+		t.Fatalf("golden comparison = %#v, want within-tolerance comparison", report.Cases[0].GoldenComparison)
 	}
 	if len(executor.calls) != 3 {
 		t.Fatalf("calls = %d, want 3", len(executor.calls))
@@ -211,6 +215,102 @@ func TestCompareUsesNullMappingAndOrderingRules(t *testing.T) {
 	}
 }
 
+func TestCompareNormalizesWithoutMutatingSharedContract(t *testing.T) {
+	contract := contractWithUnnormalizedTolerance()
+	originalPaths := append([]string(nil), contract.Tolerance.FloatPrecision.Paths...)
+	originalMappings := append([]NullMapping(nil), contract.Tolerance.NullMappings...)
+
+	comparison := Compare(contract, map[string]any{
+		"score": 1.0,
+		"name":  nil,
+		"items": []any{"a", "b"},
+	}, map[string]any{
+		"score": 1.05,
+		"name":  "",
+		"items": []any{"b", "a"},
+	}, nil)
+
+	if !comparison.WithinTolerance {
+		t.Fatalf("comparison = %#v, want normalized tolerance rules to pass", comparison)
+	}
+	if !reflect.DeepEqual(contract.Tolerance.FloatPrecision.Paths, originalPaths) {
+		t.Fatalf("float paths mutated to %#v, want %#v", contract.Tolerance.FloatPrecision.Paths, originalPaths)
+	}
+	if !reflect.DeepEqual(contract.Tolerance.NullMappings, originalMappings) {
+		t.Fatalf("null mappings mutated to %#v, want %#v", contract.Tolerance.NullMappings, originalMappings)
+	}
+}
+
+func TestCompareConcurrentSharedContract(t *testing.T) {
+	contract := contractWithUnnormalizedTolerance()
+	oldValue := map[string]any{
+		"score": 1.0,
+		"name":  nil,
+		"items": []any{"a", "b"},
+	}
+	newValue := map[string]any{
+		"score": 1.05,
+		"name":  "",
+		"items": []any{"b", "a"},
+	}
+
+	var wg sync.WaitGroup
+	failures := make(chan Comparison, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				comparison := Compare(contract, oldValue, newValue, nil)
+				if !comparison.WithinTolerance {
+					failures <- comparison
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for comparison := range failures {
+		t.Fatalf("comparison = %#v, want shared concurrent comparisons within tolerance", comparison)
+	}
+}
+
+func TestCaseReportOmitsGoldenComparisonWithoutGolden(t *testing.T) {
+	executor := newScriptedExecutor(map[string][]Observation{
+		execKey(TargetOriginal, "case-1"): {
+			{Value: map[string]any{"score": 1.0}},
+			{Value: map[string]any{"score": 1.0}},
+		},
+		execKey(TargetCandidate, "case-1"): {
+			{Value: map[string]any{"score": 1.0}},
+		},
+	})
+
+	report, err := RunGate(context.Background(), GateOptions{
+		Contract: testContract(0.1),
+		SliceID:  "reader-api",
+		Cases:    []Case{{ID: "case-1"}},
+		Executor: executor,
+	})
+	if err != nil {
+		t.Fatalf("RunGate returned error: %v", err)
+	}
+	if len(report.Cases) != 1 {
+		t.Fatalf("cases = %#v, want one case", report.Cases)
+	}
+	if report.Cases[0].GoldenComparison != nil {
+		t.Fatalf("golden comparison = %#v, want nil without golden master", report.Cases[0].GoldenComparison)
+	}
+	data, err := json.Marshal(report.Cases[0])
+	if err != nil {
+		t.Fatalf("marshal case report: %v", err)
+	}
+	if strings.Contains(string(data), "golden_comparison") {
+		t.Fatalf("case report JSON = %s, want golden_comparison omitted", string(data))
+	}
+}
+
 func TestRunGateSideEffectSliceDoesNotLiveExecute(t *testing.T) {
 	executor := newScriptedExecutor(nil)
 	report, err := RunGate(context.Background(), GateOptions{
@@ -310,5 +410,26 @@ func testContract(floatAbsolute float64) Contract {
 			Approved:       true,
 			PromotionClass: true,
 		}},
+	}
+}
+
+func contractWithUnnormalizedTolerance() Contract {
+	return Contract{
+		Version: ContractVersion,
+		Partition: Partition{
+			ReadSlices: []string{"reader-api"},
+		},
+		Tolerance: ToleranceRules{
+			FloatPrecision: &FloatPrecision{
+				Absolute: 0.1,
+				Paths:    []string{" $.score ", "", "$.score"},
+			},
+			NullMappings: []NullMapping{{
+				Path:     " $.name ",
+				OldValue: json.RawMessage(`null`),
+				NewValue: json.RawMessage(`""`),
+			}},
+			OrderingInsensitivePaths: []string{" $.items "},
+		},
 	}
 }

@@ -194,12 +194,19 @@ func normalizePartition(partition Partition) Partition {
 func normalizeTolerance(rules ToleranceRules) ToleranceRules {
 	rules.OrderingInsensitivePaths = cleanStrings(rules.OrderingInsensitivePaths)
 	if rules.FloatPrecision != nil {
-		rules.FloatPrecision.Paths = cleanStrings(rules.FloatPrecision.Paths)
+		floatPrecision := *rules.FloatPrecision
+		floatPrecision.Paths = cleanStrings(floatPrecision.Paths)
+		rules.FloatPrecision = &floatPrecision
 	}
-	for i := range rules.NullMappings {
-		rules.NullMappings[i].Path = strings.TrimSpace(rules.NullMappings[i].Path)
-		rules.NullMappings[i].OldValue = normalizeValue(rules.NullMappings[i].OldValue)
-		rules.NullMappings[i].NewValue = normalizeValue(rules.NullMappings[i].NewValue)
+	if len(rules.NullMappings) > 0 {
+		nullMappings := make([]NullMapping, 0, len(rules.NullMappings))
+		for _, mapping := range rules.NullMappings {
+			mapping.Path = strings.TrimSpace(mapping.Path)
+			mapping.OldValue = normalizeValue(mapping.OldValue)
+			mapping.NewValue = normalizeValue(mapping.NewValue)
+			nullMappings = append(nullMappings, mapping)
+		}
+		rules.NullMappings = nullMappings
 	}
 	return rules
 }
