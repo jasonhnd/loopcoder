@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/relay"
@@ -57,6 +58,7 @@ type Deps struct {
 	BuildInfo        BuildInfo
 	ComputeReadySet  func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
 	Tick             func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover         func(ctx context.Context, opts perception.Options) (perception.Report, error)
 	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
@@ -77,6 +79,7 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
+	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
 	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
 	{Name: "tick", Summary: "run one unattended delivery pass"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
@@ -132,6 +135,9 @@ func DefaultDeps() Deps {
 		},
 		Tick: func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
 			return orchestration.Tick(ctx, opts)
+		},
+		Discover: func(ctx context.Context, opts perception.Options) (perception.Report, error) {
+			return perception.Run(ctx, opts)
 		},
 		Compile: func(ctx context.Context, opts compiler.Options) (compiler.Report, error) {
 			return compiler.Run(ctx, opts, compiler.DefaultDeps())
@@ -220,6 +226,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "compile" {
 		return runCompile(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "discover" {
+		return runDiscover(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "tick" {
 		return runTick(args[1:], stdout, stderr, deps)
@@ -344,6 +353,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-effort string    optional first-run verifier reasoning effort to persist")
 	}
 	if command.Name == "compile" {
+		fmt.Fprintln(w, "  --repo string   repository path (required)")
+	}
+	if command.Name == "discover" {
 		fmt.Fprintln(w, "  --repo string   repository path (required)")
 	}
 	if command.Name == "tick" {
@@ -689,6 +701,75 @@ func runCompile(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if _, err := stderr.Write([]byte(compiler.RenderText(report))); err != nil {
 		fmt.Fprintf(stderr, "compile: write summary: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDiscover(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.Discover == nil {
+		deps.Discover = defaults.Discover
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "discover: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "discover: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 2
+	}
+	report, err := deps.Discover(context.Background(), perception.Options{
+		RepoPath: resolvedRepo,
+		CI:       deps.NewGitHubReader(resolvedRepo),
+		Writer:   deps.NewIssueWriter(resolvedRepo),
+		Now:      deps.Now(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 1
+	}
+	data, err := perception.MarshalReportJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "discover: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(perception.RenderText(report))); err != nil {
+		fmt.Fprintf(stderr, "discover: write summary: %v\n", err)
 		return 1
 	}
 	return 0
