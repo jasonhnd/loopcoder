@@ -36,32 +36,34 @@ type PromotionWriter interface {
 }
 
 type PromoteOptions struct {
-	Writer        PromotionWriter
-	RepoPath      string
-	RunID         string
-	PreProdBranch string
-	Gate          string
-	KickBackItems []string
-	Clock         func() time.Time
-	StatePush     StatePushFunc
+	Writer          PromotionWriter
+	RepoPath        string
+	RunID           string
+	PreProdBranch   string
+	Gate            string
+	KickBackItems   []string
+	Clock           func() time.Time
+	StatePush       StatePushFunc
+	ToggleInventory PromoteToggleInventoryFunc
 }
 
 type PromoteReport struct {
-	Version       int                     `json:"version"`
-	RepoPath      string                  `json:"repo_path"`
-	RunID         string                  `json:"run_id"`
-	PreProdBranch string                  `json:"pre_prod_branch"`
-	MainBranch    string                  `json:"main_branch"`
-	Gate          string                  `json:"gate"`
-	Status        string                  `json:"status"`
-	StartedAt     string                  `json:"started_at"`
-	FinishedAt    string                  `json:"finished_at"`
-	KickedBack    []PromoteKickBackResult `json:"kicked_back"`
-	NeedsHuman    []PromoteNeedsHuman     `json:"needs_human"`
-	Promoted      PromoteMainResult       `json:"promoted"`
-	Sync          PromoteSyncResult       `json:"sync"`
-	StatePush     *PromoteStatePush       `json:"state_push,omitempty"`
-	Summary       PromoteSummary          `json:"summary"`
+	Version         int                     `json:"version"`
+	RepoPath        string                  `json:"repo_path"`
+	RunID           string                  `json:"run_id"`
+	PreProdBranch   string                  `json:"pre_prod_branch"`
+	MainBranch      string                  `json:"main_branch"`
+	Gate            string                  `json:"gate"`
+	Status          string                  `json:"status"`
+	StartedAt       string                  `json:"started_at"`
+	FinishedAt      string                  `json:"finished_at"`
+	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
+	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
+	ToggleInventory PromoteToggleInventory  `json:"toggle_inventory"`
+	Promoted        PromoteMainResult       `json:"promoted"`
+	Sync            PromoteSyncResult       `json:"sync"`
+	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
+	Summary         PromoteSummary          `json:"summary"`
 }
 
 type PromoteKickBackResult struct {
@@ -184,6 +186,16 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		return failBeforeMain(fmt.Errorf("promote requires adapters.gate human-merge, got %q", opts.Gate))
 	}
 
+	inventory, err := opts.ToggleInventory(ctx, opts.RepoPath)
+	if err != nil {
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "toggle-inventory",
+			Detail: "toggle inventory could not be loaded: " + err.Error(),
+		})
+	} else {
+		report.ToggleInventory = inventory
+	}
+
 	for _, item := range normalizeKickBackItems(opts.KickBackItems) {
 		kick := PromoteKickBackResult{
 			Item:   item,
@@ -288,6 +300,9 @@ func withPromoteDefaults(opts PromoteOptions) PromoteOptions {
 		opts.StatePush = func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
 		}
+	}
+	if opts.ToggleInventory == nil {
+		opts.ToggleInventory = BuildPromoteToggleInventory
 	}
 	return opts
 }
@@ -449,6 +464,26 @@ func RenderPromoteText(report PromoteReport) string {
 	}
 
 	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Toggle inventory")
+	if len(report.ToggleInventory.FlipOn) == 0 {
+		fmt.Fprintln(&out, "- flip_on: none")
+	} else {
+		for _, item := range report.ToggleInventory.FlipOn {
+			fmt.Fprintf(&out, "- flip_on %s build_tag=%s\n", item.SliceRef, item.BuildTag)
+		}
+	}
+	if len(report.ToggleInventory.LeaveDark) == 0 {
+		fmt.Fprintln(&out, "- leave_dark: none")
+	} else {
+		for _, item := range report.ToggleInventory.LeaveDark {
+			fmt.Fprintf(&out, "- leave_dark %s build_tag=%s\n", item.SliceRef, item.BuildTag)
+			if strings.TrimSpace(item.Reason) != "" {
+				fmt.Fprintf(&out, "  reason: %s\n", item.Reason)
+			}
+		}
+	}
+
+	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Promoted")
 	fmt.Fprintf(&out, "- %s -> %s %s\n", report.Promoted.PreProdBranch, report.Promoted.MainBranch, report.Promoted.Status)
 	if report.Promoted.AlreadyUpToDate {
@@ -520,6 +555,7 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 	if report.NeedsHuman == nil {
 		report.NeedsHuman = []PromoteNeedsHuman{}
 	}
+	report.ToggleInventory = normalizePromoteToggleInventory(report.ToggleInventory)
 	if strings.TrimSpace(report.Promoted.PreProdBranch) == "" {
 		report.Promoted.PreProdBranch = report.PreProdBranch
 	}

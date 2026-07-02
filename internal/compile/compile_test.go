@@ -380,6 +380,88 @@ func TestCompileEpicIncludesMockedGoListBackbone(t *testing.T) {
 	}
 }
 
+func TestCompileMigrationEpicAnnotatesDisciplineToggleAndDarkState(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Rewrite billing engine
+Migrate billing behind Branch-by-Abstraction.
+
+- code: Add billing seam
+- code: Port invoice read path
+- code: Flip and delete old invoice path
+- code: Remove migration toggles cleanup
+`
+	writer := newFakeIssueWriter()
+	report, _, files := runCompileTestFiles(t, writer, roadmap)
+
+	if len(report.Created) != 4 {
+		t.Fatalf("created = %#v, want four migration slices", report.Created)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	if len(artifact.Nodes) != 4 {
+		t.Fatalf("artifact nodes = %#v, want four nodes", artifact.Nodes)
+	}
+	gotTypes := make([]string, 0, len(artifact.Nodes))
+	for _, node := range artifact.Nodes {
+		gotTypes = append(gotTypes, node.SliceType)
+	}
+	wantTypes := []string{EpicSliceTypeSeam, EpicSliceTypeImplementation, EpicSliceTypeFlipDelete, EpicSliceTypeCleanup}
+	if !reflect.DeepEqual(gotTypes, wantTypes) {
+		t.Fatalf("slice types = %#v, want %#v", gotTypes, wantTypes)
+	}
+
+	impl := artifact.Nodes[1]
+	if impl.BuildTagToggle == nil {
+		t.Fatalf("implementation node missing build-tag toggle: %#v", impl)
+	}
+	if impl.BuildTagToggle.BuildTag != "lc_rewrite_billing_engine_code_2" || impl.BuildTagToggle.DefaultState != EpicToggleStateOff {
+		t.Fatalf("implementation toggle = %#v", impl.BuildTagToggle)
+	}
+	if !impl.Dark || impl.BuildTagToggle.State != EpicToggleStateOff || !strings.Contains(impl.DarkReason, "not complete") {
+		t.Fatalf("implementation dark state = dark %t toggle %#v reason %q", impl.Dark, impl.BuildTagToggle, impl.DarkReason)
+	}
+	if !strings.Contains(writer.issues[2].Body, "## Build-tag toggle") || !strings.Contains(writer.issues[2].Body, "`lc_rewrite_billing_engine_code_2`") {
+		t.Fatalf("implementation issue body missing toggle instructions:\n%s", writer.issues[2].Body)
+	}
+	if !nodeDependsOn(artifact.Nodes[1], artifact.Nodes[0].ID) {
+		t.Fatalf("implementation deps = %#v, want seam dependency", artifact.Nodes[1].DependsOn)
+	}
+	if !nodeDependsOn(artifact.Nodes[2], artifact.Nodes[1].ID) {
+		t.Fatalf("flip+delete deps = %#v, want implementation dependency", artifact.Nodes[2].DependsOn)
+	}
+	if !nodeDependsOn(artifact.Nodes[3], artifact.Nodes[2].ID) {
+		t.Fatalf("cleanup deps = %#v, want flip+delete dependency", artifact.Nodes[3].DependsOn)
+	}
+}
+
+func TestCompileMigrationEpicAddsMissingCleanupSlice(t *testing.T) {
+	roadmap := `# ROADMAP
+
+## [epic] Migrate ledger backend
+Migrate the ledger storage path.
+
+- code: Port ledger read path
+`
+	writer := newFakeIssueWriter()
+	report, _, files := runCompileTestFiles(t, writer, roadmap)
+
+	if len(report.Created) != 4 {
+		t.Fatalf("created = %#v, want generated seam, impl, flip+delete, cleanup slices", report.Created)
+	}
+	artifact := readEpicArtifactTest(t, files, report.EpicDAGs[0])
+	gotTypes := make([]string, 0, len(artifact.Nodes))
+	for _, node := range artifact.Nodes {
+		gotTypes = append(gotTypes, node.SliceType)
+	}
+	wantTypes := []string{EpicSliceTypeSeam, EpicSliceTypeImplementation, EpicSliceTypeFlipDelete, EpicSliceTypeCleanup}
+	if !reflect.DeepEqual(gotTypes, wantTypes) {
+		t.Fatalf("slice types = %#v, want %#v", gotTypes, wantTypes)
+	}
+	if !strings.Contains(artifact.Nodes[3].Title, "cleanup") {
+		t.Fatalf("cleanup title = %q", artifact.Nodes[3].Title)
+	}
+}
+
 func runCompileTest(t *testing.T, writer *fakeIssueWriter, roadmap string) (Report, string) {
 	t.Helper()
 	report, written, _ := runCompileTestFiles(t, writer, roadmap)
@@ -639,4 +721,13 @@ func memberRefs(members []EpicAtomicMember) []string {
 		out = append(out, member.Ref)
 	}
 	return out
+}
+
+func nodeDependsOn(node EpicSliceNode, depID string) bool {
+	for _, got := range node.DependsOn {
+		if got == depID {
+			return true
+		}
+	}
+	return false
 }
