@@ -423,6 +423,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string                  optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string                 optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --upgraded-model string         optional upgraded retry worker model override")
+		fmt.Fprintln(w, "  --upgraded-effort string        optional upgraded retry worker effort override (default \"xhigh\" when needed)")
+		fmt.Fprintln(w, "  --verifier-provider string      optional verifier provider for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-model string         optional verifier model override for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-effort string        optional verifier effort override for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -1036,6 +1042,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ComputeReadySet:    deps.ComputeReadySet,
 		Dispatch:           deps.Dispatch,
 		Loopreview:         deps.Loopreview,
+		Recover:            deps.Recover,
 		PreProdWriter:      deps.NewPreProdWriter(resolvedRepo),
 		StatePush:          deps.StatePush,
 	})
@@ -2511,8 +2518,11 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Dispatch == nil {
 		deps.Dispatch = DefaultDeps().Dispatch
 	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = DefaultDeps().Loopreview
+	}
 	if deps.Recover == nil {
-		deps.Recover = recoverWithDispatch(deps.Dispatch)
+		deps.Recover = recoverWithDispatch(deps.Dispatch, deps.Loopreview)
 	}
 
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
@@ -2531,6 +2541,12 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var upgradedModelAlias string
+	var upgradedEffortAlias string
+	var verifierProviderAlias string
+	var verifierModelAlias string
+	var verifierEffortAlias string
+	var verifierTimeoutAlias time.Duration
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -2554,12 +2570,26 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
+	fs.StringVar(&upgradedModelAlias, "UpgradedModel", "", "upgraded model")
+	fs.StringVar(&opts.UpgradedEffort, "upgraded-effort", "", "upgraded effort")
+	fs.StringVar(&upgradedEffortAlias, "UpgradedEffort", "", "upgraded effort")
+	fs.StringVar(&opts.VerifierProvider, "verifier-provider", "", "verifier provider")
+	fs.StringVar(&verifierProviderAlias, "VerifierProvider", "", "verifier provider")
+	fs.StringVar(&opts.VerifierModel, "verifier-model", "", "verifier model")
+	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
+	fs.StringVar(&opts.VerifierEffort, "verifier-effort", "", "verifier effort")
+	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier effort")
+	fs.DurationVar(&opts.VerifierTimeout, "verifier-timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
+	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
 	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
+	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
+	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -2592,6 +2622,24 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if effortAlias != "" {
 		opts.Effort = effortAlias
+	}
+	if upgradedModelAlias != "" {
+		opts.UpgradedModel = upgradedModelAlias
+	}
+	if upgradedEffortAlias != "" {
+		opts.UpgradedEffort = upgradedEffortAlias
+	}
+	if verifierProviderAlias != "" {
+		opts.VerifierProvider = verifierProviderAlias
+	}
+	if verifierModelAlias != "" {
+		opts.VerifierModel = verifierModelAlias
+	}
+	if verifierEffortAlias != "" {
+		opts.VerifierEffort = verifierEffortAlias
+	}
+	if verifierTimeoutAlias != 0 {
+		opts.VerifierTimeout = verifierTimeoutAlias
 	}
 	opts.Stderr = stderr
 
@@ -2638,6 +2686,17 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		effortFlagSet,
 		cfg.Worker.Model,
 		cfg.Worker.ReasoningEffort,
+	)
+	if strings.TrimSpace(opts.VerifierProvider) == "" {
+		opts.VerifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
+	}
+	opts.VerifierModel, opts.VerifierEffort = applyRoleModelEffort(
+		opts.VerifierModel,
+		opts.VerifierEffort,
+		verifierModelFlagSet,
+		verifierEffortFlagSet,
+		cfg.Verifier.Model,
+		cfg.Verifier.ReasoningEffort,
 	)
 	opts.Budget = cfg.Guardrails.Budget
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
@@ -2859,7 +2918,7 @@ func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return result.ExitCode
 }
 
-func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
+func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error), review func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
 	return func(ctx context.Context, opts recovery.Options) (recovery.Result, error) {
 		recoverDeps := recovery.DefaultDeps()
 		recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
@@ -2878,9 +2937,6 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Effort:          dispatchOpts.Effort,
 				Stderr:          dispatchOpts.Stderr,
 			})
-			if err != nil {
-				return recovery.DispatchResult{}, err
-			}
 			return recovery.DispatchResult{
 				OK:          result.OK,
 				Issue:       result.Issue,
@@ -2892,8 +2948,10 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Status:      result.Status,
 				ExitCode:    result.ExitCode,
 				LogBytes:    result.LogBytes,
-			}, nil
+				Attestation: result.Attestation,
+			}, err
 		}
+		recoverDeps.Review = review
 		return recovery.Run(ctx, opts, recoverDeps)
 	}
 }

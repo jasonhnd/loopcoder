@@ -2770,6 +2770,12 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 		"-Provider", "codex",
 		"-Model", "gpt-5",
 		"-Effort", "high",
+		"-UpgradedModel", "gpt-6",
+		"-UpgradedEffort", "xhigh",
+		"-VerifierProvider", "claude",
+		"-VerifierModel", "claude-opus",
+		"-VerifierEffort", "max",
+		"-VerifierTimeout", "15s",
 	}, &stdout, &stderr, Deps{
 		Recover: func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
 			if opts.RepoPath != repo {
@@ -2786,6 +2792,12 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 			}
 			if opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
 				t.Fatalf("recover opts provider/model/effort = %#v", opts)
+			}
+			if opts.UpgradedModel != "gpt-6" || opts.UpgradedEffort != "xhigh" {
+				t.Fatalf("recover opts upgraded model/effort = %#v", opts)
+			}
+			if opts.VerifierProvider != "claude" || opts.VerifierModel != "claude-opus" || opts.VerifierEffort != "max" || opts.VerifierTimeout != 15*time.Second {
+				t.Fatalf("recover opts verifier fields = %#v", opts)
 			}
 			if opts.Stderr == nil {
 				t.Fatal("recover opts Stderr is nil")

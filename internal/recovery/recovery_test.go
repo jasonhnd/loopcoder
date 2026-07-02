@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -541,12 +543,14 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 	if gotDispatch.RunID != "run-test" || gotDispatch.BaseBranch != "trunk" || gotDispatch.RecoveryContext != "latest retry context" {
 		t.Fatalf("dispatch run/base/recovery = %#v", gotDispatch)
 	}
-	if gotDispatch.Provider != "codex" || gotDispatch.Model != "gpt-5" || gotDispatch.Effort != "high" {
+	if gotDispatch.Provider != "codex" || gotDispatch.Model != "gpt-5" || gotDispatch.Effort != "xhigh" {
 		t.Fatalf("dispatch provider/model/effort = %#v", gotDispatch)
 	}
 	for _, want := range []string{
 		"RETRY: dispatching issue #103 attempt 3",
 		"Retry branch: loop/issue-103-retry-3",
+		"Recovery strategy: upgraded_config",
+		"Effort: xhigh",
 		"Backoff seconds: 30",
 		`"ok":true`,
 		`"branch":"loop/issue-103-retry-3"`,
@@ -564,6 +568,155 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		result.DispatchResult.Attestation.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Attestation.Usage.TotalTokens != 321 {
 		t.Fatalf("retry attestation not preserved: %#v", result.DispatchResult.Attestation)
+	}
+}
+
+func TestRecoverLoopReviewFailRetriesSameThenUpgradedThenBlocks(t *testing.T) {
+	repo := t.TempDir()
+	attempts := []state.Attempt{recoverAttempt(repo, 1, "job-103-1", "failed", "first error")}
+	var dispatched []DispatchOptions
+	var reviewed []int
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:         repo,
+		IssueNumber:      103,
+		IssueTitle:       "Implement recover",
+		RunID:            "run-test",
+		MaxAttempts:      3,
+		BackoffSeconds:   []int{0},
+		Provider:         "codex",
+		VerifierProvider: "claude",
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return append([]state.Attempt(nil), attempts...), nil
+		},
+		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			dispatched = append(dispatched, opts)
+			attempts = append(attempts, recoverAttempt(repo, opts.Attempt, fmt.Sprintf("job-103-%d", opts.Attempt), "succeeded", ""))
+			return DispatchResult{
+				OK:     true,
+				Issue:  opts.IssueNumber,
+				Branch: opts.Branch,
+				RunID:  opts.RunID,
+				PR:     fmt.Sprintf("https://github.com/owner/repo/pull/%d", 100+opts.Attempt),
+				Status: "succeeded",
+			}, nil
+		},
+		Review: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			reviewed = append(reviewed, opts.PRNumber)
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictFail,
+					Evidence:        fmt.Sprintf("review failed for PR #%d", opts.PRNumber),
+					Findings:        []loopreview.Finding{},
+					SpecConformance: loopreview.SpecConformanceFail,
+				},
+				ExitCode: loopreview.ExitCodeForVerdict(loopreview.VerdictFail),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if len(dispatched) != 2 {
+		t.Fatalf("dispatch calls = %#v, want two", dispatched)
+	}
+	if dispatched[0].Attempt != 2 || dispatched[0].Effort != "" {
+		t.Fatalf("same-config dispatch = %#v", dispatched[0])
+	}
+	if dispatched[1].Attempt != 3 || dispatched[1].Effort != "xhigh" {
+		t.Fatalf("upgraded dispatch = %#v", dispatched[1])
+	}
+	if !reflect.DeepEqual(reviewed, []int{102, 103}) {
+		t.Fatalf("reviewed PRs = %#v", reviewed)
+	}
+	if len(result.RecoveryAttempts) != 2 ||
+		result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig ||
+		result.RecoveryAttempts[1].Strategy != AttemptStrategyUpgradedConfig {
+		t.Fatalf("recovery attempts = %#v", result.RecoveryAttempts)
+	}
+	for _, want := range []string{
+		"RETRY: dispatching issue #103 attempt 2",
+		"Recovery strategy: same_config",
+		"RETRY: dispatching issue #103 attempt 3",
+		"Recovery strategy: upgraded_config",
+		"BLOCKED: retry limit reached",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("report missing %q:\n%s", want, result.Report)
+		}
+	}
+}
+
+func TestRecoverLoopReviewPassStopsMidLoop(t *testing.T) {
+	repo := t.TempDir()
+	attempts := []state.Attempt{recoverAttempt(repo, 1, "job-103-1", "failed", "first error")}
+	dispatchCalls := 0
+	reviewCalls := 0
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:         repo,
+		IssueNumber:      103,
+		IssueTitle:       "Implement recover",
+		RunID:            "run-test",
+		MaxAttempts:      3,
+		BackoffSeconds:   []int{0},
+		Provider:         "codex",
+		VerifierProvider: "claude",
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return append([]state.Attempt(nil), attempts...), nil
+		},
+		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			dispatchCalls++
+			attempts = append(attempts, recoverAttempt(repo, opts.Attempt, fmt.Sprintf("job-103-%d", opts.Attempt), "succeeded", ""))
+			return DispatchResult{
+				OK:     true,
+				Issue:  opts.IssueNumber,
+				Branch: opts.Branch,
+				RunID:  opts.RunID,
+				PR:     "https://github.com/owner/repo/pull/102",
+				Status: "succeeded",
+			}, nil
+		},
+		Review: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			reviewCalls++
+			if opts.PRNumber != 102 || opts.Timeout <= 0 {
+				t.Fatalf("review opts = %#v", opts)
+			}
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Evidence:        "review passed",
+					Findings:        []loopreview.Finding{},
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionSucceeded {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionSucceeded)
+	}
+	if dispatchCalls != 1 || reviewCalls != 1 {
+		t.Fatalf("calls dispatch=%d review=%d, want one each", dispatchCalls, reviewCalls)
+	}
+	if result.DispatchResult == nil || result.DispatchResult.PR != "https://github.com/owner/repo/pull/102" {
+		t.Fatalf("dispatch result = %#v", result.DispatchResult)
+	}
+	if result.ReviewResult == nil || result.ReviewResult.Verdict.Verdict != loopreview.VerdictPass {
+		t.Fatalf("review result = %#v", result.ReviewResult)
+	}
+	if len(result.RecoveryAttempts) != 1 || result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig || result.RecoveryAttempts[0].Status != "succeeded" {
+		t.Fatalf("recovery attempts = %#v", result.RecoveryAttempts)
 	}
 }
 
@@ -592,11 +745,11 @@ func TestRecoverRetryErrorPreservesPartialDispatchAttestation(t *testing.T) {
 			}, fmt.Errorf("dispatch failed after worker attestation")
 		},
 	})
-	if err == nil {
-		t.Fatal("Run returned nil error, want dispatch error")
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
 	}
-	if result.Action != ActionRetry {
-		t.Fatalf("Action = %q, want %q", result.Action, ActionRetry)
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
 	}
 	if result.DispatchResult == nil || result.DispatchResult.Attestation == nil {
 		t.Fatalf("partial dispatch result missing attestation: %#v", result.DispatchResult)
@@ -605,6 +758,22 @@ func TestRecoverRetryErrorPreservesPartialDispatchAttestation(t *testing.T) {
 		result.DispatchResult.Attestation.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Attestation.Usage.TotalTokens != 654 {
 		t.Fatalf("partial dispatch attestation not preserved: %#v", result.DispatchResult.Attestation)
+	}
+	if len(result.RecoveryAttempts) != 2 ||
+		result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig ||
+		result.RecoveryAttempts[1].Strategy != AttemptStrategyUpgradedConfig {
+		t.Fatalf("recovery attempts = %#v", result.RecoveryAttempts)
+	}
+	for _, want := range []string{
+		"RETRY: dispatching issue #103 attempt 2",
+		"Recovery strategy: same_config",
+		"RETRY: dispatching issue #103 attempt 3",
+		"Recovery strategy: upgraded_config",
+		"BLOCKED: retry limit reached",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("report missing %q:\n%s", want, result.Report)
+		}
 	}
 }
 
