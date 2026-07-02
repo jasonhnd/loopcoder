@@ -37,6 +37,24 @@ func TestBuildPromptWithAndWithoutRecoveryContext(t *testing.T) {
 	if strings.Contains(base, "Recovery context from a prior failed attempt") {
 		t.Fatalf("prompt unexpectedly included recovery context:\n%s", base)
 	}
+	if strings.Contains(base, "Repo-local skills") {
+		t.Fatalf("prompt unexpectedly included repo skills:\n%s", base)
+	}
+
+	withRepoSkills := BuildPrompt(PromptOptions{
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		Branch:      "loop/issue-101",
+		RepoSkills:  "## Repo-local skills\nSummary: project conventions\n",
+	})
+	for _, want := range []string{
+		"## Repo-local skills",
+		"Summary: project conventions",
+	} {
+		if !strings.Contains(withRepoSkills, want) {
+			t.Fatalf("repo-skill prompt missing %q:\n%s", want, withRepoSkills)
+		}
+	}
 
 	withRecovery := BuildPrompt(PromptOptions{
 		IssueNumber:     101,
@@ -212,6 +230,83 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if fakeAgent.invocation.WorktreePath == "" || fakeAgent.invocation.Prompt == "" || fakeAgent.invocation.LogPath == "" {
 		t.Fatalf("agent invocation missing required fields: %#v", fakeAgent.invocation)
+	}
+	if strings.Contains(fakeAgent.invocation.Prompt, "Repo-local skills") {
+		t.Fatalf("agent prompt unexpectedly included repo skills:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestDispatchInjectsRepoSkillsFromWorktree(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{
+		status: " M internal/worker/worker.go\n",
+		worktreeSetup: func(worktreePath string) error {
+			skillDir := filepath.Join(worktreePath, ".claude", "skills", "go-style")
+			if err := os.MkdirAll(skillDir, 0o755); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: go-style
+description: Repository Go conventions
+---
+
+# Go Style
+
+This implementation detail should stay out of the prompt.
+`), 0o644)
+		},
+	}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented dispatch.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	for _, want := range []string{
+		"## Repo-local skills",
+		"Path: `.claude/skills/go-style/SKILL.md`",
+		"Summary: Repository Go conventions",
+		"- # Go Style",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("agent prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+	if strings.Contains(fakeAgent.invocation.Prompt, "This implementation detail should stay out of the prompt") {
+		t.Fatalf("agent prompt included skill body text:\n%s", fakeAgent.invocation.Prompt)
 	}
 }
 
@@ -454,6 +549,7 @@ func assertNoAttestationFootprint(t *testing.T, surface, text string, record att
 type workerFakeGit struct {
 	status            string
 	err               error
+	worktreeSetup     func(worktreePath string) error
 	addAllCalls       int
 	commitCalls       int
 	pushCalls         int
@@ -468,7 +564,13 @@ func (f *workerFakeGit) WorktreeAdd(_ context.Context, _ string, _ string, workt
 	if f.err != nil {
 		return f.err
 	}
-	return os.MkdirAll(worktreePath, 0o755)
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		return err
+	}
+	if f.worktreeSetup != nil {
+		return f.worktreeSetup(worktreePath)
+	}
+	return nil
 }
 
 func (f *workerFakeGit) WorktreeRemove(context.Context, string, string) error {
