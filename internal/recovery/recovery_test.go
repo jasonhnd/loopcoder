@@ -494,7 +494,7 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		IssueBody:      "issue body",
 		RunID:          "run-test",
 		BaseBranch:     "trunk",
-		MaxAttempts:    4,
+		MaxAttempts:    3,
 		BackoffSeconds: []int{10, 30, 120},
 		Provider:       "codex",
 		Model:          "gpt-5",
@@ -644,6 +644,95 @@ func TestRecoverLoopReviewFailRetriesSameThenUpgradedThenBlocks(t *testing.T) {
 		"Recovery strategy: same_config",
 		"RETRY: dispatching issue #103 attempt 3",
 		"Recovery strategy: upgraded_config",
+		"BLOCKED: retry limit reached",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("report missing %q:\n%s", want, result.Report)
+		}
+	}
+}
+
+func TestRecoverWithRaisedMaxAttemptsUpgradesOnlyFinalAttempt(t *testing.T) {
+	repo := t.TempDir()
+	attempts := []state.Attempt{recoverAttempt(repo, 1, "job-103-1", "failed", "first error")}
+	var dispatched []DispatchOptions
+	var reviewed []int
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:         repo,
+		IssueNumber:      103,
+		IssueTitle:       "Implement recover",
+		RunID:            "run-test",
+		MaxAttempts:      5,
+		BackoffSeconds:   []int{0},
+		Provider:         "codex",
+		VerifierProvider: "claude",
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return append([]state.Attempt(nil), attempts...), nil
+		},
+		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			dispatched = append(dispatched, opts)
+			attempts = append(attempts, recoverAttempt(repo, opts.Attempt, fmt.Sprintf("job-103-%d", opts.Attempt), "succeeded", ""))
+			return DispatchResult{
+				OK:     true,
+				Issue:  opts.IssueNumber,
+				Branch: opts.Branch,
+				RunID:  opts.RunID,
+				PR:     fmt.Sprintf("https://github.com/owner/repo/pull/%d", 100+opts.Attempt),
+				Status: "succeeded",
+			}, nil
+		},
+		Review: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			reviewed = append(reviewed, opts.PRNumber)
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictFail,
+					Evidence:        fmt.Sprintf("review failed for PR #%d", opts.PRNumber),
+					Findings:        []loopreview.Finding{},
+					SpecConformance: loopreview.SpecConformanceFail,
+				},
+				ExitCode: loopreview.ExitCodeForVerdict(loopreview.VerdictFail),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if len(dispatched) != 4 {
+		t.Fatalf("dispatch calls = %#v, want four", dispatched)
+	}
+	for i, opts := range dispatched {
+		wantAttempt := i + 2
+		wantEffort := ""
+		if wantAttempt == 5 {
+			wantEffort = "xhigh"
+		}
+		if opts.Attempt != wantAttempt || opts.Effort != wantEffort {
+			t.Fatalf("dispatch[%d] = %#v, want attempt %d effort %q", i, opts, wantAttempt, wantEffort)
+		}
+	}
+	if !reflect.DeepEqual(reviewed, []int{102, 103, 104, 105}) {
+		t.Fatalf("reviewed PRs = %#v", reviewed)
+	}
+	if len(result.RecoveryAttempts) != 4 ||
+		result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig ||
+		result.RecoveryAttempts[1].Strategy != AttemptStrategySameConfig ||
+		result.RecoveryAttempts[2].Strategy != AttemptStrategySameConfig ||
+		result.RecoveryAttempts[3].Strategy != AttemptStrategyUpgradedConfig {
+		t.Fatalf("recovery attempts = %#v", result.RecoveryAttempts)
+	}
+	if strings.Count(result.Report, "Recovery strategy: same_config") != 3 ||
+		strings.Count(result.Report, "Recovery strategy: upgraded_config") != 1 {
+		t.Fatalf("report did not show graduated escalation:\n%s", result.Report)
+	}
+	for _, want := range []string{
+		"RETRY: dispatching issue #103 attempt 4",
+		"RETRY: dispatching issue #103 attempt 5",
 		"BLOCKED: retry limit reached",
 	} {
 		if !strings.Contains(result.Report, want) {
