@@ -1,10 +1,10 @@
 ---
 id: 161
 title: Autonomous Delivery Loop (Automation + Perception)
-status: draft
+status: accepted
 date: 2026-06-30
 issue: 161
-pr: null
+pr: 332
 supersedes: []
 superseded_by: []
 ---
