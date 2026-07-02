@@ -360,6 +360,9 @@ func TestPromoteGoNoGoPanelOmitsAbsentSections(t *testing.T) {
 	if _, ok := panel["reconciliation"]; !ok {
 		t.Fatalf("go_no_go_panel missing reconciliation:\n%s", data)
 	}
+	if _, ok := wire["toggle_inventory"]; ok {
+		t.Fatalf("promote JSON included empty top-level toggle_inventory:\n%s", data)
+	}
 	for _, absent := range []string{"toggle_inventory", "needs_human", "failed"} {
 		if _, ok := panel[absent]; ok {
 			t.Fatalf("go_no_go_panel included absent section %q:\n%s", absent, data)
@@ -373,6 +376,81 @@ func TestPromoteGoNoGoPanelOmitsAbsentSections(t *testing.T) {
 		if strings.Contains(rendered, absent) {
 			t.Fatalf("rendered partial panel included absent section %q:\n%s", absent, rendered)
 		}
+	}
+}
+
+func TestPromoteGoNoGoPanelIncludesReconciliationLoadError(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test-promote-reconciliation-error"
+	writer := &recordingPromotionWriter{}
+
+	report, err := Promote(context.Background(), PromoteOptions{
+		Writer:        writer,
+		RepoPath:      repo,
+		RunID:         runID,
+		PreProdBranch: "pre-prod",
+		Gate:          "human-merge",
+		Clock:         fixedPromoteClock,
+		StatePush:     promoteTestStatePush(t, repo, runID),
+		ParallelRun: &PromoteParallelRunConfig{
+			Contract: promoteTestParallelRunContract(),
+		},
+		ReconcileParallelRun: func(equivalence.Contract, equivalence.ParallelRunInput) (equivalence.ParallelRunReport, error) {
+			return equivalence.ParallelRunReport{}, errors.New("missing reconciliation artifact")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Promote returned error: %v", err)
+	}
+	if report.Status != PromoteStatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", report.Status)
+	}
+	if report.GoNoGoPanel == nil || len(report.GoNoGoPanel.NeedsHuman) != 1 {
+		t.Fatalf("go/no-go panel = %#v, want reconciliation needs-human", report.GoNoGoPanel)
+	}
+	item := report.GoNoGoPanel.NeedsHuman[0]
+	if item.Step != "parallel-run-reconciliation" || !strings.Contains(item.Detail, "missing reconciliation artifact") {
+		t.Fatalf("needs-human panel item = %#v", item)
+	}
+	if report.GoNoGoPanel.Reconciliation != nil {
+		t.Fatalf("reconciliation panel = %#v, want nil after load error", report.GoNoGoPanel.Reconciliation)
+	}
+}
+
+func TestPromoteGoNoGoPanelIncludesStatePushFailure(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test-promote-state-push-failure"
+	writer := &recordingPromotionWriter{}
+
+	report, err := Promote(context.Background(), PromoteOptions{
+		Writer:        writer,
+		RepoPath:      repo,
+		RunID:         runID,
+		PreProdBranch: "pre-prod",
+		Gate:          "human-merge",
+		Clock:         fixedPromoteClock,
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			return statebranch.PushResult{
+				RepoPath: repo,
+				RunID:    runID,
+				Branch:   statebranch.DefaultBranch,
+				Remote:   statebranch.DefaultRemote,
+				Files:    []string{},
+			}, errors.New("state branch push failed")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Promote returned error: %v", err)
+	}
+	if report.Status != PromoteStatusFailed || report.StatePush == nil || report.StatePush.Error == "" {
+		t.Fatalf("report = %#v, want failed state push report", report)
+	}
+	if report.GoNoGoPanel == nil || len(report.GoNoGoPanel.Failed) != 1 {
+		t.Fatalf("go/no-go panel = %#v, want state-push failure", report.GoNoGoPanel)
+	}
+	failed := report.GoNoGoPanel.Failed[0]
+	if failed.Step != "state-push" || failed.Status != PromoteStatusFailed || !strings.Contains(failed.Detail, "state branch push failed") {
+		t.Fatalf("failed panel item = %#v", failed)
 	}
 }
 
@@ -458,7 +536,7 @@ func TestPromotePreconditionRejectionsAreLedgeredAsFailed(t *testing.T) {
 }
 
 func TestNormalizeKickBackItemsCanonicalizesPRFormsAndNumericSHA(t *testing.T) {
-	got := normalizeKickBackItems([]string{" #101 ", "101", "pr:101", "PR#101", "abcdef0", "ABCDEF0", "1234567", "1234567"})
+	got := normalizeKickBackItems([]string{" #101 ", "101", "pr:101", "PR#101", "pr:#101", "abcdef0", "ABCDEF0", "1234567", "1234567"})
 	want := []string{"#101", "abcdef0", "1234567"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalizeKickBackItems = %#v, want %#v", got, want)

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jasonhnd/loopcoder/internal/kickback"
 )
 
 // Reader is the GitHub read surface used by orchestration. Tests can inject a
@@ -556,10 +558,11 @@ func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (Pr
 }
 
 func (c *CLI) resolvePreProdKickBackCommit(ctx context.Context, item, preProdBranch string) (string, int, error) {
-	if isGitSHAish(item) {
-		return strings.TrimSpace(item), 0, nil
+	parsed := kickback.ParseItem(item)
+	if parsed.SHA != "" {
+		return parsed.SHA, 0, nil
 	}
-	prNumber := parseKickBackPRNumber(item)
+	prNumber := parsed.PRNumber
 	if prNumber <= 0 {
 		return "", 0, fmt.Errorf("kick-back item %q must be a PR number or merge commit SHA", item)
 	}
@@ -595,6 +598,18 @@ func (c *CLI) revertPreProdCommit(ctx context.Context, prNumber int, preProdBran
 	refspec := "+refs/heads/" + preProdBranch + ":refs/remotes/origin/" + preProdBranch
 	if _, err := c.run(ctx, "git", "fetch", "origin", refspec); err != nil {
 		return PreProdRevertResult{}, err
+	}
+
+	if revertSHA, err := c.findExistingPreProdRevert(ctx, preProdBranch, mergeSHA); err != nil {
+		return PreProdRevertResult{}, err
+	} else if revertSHA != "" {
+		return PreProdRevertResult{
+			PRNumber:    prNumber,
+			Branch:      preProdBranch,
+			RevertedSHA: mergeSHA,
+			SHA:         revertSHA,
+			URL:         commitURL(ctx, c, revertSHA),
+		}, nil
 	}
 
 	worktree, err := os.MkdirTemp("", "loopcoder-preprod-revert-*")
@@ -640,6 +655,51 @@ func (c *CLI) revertPreProdCommit(ctx context.Context, prNumber int, preProdBran
 		SHA:         revertSHA,
 		URL:         commitURL(ctx, c, revertSHA),
 	}, nil
+}
+
+func (c *CLI) findExistingPreProdRevert(ctx context.Context, preProdBranch, mergeSHA string) (string, error) {
+	output, err := c.run(ctx, "git", "log", "--format=%H%x00%B%x1e", "refs/remotes/origin/"+preProdBranch)
+	if err != nil {
+		return "", err
+	}
+	return existingRevertSHAForCommit(output, mergeSHA), nil
+}
+
+func existingRevertSHAForCommit(output []byte, mergeSHA string) string {
+	for _, record := range strings.Split(string(output), "\x1e") {
+		record = strings.TrimSpace(record)
+		if record == "" {
+			continue
+		}
+		parts := strings.SplitN(record, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if revertMessageTargetsCommit(parts[1], mergeSHA) {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	return ""
+}
+
+func revertMessageTargetsCommit(message, mergeSHA string) bool {
+	const prefix = "This reverts commit "
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		remainder := strings.TrimSpace(line[len(prefix):])
+		fields := strings.Fields(remainder)
+		if len(fields) == 0 {
+			continue
+		}
+		candidate := strings.Trim(fields[0], ".,")
+		if sameGitSHA(candidate, mergeSHA) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []string) (Issue, error) {
@@ -1010,44 +1070,6 @@ func firstNonEmptyString(values ...string) string {
 	return ""
 }
 
-func parseKickBackPRNumber(item string) int {
-	item = strings.ToLower(strings.TrimSpace(item))
-	item = strings.TrimPrefix(item, "pr:")
-	item = strings.TrimPrefix(item, "pr#")
-	item = strings.TrimPrefix(item, "pr-")
-	item = strings.TrimPrefix(item, "#")
-	if item == "" {
-		return 0
-	}
-	for _, ch := range item {
-		if ch < '0' || ch > '9' {
-			return 0
-		}
-	}
-	number, err := strconv.Atoi(item)
-	if err != nil || number <= 0 {
-		return 0
-	}
-	return number
-}
-
-func isGitSHAish(item string) bool {
-	item = strings.TrimSpace(item)
-	if len(item) < 7 || len(item) > 40 {
-		return false
-	}
-	for _, ch := range item {
-		switch {
-		case ch >= '0' && ch <= '9':
-		case ch >= 'a' && ch <= 'f':
-		case ch >= 'A' && ch <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 func preProdMergeSubjectPRNumber(subject string) int {
 	matches := preProdMergePRPattern.FindStringSubmatch(subject)
 	if len(matches) != 2 {
@@ -1058,6 +1080,21 @@ func preProdMergeSubjectPRNumber(subject string) int {
 		return 0
 	}
 	return number
+}
+
+func sameGitSHA(a, b string) bool {
+	a = strings.ToLower(strings.TrimSpace(a))
+	b = strings.ToLower(strings.TrimSpace(b))
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) < 7 || len(b) < 7 {
+		return false
+	}
+	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
 }
 
 func linkedIssueNumbers(pr PullRequest) []int {
