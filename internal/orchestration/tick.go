@@ -72,7 +72,7 @@ type TickOptions struct {
 	Budget           config.GuardrailBudget
 	CircuitBreaker   config.GuardrailCircuitBreaker
 	ProcessAlive     ProcessAliveFunc
-	Now              time.Time
+	Clock            func() time.Time
 	Stderr           io.Writer
 
 	Compile         CompileFunc
@@ -157,12 +157,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	}
 	opts = withTickDefaults(opts)
 
-	started := opts.Now
-	if started.IsZero() {
-		started = time.Now().UTC()
-	} else {
-		started = started.UTC()
-	}
+	started := opts.Clock().UTC()
 	if strings.TrimSpace(opts.RunID) == "" {
 		opts.RunID = state.RunIDForWave(started)
 	}
@@ -182,10 +177,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		Failures:   []TickIssue{},
 	}
 	finish := func(status, stopReason string) (TickReport, error) {
-		finished := time.Now().UTC()
-		if !opts.Now.IsZero() {
-			finished = opts.Now.UTC()
-		}
+		finished := opts.Clock().UTC()
 		tickReport.Status = status
 		tickReport.StopReason = stopReason
 		tickReport.FinishedAt = state.FormatTimestamp(finished)
@@ -410,6 +402,11 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 }
 
 func withTickDefaults(opts TickOptions) TickOptions {
+	if opts.Clock == nil {
+		opts.Clock = func() time.Time {
+			return time.Now().UTC()
+		}
+	}
 	if opts.Compile == nil {
 		opts.Compile = func(ctx context.Context, opts compiler.Options) (compiler.Report, error) {
 			return compiler.Run(ctx, opts, compiler.DefaultDeps())

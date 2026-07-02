@@ -906,7 +906,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Budget:           cfg.Guardrails.Budget,
 		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
 		ProcessAlive:     deps.ProcessAlive,
-		Now:              deps.Now(),
+		Clock:            deps.Now,
 		Stderr:           stderr,
 		Compile:          deps.Compile,
 		ComputeReadySet:  deps.ComputeReadySet,

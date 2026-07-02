@@ -28,11 +28,16 @@ func TestTickHappyPass(t *testing.T) {
 		RunID:            "run-test-wave",
 		WorkerProvider:   "codex",
 		VerifierProvider: "claude",
-		Now:              now,
+		Clock: func() time.Time {
+			return now
+		},
 		Compile: func(_ context.Context, opts compiler.Options) (compiler.Report, error) {
 			order = append(order, "compile")
 			if opts.RepoPath != repo {
 				t.Fatalf("compile repo = %q, want %q", opts.RepoPath, repo)
+			}
+			if !opts.Now.Equal(now) {
+				t.Fatalf("compile now = %s, want %s", opts.Now, now)
 			}
 			return tickCompileReport(false), nil
 		},
@@ -41,6 +46,9 @@ func TestTickHappyPass(t *testing.T) {
 			order = append(order, "ready-set")
 			if opts.RunID != "run-test-wave" || opts.BaseBranch != "trunk" {
 				t.Fatalf("ready-set opts = %#v", opts)
+			}
+			if !opts.Now.Equal(now) {
+				t.Fatalf("ready-set now = %s, want %s", opts.Now, now)
 			}
 			return readySetReport(101), nil
 		},
@@ -51,6 +59,9 @@ func TestTickHappyPass(t *testing.T) {
 			}
 			if opts.Provider != "codex" || opts.BaseBranch != "trunk" || opts.RunID != "run-test-wave" {
 				t.Fatalf("dispatch-wave opts = %#v", opts)
+			}
+			if !opts.Now.Equal(now) {
+				t.Fatalf("dispatch-wave now = %s, want %s", opts.Now, now)
 			}
 			return tickWaveReport(DispatchWaveIssueResult{
 				Issue:  101,
@@ -190,6 +201,159 @@ func TestTickNeedsHumanPRIsReported(t *testing.T) {
 	}
 	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].PR != "https://github.com/owner/repo/pull/90" {
 		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+}
+
+func TestTickReviewFailStopsFailed(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 12, "https://github.com/owner/repo/pull/120")
+	opts.Loopreview = func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+		if opts.PRNumber != 120 {
+			t.Fatalf("loopreview pr = %d, want 120", opts.PRNumber)
+		}
+		return tickLoopreview(loopreview.VerdictFail, "regression found"), nil
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusFailed || report.StopReason != TickStopReviewFailed {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if len(report.Reviews) != 1 || report.Reviews[0].Verdict != loopreview.VerdictFail {
+		t.Fatalf("reviews = %#v", report.Reviews)
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Step != "loopreview" || report.Failures[0].Issue != 12 {
+		t.Fatalf("failures = %#v", report.Failures)
+	}
+	if report.Summary.ReviewFailCount != 1 || report.Summary.FailureCount != 1 {
+		t.Fatalf("summary = %#v", report.Summary)
+	}
+}
+
+func TestTickLoopreviewErrorNeedsHuman(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 13, "https://github.com/owner/repo/pull/130")
+	opts.Loopreview = func(context.Context, loopreview.Options) (loopreview.Result, error) {
+		return loopreview.Result{}, errors.New("loopreview crashed")
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopReviewNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if len(report.Reviews) != 1 || report.Reviews[0].Verdict != loopreview.VerdictNeedsHuman || report.Reviews[0].Error != "loopreview crashed" {
+		t.Fatalf("reviews = %#v", report.Reviews)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "loopreview" || report.NeedsHuman[0].Issue != 13 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+	if len(report.Failures) != 0 {
+		t.Fatalf("failures = %#v, want none", report.Failures)
+	}
+}
+
+func TestTickStatePushFailureStopsStatePushFailed(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 14, "https://github.com/owner/repo/pull/140")
+	opts.Loopreview = func(context.Context, loopreview.Options) (loopreview.Result, error) {
+		return tickLoopreview(loopreview.VerdictPass, "review passed"), nil
+	}
+	opts.StatePush = func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+		return statebranch.PushResult{
+			Branch: statebranch.DefaultBranch,
+			Remote: statebranch.DefaultRemote,
+		}, errors.New("state branch push failed")
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusFailed || report.StopReason != TickStopStatePushFailed {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if report.StatePush == nil || report.StatePush.Error != "state branch push failed" {
+		t.Fatalf("state push = %#v", report.StatePush)
+	}
+	if !hasStatePushFailure(report.Failures) {
+		t.Fatalf("failures = %#v, want state-push failure", report.Failures)
+	}
+}
+
+func TestTickDispatchWaveErrorStopsDispatchWaveFailed(t *testing.T) {
+	reviewCalled := false
+	statePushCalled := false
+	opts := TickOptions{
+		Reader:           fakeReader{},
+		IssueWriter:      noopTickIssueWriter{},
+		RepoPath:         t.TempDir(),
+		RunID:            "run-test-wave",
+		VerifierProvider: "claude",
+		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
+			return tickCompileReport(false), nil
+		},
+		LoadAttempts: noAttempts,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(15), nil
+		},
+		DispatchWave: func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
+			return tickWaveReport(), errors.New("dispatch wave failed")
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			reviewCalled = true
+			return loopreview.Result{}, nil
+		},
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			statePushCalled = true
+			return statebranch.PushResult{Branch: statebranch.DefaultBranch, Remote: statebranch.DefaultRemote, Pushed: true}, nil
+		},
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusFailed || report.StopReason != TickStopDispatchWaveFailed {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if reviewCalled {
+		t.Fatal("loopreview was called after dispatch-wave error")
+	}
+	if !statePushCalled {
+		t.Fatal("state push was not called after dispatch-wave error")
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Step != "dispatch-wave" {
+		t.Fatalf("failures = %#v", report.Failures)
+	}
+}
+
+func TestTickReportUsesClockForNonZeroDuration(t *testing.T) {
+	started := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	opts := reviewReadyTickOptions(t.TempDir(), 16, "https://github.com/owner/repo/pull/160")
+	opts.Clock = func() time.Time {
+		current := started.Add(time.Duration(calls) * 90 * time.Second)
+		calls++
+		return current
+	}
+	opts.Loopreview = func(context.Context, loopreview.Options) (loopreview.Result, error) {
+		return tickLoopreview(loopreview.VerdictPass, "review passed"), nil
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.StartedAt != "2026-07-02T12:00:00Z" || report.FinishedAt != "2026-07-02T12:01:30Z" {
+		t.Fatalf("timing = started %q finished %q", report.StartedAt, report.FinishedAt)
+	}
+	if report.StartedAt == report.FinishedAt {
+		t.Fatalf("started and finished timestamps should differ: %q", report.StartedAt)
+	}
+	if calls != 2 {
+		t.Fatalf("clock calls = %d, want 2", calls)
 	}
 }
 
@@ -335,6 +499,40 @@ func tickLoopreview(verdict, evidence string) loopreview.Result {
 			SpecConformance: loopreview.SpecConformancePass,
 		},
 		ExitCode: loopreview.ExitCodeForVerdict(verdict),
+	}
+}
+
+func reviewReadyTickOptions(repo string, issue int, pr string) TickOptions {
+	return TickOptions{
+		Reader:           fakeReader{},
+		IssueWriter:      noopTickIssueWriter{},
+		RepoPath:         repo,
+		RunID:            "run-test-wave",
+		VerifierProvider: "claude",
+		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
+			return tickCompileReport(false), nil
+		},
+		LoadAttempts: noAttempts,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(issue), nil
+		},
+		DispatchWave: func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
+			return tickWaveReport(DispatchWaveIssueResult{
+				Issue:  issue,
+				Status: DispatchWaveStatusSucceeded,
+				PR:     pr,
+			}), nil
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			return tickLoopreview(loopreview.VerdictPass, "review passed"), nil
+		},
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			return statebranch.PushResult{
+				Branch: statebranch.DefaultBranch,
+				Remote: statebranch.DefaultRemote,
+				Pushed: true,
+			}, nil
+		},
 	}
 }
 

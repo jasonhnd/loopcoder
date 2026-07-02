@@ -1662,6 +1662,12 @@ verifier:
 			if opts.VerifierModel != "config-verifier-model" || opts.VerifierEffort != "config-verifier-effort" {
 				t.Fatalf("tick verifier model/effort = %#v", opts)
 			}
+			if opts.Clock == nil {
+				t.Fatal("tick opts clock is nil")
+			}
+			if got := opts.Clock(); !got.Equal(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)) {
+				t.Fatalf("tick opts clock = %s", got)
+			}
 			return orchestration.TickReport{
 				Version:    orchestration.TickReportVersion,
 				Repo:       "owner/repo",
