@@ -55,6 +55,7 @@ type Deps struct {
 	Stdin           io.Reader
 	BuildInfo       BuildInfo
 	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick            func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
 	Compile         func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
 	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
@@ -76,6 +77,7 @@ var commands = []Command{
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
+	{Name: "tick", Summary: "run one unattended delivery pass"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
@@ -123,6 +125,9 @@ func DefaultDeps() Deps {
 		Stdin:        os.Stdin,
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
+		},
+		Tick: func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			return orchestration.Tick(ctx, opts)
 		},
 		Compile: func(ctx context.Context, opts compiler.Options) (compiler.Report, error) {
 			return compiler.Run(ctx, opts, compiler.DefaultDeps())
@@ -211,6 +216,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "compile" {
 		return runCompile(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "tick" {
+		return runTick(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
@@ -333,6 +341,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "compile" {
 		fmt.Fprintln(w, "  --repo string   repository path (required)")
+	}
+	if command.Name == "tick" {
+		fmt.Fprintln(w, "  --repo string                    repository path (required)")
+		fmt.Fprintln(w, "  --base-branch string             base branch for ready, dispatch, and review (default worker.base_branch or \"main\")")
+		fmt.Fprintln(w, "  --run-id string                  shared run id for this pass (default generated once)")
+		fmt.Fprintln(w, "  --worker-provider string         optional worker provider override for this pass")
+		fmt.Fprintln(w, "  --verifier-provider string       optional verifier provider override for this pass")
+		fmt.Fprintln(w, "  --worker-model string            optional worker model override for this pass")
+		fmt.Fprintln(w, "  --worker-effort string           optional worker reasoning effort override for this pass")
+		fmt.Fprintln(w, "  --verifier-model string          optional verifier model override for this pass")
+		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
+		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "upgrade" {
 		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
@@ -664,6 +687,280 @@ func runCompile(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = defaults.ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+	if deps.IsTerminal == nil {
+		deps.IsTerminal = defaults.IsTerminal
+	}
+	if deps.Tick == nil {
+		deps.Tick = defaults.Tick
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = defaults.ComputeReadySet
+	}
+	if deps.Dispatch == nil {
+		deps.Dispatch = defaults.Dispatch
+	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = defaults.Loopreview
+	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+
+	fs := flag.NewFlagSet("tick", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
+	var runID string
+	var runIDAlias string
+	var workerProvider string
+	var workerProviderAlias string
+	var verifierProvider string
+	var verifierProviderAlias string
+	var workerModel string
+	var workerModelAlias string
+	var workerEffort string
+	var workerEffortAlias string
+	var verifierModel string
+	var verifierModelAlias string
+	var verifierEffort string
+	var verifierEffortAlias string
+	var verifierTimeout time.Duration
+	var verifierTimeoutAlias time.Duration
+	var throttleLimit int
+	var throttleLimitAlias int
+	var pretty bool
+	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&workerProvider, "worker-provider", "", "worker provider")
+	fs.StringVar(&workerProviderAlias, "WorkerProvider", "", "worker provider")
+	fs.StringVar(&verifierProvider, "verifier-provider", "", "verifier provider")
+	fs.StringVar(&verifierProviderAlias, "VerifierProvider", "", "verifier provider")
+	fs.StringVar(&workerModel, "worker-model", "", "worker model")
+	fs.StringVar(&workerModelAlias, "WorkerModel", "", "worker model")
+	fs.StringVar(&workerEffort, "worker-effort", "", "worker effort")
+	fs.StringVar(&workerEffortAlias, "WorkerEffort", "", "worker effort")
+	fs.StringVar(&verifierModel, "verifier-model", "", "verifier model")
+	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
+	fs.StringVar(&verifierEffort, "verifier-effort", "", "verifier effort")
+	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier effort")
+	fs.DurationVar(&verifierTimeout, "verifier-timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
+	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
+	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
+	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	baseBranchFlagSet := flagWasSet(fs, "base-branch") || flagWasSet(fs, "BaseBranch")
+	workerModelFlagSet := flagWasSet(fs, "worker-model") || flagWasSet(fs, "WorkerModel")
+	workerEffortFlagSet := flagWasSet(fs, "worker-effort") || flagWasSet(fs, "WorkerEffort")
+	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
+	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	if workerProviderAlias != "" {
+		workerProvider = workerProviderAlias
+	}
+	if verifierProviderAlias != "" {
+		verifierProvider = verifierProviderAlias
+	}
+	if workerModelAlias != "" {
+		workerModel = workerModelAlias
+	}
+	if workerEffortAlias != "" {
+		workerEffort = workerEffortAlias
+	}
+	if verifierModelAlias != "" {
+		verifierModel = verifierModelAlias
+	}
+	if verifierEffortAlias != "" {
+		verifierEffort = verifierEffortAlias
+	}
+	if verifierTimeoutAlias != 0 {
+		verifierTimeout = verifierTimeoutAlias
+	}
+	if throttleLimitAlias != 0 {
+		throttleLimit = throttleLimitAlias
+	}
+	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "tick: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "tick: --repo is required")
+		return 2
+	}
+	if throttleLimit <= 0 {
+		fmt.Fprintln(stderr, "tick: --throttle-limit must be greater than zero")
+		return 2
+	}
+	if verifierTimeout <= 0 {
+		fmt.Fprintln(stderr, "tick: --verifier-timeout must be positive")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	if !baseBranchFlagSet && strings.TrimSpace(baseBranch) == "" {
+		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
+	}
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	if strings.TrimSpace(workerProvider) == "" {
+		workerProvider = strings.TrimSpace(cfg.Adapters.Worker)
+	}
+	if strings.TrimSpace(verifierProvider) == "" {
+		verifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
+	}
+	workerModel, workerEffort = applyRoleModelEffort(
+		workerModel,
+		workerEffort,
+		workerModelFlagSet,
+		workerEffortFlagSet,
+		cfg.Worker.Model,
+		cfg.Worker.ReasoningEffort,
+	)
+	verifierModel, verifierEffort = applyRoleModelEffort(
+		verifierModel,
+		verifierEffort,
+		verifierModelFlagSet,
+		verifierEffortFlagSet,
+		cfg.Verifier.Model,
+		cfg.Verifier.ReasoningEffort,
+	)
+	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
+		Worker:   workerProvider,
+		Verifier: verifierProvider,
+	}); warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	tickReport, err := deps.Tick(context.Background(), orchestration.TickOptions{
+		Reader:           deps.NewGitHubReader(resolvedRepo),
+		IssueWriter:      deps.NewIssueWriter(resolvedRepo),
+		RepoPath:         resolvedRepo,
+		BaseBranch:       baseBranch,
+		RunID:            runID,
+		WorkerProvider:   workerProvider,
+		WorkerModel:      workerModel,
+		WorkerEffort:     workerEffort,
+		VerifierProvider: verifierProvider,
+		VerifierModel:    verifierModel,
+		VerifierEffort:   verifierEffort,
+		VerifierTimeout:  verifierTimeout,
+		ThrottleLimit:    throttleLimit,
+		Thresholds:       cfg.Resilience.Worker,
+		Budget:           cfg.Guardrails.Budget,
+		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
+		ProcessAlive:     deps.ProcessAlive,
+		Clock:            deps.Now,
+		Stderr:           stderr,
+		Compile:          deps.Compile,
+		ComputeReadySet:  deps.ComputeReadySet,
+		Dispatch:         deps.Dispatch,
+		Loopreview:       deps.Loopreview,
+		StatePush:        deps.StatePush,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	data, err := orchestration.MarshalTickJSON(tickReport)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+		return 1
+	}
+	if shouldRenderPretty(noPretty) {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := renderTickPrettyAttestations(stderr, tickReport, mode); err != nil {
+			fmt.Fprintf(stderr, "tick: write pretty attestation: %v\n", err)
+			return 1
+		}
+	}
+	return orchestration.TickExitCode(tickReport)
+}
+
+func renderTickPrettyAttestations(w io.Writer, report orchestration.TickReport, mode attestation.PrettyMode) error {
+	if report.DispatchWave != nil {
+		for _, result := range report.DispatchWave.Results {
+			if result.Attestation == nil {
+				continue
+			}
+			if err := renderPrettyAttestation(w, *result.Attestation, mode); err != nil {
+				return err
+			}
+		}
+	}
+	for _, review := range report.Reviews {
+		if review.Attestation == nil {
+			continue
+		}
+		if err := renderPrettyAttestation(w, *review.Attestation, mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {

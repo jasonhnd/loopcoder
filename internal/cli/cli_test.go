@@ -1578,6 +1578,206 @@ func TestCompileRequiresRepo(t *testing.T) {
 	}
 }
 
+func TestTickHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"tick", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{
+		"loopcoder tick",
+		"--repo",
+		"--base-branch",
+		"--run-id",
+		"--worker-provider",
+		"--verifier-provider",
+		"--worker-model",
+		"--worker-effort",
+		"--verifier-model",
+		"--verifier-effort",
+		"--verifier-timeout",
+		"--throttle-limit",
+		"--pretty",
+		"--no-pretty",
+		"LOOPCODER_PRETTY",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestTickRunsWithDualReadOutputAndConfigDefaults(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`version: 1
+adapters:
+  worker: codex
+  verifier: claude
+worker:
+  base_branch: develop
+  model: config-worker-model
+  reasoning_effort: config-worker-effort
+verifier:
+  model: config-verifier-model
+  reasoning_effort: config-verifier-effort
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo, "--run-id", "run-test-wave", "--no-pretty"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(path string) orchestration.GitHubReader {
+			if path != repo {
+				t.Fatalf("reader repo = %q, want %q", path, repo)
+			}
+			return cliFakeReader{}
+		},
+		NewIssueWriter: func(path string) compiler.IssueWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return newCLIFakeIssueWriter()
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			if opts.RepoPath != repo || opts.BaseBranch != "develop" || opts.RunID != "run-test-wave" {
+				t.Fatalf("tick opts repo/base/run = %#v", opts)
+			}
+			if opts.WorkerProvider != "codex" || opts.VerifierProvider != "claude" {
+				t.Fatalf("tick opts providers = %#v", opts)
+			}
+			if opts.WorkerModel != "config-worker-model" || opts.WorkerEffort != "config-worker-effort" {
+				t.Fatalf("tick worker model/effort = %#v", opts)
+			}
+			if opts.VerifierModel != "config-verifier-model" || opts.VerifierEffort != "config-verifier-effort" {
+				t.Fatalf("tick verifier model/effort = %#v", opts)
+			}
+			if opts.Clock == nil {
+				t.Fatal("tick opts clock is nil")
+			}
+			if got := opts.Clock(); !got.Equal(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)) {
+				t.Fatalf("tick opts clock = %s", got)
+			}
+			return orchestration.TickReport{
+				Version:    orchestration.TickReportVersion,
+				Repo:       "owner/repo",
+				RepoPath:   repo,
+				BaseBranch: opts.BaseBranch,
+				RunID:      opts.RunID,
+				Status:     orchestration.TickStatusSucceeded,
+				StopReason: orchestration.TickStopCompleted,
+				StartedAt:  "2026-07-02T12:00:00Z",
+				FinishedAt: "2026-07-02T12:00:00Z",
+				Compile: compiler.Report{
+					Repo: "owner/repo",
+					Summary: compiler.Summary{
+						UnchangedCount: 1,
+						TotalCount:     1,
+					},
+				},
+				ReadySet: report.ReadySetReport{
+					Repo:       "owner/repo",
+					BaseBranch: opts.BaseBranch,
+					Ready: []report.ReadyIssue{{
+						Issue:  10,
+						Title:  "Ready",
+						Reason: "ready",
+					}},
+				},
+				DispatchWave: &orchestration.DispatchWaveReport{
+					Repo:       "owner/repo",
+					BaseBranch: opts.BaseBranch,
+					RunID:      opts.RunID,
+					Results: []orchestration.DispatchWaveIssueResult{{
+						Issue:  10,
+						Status: orchestration.DispatchWaveStatusSucceeded,
+						PR:     "https://github.com/owner/repo/pull/10",
+					}},
+				},
+				Reviews: []orchestration.TickReviewResult{{
+					Issue:           10,
+					PR:              "https://github.com/owner/repo/pull/10",
+					PRNumber:        10,
+					Verdict:         loopreview.VerdictPass,
+					SpecConformance: loopreview.SpecConformancePass,
+					Evidence:        "review passed",
+					Findings:        []loopreview.Finding{},
+				}},
+				NeedsHuman: []orchestration.TickIssue{},
+				Failures:   []orchestration.TickIssue{},
+				StatePush: &orchestration.TickStatePush{
+					Branch: statebranch.DefaultBranch,
+					Remote: statebranch.DefaultRemote,
+					Pushed: true,
+					Files:  []string{"runs/run-test-wave/state.json"},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	var got orchestration.TickReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not tick JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.TickStatusSucceeded || got.Summary.DispatchedPRCount != 1 {
+		t.Fatalf("tick report = %#v", got)
+	}
+	if strings.Contains(stdout.String(), "TICK") {
+		t.Fatalf("stdout should be JSON only, got:\n%s", stdout.String())
+	}
+	for _, want := range []string{"TICK", "Status: succeeded", "Dispatch", "Reviews", "State"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestTickNeedsHumanExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo, "--no-pretty"}, &stdout, &stderr, Deps{
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			return orchestration.TickReport{
+				Version:    orchestration.TickReportVersion,
+				Repo:       "owner/repo",
+				RepoPath:   repo,
+				BaseBranch: "main",
+				RunID:      "run-test-wave",
+				Status:     orchestration.TickStatusNeedsHuman,
+				StopReason: orchestration.TickStopReviewNeedsHuman,
+				NeedsHuman: []orchestration.TickIssue{{
+					Step:   "loopreview",
+					PR:     "https://github.com/owner/repo/pull/10",
+					Detail: "manual review required",
+				}},
+				Failures: []orchestration.TickIssue{},
+			}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.Len() == 0 || !strings.Contains(stderr.String(), "Status: needs-human") {
+		t.Fatalf("tick did not emit dual output; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
