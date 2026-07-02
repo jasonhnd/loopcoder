@@ -21,6 +21,9 @@ type fakeReader struct {
 	prs       []gh.PullRequest
 	checks    map[int][]gh.Check
 	checkErrs map[int]error
+	diffFiles map[int][]string
+	diffs     map[int]string
+	diffErrs  map[int]error
 }
 
 func (f fakeReader) RepoName(context.Context) (string, error) {
@@ -47,6 +50,20 @@ func (f fakeReader) PRChecks(_ context.Context, number int) ([]gh.Check, error) 
 		return nil, err
 	}
 	return append([]gh.Check(nil), f.checks[number]...), nil
+}
+
+func (f fakeReader) PRDiff(_ context.Context, number int) (string, error) {
+	if err := f.diffErrs[number]; err != nil {
+		return "", err
+	}
+	return f.diffs[number], nil
+}
+
+func (f fakeReader) PRDiffNameOnly(_ context.Context, number int) ([]string, error) {
+	if err := f.diffErrs[number]; err != nil {
+		return nil, err
+	}
+	return append([]string(nil), f.diffFiles[number]...), nil
 }
 
 func TestComputeReadySetClassifications(t *testing.T) {

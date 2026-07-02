@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -41,6 +42,7 @@ const (
 	TickStopDispatchFailed            = "dispatch-failed"
 	TickStopReviewFailed              = "review-failed"
 	TickStopReviewNeedsHuman          = "review-needs-human"
+	TickStopRiskGateNeedsHuman        = "risk-gate-needs-human"
 	TickStopStatePushFailed           = "state-push-failed"
 	TickStopCompileFailed             = "compile-failed"
 	TickStopReadySetFailed            = "ready-set-failed"
@@ -55,53 +57,61 @@ type LoopreviewFunc func(ctx context.Context, opts loopreview.Options) (looprevi
 type StatePushFunc func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 
 type TickOptions struct {
-	Reader           GitHubReader
-	IssueWriter      compiler.IssueWriter
-	RepoPath         string
-	BaseBranch       string
-	RunID            string
-	WorkerProvider   string
-	WorkerModel      string
-	WorkerEffort     string
-	VerifierProvider string
-	VerifierModel    string
-	VerifierEffort   string
-	VerifierTimeout  time.Duration
-	ThrottleLimit    int
-	Thresholds       config.ResilienceWorker
-	Budget           config.GuardrailBudget
-	CircuitBreaker   config.GuardrailCircuitBreaker
-	ProcessAlive     ProcessAliveFunc
-	Clock            func() time.Time
-	Stderr           io.Writer
+	Reader                 GitHubReader
+	IssueWriter            compiler.IssueWriter
+	RepoPath               string
+	BaseBranch             string
+	RunID                  string
+	WorkerProvider         string
+	WorkerModel            string
+	WorkerEffort           string
+	VerifierProvider       string
+	VerifierModel          string
+	VerifierEffort         string
+	VerifierTimeout        time.Duration
+	PreProdBranch          string
+	RequiredChecks         []string
+	ThrottleLimit          int
+	Thresholds             config.ResilienceWorker
+	Budget                 config.GuardrailBudget
+	CircuitBreaker         config.GuardrailCircuitBreaker
+	AdditionalRiskRedLines []RiskRedLine
+	ProcessAlive           ProcessAliveFunc
+	Clock                  func() time.Time
+	Stderr                 io.Writer
 
 	Compile         CompileFunc
 	ComputeReadySet ReadySetFunc
 	DispatchWave    DispatchWaveFunc
 	Dispatch        WorkerDispatchFunc
 	Loopreview      LoopreviewFunc
+	RiskGate        RiskGateFunc
+	PreProdWriter   PreProdWriter
 	StatePush       StatePushFunc
 	LoadAttempts    LoadAttemptsFunc
 }
 
 type TickReport struct {
-	Version      int                   `json:"version"`
-	Repo         string                `json:"repo"`
-	RepoPath     string                `json:"repo_path"`
-	BaseBranch   string                `json:"base_branch"`
-	RunID        string                `json:"run_id"`
-	Status       string                `json:"status"`
-	StopReason   string                `json:"stop_reason"`
-	StartedAt    string                `json:"started_at"`
-	FinishedAt   string                `json:"finished_at"`
-	Compile      compiler.Report       `json:"compile"`
-	ReadySet     report.ReadySetReport `json:"ready_set"`
-	DispatchWave *DispatchWaveReport   `json:"dispatch_wave,omitempty"`
-	Reviews      []TickReviewResult    `json:"reviews"`
-	NeedsHuman   []TickIssue           `json:"needs_human"`
-	Failures     []TickIssue           `json:"failures"`
-	StatePush    *TickStatePush        `json:"state_push,omitempty"`
-	Summary      TickSummary           `json:"summary"`
+	Version       int                      `json:"version"`
+	Repo          string                   `json:"repo"`
+	RepoPath      string                   `json:"repo_path"`
+	BaseBranch    string                   `json:"base_branch"`
+	PreProdBranch string                   `json:"pre_prod_branch"`
+	RunID         string                   `json:"run_id"`
+	Status        string                   `json:"status"`
+	StopReason    string                   `json:"stop_reason"`
+	StartedAt     string                   `json:"started_at"`
+	FinishedAt    string                   `json:"finished_at"`
+	Compile       compiler.Report          `json:"compile"`
+	ReadySet      report.ReadySetReport    `json:"ready_set"`
+	DispatchWave  *DispatchWaveReport      `json:"dispatch_wave,omitempty"`
+	Reviews       []TickReviewResult       `json:"reviews"`
+	RiskGates     []TickRiskGateResult     `json:"risk_gates"`
+	PreProdMerges []TickPreProdMergeResult `json:"pre_prod_merges"`
+	NeedsHuman    []TickIssue              `json:"needs_human"`
+	Failures      []TickIssue              `json:"failures"`
+	StatePush     *TickStatePush           `json:"state_push,omitempty"`
+	Summary       TickSummary              `json:"summary"`
 }
 
 type TickReviewResult struct {
@@ -123,6 +133,30 @@ type TickIssue struct {
 	Detail string `json:"detail"`
 }
 
+type TickRiskGateResult struct {
+	Issue          int           `json:"issue,omitempty"`
+	PR             string        `json:"pr,omitempty"`
+	PRNumber       int           `json:"pr_number,omitempty"`
+	Status         string        `json:"status"`
+	RequiredChecks []string      `json:"required_checks"`
+	ChangedFiles   []string      `json:"changed_files"`
+	Checks         []gh.Check    `json:"checks"`
+	RedLines       []RiskRedLine `json:"red_lines"`
+	Error          string        `json:"error,omitempty"`
+}
+
+type TickPreProdMergeResult struct {
+	Issue    int    `json:"issue,omitempty"`
+	PR       string `json:"pr,omitempty"`
+	PRNumber int    `json:"pr_number,omitempty"`
+	Branch   string `json:"branch"`
+	Head     string `json:"head,omitempty"`
+	SHA      string `json:"sha,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Status   string `json:"status"`
+	Error    string `json:"error,omitempty"`
+}
+
 type TickStatePush struct {
 	Branch    string   `json:"branch"`
 	Remote    string   `json:"remote"`
@@ -134,18 +168,21 @@ type TickStatePush struct {
 }
 
 type TickSummary struct {
-	CompiledCreatedCount   int `json:"compiled_created_count"`
-	CompiledUpdatedCount   int `json:"compiled_updated_count"`
-	CompiledUnchangedCount int `json:"compiled_unchanged_count"`
-	CompiledClosedCount    int `json:"compiled_closed_count"`
-	ReadyCount             int `json:"ready_count"`
-	BlockedCount           int `json:"blocked_count"`
-	DispatchedPRCount      int `json:"dispatched_pr_count"`
-	ReviewPassCount        int `json:"review_pass_count"`
-	ReviewFailCount        int `json:"review_fail_count"`
-	ReviewNeedsHumanCount  int `json:"review_needs_human_count"`
-	NeedsHumanCount        int `json:"needs_human_count"`
-	FailureCount           int `json:"failure_count"`
+	CompiledCreatedCount    int `json:"compiled_created_count"`
+	CompiledUpdatedCount    int `json:"compiled_updated_count"`
+	CompiledUnchangedCount  int `json:"compiled_unchanged_count"`
+	CompiledClosedCount     int `json:"compiled_closed_count"`
+	ReadyCount              int `json:"ready_count"`
+	BlockedCount            int `json:"blocked_count"`
+	DispatchedPRCount       int `json:"dispatched_pr_count"`
+	ReviewPassCount         int `json:"review_pass_count"`
+	ReviewFailCount         int `json:"review_fail_count"`
+	ReviewNeedsHumanCount   int `json:"review_needs_human_count"`
+	RiskGateCleanCount      int `json:"risk_gate_clean_count"`
+	RiskGateNeedsHumanCount int `json:"risk_gate_needs_human_count"`
+	PreProdMergeCount       int `json:"pre_prod_merge_count"`
+	NeedsHumanCount         int `json:"needs_human_count"`
+	FailureCount            int `json:"failure_count"`
 }
 
 func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
@@ -164,17 +201,23 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
 	}
+	if strings.TrimSpace(opts.PreProdBranch) == "" {
+		opts.PreProdBranch = "pre-prod"
+	}
 
 	tickReport := TickReport{
-		Version:    TickReportVersion,
-		Repo:       filepath.ToSlash(opts.RepoPath),
-		RepoPath:   filepath.ToSlash(opts.RepoPath),
-		BaseBranch: opts.BaseBranch,
-		RunID:      opts.RunID,
-		StartedAt:  state.FormatTimestamp(started),
-		Reviews:    []TickReviewResult{},
-		NeedsHuman: []TickIssue{},
-		Failures:   []TickIssue{},
+		Version:       TickReportVersion,
+		Repo:          filepath.ToSlash(opts.RepoPath),
+		RepoPath:      filepath.ToSlash(opts.RepoPath),
+		BaseBranch:    opts.BaseBranch,
+		PreProdBranch: opts.PreProdBranch,
+		RunID:         opts.RunID,
+		StartedAt:     state.FormatTimestamp(started),
+		Reviews:       []TickReviewResult{},
+		RiskGates:     []TickRiskGateResult{},
+		PreProdMerges: []TickPreProdMergeResult{},
+		NeedsHuman:    []TickIssue{},
+		Failures:      []TickIssue{},
 	}
 	finish := func(status, stopReason string) (TickReport, error) {
 		finished := opts.Clock().UTC()
@@ -371,8 +414,9 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		tickReport.Reviews = append(tickReport.Reviews, review)
 		switch result.Verdict.Verdict {
 		case loopreview.VerdictPass:
+			runTickRiskGateAndPreProdMerge(ctx, opts, &tickReport, item, prNumber)
 		case loopreview.VerdictFail:
-			tickReport.Failures = append(tickReport.Failures, TickIssue{
+			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 				Step:   "loopreview",
 				Issue:  item.Issue,
 				PR:     item.PR,
@@ -396,7 +440,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		return finish(TickStatusFailed, TickStopReviewFailed)
 	}
 	if len(tickReport.NeedsHuman) > 0 {
-		return finish(TickStatusNeedsHuman, TickStopReviewNeedsHuman)
+		return finish(TickStatusNeedsHuman, tickNeedsHumanStopReason(tickReport.NeedsHuman))
 	}
 	return finish(TickStatusSucceeded, TickStopCompleted)
 }
@@ -428,6 +472,9 @@ func withTickDefaults(opts TickOptions) TickOptions {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
 		}
 	}
+	if opts.RiskGate == nil {
+		opts.RiskGate = EvaluateRiskGate
+	}
 	if opts.StatePush == nil {
 		opts.StatePush = func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.Push(ctx, opts, statebranch.DefaultDeps())
@@ -440,6 +487,171 @@ func withTickDefaults(opts TickOptions) TickOptions {
 		opts.ThrottleLimit = 4
 	}
 	return opts
+}
+
+func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, prNumber int) {
+	gateReader, ok := opts.Reader.(RiskGateReader)
+	if !ok {
+		detail := "github reader does not support PR diff and check reads for risk gate"
+		tickReport.RiskGates = append(tickReport.RiskGates, TickRiskGateResult{
+			Issue:    item.Issue,
+			PR:       item.PR,
+			PRNumber: prNumber,
+			Status:   RiskGateStatusNeedsHuman,
+			Error:    detail,
+		})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "risk-gate",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+		return
+	}
+
+	decision, err := opts.RiskGate(ctx, RiskGateOptions{
+		Reader:             gateReader,
+		PRNumber:           prNumber,
+		RequiredChecks:     opts.RequiredChecks,
+		AdditionalRedLines: opts.AdditionalRiskRedLines,
+	})
+	gateResult := TickRiskGateResult{
+		Issue:          item.Issue,
+		PR:             item.PR,
+		PRNumber:       prNumber,
+		Status:         decision.Status,
+		RequiredChecks: append([]string(nil), decision.RequiredChecks...),
+		ChangedFiles:   append([]string(nil), decision.ChangedFiles...),
+		Checks:         append([]gh.Check(nil), decision.Checks...),
+		RedLines:       append([]RiskRedLine(nil), decision.RedLines...),
+	}
+	if err != nil {
+		gateResult.Status = RiskGateStatusNeedsHuman
+		gateResult.Error = err.Error()
+		tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "risk-gate",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: err.Error(),
+		})
+		return
+	}
+	tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
+	if decision.Status != RiskGateStatusClean || len(decision.RedLines) > 0 {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "risk-gate",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: formatRiskRedLines(decision.RedLines),
+		})
+		return
+	}
+
+	if detail := preProdBranchProblem(opts.PreProdBranch, opts.BaseBranch); detail != "" {
+		tickReport.PreProdMerges = append(tickReport.PreProdMerges, TickPreProdMergeResult{
+			Issue:    item.Issue,
+			PR:       item.PR,
+			PRNumber: prNumber,
+			Branch:   opts.PreProdBranch,
+			Status:   TickStatusNeedsHuman,
+			Error:    detail,
+		})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-merge",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+		return
+	}
+	if opts.PreProdWriter == nil {
+		detail := "pre-prod writer is required for unattended pre-prod merge"
+		tickReport.PreProdMerges = append(tickReport.PreProdMerges, TickPreProdMergeResult{
+			Issue:    item.Issue,
+			PR:       item.PR,
+			PRNumber: prNumber,
+			Branch:   opts.PreProdBranch,
+			Status:   TickStatusNeedsHuman,
+			Error:    detail,
+		})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-merge",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: detail,
+		})
+		return
+	}
+
+	merged, err := opts.PreProdWriter.MergeToPreProd(ctx, prNumber, opts.PreProdBranch)
+	mergeResult := TickPreProdMergeResult{
+		Issue:    item.Issue,
+		PR:       item.PR,
+		PRNumber: prNumber,
+		Branch:   opts.PreProdBranch,
+		Status:   TickStatusSucceeded,
+	}
+	if err != nil {
+		mergeResult.Status = TickStatusNeedsHuman
+		mergeResult.Error = err.Error()
+		tickReport.PreProdMerges = append(tickReport.PreProdMerges, mergeResult)
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "pre-prod-merge",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: err.Error(),
+		})
+		return
+	}
+	mergeResult.Branch = firstNonEmpty(merged.Branch, opts.PreProdBranch)
+	mergeResult.Head = merged.Head
+	mergeResult.SHA = merged.SHA
+	mergeResult.URL = merged.URL
+	tickReport.PreProdMerges = append(tickReport.PreProdMerges, mergeResult)
+}
+
+func preProdBranchProblem(preProdBranch, baseBranch string) string {
+	branch := strings.TrimSpace(preProdBranch)
+	if branch == "" {
+		return "pre-prod branch is not configured"
+	}
+	switch strings.ToLower(branch) {
+	case "main", "master", "prod", "production":
+		return fmt.Sprintf("pre-prod branch %q is reserved for human promotion", branch)
+	}
+	if strings.EqualFold(branch, strings.TrimSpace(baseBranch)) {
+		return fmt.Sprintf("pre-prod branch %q must differ from base branch %q", branch, strings.TrimSpace(baseBranch))
+	}
+	return ""
+}
+
+func formatRiskRedLines(lines []RiskRedLine) string {
+	if len(lines) == 0 {
+		return "risk gate returned needs-human"
+	}
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		category := strings.TrimSpace(line.Category)
+		detail := strings.TrimSpace(line.Detail)
+		if category == "" {
+			category = RiskRedLineRaised
+		}
+		if detail == "" {
+			detail = "risk raised"
+		}
+		parts = append(parts, category+": "+detail)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func tickNeedsHumanStopReason(items []TickIssue) string {
+	for _, item := range items {
+		if item.Step == "risk-gate" || item.Step == "pre-prod-merge" {
+			return TickStopRiskGateNeedsHuman
+		}
+	}
+	return TickStopReviewNeedsHuman
 }
 
 func pushTickState(ctx context.Context, opts TickOptions, tickReport *TickReport) {
@@ -480,6 +692,7 @@ func RenderTickText(report TickReport) string {
 	fmt.Fprintln(&out, "TICK")
 	fmt.Fprintf(&out, "Repo: %s\n", report.Repo)
 	fmt.Fprintf(&out, "Base branch: %s\n", report.BaseBranch)
+	fmt.Fprintf(&out, "Pre-prod branch: %s\n", report.PreProdBranch)
 	fmt.Fprintf(&out, "RunId: %s\n", report.RunID)
 	fmt.Fprintf(&out, "Status: %s\n", report.Status)
 	fmt.Fprintf(&out, "Stop reason: %s\n", report.StopReason)
@@ -542,6 +755,58 @@ func RenderTickText(report TickReport) string {
 		}
 	}
 
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Risk gates")
+	if len(report.RiskGates) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, gate := range report.RiskGates {
+			target := gate.PR
+			if gate.PRNumber > 0 {
+				target = fmt.Sprintf("#%d", gate.PRNumber)
+			}
+			fmt.Fprintf(&out, "- PR %s issue #%d %s\n", target, gate.Issue, gate.Status)
+			if len(gate.RequiredChecks) > 0 {
+				fmt.Fprintf(&out, "  required_checks: %s\n", strings.Join(gate.RequiredChecks, ", "))
+			}
+			if len(gate.ChangedFiles) > 0 {
+				fmt.Fprintf(&out, "  changed_files: %s\n", strings.Join(gate.ChangedFiles, ", "))
+			}
+			if len(gate.RedLines) > 0 {
+				fmt.Fprintf(&out, "  red_lines: %s\n", formatRiskRedLines(gate.RedLines))
+			}
+			if strings.TrimSpace(gate.Error) != "" {
+				fmt.Fprintf(&out, "  error: %s\n", gate.Error)
+			}
+		}
+	}
+
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Pre-prod merges")
+	if len(report.PreProdMerges) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, merged := range report.PreProdMerges {
+			target := merged.PR
+			if merged.PRNumber > 0 {
+				target = fmt.Sprintf("#%d", merged.PRNumber)
+			}
+			fmt.Fprintf(&out, "- PR %s issue #%d %s branch=%s\n", target, merged.Issue, merged.Status, merged.Branch)
+			if strings.TrimSpace(merged.Head) != "" {
+				fmt.Fprintf(&out, "  head: %s\n", merged.Head)
+			}
+			if strings.TrimSpace(merged.SHA) != "" {
+				fmt.Fprintf(&out, "  sha: %s\n", merged.SHA)
+			}
+			if strings.TrimSpace(merged.URL) != "" {
+				fmt.Fprintf(&out, "  url: %s\n", merged.URL)
+			}
+			if strings.TrimSpace(merged.Error) != "" {
+				fmt.Fprintf(&out, "  error: %s\n", merged.Error)
+			}
+		}
+	}
+
 	renderTickIssueSection(&out, "Needs human", report.NeedsHuman)
 	renderTickIssueSection(&out, "Failures", report.Failures)
 
@@ -569,7 +834,7 @@ func RenderTickText(report TickReport) string {
 	fmt.Fprintln(&out, "Next")
 	switch report.Status {
 	case TickStatusSucceeded:
-		fmt.Fprintln(&out, "- Human review can decide what to do with passing PRs later.")
+		fmt.Fprintln(&out, "- Clean passing PRs were integrated into pre-prod; human promotion to main remains separate.")
 	case TickStatusNoReadyWork:
 		fmt.Fprintln(&out, "- No ready issues were dispatched in this pass.")
 	case TickStatusNeedsHuman:
@@ -599,6 +864,26 @@ func normalizeTickReport(report TickReport) TickReport {
 		if report.Reviews[i].Findings == nil {
 			report.Reviews[i].Findings = []loopreview.Finding{}
 		}
+	}
+	if report.RiskGates == nil {
+		report.RiskGates = []TickRiskGateResult{}
+	}
+	for i := range report.RiskGates {
+		if report.RiskGates[i].RequiredChecks == nil {
+			report.RiskGates[i].RequiredChecks = []string{}
+		}
+		if report.RiskGates[i].ChangedFiles == nil {
+			report.RiskGates[i].ChangedFiles = []string{}
+		}
+		if report.RiskGates[i].Checks == nil {
+			report.RiskGates[i].Checks = []gh.Check{}
+		}
+		if report.RiskGates[i].RedLines == nil {
+			report.RiskGates[i].RedLines = []RiskRedLine{}
+		}
+	}
+	if report.PreProdMerges == nil {
+		report.PreProdMerges = []TickPreProdMergeResult{}
 	}
 	if report.NeedsHuman == nil {
 		report.NeedsHuman = []TickIssue{}
@@ -639,6 +924,19 @@ func summarizeTick(report TickReport) TickSummary {
 			summary.ReviewFailCount++
 		case loopreview.VerdictNeedsHuman:
 			summary.ReviewNeedsHumanCount++
+		}
+	}
+	for _, gate := range report.RiskGates {
+		switch gate.Status {
+		case RiskGateStatusClean:
+			summary.RiskGateCleanCount++
+		case RiskGateStatusNeedsHuman:
+			summary.RiskGateNeedsHumanCount++
+		}
+	}
+	for _, merged := range report.PreProdMerges {
+		if merged.Status == TickStatusSucceeded {
+			summary.PreProdMergeCount++
 		}
 	}
 	return summary

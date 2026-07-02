@@ -23,6 +23,7 @@ type Reader interface {
 type Writer interface {
 	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
 	ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error)
+	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (PreProdMergeResult, error)
 }
 
 // IssueWriter is the GitHub issue mutation surface used by compile. Tests can
@@ -87,6 +88,14 @@ type Check struct {
 	Name   string `json:"name"`
 	State  string `json:"state"`
 	Bucket string `json:"bucket"`
+}
+
+type PreProdMergeResult struct {
+	PRNumber int    `json:"pr_number"`
+	Branch   string `json:"branch"`
+	Head     string `json:"head"`
+	SHA      string `json:"sha,omitempty"`
+	URL      string `json:"url,omitempty"`
 }
 
 // New returns a gh-backed reader rooted at repoPath.
@@ -248,6 +257,58 @@ func (c *CLI) ListHeadPRs(ctx context.Context, branch string) ([]PullRequestRefe
 		"--json", "number,url",
 	}, &prs)
 	return prs, err
+}
+
+func (c *CLI) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (PreProdMergeResult, error) {
+	preProdBranch = strings.TrimSpace(preProdBranch)
+	if prNumber <= 0 {
+		return PreProdMergeResult{}, fmt.Errorf("pull request number is required")
+	}
+	if preProdBranch == "" {
+		return PreProdMergeResult{}, fmt.Errorf("pre-prod branch is required")
+	}
+	if isReservedProductionBranch(preProdBranch) {
+		return PreProdMergeResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
+	}
+
+	pr, err := c.ViewPR(ctx, prNumber)
+	if err != nil {
+		return PreProdMergeResult{}, err
+	}
+	head := strings.TrimSpace(pr.HeadRefName)
+	if head == "" {
+		return PreProdMergeResult{}, fmt.Errorf("pull request #%d has no head branch", prNumber)
+	}
+	repo, err := c.RepoName(ctx)
+	if err != nil {
+		return PreProdMergeResult{}, err
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return PreProdMergeResult{}, fmt.Errorf("repository name is required")
+	}
+
+	var payload struct {
+		SHA     string `json:"sha"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := c.runJSON(ctx, []string{
+		"api",
+		"--method", "POST",
+		"repos/" + repo + "/merges",
+		"-f", "base=" + preProdBranch,
+		"-f", "head=" + head,
+		"-f", fmt.Sprintf("commit_message=loopcoder pre-prod merge PR #%d", prNumber),
+	}, &payload); err != nil {
+		return PreProdMergeResult{}, err
+	}
+	return PreProdMergeResult{
+		PRNumber: prNumber,
+		Branch:   preProdBranch,
+		Head:     head,
+		SHA:      payload.SHA,
+		URL:      payload.HTMLURL,
+	}, nil
 }
 
 func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []string) (Issue, error) {
@@ -476,5 +537,14 @@ func labelDescription(label string) string {
 		return "loopcoder dependency edge"
 	default:
 		return "loopcoder compile label"
+	}
+}
+
+func isReservedProductionBranch(branch string) bool {
+	switch strings.ToLower(strings.TrimSpace(branch)) {
+	case "main", "master", "prod", "production":
+		return true
+	default:
+		return false
 	}
 }

@@ -21,13 +21,15 @@ func TestTickHappyPass(t *testing.T) {
 	var order []string
 
 	report, err := Tick(context.Background(), TickOptions{
-		Reader:           fakeReader{},
+		Reader:           cleanRiskReader(77, "README.md"),
 		IssueWriter:      noopTickIssueWriter{},
 		RepoPath:         repo,
 		BaseBranch:       "trunk",
+		PreProdBranch:    "pre-prod",
 		RunID:            "run-test-wave",
 		WorkerProvider:   "codex",
 		VerifierProvider: "claude",
+		RequiredChecks:   []string{"verify"},
 		Clock: func() time.Time {
 			return now
 		},
@@ -77,6 +79,17 @@ func TestTickHappyPass(t *testing.T) {
 			}
 			return tickLoopreview(loopreview.VerdictPass, "review passed"), nil
 		},
+		RiskGate: func(ctx context.Context, opts RiskGateOptions) (RiskGateDecision, error) {
+			order = append(order, "risk-gate")
+			return EvaluateRiskGate(ctx, opts)
+		},
+		PreProdWriter: tickPreProdWriterFunc(func(_ context.Context, prNumber int, branch string) (gh.PreProdMergeResult, error) {
+			order = append(order, "pre-prod-merge")
+			if prNumber != 77 || branch != "pre-prod" {
+				t.Fatalf("pre-prod merge pr=%d branch=%q", prNumber, branch)
+			}
+			return gh.PreProdMergeResult{PRNumber: prNumber, Branch: branch, Head: "loop/issue-101", SHA: "abc123"}, nil
+		}),
 		StatePush: func(_ context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error) {
 			order = append(order, "state-push")
 			if opts.RepoPath != repo || opts.RunID != "run-test-wave" {
@@ -99,10 +112,10 @@ func TestTickHappyPass(t *testing.T) {
 	if report.Status != TickStatusSucceeded || report.StopReason != TickStopCompleted {
 		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
 	}
-	if !reflect.DeepEqual(order, []string{"compile", "ready-set", "dispatch-wave", "loopreview", "state-push"}) {
+	if !reflect.DeepEqual(order, []string{"compile", "ready-set", "dispatch-wave", "loopreview", "risk-gate", "pre-prod-merge", "state-push"}) {
 		t.Fatalf("call order = %#v", order)
 	}
-	if report.Summary.DispatchedPRCount != 1 || report.Summary.ReviewPassCount != 1 || report.Summary.FailureCount != 0 {
+	if report.Summary.DispatchedPRCount != 1 || report.Summary.ReviewPassCount != 1 || report.Summary.RiskGateCleanCount != 1 || report.Summary.PreProdMergeCount != 1 || report.Summary.FailureCount != 0 {
 		t.Fatalf("summary = %#v", report.Summary)
 	}
 	if report.StatePush == nil || !report.StatePush.Pushed {
@@ -204,8 +217,13 @@ func TestTickNeedsHumanPRIsReported(t *testing.T) {
 	}
 }
 
-func TestTickReviewFailStopsFailed(t *testing.T) {
+func TestTickReviewFailNeedsHumanAndDoesNotMerge(t *testing.T) {
 	opts := reviewReadyTickOptions(t.TempDir(), 12, "https://github.com/owner/repo/pull/120")
+	mergeCalled := false
+	opts.PreProdWriter = tickPreProdWriterFunc(func(context.Context, int, string) (gh.PreProdMergeResult, error) {
+		mergeCalled = true
+		return gh.PreProdMergeResult{}, nil
+	})
 	opts.Loopreview = func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
 		if opts.PRNumber != 120 {
 			t.Fatalf("loopreview pr = %d, want 120", opts.PRNumber)
@@ -217,16 +235,22 @@ func TestTickReviewFailStopsFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tick returned error: %v", err)
 	}
-	if report.Status != TickStatusFailed || report.StopReason != TickStopReviewFailed {
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopReviewNeedsHuman {
 		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
 	}
 	if len(report.Reviews) != 1 || report.Reviews[0].Verdict != loopreview.VerdictFail {
 		t.Fatalf("reviews = %#v", report.Reviews)
 	}
-	if len(report.Failures) != 1 || report.Failures[0].Step != "loopreview" || report.Failures[0].Issue != 12 {
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "loopreview" || report.NeedsHuman[0].Issue != 12 {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+	if len(report.Failures) != 0 {
 		t.Fatalf("failures = %#v", report.Failures)
 	}
-	if report.Summary.ReviewFailCount != 1 || report.Summary.FailureCount != 1 {
+	if mergeCalled {
+		t.Fatal("pre-prod merge was called after loopreview fail")
+	}
+	if report.Summary.ReviewFailCount != 1 || report.Summary.NeedsHumanCount != 1 || report.Summary.FailureCount != 0 {
 		t.Fatalf("summary = %#v", report.Summary)
 	}
 }
@@ -252,6 +276,126 @@ func TestTickLoopreviewErrorNeedsHuman(t *testing.T) {
 	}
 	if len(report.Failures) != 0 {
 		t.Fatalf("failures = %#v, want none", report.Failures)
+	}
+}
+
+func TestTickRiskGateRedLinesNeedHumanAndDoNotMerge(t *testing.T) {
+	tests := []struct {
+		name         string
+		reader       fakeReader
+		wantCategory string
+	}{
+		{
+			name:         "destructive mass deletion",
+			reader:       destructiveRiskReader(201),
+			wantCategory: RiskRedLineDestructive,
+		},
+		{
+			name: "build not green",
+			reader: fakeReader{
+				checks:    map[int][]gh.Check{201: {{Name: "verify", Bucket: "fail"}}},
+				diffFiles: map[int][]string{201: {"README.md"}},
+				diffs:     map[int]string{201: modifiedDiff("README.md")},
+			},
+			wantCategory: RiskRedLineBuild,
+		},
+		{
+			name: "loopcoder core path",
+			reader: fakeReader{
+				checks:    map[int][]gh.Check{201: passChecks()},
+				diffFiles: map[int][]string{201: {"internal/orchestration/tick.go"}},
+				diffs:     map[int]string{201: modifiedDiff("internal/orchestration/tick.go")},
+			},
+			wantCategory: RiskRedLineCore,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mergeCalled := false
+			opts := reviewReadyTickOptions(t.TempDir(), 20, "https://github.com/owner/repo/pull/201")
+			opts.Reader = tt.reader
+			opts.PreProdWriter = tickPreProdWriterFunc(func(context.Context, int, string) (gh.PreProdMergeResult, error) {
+				mergeCalled = true
+				return gh.PreProdMergeResult{}, nil
+			})
+
+			report, err := Tick(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("Tick returned error: %v", err)
+			}
+			if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopRiskGateNeedsHuman {
+				t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+			}
+			if mergeCalled {
+				t.Fatal("pre-prod merge was called despite risk red line")
+			}
+			if len(report.RiskGates) != 1 || report.RiskGates[0].Status != RiskGateStatusNeedsHuman {
+				t.Fatalf("risk gates = %#v", report.RiskGates)
+			}
+			if !riskGateHasCategory(report.RiskGates[0], tt.wantCategory) {
+				t.Fatalf("risk gate red lines = %#v, want category %q", report.RiskGates[0].RedLines, tt.wantCategory)
+			}
+			if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "risk-gate" {
+				t.Fatalf("needs-human = %#v", report.NeedsHuman)
+			}
+			if len(report.PreProdMerges) != 0 {
+				t.Fatalf("pre-prod merges = %#v, want none", report.PreProdMerges)
+			}
+		})
+	}
+}
+
+func TestTickRejectsMainAsPreProdBranchBeforeMerge(t *testing.T) {
+	mergeCalled := false
+	opts := reviewReadyTickOptions(t.TempDir(), 21, "https://github.com/owner/repo/pull/210")
+	opts.PreProdBranch = "main"
+	opts.PreProdWriter = tickPreProdWriterFunc(func(context.Context, int, string) (gh.PreProdMergeResult, error) {
+		mergeCalled = true
+		return gh.PreProdMergeResult{}, nil
+	})
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopRiskGateNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if mergeCalled {
+		t.Fatal("pre-prod writer was called with main target")
+	}
+	if len(report.RiskGates) != 1 || report.RiskGates[0].Status != RiskGateStatusClean {
+		t.Fatalf("risk gates = %#v", report.RiskGates)
+	}
+	if len(report.PreProdMerges) != 1 || report.PreProdMerges[0].Status != TickStatusNeedsHuman || !strings.Contains(report.PreProdMerges[0].Error, "reserved") {
+		t.Fatalf("pre-prod merges = %#v", report.PreProdMerges)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "pre-prod-merge" {
+		t.Fatalf("needs-human = %#v", report.NeedsHuman)
+	}
+}
+
+func TestRiskGateAdditionalRedLinesCanOnlyRaiseRisk(t *testing.T) {
+	reader := cleanRiskReader(301, "README.md")
+
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         reader,
+		PRNumber:       301,
+		RequiredChecks: []string{"verify"},
+		AdditionalRedLines: []RiskRedLine{{
+			Category: "configured-high-risk",
+			Detail:   "release policy requires a human",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate returned error: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman || len(decision.RedLines) != 1 {
+		t.Fatalf("decision = %#v, want raised needs-human", decision)
+	}
+	if decision.RedLines[0].Category != "configured-high-risk" {
+		t.Fatalf("red lines = %#v", decision.RedLines)
 	}
 }
 
@@ -408,7 +552,6 @@ func TestTickNoReadyWorkStopsWithoutDispatch(t *testing.T) {
 }
 
 func TestTickDependencySurfaceHasNoProductionUpdateMethod(t *testing.T) {
-	forbidden := []string{"merge", "promote"}
 	checkTypeSurface := func(tpe reflect.Type) []string {
 		var hits []string
 		if tpe.Kind() != reflect.Interface {
@@ -416,10 +559,11 @@ func TestTickDependencySurfaceHasNoProductionUpdateMethod(t *testing.T) {
 		}
 		for i := 0; i < tpe.NumMethod(); i++ {
 			name := strings.ToLower(tpe.Method(i).Name)
-			for _, word := range forbidden {
-				if strings.Contains(name, word) {
-					hits = append(hits, tpe.String()+"."+tpe.Method(i).Name)
-				}
+			if strings.Contains(name, "main") || strings.Contains(name, "promote") {
+				hits = append(hits, tpe.String()+"."+tpe.Method(i).Name)
+			}
+			if strings.Contains(name, "merge") && !strings.Contains(name, "preprod") {
+				hits = append(hits, tpe.String()+"."+tpe.Method(i).Name)
 			}
 		}
 		return hits
@@ -431,15 +575,20 @@ func TestTickDependencySurfaceHasNoProductionUpdateMethod(t *testing.T) {
 		field := tickOptions.Field(i)
 		name := strings.ToLower(field.Name)
 		typeName := strings.ToLower(field.Type.String())
-		for _, word := range forbidden {
-			if strings.Contains(name, word) || strings.Contains(typeName, word) {
-				hits = append(hits, field.Name+" "+field.Type.String())
-			}
+		if strings.Contains(name, "main") || strings.Contains(typeName, "main") ||
+			strings.Contains(name, "promote") || strings.Contains(typeName, "promote") {
+			hits = append(hits, field.Name+" "+field.Type.String())
+		}
+		if strings.Contains(name, "merge") && !strings.Contains(name, "preprod") {
+			hits = append(hits, field.Name+" "+field.Type.String())
+		}
+		if strings.Contains(typeName, "merge") && !strings.Contains(typeName, "preprod") {
+			hits = append(hits, field.Name+" "+field.Type.String())
 		}
 		hits = append(hits, checkTypeSurface(field.Type)...)
 	}
 	if len(hits) > 0 {
-		t.Fatalf("tick dependency surface exposes forbidden production-update names: %s", strings.Join(hits, ", "))
+		t.Fatalf("tick dependency surface exposes forbidden main/promote or non-preprod merge names: %s", strings.Join(hits, ", "))
 	}
 }
 
@@ -503,12 +652,15 @@ func tickLoopreview(verdict, evidence string) loopreview.Result {
 }
 
 func reviewReadyTickOptions(repo string, issue int, pr string) TickOptions {
+	prNumber, _ := parseTickPRNumber(pr)
 	return TickOptions{
-		Reader:           fakeReader{},
+		Reader:           cleanRiskReader(prNumber, "README.md"),
 		IssueWriter:      noopTickIssueWriter{},
 		RepoPath:         repo,
 		RunID:            "run-test-wave",
 		VerifierProvider: "claude",
+		PreProdBranch:    "pre-prod",
+		RequiredChecks:   []string{"verify"},
 		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
 			return tickCompileReport(false), nil
 		},
@@ -526,6 +678,9 @@ func reviewReadyTickOptions(repo string, issue int, pr string) TickOptions {
 		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
 			return tickLoopreview(loopreview.VerdictPass, "review passed"), nil
 		},
+		PreProdWriter: tickPreProdWriterFunc(func(_ context.Context, prNumber int, branch string) (gh.PreProdMergeResult, error) {
+			return gh.PreProdMergeResult{PRNumber: prNumber, Branch: branch, Head: "loop/issue-test", SHA: "abc123"}, nil
+		}),
 		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
 			return statebranch.PushResult{
 				Branch: statebranch.DefaultBranch,
@@ -534,6 +689,67 @@ func reviewReadyTickOptions(repo string, issue int, pr string) TickOptions {
 			}, nil
 		},
 	}
+}
+
+type tickPreProdWriterFunc func(context.Context, int, string) (gh.PreProdMergeResult, error)
+
+func (f tickPreProdWriterFunc) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (gh.PreProdMergeResult, error) {
+	return f(ctx, prNumber, preProdBranch)
+}
+
+func cleanRiskReader(prNumber int, files ...string) fakeReader {
+	if len(files) == 0 {
+		files = []string{"README.md"}
+	}
+	return fakeReader{
+		checks:    map[int][]gh.Check{prNumber: passChecks()},
+		diffFiles: map[int][]string{prNumber: files},
+		diffs:     map[int]string{prNumber: modifiedDiff(files[0])},
+	}
+}
+
+func destructiveRiskReader(prNumber int) fakeReader {
+	files := []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"}
+	return fakeReader{
+		checks:    map[int][]gh.Check{prNumber: passChecks()},
+		diffFiles: map[int][]string{prNumber: files},
+		diffs:     map[int]string{prNumber: deletedDiff(files...)},
+	}
+}
+
+func passChecks() []gh.Check {
+	return []gh.Check{{Name: "verify", Bucket: "pass"}}
+}
+
+func modifiedDiff(file string) string {
+	return "diff --git a/" + file + " b/" + file + "\n" +
+		"--- a/" + file + "\n" +
+		"+++ b/" + file + "\n" +
+		"@@ -1 +1 @@\n" +
+		"-old\n" +
+		"+new\n"
+}
+
+func deletedDiff(files ...string) string {
+	var b strings.Builder
+	for _, file := range files {
+		b.WriteString("diff --git a/" + file + " b/" + file + "\n")
+		b.WriteString("deleted file mode 100644\n")
+		b.WriteString("--- a/" + file + "\n")
+		b.WriteString("+++ /dev/null\n")
+		b.WriteString("@@ -1 +0,0 @@\n")
+		b.WriteString("-old\n")
+	}
+	return b.String()
+}
+
+func riskGateHasCategory(gate TickRiskGateResult, category string) bool {
+	for _, line := range gate.RedLines {
+		if line.Category == category {
+			return true
+		}
+	}
+	return false
 }
 
 type noopTickIssueWriter struct{}

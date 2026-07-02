@@ -190,6 +190,8 @@ func DeliveryTemplate(opts Options) string {
 	writeOptionalScalar(&b, "  ", "reasoning_effort", workerEffort)
 	b.WriteString("  base_branch: main\n")
 	b.WriteString("  command_hint: \"implement the issue, run relevant checks, commit\"\n")
+	b.WriteString("environment:\n")
+	b.WriteString("  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.\n")
 	if hasVerifier {
 		b.WriteString("verifier:\n")
 		b.WriteString("  # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.\n")

@@ -47,28 +47,29 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter  func(repoPath string) compiler.IssueWriter
-	ProcessAlive    func(pid int) bool
-	Now             func() time.Time
-	IsTerminal      func(w io.Writer) bool
-	Stdin           io.Reader
-	BuildInfo       BuildInfo
-	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick            func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Compile         func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify          func(ctx context.Context, opts verify.Options) verify.Result
-	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init            func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade         func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	SkillInstall    func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter   func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
+	ProcessAlive     func(pid int) bool
+	Now              func() time.Time
+	IsTerminal       func(w io.Writer) bool
+	Stdin            io.Reader
+	BuildInfo        BuildInfo
+	ComputeReadySet  func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick             func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify           func(ctx context.Context, opts verify.Options) verify.Result
+	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
+	Init             func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade          func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	SkillInstall     func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush        func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull        func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
@@ -117,6 +118,9 @@ func DefaultDeps() Deps {
 			return gh.New(repoPath)
 		},
 		NewIssueWriter: func(repoPath string) compiler.IssueWriter {
+			return gh.New(repoPath)
+		},
+		NewPreProdWriter: func(repoPath string) orchestration.PreProdWriter {
 			return gh.New(repoPath)
 		},
 		ProcessAlive: process.Alive,
@@ -345,6 +349,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "tick" {
 		fmt.Fprintln(w, "  --repo string                    repository path (required)")
 		fmt.Fprintln(w, "  --base-branch string             base branch for ready, dispatch, and review (default worker.base_branch or \"main\")")
+		fmt.Fprintln(w, "  --pre-prod-branch string         pre-prod branch for clean unattended integrations (default environment.pre_prod_branch or \"pre-prod\")")
 		fmt.Fprintln(w, "  --run-id string                  shared run id for this pass (default generated once)")
 		fmt.Fprintln(w, "  --worker-provider string         optional worker provider override for this pass")
 		fmt.Fprintln(w, "  --verifier-provider string       optional verifier provider override for this pass")
@@ -697,6 +702,9 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.NewIssueWriter == nil {
 		deps.NewIssueWriter = defaults.NewIssueWriter
 	}
+	if deps.NewPreProdWriter == nil {
+		deps.NewPreProdWriter = defaults.NewPreProdWriter
+	}
 	if deps.ProcessAlive == nil {
 		deps.ProcessAlive = defaults.ProcessAlive
 	}
@@ -732,6 +740,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var baseBranch string
 	var baseBranchAlias string
+	var preProdBranch string
+	var preProdBranchAlias string
 	var runID string
 	var runIDAlias string
 	var workerProvider string
@@ -759,6 +769,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", "", "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&preProdBranch, "pre-prod-branch", "", "pre-prod branch for clean unattended integrations")
+	fs.StringVar(&preProdBranchAlias, "PreProdBranch", "", "pre-prod branch for clean unattended integrations")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.StringVar(&workerProvider, "worker-provider", "", "worker provider")
@@ -786,6 +798,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	baseBranchFlagSet := flagWasSet(fs, "base-branch") || flagWasSet(fs, "BaseBranch")
+	preProdBranchFlagSet := flagWasSet(fs, "pre-prod-branch") || flagWasSet(fs, "PreProdBranch")
 	workerModelFlagSet := flagWasSet(fs, "worker-model") || flagWasSet(fs, "WorkerModel")
 	workerEffortFlagSet := flagWasSet(fs, "worker-effort") || flagWasSet(fs, "WorkerEffort")
 	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
@@ -795,6 +808,9 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if baseBranchAlias != "" {
 		baseBranch = baseBranchAlias
+	}
+	if preProdBranchAlias != "" {
+		preProdBranch = preProdBranchAlias
 	}
 	if runIDAlias != "" {
 		runID = runIDAlias
@@ -859,6 +875,12 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if strings.TrimSpace(baseBranch) == "" {
 		baseBranch = "main"
 	}
+	if !preProdBranchFlagSet && strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
+	}
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
 	if strings.TrimSpace(workerProvider) == "" {
 		workerProvider = strings.TrimSpace(cfg.Adapters.Worker)
 	}
@@ -893,6 +915,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		IssueWriter:      deps.NewIssueWriter(resolvedRepo),
 		RepoPath:         resolvedRepo,
 		BaseBranch:       baseBranch,
+		PreProdBranch:    preProdBranch,
 		RunID:            runID,
 		WorkerProvider:   workerProvider,
 		WorkerModel:      workerModel,
@@ -902,6 +925,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		VerifierEffort:   verifierEffort,
 		VerifierTimeout:  verifierTimeout,
 		ThrottleLimit:    throttleLimit,
+		RequiredChecks:   cfg.CI.Checks,
 		Thresholds:       cfg.Resilience.Worker,
 		Budget:           cfg.Guardrails.Budget,
 		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
@@ -912,6 +936,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ComputeReadySet:  deps.ComputeReadySet,
 		Dispatch:         deps.Dispatch,
 		Loopreview:       deps.Loopreview,
+		PreProdWriter:    deps.NewPreProdWriter(resolvedRepo),
 		StatePush:        deps.StatePush,
 	})
 	if err != nil {

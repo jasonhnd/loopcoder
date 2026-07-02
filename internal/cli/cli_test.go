@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1593,6 +1594,7 @@ func TestTickHelpDocumentsFlags(t *testing.T) {
 		"loopcoder tick",
 		"--repo",
 		"--base-branch",
+		"--pre-prod-branch",
 		"--run-id",
 		"--worker-provider",
 		"--verifier-provider",
@@ -1624,9 +1626,13 @@ worker:
   base_branch: develop
   model: config-worker-model
   reasoning_effort: config-worker-effort
+environment:
+  pre_prod_branch: staging
 verifier:
   model: config-verifier-model
   reasoning_effort: config-verifier-effort
+ci:
+  checks: [verify, go]
 `), 0o644); err != nil {
 		t.Fatalf("write delivery config: %v", err)
 	}
@@ -1650,8 +1656,11 @@ verifier:
 		},
 		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
 			called = true
-			if opts.RepoPath != repo || opts.BaseBranch != "develop" || opts.RunID != "run-test-wave" {
+			if opts.RepoPath != repo || opts.BaseBranch != "develop" || opts.PreProdBranch != "staging" || opts.RunID != "run-test-wave" {
 				t.Fatalf("tick opts repo/base/run = %#v", opts)
+			}
+			if !reflect.DeepEqual(opts.RequiredChecks, []string{"verify", "go"}) {
+				t.Fatalf("tick required checks = %#v", opts.RequiredChecks)
 			}
 			if opts.WorkerProvider != "codex" || opts.VerifierProvider != "claude" {
 				t.Fatalf("tick opts providers = %#v", opts)
@@ -1669,15 +1678,16 @@ verifier:
 				t.Fatalf("tick opts clock = %s", got)
 			}
 			return orchestration.TickReport{
-				Version:    orchestration.TickReportVersion,
-				Repo:       "owner/repo",
-				RepoPath:   repo,
-				BaseBranch: opts.BaseBranch,
-				RunID:      opts.RunID,
-				Status:     orchestration.TickStatusSucceeded,
-				StopReason: orchestration.TickStopCompleted,
-				StartedAt:  "2026-07-02T12:00:00Z",
-				FinishedAt: "2026-07-02T12:00:00Z",
+				Version:       orchestration.TickReportVersion,
+				Repo:          "owner/repo",
+				RepoPath:      repo,
+				BaseBranch:    opts.BaseBranch,
+				PreProdBranch: opts.PreProdBranch,
+				RunID:         opts.RunID,
+				Status:        orchestration.TickStatusSucceeded,
+				StopReason:    orchestration.TickStopCompleted,
+				StartedAt:     "2026-07-02T12:00:00Z",
+				FinishedAt:    "2026-07-02T12:00:00Z",
 				Compile: compiler.Report{
 					Repo: "owner/repo",
 					Summary: compiler.Summary{
