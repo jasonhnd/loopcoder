@@ -12,6 +12,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -451,6 +452,76 @@ func TestTickGuardrailBlockedStopsBeforeReview(t *testing.T) {
 	}
 }
 
+func TestTickDispatchFailureRecoveredPRContinuesThroughPreProd(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 22, "https://github.com/owner/repo/pull/220")
+	reader := cleanRiskReader(222, "README.md")
+	reader.views = map[int]gh.Issue{22: {Number: 22, Title: "Issue 22", Body: "issue body"}}
+	opts.Reader = reader
+	opts.DispatchWave = func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
+		return tickWaveReport(DispatchWaveIssueResult{
+			Issue:               22,
+			Status:              DispatchWaveStatusFailed,
+			Branch:              "loop/issue-22",
+			Error:               "worker failed",
+			RecoveryContextPath: ".loopcoder/runs/run-test-wave/recovery/job-22-context.md",
+		}), nil
+	}
+	recoverCalled := false
+	opts.Recover = func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
+		recoverCalled = true
+		if opts.IssueNumber != 22 || opts.SkipAdoptPR || !strings.Contains(opts.FailureContext, "worker failed") {
+			t.Fatalf("recover opts = %#v", opts)
+		}
+		review := tickLoopreview(loopreview.VerdictPass, "recovered review passed")
+		return recovery.Result{
+			Action: recovery.ActionSucceeded,
+			DispatchResult: &recovery.DispatchResult{
+				OK:     true,
+				Issue:  22,
+				Branch: "loop/issue-22-retry-2",
+				RunID:  opts.RunID,
+				PR:     "https://github.com/owner/repo/pull/222",
+				Status: "succeeded",
+			},
+			ReviewResult: &review,
+			RecoveryAttempts: []recovery.AttemptRecord{{
+				Version:  recovery.AttemptRecordVersion,
+				Issue:    22,
+				RunID:    opts.RunID,
+				Attempt:  2,
+				Strategy: recovery.AttemptStrategySameConfig,
+				Status:   "succeeded",
+				PR:       "https://github.com/owner/repo/pull/222",
+			}},
+		}, nil
+	}
+	mergedPR := 0
+	opts.PreProdWriter = tickPreProdWriterFunc(func(_ context.Context, prNumber int, branch string) (gh.PreProdMergeResult, error) {
+		mergedPR = prNumber
+		return gh.PreProdMergeResult{PRNumber: prNumber, Branch: branch, Head: "loop/issue-22-retry-2", SHA: "abc123"}, nil
+	})
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusSucceeded || report.StopReason != TickStopCompleted {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if !recoverCalled || mergedPR != 222 {
+		t.Fatalf("recoverCalled=%v mergedPR=%d", recoverCalled, mergedPR)
+	}
+	if len(report.Recoveries) != 1 || report.Recoveries[0].Action != string(recovery.ActionSucceeded) {
+		t.Fatalf("recoveries = %#v", report.Recoveries)
+	}
+	if len(report.Reviews) != 1 || report.Reviews[0].Verdict != loopreview.VerdictPass || report.Reviews[0].PRNumber != 222 {
+		t.Fatalf("reviews = %#v", report.Reviews)
+	}
+	if len(report.NeedsHuman) != 0 || len(report.Failures) != 0 {
+		t.Fatalf("needs-human=%#v failures=%#v", report.NeedsHuman, report.Failures)
+	}
+}
+
 func TestTickNeedsHumanPRIsReported(t *testing.T) {
 	repo := t.TempDir()
 
@@ -498,6 +569,7 @@ func TestTickNeedsHumanPRIsReported(t *testing.T) {
 func TestTickReviewFailNeedsHumanAndDoesNotMerge(t *testing.T) {
 	opts := reviewReadyTickOptions(t.TempDir(), 12, "https://github.com/owner/repo/pull/120")
 	mergeCalled := false
+	recoverCalled := false
 	opts.PreProdWriter = tickPreProdWriterFunc(func(context.Context, int, string) (gh.PreProdMergeResult, error) {
 		mergeCalled = true
 		return gh.PreProdMergeResult{}, nil
@@ -508,18 +580,34 @@ func TestTickReviewFailNeedsHumanAndDoesNotMerge(t *testing.T) {
 		}
 		return tickLoopreview(loopreview.VerdictFail, "regression found"), nil
 	}
+	opts.Recover = func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
+		recoverCalled = true
+		if opts.IssueNumber != 12 || !opts.SkipAdoptPR || !strings.Contains(opts.FailureContext, "regression found") {
+			t.Fatalf("recover opts = %#v", opts)
+		}
+		return recovery.Result{
+			Action: recovery.ActionBlocked,
+			Report: "BLOCKED: retry limit reached\n",
+		}, nil
+	}
 
 	report, err := Tick(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("Tick returned error: %v", err)
 	}
-	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopReviewNeedsHuman {
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopRecoverNeedsHuman {
 		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if !recoverCalled {
+		t.Fatal("recover was not called after loopreview fail")
 	}
 	if len(report.Reviews) != 1 || report.Reviews[0].Verdict != loopreview.VerdictFail {
 		t.Fatalf("reviews = %#v", report.Reviews)
 	}
-	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "loopreview" || report.NeedsHuman[0].Issue != 12 {
+	if len(report.Recoveries) != 1 || report.Recoveries[0].Action != string(recovery.ActionBlocked) {
+		t.Fatalf("recoveries = %#v", report.Recoveries)
+	}
+	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "recover" || report.NeedsHuman[0].Issue != 12 {
 		t.Fatalf("needs-human = %#v", report.NeedsHuman)
 	}
 	if len(report.Failures) != 0 {
@@ -530,6 +618,76 @@ func TestTickReviewFailNeedsHumanAndDoesNotMerge(t *testing.T) {
 	}
 	if report.Summary.ReviewFailCount != 1 || report.Summary.NeedsHumanCount != 1 || report.Summary.FailureCount != 0 {
 		t.Fatalf("summary = %#v", report.Summary)
+	}
+}
+
+func TestTickReviewFailRecoveredPRContinuesThroughPreProd(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 12, "https://github.com/owner/repo/pull/120")
+	opts.Reader = cleanRiskReader(121, "README.md")
+	loopreviewCalls := 0
+	opts.Loopreview = func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+		loopreviewCalls++
+		if opts.PRNumber != 120 {
+			t.Fatalf("initial loopreview pr = %d, want 120", opts.PRNumber)
+		}
+		return tickLoopreview(loopreview.VerdictFail, "regression found"), nil
+	}
+	recoverCalled := false
+	opts.Recover = func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
+		recoverCalled = true
+		if opts.IssueNumber != 12 || !opts.SkipAdoptPR || !strings.Contains(opts.FailureContext, "regression found") {
+			t.Fatalf("recover opts = %#v", opts)
+		}
+		review := tickLoopreview(loopreview.VerdictPass, "recovered review passed")
+		return recovery.Result{
+			Action: recovery.ActionSucceeded,
+			DispatchResult: &recovery.DispatchResult{
+				OK:     true,
+				Issue:  12,
+				Branch: "loop/issue-12-retry-2",
+				RunID:  opts.RunID,
+				PR:     "https://github.com/owner/repo/pull/121",
+				Status: "succeeded",
+			},
+			ReviewResult: &review,
+			RecoveryAttempts: []recovery.AttemptRecord{{
+				Version:  recovery.AttemptRecordVersion,
+				Issue:    12,
+				RunID:    opts.RunID,
+				Attempt:  2,
+				Strategy: recovery.AttemptStrategySameConfig,
+				Status:   "succeeded",
+				PR:       "https://github.com/owner/repo/pull/121",
+			}},
+		}, nil
+	}
+	mergedPR := 0
+	opts.PreProdWriter = tickPreProdWriterFunc(func(_ context.Context, prNumber int, branch string) (gh.PreProdMergeResult, error) {
+		mergedPR = prNumber
+		return gh.PreProdMergeResult{PRNumber: prNumber, Branch: branch, Head: "loop/issue-12-retry-2", SHA: "abc123"}, nil
+	})
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusSucceeded || report.StopReason != TickStopCompleted {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if !recoverCalled || loopreviewCalls != 1 {
+		t.Fatalf("recoverCalled=%v loopreviewCalls=%d", recoverCalled, loopreviewCalls)
+	}
+	if mergedPR != 121 {
+		t.Fatalf("merged PR = %d, want 121", mergedPR)
+	}
+	if len(report.Recoveries) != 1 || report.Recoveries[0].Action != string(recovery.ActionSucceeded) {
+		t.Fatalf("recoveries = %#v", report.Recoveries)
+	}
+	if len(report.Reviews) != 2 || report.Reviews[0].Verdict != loopreview.VerdictFail || report.Reviews[1].Verdict != loopreview.VerdictPass || report.Reviews[1].PRNumber != 121 {
+		t.Fatalf("reviews = %#v", report.Reviews)
+	}
+	if len(report.NeedsHuman) != 0 || len(report.Failures) != 0 {
+		t.Fatalf("needs-human=%#v failures=%#v", report.NeedsHuman, report.Failures)
 	}
 }
 

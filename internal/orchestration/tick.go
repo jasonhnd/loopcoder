@@ -19,6 +19,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -43,6 +44,7 @@ const (
 	TickStopDispatchFailed            = "dispatch-failed"
 	TickStopReviewFailed              = "review-failed"
 	TickStopReviewNeedsHuman          = "review-needs-human"
+	TickStopRecoverNeedsHuman         = "recover-needs-human"
 	TickStopRiskGateNeedsHuman        = "risk-gate-needs-human"
 	TickStopPreProdNeedsHuman         = "pre-prod-needs-human"
 	TickStopStatePushFailed           = "state-push-failed"
@@ -59,6 +61,7 @@ const (
 type CompileFunc func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 type DispatchWaveFunc func(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveReport, error)
 type LoopreviewFunc func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+type RecoverFunc func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 type StatePushFunc func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 
 type TickOptions struct {
@@ -91,6 +94,7 @@ type TickOptions struct {
 	DispatchWave    DispatchWaveFunc
 	Dispatch        WorkerDispatchFunc
 	Loopreview      LoopreviewFunc
+	Recover         RecoverFunc
 	RiskGate        RiskGateFunc
 	PreProdWriter   PreProdWriter
 	StatePush       StatePushFunc
@@ -111,6 +115,7 @@ type TickReport struct {
 	Compile          compiler.Report           `json:"compile"`
 	ReadySet         report.ReadySetReport     `json:"ready_set"`
 	DispatchWave     *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
+	Recoveries       []TickRecoveryResult      `json:"recoveries,omitempty"`
 	Reviews          []TickReviewResult        `json:"reviews"`
 	RiskGates        []TickRiskGateResult      `json:"risk_gates"`
 	PreProdMerges    []TickPreProdMergeResult  `json:"pre_prod_merges"`
@@ -134,6 +139,14 @@ type TickReviewResult struct {
 	Findings           []loopreview.Finding           `json:"findings"`
 	Error              string                         `json:"error,omitempty"`
 	Attestation        *attestation.AttestationRecord `json:"attestation,omitempty"`
+}
+
+type TickRecoveryResult struct {
+	Issue    int                      `json:"issue"`
+	PR       string                   `json:"pr,omitempty"`
+	Action   string                   `json:"action"`
+	Detail   string                   `json:"detail,omitempty"`
+	Attempts []recovery.AttemptRecord `json:"attempts,omitempty"`
 }
 
 type TickIssue struct {
@@ -390,12 +403,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 				Detail: result.Error,
 			})
 		case DispatchWaveStatusFailed:
-			tickReport.Failures = append(tickReport.Failures, TickIssue{
-				Step:   "dispatch-wave",
-				Issue:  result.Issue,
-				PR:     result.PR,
-				Detail: result.Error,
-			})
+			runTickRecoverDispatchFailure(ctx, opts, &tickReport, result)
 		}
 	}
 	if len(tickReport.NeedsHuman) > 0 {
@@ -421,6 +429,12 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		pushTickState(ctx, opts, &tickReport)
 		if len(tickReport.Failures) > 0 {
 			return finish(TickStatusFailed, TickStopStatePushFailed)
+		}
+		if len(tickReport.NeedsHuman) > 0 {
+			return finish(TickStatusNeedsHuman, tickNeedsHumanStopReason(tickReport.NeedsHuman))
+		}
+		if len(tickReport.Recoveries) > 0 || len(tickReport.Reviews) > 0 || len(tickReport.PreProdMerges) > 0 {
+			return finish(TickStatusSucceeded, TickStopCompleted)
 		}
 		return finish(TickStatusNoReadyWork, TickStopNoReviewablePRsDispatched)
 	}
@@ -477,12 +491,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		case loopreview.VerdictPass:
 			runTickRiskGateAndPreProdMerge(ctx, opts, &tickReport, item, prNumber)
 		case loopreview.VerdictFail:
-			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
-				Step:   "loopreview",
-				Issue:  item.Issue,
-				PR:     item.PR,
-				Detail: firstNonEmpty(result.Verdict.Evidence, "verifier returned fail"),
-			})
+			runTickRecoverReviewFailure(ctx, opts, &tickReport, item, result)
 		default:
 			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 				Step:   "loopreview",
@@ -533,6 +542,45 @@ func withTickDefaults(opts TickOptions) TickOptions {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
 		}
 	}
+	if opts.Recover == nil {
+		opts.Recover = func(ctx context.Context, recoverOpts recovery.Options) (recovery.Result, error) {
+			recoverDeps := recovery.DefaultDeps()
+			recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
+				result, err := opts.Dispatch(ctx, worker.Options{
+					RepoPath:        dispatchOpts.RepoPath,
+					IssueNumber:     dispatchOpts.IssueNumber,
+					IssueTitle:      dispatchOpts.IssueTitle,
+					IssueBody:       dispatchOpts.IssueBody,
+					BaseBranch:      dispatchOpts.BaseBranch,
+					Branch:          dispatchOpts.Branch,
+					RunID:           dispatchOpts.RunID,
+					Attempt:         dispatchOpts.Attempt,
+					RecoveryContext: dispatchOpts.RecoveryContext,
+					Provider:        dispatchOpts.Provider,
+					Model:           dispatchOpts.Model,
+					Effort:          dispatchOpts.Effort,
+					Stderr:          dispatchOpts.Stderr,
+				})
+				return recovery.DispatchResult{
+					OK:          result.OK,
+					Issue:       result.Issue,
+					Branch:      result.Branch,
+					RunID:       result.RunID,
+					PR:          result.PR,
+					Summary:     result.Summary,
+					AttemptPath: result.AttemptPath,
+					Status:      result.Status,
+					ExitCode:    result.ExitCode,
+					LogBytes:    result.LogBytes,
+					Attestation: result.Attestation,
+				}, err
+			}
+			recoverDeps.Review = func(ctx context.Context, reviewOpts loopreview.Options) (loopreview.Result, error) {
+				return opts.Loopreview(ctx, reviewOpts)
+			}
+			return recovery.Run(ctx, recoverOpts, recoverDeps)
+		}
+	}
 	if opts.RiskGate == nil {
 		opts.RiskGate = EvaluateRiskGate
 	}
@@ -548,6 +596,305 @@ func withTickDefaults(opts TickOptions) TickOptions {
 		opts.ThrottleLimit = 4
 	}
 	return opts
+}
+
+func runTickRecoverDispatchFailure(ctx context.Context, opts TickOptions, tickReport *TickReport, result DispatchWaveIssueResult) {
+	issue, err := opts.Reader.ViewIssue(ctx, result.Issue)
+	if err != nil {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  result.Issue,
+			PR:     result.PR,
+			Detail: fmt.Sprintf("read issue for dispatch recovery: %v", err),
+		})
+		return
+	}
+	runTickRecoverFailure(ctx, opts, tickReport, tickRecoveryRequest{
+		IssueNumber:    result.Issue,
+		IssueTitle:     firstNonEmpty(issue.Title, fmt.Sprintf("Issue #%d", result.Issue)),
+		IssueBody:      issue.Body,
+		TriggerStep:    "dispatch-wave",
+		PR:             result.PR,
+		Detail:         result.Error,
+		FailureContext: renderTickDispatchRecoveryContext(result),
+		SkipAdoptPR:    false,
+	})
+}
+
+func runTickRecoverReviewFailure(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, review loopreview.Result) {
+	issue, err := opts.Reader.ViewIssue(ctx, item.Issue)
+	if err != nil {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  item.Issue,
+			PR:     item.PR,
+			Detail: fmt.Sprintf("read issue for review recovery: %v", err),
+		})
+		return
+	}
+	runTickRecoverFailure(ctx, opts, tickReport, tickRecoveryRequest{
+		IssueNumber:    item.Issue,
+		IssueTitle:     firstNonEmpty(issue.Title, fmt.Sprintf("Issue #%d", item.Issue)),
+		IssueBody:      issue.Body,
+		TriggerStep:    "loopreview",
+		PR:             item.PR,
+		Detail:         firstNonEmpty(review.Verdict.Evidence, "verifier returned fail"),
+		FailureContext: renderTickReviewRecoveryContext(item, review),
+		SkipAdoptPR:    true,
+	})
+}
+
+type tickRecoveryRequest struct {
+	IssueNumber    int
+	IssueTitle     string
+	IssueBody      string
+	TriggerStep    string
+	PR             string
+	Detail         string
+	FailureContext string
+	SkipAdoptPR    bool
+}
+
+func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *TickReport, request tickRecoveryRequest) {
+	result, err := opts.Recover(ctx, recovery.Options{
+		RepoPath:         opts.RepoPath,
+		IssueNumber:      request.IssueNumber,
+		IssueTitle:       request.IssueTitle,
+		IssueBody:        request.IssueBody,
+		RunID:            opts.RunID,
+		BaseBranch:       opts.BaseBranch,
+		MaxAttempts:      opts.Thresholds.MaxAttempts,
+		BackoffSeconds:   opts.Thresholds.RetryBackoffSeconds,
+		Provider:         opts.WorkerProvider,
+		Model:            opts.WorkerModel,
+		Effort:           opts.WorkerEffort,
+		FailureContext:   request.FailureContext,
+		SkipAdoptPR:      request.SkipAdoptPR,
+		VerifierProvider: opts.VerifierProvider,
+		VerifierModel:    opts.VerifierModel,
+		VerifierEffort:   opts.VerifierEffort,
+		VerifierTimeout:  opts.VerifierTimeout,
+		Budget:           opts.Budget,
+		CircuitBreaker:   opts.CircuitBreaker,
+		Now:              opts.Clock(),
+		Stderr:           opts.Stderr,
+	})
+	recoveryReport := TickRecoveryResult{
+		Issue:    request.IssueNumber,
+		PR:       request.PR,
+		Action:   string(result.Action),
+		Detail:   firstNonEmpty(request.Detail, request.TriggerStep),
+		Attempts: append([]recovery.AttemptRecord(nil), result.RecoveryAttempts...),
+	}
+	if result.DispatchResult != nil {
+		recoveryReport.PR = firstNonEmpty(result.DispatchResult.PR, recoveryReport.PR)
+	}
+	if result.AdoptedPR != nil {
+		recoveryReport.PR = firstNonEmpty(result.AdoptedPR.URL, fmt.Sprintf("#%d", result.AdoptedPR.Number), recoveryReport.PR)
+	}
+	if err != nil {
+		recoveryReport.Detail = err.Error()
+	}
+	tickReport.Recoveries = append(tickReport.Recoveries, recoveryReport)
+	if err != nil {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  request.IssueNumber,
+			PR:     recoveryReport.PR,
+			Detail: err.Error(),
+		})
+		return
+	}
+
+	switch result.Action {
+	case recovery.ActionSucceeded:
+		runTickRecoveredPR(ctx, opts, tickReport, request.IssueNumber, result.DispatchResult, result.ReviewResult)
+	case recovery.ActionAdopt:
+		runTickAdoptedPR(ctx, opts, tickReport, request.IssueNumber, result.AdoptedPR)
+	case recovery.ActionRetry:
+		runTickRecoveredPR(ctx, opts, tickReport, request.IssueNumber, result.DispatchResult, result.ReviewResult)
+	default:
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  request.IssueNumber,
+			PR:     recoveryReport.PR,
+			Detail: firstNonEmpty(recoveryBlockedDetail(result.Report), request.Detail, "recovery exhausted"),
+		})
+	}
+}
+
+func runTickRecoveredPR(ctx context.Context, opts TickOptions, tickReport *TickReport, issueNumber int, dispatchResult *recovery.DispatchResult, reviewResult *loopreview.Result) {
+	if dispatchResult == nil || strings.TrimSpace(dispatchResult.PR) == "" {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			Detail: "recovery did not produce a reviewable PR",
+		})
+		return
+	}
+	prNumber, ok := parseTickPRNumber(dispatchResult.PR)
+	if !ok {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			PR:     dispatchResult.PR,
+			Detail: "could not parse recovered pull request number",
+		})
+		return
+	}
+	if reviewResult == nil {
+		result, err := opts.Loopreview(ctx, loopreview.Options{
+			RepoPath:   opts.RepoPath,
+			PRNumber:   prNumber,
+			Provider:   opts.VerifierProvider,
+			Model:      opts.VerifierModel,
+			Effort:     opts.VerifierEffort,
+			BaseBranch: opts.BaseBranch,
+			Timeout:    opts.VerifierTimeout,
+			Stderr:     opts.Stderr,
+		})
+		if err != nil {
+			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+				Step:   "recover",
+				Issue:  issueNumber,
+				PR:     dispatchResult.PR,
+				Detail: err.Error(),
+			})
+			return
+		}
+		reviewResult = &result
+	}
+	review := tickReviewResultFromLoopreview(issueNumber, dispatchResult.PR, prNumber, *reviewResult)
+	tickReport.Reviews = append(tickReport.Reviews, review)
+	if review.Verdict != loopreview.VerdictPass {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			PR:     dispatchResult.PR,
+			Detail: firstNonEmpty(review.Evidence, review.Error, "recovered PR did not pass loopreview"),
+		})
+		return
+	}
+	runTickRiskGateAndPreProdMerge(ctx, opts, tickReport, tickReviewCandidate{Issue: issueNumber, PR: dispatchResult.PR}, prNumber)
+}
+
+func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickReport, issueNumber int, adopted *recovery.AdoptedPR) {
+	if adopted == nil || adopted.Number <= 0 {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			Detail: "recovery adopted a PR without a PR number",
+		})
+		return
+	}
+	pr := firstNonEmpty(adopted.URL, fmt.Sprintf("#%d", adopted.Number))
+	result, err := opts.Loopreview(ctx, loopreview.Options{
+		RepoPath:   opts.RepoPath,
+		PRNumber:   adopted.Number,
+		Provider:   opts.VerifierProvider,
+		Model:      opts.VerifierModel,
+		Effort:     opts.VerifierEffort,
+		BaseBranch: opts.BaseBranch,
+		Timeout:    opts.VerifierTimeout,
+		Stderr:     opts.Stderr,
+	})
+	if err != nil {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			PR:     pr,
+			Detail: err.Error(),
+		})
+		return
+	}
+	review := tickReviewResultFromLoopreview(issueNumber, pr, adopted.Number, result)
+	tickReport.Reviews = append(tickReport.Reviews, review)
+	if review.Verdict != loopreview.VerdictPass {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+			Step:   "recover",
+			Issue:  issueNumber,
+			PR:     pr,
+			Detail: firstNonEmpty(review.Evidence, review.Error, "adopted PR did not pass loopreview"),
+		})
+		return
+	}
+	runTickRiskGateAndPreProdMerge(ctx, opts, tickReport, tickReviewCandidate{Issue: issueNumber, PR: pr}, adopted.Number)
+}
+
+func tickReviewResultFromLoopreview(issueNumber int, pr string, prNumber int, result loopreview.Result) TickReviewResult {
+	return TickReviewResult{
+		Issue:           issueNumber,
+		PR:              pr,
+		PRNumber:        prNumber,
+		Verdict:         result.Verdict.Verdict,
+		SpecConformance: result.Verdict.SpecConformance,
+		Evidence:        result.Verdict.Evidence,
+		Findings:        append([]loopreview.Finding(nil), result.Verdict.Findings...),
+		Attestation:     result.Verdict.Attestation,
+	}
+}
+
+func renderTickDispatchRecoveryContext(result DispatchWaveIssueResult) string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "# Recovery context for dispatch failure on issue #%d\n\n", result.Issue)
+	if strings.TrimSpace(result.PR) != "" {
+		fmt.Fprintf(&out, "- PR: %s\n", result.PR)
+	}
+	if strings.TrimSpace(result.Branch) != "" {
+		fmt.Fprintf(&out, "- Branch: %s\n", result.Branch)
+	}
+	if strings.TrimSpace(result.AttemptPath) != "" {
+		fmt.Fprintf(&out, "- Attempt path: %s\n", result.AttemptPath)
+	}
+	if strings.TrimSpace(result.RecoveryContextPath) != "" {
+		fmt.Fprintf(&out, "- Recovery context path: %s\n", result.RecoveryContextPath)
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "## Dispatch failure")
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "```text")
+	fmt.Fprintln(&out, result.Error)
+	fmt.Fprintln(&out, "```")
+	return out.String()
+}
+
+func renderTickReviewRecoveryContext(item tickReviewCandidate, result loopreview.Result) string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "# Recovery context for loopreview failure on issue #%d\n\n", item.Issue)
+	if strings.TrimSpace(item.PR) != "" {
+		fmt.Fprintf(&out, "- PR: %s\n", item.PR)
+	}
+	fmt.Fprintf(&out, "- Verdict: %s\n", result.Verdict.Verdict)
+	if strings.TrimSpace(result.Verdict.SpecConformance) != "" {
+		fmt.Fprintf(&out, "- Spec conformance: %s\n", result.Verdict.SpecConformance)
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "## Verifier evidence")
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "```text")
+	fmt.Fprintln(&out, result.Verdict.Evidence)
+	fmt.Fprintln(&out, "```")
+	if len(result.Verdict.Findings) > 0 {
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "## Verifier findings")
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "```text")
+		for _, finding := range result.Verdict.Findings {
+			fmt.Fprintf(&out, "- %s %s: %s\n", finding.Severity, finding.File, finding.Note)
+		}
+		fmt.Fprintln(&out, "```")
+	}
+	return out.String()
+}
+
+func recoveryBlockedDetail(report string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(report, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "BLOCKED:") {
+			return line
+		}
+	}
+	return ""
 }
 
 func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, prNumber int) {
@@ -900,6 +1247,9 @@ func formatRiskRedLines(lines []RiskRedLine) string {
 
 func tickNeedsHumanStopReason(items []TickIssue) string {
 	for _, item := range items {
+		if item.Step == "recover" {
+			return TickStopRecoverNeedsHuman
+		}
 		if item.Step == "risk-gate" || item.Step == "pre-prod-merge" {
 			return TickStopRiskGateNeedsHuman
 		}
@@ -1018,6 +1368,37 @@ func RenderTickText(report TickReport) string {
 			renderTickConfiguredEvidence(&out, result.ConfiguredEvidence)
 			if strings.TrimSpace(result.Error) != "" {
 				fmt.Fprintf(&out, "  detail: %s\n", result.Error)
+			}
+		}
+	}
+
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Recoveries")
+	if len(report.Recoveries) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, recovered := range report.Recoveries {
+			fmt.Fprintf(&out, "- #%d %s\n", recovered.Issue, recovered.Action)
+			if strings.TrimSpace(recovered.PR) != "" {
+				fmt.Fprintf(&out, "  pr: %s\n", recovered.PR)
+			}
+			if strings.TrimSpace(recovered.Detail) != "" {
+				fmt.Fprintf(&out, "  detail: %s\n", recovered.Detail)
+			}
+			for _, attempt := range recovered.Attempts {
+				fmt.Fprintf(&out, "  attempt %d %s %s\n", attempt.Attempt, attempt.Strategy, attempt.Status)
+				if strings.TrimSpace(attempt.PR) != "" {
+					fmt.Fprintf(&out, "    pr: %s\n", attempt.PR)
+				}
+				if strings.TrimSpace(attempt.Branch) != "" {
+					fmt.Fprintf(&out, "    branch: %s\n", attempt.Branch)
+				}
+				if strings.TrimSpace(attempt.Effort) != "" {
+					fmt.Fprintf(&out, "    effort: %s\n", attempt.Effort)
+				}
+				if strings.TrimSpace(attempt.Error) != "" {
+					fmt.Fprintf(&out, "    error: %s\n", attempt.Error)
+				}
 			}
 		}
 	}
