@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -120,6 +122,77 @@ func TestTickHappyPass(t *testing.T) {
 	}
 	if report.StatePush == nil || !report.StatePush.Pushed {
 		t.Fatalf("state push = %#v, want pushed", report.StatePush)
+	}
+}
+
+func TestTickConfiguredEvidenceSurfacesInJSONAndText(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 31, "https://github.com/owner/repo/pull/310")
+	opts.ConfiguredEvidence = []config.EvidenceArtifact{
+		{ProjectType: "website", PreviewURL: "https://preview.example.com/pr-310"},
+		{ProjectType: "cli", ExampleOutput: "$ loopcoder --version\nversion=dev"},
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	wantEvidence := opts.ConfiguredEvidence
+	if !reflect.DeepEqual(report.DispatchWave.Results[0].ConfiguredEvidence, wantEvidence) {
+		t.Fatalf("dispatch evidence = %#v, want %#v", report.DispatchWave.Results[0].ConfiguredEvidence, wantEvidence)
+	}
+	if !reflect.DeepEqual(report.Reviews[0].ConfiguredEvidence, wantEvidence) {
+		t.Fatalf("review evidence = %#v, want %#v", report.Reviews[0].ConfiguredEvidence, wantEvidence)
+	}
+	if !reflect.DeepEqual(report.PreProdMerges[0].ConfiguredEvidence, wantEvidence) {
+		t.Fatalf("pre-prod merge evidence = %#v, want %#v", report.PreProdMerges[0].ConfiguredEvidence, wantEvidence)
+	}
+
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("tick JSON is invalid:\n%s", string(data))
+	}
+	for _, want := range []string{
+		`"configured_evidence"`,
+		`"project_type": "website"`,
+		`"preview_url": "https://preview.example.com/pr-310"`,
+		`"example_output": "$ loopcoder --version\nversion=dev"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing %q:\n%s", want, string(data))
+		}
+	}
+
+	text := RenderTickText(report)
+	for _, want := range []string{
+		"configured_evidence: website preview_url=https://preview.example.com/pr-310",
+		`configured_evidence: cli example_output=$ loopcoder --version\nversion=dev`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("tick text missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestTickConfiguredEvidenceAbsentOmitsJSONAndText(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 32, "https://github.com/owner/repo/pull/320")
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	if strings.Contains(string(data), "configured_evidence") {
+		t.Fatalf("tick JSON unexpectedly contains configured_evidence:\n%s", string(data))
+	}
+	text := RenderTickText(report)
+	if strings.Contains(text, "configured_evidence") {
+		t.Fatalf("tick text unexpectedly contains configured_evidence:\n%s", text)
 	}
 }
 

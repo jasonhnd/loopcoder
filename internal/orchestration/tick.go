@@ -72,6 +72,7 @@ type TickOptions struct {
 	VerifierTimeout        time.Duration
 	PreProdBranch          string
 	RequiredChecks         []string
+	ConfiguredEvidence     []config.EvidenceArtifact
 	ThrottleLimit          int
 	Thresholds             config.ResilienceWorker
 	Budget                 config.GuardrailBudget
@@ -118,72 +119,78 @@ type TickReport struct {
 }
 
 type TickReviewResult struct {
-	Issue           int                            `json:"issue,omitempty"`
-	PR              string                         `json:"pr,omitempty"`
-	PRNumber        int                            `json:"pr_number,omitempty"`
-	Verdict         string                         `json:"verdict"`
-	SpecConformance string                         `json:"spec_conformance,omitempty"`
-	Evidence        string                         `json:"evidence,omitempty"`
-	Findings        []loopreview.Finding           `json:"findings"`
-	Error           string                         `json:"error,omitempty"`
-	Attestation     *attestation.AttestationRecord `json:"attestation,omitempty"`
+	Issue              int                            `json:"issue,omitempty"`
+	PR                 string                         `json:"pr,omitempty"`
+	PRNumber           int                            `json:"pr_number,omitempty"`
+	Verdict            string                         `json:"verdict"`
+	SpecConformance    string                         `json:"spec_conformance,omitempty"`
+	Evidence           string                         `json:"evidence,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact      `json:"configured_evidence,omitempty"`
+	Findings           []loopreview.Finding           `json:"findings"`
+	Error              string                         `json:"error,omitempty"`
+	Attestation        *attestation.AttestationRecord `json:"attestation,omitempty"`
 }
 
 type TickIssue struct {
-	Step   string `json:"step"`
-	Issue  int    `json:"issue,omitempty"`
-	PR     string `json:"pr,omitempty"`
-	Detail string `json:"detail"`
+	Step               string                    `json:"step"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	Detail             string                    `json:"detail"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
 type TickRiskGateResult struct {
-	Issue          int           `json:"issue,omitempty"`
-	PR             string        `json:"pr,omitempty"`
-	PRNumber       int           `json:"pr_number,omitempty"`
-	Status         string        `json:"status"`
-	RequiredChecks []string      `json:"required_checks"`
-	ChangedFiles   []string      `json:"changed_files"`
-	Checks         []gh.Check    `json:"checks"`
-	RedLines       []RiskRedLine `json:"red_lines"`
-	Error          string        `json:"error,omitempty"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	PRNumber           int                       `json:"pr_number,omitempty"`
+	Status             string                    `json:"status"`
+	RequiredChecks     []string                  `json:"required_checks"`
+	ChangedFiles       []string                  `json:"changed_files"`
+	Checks             []gh.Check                `json:"checks"`
+	RedLines           []RiskRedLine             `json:"red_lines"`
+	Error              string                    `json:"error,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
 type TickPreProdMergeResult struct {
-	Issue    int    `json:"issue,omitempty"`
-	PR       string `json:"pr,omitempty"`
-	PRNumber int    `json:"pr_number,omitempty"`
-	Branch   string `json:"branch"`
-	Head     string `json:"head,omitempty"`
-	SHA      string `json:"sha,omitempty"`
-	URL      string `json:"url,omitempty"`
-	Status   string `json:"status"`
-	Error    string `json:"error,omitempty"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	PRNumber           int                       `json:"pr_number,omitempty"`
+	Branch             string                    `json:"branch"`
+	Head               string                    `json:"head,omitempty"`
+	SHA                string                    `json:"sha,omitempty"`
+	URL                string                    `json:"url,omitempty"`
+	Status             string                    `json:"status"`
+	Error              string                    `json:"error,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
 type TickPreProdHealthResult struct {
-	Issue          int        `json:"issue,omitempty"`
-	PR             string     `json:"pr,omitempty"`
-	PRNumber       int        `json:"pr_number,omitempty"`
-	Branch         string     `json:"branch"`
-	HeadSHA        string     `json:"head_sha,omitempty"`
-	MergeSHA       string     `json:"merge_sha,omitempty"`
-	Status         string     `json:"status"`
-	RequiredChecks []string   `json:"required_checks"`
-	Checks         []gh.Check `json:"checks"`
-	Problems       []string   `json:"problems"`
-	Error          string     `json:"error,omitempty"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	PRNumber           int                       `json:"pr_number,omitempty"`
+	Branch             string                    `json:"branch"`
+	HeadSHA            string                    `json:"head_sha,omitempty"`
+	MergeSHA           string                    `json:"merge_sha,omitempty"`
+	Status             string                    `json:"status"`
+	RequiredChecks     []string                  `json:"required_checks"`
+	Checks             []gh.Check                `json:"checks"`
+	Problems           []string                  `json:"problems"`
+	Error              string                    `json:"error,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
 type TickPreProdRevertResult struct {
-	Issue       int    `json:"issue,omitempty"`
-	PR          string `json:"pr,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	Branch      string `json:"branch"`
-	RevertedSHA string `json:"reverted_sha,omitempty"`
-	SHA         string `json:"sha,omitempty"`
-	URL         string `json:"url,omitempty"`
-	Status      string `json:"status"`
-	Error       string `json:"error,omitempty"`
+	Issue              int                       `json:"issue,omitempty"`
+	PR                 string                    `json:"pr,omitempty"`
+	PRNumber           int                       `json:"pr_number,omitempty"`
+	Branch             string                    `json:"branch"`
+	RevertedSHA        string                    `json:"reverted_sha,omitempty"`
+	SHA                string                    `json:"sha,omitempty"`
+	URL                string                    `json:"url,omitempty"`
+	Status             string                    `json:"status"`
+	Error              string                    `json:"error,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
 
 type TickStatePush struct {
@@ -256,6 +263,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		tickReport.Status = status
 		tickReport.StopReason = stopReason
 		tickReport.FinishedAt = state.FormatTimestamp(finished)
+		attachTickConfiguredEvidence(&tickReport, opts.ConfiguredEvidence)
 		tickReport.Summary = summarizeTick(tickReport)
 		return normalizeTickReport(tickReport), nil
 	}
@@ -953,6 +961,7 @@ func RenderTickText(report TickReport) string {
 			if strings.TrimSpace(result.Branch) != "" {
 				fmt.Fprintf(&out, "  branch: %s\n", result.Branch)
 			}
+			renderTickConfiguredEvidence(&out, result.ConfiguredEvidence)
 			if strings.TrimSpace(result.Error) != "" {
 				fmt.Fprintf(&out, "  detail: %s\n", result.Error)
 			}
@@ -976,6 +985,7 @@ func RenderTickText(report TickReport) string {
 			if strings.TrimSpace(review.Evidence) != "" {
 				fmt.Fprintf(&out, "  evidence: %s\n", review.Evidence)
 			}
+			renderTickConfiguredEvidence(&out, review.ConfiguredEvidence)
 			if strings.TrimSpace(review.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", review.Error)
 			}
@@ -1002,6 +1012,7 @@ func RenderTickText(report TickReport) string {
 			if len(gate.RedLines) > 0 {
 				fmt.Fprintf(&out, "  red_lines: %s\n", formatRiskRedLines(gate.RedLines))
 			}
+			renderTickConfiguredEvidence(&out, gate.ConfiguredEvidence)
 			if strings.TrimSpace(gate.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", gate.Error)
 			}
@@ -1028,6 +1039,7 @@ func RenderTickText(report TickReport) string {
 			if strings.TrimSpace(merged.URL) != "" {
 				fmt.Fprintf(&out, "  url: %s\n", merged.URL)
 			}
+			renderTickConfiguredEvidence(&out, merged.ConfiguredEvidence)
 			if strings.TrimSpace(merged.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", merged.Error)
 			}
@@ -1057,6 +1069,7 @@ func RenderTickText(report TickReport) string {
 			if len(health.Problems) > 0 {
 				fmt.Fprintf(&out, "  problems: %s\n", strings.Join(health.Problems, ", "))
 			}
+			renderTickConfiguredEvidence(&out, health.ConfiguredEvidence)
 			if strings.TrimSpace(health.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", health.Error)
 			}
@@ -1083,6 +1096,7 @@ func RenderTickText(report TickReport) string {
 			if strings.TrimSpace(reverted.URL) != "" {
 				fmt.Fprintf(&out, "  url: %s\n", reverted.URL)
 			}
+			renderTickConfiguredEvidence(&out, reverted.ConfiguredEvidence)
 			if strings.TrimSpace(reverted.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", reverted.Error)
 			}
@@ -1246,6 +1260,124 @@ func summarizeTick(report TickReport) TickSummary {
 	return summary
 }
 
+func attachTickConfiguredEvidence(report *TickReport, evidence []config.EvidenceArtifact) {
+	evidence = normalizeConfiguredEvidence(evidence)
+	if len(evidence) == 0 {
+		return
+	}
+	if report.DispatchWave != nil {
+		for i := range report.DispatchWave.Results {
+			result := &report.DispatchWave.Results[i]
+			if tickHasReportTarget(result.Issue, result.PR) {
+				result.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+			}
+		}
+	}
+	for i := range report.Reviews {
+		item := &report.Reviews[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.RiskGates {
+		item := &report.RiskGates[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.PreProdMerges {
+		item := &report.PreProdMerges[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.PreProdHealth {
+		item := &report.PreProdHealth[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.PreProdReverts {
+		item := &report.PreProdReverts[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.NeedsHuman {
+		item := &report.NeedsHuman[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+	for i := range report.Failures {
+		item := &report.Failures[i]
+		if tickHasReportTarget(item.Issue, item.PR) {
+			item.ConfiguredEvidence = copyConfiguredEvidence(evidence)
+		}
+	}
+}
+
+func normalizeConfiguredEvidence(evidence []config.EvidenceArtifact) []config.EvidenceArtifact {
+	out := make([]config.EvidenceArtifact, 0, len(evidence))
+	for _, item := range evidence {
+		item.ProjectType = strings.TrimSpace(item.ProjectType)
+		item.PreviewURL = strings.TrimSpace(item.PreviewURL)
+		item.ExampleOutput = strings.TrimSpace(item.ExampleOutput)
+		item.TestResults = strings.TrimSpace(item.TestResults)
+		item.PreviewBuild = strings.TrimSpace(item.PreviewBuild)
+		if item.ProjectType == "" || tickConfiguredEvidenceEmpty(item) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func tickConfiguredEvidenceEmpty(item config.EvidenceArtifact) bool {
+	return strings.TrimSpace(item.PreviewURL) == "" &&
+		strings.TrimSpace(item.ExampleOutput) == "" &&
+		strings.TrimSpace(item.TestResults) == "" &&
+		strings.TrimSpace(item.PreviewBuild) == ""
+}
+
+func copyConfiguredEvidence(evidence []config.EvidenceArtifact) []config.EvidenceArtifact {
+	return append([]config.EvidenceArtifact(nil), evidence...)
+}
+
+func tickHasReportTarget(issue int, pr string) bool {
+	return issue > 0 || strings.TrimSpace(pr) != ""
+}
+
+func renderTickConfiguredEvidence(out *bytes.Buffer, evidence []config.EvidenceArtifact) {
+	evidence = normalizeConfiguredEvidence(evidence)
+	for _, item := range evidence {
+		parts := make([]string, 0, 4)
+		if item.PreviewURL != "" {
+			parts = append(parts, "preview_url="+formatTickEvidenceValue(item.PreviewURL))
+		}
+		if item.ExampleOutput != "" {
+			parts = append(parts, "example_output="+formatTickEvidenceValue(item.ExampleOutput))
+		}
+		if item.TestResults != "" {
+			parts = append(parts, "test_results="+formatTickEvidenceValue(item.TestResults))
+		}
+		if item.PreviewBuild != "" {
+			parts = append(parts, "preview_build="+formatTickEvidenceValue(item.PreviewBuild))
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		fmt.Fprintf(out, "  configured_evidence: %s %s\n", item.ProjectType, strings.Join(parts, " "))
+	}
+}
+
+func formatTickEvidenceValue(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	return value
+}
+
 func renderTickIssueSection(out *bytes.Buffer, title string, issues []TickIssue) {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, title)
@@ -1262,6 +1394,7 @@ func renderTickIssueSection(out *bytes.Buffer, title string, issues []TickIssue)
 			target += " " + item.PR
 		}
 		fmt.Fprintf(out, "- %s: %s\n", target, item.Detail)
+		renderTickConfiguredEvidence(out, item.ConfiguredEvidence)
 	}
 }
 

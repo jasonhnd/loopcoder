@@ -42,6 +42,11 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		"verifier: claude",
 		"pre_prod_branch: pre-prod",
 		"checks: []",
+		"# evidence:",
+		"preview_url: https://preview.example.com",
+		"example_output: |",
+		"test_results: go test ./...",
+		"preview_build: dist/app-preview.zip",
 		"# model:",
 		"# reasoning_effort:",
 	} {

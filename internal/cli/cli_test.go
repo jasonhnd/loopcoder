@@ -15,6 +15,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -1695,6 +1696,13 @@ verifier:
   reasoning_effort: config-verifier-effort
 ci:
   checks: [verify, go]
+evidence:
+  website:
+    preview_url: https://preview.example.com
+  cli:
+    example_output: |
+      $ loopcoder --version
+      version=dev
 `), 0o644); err != nil {
 		t.Fatalf("write delivery config: %v", err)
 	}
@@ -1723,6 +1731,13 @@ ci:
 			}
 			if !reflect.DeepEqual(opts.RequiredChecks, []string{"verify", "go"}) {
 				t.Fatalf("tick required checks = %#v", opts.RequiredChecks)
+			}
+			wantEvidence := []config.EvidenceArtifact{
+				{ProjectType: "website", PreviewURL: "https://preview.example.com"},
+				{ProjectType: "cli", ExampleOutput: "$ loopcoder --version\nversion=dev"},
+			}
+			if !reflect.DeepEqual(opts.ConfiguredEvidence, wantEvidence) {
+				t.Fatalf("tick configured evidence = %#v, want %#v", opts.ConfiguredEvidence, wantEvidence)
 			}
 			if opts.WorkerProvider != "codex" || opts.VerifierProvider != "claude" {
 				t.Fatalf("tick opts providers = %#v", opts)
