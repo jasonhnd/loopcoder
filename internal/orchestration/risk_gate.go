@@ -260,6 +260,9 @@ func buildRedLines(required []string, checks []gh.Check, err error) []RiskRedLin
 func checkPassed(check gh.Check) bool {
 	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
 	state := strings.ToLower(strings.TrimSpace(check.State))
+	// gh exposes both bucket and state, and different check sources can leave
+	// either field empty or stale. Accept a passing value from either field for
+	// this local green predicate; checks with no passing signal still raise risk.
 	return bucket == "pass" || state == "success" || state == "passed"
 }
 
@@ -315,18 +318,11 @@ func isLoopcoderCorePath(file string) bool {
 		"AGENTS.md":     true,
 		"GEMINI.md":     true,
 		"SKILL.md":      true,
-		"internal/orchestration/dispatch_wave.go":      true,
-		"internal/orchestration/dispatch_wave_test.go": true,
-		"internal/orchestration/ready_set.go":          true,
-		"internal/orchestration/ready_set_test.go":     true,
-		"internal/orchestration/resume.go":             true,
-		"internal/orchestration/resume_test.go":        true,
-		"internal/orchestration/risk_gate.go":          true,
-		"internal/orchestration/risk_gate_test.go":     true,
-		"internal/orchestration/tick.go":               true,
-		"internal/orchestration/tick_test.go":          true,
 	}
 	if exact[file] {
+		return true
+	}
+	if isLoopcoderCoreOrchestrationPath(file) {
 		return true
 	}
 	prefixes := []string{
@@ -349,6 +345,10 @@ func isLoopcoderCorePath(file string) bool {
 		}
 	}
 	return false
+}
+
+func isLoopcoderCoreOrchestrationPath(file string) bool {
+	return path.Dir(file) == "internal/orchestration" && path.Ext(file) == ".go" && path.Base(file) != "doc.go"
 }
 
 func normalizeAdditionalRedLines(lines []RiskRedLine) []RiskRedLine {
