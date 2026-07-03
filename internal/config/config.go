@@ -343,7 +343,7 @@ func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowB
 	}
 	data, err := show(ctx, repoPath, baseBranch)
 	if err != nil {
-		if isBaseConfigAbsentError(err) {
+		if gitutil.IsPathAbsentOnRef(err, ".delivery.yml") {
 			return nil, false, nil
 		}
 		return nil, false, err
@@ -365,30 +365,6 @@ func normalizeBaseBranch(baseBranch string) string {
 		return "main"
 	}
 	return baseBranch
-}
-
-func isBaseConfigAbsentError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	text := strings.ToLower(err.Error())
-	if !strings.Contains(text, ".delivery.yml") {
-		return false
-	}
-	for _, signal := range []string{
-		"does not exist",
-		"exists on disk, but not in",
-		"did not match any file",
-		"not found in",
-	} {
-		if strings.Contains(text, signal) {
-			return true
-		}
-	}
-	return false
 }
 
 func warnBaseConfigCheckFailed(w io.Writer, baseBranch string, err error) {
