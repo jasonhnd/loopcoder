@@ -1736,6 +1736,9 @@ ci:
 			if opts.Clock == nil || opts.StatePush == nil {
 				t.Fatalf("promote opts missing clock or state push: %#v", opts)
 			}
+			if opts.ResolveAutoGate == nil {
+				t.Fatal("promote auto-gate resolver was not set")
+			}
 			return orchestration.PromoteReport{
 				Version:       orchestration.PromoteReportVersion,
 				RepoPath:      opts.RepoPath,
@@ -3159,7 +3162,15 @@ func (cliFakePromotionWriter) BranchHeadSHA(context.Context, string) (string, er
 }
 
 func (cliFakePromotionWriter) BranchChecks(context.Context, string) (gh.BranchChecksResult, error) {
-	return gh.BranchChecksResult{}, nil
+	return gh.BranchChecksResult{
+		Branch:  "pre-prod",
+		HeadSHA: "preprod-sha",
+		Checks:  []gh.Check{{Name: "verify", State: "success", Bucket: "pass"}},
+	}, nil
+}
+
+func (cliFakePromotionWriter) CompareBranches(context.Context, string, string) ([]string, string, error) {
+	return []string{"README.md"}, "diff --git a/README.md b/README.md\n", nil
 }
 
 func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, string) (gh.PreProdKickBackResult, error) {

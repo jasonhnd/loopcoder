@@ -39,6 +39,7 @@ const (
 type PromotionWriter interface {
 	BranchHeadSHA(ctx context.Context, branch string) (string, error)
 	BranchChecks(ctx context.Context, branch string) (gh.BranchChecksResult, error)
+	CompareBranches(ctx context.Context, base, head string) (files []string, diff string, err error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (gh.NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (gh.MainPromotionResult, error)
@@ -59,6 +60,7 @@ type PromoteOptions struct {
 	ParallelRun          *PromoteParallelRunConfig
 	ReconcileParallelRun PromoteParallelRunReconcileFunc
 	AutoGate             *AutoGateInputs
+	ResolveAutoGate      func(ctx context.Context) (*AutoGateInputs, error)
 	RequiredChecks       []string
 }
 
@@ -321,6 +323,13 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	}
 	if err := validatePromotionGate(opts.Gate); err != nil {
 		return failBeforeMain(err)
+	}
+	if opts.Gate == GateAuto && opts.AutoGate == nil && opts.ResolveAutoGate != nil {
+		autoGate, err := opts.ResolveAutoGate(ctx)
+		if err != nil {
+			return needsHumanBeforeMain("auto-gate", "auto-gate inputs unavailable: "+err.Error())
+		}
+		opts.AutoGate = autoGate
 	}
 	switch opts.Gate {
 	case GateHumanMerge:

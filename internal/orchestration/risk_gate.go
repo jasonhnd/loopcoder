@@ -312,6 +312,11 @@ func corePathRedLines(changedFiles []string) []RiskRedLine {
 	}}
 }
 
+func PromotionRedLinesClean(files []string, diff string) bool {
+	return len(destructiveRedLines(diff)) == 0 &&
+		len(corePathRedLines(normalizeChangedFiles(files))) == 0
+}
+
 func isLoopcoderCorePath(file string) bool {
 	file = normalizeRepoPath(file)
 	if file == "" {
