@@ -266,11 +266,16 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 		gate               string
 		checks             gh.BranchChecksResult
 		mainPriorSHA       string
+		revertErr          error
 		wantCalls          []string
 		wantRollback       bool
 		wantRollbackEvent  bool
+		wantRollbackLedger []string
+		wantRollbackError  string
 		wantNeedsHumanStep string
+		wantNeedsHumanText string
 		wantStatus         string
+		wantFailureCount   int
 	}{
 		{
 			name: "auto-green-no-rollback",
@@ -296,6 +301,25 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 			wantRollbackEvent:  true,
 			wantNeedsHumanStep: "production-rollback",
 			wantStatus:         PromoteStatusSucceeded,
+		},
+		{
+			name:      "auto-red-at-promoted-sha-rollback-error-needs-human",
+			gate:      GateAuto,
+			revertErr: errors.New("rollback command failed"),
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "failure", Bucket: "fail"}},
+			},
+			wantCalls:          []string{"head:main", "promote:pre-prod", "checks:main", "revert:main:main-sha:main-prior-sha", "sync:pre-prod"},
+			wantRollback:       true,
+			wantRollbackEvent:  true,
+			wantRollbackLedger: []string{`"outcome":"failed"`, `"merge_commit":"main-sha"`, `"prior_stable_commit":"main-prior-sha"`, `"error":"rollback command failed"`},
+			wantRollbackError:  "rollback command failed",
+			wantNeedsHumanStep: "production-rollback",
+			wantNeedsHumanText: "automatic rollback failed: rollback command failed",
+			wantStatus:         PromoteStatusFailed,
+			wantFailureCount:   1,
 		},
 		{
 			name:         "auto-red-with-empty-prior-stable-needs-human-no-rollback",
@@ -338,7 +362,7 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := t.TempDir()
 			runID := "run-test-promote-rollback-" + tt.name
-			writer := &recordingPromotionWriter{branchChecks: tt.checks}
+			writer := &recordingPromotionWriter{branchChecks: tt.checks, revertErr: tt.revertErr}
 			if tt.mainPriorSHA != "" || strings.Contains(tt.name, "empty-prior") {
 				writer.mainHeadSHASet = true
 				writer.mainHeadSHA = tt.mainPriorSHA
@@ -361,6 +385,9 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 			if report.Status != tt.wantStatus {
 				t.Fatalf("status = %s, want %s", report.Status, tt.wantStatus)
 			}
+			if report.Summary.FailureCount != tt.wantFailureCount {
+				t.Fatalf("failure count = %d, want %d; summary=%#v", report.Summary.FailureCount, tt.wantFailureCount, report.Summary)
+			}
 			if !reflect.DeepEqual(writer.calls, tt.wantCalls) {
 				t.Fatalf("calls = %#v, want %#v", writer.calls, tt.wantCalls)
 			}
@@ -368,13 +395,20 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 				t.Fatalf("rollback = %#v, want present=%t", report.Rollback, tt.wantRollback)
 			}
 			if tt.wantRollback {
-				if report.Rollback.MergeCommit != "main-sha" || report.Rollback.PriorStableCommit != "main-prior-sha" || report.Rollback.RevertSHA != "production-revert-sha" {
-					t.Fatalf("rollback = %#v, want merge/prior/revert SHAs", report.Rollback)
+				if report.Rollback.MergeCommit != "main-sha" || report.Rollback.PriorStableCommit != "main-prior-sha" {
+					t.Fatalf("rollback = %#v, want merge/prior SHAs", report.Rollback)
+				}
+				if tt.wantRollbackError != "" {
+					if report.Rollback.Status != PromoteStatusFailed || !strings.Contains(report.Rollback.Error, tt.wantRollbackError) {
+						t.Fatalf("rollback = %#v, want failed error containing %q", report.Rollback, tt.wantRollbackError)
+					}
+				} else if report.Rollback.RevertSHA != "production-revert-sha" {
+					t.Fatalf("rollback = %#v, want revert SHA", report.Rollback)
 				}
 			}
 			if tt.wantNeedsHumanStep != "" {
-				if !promoteNeedsHumanHasStep(report.NeedsHuman, tt.wantNeedsHumanStep) {
-					t.Fatalf("needs-human = %#v, want step %q", report.NeedsHuman, tt.wantNeedsHumanStep)
+				if !promoteNeedsHumanHasStepDetail(report.NeedsHuman, tt.wantNeedsHumanStep, tt.wantNeedsHumanText) {
+					t.Fatalf("needs-human = %#v, want step %q detail containing %q", report.NeedsHuman, tt.wantNeedsHumanStep, tt.wantNeedsHumanText)
 				}
 			} else if len(report.NeedsHuman) != 0 {
 				t.Fatalf("needs-human = %#v, want none", report.NeedsHuman)
@@ -385,7 +419,11 @@ func TestPromoteAutoProductionHealthRollback(t *testing.T) {
 				t.Fatalf("rollback event present = %t, want %t:\n%s", hasRollbackEvent, tt.wantRollbackEvent, events)
 			}
 			if tt.wantRollbackEvent {
-				for _, want := range []string{`"merge_commit":"main-sha"`, `"prior_stable_commit":"main-prior-sha"`, `"revert_sha":"production-revert-sha"`} {
+				wantRollbackLedger := tt.wantRollbackLedger
+				if len(wantRollbackLedger) == 0 {
+					wantRollbackLedger = []string{`"merge_commit":"main-sha"`, `"prior_stable_commit":"main-prior-sha"`, `"revert_sha":"production-revert-sha"`}
+				}
+				for _, want := range wantRollbackLedger {
 					if !strings.Contains(events, want) {
 						t.Fatalf("rollback ledger missing %q:\n%s", want, events)
 					}
@@ -1000,9 +1038,12 @@ func promoteTestParallelRunContract() equivalence.Contract {
 	}
 }
 
-func promoteNeedsHumanHasStep(items []PromoteNeedsHuman, step string) bool {
+func promoteNeedsHumanHasStepDetail(items []PromoteNeedsHuman, step, detail string) bool {
 	for _, item := range items {
-		if item.Step == step {
+		if item.Step != step {
+			continue
+		}
+		if detail == "" || strings.Contains(item.Detail, detail) {
 			return true
 		}
 	}
