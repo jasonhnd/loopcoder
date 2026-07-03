@@ -38,7 +38,7 @@ func TestPromoteWholeBatchPromotesPreProdToMainAndSyncs(t *testing.T) {
 	if report.Status != PromoteStatusSucceeded {
 		t.Fatalf("status = %s, want succeeded", report.Status)
 	}
-	if !reflect.DeepEqual(writer.calls, []string{"promote:pre-prod", "sync:pre-prod"}) {
+	if !reflect.DeepEqual(writer.calls, []string{"head:main", "promote:pre-prod", "sync:pre-prod"}) {
 		t.Fatalf("calls = %#v", writer.calls)
 	}
 	if report.Summary.PromotedCount != 1 || report.Summary.KickedBackCount != 0 || report.Summary.FailureCount != 0 {
@@ -51,7 +51,7 @@ func TestPromoteWholeBatchPromotesPreProdToMainAndSyncs(t *testing.T) {
 		t.Fatalf("ledger state = runID %q statePush %#v", report.RunID, report.StatePush)
 	}
 	event := readPromoteEvents(t, repo, runID)
-	for _, want := range []string{`"event":"promote.attempt"`, `"outcome":"promoted"`, `"sha":"main-sha"`} {
+	for _, want := range []string{`"event":"promote.attempt"`, `"outcome":"promoted"`, `"sha":"main-sha"`, `"merge_commit":"main-sha"`, `"prior_stable_commit":"main-prior-sha"`} {
 		if !strings.Contains(event, want) {
 			t.Fatalf("promote ledger missing %q:\n%s", want, event)
 		}
@@ -79,7 +79,7 @@ func TestPromoteKickBackRevertsItemsBeforePromotingRemainder(t *testing.T) {
 	if report.Status != PromoteStatusSucceeded {
 		t.Fatalf("status = %s, want succeeded", report.Status)
 	}
-	wantCalls := []string{"kick:#101:pre-prod", "route:101", "kick:merge-sha:pre-prod", "route:101", "promote:pre-prod", "sync:pre-prod"}
+	wantCalls := []string{"kick:#101:pre-prod", "route:101", "kick:merge-sha:pre-prod", "route:101", "head:main", "promote:pre-prod", "sync:pre-prod"}
 	if !reflect.DeepEqual(writer.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", writer.calls, wantCalls)
 	}
@@ -157,6 +157,12 @@ func TestPromoteAlreadyUpToDateIsLedgeredAsSkipped(t *testing.T) {
 	if !strings.Contains(event, `"outcome":"skipped-as-done"`) || !strings.Contains(event, `"already_up_to_date":true`) {
 		t.Fatalf("already-up-to-date ledger missing skipped outcome:\n%s", event)
 	}
+	if !strings.Contains(event, `"prior_stable_commit":"main-prior-sha"`) {
+		t.Fatalf("already-up-to-date ledger missing prior stable commit:\n%s", event)
+	}
+	if strings.Contains(event, `"merge_commit"`) {
+		t.Fatalf("already-up-to-date ledger should not record an empty merge commit:\n%s", event)
+	}
 }
 
 func TestPromoteDarkEpicSlicesDoNotBlockPromotion(t *testing.T) {
@@ -201,7 +207,7 @@ func TestPromoteDarkEpicSlicesDoNotBlockPromotion(t *testing.T) {
 	if report.Status != PromoteStatusSucceeded {
 		t.Fatalf("status = %s, want succeeded", report.Status)
 	}
-	if !reflect.DeepEqual(writer.calls, []string{"promote:pre-prod", "sync:pre-prod"}) {
+	if !reflect.DeepEqual(writer.calls, []string{"head:main", "promote:pre-prod", "sync:pre-prod"}) {
 		t.Fatalf("calls = %#v, want promotion to continue despite dark slice", writer.calls)
 	}
 	if len(report.ToggleInventory.LeaveDark) != 1 || report.ToggleInventory.LeaveDark[0].SliceRef != "rewrite-billing-engine/code-2" {
@@ -548,6 +554,11 @@ type recordingPromotionWriter struct {
 	kickErr         error
 	routeErr        error
 	alreadyUpToDate bool
+}
+
+func (w *recordingPromotionWriter) BranchHeadSHA(_ context.Context, branch string) (string, error) {
+	w.calls = append(w.calls, "head:"+branch)
+	return branch + "-prior-sha", nil
 }
 
 func (w *recordingPromotionWriter) KickBackFromPreProd(_ context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error) {

@@ -3147,6 +3147,10 @@ func int64TestPtr(value int64) *int64 {
 
 type cliFakePromotionWriter struct{}
 
+func (cliFakePromotionWriter) BranchHeadSHA(context.Context, string) (string, error) {
+	return "main-prior-sha", nil
+}
+
 func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, string) (gh.PreProdKickBackResult, error) {
 	return gh.PreProdKickBackResult{}, nil
 }

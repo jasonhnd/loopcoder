@@ -267,6 +267,23 @@ func TestBranchChecksReadsHeadCheckRunsAndStatuses(t *testing.T) {
 	}
 }
 
+func TestBranchHeadSHAReadsRef(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00ls-remote\x00origin\x00refs/heads/main": []byte("main-head-sha\trefs/heads/main\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.BranchHeadSHA(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("BranchHeadSHA returned error: %v", err)
+	}
+	if got != "main-head-sha" {
+		t.Fatalf("BranchHeadSHA = %q, want main-head-sha", got)
+	}
+}
+
 func TestRevertOnPreProdUsesTemporaryWorktreeAndPushesOnlyPreProd(t *testing.T) {
 	runner := &preProdRevertRunner{}
 	client := NewWithRunner("repo", runner)

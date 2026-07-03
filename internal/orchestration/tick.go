@@ -196,6 +196,7 @@ type TickPreProdMergeResult struct {
 	Branch             string                    `json:"branch"`
 	Head               string                    `json:"head,omitempty"`
 	SHA                string                    `json:"sha,omitempty"`
+	PriorStableCommit  string                    `json:"prior_stable_commit,omitempty"`
 	URL                string                    `json:"url,omitempty"`
 	Status             string                    `json:"status"`
 	Error              string                    `json:"error,omitempty"`
@@ -224,6 +225,8 @@ type TickPreProdRevertResult struct {
 	Branch             string                    `json:"branch"`
 	RevertedSHA        string                    `json:"reverted_sha,omitempty"`
 	SHA                string                    `json:"sha,omitempty"`
+	MergeCommit        string                    `json:"merge_commit,omitempty"`
+	PriorStableCommit  string                    `json:"prior_stable_commit,omitempty"`
 	URL                string                    `json:"url,omitempty"`
 	Status             string                    `json:"status"`
 	Error              string                    `json:"error,omitempty"`
@@ -996,13 +999,15 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		return
 	}
 
+	priorStableCommit := readTickPriorStableCommit(ctx, opts, opts.PreProdBranch)
 	merged, err := opts.PreProdWriter.MergeToPreProd(ctx, prNumber, opts.PreProdBranch)
 	mergeResult := TickPreProdMergeResult{
-		Issue:    item.Issue,
-		PR:       item.PR,
-		PRNumber: prNumber,
-		Branch:   opts.PreProdBranch,
-		Status:   TickStatusSucceeded,
+		Issue:             item.Issue,
+		PR:                item.PR,
+		PRNumber:          prNumber,
+		Branch:            opts.PreProdBranch,
+		PriorStableCommit: priorStableCommit,
+		Status:            TickStatusSucceeded,
 	}
 	if err != nil {
 		mergeResult.Status = TickStatusNeedsHuman
@@ -1124,12 +1129,14 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 func runTickPreProdRevert(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate, prNumber int, mergeResult TickPreProdMergeResult, health TickPreProdHealthResult) {
 	reverted, err := opts.PreProdWriter.RevertOnPreProd(ctx, prNumber, opts.PreProdBranch, mergeResult.SHA)
 	revertResult := TickPreProdRevertResult{
-		Issue:       item.Issue,
-		PR:          item.PR,
-		PRNumber:    prNumber,
-		Branch:      opts.PreProdBranch,
-		RevertedSHA: mergeResult.SHA,
-		Status:      TickStatusSucceeded,
+		Issue:             item.Issue,
+		PR:                item.PR,
+		PRNumber:          prNumber,
+		Branch:            opts.PreProdBranch,
+		RevertedSHA:       mergeResult.SHA,
+		MergeCommit:       mergeResult.SHA,
+		PriorStableCommit: mergeResult.PriorStableCommit,
+		Status:            TickStatusSucceeded,
 	}
 	if err != nil {
 		revertResult.Status = TickStatusFailed
@@ -1145,6 +1152,7 @@ func runTickPreProdRevert(ctx context.Context, opts TickOptions, tickReport *Tic
 	}
 	revertResult.Branch = firstNonEmpty(reverted.Branch, opts.PreProdBranch)
 	revertResult.RevertedSHA = firstNonEmpty(reverted.RevertedSHA, mergeResult.SHA)
+	revertResult.MergeCommit = firstNonEmpty(revertResult.MergeCommit, revertResult.RevertedSHA)
 	revertResult.SHA = reverted.SHA
 	revertResult.URL = reverted.URL
 	tickReport.PreProdReverts = append(tickReport.PreProdReverts, revertResult)
@@ -1159,6 +1167,32 @@ func runTickPreProdRevert(ctx context.Context, opts TickOptions, tickReport *Tic
 		PR:     item.PR,
 		Detail: detail,
 	})
+}
+
+func readTickPriorStableCommit(ctx context.Context, opts TickOptions, branch string) string {
+	reader, ok := opts.Reader.(BranchHeadReader)
+	if !ok {
+		writeTickWarning(opts, "warning: github reader does not support branch head reads before pre-prod merge\n")
+		return ""
+	}
+	sha, err := reader.BranchHeadSHA(ctx, branch)
+	if err != nil {
+		writeTickWarning(opts, "warning: could not read %s head before pre-prod merge: %v\n", branch, err)
+		return ""
+	}
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		writeTickWarning(opts, "warning: %s head read before pre-prod merge returned an empty SHA\n", branch)
+	}
+	return sha
+}
+
+func writeTickWarning(opts TickOptions, format string, args ...any) {
+	out := opts.Stderr
+	if out == nil {
+		out = os.Stderr
+	}
+	fmt.Fprintf(out, format, args...)
 }
 
 func preProdBranchProblem(preProdBranch, baseBranch string) string {
