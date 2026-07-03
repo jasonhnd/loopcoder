@@ -103,6 +103,8 @@ var commands = []Command{
 	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
 }
 
+const loopreviewCommandFailureExitCode = 3
+
 // Commands returns the registered subcommands in root help order.
 func Commands() []Command {
 	out := make([]Command, len(commands))
@@ -473,6 +475,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
 		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty            suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Exit codes:")
+		fmt.Fprintln(w, "  0   clean verifier verdict: pass")
+		fmt.Fprintln(w, "  1   clean verifier verdict: fail")
+		fmt.Fprintln(w, "  2   clean verifier verdict: needs-human")
+		fmt.Fprintln(w, "  3   command failure before/after a clean verdict (flags, repo, config, provider/git, or output error)")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -3098,7 +3106,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
 
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
 	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
@@ -3129,25 +3137,25 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "loopreview: --repo is required")
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 	if opts.PRNumber <= 0 {
 		fmt.Fprintln(stderr, "loopreview: --pr-number is required")
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 	if strings.TrimSpace(opts.Provider) == "" {
 		fmt.Fprintln(stderr, "loopreview: --provider is required")
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 	if opts.Timeout <= 0 {
 		fmt.Fprintln(stderr, "loopreview: --timeout must be positive")
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 
 	resolvedRepo, err := resolveRepo(opts.RepoPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
-		return 2
+		return loopreviewCommandFailureExitCode
 	}
 	opts.RepoPath = resolvedRepo
 	opts.Stderr = stderr
@@ -3155,7 +3163,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
-		return 1
+		return loopreviewCommandFailureExitCode
 	}
 	opts.Model, opts.Effort = applyRoleModelEffort(
 		opts.Model,
@@ -3175,26 +3183,26 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	result, err := deps.Loopreview(context.Background(), opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
-		return 1
+		return loopreviewCommandFailureExitCode
 	}
 	if err := loopreview.Render(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
-		return 1
+		return loopreviewCommandFailureExitCode
 	}
 	if result.Verdict.Attestation != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
 		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Attestation, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
-			return 1
+			return loopreviewCommandFailureExitCode
 		}
 		if shouldRenderPretty(noPretty) {
 			if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, mode); err != nil {
 				fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
-				return 1
+				return loopreviewCommandFailureExitCode
 			}
 		}
 	}
-	return result.ExitCode
+	return loopreview.ExitCodeForVerdict(result.Verdict.Verdict)
 }
 
 func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {

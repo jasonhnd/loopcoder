@@ -4,7 +4,7 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.4.1-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.4.2-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
@@ -113,6 +113,19 @@ artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress
 the display; `attest --pretty` remains the direct human-readable Conductor
 self-attestation form.
 
+### loopreview exit codes
+
+`loopcoder loopreview` reserves process exit codes `0`, `1`, and `2` for clean
+verifier verdicts only, so CI can distinguish a review decision from a command
+failure:
+
+- `0` means clean verifier verdict `pass`.
+- `1` means clean verifier verdict `fail`.
+- `2` means clean verifier verdict `needs-human`.
+- `3` means the `loopreview` command itself failed before or after a clean
+  verdict, such as invalid flags, a bad `--repo`, configuration load failure,
+  provider/git setup failure, or output/relay write failure.
+
 `loopcoder status` renders delivery status from local `.loopcoder/` run state.
 Installed conductor hooks enforce the local flow: `conductor-relay-guard`
 prevents hidden `dispatch` or `loopreview` attestation blocks from completing a
@@ -159,7 +172,7 @@ delivery or merge turn finishes. Install them into project
 
 ## Status
 
-v0.4.1 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview` with bounded review packets and a timeout safety net, `.delivery.yml` role slots including a pinned Claude verifier model and effort, default-on `auto` production promotion with `human-merge` opt-out, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Auto promotion is backed by a deterministic conjunctive gate over CI-green / loopreview-pass / evidence-present / red-line-clean signals, first-class ledgered revert-target SHAs, and deterministic production rollback to the recorded prior-stable SHA. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The `conductor-attest` gate applies only to delivery or merge turns, blocks at most once, and honors the `stop_hook_active` escape valve, so it cannot loop or block ordinary planning turns. `loopcoder skill install` and `loopcoder upgrade` migrate stale `node hooks/*.js` entries to the binary command and write a gitignored `.loopcoder/conductor-workspace` marker, and `loopcoder doctor` verifies the hook command form and that `loopcoder` resolves on `PATH`. Stale installed conductor skills can be refreshed by install/upgrade/doctor flows, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` mechanism proof exists for `codex` and `claude`, and required identity, usage, or guardrail evidence fails closed. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation remains a documented target rather than current behavior. loopcoder's own repository remains explicitly configured with `gate: human-merge` for self-hosting safety.
+v0.4.2 is the current cross-platform native Go CLI. It is an operational-reliability hardening release per [`docs/specs/0423-operational-reliability-hardening.md`](docs/specs/0423-operational-reliability-hardening.md) and #407: hung/stalled workers harvest committable work before discard (H1), worker/verifier liveness includes worktree-mtime progress with raised watchdog windows (H2), `loopreview` builds source-first review packets before generated/large diffs (H3), config resolution fails loud when `.delivery.yml` exists on the base branch but not the working tree and supports `--config-from-base` (H4), and `loopreview` reserves exit codes `0`/`1`/`2` for clean verdicts while command failures exit `3` (H5). It retains provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview`, `.delivery.yml` role slots including a pinned Claude verifier model and effort, default-on `auto` production promotion with `human-merge` opt-out, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation remains a documented target rather than current behavior. loopcoder's own repository remains explicitly configured with `gate: human-merge` for self-hosting safety.
 
 ## License
 
