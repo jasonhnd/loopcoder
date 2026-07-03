@@ -38,11 +38,21 @@ const (
 	reviewPacketChangedFilesBudgetBytes = 8 * 1024
 	reviewPacketDiffBudgetBytes         = 80 * 1024
 	reviewPacketDiffFileBudgetBytes     = 24 * 1024
+	reviewPacketGeneratedDiffFileBytes  = 2 * 1024
+	reviewPacketGeneratedSizeBytes      = 128 * 1024
 	reviewPacketIssueBudgetBytes        = 12 * 1024
 	reviewPacketSpecBudgetBytes         = 40 * 1024
 	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
 	providerFailureLogBudgetBytes       = 4 * 1024
 )
+
+var defaultGeneratedPatterns = []string{
+	"tests/baseline/**",
+	"*.lock",
+	"dist/**",
+	"*.min.*",
+	"vendor/**",
+}
 
 type Options struct {
 	RepoPath       string
@@ -105,21 +115,25 @@ type Deps struct {
 }
 
 type ReviewPacketLimits struct {
-	ChangedFilesBytes int
-	DiffBytes         int
-	DiffFileBytes     int
-	IssueBytes        int
-	SpecBytes         int
-	TotalPromptBytes  int
+	ChangedFilesBytes      int
+	DiffBytes              int
+	DiffFileBytes          int
+	GeneratedDiffFileBytes int
+	GeneratedSizeBytes     int
+	GeneratedPatterns      []string
+	IssueBytes             int
+	SpecBytes              int
+	TotalPromptBytes       int
 }
 
 type reviewInputs struct {
-	PR           gh.PullRequest
-	Issue        gh.Issue
-	IssuePresent bool
-	Diff         string
-	ChangedFiles []string
-	Spec         specInput
+	PR                      gh.PullRequest
+	Issue                   gh.Issue
+	IssuePresent            bool
+	Diff                    string
+	ChangedFiles            []string
+	GeneratedAttributeRules []generatedAttributeRule
+	Spec                    specInput
 }
 
 type specInput struct {
@@ -513,7 +527,7 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 		SpecPathAdded:      specPathAdded,
 		SpecContent:        truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
 		ChangedFiles:       buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
-		Diff:               buildDiffSection(inputs.Diff, limits.DiffBytes, limits.DiffFileBytes),
+		Diff:               buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
 		Limits:             limits,
 	}
 }
@@ -551,12 +565,15 @@ const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"requir
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{
-		ChangedFilesBytes: reviewPacketChangedFilesBudgetBytes,
-		DiffBytes:         reviewPacketDiffBudgetBytes,
-		DiffFileBytes:     reviewPacketDiffFileBudgetBytes,
-		IssueBytes:        reviewPacketIssueBudgetBytes,
-		SpecBytes:         reviewPacketSpecBudgetBytes,
-		TotalPromptBytes:  reviewPacketTotalPromptBudgetBytes,
+		ChangedFilesBytes:      reviewPacketChangedFilesBudgetBytes,
+		DiffBytes:              reviewPacketDiffBudgetBytes,
+		DiffFileBytes:          reviewPacketDiffFileBudgetBytes,
+		GeneratedDiffFileBytes: reviewPacketGeneratedDiffFileBytes,
+		GeneratedSizeBytes:     reviewPacketGeneratedSizeBytes,
+		GeneratedPatterns:      defaultGeneratedPatterns,
+		IssueBytes:             reviewPacketIssueBudgetBytes,
+		SpecBytes:              reviewPacketSpecBudgetBytes,
+		TotalPromptBytes:       reviewPacketTotalPromptBudgetBytes,
 	}
 	if limits.ChangedFilesBytes <= 0 {
 		limits.ChangedFilesBytes = defaults.ChangedFilesBytes
@@ -566,6 +583,15 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	}
 	if limits.DiffFileBytes <= 0 {
 		limits.DiffFileBytes = defaults.DiffFileBytes
+	}
+	if limits.GeneratedDiffFileBytes <= 0 {
+		limits.GeneratedDiffFileBytes = defaults.GeneratedDiffFileBytes
+	}
+	if limits.GeneratedSizeBytes <= 0 {
+		limits.GeneratedSizeBytes = defaults.GeneratedSizeBytes
+	}
+	if len(limits.GeneratedPatterns) == 0 {
+		limits.GeneratedPatterns = append([]string(nil), defaults.GeneratedPatterns...)
 	}
 	if limits.IssueBytes <= 0 {
 		limits.IssueBytes = defaults.IssueBytes
@@ -590,6 +616,7 @@ func reduceReviewPacketBudgets(limits *ReviewPacketLimits, bytesToRemove int) bo
 		&limits.IssueBytes,
 		&limits.ChangedFilesBytes,
 		&limits.DiffFileBytes,
+		&limits.GeneratedDiffFileBytes,
 	} {
 		if bytesToRemove <= 0 {
 			break
@@ -740,21 +767,26 @@ func countNonEmptyStrings(values []string) int {
 	return count
 }
 
-func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection {
+func buildDiffSection(diff string, limits ReviewPacketLimits, generatedRules []generatedAttributeRule) packetSection {
 	diff = strings.TrimRight(diff, "\n")
 	if strings.TrimSpace(diff) == "" {
 		return packetSection{}
 	}
 	patches := splitDiffPatches(diff)
+	orderedPatches := sourceFirstDiffPatches(patches, limits, generatedRules)
 	var out strings.Builder
 	omittedBytes := 0
 	omittedLines := 0
 	omittedFiles := []string{}
-	for i, patch := range patches {
+	for i, patch := range orderedPatches {
+		perFileBudget := limits.DiffFileBytes
+		if patch.Generated {
+			perFileBudget = limits.GeneratedDiffFileBytes
+		}
 		patchSection := truncatePacketSection(patch.Text, perFileBudget)
 		block := formatDiffPatchBlock(patch.File, patchSection)
-		if out.Len()+len(block) > diffBudget {
-			for _, omitted := range patches[i:] {
+		if out.Len()+len(block) > limits.DiffBytes {
+			for _, omitted := range orderedPatches[i:] {
 				omittedBytes += len(omitted.Text)
 				omittedLines += countLines(omitted.Text)
 				omittedFiles = append(omittedFiles, omitted.File)
@@ -776,6 +808,115 @@ func buildDiffSection(diff string, diffBudget, perFileBudget int) packetSection 
 		OmittedFiles:  omittedFiles,
 		Truncated:     omittedBytes > 0 || omittedLines > 0,
 	}
+}
+
+type classifiedDiffPatch struct {
+	diffPatch
+	Generated bool
+}
+
+func sourceFirstDiffPatches(patches []diffPatch, limits ReviewPacketLimits, generatedRules []generatedAttributeRule) []classifiedDiffPatch {
+	source := []classifiedDiffPatch{}
+	generated := []classifiedDiffPatch{}
+	for _, patch := range patches {
+		classified := classifiedDiffPatch{
+			diffPatch: patch,
+			Generated: isGeneratedPatch(patch, limits, generatedRules),
+		}
+		if classified.Generated {
+			generated = append(generated, classified)
+			continue
+		}
+		source = append(source, classified)
+	}
+	return append(source, generated...)
+}
+
+func isGeneratedPatch(patch diffPatch, limits ReviewPacketLimits, generatedRules []generatedAttributeRule) bool {
+	file := normalizeRepoPath(patch.File)
+	if file == "" {
+		return false
+	}
+	if matchesAnyRepoGlob(file, limits.GeneratedPatterns) {
+		return true
+	}
+	if generatedByAttributes(file, generatedRules) {
+		return true
+	}
+	return generatedBySizeThreshold(file, len(patch.Text), limits.GeneratedSizeBytes)
+}
+
+func matchesAnyRepoGlob(path string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchRepoGlob(pattern, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func generatedByAttributes(path string, rules []generatedAttributeRule) bool {
+	generatedSet := false
+	generated := false
+	diffSet := false
+	diffEnabled := true
+	for _, rule := range rules {
+		if !matchRepoGlob(rule.Pattern, path) {
+			continue
+		}
+		if rule.Generated != nil {
+			generatedSet = true
+			generated = *rule.Generated
+		}
+		if rule.Diff != nil {
+			diffSet = true
+			diffEnabled = *rule.Diff
+		}
+	}
+	if generatedSet && generated {
+		return true
+	}
+	return diffSet && !diffEnabled
+}
+
+func generatedBySizeThreshold(path string, size, threshold int) bool {
+	if threshold <= 0 || size < threshold {
+		return false
+	}
+	lower := strings.ToLower(normalizeRepoPath(path))
+	base := repoPathBase(lower)
+	for _, signal := range []string{
+		"/generated/",
+		"/baseline/",
+		"/baselines/",
+		"/snapshot/",
+		"/snapshots/",
+		"/vendor/",
+		"/dist/",
+	} {
+		if strings.Contains("/"+lower+"/", signal) {
+			return true
+		}
+	}
+	for _, signal := range []string{
+		".generated.",
+		".gen.",
+		".min.",
+	} {
+		if strings.Contains(base, signal) {
+			return true
+		}
+	}
+	for _, suffix := range []string{
+		"_generated.go",
+		".pb.go",
+		".lock",
+	} {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 type diffPatch struct {
@@ -896,9 +1037,100 @@ func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath 
 	issue, present := loadIssue(ctx, github, pr)
 	inputs.Issue = issue
 	inputs.IssuePresent = present
+	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, opts.BaseBranch)
 	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, opts.BaseBranch, specSearchTexts(issue, present, pr))
 	inputs.Spec = classifySpecAbsence(inputs.Spec, opts.BaseBranch, changedFiles, diff)
 	return inputs, nil
+}
+
+type generatedAttributeRule struct {
+	Pattern   string
+	Generated *bool
+	Diff      *bool
+}
+
+func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, baseBranch string) []generatedAttributeRule {
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	content, err := git.Show(ctx, repoPath, "origin/"+baseBranch+":.gitattributes")
+	if err != nil || strings.TrimSpace(content) == "" {
+		return nil
+	}
+	return parseGeneratedAttributeRules(content)
+}
+
+func parseGeneratedAttributeRules(content string) []generatedAttributeRule {
+	rules := []generatedAttributeRule{}
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "[attr]") {
+			continue
+		}
+		pattern := normalizeGitattributesPattern(fields[0])
+		if pattern == "" {
+			continue
+		}
+		rule := generatedAttributeRule{Pattern: pattern}
+		for _, attr := range fields[1:] {
+			if value, ok := parseAttributeBool(attr, "linguist-generated"); ok {
+				rule.Generated = boolPtr(value)
+				continue
+			}
+			if value, ok := parseAttributeBool(attr, "linguist-diff"); ok {
+				rule.Diff = boolPtr(value)
+			}
+		}
+		if rule.Generated != nil || rule.Diff != nil {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+func normalizeGitattributesPattern(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" || strings.HasPrefix(pattern, "!") {
+		return ""
+	}
+	if unquoted, err := strconv.Unquote(pattern); err == nil {
+		pattern = unquoted
+	}
+	pattern = normalizeRepoPath(pattern)
+	if strings.HasSuffix(pattern, "/") {
+		pattern += "**"
+	}
+	return pattern
+}
+
+func parseAttributeBool(attr, name string) (bool, bool) {
+	attr = strings.TrimSpace(attr)
+	switch attr {
+	case name:
+		return true, true
+	case "-" + name, "!" + name:
+		return false, true
+	}
+	prefix := name + "="
+	if !strings.HasPrefix(attr, prefix) {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(strings.TrimPrefix(attr, prefix))) {
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func loadIssue(ctx context.Context, github GitHubClient, pr gh.PullRequest) (gh.Issue, bool) {
@@ -1096,6 +1328,71 @@ func normalizeRepoPath(path string) string {
 	path = strings.TrimSpace(strings.ReplaceAll(path, `\`, `/`))
 	path = strings.TrimPrefix(path, "./")
 	return path
+}
+
+func matchRepoGlob(pattern, path string) bool {
+	pattern = normalizeRepoPath(pattern)
+	path = normalizeRepoPath(path)
+	if pattern == "" || path == "" {
+		return false
+	}
+	anchored := strings.HasPrefix(pattern, "/")
+	pattern = strings.TrimPrefix(pattern, "/")
+	if strings.HasSuffix(pattern, "/") {
+		pattern += "**"
+	}
+	if !anchored && !strings.Contains(pattern, "/") {
+		return matchGlobPattern(pattern, repoPathBase(path))
+	}
+	return matchGlobPattern(pattern, path)
+}
+
+func matchGlobPattern(pattern, value string) bool {
+	re, err := regexp.Compile(globPatternRegexp(pattern))
+	if err != nil {
+		return false
+	}
+	return re.MatchString(value)
+}
+
+func globPatternRegexp(pattern string) string {
+	var out strings.Builder
+	out.WriteString("^")
+	for i := 0; i < len(pattern); {
+		switch {
+		case strings.HasPrefix(pattern[i:], "**/"):
+			out.WriteString("(?:.*/)?")
+			i += 3
+		case strings.HasPrefix(pattern[i:], "**"):
+			out.WriteString(".*")
+			i += 2
+		default:
+			ch := pattern[i]
+			switch ch {
+			case '*':
+				out.WriteString("[^/]*")
+			case '?':
+				out.WriteString("[^/]")
+			default:
+				out.WriteString(regexp.QuoteMeta(string(ch)))
+			}
+			i++
+		}
+	}
+	out.WriteString("$")
+	return out.String()
+}
+
+func repoPathBase(path string) string {
+	path = normalizeRepoPath(path)
+	if path == "" {
+		return ""
+	}
+	index := strings.LastIndex(path, "/")
+	if index < 0 {
+		return path
+	}
+	return path[index+1:]
 }
 
 func checkoutPRWorktree(ctx context.Context, deps Deps, repoPath, worktreePath string, prNumber int) error {
