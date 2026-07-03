@@ -922,6 +922,7 @@ func TestTickAutoRevertsPreProdWhenMergedCommitTurnsCIRed(t *testing.T) {
 				Checks:  []gh.Check{{Name: "verify", Bucket: "fail"}},
 			},
 		},
+		branchHeads: map[string]string{"pre-prod": "preprod-prior-sha"},
 	}
 	writer := &recordingPreProdWriter{
 		mergeResult:  gh.PreProdMergeResult{PRNumber: 220, Branch: "pre-prod", Head: "loop/issue-22", SHA: "merge-sha"},
@@ -945,7 +946,14 @@ func TestTickAutoRevertsPreProdWhenMergedCommitTurnsCIRed(t *testing.T) {
 	if len(report.PreProdHealth) != 1 || report.PreProdHealth[0].Status != PreProdHealthStatusRed {
 		t.Fatalf("pre-prod health = %#v", report.PreProdHealth)
 	}
-	if len(report.PreProdReverts) != 1 || report.PreProdReverts[0].Status != TickStatusSucceeded || report.PreProdReverts[0].RevertedSHA != "merge-sha" {
+	if len(report.PreProdMerges) != 1 || report.PreProdMerges[0].PriorStableCommit != "preprod-prior-sha" {
+		t.Fatalf("pre-prod merges = %#v", report.PreProdMerges)
+	}
+	if len(report.PreProdReverts) != 1 ||
+		report.PreProdReverts[0].Status != TickStatusSucceeded ||
+		report.PreProdReverts[0].RevertedSHA != "merge-sha" ||
+		report.PreProdReverts[0].MergeCommit != "merge-sha" ||
+		report.PreProdReverts[0].PriorStableCommit != "preprod-prior-sha" {
 		t.Fatalf("pre-prod reverts = %#v", report.PreProdReverts)
 	}
 	if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "pre-prod-revert" || report.NeedsHuman[0].Issue != 22 {

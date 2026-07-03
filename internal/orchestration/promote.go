@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 )
 
 type PromotionWriter interface {
+	BranchHeadSHA(ctx context.Context, branch string) (string, error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (gh.NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (gh.MainPromotionResult, error)
@@ -150,14 +152,15 @@ type PromoteKickBackResult struct {
 }
 
 type PromoteMainResult struct {
-	PreProdBranch   string `json:"pre_prod_branch"`
-	MainBranch      string `json:"main_branch"`
-	Head            string `json:"head,omitempty"`
-	SHA             string `json:"sha,omitempty"`
-	URL             string `json:"url,omitempty"`
-	AlreadyUpToDate bool   `json:"already_up_to_date,omitempty"`
-	Status          string `json:"status"`
-	Error           string `json:"error,omitempty"`
+	PreProdBranch     string `json:"pre_prod_branch"`
+	MainBranch        string `json:"main_branch"`
+	Head              string `json:"head,omitempty"`
+	SHA               string `json:"sha,omitempty"`
+	PriorStableCommit string `json:"prior_stable_commit,omitempty"`
+	URL               string `json:"url,omitempty"`
+	AlreadyUpToDate   bool   `json:"already_up_to_date,omitempty"`
+	Status            string `json:"status"`
+	Error             string `json:"error,omitempty"`
 }
 
 type PromoteSyncResult struct {
@@ -334,12 +337,14 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		report.NeedsHuman = append(report.NeedsHuman, needsHuman)
 	}
 
+	priorStableCommit := readPromotePriorStableCommit(ctx, opts)
 	promoted, err := opts.Writer.PromotePreProdToMain(ctx, opts.PreProdBranch)
 	report.Promoted = PromoteMainResult{
-		PreProdBranch: opts.PreProdBranch,
-		MainBranch:    "main",
-		Head:          opts.PreProdBranch,
-		Status:        PromoteStatusSucceeded,
+		PreProdBranch:     opts.PreProdBranch,
+		MainBranch:        "main",
+		Head:              opts.PreProdBranch,
+		PriorStableCommit: priorStableCommit,
+		Status:            PromoteStatusSucceeded,
 	}
 	if err != nil {
 		report.Promoted.Status = PromoteStatusFailed
@@ -410,18 +415,20 @@ func recordPromoteAttempt(ctx context.Context, opts PromoteOptions, report *Prom
 	}
 	outcome := promoteLedgerOutcome(*report)
 	if err := state.AppendEvent(opts.RepoPath, report.RunID, state.Event{
-		Timestamp: report.FinishedAt,
-		RunID:     report.RunID,
-		JobID:     "promote",
-		Issue:     0,
-		Phase:     "promote",
-		Status:    outcome,
-		LogBytes:  0,
-		ExitCode:  &exitCode,
-		Error:     errorMessage,
-		Event:     promoteLedgerEvent,
-		Outcome:   outcome,
-		Details:   json.RawMessage(reportJSON),
+		Timestamp:         report.FinishedAt,
+		RunID:             report.RunID,
+		JobID:             "promote",
+		Issue:             0,
+		Phase:             "promote",
+		Status:            outcome,
+		LogBytes:          0,
+		ExitCode:          &exitCode,
+		Error:             errorMessage,
+		Event:             promoteLedgerEvent,
+		Outcome:           outcome,
+		MergeCommit:       strings.TrimSpace(report.Promoted.SHA),
+		PriorStableCommit: strings.TrimSpace(report.Promoted.PriorStableCommit),
+		Details:           json.RawMessage(reportJSON),
 	}); err != nil {
 		return fmt.Errorf("append promote ledger event: %w", err)
 	}
@@ -439,6 +446,19 @@ func recordPromoteAttempt(ctx context.Context, opts PromoteOptions, report *Prom
 		return fmt.Errorf("push promote ledger: %s", result.PushError)
 	}
 	return nil
+}
+
+func readPromotePriorStableCommit(ctx context.Context, opts PromoteOptions) string {
+	sha, err := opts.Writer.BranchHeadSHA(ctx, "main")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not read main head before promotion: %v\n", err)
+		return ""
+	}
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		fmt.Fprintln(os.Stderr, "warning: main head read before promotion returned an empty SHA")
+	}
+	return sha
 }
 
 func promoteStatePush(result statebranch.PushResult) *PromoteStatePush {

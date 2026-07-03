@@ -46,6 +46,10 @@ type PreProdHealthReader interface {
 	BranchChecks(ctx context.Context, branch string) (gh.BranchChecksResult, error)
 }
 
+type BranchHeadReader interface {
+	BranchHeadSHA(ctx context.Context, branch string) (string, error)
+}
+
 type RiskGateFunc func(ctx context.Context, opts RiskGateOptions) (RiskGateDecision, error)
 
 type RiskGateOptions struct {

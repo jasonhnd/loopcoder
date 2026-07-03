@@ -43,6 +43,7 @@ type Writer interface {
 // intentionally separate from Writer so unattended tick dependencies cannot gain
 // a main-merge method by interface widening.
 type ProductionWriter interface {
+	BranchHeadSHA(ctx context.Context, branch string) (string, error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error)
@@ -357,6 +358,14 @@ func (c *CLI) BranchChecks(ctx context.Context, branch string) (BranchChecksResu
 		HeadSHA: sha,
 		Checks:  checks,
 	}, nil
+}
+
+func (c *CLI) BranchHeadSHA(ctx context.Context, branch string) (string, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", fmt.Errorf("branch is required")
+	}
+	return c.branchHeadSHA(ctx, branch)
 }
 
 func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {

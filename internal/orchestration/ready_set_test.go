@@ -27,6 +27,8 @@ type fakeReader struct {
 	checkErrs       map[int]error
 	branchChecks    map[string]gh.BranchChecksResult
 	branchCheckErrs map[string]error
+	branchHeads     map[string]string
+	branchHeadErrs  map[string]error
 	diffFiles       map[int][]string
 	diffs           map[int]string
 	diffErrs        map[int]error
@@ -67,6 +69,16 @@ func (f fakeReader) BranchChecks(_ context.Context, branch string) (gh.BranchChe
 		return result, nil
 	}
 	return gh.BranchChecksResult{Branch: branch, HeadSHA: "abc123", Checks: passChecks()}, nil
+}
+
+func (f fakeReader) BranchHeadSHA(_ context.Context, branch string) (string, error) {
+	if err := f.branchHeadErrs[branch]; err != nil {
+		return "", err
+	}
+	if sha, ok := f.branchHeads[branch]; ok {
+		return sha, nil
+	}
+	return "abc123", nil
 }
 
 func (f fakeReader) PRDiff(_ context.Context, number int) (string, error) {
