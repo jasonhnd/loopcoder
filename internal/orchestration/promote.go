@@ -27,7 +27,8 @@ const (
 	PromoteOutcomeSkippedAsDone = "skipped-as-done"
 	PromoteOutcomeFailed        = "failed"
 
-	promoteLedgerEvent = "promote.attempt"
+	promoteLedgerEvent         = "promote.attempt"
+	promoteRollbackLedgerEvent = "promote.rollback"
 )
 
 const (
@@ -37,9 +38,11 @@ const (
 
 type PromotionWriter interface {
 	BranchHeadSHA(ctx context.Context, branch string) (string, error)
+	BranchChecks(ctx context.Context, branch string) (gh.BranchChecksResult, error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (gh.NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (gh.MainPromotionResult, error)
+	RevertProductionMerge(ctx context.Context, mainBranch, mergeCommit, priorStableCommit string) (gh.ProductionRevertResult, error)
 	SyncPreProdFromMain(ctx context.Context, preProdBranch string) (gh.PreProdSyncResult, error)
 }
 
@@ -56,6 +59,7 @@ type PromoteOptions struct {
 	ParallelRun          *PromoteParallelRunConfig
 	ReconcileParallelRun PromoteParallelRunReconcileFunc
 	AutoGate             *AutoGateInputs
+	RequiredChecks       []string
 }
 
 type PromoteParallelRunReconcileFunc func(equivalence.Contract, equivalence.ParallelRunInput) (equivalence.ParallelRunReport, error)
@@ -73,63 +77,69 @@ type AutoGateInputs struct {
 }
 
 type PromoteReport struct {
-	Version         int                     `json:"version"`
-	RepoPath        string                  `json:"repo_path"`
-	RunID           string                  `json:"run_id"`
-	PreProdBranch   string                  `json:"pre_prod_branch"`
-	MainBranch      string                  `json:"main_branch"`
-	Gate            string                  `json:"gate"`
-	Status          string                  `json:"status"`
-	StartedAt       string                  `json:"started_at"`
-	FinishedAt      string                  `json:"finished_at"`
-	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
-	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
-	ToggleInventory PromoteToggleInventory  `json:"toggle_inventory,omitempty"`
-	GoNoGoPanel     *PromoteGoNoGoPanel     `json:"go_no_go_panel,omitempty"`
-	Promoted        PromoteMainResult       `json:"promoted"`
-	Sync            PromoteSyncResult       `json:"sync"`
-	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
-	Summary         PromoteSummary          `json:"summary"`
+	Version          int                            `json:"version"`
+	RepoPath         string                         `json:"repo_path"`
+	RunID            string                         `json:"run_id"`
+	PreProdBranch    string                         `json:"pre_prod_branch"`
+	MainBranch       string                         `json:"main_branch"`
+	Gate             string                         `json:"gate"`
+	Status           string                         `json:"status"`
+	StartedAt        string                         `json:"started_at"`
+	FinishedAt       string                         `json:"finished_at"`
+	KickedBack       []PromoteKickBackResult        `json:"kicked_back"`
+	NeedsHuman       []PromoteNeedsHuman            `json:"needs_human"`
+	ToggleInventory  PromoteToggleInventory         `json:"toggle_inventory,omitempty"`
+	GoNoGoPanel      *PromoteGoNoGoPanel            `json:"go_no_go_panel,omitempty"`
+	Promoted         PromoteMainResult              `json:"promoted"`
+	ProductionHealth *PromoteProductionHealthResult `json:"production_health,omitempty"`
+	Rollback         *PromoteRollbackResult         `json:"rollback,omitempty"`
+	Sync             PromoteSyncResult              `json:"sync"`
+	StatePush        *PromoteStatePush              `json:"state_push,omitempty"`
+	Summary          PromoteSummary                 `json:"summary"`
 }
 
 type promoteReportJSON struct {
-	Version         int                     `json:"version"`
-	RepoPath        string                  `json:"repo_path"`
-	RunID           string                  `json:"run_id"`
-	PreProdBranch   string                  `json:"pre_prod_branch"`
-	MainBranch      string                  `json:"main_branch"`
-	Gate            string                  `json:"gate"`
-	Status          string                  `json:"status"`
-	StartedAt       string                  `json:"started_at"`
-	FinishedAt      string                  `json:"finished_at"`
-	KickedBack      []PromoteKickBackResult `json:"kicked_back"`
-	NeedsHuman      []PromoteNeedsHuman     `json:"needs_human"`
-	ToggleInventory *PromoteToggleInventory `json:"toggle_inventory,omitempty"`
-	GoNoGoPanel     *PromoteGoNoGoPanel     `json:"go_no_go_panel,omitempty"`
-	Promoted        PromoteMainResult       `json:"promoted"`
-	Sync            PromoteSyncResult       `json:"sync"`
-	StatePush       *PromoteStatePush       `json:"state_push,omitempty"`
-	Summary         PromoteSummary          `json:"summary"`
+	Version          int                            `json:"version"`
+	RepoPath         string                         `json:"repo_path"`
+	RunID            string                         `json:"run_id"`
+	PreProdBranch    string                         `json:"pre_prod_branch"`
+	MainBranch       string                         `json:"main_branch"`
+	Gate             string                         `json:"gate"`
+	Status           string                         `json:"status"`
+	StartedAt        string                         `json:"started_at"`
+	FinishedAt       string                         `json:"finished_at"`
+	KickedBack       []PromoteKickBackResult        `json:"kicked_back"`
+	NeedsHuman       []PromoteNeedsHuman            `json:"needs_human"`
+	ToggleInventory  *PromoteToggleInventory        `json:"toggle_inventory,omitempty"`
+	GoNoGoPanel      *PromoteGoNoGoPanel            `json:"go_no_go_panel,omitempty"`
+	Promoted         PromoteMainResult              `json:"promoted"`
+	ProductionHealth *PromoteProductionHealthResult `json:"production_health,omitempty"`
+	Rollback         *PromoteRollbackResult         `json:"rollback,omitempty"`
+	Sync             PromoteSyncResult              `json:"sync"`
+	StatePush        *PromoteStatePush              `json:"state_push,omitempty"`
+	Summary          PromoteSummary                 `json:"summary"`
 }
 
 func (report PromoteReport) MarshalJSON() ([]byte, error) {
 	wire := promoteReportJSON{
-		Version:       report.Version,
-		RepoPath:      report.RepoPath,
-		RunID:         report.RunID,
-		PreProdBranch: report.PreProdBranch,
-		MainBranch:    report.MainBranch,
-		Gate:          report.Gate,
-		Status:        report.Status,
-		StartedAt:     report.StartedAt,
-		FinishedAt:    report.FinishedAt,
-		KickedBack:    report.KickedBack,
-		NeedsHuman:    report.NeedsHuman,
-		GoNoGoPanel:   report.GoNoGoPanel,
-		Promoted:      report.Promoted,
-		Sync:          report.Sync,
-		StatePush:     report.StatePush,
-		Summary:       report.Summary,
+		Version:          report.Version,
+		RepoPath:         report.RepoPath,
+		RunID:            report.RunID,
+		PreProdBranch:    report.PreProdBranch,
+		MainBranch:       report.MainBranch,
+		Gate:             report.Gate,
+		Status:           report.Status,
+		StartedAt:        report.StartedAt,
+		FinishedAt:       report.FinishedAt,
+		KickedBack:       report.KickedBack,
+		NeedsHuman:       report.NeedsHuman,
+		GoNoGoPanel:      report.GoNoGoPanel,
+		Promoted:         report.Promoted,
+		ProductionHealth: report.ProductionHealth,
+		Rollback:         report.Rollback,
+		Sync:             report.Sync,
+		StatePush:        report.StatePush,
+		Summary:          report.Summary,
 	}
 	if promoteToggleInventoryHasItems(report.ToggleInventory) {
 		inventory := report.ToggleInventory
@@ -172,6 +182,27 @@ type PromoteMainResult struct {
 	PriorStableCommit string `json:"prior_stable_commit,omitempty"`
 	URL               string `json:"url,omitempty"`
 	AlreadyUpToDate   bool   `json:"already_up_to_date,omitempty"`
+	Status            string `json:"status"`
+	Error             string `json:"error,omitempty"`
+}
+
+type PromoteProductionHealthResult struct {
+	Branch         string     `json:"branch"`
+	HeadSHA        string     `json:"head_sha,omitempty"`
+	MergeSHA       string     `json:"merge_sha,omitempty"`
+	Status         string     `json:"status"`
+	RequiredChecks []string   `json:"required_checks"`
+	Checks         []gh.Check `json:"checks"`
+	Problems       []string   `json:"problems"`
+	Error          string     `json:"error,omitempty"`
+}
+
+type PromoteRollbackResult struct {
+	MainBranch        string `json:"main_branch"`
+	MergeCommit       string `json:"merge_commit,omitempty"`
+	PriorStableCommit string `json:"prior_stable_commit,omitempty"`
+	RevertSHA         string `json:"revert_sha,omitempty"`
+	URL               string `json:"url,omitempty"`
 	Status            string `json:"status"`
 	Error             string `json:"error,omitempty"`
 }
@@ -401,6 +432,8 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	report.Promoted.AlreadyUpToDate = promoted.AlreadyUpToDate
 	report.Summary.PromotedCount = 1
 
+	runPromoteProductionKeepsGreen(ctx, opts, &report)
+
 	synced, err := opts.Writer.SyncPreProdFromMain(ctx, opts.PreProdBranch)
 	report.Sync = PromoteSyncResult{
 		PreProdBranch: opts.PreProdBranch,
@@ -419,6 +452,133 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	report.Sync.SHA = synced.SHA
 	report.Sync.URL = synced.URL
 	return finish()
+}
+
+func runPromoteProductionKeepsGreen(ctx context.Context, opts PromoteOptions, report *PromoteReport) {
+	if opts.Gate != GateAuto {
+		return
+	}
+	if report == nil || report.Promoted.Status != PromoteStatusSucceeded || report.Promoted.AlreadyUpToDate {
+		return
+	}
+	mainBranch := firstNonEmpty(report.Promoted.MainBranch, "main")
+	mergeSHA := strings.TrimSpace(report.Promoted.SHA)
+	if mergeSHA == "" {
+		detail := "production promotion did not return a merge commit SHA"
+		report.ProductionHealth = &PromoteProductionHealthResult{
+			Branch:         mainBranch,
+			Status:         PreProdHealthStatusUnknown,
+			RequiredChecks: normalizeRequiredChecks(opts.RequiredChecks),
+			Checks:         []gh.Check{},
+			Problems:       []string{detail},
+			Error:          detail,
+		}
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-health",
+			Detail: detail,
+		})
+		return
+	}
+
+	branchChecks, err := opts.Writer.BranchChecks(ctx, mainBranch)
+	health := PromoteProductionHealthResult{
+		Branch:         firstNonEmpty(branchChecks.Branch, mainBranch),
+		HeadSHA:        branchChecks.HeadSHA,
+		MergeSHA:       mergeSHA,
+		RequiredChecks: normalizeRequiredChecks(opts.RequiredChecks),
+		Checks:         append([]gh.Check(nil), branchChecks.Checks...),
+		Problems:       []string{},
+	}
+	if err != nil {
+		health.Status = PreProdHealthStatusUnknown
+		health.Error = err.Error()
+		report.ProductionHealth = &health
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-health",
+			Detail: err.Error(),
+		})
+		return
+	}
+	health.Status, health.Problems = preProdHealthStatus(health.RequiredChecks, health.Checks)
+	report.ProductionHealth = &health
+
+	switch health.Status {
+	case PreProdHealthStatusGreen:
+		return
+	case PreProdHealthStatusRed:
+		if sameGitSHA(health.HeadSHA, mergeSHA) {
+			runPromoteProductionRollback(ctx, opts, report, mainBranch, health)
+			return
+		}
+		detail := fmt.Sprintf("production CI is red at %s, not the just-promoted commit %s", firstNonEmpty(health.HeadSHA, "unknown"), mergeSHA)
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-health",
+			Detail: detail,
+		})
+	case PreProdHealthStatusPending:
+		return
+	default:
+		detail := "production CI is not green: " + strings.Join(health.Problems, ", ")
+		if len(health.Problems) == 0 {
+			detail = "production CI status is " + health.Status
+		}
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-health",
+			Detail: detail,
+		})
+	}
+}
+
+func runPromoteProductionRollback(ctx context.Context, opts PromoteOptions, report *PromoteReport, mainBranch string, health PromoteProductionHealthResult) {
+	mergeCommit := strings.TrimSpace(report.Promoted.SHA)
+	priorStableCommit := strings.TrimSpace(report.Promoted.PriorStableCommit)
+	if mergeCommit == "" || priorStableCommit == "" {
+		detail := "production CI red after promotion, but merge commit or prior stable commit is missing; refusing blind rollback"
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-rollback",
+			Detail: detail,
+		})
+		return
+	}
+
+	rollback := PromoteRollbackResult{
+		MainBranch:        mainBranch,
+		MergeCommit:       mergeCommit,
+		PriorStableCommit: priorStableCommit,
+		Status:            PromoteStatusSucceeded,
+	}
+	reverted, err := opts.Writer.RevertProductionMerge(ctx, mainBranch, mergeCommit, priorStableCommit)
+	if err != nil {
+		rollback.Status = PromoteStatusFailed
+		rollback.Error = err.Error()
+		report.Rollback = &rollback
+		report.Status = PromoteStatusFailed
+		report.Summary.FailureCount++
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   "production-rollback",
+			Detail: "production CI red after promotion, and automatic rollback failed: " + err.Error(),
+		})
+		return
+	}
+
+	rollback.MainBranch = firstNonEmpty(reverted.Branch, mainBranch)
+	rollback.MergeCommit = firstNonEmpty(reverted.MergeCommit, mergeCommit)
+	rollback.PriorStableCommit = firstNonEmpty(reverted.PriorStableCommit, priorStableCommit)
+	rollback.RevertSHA = reverted.SHA
+	rollback.URL = reverted.URL
+	report.Rollback = &rollback
+
+	detail := fmt.Sprintf("production CI red after merge %s; reverted %s to prior stable %s", mergeCommit, rollback.MainBranch, priorStableCommit)
+	if strings.TrimSpace(rollback.RevertSHA) != "" {
+		detail += " with revert " + rollback.RevertSHA
+	}
+	if len(health.Problems) > 0 {
+		detail += ": " + strings.Join(health.Problems, ", ")
+	}
+	report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+		Step:   "production-rollback",
+		Detail: detail,
+	})
 }
 
 func withPromoteDefaults(opts PromoteOptions) PromoteOptions {
@@ -471,6 +631,42 @@ func recordPromoteAttempt(ctx context.Context, opts PromoteOptions, report *Prom
 		Details:           json.RawMessage(reportJSON),
 	}); err != nil {
 		return fmt.Errorf("append promote ledger event: %w", err)
+	}
+
+	if report.Rollback != nil {
+		rollbackJSON, err := json.Marshal(report.Rollback)
+		if err != nil {
+			return fmt.Errorf("marshal promote rollback ledger event: %w", err)
+		}
+		rollbackExitCode := 0
+		var rollbackError *string
+		rollbackOutcome := strings.TrimSpace(report.Rollback.Status)
+		if rollbackOutcome == "" {
+			rollbackOutcome = PromoteStatusSucceeded
+		}
+		if rollbackOutcome == PromoteStatusFailed {
+			rollbackExitCode = 1
+			text := firstNonEmpty(report.Rollback.Error, "production rollback failed")
+			rollbackError = &text
+		}
+		if err := state.AppendEvent(opts.RepoPath, report.RunID, state.Event{
+			Timestamp:         report.FinishedAt,
+			RunID:             report.RunID,
+			JobID:             "promote",
+			Issue:             0,
+			Phase:             "promote",
+			Status:            rollbackOutcome,
+			LogBytes:          0,
+			ExitCode:          &rollbackExitCode,
+			Error:             rollbackError,
+			Event:             promoteRollbackLedgerEvent,
+			Outcome:           rollbackOutcome,
+			MergeCommit:       strings.TrimSpace(report.Rollback.MergeCommit),
+			PriorStableCommit: strings.TrimSpace(report.Rollback.PriorStableCommit),
+			Details:           json.RawMessage(rollbackJSON),
+		}); err != nil {
+			return fmt.Errorf("append promote rollback ledger event: %w", err)
+		}
 	}
 
 	result, err := opts.StatePush(ctx, statebranch.PushOptions{
@@ -530,6 +726,9 @@ func promoteReportError(report PromoteReport) string {
 	}
 	if strings.TrimSpace(report.Promoted.Error) != "" {
 		return report.Promoted.Error
+	}
+	if report.Rollback != nil && strings.TrimSpace(report.Rollback.Error) != "" {
+		return report.Rollback.Error
 	}
 	if strings.TrimSpace(report.Sync.Error) != "" {
 		return report.Sync.Error
@@ -628,6 +827,13 @@ func promoteFailedItems(report PromoteReport) []PromoteFailedItem {
 			Step:   "pre-prod-sync",
 			Status: firstNonEmpty(report.Sync.Status, PromoteStatusFailed),
 			Detail: firstNonEmpty(report.Sync.Error, "pre-prod sync failed"),
+		})
+	}
+	if report.Rollback != nil && promoteResultFailed(report.Rollback.Status, report.Rollback.Error) {
+		failed = append(failed, PromoteFailedItem{
+			Step:   "production-rollback",
+			Status: firstNonEmpty(report.Rollback.Status, PromoteStatusFailed),
+			Detail: firstNonEmpty(report.Rollback.Error, "production rollback failed"),
 		})
 	}
 	if report.StatePush != nil && promoteResultFailed("", firstNonEmpty(report.StatePush.Error, report.StatePush.PushError)) {
@@ -747,6 +953,50 @@ func RenderPromoteText(report PromoteReport) string {
 	}
 	if strings.TrimSpace(report.Promoted.Error) != "" {
 		fmt.Fprintf(&out, "  error: %s\n", report.Promoted.Error)
+	}
+
+	if report.ProductionHealth != nil {
+		health := report.ProductionHealth
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "Production health")
+		fmt.Fprintf(&out, "- %s status=%s\n", health.Branch, health.Status)
+		if strings.TrimSpace(health.HeadSHA) != "" {
+			fmt.Fprintf(&out, "  head_sha: %s\n", health.HeadSHA)
+		}
+		if strings.TrimSpace(health.MergeSHA) != "" {
+			fmt.Fprintf(&out, "  merge_sha: %s\n", health.MergeSHA)
+		}
+		if len(health.RequiredChecks) > 0 {
+			fmt.Fprintf(&out, "  required_checks: %s\n", strings.Join(health.RequiredChecks, ", "))
+		}
+		if len(health.Problems) > 0 {
+			fmt.Fprintf(&out, "  problems: %s\n", strings.Join(health.Problems, ", "))
+		}
+		if strings.TrimSpace(health.Error) != "" {
+			fmt.Fprintf(&out, "  error: %s\n", health.Error)
+		}
+	}
+
+	if report.Rollback != nil {
+		rollback := report.Rollback
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "Production rollback")
+		fmt.Fprintf(&out, "- %s %s\n", rollback.MainBranch, rollback.Status)
+		if strings.TrimSpace(rollback.MergeCommit) != "" {
+			fmt.Fprintf(&out, "  merge_commit: %s\n", rollback.MergeCommit)
+		}
+		if strings.TrimSpace(rollback.PriorStableCommit) != "" {
+			fmt.Fprintf(&out, "  prior_stable_commit: %s\n", rollback.PriorStableCommit)
+		}
+		if strings.TrimSpace(rollback.RevertSHA) != "" {
+			fmt.Fprintf(&out, "  revert_sha: %s\n", rollback.RevertSHA)
+		}
+		if strings.TrimSpace(rollback.URL) != "" {
+			fmt.Fprintf(&out, "  url: %s\n", rollback.URL)
+		}
+		if strings.TrimSpace(rollback.Error) != "" {
+			fmt.Fprintf(&out, "  error: %s\n", rollback.Error)
+		}
 	}
 
 	fmt.Fprintln(&out)
@@ -869,6 +1119,33 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 		report.GoNoGoPanel = normalizePromoteGoNoGoPanel(*report.GoNoGoPanel)
 	} else {
 		report.GoNoGoPanel = assemblePromoteGoNoGoPanel(report)
+	}
+	if report.ProductionHealth != nil {
+		health := *report.ProductionHealth
+		health.Branch = strings.TrimSpace(health.Branch)
+		health.HeadSHA = strings.TrimSpace(health.HeadSHA)
+		health.MergeSHA = strings.TrimSpace(health.MergeSHA)
+		health.Status = strings.TrimSpace(health.Status)
+		health.RequiredChecks = normalizeRequiredChecks(health.RequiredChecks)
+		if health.Checks == nil {
+			health.Checks = []gh.Check{}
+		}
+		if health.Problems == nil {
+			health.Problems = []string{}
+		}
+		report.ProductionHealth = &health
+	}
+	if report.Rollback != nil {
+		rollback := *report.Rollback
+		rollback.MainBranch = strings.TrimSpace(rollback.MainBranch)
+		rollback.MergeCommit = strings.TrimSpace(rollback.MergeCommit)
+		rollback.PriorStableCommit = strings.TrimSpace(rollback.PriorStableCommit)
+		rollback.RevertSHA = strings.TrimSpace(rollback.RevertSHA)
+		rollback.Status = strings.TrimSpace(rollback.Status)
+		if rollback.Status == "" {
+			rollback.Status = PromoteStatusSucceeded
+		}
+		report.Rollback = &rollback
 	}
 	if strings.TrimSpace(report.Promoted.PreProdBranch) == "" {
 		report.Promoted.PreProdBranch = report.PreProdBranch

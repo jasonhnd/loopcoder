@@ -168,7 +168,7 @@ func TestPromoteAutoGatePath(t *testing.T) {
 			gate:       GateAuto,
 			autoGate:   allTrue,
 			wantStatus: PromoteStatusSucceeded,
-			wantCalls:  []string{"head:main", "promote:pre-prod", "sync:pre-prod"},
+			wantCalls:  []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
 		},
 		{
 			name: "auto-false-signal-needs-human",
@@ -208,14 +208,15 @@ func TestPromoteAutoGatePath(t *testing.T) {
 			writer := &recordingPromotionWriter{}
 
 			report, err := Promote(context.Background(), PromoteOptions{
-				Writer:        writer,
-				RepoPath:      repo,
-				RunID:         runID,
-				PreProdBranch: "pre-prod",
-				Gate:          tt.gate,
-				AutoGate:      tt.autoGate,
-				Clock:         fixedPromoteClock,
-				StatePush:     promoteTestStatePush(t, repo, runID),
+				Writer:         writer,
+				RepoPath:       repo,
+				RunID:          runID,
+				PreProdBranch:  "pre-prod",
+				Gate:           tt.gate,
+				AutoGate:       tt.autoGate,
+				RequiredChecks: []string{"verify"},
+				Clock:          fixedPromoteClock,
+				StatePush:      promoteTestStatePush(t, repo, runID),
 			})
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -247,6 +248,148 @@ func TestPromoteAutoGatePath(t *testing.T) {
 			event := readPromoteEvents(t, repo, runID)
 			if !strings.Contains(event, `"event":"promote.attempt"`) {
 				t.Fatalf("promote ledger missing event:\n%s", event)
+			}
+		})
+	}
+}
+
+func TestPromoteAutoProductionHealthRollback(t *testing.T) {
+	truthy := true
+	allTrue := &AutoGateInputs{
+		CIGreen:         &truthy,
+		VerdictPass:     &truthy,
+		EvidencePresent: &truthy,
+		RedLineClean:    &truthy,
+	}
+	tests := []struct {
+		name               string
+		gate               string
+		checks             gh.BranchChecksResult
+		mainPriorSHA       string
+		wantCalls          []string
+		wantRollback       bool
+		wantRollbackEvent  bool
+		wantNeedsHumanStep string
+		wantStatus         string
+	}{
+		{
+			name: "auto-green-no-rollback",
+			gate: GateAuto,
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "success", Bucket: "pass"}},
+			},
+			wantCalls:  []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
+			wantStatus: PromoteStatusSucceeded,
+		},
+		{
+			name: "auto-red-at-promoted-sha-rolls-back",
+			gate: GateAuto,
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "failure", Bucket: "fail"}},
+			},
+			wantCalls:          []string{"head:main", "promote:pre-prod", "checks:main", "revert:main:main-sha:main-prior-sha", "sync:pre-prod"},
+			wantRollback:       true,
+			wantRollbackEvent:  true,
+			wantNeedsHumanStep: "production-rollback",
+			wantStatus:         PromoteStatusSucceeded,
+		},
+		{
+			name:         "auto-red-with-empty-prior-stable-needs-human-no-rollback",
+			gate:         GateAuto,
+			mainPriorSHA: "",
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "failure", Bucket: "fail"}},
+			},
+			wantCalls:          []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
+			wantNeedsHumanStep: "production-rollback",
+			wantStatus:         PromoteStatusSucceeded,
+		},
+		{
+			name: "auto-pending-leaves-main-alone",
+			gate: GateAuto,
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "pending", Bucket: "pending"}},
+			},
+			wantCalls:  []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
+			wantStatus: PromoteStatusSucceeded,
+		},
+		{
+			name: "human-merge-red-main-does-not-health-check-or-rollback",
+			gate: GateHumanMerge,
+			checks: gh.BranchChecksResult{
+				Branch:  "main",
+				HeadSHA: "main-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "failure", Bucket: "fail"}},
+			},
+			wantCalls:  []string{"head:main", "promote:pre-prod", "sync:pre-prod"},
+			wantStatus: PromoteStatusSucceeded,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runID := "run-test-promote-rollback-" + tt.name
+			writer := &recordingPromotionWriter{branchChecks: tt.checks}
+			if tt.mainPriorSHA != "" || strings.Contains(tt.name, "empty-prior") {
+				writer.mainHeadSHASet = true
+				writer.mainHeadSHA = tt.mainPriorSHA
+			}
+
+			report, err := Promote(context.Background(), PromoteOptions{
+				Writer:         writer,
+				RepoPath:       repo,
+				RunID:          runID,
+				PreProdBranch:  "pre-prod",
+				Gate:           tt.gate,
+				AutoGate:       allTrue,
+				RequiredChecks: []string{"verify"},
+				Clock:          fixedPromoteClock,
+				StatePush:      promoteTestStatePush(t, repo, runID),
+			})
+			if err != nil {
+				t.Fatalf("Promote returned error: %v", err)
+			}
+			if report.Status != tt.wantStatus {
+				t.Fatalf("status = %s, want %s", report.Status, tt.wantStatus)
+			}
+			if !reflect.DeepEqual(writer.calls, tt.wantCalls) {
+				t.Fatalf("calls = %#v, want %#v", writer.calls, tt.wantCalls)
+			}
+			if (report.Rollback != nil) != tt.wantRollback {
+				t.Fatalf("rollback = %#v, want present=%t", report.Rollback, tt.wantRollback)
+			}
+			if tt.wantRollback {
+				if report.Rollback.MergeCommit != "main-sha" || report.Rollback.PriorStableCommit != "main-prior-sha" || report.Rollback.RevertSHA != "production-revert-sha" {
+					t.Fatalf("rollback = %#v, want merge/prior/revert SHAs", report.Rollback)
+				}
+			}
+			if tt.wantNeedsHumanStep != "" {
+				if !promoteNeedsHumanHasStep(report.NeedsHuman, tt.wantNeedsHumanStep) {
+					t.Fatalf("needs-human = %#v, want step %q", report.NeedsHuman, tt.wantNeedsHumanStep)
+				}
+			} else if len(report.NeedsHuman) != 0 {
+				t.Fatalf("needs-human = %#v, want none", report.NeedsHuman)
+			}
+			events := readPromoteEvents(t, repo, runID)
+			hasRollbackEvent := strings.Contains(events, `"event":"promote.rollback"`)
+			if hasRollbackEvent != tt.wantRollbackEvent {
+				t.Fatalf("rollback event present = %t, want %t:\n%s", hasRollbackEvent, tt.wantRollbackEvent, events)
+			}
+			if tt.wantRollbackEvent {
+				for _, want := range []string{`"merge_commit":"main-sha"`, `"prior_stable_commit":"main-prior-sha"`, `"revert_sha":"production-revert-sha"`} {
+					if !strings.Contains(events, want) {
+						t.Fatalf("rollback ledger missing %q:\n%s", want, events)
+					}
+				}
 			}
 		})
 	}
@@ -748,11 +891,30 @@ type recordingPromotionWriter struct {
 	kickErr         error
 	routeErr        error
 	alreadyUpToDate bool
+	mainHeadSHA     string
+	mainHeadSHASet  bool
+	branchChecks    gh.BranchChecksResult
+	revertErr       error
 }
 
 func (w *recordingPromotionWriter) BranchHeadSHA(_ context.Context, branch string) (string, error) {
 	w.calls = append(w.calls, "head:"+branch)
+	if w.mainHeadSHASet {
+		return w.mainHeadSHA, nil
+	}
 	return branch + "-prior-sha", nil
+}
+
+func (w *recordingPromotionWriter) BranchChecks(_ context.Context, branch string) (gh.BranchChecksResult, error) {
+	w.calls = append(w.calls, "checks:"+branch)
+	if strings.TrimSpace(w.branchChecks.Branch) != "" || strings.TrimSpace(w.branchChecks.HeadSHA) != "" || len(w.branchChecks.Checks) > 0 {
+		return w.branchChecks, nil
+	}
+	return gh.BranchChecksResult{
+		Branch:  branch,
+		HeadSHA: "main-sha",
+		Checks:  []gh.Check{{Name: "verify", State: "success", Bucket: "pass"}},
+	}, nil
 }
 
 func (w *recordingPromotionWriter) KickBackFromPreProd(_ context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error) {
@@ -796,6 +958,20 @@ func (w *recordingPromotionWriter) PromotePreProdToMain(_ context.Context, prePr
 	}, nil
 }
 
+func (w *recordingPromotionWriter) RevertProductionMerge(_ context.Context, mainBranch, mergeCommit, priorStableCommit string) (gh.ProductionRevertResult, error) {
+	w.calls = append(w.calls, "revert:"+mainBranch+":"+mergeCommit+":"+priorStableCommit)
+	if w.revertErr != nil {
+		return gh.ProductionRevertResult{}, w.revertErr
+	}
+	return gh.ProductionRevertResult{
+		Branch:            mainBranch,
+		RevertedSHA:       mergeCommit,
+		MergeCommit:       mergeCommit,
+		PriorStableCommit: priorStableCommit,
+		SHA:               "production-revert-sha",
+	}, nil
+}
+
 func (w *recordingPromotionWriter) SyncPreProdFromMain(_ context.Context, preProdBranch string) (gh.PreProdSyncResult, error) {
 	w.calls = append(w.calls, "sync:"+preProdBranch)
 	return gh.PreProdSyncResult{
@@ -822,6 +998,15 @@ func promoteTestParallelRunContract() equivalence.Contract {
 			},
 		},
 	}
+}
+
+func promoteNeedsHumanHasStep(items []PromoteNeedsHuman, step string) bool {
+	for _, item := range items {
+		if item.Step == step {
+			return true
+		}
+	}
+	return false
 }
 
 func promoteTestStatePush(t *testing.T, repo, runID string) StatePushFunc {
