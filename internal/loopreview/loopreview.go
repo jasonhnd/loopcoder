@@ -166,6 +166,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if warnings == nil {
 		warnings = io.Discard
 	}
+	opts.Stderr = warnings
 
 	if opts.PRNumber <= 0 {
 		return Result{}, errors.New("pull request number is required")
@@ -183,6 +184,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
 		BaseBranch:     opts.BaseBranch,
 		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       warnings,
 	})
 	if err != nil {
 		return Result{}, err
@@ -235,6 +237,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
+		Stderr:       warnings,
 		HardCap:      opts.Timeout,
 		StallTimeout: config.DurationSeconds(resilience.Verifier.StallTimeoutSeconds, VerifierStallTimeout),
 		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
@@ -1037,7 +1040,7 @@ func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath 
 	issue, present := loadIssue(ctx, github, pr)
 	inputs.Issue = issue
 	inputs.IssuePresent = present
-	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, opts.BaseBranch)
+	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, opts.BaseBranch, opts.Stderr)
 	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, opts.BaseBranch, specSearchTexts(issue, present, pr))
 	inputs.Spec = classifySpecAbsence(inputs.Spec, opts.BaseBranch, changedFiles, diff)
 	return inputs, nil
@@ -1049,15 +1052,51 @@ type generatedAttributeRule struct {
 	Diff      *bool
 }
 
-func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, baseBranch string) []generatedAttributeRule {
+func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, baseBranch string, warnings io.Writer) []generatedAttributeRule {
 	if strings.TrimSpace(baseBranch) == "" {
 		baseBranch = "main"
 	}
-	content, err := git.Show(ctx, repoPath, "origin/"+baseBranch+":.gitattributes")
-	if err != nil || strings.TrimSpace(content) == "" {
+	revPath := "origin/" + baseBranch + ":.gitattributes"
+	content, err := git.Show(ctx, repoPath, revPath)
+	if err != nil {
+		if isGitPathAbsentError(err, ".gitattributes") {
+			return nil
+		}
+		if warnings == nil {
+			warnings = io.Discard
+		}
+		fmt.Fprintf(warnings, "[loopcoder] warning: generated-file classification via .gitattributes is unavailable from %s: %v; falling back to glob and size heuristics\n", revPath, err)
+		return nil
+	}
+	if strings.TrimSpace(content) == "" {
 		return nil
 	}
 	return parseGeneratedAttributeRules(content)
+}
+
+func isGitPathAbsentError(err error, path string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" || !strings.Contains(text, path) {
+		return false
+	}
+	for _, signal := range []string{
+		"does not exist",
+		"exists on disk, but not in",
+		"did not match any file",
+		"not found in",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGeneratedAttributeRules(content string) []generatedAttributeRule {

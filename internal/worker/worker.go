@@ -282,6 +282,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
 		BaseBranch:     opts.BaseBranch,
 		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       warnings,
 	})
 	if err != nil {
 		return Result{}, err
@@ -290,6 +291,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		LogPath:      logPath,
+		Stderr:       warnings,
 		Model:        opts.Model,
 		Effort:       opts.Effort,
 		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
@@ -585,7 +587,7 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 	}
 
 	started := opts.now()
-	existing := findOpenHarvestPR(ctx, opts.github, opts.opts.IssueNumber, harvestBranch)
+	existing := findOpenHarvestPR(ctx, opts.github, opts.opts.IssueNumber, harvestBranch, opts.warnings)
 	ended := opts.now()
 	if existing != nil {
 		record := buildHarvestConductorAttestation(opts.opts, started, ended)
@@ -740,9 +742,12 @@ func buildHarvestConductorAttestation(opts Options, started, ended time.Time) at
 	}
 }
 
-func findOpenHarvestPR(ctx context.Context, github GitHubClient, issueNumber int, currentHarvestBranch string) *gh.PullRequest {
+func findOpenHarvestPR(ctx context.Context, github GitHubClient, issueNumber int, currentHarvestBranch string, warnings io.Writer) *gh.PullRequest {
 	if github == nil {
 		return nil
+	}
+	if warnings == nil {
+		warnings = io.Discard
 	}
 	if prs, err := github.ListHeadPRs(ctx, currentHarvestBranch); err == nil && len(prs) > 0 {
 		return &gh.PullRequest{
@@ -750,9 +755,12 @@ func findOpenHarvestPR(ctx context.Context, github GitHubClient, issueNumber int
 			URL:         prs[0].URL,
 			HeadRefName: currentHarvestBranch,
 		}
+	} else if err != nil {
+		fmt.Fprintf(warnings, "[loopcoder] warning: harvest idempotency check could not list PRs for head %s: %v; proceeding with harvest, duplicate needs-human PR may result\n", currentHarvestBranch, err)
 	}
 	openPRs, err := github.ListOpenPRs(ctx)
 	if err != nil {
+		fmt.Fprintf(warnings, "[loopcoder] warning: harvest idempotency check could not list open PRs for issue #%d: %v; proceeding with harvest, duplicate needs-human PR may result\n", issueNumber, err)
 		return nil
 	}
 	prefix := fmt.Sprintf("loop/issue-%d-retry-", issueNumber)

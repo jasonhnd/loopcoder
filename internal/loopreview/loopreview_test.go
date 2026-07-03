@@ -501,6 +501,52 @@ func TestGatherInputsParsesGeneratedAttributes(t *testing.T) {
 	}
 }
 
+func TestGatherInputsWarnsWhenGeneratedAttributesGitShowFails(t *testing.T) {
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+		showErrs: map[string]error{
+			"origin/main:.gitattributes": errors.New("git show failed"),
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("internal/foo.go", "+ package foo\n"),
+		files: []string{"internal/foo.go"},
+	}
+	var stderr strings.Builder
+
+	inputs, err := gatherInputs(context.Background(), Deps{Git: fakeGit}, fakeGitHub, t.TempDir(), Options{
+		PRNumber:   152,
+		BaseBranch: "main",
+		Stderr:     &stderr,
+	})
+	if err != nil {
+		t.Fatalf("gatherInputs returned error: %v", err)
+	}
+	if len(inputs.GeneratedAttributeRules) != 0 {
+		t.Fatalf("GeneratedAttributeRules = %#v, want fallback without attribute rules", inputs.GeneratedAttributeRules)
+	}
+	for _, want := range []string{"warning", "generated-file classification via .gitattributes is unavailable", "falling back to glob and size heuristics"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestBuildReviewPacketTruncatesIssueBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.Issue.Body = "keep issue context\n" + strings.Repeat("omitted issue context\n", 40) + "TAIL_ISSUE_SHOULD_NOT_APPEAR\n"
@@ -1197,6 +1243,7 @@ type loopreviewFakeGit struct {
 	removed   bool
 	show      map[string]string
 	showErr   error
+	showErrs  map[string]error
 }
 
 func (f *loopreviewFakeGit) FetchOriginBase(_ context.Context, _ string, baseBranch string) error {
@@ -1220,6 +1267,9 @@ func (f *loopreviewFakeGit) WorktreeRemove(context.Context, string, string) erro
 }
 
 func (f *loopreviewFakeGit) Show(_ context.Context, _ string, revPath string) (string, error) {
+	if err := f.showErrs[revPath]; err != nil {
+		return "", err
+	}
 	if f.showErr != nil {
 		return "", f.showErr
 	}
