@@ -39,6 +39,7 @@ type DispatchWaveOptions struct {
 	Provider       string
 	Model          string
 	Effort         string
+	ConfigFromBase bool
 	ThrottleLimit  int
 	Thresholds     config.ResilienceWorker
 	Budget         config.GuardrailBudget
@@ -356,17 +357,18 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		return result
 	}
 	dispatchResult, err := opts.Dispatch(ctx, worker.Options{
-		RepoPath:    opts.RepoPath,
-		IssueNumber: issueNumber,
-		IssueTitle:  issue.Title,
-		IssueBody:   issue.Body,
-		BaseBranch:  opts.BaseBranch,
-		RunID:       opts.RunID,
-		Attempt:     1,
-		Provider:    opts.Provider,
-		Model:       opts.Model,
-		Effort:      opts.Effort,
-		Stderr:      opts.Stderr,
+		RepoPath:       opts.RepoPath,
+		IssueNumber:    issueNumber,
+		IssueTitle:     issue.Title,
+		IssueBody:      issue.Body,
+		BaseBranch:     opts.BaseBranch,
+		RunID:          opts.RunID,
+		Attempt:        1,
+		Provider:       opts.Provider,
+		Model:          opts.Model,
+		Effort:         opts.Effort,
+		ConfigFromBase: opts.ConfigFromBase,
+		Stderr:         opts.Stderr,
 	})
 	if err != nil {
 		result.Status = DispatchWaveStatusFailed
