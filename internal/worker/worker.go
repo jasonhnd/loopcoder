@@ -659,8 +659,7 @@ func buildHarvestPRTitle(title string, issueNumber int) string {
 
 func buildHarvestPRBody(opts Options, result agent.Result, recoveryBrief string) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "Refs #%d\n", opts.IssueNumber)
-	fmt.Fprintf(&out, "Part of #%d\n\n", opts.IssueNumber)
+	fmt.Fprintf(&out, "Refs #%d\n\n", opts.IssueNumber)
 	fmt.Fprintln(&out, "This needs-human PR was harvested from a hung/killed worker and is possibly incomplete. Human review is required before any merge.")
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "## Recovery brief")

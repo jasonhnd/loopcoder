@@ -619,7 +619,6 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Refs #101",
-		"Part of #101",
 		"needs-human",
 		"harvested from a hung/killed worker",
 		"possibly incomplete",
@@ -637,7 +636,7 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 			t.Fatalf("harvest PR body missing %q:\n%s", want, fakeGitHub.lastPRBody)
 		}
 	}
-	for _, forbidden := range []string{"Closes #101", "closes #101", `"role":"worker"`} {
+	for _, forbidden := range []string{"Part of #101", "Closes #101", "closes #101", `"role":"worker"`} {
 		if strings.Contains(fakeGitHub.lastPRBody, forbidden) {
 			t.Fatalf("harvest PR body contains forbidden %q:\n%s", forbidden, fakeGitHub.lastPRBody)
 		}

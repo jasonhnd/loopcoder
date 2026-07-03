@@ -68,8 +68,6 @@ type worktreeObservation struct {
 	rootErr       error
 }
 
-var timeNow = time.Now
-
 // Run starts cmd, supervises it, and waits until the process exits or is
 // terminated by the parent context, the hard cap, or the optional stall signal.
 //
@@ -149,7 +147,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			res, err := killAndDrain(start, group, cmd.Process, waitCh, OutcomeDeadline, ctx.Err())
 			return res, err
 		case <-stallC:
-			now := timeNow()
+			now := time.Now()
 			currentLog := observeLog(opts.LogPath)
 			currentWorktree := lastWorktree
 			logProgress := currentLog.changedFrom(lastLog)
