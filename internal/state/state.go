@@ -67,18 +67,20 @@ type AttemptRecord struct {
 }
 
 type Event struct {
-	Timestamp string  `json:"ts"`
-	RunID     string  `json:"run_id"`
-	JobID     string  `json:"job_id"`
-	Issue     int     `json:"issue"`
-	Phase     string  `json:"phase"`
-	Status    string  `json:"status"`
-	LogBytes  int64   `json:"log_bytes"`
-	ExitCode  *int    `json:"exit_code"`
-	Error     *string `json:"error"`
-	Event     string  `json:"event,omitempty"`
-	Outcome   string  `json:"outcome,omitempty"`
-	Details   any     `json:"details,omitempty"`
+	Timestamp         string  `json:"ts"`
+	RunID             string  `json:"run_id"`
+	JobID             string  `json:"job_id"`
+	Issue             int     `json:"issue"`
+	Phase             string  `json:"phase"`
+	Status            string  `json:"status"`
+	LogBytes          int64   `json:"log_bytes"`
+	ExitCode          *int    `json:"exit_code"`
+	Error             *string `json:"error"`
+	Event             string  `json:"event,omitempty"`
+	Outcome           string  `json:"outcome,omitempty"`
+	MergeCommit       string  `json:"merge_commit,omitempty"`
+	PriorStableCommit string  `json:"prior_stable_commit,omitempty"`
+	Details           any     `json:"details,omitempty"`
 }
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.

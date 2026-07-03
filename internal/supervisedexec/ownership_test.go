@@ -26,7 +26,7 @@ func TestApplyEnvMarkers(t *testing.T) {
 }
 
 func TestApplyEnvMarkersOmitsEmptyRunIDAndRole(t *testing.T) {
-	cmd := &exec.Cmd{}
+	cmd := &exec.Cmd{Env: []string{}}
 	applyEnvMarkers(cmd, "", "")
 	managed := false
 	for _, e := range cmd.Env {

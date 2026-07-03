@@ -267,6 +267,54 @@ func TestBranchChecksReadsHeadCheckRunsAndStatuses(t *testing.T) {
 	}
 }
 
+func TestBranchHeadSHAReadsRef(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00ls-remote\x00origin\x00refs/heads/main": []byte("main-head-sha\trefs/heads/main\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.BranchHeadSHA(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("BranchHeadSHA returned error: %v", err)
+	}
+	if got != "main-head-sha" {
+		t.Fatalf("BranchHeadSHA = %q, want main-head-sha", got)
+	}
+}
+
+func TestCompareBranchesFetchesAndDiffsRemoteBranches(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00fetch\x00origin\x00+refs/heads/main:refs/remotes/origin/main\x00+refs/heads/pre-prod:refs/remotes/origin/pre-prod": nil,
+			"repo\x00git\x00diff\x00--name-only\x00refs/remotes/origin/main...refs/remotes/origin/pre-prod":                                    []byte("README.md\r\ninternal/orchestration/promote.go\n"),
+			"repo\x00git\x00diff\x00refs/remotes/origin/main...refs/remotes/origin/pre-prod":                                                   []byte("diff --git a/README.md b/README.md\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	files, diff, err := client.CompareBranches(context.Background(), "main", "pre-prod")
+	if err != nil {
+		t.Fatalf("CompareBranches returned error: %v", err)
+	}
+	if !reflect.DeepEqual(files, []string{"README.md", "internal/orchestration/promote.go"}) {
+		t.Fatalf("files = %#v, want compare files", files)
+	}
+	if diff != "diff --git a/README.md b/README.md\n" {
+		t.Fatalf("diff = %q, want git diff output", diff)
+	}
+
+	want := [][]string{
+		{"repo", "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/pre-prod:refs/remotes/origin/pre-prod"},
+		{"repo", "git", "diff", "--name-only", "refs/remotes/origin/main...refs/remotes/origin/pre-prod"},
+		{"repo", "git", "diff", "refs/remotes/origin/main...refs/remotes/origin/pre-prod"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestRevertOnPreProdUsesTemporaryWorktreeAndPushesOnlyPreProd(t *testing.T) {
 	runner := &preProdRevertRunner{}
 	client := NewWithRunner("repo", runner)
@@ -439,6 +487,95 @@ func TestKickBackFromPreProdSkipsAlreadyRevertedCommit(t *testing.T) {
 		if len(call) >= 3 && call[1] == "git" && (call[2] == "revert" || call[2] == "push" || call[2] == "worktree") {
 			t.Fatalf("already-reverted kick-back should not mutate pre-prod, saw call %#v", call)
 		}
+	}
+}
+
+func TestRevertProductionMergeCreatesForwardRevertCommit(t *testing.T) {
+	runner := &productionRevertRunner{}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.RevertProductionMerge(context.Background(), "main", "merge-sha", "prior-stable-sha")
+	if err != nil {
+		t.Fatalf("RevertProductionMerge returned error: %v", err)
+	}
+	if got.Branch != "main" || got.RevertedSHA != "merge-sha" || got.MergeCommit != "merge-sha" || got.PriorStableCommit != "prior-stable-sha" || got.SHA != "production-revert-sha" {
+		t.Fatalf("RevertProductionMerge result = %#v", got)
+	}
+
+	var sawFetch, sawRevert, sawPush bool
+	for _, call := range runner.calls {
+		assertNoDestructiveProductionRevertCommand(t, call)
+		if reflect.DeepEqual(call, []string{"repo", "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"}) {
+			sawFetch = true
+		}
+		if len(call) >= 7 && call[1] == "git" && call[2] == "revert" && reflect.DeepEqual(call[3:], []string{"-m", "1", "--no-edit", "merge-sha"}) {
+			sawRevert = true
+		}
+		if len(call) == 5 && call[1] == "git" && reflect.DeepEqual(call[2:], []string{"push", "origin", "HEAD:main"}) {
+			sawPush = true
+		}
+	}
+	if !sawFetch || !sawRevert || !sawPush {
+		t.Fatalf("calls missing fetch=%t revert=%t push=%t: %#v", sawFetch, sawRevert, sawPush, runner.calls)
+	}
+}
+
+func TestRevertProductionMergeIsIdempotentAfterForwardRevert(t *testing.T) {
+	runner := &productionRevertRunner{}
+	client := NewWithRunner("repo", runner)
+
+	first, err := client.RevertProductionMerge(context.Background(), "main", "merge-sha", "prior-stable-sha")
+	if err != nil {
+		t.Fatalf("first RevertProductionMerge returned error: %v", err)
+	}
+	if first.SHA != "production-revert-sha" {
+		t.Fatalf("first RevertProductionMerge SHA = %q, want production-revert-sha", first.SHA)
+	}
+	second, err := client.RevertProductionMerge(context.Background(), "main", "merge-sha", "prior-stable-sha")
+	if err != nil {
+		t.Fatalf("second RevertProductionMerge returned error: %v", err)
+	}
+	if second.SHA != "production-revert-sha" || second.MergeCommit != "merge-sha" || second.PriorStableCommit != "prior-stable-sha" {
+		t.Fatalf("second RevertProductionMerge result = %#v, want existing revert", second)
+	}
+	var revertCalls, pushCalls int
+	for _, call := range runner.calls {
+		assertNoDestructiveProductionRevertCommand(t, call)
+		if len(call) >= 3 && call[1] == "git" && call[2] == "revert" {
+			revertCalls++
+		}
+		if len(call) == 5 && call[1] == "git" && reflect.DeepEqual(call[2:], []string{"push", "origin", "HEAD:main"}) {
+			pushCalls++
+		}
+	}
+	if revertCalls != 1 || pushCalls != 1 {
+		t.Fatalf("revertCalls=%d pushCalls=%d, want one forward revert and one push: %#v", revertCalls, pushCalls, runner.calls)
+	}
+}
+
+func TestRevertProductionMergeRequiresRecordedTarget(t *testing.T) {
+	tests := []struct {
+		name        string
+		mergeCommit string
+		priorStable string
+		wantErr     string
+	}{
+		{name: "missing-merge", mergeCommit: "", priorStable: "prior-stable-sha", wantErr: "merge commit SHA is required"},
+		{name: "missing-prior", mergeCommit: "merge-sha", priorStable: "", wantErr: "prior stable commit SHA is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &productionRevertRunner{}
+			client := NewWithRunner("repo", runner)
+
+			_, err := client.RevertProductionMerge(context.Background(), "main", tt.mergeCommit, tt.priorStable)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("RevertProductionMerge error = %v, want %q", err, tt.wantErr)
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("calls = %#v, want none", runner.calls)
+			}
+		})
 	}
 }
 
@@ -800,4 +937,56 @@ func (r *preProdKickBackAlreadyRevertedRunner) Run(_ context.Context, dir, name 
 		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
 	}
 	return nil, nil
+}
+
+type productionRevertRunner struct {
+	calls          [][]string
+	existingRevert bool
+	createdRevert  bool
+}
+
+func (r *productionRevertRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
+	call := append([]string{dir, name}, args...)
+	r.calls = append(r.calls, call)
+	if name == "gh" && reflect.DeepEqual(args, []string{"repo", "view", "--json", "nameWithOwner"}) {
+		return []byte(`{"nameWithOwner":"owner/repo"}`), nil
+	}
+	if name != "git" {
+		return nil, nil
+	}
+	if dir == "repo" && reflect.DeepEqual(args, []string{"log", "--format=%H%x00%B%x1e", "refs/remotes/origin/main"}) {
+		if r.createdRevert {
+			return []byte("production-revert-sha\x00Revert \"loopcoder promote pre-prod to main\"\n\nThis reverts commit merge-sha.\x1e"), nil
+		}
+		if r.existingRevert {
+			return []byte("existing-production-revert-sha\x00Revert \"loopcoder promote pre-prod to main\"\n\nThis reverts commit merge-sha.\x1e"), nil
+		}
+		return []byte("merge-sha\x00loopcoder promote pre-prod to main\x1e"), nil
+	}
+	if dir == "repo" && reflect.DeepEqual(args, []string{"rev-parse", "refs/remotes/origin/main"}) {
+		return []byte("merge-sha\n"), nil
+	}
+	if len(args) == 2 && args[0] == "rev-parse" && args[1] == "HEAD" {
+		return []byte("production-revert-sha\n"), nil
+	}
+	if len(args) == 2 && args[0] == "rev-parse" && strings.HasSuffix(args[1], "^{tree}") {
+		return []byte("stable-tree-sha\n"), nil
+	}
+	if reflect.DeepEqual(args, []string{"push", "origin", "HEAD:main"}) {
+		r.createdRevert = true
+		return nil, nil
+	}
+	return nil, nil
+}
+
+func assertNoDestructiveProductionRevertCommand(t *testing.T, call []string) {
+	t.Helper()
+	joined := strings.ToLower(strings.Join(call, "\x00"))
+	if strings.Contains(joined, "reset\x00--hard") || strings.Contains(joined, "reset --hard") {
+		t.Fatalf("production revert used reset --hard: %#v", call)
+	}
+	if strings.Contains(joined, "push\x00-f") || strings.Contains(joined, "push\x00--force") ||
+		strings.Contains(joined, "push -f") || strings.Contains(joined, "push --force") {
+		t.Fatalf("production revert used force push: %#v", call)
+	}
 }

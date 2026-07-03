@@ -314,6 +314,79 @@ func TestAppendEventWritesCompactJSONLine(t *testing.T) {
 	}
 }
 
+func TestEventPromotionCommitFieldsJSONCompatibility(t *testing.T) {
+	tests := []struct {
+		name              string
+		event             Event
+		inputJSON         string
+		wantMergeCommit   string
+		wantPriorStable   string
+		wantAbsentOnWrite bool
+	}{
+		{
+			name: "omitempty when empty",
+			event: Event{
+				Timestamp: "2026-07-03T00:00:00Z",
+				RunID:     "run-test",
+				JobID:     "promote",
+				Phase:     "promote",
+				Status:    "promoted",
+				LogBytes:  0,
+			},
+			wantAbsentOnWrite: true,
+		},
+		{
+			name: "populated round trip",
+			event: Event{
+				Timestamp:         "2026-07-03T00:00:00Z",
+				RunID:             "run-test",
+				JobID:             "promote",
+				Phase:             "promote",
+				Status:            "promoted",
+				LogBytes:          0,
+				MergeCommit:       "merge-sha",
+				PriorStableCommit: "prior-sha",
+			},
+			wantMergeCommit: "merge-sha",
+			wantPriorStable: "prior-sha",
+		},
+		{
+			name:      "legacy event without fields",
+			inputJSON: `{"ts":"2026-07-03T00:00:00Z","run_id":"run-test","job_id":"promote","issue":0,"phase":"promote","status":"promoted","log_bytes":0}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte(tt.inputJSON)
+			if tt.inputJSON == "" {
+				var err error
+				data, err = json.Marshal(tt.event)
+				if err != nil {
+					t.Fatalf("Marshal Event returned error: %v", err)
+				}
+			}
+			if tt.wantAbsentOnWrite {
+				text := string(data)
+				if strings.Contains(text, "merge_commit") || strings.Contains(text, "prior_stable_commit") {
+					t.Fatalf("empty promotion commit fields were not omitted: %s", text)
+				}
+			}
+
+			var got Event
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("Unmarshal Event returned error: %v", err)
+			}
+			if got.MergeCommit != tt.wantMergeCommit {
+				t.Fatalf("MergeCommit = %q, want %q", got.MergeCommit, tt.wantMergeCommit)
+			}
+			if got.PriorStableCommit != tt.wantPriorStable {
+				t.Fatalf("PriorStableCommit = %q, want %q", got.PriorStableCommit, tt.wantPriorStable)
+			}
+		})
+	}
+}
+
 func validAttemptAttestation(issue int, totalTokens int64) attestation.AttestationRecord {
 	return attestation.AttestationRecord{
 		Role:        attestation.RoleWorker,

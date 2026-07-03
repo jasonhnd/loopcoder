@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-03
+
+### Changed
+
+- **E2 auto-promote to production (default-on)** per [`docs/specs/0403-e2-auto-promote-production.md`](docs/specs/0403-e2-auto-promote-production.md): the default production promotion gate is now `auto`. An unset `adapters.gate` normalizes to `auto`, and newly scaffolded `.delivery.yml` files set `gate: auto`.
+- The `auto` gate is deterministic, conjunctive, and veto-only over CI-green, `loopreview` pass, configured evidence present, and an independently re-evaluated red-line floor. Missing, unknown, or failing inputs still fail closed to `needs-human`; the policy can only add vetoes, never lower the floor.
+- Production auto-rollback is deterministic and never LLM-driven: auto-promoted production merges record `merge_commit` and `prior_stable_commit`, and a failed post-promote check reverts production to the recorded prior-stable SHA.
+- `human-merge` remains fully supported as the explicit opt-out for projects where humans choose production merges.
+- loopcoder itself remains explicitly configured with `gate: human-merge`; 0.4.1 is human-gated for self-hosting safety even though new projects default to `auto`.
+
 ## [0.4.0] - 2026-07-03
 
 The autonomous delivery loop, per [`docs/specs/0161-autonomous-delivery-loop.md`](docs/specs/0161-autonomous-delivery-loop.md). A human touches only two ends -- approving the plan and promoting to production -- while a deterministic orchestrator (`tick`) drives three LLM nodes (Planner = `compile`, Generator = worker, Evaluator = `loopreview`) around the loop in between.

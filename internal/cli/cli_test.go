@@ -1703,6 +1703,10 @@ adapters:
   gate: human-merge
 environment:
   pre_prod_branch: staging
+ci:
+  checks:
+    - verify
+    - go
 `), 0o644); err != nil {
 		t.Fatalf("write delivery config: %v", err)
 	}
@@ -1723,11 +1727,17 @@ environment:
 			if !reflect.DeepEqual(opts.KickBackItems, []string{"#101", "merge-sha"}) {
 				t.Fatalf("kick-back items = %#v", opts.KickBackItems)
 			}
+			if !reflect.DeepEqual(opts.RequiredChecks, []string{"verify", "go"}) {
+				t.Fatalf("promote required checks = %#v", opts.RequiredChecks)
+			}
 			if opts.Writer == nil {
 				t.Fatal("promotion writer was not set")
 			}
 			if opts.Clock == nil || opts.StatePush == nil {
 				t.Fatalf("promote opts missing clock or state push: %#v", opts)
+			}
+			if opts.ResolveAutoGate == nil {
+				t.Fatal("promote auto-gate resolver was not set")
 			}
 			return orchestration.PromoteReport{
 				Version:       orchestration.PromoteReportVersion,
@@ -3147,6 +3157,22 @@ func int64TestPtr(value int64) *int64 {
 
 type cliFakePromotionWriter struct{}
 
+func (cliFakePromotionWriter) BranchHeadSHA(context.Context, string) (string, error) {
+	return "main-prior-sha", nil
+}
+
+func (cliFakePromotionWriter) BranchChecks(context.Context, string) (gh.BranchChecksResult, error) {
+	return gh.BranchChecksResult{
+		Branch:  "pre-prod",
+		HeadSHA: "preprod-sha",
+		Checks:  []gh.Check{{Name: "verify", State: "success", Bucket: "pass"}},
+	}, nil
+}
+
+func (cliFakePromotionWriter) CompareBranches(context.Context, string, string) ([]string, string, error) {
+	return []string{"README.md"}, "diff --git a/README.md b/README.md\n", nil
+}
+
 func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, string) (gh.PreProdKickBackResult, error) {
 	return gh.PreProdKickBackResult{}, nil
 }
@@ -3157,6 +3183,10 @@ func (cliFakePromotionWriter) RouteKickBackToNeedsHuman(context.Context, int) (g
 
 func (cliFakePromotionWriter) PromotePreProdToMain(context.Context, string) (gh.MainPromotionResult, error) {
 	return gh.MainPromotionResult{}, nil
+}
+
+func (cliFakePromotionWriter) RevertProductionMerge(context.Context, string, string, string) (gh.ProductionRevertResult, error) {
+	return gh.ProductionRevertResult{}, nil
 }
 
 func (cliFakePromotionWriter) SyncPreProdFromMain(context.Context, string) (gh.PreProdSyncResult, error) {

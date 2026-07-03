@@ -43,9 +43,13 @@ type Writer interface {
 // intentionally separate from Writer so unattended tick dependencies cannot gain
 // a main-merge method by interface widening.
 type ProductionWriter interface {
+	BranchHeadSHA(ctx context.Context, branch string) (string, error)
+	BranchChecks(ctx context.Context, branch string) (BranchChecksResult, error)
+	CompareBranches(ctx context.Context, base, head string) (files []string, diff string, err error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error)
+	RevertProductionMerge(ctx context.Context, mainBranch, mergeCommit, priorStableCommit string) (ProductionRevertResult, error)
 	SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error)
 }
 
@@ -134,6 +138,15 @@ type PreProdRevertResult struct {
 	RevertedSHA string `json:"reverted_sha"`
 	SHA         string `json:"sha,omitempty"`
 	URL         string `json:"url,omitempty"`
+}
+
+type ProductionRevertResult struct {
+	Branch            string `json:"branch"`
+	RevertedSHA       string `json:"reverted_sha"`
+	MergeCommit       string `json:"merge_commit,omitempty"`
+	PriorStableCommit string `json:"prior_stable_commit,omitempty"`
+	SHA               string `json:"sha,omitempty"`
+	URL               string `json:"url,omitempty"`
 }
 
 type PreProdKickBackResult struct {
@@ -303,14 +316,7 @@ func (c *CLI) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
-	files := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			files = append(files, trimmed)
-		}
-	}
-	return files, nil
+	return parseNameOnlyOutput(output), nil
 }
 
 func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {
@@ -357,6 +363,41 @@ func (c *CLI) BranchChecks(ctx context.Context, branch string) (BranchChecksResu
 		HeadSHA: sha,
 		Checks:  checks,
 	}, nil
+}
+
+func (c *CLI) BranchHeadSHA(ctx context.Context, branch string) (string, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", fmt.Errorf("branch is required")
+	}
+	return c.branchHeadSHA(ctx, branch)
+}
+
+func (c *CLI) CompareBranches(ctx context.Context, base, head string) ([]string, string, error) {
+	base = strings.TrimSpace(base)
+	head = strings.TrimSpace(head)
+	if base == "" {
+		return nil, "", fmt.Errorf("base branch is required")
+	}
+	if head == "" {
+		return nil, "", fmt.Errorf("head branch is required")
+	}
+	if _, err := c.run(ctx, "git", "fetch", "origin",
+		"+refs/heads/"+base+":refs/remotes/origin/"+base,
+		"+refs/heads/"+head+":refs/remotes/origin/"+head,
+	); err != nil {
+		return nil, "", err
+	}
+	compare := "refs/remotes/origin/" + base + "...refs/remotes/origin/" + head
+	nameOnly, err := c.run(ctx, "git", "diff", "--name-only", compare)
+	if err != nil {
+		return nil, "", err
+	}
+	diff, err := c.run(ctx, "git", "diff", compare)
+	if err != nil {
+		return nil, "", err
+	}
+	return parseNameOnlyOutput(nameOnly), string(diff), nil
 }
 
 func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {
@@ -552,6 +593,26 @@ func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (M
 	}, nil
 }
 
+func (c *CLI) RevertProductionMerge(ctx context.Context, mainBranch, mergeCommit, priorStableCommit string) (ProductionRevertResult, error) {
+	mainBranch = strings.TrimSpace(mainBranch)
+	mergeCommit = strings.TrimSpace(mergeCommit)
+	priorStableCommit = strings.TrimSpace(priorStableCommit)
+	if mainBranch == "" {
+		return ProductionRevertResult{}, fmt.Errorf("main branch is required")
+	}
+	if !isReservedProductionBranch(mainBranch) {
+		return ProductionRevertResult{}, fmt.Errorf("branch %q is not a production branch", mainBranch)
+	}
+	if mergeCommit == "" {
+		return ProductionRevertResult{}, fmt.Errorf("merge commit SHA is required")
+	}
+	if priorStableCommit == "" {
+		return ProductionRevertResult{}, fmt.Errorf("prior stable commit SHA is required")
+	}
+
+	return c.revertProductionCommit(ctx, mainBranch, mergeCommit, priorStableCommit)
+}
+
 func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error) {
 	preProdBranch = strings.TrimSpace(preProdBranch)
 	if preProdBranch == "" {
@@ -579,6 +640,85 @@ func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (Pr
 		MainBranch:    "main",
 		SHA:           sha,
 		URL:           commitURL(ctx, c, sha),
+	}, nil
+}
+
+func (c *CLI) revertProductionCommit(ctx context.Context, mainBranch, mergeCommit, priorStableCommit string) (ProductionRevertResult, error) {
+	refspec := "+refs/heads/" + mainBranch + ":refs/remotes/origin/" + mainBranch
+	if _, err := c.run(ctx, "git", "fetch", "origin", refspec); err != nil {
+		return ProductionRevertResult{}, err
+	}
+
+	if revertSHA, err := c.findExistingProductionRevert(ctx, mainBranch, mergeCommit); err != nil {
+		return ProductionRevertResult{}, err
+	} else if revertSHA != "" {
+		if err := c.validateCommitTreesMatch(ctx, c.repoPath, revertSHA, priorStableCommit); err != nil {
+			return ProductionRevertResult{}, err
+		}
+		return ProductionRevertResult{
+			Branch:            mainBranch,
+			RevertedSHA:       mergeCommit,
+			MergeCommit:       mergeCommit,
+			PriorStableCommit: priorStableCommit,
+			SHA:               revertSHA,
+			URL:               commitURL(ctx, c, revertSHA),
+		}, nil
+	}
+
+	branchHead, err := c.remoteBranchHead(ctx, mainBranch)
+	if err != nil {
+		return ProductionRevertResult{}, err
+	}
+	if !sameGitSHA(branchHead, mergeCommit) {
+		return ProductionRevertResult{}, fmt.Errorf("%s head %s is not the just-promoted merge commit %s", mainBranch, branchHead, mergeCommit)
+	}
+
+	worktree, err := os.MkdirTemp("", "loopcoder-production-revert-*")
+	if err != nil {
+		return ProductionRevertResult{}, fmt.Errorf("create temporary production revert worktree: %w", err)
+	}
+	if err := os.RemoveAll(worktree); err != nil {
+		return ProductionRevertResult{}, fmt.Errorf("prepare temporary production revert worktree path: %w", err)
+	}
+	defer os.RemoveAll(worktree)
+
+	addedWorktree := false
+	defer func() {
+		if addedWorktree {
+			_, _ = c.run(ctx, "git", "worktree", "remove", "--force", worktree)
+		}
+	}()
+
+	if _, err := c.run(ctx, "git", "worktree", "add", "--detach", worktree, "refs/remotes/origin/"+mainBranch); err != nil {
+		return ProductionRevertResult{}, err
+	}
+	addedWorktree = true
+
+	if _, err := c.runner.Run(ctx, worktree, "git", "revert", "-m", "1", "--no-edit", mergeCommit); err != nil {
+		return ProductionRevertResult{}, err
+	}
+	revertSHABytes, err := c.runner.Run(ctx, worktree, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return ProductionRevertResult{}, err
+	}
+	revertSHA := strings.TrimSpace(string(revertSHABytes))
+	if revertSHA == "" {
+		return ProductionRevertResult{}, fmt.Errorf("production revert produced an empty commit SHA")
+	}
+	if err := c.validateCommitTreesMatch(ctx, worktree, "HEAD", priorStableCommit); err != nil {
+		return ProductionRevertResult{}, err
+	}
+	if _, err := c.runner.Run(ctx, worktree, "git", "push", "origin", "HEAD:"+mainBranch); err != nil {
+		return ProductionRevertResult{}, err
+	}
+
+	return ProductionRevertResult{
+		Branch:            mainBranch,
+		RevertedSHA:       mergeCommit,
+		MergeCommit:       mergeCommit,
+		PriorStableCommit: priorStableCommit,
+		SHA:               revertSHA,
+		URL:               commitURL(ctx, c, revertSHA),
 	}, nil
 }
 
@@ -690,6 +830,14 @@ func (c *CLI) findExistingPreProdRevert(ctx context.Context, preProdBranch, merg
 	return existingRevertSHAForCommit(output, mergeSHA), nil
 }
 
+func (c *CLI) findExistingProductionRevert(ctx context.Context, mainBranch, mergeSHA string) (string, error) {
+	output, err := c.run(ctx, "git", "log", "--format=%H%x00%B%x1e", "refs/remotes/origin/"+mainBranch)
+	if err != nil {
+		return "", err
+	}
+	return existingRevertSHAForCommit(output, mergeSHA), nil
+}
+
 func existingRevertSHAForCommit(output []byte, mergeSHA string) string {
 	for _, record := range strings.Split(string(output), "\x1e") {
 		record = strings.TrimSpace(record)
@@ -725,6 +873,45 @@ func revertMessageTargetsCommit(message, mergeSHA string) bool {
 		}
 	}
 	return false
+}
+
+func (c *CLI) remoteBranchHead(ctx context.Context, branch string) (string, error) {
+	output, err := c.run(ctx, "git", "rev-parse", "refs/remotes/origin/"+branch)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(string(output))
+	if sha == "" {
+		return "", fmt.Errorf("branch %q resolved to an empty SHA", branch)
+	}
+	return sha, nil
+}
+
+func (c *CLI) validateCommitTreesMatch(ctx context.Context, dir, revertedCommit, priorStableCommit string) error {
+	revertedTree, err := c.commitTree(ctx, dir, revertedCommit)
+	if err != nil {
+		return fmt.Errorf("read production revert tree: %w", err)
+	}
+	priorTree, err := c.commitTree(ctx, dir, priorStableCommit)
+	if err != nil {
+		return fmt.Errorf("read prior stable tree: %w", err)
+	}
+	if !sameGitSHA(revertedTree, priorTree) {
+		return fmt.Errorf("production revert tree %s does not match prior stable tree %s", revertedTree, priorTree)
+	}
+	return nil
+}
+
+func (c *CLI) commitTree(ctx context.Context, dir, rev string) (string, error) {
+	output, err := c.runner.Run(ctx, dir, "git", "rev-parse", strings.TrimSpace(rev)+"^{tree}")
+	if err != nil {
+		return "", err
+	}
+	tree := strings.TrimSpace(string(output))
+	if tree == "" {
+		return "", fmt.Errorf("commit %q resolved to an empty tree", rev)
+	}
+	return tree, nil
 }
 
 func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []string) (Issue, error) {
@@ -947,6 +1134,17 @@ func trimToJSON(output []byte) []byte {
 		}
 	}
 	return []byte(strings.TrimSpace(text))
+}
+
+func parseNameOnlyOutput(output []byte) []string {
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
+	files := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			files = append(files, trimmed)
+		}
+	}
+	return files
 }
 
 var githubRemotePattern = regexp.MustCompile(`github\.com[:/]([^/]+)/(.+?)(?:\.git)?$`)

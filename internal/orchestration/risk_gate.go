@@ -46,6 +46,10 @@ type PreProdHealthReader interface {
 	BranchChecks(ctx context.Context, branch string) (gh.BranchChecksResult, error)
 }
 
+type BranchHeadReader interface {
+	BranchHeadSHA(ctx context.Context, branch string) (string, error)
+}
+
 type RiskGateFunc func(ctx context.Context, opts RiskGateOptions) (RiskGateDecision, error)
 
 type RiskGateOptions struct {
@@ -306,6 +310,11 @@ func corePathRedLines(changedFiles []string) []RiskRedLine {
 		Category: RiskRedLineCore,
 		Detail:   "loopcoder core paths changed: " + strings.Join(matches, ", ") + "; human rebuild and tick restart required before changes take effect",
 	}}
+}
+
+func PromotionRedLinesClean(files []string, diff string) bool {
+	return len(destructiveRedLines(diff)) == 0 &&
+		len(corePathRedLines(normalizeChangedFiles(files))) == 0
 }
 
 func isLoopcoderCorePath(file string) bool {
