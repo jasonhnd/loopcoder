@@ -22,9 +22,9 @@ need
   -> ready-set / dispatch-wave / dispatch
   -> worker-created pull requests
   -> loopreview + hosted checks + local gates
+  -> tick integrates clean work to pre-prod
+  -> promote auto-gates production by default
   -> chat progress and final report
-  -> user names PRs to merge
-  -> gh pr merge from the conductor session
 ```
 
 GitHub issues, labels, PRs, branches, and checks remain the delivery source of
@@ -69,7 +69,8 @@ incomplete attestation, or an unreadable referenced spec become `needs-human`.
 
 The verifier provider should differ from the worker provider. If the invoked
 verifier matches `.delivery.yml`'s worker provider, the CLI emits an advisory
-warning and still proceeds because human merge remains the final gate.
+warning and still proceeds; verifier independence remains important because the
+default production gate consumes the verifier verdict.
 
 As of the 0.3.3 provider proof, `claude` and `codex` are verified
 `loopreview` providers in the mechanism sense: both providers returned a valid
@@ -95,13 +96,15 @@ loopcoder is organized around stable responsibilities with native adapters:
 | VcsHost | Open PRs, read diffs/checks, and merge named PRs | GitHub via `gh` |
 | Verifier | Review PRs against issue, diff, checks, and spec | `loopcoder loopreview` read-only provider invocation |
 | LocalGate | Run configured local tests/typecheck/build commands | `loopcoder verify-local` |
-| Gate | Decide whether a PR may merge | Human merge gate; user names PRs |
+| Gate | Decide whether pre-prod may promote to production | `auto` by default; `human-merge` opt-out |
 | Reporter | Surface progress, verdicts, failures, and final status | The conductor chat |
 
 `.delivery.yml` selects per-repo defaults such as base branch, worker provider,
-verifier provider, required hosted checks, local command gates, and resilience
-thresholds. Optional model and effort values are passed only when the user or
-configuration explicitly supplies them.
+verifier provider, promotion gate, required hosted checks, local command gates,
+and resilience thresholds. Optional model and effort values are passed only when
+the user or configuration explicitly supplies them. The promotion gate defaults
+to `auto`; `human-merge` is the explicit opt-out for projects where humans choose
+production merges.
 
 ## State Model
 
@@ -125,7 +128,7 @@ recovery context, and duplicate-dispatch risk.
 
 Current orchestration is a conductor-led, binary-assisted loop. `SKILL.md`
 defines the doc-first sequence, issue drafting, human approval, dispatch,
-verification folding, reporting, and human merge gate. The binary provides the
+verification folding, reporting, and promotion gate. The binary provides the
 mechanical pieces: `ready-set` classifies open issues, `dispatch` runs one
 worker, `dispatch-wave` preflights and dispatches selected ready issues with a
 shared run id and throttle limit, and `resume` reconciles GitHub plus local run
@@ -156,6 +159,15 @@ to `needs-human`. After a pre-prod merge, `tick` reads the configured CI checks
 on the pre-prod branch head; if that head is the just-created merge commit and a
 required check is red, `tick` reverts the commit on pre-prod and records the PR
 as `needs-human`. No `tick` path can merge to `main`.
+
+Production promotion is the separate `promote` step. With the default
+`adapters.gate: auto`, it auto-promotes only when required CI is green,
+`loopreview` passed, configured evidence is present, and the red-line floor is
+clean; missing or unknown inputs fail closed to `needs-human`. Auto promotion
+records `merge_commit` and `prior_stable_commit`, then deterministically reverts
+production to the recorded prior-stable SHA if post-promote checks fail. Setting
+`adapters.gate: human-merge` keeps the old human-directed production promotion
+behavior.
 
 ### Resilience
 

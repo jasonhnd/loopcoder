@@ -4,7 +4,7 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.4.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.4.1-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
@@ -15,9 +15,9 @@
 
 ## What it is
 
-loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches provider-pluggable workers in isolated git worktrees, opens pull requests, runs an independent read-only verifier, and leaves the merge to you.
+loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches provider-pluggable workers in isolated git worktrees, opens pull requests, runs an independent read-only verifier, and auto-promotes qualifying work to production by default.
 
-It kills the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. You stay the merge authority. Repo-facing artifacts and worker summaries are written in English.
+It kills the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. Set `adapters.gate: human-merge` when you want humans to choose production merges explicitly. Repo-facing artifacts and worker summaries are written in English.
 
 ## The loop
 
@@ -27,16 +27,19 @@ flowchart LR
   plan --> dispatch[dispatch workers<br/>codex / claude / gemini exp.]
   dispatch --> pr[pull requests]
   pr --> review[loopreview verifier<br/>read-only verdict + required checks]
-  review --> gate{{you merge}}
-  gate -. next layer .-> plan
+  review --> preprod[pre-prod]
+  preprod --> gate{{auto gate<br/>or human-merge opt-out}}
+  gate --> prod[production]
+  prod -. next layer .-> plan
 ```
 
 The conductor is a configured agent session. The worker defaults to `codex`;
-`codex` and `claude` are the verified worker providers for v0.3.7. The
+`codex` and `claude` are the verified worker providers. The
 `gemini` worker adapter is present and registered, but experimental and
 unverified end-to-end because the Gemini CLI was not usable in the development
 environment. The verifier is configured separately and should normally differ
-from the worker. The gate is always you.
+from the worker. The production promotion gate defaults to `auto`; set
+`adapters.gate: human-merge` to opt out.
 
 ## What it looks like
 
@@ -47,7 +50,7 @@ you   > /loopcoder add a /healthz endpoint and a test, behind a feature flag
 loop  > plan: #41 endpoint, #42 test (blocked-by #41). dispatch the ready set? [y]
 loop  > #41 -> worktree -> codex -> PR #43   checks green   verdict: pass
 loop  > #41 merged; #42 ready -> PR #44   verdict: pass
-loop  > done. 2 PRs, you merged both, 0 blocked.
+loop  > done. 2 PRs promoted, 0 blocked.
 ```
 
 ## Install
@@ -87,7 +90,7 @@ Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell. 
 
 ## Usage
 
-- In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; you name what to merge.
+- In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; production promotion is automatic by default when the gate passes, with `human-merge` available as an explicit opt-out.
 - The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
 
 ```bash
@@ -123,14 +126,14 @@ delivery or merge turn finishes. Install them into project
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into `loopcoder status`, and reports progress. It never writes the code itself.
 - Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh, isolated git worktree, then opens a PR. The verified worker providers are `codex` (default) and `claude`; `gemini` is registered but experimental/unverified.
 - Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status when the verifier completes. Its bounded review packet, timeout safety net, and provider attestation are verified for `codex` and `claude`; a slow, hung, malformed, or incomplete verifier still degrades to `needs-human`. `gemini` verification remains unverified.
-- Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. Main/production remains human-only.
-- Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and human production-merge gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, and `verifier`; `verifier == worker` is advisory-only but should be avoided for author-bias reduction.
+- Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step defaults to `gate: auto`, which auto-promotes to production only when CI is green, `loopreview` passed, configured evidence is present, and the red-line floor is clean; production auto-rollback deterministically reverts to the recorded prior-stable SHA if post-promote checks fail.
+- Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and production promotion gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, `verifier`, and `gate`; `gate: human-merge` is the explicit opt-out from default auto promotion, and `verifier == worker` is advisory-only but should be avoided for author-bias reduction.
 - Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
 - Cross-platform: one Go binary; providers run through native adapters, and worktree creation is serialized with a cross-platform file lock.
 
 ## Why loopcoder
 
-- Main stays an explicit human gate; unattended `tick` integration is limited to reversible pre-prod.
+- Production promotion defaults to `auto`, with a deterministic conjunctive gate, production rollback to the recorded prior-stable SHA, and `human-merge` as the explicit opt-out.
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, with `codex` and `claude` provider verification proven by real smoke runs.
@@ -156,7 +159,7 @@ delivery or merge turn finishes. Install them into project
 
 ## Status
 
-v0.3.9 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview` with bounded review packets and a timeout safety net, `.delivery.yml` role slots including a pinned Claude verifier model and effort, human-merge gate, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The `conductor-attest` gate applies only to delivery or merge turns, blocks at most once, and honors the `stop_hook_active` escape valve, so it cannot loop or block ordinary planning turns. `loopcoder skill install` and `loopcoder upgrade` migrate stale `node hooks/*.js` entries to the binary command and write a gitignored `.loopcoder/conductor-workspace` marker, and `loopcoder doctor` verifies the hook command form and that `loopcoder` resolves on `PATH`. Stale installed conductor skills can be refreshed by install/upgrade/doctor flows, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` mechanism proof exists for `codex` and `claude`, and required identity, usage, or guardrail evidence fails closed. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation plus a background or cloud conductor tick remain documented targets rather than current behavior.
+v0.4.1 is the current cross-platform native Go CLI: provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview` with bounded review packets and a timeout safety net, `.delivery.yml` role slots including a pinned Claude verifier model and effort, default-on `auto` production promotion with `human-merge` opt-out, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Auto promotion is backed by a deterministic conjunctive gate over CI-green / loopreview-pass / evidence-present / red-line-clean signals, first-class ledgered revert-target SHAs, and deterministic production rollback to the recorded prior-stable SHA. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The `conductor-attest` gate applies only to delivery or merge turns, blocks at most once, and honors the `stop_hook_active` escape valve, so it cannot loop or block ordinary planning turns. `loopcoder skill install` and `loopcoder upgrade` migrate stale `node hooks/*.js` entries to the binary command and write a gitignored `.loopcoder/conductor-workspace` marker, and `loopcoder doctor` verifies the hook command form and that `loopcoder` resolves on `PATH`. Stale installed conductor skills can be refreshed by install/upgrade/doctor flows, the attestation layer is verified end-to-end on `codex` and `claude`, `loopreview` mechanism proof exists for `codex` and `claude`, and required identity, usage, or guardrail evidence fails closed. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation remains a documented target rather than current behavior. loopcoder's own repository remains explicitly configured with `gate: human-merge` for self-hosting safety.
 
 ## License
 

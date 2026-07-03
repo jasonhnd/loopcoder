@@ -43,6 +43,8 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		"work_items: github",
 		"worker: codex",
 		"verifier: claude",
+		"gate: auto",
+		"set human-merge to opt out",
 		"pre_prod_branch: pre-prod",
 		"checks: []",
 		"# evidence:",

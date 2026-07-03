@@ -73,7 +73,8 @@ push access.
    ```
 
    The conductor plans the work, dispatches workers, runs `loopreview`, and
-   reports merge-ready pull requests. You remain the merge gate.
+   reports promotion status. Production promotion is automatic by default when
+   the gate passes; set `adapters.gate: human-merge` to opt out.
 
 ## Prerequisites
 
@@ -235,11 +236,11 @@ its own global configuration.
 ## Per-Repo Setup
 
 Use `loopcoder init` or manually add a `.delivery.yml` file at the repository
-root. If it is absent, loopcoder uses the v1 defaults from the current design:
-GitHub issues, git worktrees, the Codex worker adapter, GitHub
-PRs/checks/merges, independent `loopreview` verification, pre-prod-only
-auto-integration for clean `tick` PRs, human production merge gating, and chat
-reporting.
+root. If it is absent, loopcoder uses the current defaults: GitHub issues, git
+worktrees, the Codex worker adapter, GitHub PRs/checks/merges, independent
+`loopreview` verification, pre-prod-only auto-integration for clean `tick` PRs,
+default `auto` production promotion, and chat reporting. Use `gate:
+human-merge` when a project needs humans to choose production merges explicitly.
 
 The current example is:
 
@@ -252,7 +253,7 @@ adapters:
   worker: codex           # Default worker provider.
   vcs: github             # GitHub hosts PRs and checks.
   verifier: claude        # Should differ from worker; provider registry key.
-  gate: human-merge       # Humans choose what merges.
+  gate: auto              # Default-on production promotion; set human-merge to opt out so humans choose what merges.
 worker:
   # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.
   # model:
@@ -261,7 +262,7 @@ worker:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
 environment:
-  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.
+  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; promote is the separate production step.
 # evidence:
 #   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.
 #   website:
@@ -287,7 +288,12 @@ report:
 
 `environment.pre_prod_branch` defaults to `pre-prod`. If that branch is absent,
 empty, reserved as `main`/production, or cannot accept the merge, `tick` skips
-auto-merge, records `needs-human`, and leaves production untouched.
+auto-merge, records `needs-human`, and leaves production untouched. Promotion to
+production remains a separate `promote` step: with the default `gate: auto`, it
+auto-promotes only when required CI is green, `loopreview` passed, configured
+evidence is present, and the red-line floor is clean. A failed post-promote
+check triggers deterministic rollback to the recorded `prior_stable_commit`.
+`gate: human-merge` keeps the old explicit human promotion behavior.
 
 `evidence` is optional. When present, it is keyed by project type (`website`,
 `cli`, `library`, or `app`) and supports simple proof fields such as
@@ -344,9 +350,12 @@ For compatibility signals such as `min_loopcoder_version`, see
    just-created merge commit and a required check is red, `tick` reverts that
    commit on pre-prod and records the PR as `needs-human`.
 
-8. You name which pre-prod batch or PRs to promote to production/main.
-   loopcoder merges only those named targets by running the human-directed merge
-   path; `tick` never auto-merges to `main`.
+8. `loopcoder promote` advances the pre-prod batch to production/main. With the
+   default `gate: auto`, promotion happens only after the deterministic gate has
+   CI-green, verifier-pass, evidence-present, and red-line-clean signals, and it
+   records rollback SHAs before merging. With `gate: human-merge`, you name the
+   pre-prod batch or PRs to promote and loopcoder uses the explicit human merge
+   path. `tick` never auto-merges to `main`.
 
 ## Version And Doctor
 
