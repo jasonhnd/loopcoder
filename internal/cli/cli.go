@@ -1420,16 +1420,28 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 		preProdBranch = "pre-prod"
 	}
 
+	writer := deps.NewPromoteWriter(resolvedRepo)
+	resolveAutoGate := func(ctx context.Context) (*orchestration.AutoGateInputs, error) {
+		return orchestration.ResolvePromoteAutoGate(ctx, orchestration.AutoGateResolverOptions{
+			Writer:             writer,
+			RepoPath:           resolvedRepo,
+			PreProdBranch:      preProdBranch,
+			RequiredChecks:     cfg.CI.Checks,
+			ConfiguredEvidence: cfg.Evidence.Artifacts(),
+		})
+	}
+
 	report, err := deps.Promote(context.Background(), orchestration.PromoteOptions{
-		Writer:         deps.NewPromoteWriter(resolvedRepo),
-		RepoPath:       resolvedRepo,
-		RunID:          runID,
-		PreProdBranch:  preProdBranch,
-		Gate:           cfg.Adapters.Gate,
-		KickBackItems:  []string(kickBack),
-		RequiredChecks: cfg.CI.Checks,
-		Clock:          deps.Now,
-		StatePush:      deps.StatePush,
+		Writer:          writer,
+		RepoPath:        resolvedRepo,
+		RunID:           runID,
+		PreProdBranch:   preProdBranch,
+		Gate:            cfg.Adapters.Gate,
+		KickBackItems:   []string(kickBack),
+		ResolveAutoGate: resolveAutoGate,
+		RequiredChecks:  cfg.CI.Checks,
+		Clock:           deps.Now,
+		StatePush:       deps.StatePush,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)

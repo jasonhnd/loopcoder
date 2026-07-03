@@ -284,6 +284,37 @@ func TestBranchHeadSHAReadsRef(t *testing.T) {
 	}
 }
 
+func TestCompareBranchesFetchesAndDiffsRemoteBranches(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00git\x00fetch\x00origin\x00+refs/heads/main:refs/remotes/origin/main\x00+refs/heads/pre-prod:refs/remotes/origin/pre-prod": nil,
+			"repo\x00git\x00diff\x00--name-only\x00refs/remotes/origin/main...refs/remotes/origin/pre-prod":                                    []byte("README.md\r\ninternal/orchestration/promote.go\n"),
+			"repo\x00git\x00diff\x00refs/remotes/origin/main...refs/remotes/origin/pre-prod":                                                   []byte("diff --git a/README.md b/README.md\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	files, diff, err := client.CompareBranches(context.Background(), "main", "pre-prod")
+	if err != nil {
+		t.Fatalf("CompareBranches returned error: %v", err)
+	}
+	if !reflect.DeepEqual(files, []string{"README.md", "internal/orchestration/promote.go"}) {
+		t.Fatalf("files = %#v, want compare files", files)
+	}
+	if diff != "diff --git a/README.md b/README.md\n" {
+		t.Fatalf("diff = %q, want git diff output", diff)
+	}
+
+	want := [][]string{
+		{"repo", "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/pre-prod:refs/remotes/origin/pre-prod"},
+		{"repo", "git", "diff", "--name-only", "refs/remotes/origin/main...refs/remotes/origin/pre-prod"},
+		{"repo", "git", "diff", "refs/remotes/origin/main...refs/remotes/origin/pre-prod"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestRevertOnPreProdUsesTemporaryWorktreeAndPushesOnlyPreProd(t *testing.T) {
 	runner := &preProdRevertRunner{}
 	client := NewWithRunner("repo", runner)

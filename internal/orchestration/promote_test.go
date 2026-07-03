@@ -12,6 +12,7 @@ import (
 	"time"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/equivalence"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -249,6 +250,244 @@ func TestPromoteAutoGatePath(t *testing.T) {
 			if !strings.Contains(event, `"event":"promote.attempt"`) {
 				t.Fatalf("promote ledger missing event:\n%s", event)
 			}
+		})
+	}
+}
+
+func TestPromoteAutoGateResolverWiring(t *testing.T) {
+	truthy := true
+	allTrue := &AutoGateInputs{
+		CIGreen:         &truthy,
+		VerdictPass:     &truthy,
+		EvidencePresent: &truthy,
+		RedLineClean:    &truthy,
+	}
+	tests := []struct {
+		name              string
+		gate              string
+		autoGate          *AutoGateInputs
+		resolveAutoGate   func(ctx context.Context) (*AutoGateInputs, error)
+		wantResolverCalls int
+		wantCalls         []string
+		wantNeedsHuman    string
+	}{
+		{
+			name: "auto-resolves-inputs-before-gate",
+			gate: GateAuto,
+			resolveAutoGate: func(context.Context) (*AutoGateInputs, error) {
+				return allTrue, nil
+			},
+			wantResolverCalls: 1,
+			wantCalls:         []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
+		},
+		{
+			name: "auto-resolver-error-fail-closed",
+			gate: GateAuto,
+			resolveAutoGate: func(context.Context) (*AutoGateInputs, error) {
+				return nil, errors.New("resolver unavailable")
+			},
+			wantResolverCalls: 1,
+			wantNeedsHuman:    "resolver unavailable",
+		},
+		{
+			name:     "auto-direct-inputs-skip-resolver",
+			gate:     GateAuto,
+			autoGate: allTrue,
+			resolveAutoGate: func(context.Context) (*AutoGateInputs, error) {
+				return nil, errors.New("must not be called")
+			},
+			wantCalls: []string{"head:main", "promote:pre-prod", "checks:main", "sync:pre-prod"},
+		},
+		{
+			name: "human-merge-skips-resolver",
+			gate: GateHumanMerge,
+			resolveAutoGate: func(context.Context) (*AutoGateInputs, error) {
+				return nil, errors.New("must not be called")
+			},
+			wantCalls: []string{"head:main", "promote:pre-prod", "sync:pre-prod"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runID := "run-test-promote-resolver-" + tt.name
+			writer := &recordingPromotionWriter{}
+			resolverCalls := 0
+			resolver := func(ctx context.Context) (*AutoGateInputs, error) {
+				resolverCalls++
+				return tt.resolveAutoGate(ctx)
+			}
+
+			report, err := Promote(context.Background(), PromoteOptions{
+				Writer:          writer,
+				RepoPath:        repo,
+				RunID:           runID,
+				PreProdBranch:   "pre-prod",
+				Gate:            tt.gate,
+				AutoGate:        tt.autoGate,
+				ResolveAutoGate: resolver,
+				RequiredChecks:  []string{"verify"},
+				Clock:           fixedPromoteClock,
+				StatePush:       promoteTestStatePush(t, repo, runID),
+			})
+			if err != nil {
+				t.Fatalf("Promote returned error: %v", err)
+			}
+			if resolverCalls != tt.wantResolverCalls {
+				t.Fatalf("resolver calls = %d, want %d", resolverCalls, tt.wantResolverCalls)
+			}
+			if !reflect.DeepEqual(writer.calls, tt.wantCalls) {
+				t.Fatalf("writer calls = %#v, want %#v", writer.calls, tt.wantCalls)
+			}
+			if tt.wantNeedsHuman == "" {
+				if len(report.NeedsHuman) != 0 {
+					t.Fatalf("needs-human = %#v, want none", report.NeedsHuman)
+				}
+				return
+			}
+			if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "auto-gate" || !strings.Contains(report.NeedsHuman[0].Detail, tt.wantNeedsHuman) {
+				t.Fatalf("needs-human = %#v, want auto-gate detail containing %q", report.NeedsHuman, tt.wantNeedsHuman)
+			}
+			if report.Summary.PromotedCount != 0 || strings.TrimSpace(report.Promoted.SHA) != "" {
+				t.Fatalf("promoted = %#v summary=%#v, want no main merge", report.Promoted, report.Summary)
+			}
+		})
+	}
+}
+
+func TestResolvePromoteAutoGateFromSignals(t *testing.T) {
+	evidence := []config.EvidenceArtifact{{
+		ProjectType: "cli",
+		TestResults: "go test ./...",
+	}}
+	pending := []TickPendingPromotion{{PRNumber: 418, Branch: "pre-prod", SHA: "merge-sha"}}
+	tests := []struct {
+		name           string
+		writer         recordingPromotionWriter
+		requiredChecks []string
+		evidence       []config.EvidenceArtifact
+		pending        []TickPendingPromotion
+		wantCI         *bool
+		wantVerdict    *bool
+		wantEvidence   *bool
+		wantRedLine    *bool
+	}{
+		{
+			name:           "all-healthy",
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantCI:         promoteBoolPtr(true),
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+		{
+			name: "ci-red-false",
+			writer: recordingPromotionWriter{branchChecks: gh.BranchChecksResult{
+				Branch:  "pre-prod",
+				HeadSHA: "preprod-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "failure", Bucket: "fail"}},
+			}},
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantCI:         promoteBoolPtr(false),
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+		{
+			name: "ci-pending-nil",
+			writer: recordingPromotionWriter{branchChecks: gh.BranchChecksResult{
+				Branch:  "pre-prod",
+				HeadSHA: "preprod-sha",
+				Checks:  []gh.Check{{Name: "verify", State: "queued", Bucket: "pending"}},
+			}},
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+		{
+			name:           "ci-error-nil",
+			writer:         recordingPromotionWriter{branchChecksErr: errors.New("checks unavailable")},
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+		{
+			name:           "empty-ledger-verdict-nil",
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			wantCI:         promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+		{
+			name: "core-path-red-line-false",
+			writer: recordingPromotionWriter{
+				compareFiles: []string{"internal/orchestration/promote.go"},
+				compareDiff:  "diff --git a/internal/orchestration/promote.go b/internal/orchestration/promote.go\n",
+			},
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantCI:         promoteBoolPtr(true),
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+			wantRedLine:    promoteBoolPtr(false),
+		},
+		{
+			name:           "compare-error-red-line-nil",
+			writer:         recordingPromotionWriter{compareErr: errors.New("compare unavailable")},
+			requiredChecks: []string{"verify"},
+			evidence:       evidence,
+			pending:        pending,
+			wantCI:         promoteBoolPtr(true),
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(true),
+		},
+		{
+			name:           "no-configured-evidence-false",
+			requiredChecks: []string{"verify"},
+			pending:        pending,
+			wantCI:         promoteBoolPtr(true),
+			wantVerdict:    promoteBoolPtr(true),
+			wantEvidence:   promoteBoolPtr(false),
+			wantRedLine:    promoteBoolPtr(true),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writer := tt.writer
+			got, err := ResolvePromoteAutoGate(context.Background(), AutoGateResolverOptions{
+				Writer:             &writer,
+				RepoPath:           t.TempDir(),
+				PreProdBranch:      "pre-prod",
+				RequiredChecks:     tt.requiredChecks,
+				ConfiguredEvidence: tt.evidence,
+				LoadPendingPromotionLedger: func(repoPath, preProdBranch string) []TickPendingPromotion {
+					if strings.TrimSpace(repoPath) == "" || preProdBranch != "pre-prod" {
+						t.Fatalf("ledger loader args = %q %q", repoPath, preProdBranch)
+					}
+					return tt.pending
+				},
+			})
+			if err != nil {
+				t.Fatalf("ResolvePromoteAutoGate returned error: %v", err)
+			}
+			assertPromoteBoolPtr(t, "CIGreen", got.CIGreen, tt.wantCI)
+			assertPromoteBoolPtr(t, "VerdictPass", got.VerdictPass, tt.wantVerdict)
+			assertPromoteBoolPtr(t, "EvidencePresent", got.EvidencePresent, tt.wantEvidence)
+			assertPromoteBoolPtr(t, "RedLineClean", got.RedLineClean, tt.wantRedLine)
 		})
 	}
 }
@@ -932,6 +1171,10 @@ type recordingPromotionWriter struct {
 	mainHeadSHA     string
 	mainHeadSHASet  bool
 	branchChecks    gh.BranchChecksResult
+	branchChecksErr error
+	compareFiles    []string
+	compareDiff     string
+	compareErr      error
 	revertErr       error
 }
 
@@ -945,6 +1188,9 @@ func (w *recordingPromotionWriter) BranchHeadSHA(_ context.Context, branch strin
 
 func (w *recordingPromotionWriter) BranchChecks(_ context.Context, branch string) (gh.BranchChecksResult, error) {
 	w.calls = append(w.calls, "checks:"+branch)
+	if w.branchChecksErr != nil {
+		return gh.BranchChecksResult{}, w.branchChecksErr
+	}
 	if strings.TrimSpace(w.branchChecks.Branch) != "" || strings.TrimSpace(w.branchChecks.HeadSHA) != "" || len(w.branchChecks.Checks) > 0 {
 		return w.branchChecks, nil
 	}
@@ -953,6 +1199,18 @@ func (w *recordingPromotionWriter) BranchChecks(_ context.Context, branch string
 		HeadSHA: "main-sha",
 		Checks:  []gh.Check{{Name: "verify", State: "success", Bucket: "pass"}},
 	}, nil
+}
+
+func (w *recordingPromotionWriter) CompareBranches(_ context.Context, base, head string) ([]string, string, error) {
+	w.calls = append(w.calls, "compare:"+base+"..."+head)
+	if w.compareErr != nil {
+		return nil, "", w.compareErr
+	}
+	files := append([]string(nil), w.compareFiles...)
+	if len(files) == 0 && strings.TrimSpace(w.compareDiff) == "" {
+		files = []string{"README.md"}
+	}
+	return files, w.compareDiff, nil
 }
 
 func (w *recordingPromotionWriter) KickBackFromPreProd(_ context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error) {
@@ -1048,6 +1306,18 @@ func promoteNeedsHumanHasStepDetail(items []PromoteNeedsHuman, step, detail stri
 		}
 	}
 	return false
+}
+
+func assertPromoteBoolPtr(t *testing.T, name string, got, want *bool) {
+	t.Helper()
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("%s = %v, want %v", name, got, want)
+	case *got != *want:
+		t.Fatalf("%s = %t, want %t", name, *got, *want)
+	}
 }
 
 func promoteTestStatePush(t *testing.T, repo, runID string) StatePushFunc {

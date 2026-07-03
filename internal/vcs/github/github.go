@@ -45,6 +45,7 @@ type Writer interface {
 type ProductionWriter interface {
 	BranchHeadSHA(ctx context.Context, branch string) (string, error)
 	BranchChecks(ctx context.Context, branch string) (BranchChecksResult, error)
+	CompareBranches(ctx context.Context, base, head string) (files []string, diff string, err error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (PreProdKickBackResult, error)
 	RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (NeedsHumanRouteResult, error)
 	PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error)
@@ -315,14 +316,7 @@ func (c *CLI) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
-	files := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			files = append(files, trimmed)
-		}
-	}
-	return files, nil
+	return parseNameOnlyOutput(output), nil
 }
 
 func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {
@@ -377,6 +371,33 @@ func (c *CLI) BranchHeadSHA(ctx context.Context, branch string) (string, error) 
 		return "", fmt.Errorf("branch is required")
 	}
 	return c.branchHeadSHA(ctx, branch)
+}
+
+func (c *CLI) CompareBranches(ctx context.Context, base, head string) ([]string, string, error) {
+	base = strings.TrimSpace(base)
+	head = strings.TrimSpace(head)
+	if base == "" {
+		return nil, "", fmt.Errorf("base branch is required")
+	}
+	if head == "" {
+		return nil, "", fmt.Errorf("head branch is required")
+	}
+	if _, err := c.run(ctx, "git", "fetch", "origin",
+		"+refs/heads/"+base+":refs/remotes/origin/"+base,
+		"+refs/heads/"+head+":refs/remotes/origin/"+head,
+	); err != nil {
+		return nil, "", err
+	}
+	compare := "refs/remotes/origin/" + base + "...refs/remotes/origin/" + head
+	nameOnly, err := c.run(ctx, "git", "diff", "--name-only", compare)
+	if err != nil {
+		return nil, "", err
+	}
+	diff, err := c.run(ctx, "git", "diff", compare)
+	if err != nil {
+		return nil, "", err
+	}
+	return parseNameOnlyOutput(nameOnly), string(diff), nil
 }
 
 func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {
@@ -1113,6 +1134,17 @@ func trimToJSON(output []byte) []byte {
 		}
 	}
 	return []byte(strings.TrimSpace(text))
+}
+
+func parseNameOnlyOutput(output []byte) []string {
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n")
+	files := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			files = append(files, trimmed)
+		}
+	}
+	return files
 }
 
 var githubRemotePattern = regexp.MustCompile(`github\.com[:/]([^/]+)/(.+?)(?:\.git)?$`)
