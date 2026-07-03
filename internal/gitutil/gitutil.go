@@ -194,6 +194,8 @@ func (c *Client) PushUpstream(ctx context.Context, repoPath, branch string) erro
 }
 
 // PushUpstreamForceWithLease force-updates a scratch branch and sets upstream.
+// Present remote branches pin the lease to their ls-remote SHA; absent remote
+// branches intentionally use an empty expected SHA so git requires ref absence.
 func (c *Client) PushUpstreamForceWithLease(ctx context.Context, repoPath, branch string) error {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
