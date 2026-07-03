@@ -32,6 +32,7 @@ const (
 	SpecConformanceNotApplicable = "not-applicable"
 
 	DefaultVerifierTimeout = 600 * time.Second
+	VerifierStallTimeout   = 120 * time.Second
 
 	reviewPacketChangedFilesBudgetBytes = 8 * 1024
 	reviewPacketDiffBudgetBytes         = 80 * 1024
@@ -204,10 +205,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
-	agentCtx, cancelAgent := context.WithTimeout(ctx, opts.Timeout)
-	defer cancelAgent()
-
-	agentResult, agentErr := runner.Run(agentCtx, agent.Invocation{
+	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		Model:        opts.Model,
@@ -215,14 +213,15 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
+		HardCap:      opts.Timeout,
+		StallTimeout: VerifierStallTimeout,
 	})
+	if agentResult.Hung {
+		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	}
 	record := verifierAttestation(opts, agentResult)
 	fmt.Fprintln(warnings, record.Header())
-	if errors.Is(agentCtx.Err(), context.DeadlineExceeded) {
-		note := providerFailureNote(logPath, fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout)))
-		verdict := needsHumanVerdict("error", "", note)
-		return resultWithAttestation(verdict, record), nil
-	}
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
 		return resultWithAttestation(verdict, record), nil
@@ -289,6 +288,28 @@ func resultWithAttestation(verdict Verdict, record attestation.AttestationRecord
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
 	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}
+}
+
+func verifierHungVerdict(provider, logPath string, timeout time.Duration, reason string) Verdict {
+	var note string
+	switch reason {
+	case agent.HungReasonDeadline:
+		note = fmt.Sprintf("%s verifier timed out after %s", provider, formatTimeout(timeout))
+	case agent.HungReasonStall:
+		note = fmt.Sprintf("%s verifier hung (reason=hung hung_reason=stall; silent for %s)", provider, formatTimeout(VerifierStallTimeout))
+	default:
+		note = fmt.Sprintf("%s verifier hung (reason=hung hung_reason=%s)", provider, firstNonEmpty(reason, "unknown"))
+	}
+	return needsHumanVerdict("error", "", providerFailureNote(logPath, note))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func Render(w io.Writer, result Result) error {

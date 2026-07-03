@@ -58,6 +58,8 @@ const (
 	AttemptStrategyUpgradedConfig = "upgraded_config"
 
 	AttemptRecordVersion = 1
+	StatusHung           = "hung"
+	HungReasonLedger     = "reason=hung"
 )
 
 type Options struct {
@@ -350,8 +352,14 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		if strings.TrimSpace(latestBriefText) == "" {
 			latestBriefText = strings.TrimSpace(opts.FailureContext)
 		}
+		latestHung := latestFailureHung(attempts, latestStatus, latestBriefText) || lastRecoveryAttemptHung(recoveryAttempts)
 		if priorAttempts >= opts.MaxAttempts {
-			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts))
+			blockReason := ""
+			if latestHung {
+				blockReason = HungReasonLedger
+				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath))
+			}
+			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, blockReason))
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -363,6 +371,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		nextAttempt := priorAttempts + 1
 		localPriorAttempts = nextAttempt
 		strategy := strategyForAttempt(nextAttempt, opts.MaxAttempts)
+		if latestHung {
+			strategy = AttemptStrategySameConfig
+		}
 		model, effort := modelEffortForStrategy(opts, strategy)
 		retryBranch := fmt.Sprintf("loop/issue-%d-retry-%d", opts.IssueNumber, nextAttempt)
 		backoffSeconds := selectBackoffSeconds(priorAttempts, opts.BackoffSeconds)
@@ -413,6 +424,10 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		if dispatchErr != nil || !dispatchResult.OK || strings.TrimSpace(dispatchResult.PR) == "" {
 			record.Status = "failed"
 			record.Error = dispatchFailureDetail(dispatchResult, dispatchErr)
+			if dispatchFailureHung(dispatchResult, dispatchErr) {
+				record.Status = StatusHung
+				record.Error = ensureHungReason(record.Error)
+			}
 			if opts.CircuitBreaker.Enabled() {
 				decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, record.Error)
 				if !decision.Allowed {
@@ -799,6 +814,62 @@ func recoverNow(opts Options) time.Time {
 	return time.Now().UTC()
 }
 
+func latestFailureHung(attempts []attemptHistoryEntry, latestStatus, _ string) bool {
+	if statusOrDetailHung(latestStatus, "") {
+		return true
+	}
+	latest := latestHistoryAttempt(attempts)
+	return latest != nil && statusOrDetailHung(latest.Record.Status, latest.Record.Error)
+}
+
+func lastRecoveryAttemptHung(attempts []AttemptRecord) bool {
+	if len(attempts) == 0 {
+		return false
+	}
+	latest := attempts[len(attempts)-1]
+	return statusOrDetailHung(latest.Status, latest.Error)
+}
+
+func dispatchFailureHung(result DispatchResult, err error) bool {
+	return statusOrDetailHung(result.Status, dispatchFailureDetail(result, err))
+}
+
+func statusOrDetailHung(status, detail string) bool {
+	if strings.EqualFold(strings.TrimSpace(status), StatusHung) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(detail), HungReasonLedger)
+}
+
+func ensureHungReason(detail string) string {
+	detail = strings.TrimSpace(detail)
+	if strings.Contains(strings.ToLower(detail), HungReasonLedger) {
+		return detail
+	}
+	if detail == "" {
+		return HungReasonLedger
+	}
+	return HungReasonLedger + ": " + detail
+}
+
+func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempts int, latestBriefPath string) AttemptRecord {
+	now := state.FormatTimestamp(recoverNow(opts))
+	record := AttemptRecord{
+		Version:             AttemptRecordVersion,
+		Issue:               opts.IssueNumber,
+		RunID:               opts.RunID,
+		Attempt:             priorAttempts,
+		Strategy:            AttemptStrategySameConfig,
+		Status:              guardrails.StatusNeedsHuman,
+		RecoveryContextPath: latestBriefPath,
+		Error:               HungReasonLedger + ": retry limit reached after hung attempt",
+		StartedAt:           now,
+		FinishedAt:          now,
+	}
+	_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+	return record
+}
+
 func dispatchFailureDetail(result DispatchResult, err error) string {
 	if err != nil {
 		return err.Error()
@@ -855,7 +926,7 @@ func renderAdoptReport(issueNumber int, runID string, priorAttempts int, latestS
 	return out.String()
 }
 
-func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry) string {
+func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry, reason string) string {
 	var out bytes.Buffer
 	fmt.Fprintln(&out, "BLOCKED: retry limit reached")
 	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
@@ -863,6 +934,9 @@ func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttemp
 	fmt.Fprintf(&out, "Prior attempts: %d\n", priorAttempts)
 	fmt.Fprintf(&out, "Max attempts: %d\n", maxAttempts)
 	fmt.Fprintf(&out, "Latest status: %s\n", latestStatus)
+	if strings.TrimSpace(reason) != "" {
+		fmt.Fprintf(&out, "Reason: %s\n", reason)
+	}
 	fmt.Fprintf(&out, "Latest recovery brief: %s\n", latestBriefPath)
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Latest recovery brief contents:")

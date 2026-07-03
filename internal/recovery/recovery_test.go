@@ -866,6 +866,92 @@ func TestRecoverRetryErrorPreservesPartialDispatchAttestation(t *testing.T) {
 	}
 }
 
+func TestRecoverHungRetriesSameConfigAndExhaustsBudget(t *testing.T) {
+	repo := t.TempDir()
+	attempts := []state.Attempt{
+		recoverAttempt(repo, 1, "job-103-1", "failed", "first error"),
+		recoverAttempt(repo, 2, "job-103-2", StatusHung, "reason=hung: worker stalled"),
+	}
+	var dispatched []DispatchOptions
+	var records []AttemptRecord
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+		Provider:       "codex",
+		Model:          "gpt-5",
+		Effort:         "high",
+		UpgradedModel:  "gpt-5.5",
+		UpgradedEffort: "xhigh",
+		Now:            fixedRecoverTime(),
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return append([]state.Attempt(nil), attempts...), nil
+		},
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			dispatched = append(dispatched, opts)
+			return DispatchResult{
+				OK:       false,
+				Issue:    opts.IssueNumber,
+				Branch:   opts.Branch,
+				RunID:    opts.RunID,
+				Status:   StatusHung,
+				ExitCode: -1,
+				LogBytes: 12,
+			}, fmt.Errorf("reason=hung: worker stalled again")
+		},
+		RecordAttempt: func(_ string, _ string, record AttemptRecord) error {
+			records = append(records, record)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if len(dispatched) != 1 {
+		t.Fatalf("dispatch calls = %#v, want one", dispatched)
+	}
+	if dispatched[0].Attempt != 3 || dispatched[0].Model != "gpt-5" || dispatched[0].Effort != "high" {
+		t.Fatalf("hung retry dispatch = %#v, want same-config final attempt", dispatched[0])
+	}
+	if len(result.RecoveryAttempts) != 2 {
+		t.Fatalf("recovery attempts = %#v, want hung attempt plus needs-human escalation", result.RecoveryAttempts)
+	}
+	if result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig || result.RecoveryAttempts[0].Status != StatusHung {
+		t.Fatalf("hung recovery record = %#v, want same_config/hung", result.RecoveryAttempts[0])
+	}
+	if result.RecoveryAttempts[1].Status != guardrails.StatusNeedsHuman || !strings.Contains(result.RecoveryAttempts[1].Error, "reason=hung") {
+		t.Fatalf("needs-human escalation = %#v, want reason=hung", result.RecoveryAttempts[1])
+	}
+	if len(records) != 2 || records[0].Status != StatusHung || records[1].Status != guardrails.StatusNeedsHuman {
+		t.Fatalf("recorded attempts = %#v, want hung then needs-human", records)
+	}
+	for _, want := range []string{
+		"RETRY: dispatching issue #103 attempt 3",
+		"Recovery strategy: same_config",
+		"Reason: reason=hung",
+		"BLOCKED: retry limit reached",
+	} {
+		if !strings.Contains(result.Report, want) {
+			t.Fatalf("report missing %q:\n%s", want, result.Report)
+		}
+	}
+	if strings.Contains(result.Report, "upgraded_config") || strings.Contains(result.Report, "gpt-5.5") || strings.Contains(result.Report, "xhigh") {
+		t.Fatalf("hung recovery report unexpectedly upgraded config:\n%s", result.Report)
+	}
+}
+
 func recoverAttempt(repo string, attemptNumber int, jobID, status, errText string) state.Attempt {
 	return state.Attempt{
 		Issue:        103,

@@ -231,6 +231,9 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if fakeAgent.invocation.WorktreePath == "" || fakeAgent.invocation.Prompt == "" || fakeAgent.invocation.LogPath == "" {
 		t.Fatalf("agent invocation missing required fields: %#v", fakeAgent.invocation)
 	}
+	if fakeAgent.invocation.HardCap != WorkerHardCap || fakeAgent.invocation.StallTimeout != WorkerStallTimeout {
+		t.Fatalf("agent supervision = hard cap %s stall %s, want %s/%s", fakeAgent.invocation.HardCap, fakeAgent.invocation.StallTimeout, WorkerHardCap, WorkerStallTimeout)
+	}
 	if strings.Contains(fakeAgent.invocation.Prompt, "Repo-local skills") {
 		t.Fatalf("agent prompt unexpectedly included repo skills:\n%s", fakeAgent.invocation.Prompt)
 	}
@@ -425,6 +428,94 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	}
 	if got.ExitCode == nil || *got.ExitCode != 7 {
 		t.Fatalf("failed attempt exit code = %#v, want 7", got.ExitCode)
+	}
+}
+
+func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "provider stopped producing output\n",
+	}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err == nil {
+		t.Fatal("Dispatch returned nil error, want hung failure")
+	}
+	if result.Status != "hung" || result.OK || result.Attestation != nil {
+		t.Fatalf("hung result = %#v, want status hung, not ok, no attestation", result)
+	}
+	for _, want := range []string{"exec hung", "reason=hung", "hung_reason=stall"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("hung error missing %q: %v", want, err)
+		}
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("LoadAttempts returned %d attempts, want 1", len(attempts))
+	}
+	got := attempts[0]
+	if got.Status != "hung" || got.Attestation != nil {
+		t.Fatalf("hung attempt = %#v, want status hung and no attestation", got)
+	}
+	if !strings.Contains(got.Error, "reason=hung") {
+		t.Fatalf("hung attempt error = %q, want reason=hung", got.Error)
+	}
+
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test", "job-101-4321"))
+	if err != nil {
+		t.Fatalf("ReadFile recovery brief: %v", err)
+	}
+	if !strings.Contains(string(brief), "- Status: hung") || !strings.Contains(string(brief), "reason=hung") {
+		t.Fatalf("hung recovery brief missing status/reason:\n%s", string(brief))
+	}
+
+	events, err := os.ReadFile(state.EventsPath(repo, "run-test"))
+	if err != nil {
+		t.Fatalf("ReadFile events: %v", err)
+	}
+	for _, want := range []string{`"status":"hung"`, `"event":"worker_hung"`, `"outcome":"hung"`, `"reason":"hung"`} {
+		if !strings.Contains(string(events), want) {
+			t.Fatalf("events missing %q:\n%s", want, string(events))
+		}
 	}
 }
 

@@ -849,7 +849,11 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 		diff:  "diff",
 		files: []string{"file.go"},
 	}
-	fakeAgent := &loopreviewFakeAgent{blockUntilCanceled: true}
+	fakeAgent := &loopreviewFakeAgent{result: &agent.Result{
+		ExitCode:   -1,
+		Hung:       true,
+		HungReason: agent.HungReasonDeadline,
+	}}
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:   repo,
@@ -882,11 +886,14 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 	if !strings.Contains(result.Verdict.Evidence, "claude verifier timed out after 10ms") {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
 	}
+	if result.Verdict.Attestation != nil {
+		t.Fatalf("hung verifier result had attestation: %#v", result.Verdict.Attestation)
+	}
 	if fakeAgent.calls != 1 {
 		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
 	}
-	if fakeAgent.ctxErr != context.DeadlineExceeded {
-		t.Fatalf("agent ctxErr = %v, want context deadline exceeded", fakeAgent.ctxErr)
+	if fakeAgent.invocation.HardCap != 10*time.Millisecond || fakeAgent.invocation.StallTimeout != VerifierStallTimeout {
+		t.Fatalf("agent supervision = hard cap %s stall %s, want 10ms/%s", fakeAgent.invocation.HardCap, fakeAgent.invocation.StallTimeout, VerifierStallTimeout)
 	}
 }
 
