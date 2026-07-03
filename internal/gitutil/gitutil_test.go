@@ -109,6 +109,28 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	}
 }
 
+func TestPushUpstreamForceWithLeaseUsesAbsentRefLeaseWhenRemoteBranchMissing(t *testing.T) {
+	runner := &fakeGitRunner{
+		outputs: map[string][]byte{
+			"wt\x00ls-remote\x00origin\x00refs/heads/loop/issue-439-retry-1": []byte(""),
+		},
+	}
+	client := NewWithRunner(runner)
+
+	err := client.PushUpstreamForceWithLease(context.Background(), "wt", "loop/issue-439-retry-1")
+	if err != nil {
+		t.Fatalf("PushUpstreamForceWithLease returned error: %v", err)
+	}
+
+	want := [][]string{
+		{"wt", "ls-remote", "origin", "refs/heads/loop/issue-439-retry-1"},
+		{"wt", "push", "--force-with-lease=refs/heads/loop/issue-439-retry-1:", "-u", "origin", "HEAD:refs/heads/loop/issue-439-retry-1"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("git calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestClientPropagatesRunnerError(t *testing.T) {
 	wantErr := errors.New("boom")
 	client := NewWithRunner(&fakeGitRunner{err: wantErr})
