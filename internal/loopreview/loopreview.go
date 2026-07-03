@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -160,13 +161,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = DefaultVerifierTimeout
-	}
-
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
 		return Result{}, err
+	}
+	resilience := config.ResilienceForRepo(repoPath)
+	if opts.Timeout <= 0 {
+		opts.Timeout = config.DurationSeconds(resilience.Verifier.HardCapSeconds, DefaultVerifierTimeout)
 	}
 	runner, err := deps.AgentLookup(opts.Provider)
 	if err != nil {
@@ -214,7 +215,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
 		HardCap:      opts.Timeout,
-		StallTimeout: VerifierStallTimeout,
+		StallTimeout: config.DurationSeconds(resilience.Verifier.StallTimeoutSeconds, VerifierStallTimeout),
 		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
 		Role:         "verifier",
 	})
