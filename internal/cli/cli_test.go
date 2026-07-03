@@ -2834,7 +2834,7 @@ func TestDispatchDoesNotRenderSuccessJSONWithoutAttestation(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "worker attestation is missing") {
+	if !strings.Contains(stderr.String(), "dispatch attestation is missing") {
 		t.Fatalf("stderr missing attestation error: %q", stderr.String())
 	}
 }

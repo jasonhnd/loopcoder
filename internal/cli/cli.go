@@ -2294,7 +2294,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 		RunID:        result.RunID,
 		InvocationID: invocationID,
 		Command:      "dispatch",
-		Role:         attestation.RoleWorker,
+		Role:         record.Role,
 		Issue:        result.Issue,
 		PR:           result.PR,
 		CreatedAt:    now,
@@ -2329,14 +2329,14 @@ func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.Atte
 
 func renderDispatch(w io.Writer, result worker.Result) error {
 	if result.Attestation == nil {
-		return errors.New("worker attestation is missing")
+		return errors.New("dispatch attestation is missing")
 	}
 	if err := result.Attestation.Validate(); err != nil {
-		return fmt.Errorf("validate worker attestation: %w", err)
+		return fmt.Errorf("validate dispatch attestation: %w", err)
 	}
 	canonical, err := result.Attestation.CanonicalJSON()
 	if err != nil {
-		return fmt.Errorf("render worker attestation JSON: %w", err)
+		return fmt.Errorf("render dispatch attestation JSON: %w", err)
 	}
 	data, err := worker.MarshalResult(result)
 	if err != nil {

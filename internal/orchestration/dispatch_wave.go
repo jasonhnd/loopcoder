@@ -377,7 +377,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		enrichDispatchWaveFailure(&result, opts)
 		return result
 	}
-	result.Status = DispatchWaveStatusSucceeded
+	result.Status = firstNonEmpty(dispatchResult.Status, DispatchWaveStatusSucceeded)
 	result.Branch = dispatchResult.Branch
 	result.PR = dispatchResult.PR
 	result.AttemptPath = dispatchResult.AttemptPath

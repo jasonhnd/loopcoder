@@ -193,8 +193,40 @@ func (c *Client) PushUpstream(ctx context.Context, repoPath, branch string) erro
 	return err
 }
 
+// PushUpstreamForceWithLease force-updates a scratch branch and sets upstream.
+func (c *Client) PushUpstreamForceWithLease(ctx context.Context, repoPath, branch string) error {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	remoteRef := "refs/heads/" + branch
+	expected, err := c.remoteBranchSHA(ctx, repoPath, remoteRef)
+	if err != nil {
+		return err
+	}
+	lease := "--force-with-lease=" + remoteRef + ":" + expected
+	_, err = c.run(ctx, repoPath, "push", lease, "-u", "origin", "HEAD:"+remoteRef)
+	return err
+}
+
 // BranchDelete deletes a local branch forcefully.
 func (c *Client) BranchDelete(ctx context.Context, repoPath, branch string) error {
 	_, err := c.run(ctx, repoPath, "branch", "-D", branch)
 	return err
+}
+
+func (c *Client) remoteBranchSHA(ctx context.Context, repoPath, remoteRef string) (string, error) {
+	output, err := c.run(ctx, repoPath, "ls-remote", "origin", remoteRef)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		return "", nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(fields[0]), nil
 }
