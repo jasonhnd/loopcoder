@@ -141,6 +141,83 @@ func TestClientPropagatesRunnerError(t *testing.T) {
 	}
 }
 
+func TestIsPathAbsentOnRefDiscriminatesBadRefs(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		path string
+		want bool
+	}{
+		{
+			name: "os not exist sentinel",
+			err:  os.ErrNotExist,
+			path: ".delivery.yml",
+			want: true,
+		},
+		{
+			name: "path does not exist in valid ref",
+			err:  errors.New("git show origin/main:.delivery.yml: exit status 128: fatal: Path '.delivery.yml' does not exist in 'origin/main'"),
+			path: ".delivery.yml",
+			want: true,
+		},
+		{
+			name: "path exists on disk but absent from valid ref",
+			err:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: path '.gitattributes' exists on disk, but not in 'origin/main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "unquoted path exists on disk but absent from valid ref",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: .gitattributes exists on disk, but not in 'main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "quoted path exists on disk but absent from valid ref",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: '.gitattributes' exists on disk, but not in 'main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "bad base pathspec is real failure despite wrapped rev path",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: error: pathspec 'main' did not match any file(s) known to git"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "invalid object name is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: invalid object name 'main'"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "ambiguous argument is real failure",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: ambiguous argument 'main:.gitattributes': unknown revision or path not in the working tree"),
+			path: ".gitattributes",
+			want: false,
+		},
+		{
+			name: "missing reliable phrasing is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: not a git repository"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "old not found signal is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: .delivery.yml not found in main"),
+			path: ".delivery.yml",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPathAbsentOnRef(tt.err, tt.path); got != tt.want {
+				t.Fatalf("IsPathAbsentOnRef(%v, %q) = %v, want %v", tt.err, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExecRunnerCapturesOutputAndNonZeroExit(t *testing.T) {
 	withTestGitCommand(t, 2*time.Second)
 

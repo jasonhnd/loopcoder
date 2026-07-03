@@ -1059,7 +1059,7 @@ func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, b
 	revPath := "origin/" + baseBranch + ":.gitattributes"
 	content, err := git.Show(ctx, repoPath, revPath)
 	if err != nil {
-		if isGitPathAbsentError(err, ".gitattributes") {
+		if gitutil.IsPathAbsentOnRef(err, ".gitattributes") {
 			return nil
 		}
 		if warnings == nil {
@@ -1072,31 +1072,6 @@ func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, b
 		return nil
 	}
 	return parseGeneratedAttributeRules(content)
-}
-
-func isGitPathAbsentError(err error, path string) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	text := strings.ToLower(err.Error())
-	path = strings.ToLower(strings.TrimSpace(path))
-	if path == "" || !strings.Contains(text, path) {
-		return false
-	}
-	for _, signal := range []string{
-		"does not exist",
-		"exists on disk, but not in",
-		"did not match any file",
-		"not found in",
-	} {
-		if strings.Contains(text, signal) {
-			return true
-		}
-	}
-	return false
 }
 
 func parseGeneratedAttributeRules(content string) []generatedAttributeRule {

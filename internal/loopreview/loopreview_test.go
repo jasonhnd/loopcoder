@@ -547,6 +547,65 @@ func TestGatherInputsWarnsWhenGeneratedAttributesGitShowFails(t *testing.T) {
 	}
 }
 
+func TestLoadGeneratedAttributeRulesDiscriminatesBaseRefFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		showErr  error
+		wantWarn bool
+	}{
+		{
+			name:    "path absent from valid base is silent",
+			showErr: errors.New("git show origin/main:.gitattributes: exit status 128: fatal: Path '.gitattributes' does not exist in 'main'"),
+		},
+		{
+			name:    "path exists on disk but absent from valid base is silent",
+			showErr: errors.New("git show origin/main:.gitattributes: exit status 128: fatal: .gitattributes exists on disk, but not in 'main'"),
+		},
+		{
+			name:     "bad base pathspec warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: error: pathspec 'main' did not match any file(s) known to git"),
+			wantWarn: true,
+		},
+		{
+			name:     "invalid object name warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: invalid object name 'main'"),
+			wantWarn: true,
+		},
+		{
+			name:     "ambiguous argument warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: ambiguous argument 'main:.gitattributes': unknown revision or path not in the working tree"),
+			wantWarn: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeGit := &loopreviewFakeGit{
+				showErrs: map[string]error{
+					"origin/main:.gitattributes": tt.showErr,
+				},
+			}
+			var warnings strings.Builder
+
+			rules := loadGeneratedAttributeRules(context.Background(), fakeGit, t.TempDir(), "main", &warnings)
+			if len(rules) != 0 {
+				t.Fatalf("rules = %#v, want fallback without attribute rules", rules)
+			}
+			if tt.wantWarn {
+				for _, want := range []string{"warning", "generated-file classification via .gitattributes is unavailable", "falling back to glob and size heuristics"} {
+					if !strings.Contains(warnings.String(), want) {
+						t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+					}
+				}
+				return
+			}
+			if warnings.Len() != 0 {
+				t.Fatalf("warnings = %q, want none", warnings.String())
+			}
+		})
+	}
+}
+
 func TestBuildReviewPacketTruncatesIssueBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.Issue.Body = "keep issue context\n" + strings.Repeat("omitted issue context\n", 40) + "TAIL_ISSUE_SHOULD_NOT_APPEAR\n"

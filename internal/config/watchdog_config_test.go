@@ -148,6 +148,68 @@ func TestLoadForRepoLoudConfigResolution(t *testing.T) {
 	}
 }
 
+func TestLoadForRepoBaseConfigAbsentDiscrimination(t *testing.T) {
+	tests := []struct {
+		name     string
+		showErr  error
+		wantWarn bool
+	}{
+		{
+			name:    "path absent from valid base is silent",
+			showErr: errors.New("git show main:.delivery.yml: exit status 128: fatal: Path '.delivery.yml' does not exist in 'main'"),
+		},
+		{
+			name:    "path exists on disk but absent from valid base is silent",
+			showErr: errors.New("git show main:.delivery.yml: exit status 128: fatal: .delivery.yml exists on disk, but not in 'main'"),
+		},
+		{
+			name:     "bad base pathspec warns and defaults",
+			showErr:  errors.New("git show main:.delivery.yml: exit status 128: error: pathspec 'main' did not match any file(s) known to git"),
+			wantWarn: true,
+		},
+		{
+			name:     "invalid object name warns and defaults",
+			showErr:  errors.New("git show main:.delivery.yml: exit status 128: fatal: invalid object name 'main'"),
+			wantWarn: true,
+		},
+		{
+			name:     "ambiguous argument warns and defaults",
+			showErr:  errors.New("git show main:.delivery.yml: exit status 128: fatal: ambiguous argument 'main:.delivery.yml': unknown revision or path not in the working tree"),
+			wantWarn: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var warnings strings.Builder
+			cfg, err := LoadForRepo(context.Background(), t.TempDir(), LoadOptions{
+				BaseBranch: "main",
+				ShowBaseConfig: func(context.Context, string, string) ([]byte, error) {
+					return nil, tt.showErr
+				},
+				Warnings: &warnings,
+			})
+			if err != nil {
+				t.Fatalf("LoadForRepo returned error: %v", err)
+			}
+			if cfg.Resilience.Worker.HardCapSeconds != 2700 {
+				t.Fatalf("worker hard cap = %d, want default 2700", cfg.Resilience.Worker.HardCapSeconds)
+			}
+			if tt.wantWarn {
+				for _, want := range []string{"warning", "base .delivery.yml consistency check could not run", "using defaults"} {
+					if !strings.Contains(warnings.String(), want) {
+						t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+					}
+				}
+				return
+			}
+			if warnings.Len() != 0 {
+				t.Fatalf("warnings = %q, want none", warnings.String())
+			}
+		})
+	}
+}
+
 func TestResilienceForRepoLoudConfigResolution(t *testing.T) {
 	baseConfig := []byte("version: 1\nresilience:\n  verifier:\n    hard_cap_seconds: 44\n")
 	tests := []struct {

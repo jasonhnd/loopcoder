@@ -3,7 +3,9 @@ package gitutil
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -164,6 +166,34 @@ func (c *Client) Show(ctx context.Context, repoPath, revPath string) (string, er
 		return "", err
 	}
 	return string(output), nil
+}
+
+// IsPathAbsentOnRef reports whether err is the reliable git show signal for a
+// path that is absent from an otherwise valid ref.
+func IsPathAbsentOnRef(err error, path string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	quotedPath := "'" + path + "'"
+	for _, signal := range []string{
+		"path " + quotedPath + " does not exist in '",
+		"path " + quotedPath + " exists on disk, but not in '",
+		quotedPath + " exists on disk, but not in '",
+		path + " exists on disk, but not in '",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 // StatusPorcelain returns git status --porcelain output.
