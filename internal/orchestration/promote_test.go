@@ -134,6 +134,36 @@ func TestEvaluateAutoGateConjunctiveFailClosed(t *testing.T) {
 	}
 }
 
+func TestNormalizePromotionGateDefaultsToAutoAndValidationStaysClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		gate string
+		want string
+	}{
+		{name: "empty-defaults-auto", want: GateAuto},
+		{name: "blank-defaults-auto", gate: " \t\n", want: GateAuto},
+		{name: "human-merge-explicit", gate: GateHumanMerge, want: GateHumanMerge},
+		{name: "auto-explicit", gate: GateAuto, want: GateAuto},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizePromotionGate(tt.gate); got != tt.want {
+				t.Fatalf("normalizePromotionGate(%q) = %q, want %q", tt.gate, got, tt.want)
+			}
+		})
+	}
+
+	for _, gate := range []string{GateHumanMerge, GateAuto} {
+		if err := validatePromotionGate(gate); err != nil {
+			t.Fatalf("validatePromotionGate(%q) returned error: %v", gate, err)
+		}
+	}
+	if err := validatePromotionGate("bogus"); err == nil || !strings.Contains(err.Error(), "allowed values: human-merge, auto") {
+		t.Fatalf("validatePromotionGate(bogus) = %v, want closed-set error", err)
+	}
+}
+
 func TestPromoteAutoGatePath(t *testing.T) {
 	truthy := true
 	falsey := false

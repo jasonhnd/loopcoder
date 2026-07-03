@@ -1178,7 +1178,7 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 func normalizePromotionGate(gate string) string {
 	gate = strings.TrimSpace(gate)
 	if gate == "" {
-		return GateHumanMerge
+		return GateAuto
 	}
 	return gate
 }
