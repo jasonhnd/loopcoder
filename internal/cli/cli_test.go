@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -154,9 +155,24 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "Exit codes:", "0   clean verifier verdict: pass", "1   clean verifier verdict: fail", "2   clean verifier verdict: needs-human", "3   command failure"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestReadmeDocumentsLoopreviewExitCodeMap(t *testing.T) {
+	readme := readRepoFile(t, "README.md")
+	for _, want := range []string{
+		"loopreview exit codes",
+		"`0` means clean verifier verdict `pass`",
+		"`1` means clean verifier verdict `fail`",
+		"`2` means clean verifier verdict `needs-human`",
+		"`3` means the `loopreview` command itself failed",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Fatalf("README missing %q", want)
 		}
 	}
 }
@@ -1179,6 +1195,101 @@ func TestLoopreviewSurfacesNeedsHumanExitCode(t *testing.T) {
 	if !strings.Contains(stdout.String(), `"verdict":"needs-human"`) {
 		t.Fatalf("stdout missing needs-human verdict: %s", stdout.String())
 	}
+}
+
+func TestLoopreviewReturnsCleanVerdictExitCodes(t *testing.T) {
+	tests := []struct {
+		name     string
+		verdict  string
+		wantCode int
+	}{
+		{name: "pass", verdict: loopreview.VerdictPass, wantCode: 0},
+		{name: "fail", verdict: loopreview.VerdictFail, wantCode: 1},
+		{name: "needs human", verdict: loopreview.VerdictNeedsHuman, wantCode: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			repo := t.TempDir()
+
+			exitCode := RunWithDeps([]string{
+				"loopreview",
+				"--repo", repo,
+				"--pr-number", "152",
+				"--provider", "codex",
+			}, &stdout, &stderr, Deps{
+				Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+					return loopreview.Result{
+						Verdict: loopreview.Verdict{
+							Verdict:         tt.verdict,
+							Findings:        []loopreview.Finding{},
+							Evidence:        "review completed",
+							SpecConformance: loopreview.SpecConformancePass,
+						},
+						ExitCode: 99,
+					}, nil
+				},
+			})
+			if exitCode != tt.wantCode {
+				t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, tt.wantCode)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+			if !strings.Contains(stdout.String(), `"verdict":"`+tt.verdict+`"`) {
+				t.Fatalf("stdout missing verdict %q: %s", tt.verdict, stdout.String())
+			}
+		})
+	}
+}
+
+func TestLoopreviewCommandFailuresUseDistinctExitCode(t *testing.T) {
+	t.Run("bad repo", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		repo := filepath.Join(t.TempDir(), "missing")
+
+		exitCode := RunWithDeps([]string{
+			"loopreview",
+			"--repo", repo,
+			"--pr-number", "152",
+			"--provider", "codex",
+		}, &stdout, &stderr, Deps{})
+		if exitCode != loopreviewCommandFailureExitCode {
+			t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, loopreviewCommandFailureExitCode)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "resolve repo path") {
+			t.Fatalf("stderr missing repo error: %q", stderr.String())
+		}
+	})
+
+	t.Run("runtime error", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		repo := t.TempDir()
+
+		exitCode := RunWithDeps([]string{
+			"loopreview",
+			"--repo", repo,
+			"--pr-number", "152",
+			"--provider", "codex",
+		}, &stdout, &stderr, Deps{
+			Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+				return loopreview.Result{}, errors.New("provider crashed")
+			},
+		})
+		if exitCode != loopreviewCommandFailureExitCode {
+			t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, loopreviewCommandFailureExitCode)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("stdout = %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "provider crashed") {
+			t.Fatalf("stderr missing runtime error: %q", stderr.String())
+		}
+	})
 }
 
 func TestLoopreviewWarnsWhenVerifierMatchesConfiguredWorker(t *testing.T) {
@@ -3075,6 +3186,20 @@ func readSingleFile(t *testing.T, pattern string) string {
 	data, err := os.ReadFile(matches[0])
 	if err != nil {
 		t.Fatalf("read %s: %v", matches[0], err)
+	}
+	return string(data)
+}
+
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	data, err := os.ReadFile(filepath.Join(repoRoot, rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(data)
 }

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-07-03
+
+### Fixed
+
+- **Operational reliability hardening** per [`docs/specs/0423-operational-reliability-hardening.md`](docs/specs/0423-operational-reliability-hardening.md) and #407.
+- **H1 harvest-before-discard** -- hung or stalled workers harvest committable work before discard, opening a needs-human PR instead of losing a finished or partially finished deliverable.
+- **H2 worktree-mtime liveness** -- worker and verifier supervision treats worktree file activity as progress in addition to log growth, with raised watchdog windows for realistic build/test cycles.
+- **H3 source-first review packet** -- `loopreview` admits source/config diffs before generated or very large diffs so generated artifacts cannot consume the whole review budget ahead of the code under review.
+- **H4 loud config resolution** -- both config loaders fail loud when `.delivery.yml` is absent from the working tree but present on the base branch, `doctor` reports the mismatch, and `--config-from-base` is the explicit opt-in to read config from base.
+- **H5 distinguishable loopreview exit codes** -- `loopreview` now reserves `0`/`1`/`2` for clean verifier verdicts (`pass`/`fail`/`needs-human`) and returns `3` when the command itself fails, such as bad flags, bad `--repo`, config/provider/git setup failure, or output/relay write failure.
+
+### Notes
+
+- The 0.4.2 hardening keeps the self-hosting model and human gate intact: harvested work is needs-human, verifier judgments remain explicit verdicts, and command failures are no longer confused with `fail` or `needs-human` verdicts by CI runners.
+
 ## [0.4.1] - 2026-07-03
 
 ### Changed
