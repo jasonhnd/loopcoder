@@ -1,10 +1,10 @@
 ---
 id: 403
 title: E2 — Auto-Promote to Production (default-on)
-status: draft
+status: accepted
 date: 2026-07-03
 issue: 403
-pr: null
+pr: 404
 supersedes: [161]
 superseded_by: []
 ---
