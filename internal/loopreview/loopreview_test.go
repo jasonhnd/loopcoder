@@ -356,6 +356,145 @@ func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPacketOrdersSourceBeforeGeneratedDiffs(t *testing.T) {
+	tests := []struct {
+		name                    string
+		generatedPath           string
+		generatedAttributeRules []generatedAttributeRule
+	}{
+		{
+			name:          "default generated glob",
+			generatedPath: "tests/baseline/large.jsonl",
+		},
+		{
+			name:                    "gitattributes generated marker",
+			generatedPath:           "snapshots/large.txt",
+			generatedAttributeRules: parseGeneratedAttributeRules("snapshots/** linguist-generated=true\n"),
+		},
+		{
+			name:                    "gitattributes diff disabled marker",
+			generatedPath:           "golden/large.txt",
+			generatedAttributeRules: parseGeneratedAttributeRules("golden/** linguist-diff=false\n"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputs := loopreviewPromptTestInputs()
+			inputs.GeneratedAttributeRules = tt.generatedAttributeRules
+			inputs.ChangedFiles = []string{tt.generatedPath, "internal/foo.go"}
+			inputs.Diff = loopreviewDiffPatch(tt.generatedPath, "+ generated header\n"+strings.Repeat("+ generated data row\n", 80)+"+ GENERATED_TAIL_SHOULD_NOT_APPEAR\n") +
+				loopreviewDiffPatch("internal/foo.go", "+ package foo\n+ const SourceLastLine = \"SOURCE_LAST_LINE\"\n")
+
+			prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+				DiffBytes:              700,
+				DiffFileBytes:          4096,
+				GeneratedDiffFileBytes: 120,
+			})
+
+			if !packet.Diff.Truncated {
+				t.Fatal("diff was not truncated")
+			}
+			sourceIndex := strings.Index(prompt, "## internal/foo.go")
+			generatedIndex := strings.Index(prompt, "## "+tt.generatedPath)
+			if sourceIndex < 0 {
+				t.Fatalf("prompt missing source diff:\n%s", prompt)
+			}
+			if generatedIndex < 0 {
+				t.Fatalf("prompt missing generated diff note:\n%s", prompt)
+			}
+			if generatedIndex < sourceIndex {
+				t.Fatalf("generated diff appeared before source diff:\n%s", prompt)
+			}
+			for _, want := range []string{
+				"SOURCE_LAST_LINE",
+				"[TRUNCATED diff for " + tt.generatedPath + ": omitted",
+				"[TRUNCATED diff: omitted",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing %q:\n%s", want, prompt)
+				}
+			}
+			for _, unwanted := range []string{
+				"[TRUNCATED diff for internal/foo.go",
+				"GENERATED_TAIL_SHOULD_NOT_APPEAR",
+				"omitted files: internal/foo.go",
+			} {
+				if strings.Contains(prompt, unwanted) {
+					t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildReviewPacketDoesNotClassifyLargeSourceBySizeOnly(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{"internal/large.go", "internal/foo.go"}
+	inputs.Diff = loopreviewDiffPatch("internal/large.go", "+ "+strings.Repeat("source ", 60)+"LEGIT_SOURCE_DEEP_LINE\n") +
+		loopreviewDiffPatch("internal/foo.go", "+ package foo\n")
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DiffBytes:              1200,
+		DiffFileBytes:          900,
+		GeneratedDiffFileBytes: 80,
+		GeneratedSizeBytes:     100,
+	})
+
+	if packet.Diff.Truncated {
+		t.Fatalf("large source diff was truncated as generated:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "LEGIT_SOURCE_DEEP_LINE") {
+		t.Fatalf("prompt missing large source tail:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "[TRUNCATED diff for internal/large.go") {
+		t.Fatalf("large source diff was classified as generated:\n%s", prompt)
+	}
+}
+
+func TestGatherInputsParsesGeneratedAttributes(t *testing.T) {
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:.gitattributes":       "snapshots/** linguist-generated=true\ngolden/** linguist-diff=false\nmanual/** -linguist-generated\n",
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("snapshots/out.txt", "+ snapshot\n"),
+		files: []string{"snapshots/out.txt"},
+	}
+
+	inputs, err := gatherInputs(context.Background(), Deps{Git: fakeGit}, fakeGitHub, t.TempDir(), Options{
+		PRNumber:   152,
+		BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("gatherInputs returned error: %v", err)
+	}
+	if !generatedByAttributes("snapshots/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("snapshots/out.txt was not classified from .gitattributes: %#v", inputs.GeneratedAttributeRules)
+	}
+	if !generatedByAttributes("golden/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("golden/out.txt was not classified from linguist-diff=false: %#v", inputs.GeneratedAttributeRules)
+	}
+	if generatedByAttributes("manual/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("manual/out.txt was classified despite an explicit unset: %#v", inputs.GeneratedAttributeRules)
+	}
+}
+
 func TestBuildReviewPacketTruncatesIssueBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.Issue.Body = "keep issue context\n" + strings.Repeat("omitted issue context\n", 40) + "TAIL_ISSUE_SHOULD_NOT_APPEAR\n"
