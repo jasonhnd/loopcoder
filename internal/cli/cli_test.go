@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -173,7 +174,7 @@ func TestLoadDeliveryConfigLoudResolution(t *testing.T) {
 		{
 			name: "no config anywhere uses defaults",
 			show: func(context.Context, string, string) ([]byte, error) {
-				return nil, errors.New("not found")
+				return nil, os.ErrNotExist
 			},
 		},
 	}
@@ -2208,6 +2209,36 @@ func TestTriggerCronRunsTickWithExplicitRepo(t *testing.T) {
 	}
 }
 
+func TestTriggerBaseBranchThreadsConfigMismatchCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := initRepoWithDeliveryOnlyOnBranch(t, "trunk")
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"cron",
+		"--repo", repo,
+		"--base-branch", "trunk",
+		"--schedule", "@hourly",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			t.Fatal("Tick should not run when base config mismatch is detected")
+			return orchestration.TickReport{}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	for _, want := range []string{"trigger cron", "present on trunk", "--config-from-base"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestTriggerGoalLoopMaxIterationsAliasRoutesNeedsHuman(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -3269,6 +3300,47 @@ func readRepoFile(t *testing.T, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(data)
+}
+
+func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {
+	t.Helper()
+	repo := t.TempDir()
+	runCLITestGit(t, repo, "init", "-b", "main")
+	runCLITestGit(t, repo, "config", "user.email", "loopcoder-test@example.com")
+	runCLITestGit(t, repo, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runCLITestGit(t, repo, "add", "README.md")
+	runCLITestGit(t, repo, "commit", "-m", "initial")
+	runCLITestGit(t, repo, "checkout", "-b", baseBranch)
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nworker:\n  base_branch: "+baseBranch+"\n"), 0o644); err != nil {
+		t.Fatalf("write .delivery.yml: %v", err)
+	}
+	runCLITestGit(t, repo, "add", ".delivery.yml")
+	runCLITestGit(t, repo, "commit", "-m", "add delivery config")
+	runCLITestGit(t, repo, "checkout", "main")
+	return repo
+}
+
+func runCLITestGit(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	cmdArgs := append([]string{"-C", repo}, args...)
+	if len(args) > 0 && args[0] == "init" {
+		cmdArgs = args
+		cmd := exec.Command("git", cmdArgs...)
+		cmd.Dir = repo
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
+		}
+		return
+	}
+	cmd := exec.Command("git", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(cmdArgs, " "), err, string(output))
+	}
 }
 
 func cliTriggerTickReport(opts orchestration.TickOptions, status, stopReason string) orchestration.TickReport {

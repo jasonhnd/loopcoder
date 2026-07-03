@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -658,6 +659,70 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 }
 
+func TestDispatchHungHarvestWarnsAndContinuesWhenDedupCheckFails(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "hung\n",
+	}
+	fakeGitHub := &workerFakeGitHub{
+		prURL:       "https://github.com/owner/repo/pull/101",
+		listHeadErr: errors.New("head PR lookup unavailable"),
+		listOpenErr: errors.New("github API temporarily unavailable"),
+	}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Attempt:     2,
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if !result.OK || result.Status != "needs-human" || result.PR != "https://github.com/owner/repo/pull/101" {
+		t.Fatalf("harvest result = %#v", result)
+	}
+	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.forcePushCalls != 1 || fakeGitHub.createPRCalls != 1 {
+		t.Fatalf("harvest did not continue after dedup warning: add=%d commit=%d force=%d createPR=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.forcePushCalls, fakeGitHub.createPRCalls)
+	}
+	for _, want := range []string{"warning", "harvest idempotency check", "duplicate needs-human PR may result"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warnings missing %q:\n%s", want, warnings.String())
+		}
+	}
+}
+
 func TestDispatchHungHarvestUsesForceWithLeaseForPreExistingRemoteBranch(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
@@ -970,6 +1035,10 @@ type workerFakeGitHub struct {
 	prs           []gh.PullRequestReference
 	openPRs       []gh.PullRequest
 	err           error
+	repoErr       error
+	createErr     error
+	listHeadErr   error
+	listOpenErr   error
 	createPRCalls int
 	lastPRHead    string
 	lastPRBase    string
@@ -978,6 +1047,9 @@ type workerFakeGitHub struct {
 }
 
 func (f *workerFakeGitHub) RepoName(context.Context) (string, error) {
+	if f.repoErr != nil {
+		return "", f.repoErr
+	}
 	if f.err != nil {
 		return "", f.err
 	}
@@ -986,6 +1058,9 @@ func (f *workerFakeGitHub) RepoName(context.Context) (string, error) {
 
 func (f *workerFakeGitHub) CreatePR(_ context.Context, head, base, title, body string) (string, error) {
 	f.createPRCalls++
+	if f.createErr != nil {
+		return "", f.createErr
+	}
 	if f.err != nil {
 		return "", f.err
 	}
@@ -1000,6 +1075,9 @@ func (f *workerFakeGitHub) CreatePR(_ context.Context, head, base, title, body s
 }
 
 func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullRequestReference, error) {
+	if f.listHeadErr != nil {
+		return nil, f.listHeadErr
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -1007,6 +1085,9 @@ func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullReques
 }
 
 func (f *workerFakeGitHub) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
+	if f.listOpenErr != nil {
+		return nil, f.listOpenErr
+	}
 	if f.err != nil {
 		return nil, f.err
 	}

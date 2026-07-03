@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,7 @@ type LoadOptions struct {
 	BaseBranch     string
 	ConfigFromBase bool
 	ShowBaseConfig ShowBaseConfigFunc
+	Warnings       io.Writer
 }
 
 type ConfigMismatchError struct {
@@ -269,7 +271,11 @@ func LoadForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Config
 		return cfg, err
 	}
 	baseBranch := normalizeBaseBranch(opts.BaseBranch)
-	baseConfig, ok := showBaseConfig(ctx, repoPath, baseBranch, opts.ShowBaseConfig)
+	baseConfig, ok, checkErr := showBaseConfig(ctx, repoPath, baseBranch, opts.ShowBaseConfig)
+	if checkErr != nil {
+		warnBaseConfigCheckFailed(opts.Warnings, baseBranch, checkErr)
+		return cfg, nil
+	}
 	if !ok {
 		return cfg, nil
 	}
@@ -328,7 +334,7 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 	return nil
 }
 
-func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowBaseConfigFunc) ([]byte, bool) {
+func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowBaseConfigFunc) ([]byte, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -337,9 +343,12 @@ func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowB
 	}
 	data, err := show(ctx, repoPath, baseBranch)
 	if err != nil {
-		return nil, false
+		if isBaseConfigAbsentError(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
-	return data, true
+	return data, true, nil
 }
 
 func defaultShowBaseConfig(ctx context.Context, repoPath, baseBranch string) ([]byte, error) {
@@ -356,4 +365,38 @@ func normalizeBaseBranch(baseBranch string) string {
 		return "main"
 	}
 	return baseBranch
+}
+
+func isBaseConfigAbsentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	if !strings.Contains(text, ".delivery.yml") {
+		return false
+	}
+	for _, signal := range []string{
+		"does not exist",
+		"exists on disk, but not in",
+		"did not match any file",
+		"not found in",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func warnBaseConfigCheckFailed(w io.Writer, baseBranch string, err error) {
+	if err == nil {
+		return
+	}
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "[loopcoder] warning: base .delivery.yml consistency check could not run for %s: %v; using defaults (configuration may be stale)\n", normalizeBaseBranch(baseBranch), err)
 }

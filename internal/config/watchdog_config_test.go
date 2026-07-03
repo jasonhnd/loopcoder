@@ -3,6 +3,8 @@ package config
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +56,7 @@ func TestResilienceForRepoDefaultsWhenMissing(t *testing.T) {
 	r, err := ResilienceForRepo(context.Background(), t.TempDir(), LoadOptions{
 		BaseBranch: "main",
 		ShowBaseConfig: func(context.Context, string, string) ([]byte, error) {
-			return nil, errors.New("not found")
+			return nil, os.ErrNotExist
 		},
 	})
 	if err != nil {
@@ -94,7 +96,14 @@ func TestLoadForRepoLoudConfigResolution(t *testing.T) {
 		{
 			name: "no config anywhere uses defaults",
 			show: func(context.Context, string, string) ([]byte, error) {
-				return nil, errors.New("not found")
+				return nil, os.ErrNotExist
+			},
+			wantHardCap: 2700,
+		},
+		{
+			name: "base check real failure warns and defaults",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return nil, errors.New("git show failed")
 			},
 			wantHardCap: 2700,
 		},
@@ -102,10 +111,12 @@ func TestLoadForRepoLoudConfigResolution(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var warnings strings.Builder
 			cfg, err := LoadForRepo(context.Background(), t.TempDir(), LoadOptions{
 				BaseBranch:     "main",
 				ConfigFromBase: tt.configFromBase,
 				ShowBaseConfig: tt.show,
+				Warnings:       &warnings,
 			})
 			if tt.wantErr {
 				var mismatch ConfigMismatchError
@@ -125,6 +136,13 @@ func TestLoadForRepoLoudConfigResolution(t *testing.T) {
 			}
 			if cfg.Resilience.Worker.HardCapSeconds != tt.wantHardCap {
 				t.Fatalf("worker hard cap = %d, want %d", cfg.Resilience.Worker.HardCapSeconds, tt.wantHardCap)
+			}
+			if tt.name == "base check real failure warns and defaults" {
+				if !strings.Contains(warnings.String(), "base .delivery.yml consistency check could not run") || !strings.Contains(warnings.String(), "using defaults") {
+					t.Fatalf("warning missing real git failure details:\n%s", warnings.String())
+				}
+			} else if warnings.Len() != 0 {
+				t.Fatalf("warnings = %q, want none", warnings.String())
 			}
 		})
 	}
@@ -157,7 +175,7 @@ func TestResilienceForRepoLoudConfigResolution(t *testing.T) {
 		{
 			name: "no config anywhere uses defaults",
 			show: func(context.Context, string, string) ([]byte, error) {
-				return nil, errors.New("not found")
+				return nil, os.ErrNotExist
 			},
 			wantHardCap: 900,
 		},
@@ -169,6 +187,7 @@ func TestResilienceForRepoLoudConfigResolution(t *testing.T) {
 				BaseBranch:     "main",
 				ConfigFromBase: tt.configFromBase,
 				ShowBaseConfig: tt.show,
+				Warnings:       io.Discard,
 			})
 			if tt.wantErr {
 				var mismatch ConfigMismatchError

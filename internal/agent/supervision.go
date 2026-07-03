@@ -24,6 +24,7 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		StallTimeout: inv.StallTimeout,
 		LogPath:      inv.LogPath,
 		WorktreePath: inv.WorktreePath,
+		Stderr:       inv.Stderr,
 		RunID:        inv.RunID,
 		Role:         inv.Role,
 	}

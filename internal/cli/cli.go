@@ -407,6 +407,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "trigger" {
 		fmt.Fprintln(w, "  <kind>                           trigger kind: cron, goal-loop, or hook")
 		fmt.Fprintln(w, "  --repo string                    repository path (required)")
+		fmt.Fprintln(w, "  --base-branch string             base branch for config checks and tick (default \"main\")")
 		fmt.Fprintln(w, "  --schedule string                cron schedule metadata (cron)")
 		fmt.Fprintln(w, "  --event string                   event name (hook)")
 		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
@@ -1183,6 +1184,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var repoPath string
 	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
 	var schedule string
 	var scheduleAlias string
 	var event string
@@ -1201,6 +1204,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&schedule, "schedule", "", "cron schedule")
 	fs.StringVar(&scheduleAlias, "Schedule", "", "cron schedule")
 	fs.StringVar(&event, "event", "", "hook event")
@@ -1222,6 +1227,10 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if repoPath == "" {
 		repoPath = repoAlias
+	}
+	baseBranchFlagSet := flagWasSet(fs, "base-branch") || flagWasSet(fs, "BaseBranch")
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
 	}
 	if scheduleAlias != "" {
 		schedule = scheduleAlias
@@ -1279,12 +1288,16 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 2
 	}
-	cfg, err := loadDeliveryConfig(resolvedRepo, "main", configFromBase)
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 1
 	}
-	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg, configFromBase)
+	tickBaseBranch := ""
+	if baseBranchFlagSet {
+		tickBaseBranch = baseBranch
+	}
+	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg, configFromBase, tickBaseBranch)
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   tickOptions.WorkerProvider,
 		Verifier: tickOptions.VerifierProvider,
@@ -1330,8 +1343,11 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return orchestration.TriggerExitCode(triggerReport)
 }
 
-func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config, configFromBase bool) orchestration.TickOptions {
-	baseBranch := strings.TrimSpace(cfg.Worker.BaseBranch)
+func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config, configFromBase bool, explicitBaseBranch string) orchestration.TickOptions {
+	baseBranch := strings.TrimSpace(explicitBaseBranch)
+	if baseBranch == "" {
+		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
+	}
 	if baseBranch == "" {
 		baseBranch = "main"
 	}

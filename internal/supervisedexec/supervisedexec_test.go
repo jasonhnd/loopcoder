@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,6 +176,57 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 				t.Fatalf("Elapsed = %s, want >= %s so worktree activity crossed the stall window", result.Elapsed, tt.minElapsed)
 			}
 		})
+	}
+}
+
+func TestWorktreePollIntervalDecouplesFromLogPollAtScale(t *testing.T) {
+	stallTimeout := 5 * time.Minute
+	logInterval := stallPollInterval(stallTimeout)
+	walkInterval := worktreePollInterval(stallTimeout, logInterval)
+	if logInterval != 500*time.Millisecond {
+		t.Fatalf("log interval = %s, want 500ms", logInterval)
+	}
+	if walkInterval != 30*time.Second {
+		t.Fatalf("worktree interval = %s, want 30s", walkInterval)
+	}
+
+	start := time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Minute)
+	lastWalk := start
+	logPolls := 0
+	walks := 1 // initial observation before the ticker loop
+	for tick := start.Add(logInterval); !tick.After(end); tick = tick.Add(logInterval) {
+		logPolls++
+		if shouldWalkWorktree(tick, lastWalk, walkInterval) {
+			walks++
+			lastWalk = tick
+		}
+	}
+	if walks >= logPolls/10 {
+		t.Fatalf("worktree walks = %d over %d log polls, want far less than log cadence", walks, logPolls)
+	}
+}
+
+func TestObserveWorktreeRootErrorWarnsAndReturnsZeroObservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing")
+	observation := observeWorktree(path)
+	if observation.rootErr == nil {
+		t.Fatal("rootErr = nil, want root walk error")
+	}
+	if observation.exists || !observation.latestModTime.IsZero() {
+		t.Fatalf("observation = %#v, want no file activity", observation)
+	}
+
+	var warnings strings.Builder
+	emitted := false
+	warnWorktreeUnavailable(&warnings, path, observation.rootErr, &emitted)
+	if !emitted {
+		t.Fatal("warning was not marked emitted")
+	}
+	for _, want := range []string{"warning", "worktree liveness signal unavailable", "falling back to log-only"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+		}
 	}
 }
 

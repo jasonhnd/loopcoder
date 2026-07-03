@@ -5,6 +5,8 @@ package supervisedexec
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +34,7 @@ type Options struct {
 	StallTimeout time.Duration
 	LogPath      string
 	WorktreePath string
+	Stderr       io.Writer
 	StallGrace   time.Duration
 	OnStall      func(silentFor time.Duration)
 	// RunID and Role tag the spawned child as loopcoder-managed and place it in
@@ -62,7 +65,10 @@ type logObservation struct {
 type worktreeObservation struct {
 	exists        bool
 	latestModTime time.Time
+	rootErr       error
 }
+
+var timeNow = time.Now
 
 // Run starts cmd, supervises it, and waits until the process exits or is
 // terminated by the parent context, the hard cap, or the optional stall signal.
@@ -114,14 +120,24 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	var stallC <-chan time.Time
 	var lastLog logObservation
 	var lastWorktree worktreeObservation
+	var lastWorktreeWalk time.Time
+	var worktreeSignalDisabled bool
+	var worktreeWarningEmitted bool
 	lastProgress := start
 	if opts.StallTimeout > 0 {
 		lastLog = observeLog(opts.LogPath)
 		lastWorktree = observeWorktree(opts.WorktreePath)
+		lastWorktreeWalk = start
+		if lastWorktree.rootErr != nil {
+			warnWorktreeUnavailable(opts.Stderr, opts.WorktreePath, lastWorktree.rootErr, &worktreeWarningEmitted)
+			worktreeSignalDisabled = true
+			lastWorktree = worktreeObservation{}
+		}
 		stallTicks = time.NewTicker(stallPollInterval(opts.StallTimeout))
 		defer stallTicks.Stop()
 		stallC = stallTicks.C
 	}
+	worktreePoll := worktreePollInterval(opts.StallTimeout, stallPollInterval(opts.StallTimeout))
 
 	for {
 		select {
@@ -133,13 +149,24 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			res, err := killAndDrain(start, group, cmd.Process, waitCh, OutcomeDeadline, ctx.Err())
 			return res, err
 		case <-stallC:
-			now := time.Now()
+			now := timeNow()
 			currentLog := observeLog(opts.LogPath)
-			currentWorktree := observeWorktree(opts.WorktreePath)
+			currentWorktree := lastWorktree
 			logProgress := currentLog.changedFrom(lastLog)
-			worktreeProgress := currentWorktree.advancedFrom(lastWorktree)
+			worktreeProgress := false
+			if !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
+				currentWorktree = observeWorktree(opts.WorktreePath)
+				lastWorktreeWalk = now
+				if currentWorktree.rootErr != nil {
+					warnWorktreeUnavailable(opts.Stderr, opts.WorktreePath, currentWorktree.rootErr, &worktreeWarningEmitted)
+					worktreeSignalDisabled = true
+					currentWorktree = worktreeObservation{}
+				} else {
+					worktreeProgress = currentWorktree.advancedFrom(lastWorktree)
+					lastWorktree = currentWorktree
+				}
+			}
 			lastLog = currentLog
-			lastWorktree = currentWorktree
 			if logProgress || worktreeProgress {
 				lastProgress = now
 				continue
@@ -259,6 +286,10 @@ func observeWorktree(path string) worktreeObservation {
 	var observation worktreeObservation
 	_ = filepath.WalkDir(path, func(currentPath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if currentPath == path {
+				observation.rootErr = walkErr
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if currentPath != path && entry.Name() == ".git" {
@@ -293,4 +324,36 @@ func stallPollInterval(timeout time.Duration) time.Duration {
 		return 500 * time.Millisecond
 	}
 	return interval
+}
+
+func worktreePollInterval(timeout, logInterval time.Duration) time.Duration {
+	interval := timeout / 8
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval < logInterval {
+		interval = logInterval
+	}
+	return interval
+}
+
+func shouldWalkWorktree(current, last time.Time, interval time.Duration) bool {
+	if interval <= 0 {
+		return true
+	}
+	if last.IsZero() {
+		return true
+	}
+	return current.Sub(last) >= interval
+}
+
+func warnWorktreeUnavailable(w io.Writer, path string, err error, emitted *bool) {
+	if emitted == nil || *emitted || err == nil || path == "" {
+		return
+	}
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "[loopcoder] warning: worktree liveness signal unavailable for %s: %v; falling back to log-only stall detection\n", path, err)
+	*emitted = true
 }
