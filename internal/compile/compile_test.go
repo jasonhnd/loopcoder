@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -405,6 +406,111 @@ func TestExtractGoListBackboneFailureUnavailable(t *testing.T) {
 	if len(backbone.Packages) != 0 || len(backbone.Edges) != 0 {
 		t.Fatalf("backbone packages=%#v edges=%#v, want empty unavailable metadata", backbone.Packages, backbone.Edges)
 	}
+}
+
+func TestExtractGoListBackboneCapturesOutput(t *testing.T) {
+	repo := repoWithGoMod(t)
+	withTestGoListCommand(t, 2*time.Second, "-test.run=TestGoListExecHelper", "--", "golist-json")
+
+	backbone, err := ExtractGoListBackbone(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ExtractGoListBackbone returned error: %v", err)
+	}
+	if !backbone.Available {
+		t.Fatalf("Available = false, want true: %#v", backbone)
+	}
+	if len(backbone.Packages) != 1 || backbone.Packages[0].Dir != "." {
+		t.Fatalf("Packages = %#v, want one root package", backbone.Packages)
+	}
+}
+
+func TestExtractGoListBackboneTimesOutUnavailable(t *testing.T) {
+	repo := repoWithGoMod(t)
+	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep", "5s")
+
+	start := time.Now()
+	backbone, err := ExtractGoListBackbone(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ExtractGoListBackbone returned error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("ExtractGoListBackbone elapsed = %s, want bounded timeout", elapsed)
+	}
+	if backbone.Available {
+		t.Fatalf("Available = true, want unavailable after timeout: %#v", backbone)
+	}
+}
+
+func repoWithGoMod(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/repo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	return repo
+}
+
+func withTestGoListCommand(t *testing.T, hardCap time.Duration, args ...string) {
+	t.Helper()
+	oldCommand := goListCommand
+	oldArgs := goListArgs
+	oldHardCap := goListHardCap
+	goListCommand = os.Args[0]
+	goListArgs = append([]string(nil), args...)
+	goListHardCap = hardCap
+	t.Setenv("GO_WANT_COMPILE_HELPER", "1")
+	t.Cleanup(func() {
+		goListCommand = oldCommand
+		goListArgs = oldArgs
+		goListHardCap = oldHardCap
+	})
+}
+
+func TestGoListExecHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_COMPILE_HELPER") != "1" {
+		return
+	}
+	runExecHelper()
+}
+
+func runExecHelper() {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		fmt.Fprintln(os.Stderr, "missing helper mode")
+		os.Exit(2)
+	}
+	mode := os.Args[separator+1]
+	args := os.Args[separator+2:]
+	switch mode {
+	case "golist-json":
+		dir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stdout, "{\"ImportPath\":\"example.com/repo\",\"Dir\":%q,\"Name\":\"repo\"}\n", dir)
+	case "sleep":
+		time.Sleep(parseHelperDuration(args[0]))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func parseHelperDuration(value string) time.Duration {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse duration %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return duration
 }
 
 func TestCompileEpicUsesUnavailableBackboneWhenExtractorFails(t *testing.T) {

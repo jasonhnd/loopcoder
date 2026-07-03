@@ -12,12 +12,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"gopkg.in/yaml.v3"
 )
+
+const commandHardCapDefault = 60 * time.Second
+
+var commandHardCap = commandHardCapDefault
 
 type Status string
 
@@ -178,6 +184,9 @@ func normalizeDeps(deps Deps) Deps {
 }
 
 func execRunCommand(ctx context.Context, dir string, name string, args ...string) (CommandResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	if strings.TrimSpace(dir) != "" {
 		cmd.Dir = dir
@@ -188,18 +197,20 @@ func execRunCommand(ctx context.Context, dir string, name string, args ...string
 	cmd.Stderr = &stderr
 
 	result := CommandResult{}
-	err := cmd.Run()
+	runResult, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: commandHardCap})
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
-	if err == nil {
+	if err != nil {
+		return result, err
+	}
+	if runResult.Outcome == supervisedexec.OutcomeDeadline {
+		return result, fmt.Errorf("%s timed out after %s", strings.Join(append([]string{name}, args...), " "), commandHardCap)
+	}
+	if runResult.ExitCode == 0 {
 		return result, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
-		return result, nil
-	}
-	return result, err
+	result.ExitCode = runResult.ExitCode
+	return result, nil
 }
 
 func checkGit(deps Deps) (Check, bool) {

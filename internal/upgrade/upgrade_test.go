@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 )
@@ -520,6 +522,107 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 	if got := readFileString(t, filepath.Join(skillDir, "README.md")); got != "user note\n" {
 		t.Fatalf("unrelated file = %q, want preserved", got)
 	}
+}
+
+func TestExecRunCommandCapturesOutputAndNonZeroExit(t *testing.T) {
+	withTestCommandCap(t, 2*time.Second)
+
+	result, err := execRunCommand(context.Background(), os.Args[0], "-test.run=TestUpgradeExecHelper", "--", "stdout", "ok")
+	if err != nil {
+		t.Fatalf("execRunCommand returned error: %v", err)
+	}
+	if result.ExitCode != 0 || result.Stdout != "ok\n" || result.Stderr != "" {
+		t.Fatalf("result = %#v, want stdout ok exit 0", result)
+	}
+
+	result, err = execRunCommand(context.Background(), os.Args[0], "-test.run=TestUpgradeExecHelper", "--", "combined-exit", "stdout", "stderr", "7")
+	if err != nil {
+		t.Fatalf("execRunCommand returned error for non-zero exit: %v", err)
+	}
+	if result.ExitCode != 7 || result.Stdout != "stdout\n" || result.Stderr != "stderr\n" {
+		t.Fatalf("result = %#v, want captured output and exit 7", result)
+	}
+}
+
+func TestExecRunCommandTimesOut(t *testing.T) {
+	withTestCommandCap(t, 50*time.Millisecond)
+
+	start := time.Now()
+	_, err := execRunCommand(context.Background(), os.Args[0], "-test.run=TestUpgradeExecHelper", "--", "sleep", "5s")
+	if err == nil {
+		t.Fatal("execRunCommand error = nil, want timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("execRunCommand elapsed = %s, want bounded timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %q, want timeout", err.Error())
+	}
+}
+
+func withTestCommandCap(t *testing.T, hardCap time.Duration) {
+	t.Helper()
+	oldHardCap := commandHardCap
+	commandHardCap = hardCap
+	t.Setenv("GO_WANT_UPGRADE_HELPER", "1")
+	t.Cleanup(func() {
+		commandHardCap = oldHardCap
+	})
+}
+
+func TestUpgradeExecHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_UPGRADE_HELPER") != "1" {
+		return
+	}
+	runExecHelper()
+}
+
+func runExecHelper() {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		fmt.Fprintln(os.Stderr, "missing helper mode")
+		os.Exit(2)
+	}
+	mode := os.Args[separator+1]
+	args := os.Args[separator+2:]
+	switch mode {
+	case "stdout":
+		fmt.Fprintln(os.Stdout, args[0])
+	case "combined-exit":
+		fmt.Fprintln(os.Stdout, args[0])
+		fmt.Fprintln(os.Stderr, args[1])
+		os.Exit(parseHelperInt(args[2]))
+	case "sleep":
+		time.Sleep(parseHelperDuration(args[0]))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func parseHelperDuration(value string) time.Duration {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse duration %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return duration
+}
+
+func parseHelperInt(value string) int {
+	var n int
+	if _, err := fmt.Sscanf(value, "%d", &n); err != nil {
+		fmt.Fprintf(os.Stderr, "parse int %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return n
 }
 
 func TestReplaceStableBinaryWindowsSchedulesDeferredReplaceWhenAtomicAndBackupRenamesFail(t *testing.T) {

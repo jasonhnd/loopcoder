@@ -6,6 +6,17 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+)
+
+const gitHardCapDefault = 60 * time.Second
+
+var (
+	gitCommand   = "git"
+	gitHardCap   = gitHardCapDefault
+	buildGitArgs = gitArgs
 )
 
 // Runner is the process surface used by Client. Tests can inject a fake runner
@@ -37,15 +48,19 @@ type ExecRunner struct{}
 
 // RunGit runs git -C <repoPath> <args...> and returns stdout.
 func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) ([]byte, error) {
-	allArgs := append([]string{"-C", repoPath}, args...)
-	cmd := exec.CommandContext(ctx, "git", allArgs...)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	allArgs := buildGitArgs(repoPath, args...)
+	cmd := exec.CommandContext(ctx, gitCommand, allArgs...)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: gitHardCap})
+	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = strings.TrimSpace(stdout.String())
@@ -55,7 +70,45 @@ func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) (
 		}
 		return nil, fmt.Errorf("git %s: %w", strings.Join(allArgs, " "), err)
 	}
+	if result.Outcome == supervisedexec.OutcomeDeadline {
+		return nil, fmt.Errorf("git %s timed out after %s", strings.Join(allArgs, " "), gitHardCap)
+	}
+	if result.ExitCode != 0 {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		err := commandExitError(cmd, result.ExitCode)
+		if detail != "" {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(allArgs, " "), err, detail)
+		}
+		return nil, fmt.Errorf("git %s: %w", strings.Join(allArgs, " "), err)
+	}
 	return stdout.Bytes(), nil
+}
+
+func gitArgs(repoPath string, args ...string) []string {
+	allArgs := append([]string{"-C", repoPath}, args...)
+	return allArgs
+}
+
+type exitStatusError struct {
+	code int
+}
+
+func (e exitStatusError) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+func (e exitStatusError) ExitCode() int {
+	return e.code
+}
+
+func commandExitError(cmd *exec.Cmd, code int) error {
+	if cmd.ProcessState != nil {
+		return &exec.ExitError{ProcessState: cmd.ProcessState}
+	}
+	return exitStatusError{code: code}
 }
 
 func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]byte, error) {

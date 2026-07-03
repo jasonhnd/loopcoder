@@ -3,9 +3,13 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseJSONOutputTrimsWarnings(t *testing.T) {
@@ -47,6 +51,115 @@ func TestParseGitHubRemote(t *testing.T) {
 			t.Fatalf("parseGitHubRemote(%q) = %q, want %q", input, got, want)
 		}
 	}
+}
+
+func TestExecRunnerCapturesOutputAndNonZeroExit(t *testing.T) {
+	withTestGHCap(t, 2*time.Second)
+	dir := t.TempDir()
+
+	output, err := (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "stdout", "hello")
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if string(output) != "hello\n" {
+		t.Fatalf("output = %q, want hello newline", output)
+	}
+
+	output, err = (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "stderr-exit", "detail", "7")
+	if err == nil {
+		t.Fatal("Run error = nil, want non-zero exit error")
+	}
+	if output != nil {
+		t.Fatalf("output = %q, want nil on error", output)
+	}
+	if !strings.Contains(err.Error(), "exit status 7") || !strings.Contains(err.Error(), "detail") {
+		t.Fatalf("error = %q, want exit status and stderr detail", err.Error())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("error = %v, want wrapped exec.ExitError exit 7", err)
+	}
+}
+
+func TestExecRunnerTimesOut(t *testing.T) {
+	withTestGHCap(t, 50*time.Millisecond)
+	dir := t.TempDir()
+
+	start := time.Now()
+	_, err := (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "sleep", "5s")
+	if err == nil {
+		t.Fatal("Run error = nil, want timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %q, want timeout", err.Error())
+	}
+}
+
+func withTestGHCap(t *testing.T, hardCap time.Duration) {
+	t.Helper()
+	oldHardCap := ghHardCap
+	ghHardCap = hardCap
+	t.Setenv("GO_WANT_GITHUB_HELPER", "1")
+	t.Cleanup(func() {
+		ghHardCap = oldHardCap
+	})
+}
+
+func TestGitHubExecHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_GITHUB_HELPER") != "1" {
+		return
+	}
+	runExecHelper()
+}
+
+func runExecHelper() {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		fmt.Fprintln(os.Stderr, "missing helper mode")
+		os.Exit(2)
+	}
+	mode := os.Args[separator+1]
+	args := os.Args[separator+2:]
+	switch mode {
+	case "stdout":
+		fmt.Fprintln(os.Stdout, args[0])
+	case "stderr-exit":
+		fmt.Fprintln(os.Stderr, args[0])
+		os.Exit(parseHelperInt(args[1]))
+	case "sleep":
+		time.Sleep(parseHelperDuration(args[0]))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func parseHelperDuration(value string) time.Duration {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse duration %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return duration
+}
+
+func parseHelperInt(value string) int {
+	var n int
+	if _, err := fmt.Sscanf(value, "%d", &n); err != nil {
+		fmt.Fprintf(os.Stderr, "parse int %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return n
 }
 
 func TestCreatePRRunsGhPRCreate(t *testing.T) {
