@@ -23,6 +23,8 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		HardCap:      inv.HardCap,
 		StallTimeout: inv.StallTimeout,
 		LogPath:      inv.LogPath,
+		RunID:        inv.RunID,
+		Role:         inv.Role,
 	}
 	if inv.StallTimeout > 0 {
 		opts.OnStall = appendStallLine(inv.LogPath, provider)

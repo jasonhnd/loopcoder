@@ -215,6 +215,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		LogPath:      logPath,
 		HardCap:      opts.Timeout,
 		StallTimeout: VerifierStallTimeout,
+		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
+		Role:         "verifier",
 	})
 	if agentResult.Hung {
 		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)

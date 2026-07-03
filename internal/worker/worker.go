@@ -282,6 +282,8 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		Effort:       opts.Effort,
 		HardCap:      WorkerHardCap,
 		StallTimeout: WorkerStallTimeout,
+		RunID:        opts.RunID,
+		Role:         "worker",
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int
