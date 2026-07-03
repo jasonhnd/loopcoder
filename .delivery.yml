@@ -31,15 +31,15 @@ verifier:
 #     max_attempts: 3
 #     Optional. Absent = [10, 30, 120]; retry backoff schedule between attempts.
 #     retry_backoff_seconds: [10, 30, 120]
-#     Optional. Absent = 1800; process-watchdog hard cap (seconds) for the worker provider CLI; it is killed past this.
-#     hard_cap_seconds: 1800
-#     Optional. Absent = 120; kill the worker provider CLI after this many seconds with no log output (stall).
-#     stall_timeout_seconds: 120
+#     Optional. Absent = 2700; process-watchdog hard cap (seconds) for the worker provider CLI; it is killed past this.
+#     hard_cap_seconds: 2700
+#     Optional. Absent = 300; kill the worker provider CLI after this many seconds with no log output or worktree file activity (stall).
+#     stall_timeout_seconds: 300
 #   verifier:
-#     Optional. Absent = 600; process-watchdog hard cap (seconds) for the verifier provider CLI.
-#     hard_cap_seconds: 600
-#     Optional. Absent = 120; kill the verifier provider CLI after this many seconds with no log output (stall).
-#     stall_timeout_seconds: 120
+#     Optional. Absent = 900; process-watchdog hard cap (seconds) for the verifier provider CLI.
+#     hard_cap_seconds: 900
+#     Optional. Absent = 300; kill the verifier provider CLI after this many seconds with no log output or worktree file activity (stall).
+#     stall_timeout_seconds: 300
 ci:
   checks: [verify, go]
   # Optional. Absent = no local test command gate.

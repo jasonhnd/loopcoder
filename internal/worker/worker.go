@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	WorkerHardCap      = 30 * time.Minute
-	WorkerStallTimeout = 120 * time.Second
+	WorkerHardCap      = 45 * time.Minute
+	WorkerStallTimeout = 5 * time.Minute
 )
 
 type Options struct {

@@ -32,8 +32,8 @@ const (
 	SpecConformanceFail          = "fail"
 	SpecConformanceNotApplicable = "not-applicable"
 
-	DefaultVerifierTimeout = 600 * time.Second
-	VerifierStallTimeout   = 120 * time.Second
+	DefaultVerifierTimeout = 15 * time.Minute
+	VerifierStallTimeout   = 5 * time.Minute
 
 	reviewPacketChangedFilesBudgetBytes = 8 * 1024
 	reviewPacketDiffBudgetBytes         = 80 * 1024

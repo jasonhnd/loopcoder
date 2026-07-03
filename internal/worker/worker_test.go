@@ -15,6 +15,12 @@ import (
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
+func TestWorkerWatchdogDefaultsAreRaised(t *testing.T) {
+	if WorkerHardCap != 45*time.Minute || WorkerStallTimeout != 5*time.Minute {
+		t.Fatalf("worker watchdog defaults = hard cap %s stall %s, want 45m0s/5m0s", WorkerHardCap, WorkerStallTimeout)
+	}
+}
+
 func TestBuildPromptWithAndWithoutRecoveryContext(t *testing.T) {
 	base := BuildPrompt(PromptOptions{
 		IssueNumber: 101,
