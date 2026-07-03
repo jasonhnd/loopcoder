@@ -1,10 +1,10 @@
 ---
 id: 408
 title: Verifier stream-json output (stall-watchdog reliability)
-status: draft
+status: accepted
 date: 2026-07-03
 issue: 408
-pr: null
+pr: 409
 supersedes: []
 superseded_by: []
 ---
