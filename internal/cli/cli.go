@@ -1421,14 +1421,15 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 
 	report, err := deps.Promote(context.Background(), orchestration.PromoteOptions{
-		Writer:        deps.NewPromoteWriter(resolvedRepo),
-		RepoPath:      resolvedRepo,
-		RunID:         runID,
-		PreProdBranch: preProdBranch,
-		Gate:          cfg.Adapters.Gate,
-		KickBackItems: []string(kickBack),
-		Clock:         deps.Now,
-		StatePush:     deps.StatePush,
+		Writer:         deps.NewPromoteWriter(resolvedRepo),
+		RepoPath:       resolvedRepo,
+		RunID:          runID,
+		PreProdBranch:  preProdBranch,
+		Gate:           cfg.Adapters.Gate,
+		KickBackItems:  []string(kickBack),
+		RequiredChecks: cfg.CI.Checks,
+		Clock:          deps.Now,
+		StatePush:      deps.StatePush,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
