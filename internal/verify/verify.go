@@ -18,13 +18,18 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 const (
 	StatusPass       = "pass"
 	StatusFail       = "fail"
 	StatusNeedsHuman = "needs-human"
+
+	commandHardCapDefault = 15 * time.Minute
 )
+
+var commandHardCap = commandHardCapDefault
 
 type Options struct {
 	RepoPath   string
@@ -243,6 +248,9 @@ func Render(w io.Writer, result Result) error {
 }
 
 func (ExecRunner) Run(ctx context.Context, invocation CommandInvocation) CommandRunResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, invocation.File, invocation.Args...)
 	cmd.Dir = invocation.WorkingDirectory
 
@@ -250,19 +258,27 @@ func (ExecRunner) Run(ctx context.Context, invocation CommandInvocation) Command
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 
-	if err := cmd.Run(); err != nil {
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: commandHardCap})
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return CommandRunResult{ExitCode: -1, Output: splitLines(output.String()), Err: ctxErr}
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return CommandRunResult{ExitCode: exitErr.ExitCode(), Output: splitLines(output.String())}
 		}
 		lines := splitLines(output.String())
 		if len(lines) == 0 {
 			lines = []string{err.Error()}
 		}
 		return CommandRunResult{ExitCode: 127, Output: lines, Err: err}
+	}
+	if result.Outcome == supervisedexec.OutcomeDeadline {
+		lines := splitLines(output.String())
+		err := fmt.Errorf("%s timed out after %s", strings.Join(append([]string{invocation.File}, invocation.Args...), " "), commandHardCap)
+		if len(lines) == 0 {
+			lines = []string{err.Error()}
+		}
+		return CommandRunResult{ExitCode: -1, Output: lines, Err: err}
+	}
+	if result.ExitCode != 0 {
+		return CommandRunResult{ExitCode: result.ExitCode, Output: splitLines(output.String())}
 	}
 	return CommandRunResult{ExitCode: 0, Output: splitLines(output.String())}
 }

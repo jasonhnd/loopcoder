@@ -14,6 +14,17 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+)
+
+const goListHardCapDefault = 120 * time.Second
+
+var (
+	goListCommand = "go"
+	goListArgs    = []string{"list", "-json", "./..."}
+	goListHardCap = goListHardCapDefault
 )
 
 func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone, error) {
@@ -25,14 +36,16 @@ func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone
 		return GoListBackbone{}, fmt.Errorf("inspect go.mod for go list backbone: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "list", "-json", "./...")
+	cmd := exec.CommandContext(ctx, goListCommand, goListArgs...)
 	cmd.Dir = repoPath
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = io.Discard
-	data, err := cmd.Output()
-	if err != nil {
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: goListHardCap})
+	if err != nil || result.Outcome != supervisedexec.OutcomeCompleted || result.ExitCode != 0 {
 		return backbone, nil
 	}
-	parsed, err := parseGoListBackbone(repoPath, data)
+	parsed, err := parseGoListBackbone(repoPath, stdout.Bytes())
 	if err != nil {
 		return backbone, nil
 	}

@@ -2,6 +2,7 @@
 package scaffold
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 const (
 	DeliveryFilename = ".delivery.yml"
 	RoadmapFilename  = "ROADMAP.md"
+
+	ghHardCapDefault = 60 * time.Second
+)
+
+var (
+	ghCommand = "gh"
+	ghHardCap = ghHardCapDefault
 )
 
 type Options struct {
@@ -367,7 +378,44 @@ func (osFileSystem) WriteFile(name string, data []byte, perm fs.FileMode) error 
 type execGitHubRunner struct{}
 
 func (execGitHubRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "gh", args...)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, ghCommand, args...)
 	cmd.Dir = dir
-	return cmd.CombinedOutput()
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: ghHardCap})
+	if err != nil {
+		return output.Bytes(), err
+	}
+	if result.Outcome == supervisedexec.OutcomeDeadline {
+		return output.Bytes(), fmt.Errorf("gh %s timed out after %s", strings.Join(args, " "), ghHardCap)
+	}
+	if result.ExitCode != 0 {
+		return output.Bytes(), commandExitError(cmd, result.ExitCode)
+	}
+	return output.Bytes(), nil
+}
+
+type exitStatusError struct {
+	code int
+}
+
+func (e exitStatusError) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+func (e exitStatusError) ExitCode() int {
+	return e.code
+}
+
+func commandExitError(cmd *exec.Cmd, code int) error {
+	if cmd.ProcessState != nil {
+		return &exec.ExitError{ProcessState: cmd.ProcessState}
+	}
+	return exitStatusError{code: code}
 }

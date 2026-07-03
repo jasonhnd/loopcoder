@@ -3,6 +3,7 @@ package verify
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -124,6 +125,117 @@ func TestRunNeedsHumanForUnrunnableCommand(t *testing.T) {
 	if command.Status != StatusNeedsHuman || command.Reason != "missing-tool" {
 		t.Fatalf("command result = %#v, want missing-tool needs-human", command)
 	}
+}
+
+func TestExecRunnerCapturesOutputAndNonZeroExit(t *testing.T) {
+	withTestCommandCap(t, 2*time.Second)
+
+	run := (ExecRunner{}).Run(context.Background(), CommandInvocation{
+		File: os.Args[0],
+		Args: []string{"-test.run=TestVerifyExecHelper", "--", "stdout", "ok"},
+	})
+	if run.Err != nil || run.ExitCode != 0 || !reflect.DeepEqual(run.Output, []string{"ok"}) {
+		t.Fatalf("Run = %#v, want output ok exit 0", run)
+	}
+
+	run = (ExecRunner{}).Run(context.Background(), CommandInvocation{
+		File: os.Args[0],
+		Args: []string{"-test.run=TestVerifyExecHelper", "--", "combined-exit", "stdout", "stderr", "7"},
+	})
+	if run.Err != nil || run.ExitCode != 7 {
+		t.Fatalf("Run = %#v, want exit 7 without runner error", run)
+	}
+	text := strings.Join(run.Output, "\n")
+	if !strings.Contains(text, "stdout") || !strings.Contains(text, "stderr") {
+		t.Fatalf("output = %#v, want combined stdout and stderr", run.Output)
+	}
+}
+
+func TestExecRunnerTimesOut(t *testing.T) {
+	withTestCommandCap(t, 50*time.Millisecond)
+
+	start := time.Now()
+	run := (ExecRunner{}).Run(context.Background(), CommandInvocation{
+		File: os.Args[0],
+		Args: []string{"-test.run=TestVerifyExecHelper", "--", "sleep", "5s"},
+	})
+	if run.Err == nil {
+		t.Fatal("Run Err = nil, want timeout")
+	}
+	if run.ExitCode != -1 {
+		t.Fatalf("ExitCode = %d, want -1", run.ExitCode)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
+	}
+	if !strings.Contains(run.Err.Error(), "timed out") {
+		t.Fatalf("error = %q, want timeout", run.Err.Error())
+	}
+}
+
+func withTestCommandCap(t *testing.T, hardCap time.Duration) {
+	t.Helper()
+	oldHardCap := commandHardCap
+	commandHardCap = hardCap
+	t.Setenv("GO_WANT_VERIFY_HELPER", "1")
+	t.Cleanup(func() {
+		commandHardCap = oldHardCap
+	})
+}
+
+func TestVerifyExecHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_VERIFY_HELPER") != "1" {
+		return
+	}
+	runExecHelper()
+}
+
+func runExecHelper() {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		fmt.Fprintln(os.Stderr, "missing helper mode")
+		os.Exit(2)
+	}
+	mode := os.Args[separator+1]
+	args := os.Args[separator+2:]
+	switch mode {
+	case "stdout":
+		fmt.Fprintln(os.Stdout, args[0])
+	case "combined-exit":
+		fmt.Fprintln(os.Stdout, args[0])
+		fmt.Fprintln(os.Stderr, args[1])
+		os.Exit(parseHelperInt(args[2]))
+	case "sleep":
+		time.Sleep(parseHelperDuration(args[0]))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func parseHelperDuration(value string) time.Duration {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse duration %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return duration
+}
+
+func parseHelperInt(value string) int {
+	var n int
+	if _, err := fmt.Sscanf(value, "%d", &n); err != nil {
+		fmt.Fprintf(os.Stderr, "parse int %q: %v\n", value, err)
+		os.Exit(2)
+	}
+	return n
 }
 
 func repoWithDelivery(t *testing.T, content string) string {

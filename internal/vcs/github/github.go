@@ -11,9 +11,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/kickback"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
+
+const ghHardCapDefault = 60 * time.Second
+
+var ghHardCap = ghHardCapDefault
 
 // Reader is the GitHub read surface used by orchestration. Tests can inject a
 // fake implementation so no real gh credentials are required.
@@ -178,6 +184,9 @@ func NewWithRunner(repoPath string, runner Runner) *CLI {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 
@@ -186,7 +195,8 @@ func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: ghHardCap})
+	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = strings.TrimSpace(stdout.String())
@@ -196,7 +206,40 @@ func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]
 		}
 		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
+	if result.Outcome == supervisedexec.OutcomeDeadline {
+		return nil, fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), ghHardCap)
+	}
+	if result.ExitCode != 0 {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		err := commandExitError(cmd, result.ExitCode)
+		if detail != "" {
+			return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
+		}
+		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
 	return stdout.Bytes(), nil
+}
+
+type exitStatusError struct {
+	code int
+}
+
+func (e exitStatusError) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+func (e exitStatusError) ExitCode() int {
+	return e.code
+}
+
+func commandExitError(cmd *exec.Cmd, code int) error {
+	if cmd.ProcessState != nil {
+		return &exec.ExitError{ProcessState: cmd.ProcessState}
+	}
+	return exitStatusError{code: code}
 }
 
 func (c *CLI) RepoName(ctx context.Context) (string, error) {
