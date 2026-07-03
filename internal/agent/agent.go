@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
@@ -17,6 +18,8 @@ type Invocation struct {
 	ReadOnly     bool
 	OutputSchema string
 	LogPath      string
+	HardCap      time.Duration
+	StallTimeout time.Duration
 }
 
 type Result struct {
@@ -28,6 +31,8 @@ type Result struct {
 	StartedAt  string
 	EndedAt    string
 	DurationMS int64
+	Hung       bool
+	HungReason string
 }
 
 type Runner interface {
