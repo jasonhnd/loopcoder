@@ -32,7 +32,7 @@ func BuildClaudeArgs(inv Invocation) []string {
 	} else {
 		args = append(args, "--dangerously-skip-permissions")
 	}
-	args = append(args, "--output-format", "json")
+	args = append(args, "--output-format", "stream-json", "--verbose")
 	if strings.TrimSpace(inv.OutputSchema) != "" {
 		args = append(args, "--json-schema", inv.OutputSchema)
 	}
@@ -76,8 +76,8 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 }
 
 func parseClaudeSummary(output []byte) string {
-	trimmed := bytes.TrimSpace(output)
-	if len(trimmed) == 0 {
+	resultEvent := extractClaudeResultEvent(output)
+	if len(resultEvent) == 0 {
 		return ""
 	}
 
@@ -85,7 +85,7 @@ func parseClaudeSummary(output []byte) string {
 		Result           string          `json:"result"`
 		StructuredOutput json.RawMessage `json:"structured_output"`
 	}
-	if err := json.Unmarshal(trimmed, &payload); err != nil {
+	if err := json.Unmarshal(resultEvent, &payload); err != nil {
 		return ""
 	}
 	if structured := bytes.TrimSpace(payload.StructuredOutput); len(structured) > 0 && !bytes.Equal(structured, []byte("null")) {
@@ -103,8 +103,8 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 		Effort: strings.TrimSpace(inv.Effort),
 	}
 
-	trimmed := bytes.TrimSpace(output)
-	if len(trimmed) == 0 {
+	resultEvent := extractClaudeResultEvent(output)
+	if len(resultEvent) == 0 {
 		return metadata
 	}
 
@@ -116,7 +116,7 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 			TotalTokens  json.RawMessage `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(trimmed, &payload); err != nil {
+	if err := json.Unmarshal(resultEvent, &payload); err != nil {
 		return metadata
 	}
 
@@ -136,6 +136,40 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 		metadata.Usage.TotalTokens = totalTokens
 	}
 	return metadata
+}
+
+func extractClaudeResultEvent(output []byte) []byte {
+	var result []byte
+	for _, line := range bytes.Split(output, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(trimmed, &event); err != nil {
+			continue
+		}
+		if event.Type == "result" {
+			result = append([]byte(nil), trimmed...)
+		}
+	}
+	if len(result) > 0 {
+		return result
+	}
+
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(trimmed, &event); err != nil || event.Type != "result" {
+		return nil
+	}
+	return append([]byte(nil), trimmed...)
 }
 
 func claudePrimaryModel(values map[string]json.RawMessage) string {
