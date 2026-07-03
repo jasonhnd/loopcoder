@@ -4,7 +4,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -73,7 +75,8 @@ type Browser struct {
 }
 
 type Resilience struct {
-	Worker ResilienceWorker `yaml:"worker"`
+	Worker   ResilienceWorker   `yaml:"worker"`
+	Verifier ResilienceVerifier `yaml:"verifier"`
 }
 
 type ResilienceWorker struct {
@@ -82,6 +85,16 @@ type ResilienceWorker struct {
 	HungAfterSeconds         int   `yaml:"hung_after_seconds"`
 	MaxAttempts              int   `yaml:"max_attempts"`
 	RetryBackoffSeconds      []int `yaml:"retry_backoff_seconds"`
+	// Process-watchdog caps for the worker provider CLI (spec 0390, Decision 7).
+	// Absent/zero falls back to the built-in default.
+	HardCapSeconds      int `yaml:"hard_cap_seconds"`
+	StallTimeoutSeconds int `yaml:"stall_timeout_seconds"`
+}
+
+// ResilienceVerifier holds process-watchdog caps for the verifier provider CLI.
+type ResilienceVerifier struct {
+	HardCapSeconds      int `yaml:"hard_cap_seconds"`
+	StallTimeoutSeconds int `yaml:"stall_timeout_seconds"`
 }
 
 type Report struct {
@@ -184,6 +197,12 @@ func Default() Config {
 				HungAfterSeconds:         300,
 				MaxAttempts:              3,
 				RetryBackoffSeconds:      []int{10, 30, 120},
+				HardCapSeconds:           1800,
+				StallTimeoutSeconds:      120,
+			},
+			Verifier: ResilienceVerifier{
+				HardCapSeconds:      600,
+				StallTimeoutSeconds: 120,
 			},
 		},
 		Environment: Environment{
@@ -214,6 +233,25 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
+// falling back to built-in defaults when the file is missing or unreadable.
+func ResilienceForRepo(repoPath string) Resilience {
+	cfg, err := Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err != nil {
+		return Default().Resilience
+	}
+	return cfg.Resilience
+}
+
+// DurationSeconds converts a positive seconds value to a Duration, falling back
+// to def when seconds is zero or negative.
+func DurationSeconds(seconds int, def time.Duration) time.Duration {
+	if seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return def
 }
 
 func validateGuardrailBudget(b GuardrailBudget) error {

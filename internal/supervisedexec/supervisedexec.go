@@ -32,6 +32,10 @@ type Options struct {
 	LogPath      string
 	StallGrace   time.Duration
 	OnStall      func(silentFor time.Duration)
+	// RunID and Role tag the spawned child as loopcoder-managed and place it in
+	// a per-run kill-group (spec 0390, Decision 11). Both may be empty.
+	RunID string
+	Role  string
 }
 
 // Result reports the outcome of a supervised command.
@@ -69,9 +73,21 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		return Result{Elapsed: time.Since(start)}, errors.New("supervisedexec: LogPath is required when StallTimeout > 0")
 	}
 
+	group := newKillGroup(opts.RunID)
+	group.prepare(cmd)
+	applyEnvMarkers(cmd, opts.RunID, opts.Role)
+
 	if err := cmd.Start(); err != nil {
+		group.close()
 		return Result{Elapsed: time.Since(start)}, err
 	}
+	_ = group.adopt(cmd)
+	managedPID := cmd.Process.Pid
+	registerProc(cmd, opts.RunID, opts.Role, group)
+	defer func() {
+		deregisterProc(managedPID)
+		group.close()
+	}()
 
 	waitCh := make(chan waitResult, 1)
 	go func() {
@@ -98,9 +114,9 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		case wr := <-waitCh:
 			return completedResult(start, wr)
 		case <-hardCap.C:
-			return killAndDrain(start, cmd.Process, waitCh, OutcomeDeadline, nil)
+			return killAndDrain(start, group, cmd.Process, waitCh, OutcomeDeadline, nil)
 		case <-ctx.Done():
-			res, err := killAndDrain(start, cmd.Process, waitCh, OutcomeDeadline, ctx.Err())
+			res, err := killAndDrain(start, group, cmd.Process, waitCh, OutcomeDeadline, ctx.Err())
 			return res, err
 		case <-stallC:
 			now := time.Now()
@@ -112,7 +128,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			}
 			silentFor := now.Sub(lastProgress)
 			if silentFor >= opts.StallTimeout {
-				return handleStall(ctx, start, cmd.Process, waitCh, hardCap, opts, silentFor)
+				return handleStall(ctx, start, group, cmd.Process, waitCh, hardCap, opts, silentFor)
 			}
 		}
 	}
@@ -152,7 +168,7 @@ func completedResult(start time.Time, wr waitResult) (Result, error) {
 	return result, wr.err
 }
 
-func handleStall(ctx context.Context, start time.Time, process *os.Process, waitCh <-chan waitResult, hardCap *time.Timer, opts Options, silentFor time.Duration) (Result, error) {
+func handleStall(ctx context.Context, start time.Time, group killGroup, process *os.Process, waitCh <-chan waitResult, hardCap *time.Timer, opts Options, silentFor time.Duration) (Result, error) {
 	if opts.OnStall != nil {
 		go opts.OnStall(silentFor)
 	}
@@ -163,24 +179,31 @@ func handleStall(ctx context.Context, start time.Time, process *os.Process, wait
 		case wr := <-waitCh:
 			return completedResult(start, wr)
 		case <-hardCap.C:
-			return killAndDrain(start, process, waitCh, OutcomeDeadline, nil)
+			return killAndDrain(start, group, process, waitCh, OutcomeDeadline, nil)
 		case <-ctx.Done():
-			res, err := killAndDrain(start, process, waitCh, OutcomeDeadline, ctx.Err())
+			res, err := killAndDrain(start, group, process, waitCh, OutcomeDeadline, ctx.Err())
 			return res, err
 		case <-grace.C:
 		}
 	}
-	return killAndDrain(start, process, waitCh, OutcomeStalled, nil)
+	return killAndDrain(start, group, process, waitCh, OutcomeStalled, nil)
 }
 
-func killAndDrain(start time.Time, process *os.Process, waitCh <-chan waitResult, outcome Outcome, cause error) (Result, error) {
+func killAndDrain(start time.Time, group killGroup, process *os.Process, waitCh <-chan waitResult, outcome Outcome, cause error) (Result, error) {
 	select {
 	case wr := <-waitCh:
 		return completedResult(start, wr)
 	default:
 	}
 
-	_ = process.Kill()
+	// Kill the whole kill-group (child + its descendant subtree) first, then the
+	// direct process as a fallback if the group handle was unavailable.
+	if group != nil {
+		_ = group.kill()
+	}
+	if process != nil {
+		_ = process.Kill()
+	}
 	<-waitCh
 
 	result := Result{

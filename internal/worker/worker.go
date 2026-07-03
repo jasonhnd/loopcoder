@@ -13,6 +13,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -274,14 +275,17 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
+	resilience := config.ResilienceForRepo(repoPath)
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		LogPath:      logPath,
 		Model:        opts.Model,
 		Effort:       opts.Effort,
-		HardCap:      WorkerHardCap,
-		StallTimeout: WorkerStallTimeout,
+		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		StallTimeout: config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
+		RunID:        opts.RunID,
+		Role:         "worker",
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int

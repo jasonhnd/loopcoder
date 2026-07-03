@@ -20,6 +20,10 @@ type Invocation struct {
 	LogPath      string
 	HardCap      time.Duration
 	StallTimeout time.Duration
+	// RunID and Role tag the spawned provider process as loopcoder-managed and
+	// place it in a per-run kill-group (spec 0390, Decision 11).
+	RunID string
+	Role  string
 }
 
 type Result struct {
