@@ -30,6 +30,11 @@ const (
 	promoteLedgerEvent = "promote.attempt"
 )
 
+const (
+	GateHumanMerge = "human-merge"
+	GateAuto       = "auto"
+)
+
 type PromotionWriter interface {
 	BranchHeadSHA(ctx context.Context, branch string) (string, error)
 	KickBackFromPreProd(ctx context.Context, item, preProdBranch string) (gh.PreProdKickBackResult, error)
@@ -50,6 +55,7 @@ type PromoteOptions struct {
 	ToggleInventory      PromoteToggleInventoryFunc
 	ParallelRun          *PromoteParallelRunConfig
 	ReconcileParallelRun PromoteParallelRunReconcileFunc
+	AutoGate             *AutoGateInputs
 }
 
 type PromoteParallelRunReconcileFunc func(equivalence.Contract, equivalence.ParallelRunInput) (equivalence.ParallelRunReport, error)
@@ -57,6 +63,13 @@ type PromoteParallelRunReconcileFunc func(equivalence.Contract, equivalence.Para
 type PromoteParallelRunConfig struct {
 	Contract equivalence.Contract
 	Input    equivalence.ParallelRunInput
+}
+
+type AutoGateInputs struct {
+	CIGreen         *bool
+	VerdictPass     *bool
+	EvidencePresent *bool
+	RedLineClean    *bool
 }
 
 type PromoteReport struct {
@@ -249,6 +262,22 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		finished, _ := finish()
 		return finished, err
 	}
+	needsHumanBeforeMain := func(step, detail string) (PromoteReport, error) {
+		report.Status = PromoteStatusFailed
+		report.Summary.FailureCount++
+		report.NeedsHuman = append(report.NeedsHuman, PromoteNeedsHuman{
+			Step:   step,
+			Detail: detail,
+		})
+		report.Promoted = PromoteMainResult{
+			PreProdBranch: opts.PreProdBranch,
+			MainBranch:    "main",
+			Head:          opts.PreProdBranch,
+			Status:        PromoteStatusFailed,
+			Error:         detail,
+		}
+		return finish()
+	}
 
 	if opts.Writer == nil {
 		return failBeforeMain(errors.New("promotion writer is required"))
@@ -259,8 +288,19 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	if isReservedPromotionBranch(opts.PreProdBranch) {
 		return failBeforeMain(fmt.Errorf("pre-prod branch %q is reserved for human promotion", opts.PreProdBranch))
 	}
-	if opts.Gate != "human-merge" {
-		return failBeforeMain(fmt.Errorf("promote requires adapters.gate human-merge, got %q", opts.Gate))
+	if err := validatePromotionGate(opts.Gate); err != nil {
+		return failBeforeMain(err)
+	}
+	switch opts.Gate {
+	case GateHumanMerge:
+	case GateAuto:
+		if opts.AutoGate == nil {
+			return needsHumanBeforeMain("auto-gate", "auto-gate inputs unavailable")
+		}
+		allowed, reason := evaluateAutoGate(*opts.AutoGate)
+		if !allowed {
+			return needsHumanBeforeMain("auto-gate", reason)
+		}
 	}
 
 	if opts.ParallelRun != nil {
@@ -852,9 +892,46 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 func normalizePromotionGate(gate string) string {
 	gate = strings.TrimSpace(gate)
 	if gate == "" {
-		return "human-merge"
+		return GateHumanMerge
 	}
 	return gate
+}
+
+func validatePromotionGate(gate string) error {
+	switch gate {
+	case GateHumanMerge, GateAuto:
+		return nil
+	default:
+		return fmt.Errorf("invalid adapters.gate %q; allowed values: %s, %s", gate, GateHumanMerge, GateAuto)
+	}
+}
+
+func evaluateAutoGate(in AutoGateInputs) (bool, string) {
+	if in.RedLineClean == nil {
+		return false, "red-line floor signal missing"
+	}
+	if !*in.RedLineClean {
+		return false, "red-line floor blocked promotion"
+	}
+	if in.CIGreen == nil {
+		return false, "CI green signal missing"
+	}
+	if !*in.CIGreen {
+		return false, "CI green is false"
+	}
+	if in.VerdictPass == nil {
+		return false, "verdict pass signal missing"
+	}
+	if !*in.VerdictPass {
+		return false, "verdict pass is false"
+	}
+	if in.EvidencePresent == nil {
+		return false, "evidence present signal missing"
+	}
+	if !*in.EvidencePresent {
+		return false, "evidence present is false"
+	}
+	return true, "auto-gate passed"
 }
 
 func normalizeKickBackItems(items []string) []string {

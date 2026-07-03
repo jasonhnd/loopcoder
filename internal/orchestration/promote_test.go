@@ -58,6 +58,200 @@ func TestPromoteWholeBatchPromotesPreProdToMainAndSyncs(t *testing.T) {
 	}
 }
 
+func TestEvaluateAutoGateConjunctiveFailClosed(t *testing.T) {
+	truthy := true
+	falsey := false
+	allTrue := AutoGateInputs{
+		CIGreen:         &truthy,
+		VerdictPass:     &truthy,
+		EvidencePresent: &truthy,
+		RedLineClean:    &truthy,
+	}
+	tests := []struct {
+		name       string
+		input      AutoGateInputs
+		wantAllow  bool
+		wantReason string
+	}{
+		{
+			name:      "all-four-true",
+			input:     allTrue,
+			wantAllow: true,
+		},
+		{
+			name:       "ci-false",
+			input:      AutoGateInputs{CIGreen: &falsey, VerdictPass: &truthy, EvidencePresent: &truthy, RedLineClean: &truthy},
+			wantReason: "CI",
+		},
+		{
+			name:       "verdict-false",
+			input:      AutoGateInputs{CIGreen: &truthy, VerdictPass: &falsey, EvidencePresent: &truthy, RedLineClean: &truthy},
+			wantReason: "verdict",
+		},
+		{
+			name:       "evidence-false",
+			input:      AutoGateInputs{CIGreen: &truthy, VerdictPass: &truthy, EvidencePresent: &falsey, RedLineClean: &truthy},
+			wantReason: "evidence",
+		},
+		{
+			name:       "red-line-false",
+			input:      AutoGateInputs{CIGreen: &truthy, VerdictPass: &truthy, EvidencePresent: &truthy, RedLineClean: &falsey},
+			wantReason: "red-line floor",
+		},
+		{
+			name:       "ci-missing",
+			input:      AutoGateInputs{VerdictPass: &truthy, EvidencePresent: &truthy, RedLineClean: &truthy},
+			wantReason: "CI",
+		},
+		{
+			name:       "verdict-missing",
+			input:      AutoGateInputs{CIGreen: &truthy, EvidencePresent: &truthy, RedLineClean: &truthy},
+			wantReason: "verdict",
+		},
+		{
+			name:       "evidence-missing",
+			input:      AutoGateInputs{CIGreen: &truthy, VerdictPass: &truthy, RedLineClean: &truthy},
+			wantReason: "evidence",
+		},
+		{
+			name:       "red-line-missing",
+			input:      AutoGateInputs{CIGreen: &truthy, VerdictPass: &truthy, EvidencePresent: &truthy},
+			wantReason: "red-line floor",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allowed, reason := evaluateAutoGate(tt.input)
+			if allowed != tt.wantAllow {
+				t.Fatalf("allowed = %t, want %t (reason %q)", allowed, tt.wantAllow, reason)
+			}
+			if !tt.wantAllow && !strings.Contains(reason, tt.wantReason) {
+				t.Fatalf("reason = %q, want it to name %q", reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestPromoteAutoGatePath(t *testing.T) {
+	truthy := true
+	falsey := false
+	allTrue := &AutoGateInputs{
+		CIGreen:         &truthy,
+		VerdictPass:     &truthy,
+		EvidencePresent: &truthy,
+		RedLineClean:    &truthy,
+	}
+	tests := []struct {
+		name           string
+		gate           string
+		autoGate       *AutoGateInputs
+		wantErr        string
+		wantStatus     string
+		wantCalls      []string
+		wantNeedsHuman string
+	}{
+		{
+			name:       "human-merge-unchanged",
+			gate:       GateHumanMerge,
+			wantStatus: PromoteStatusSucceeded,
+			wantCalls:  []string{"head:main", "promote:pre-prod", "sync:pre-prod"},
+		},
+		{
+			name:           "auto-inputs-unavailable",
+			gate:           GateAuto,
+			wantStatus:     PromoteStatusFailed,
+			wantNeedsHuman: "auto-gate inputs unavailable",
+		},
+		{
+			name:       "auto-all-true-promotes",
+			gate:       GateAuto,
+			autoGate:   allTrue,
+			wantStatus: PromoteStatusSucceeded,
+			wantCalls:  []string{"head:main", "promote:pre-prod", "sync:pre-prod"},
+		},
+		{
+			name: "auto-false-signal-needs-human",
+			gate: GateAuto,
+			autoGate: &AutoGateInputs{
+				CIGreen:         &falsey,
+				VerdictPass:     &truthy,
+				EvidencePresent: &truthy,
+				RedLineClean:    &truthy,
+			},
+			wantStatus:     PromoteStatusFailed,
+			wantNeedsHuman: "CI green is false",
+		},
+		{
+			name: "auto-missing-signal-needs-human",
+			gate: GateAuto,
+			autoGate: &AutoGateInputs{
+				CIGreen:      &truthy,
+				VerdictPass:  &truthy,
+				RedLineClean: &truthy,
+			},
+			wantStatus:     PromoteStatusFailed,
+			wantNeedsHuman: "evidence present signal missing",
+		},
+		{
+			name:       "bogus-gate-fail-closed",
+			gate:       "bogus",
+			wantErr:    "allowed values: human-merge, auto",
+			wantStatus: PromoteStatusFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runID := "run-test-promote-auto-" + tt.name
+			writer := &recordingPromotionWriter{}
+
+			report, err := Promote(context.Background(), PromoteOptions{
+				Writer:        writer,
+				RepoPath:      repo,
+				RunID:         runID,
+				PreProdBranch: "pre-prod",
+				Gate:          tt.gate,
+				AutoGate:      tt.autoGate,
+				Clock:         fixedPromoteClock,
+				StatePush:     promoteTestStatePush(t, repo, runID),
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Promote error = %v, want %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("Promote returned error: %v", err)
+			}
+			if report.Status != tt.wantStatus {
+				t.Fatalf("status = %s, want %s", report.Status, tt.wantStatus)
+			}
+			if !reflect.DeepEqual(writer.calls, tt.wantCalls) {
+				t.Fatalf("calls = %#v, want %#v", writer.calls, tt.wantCalls)
+			}
+			if tt.wantNeedsHuman == "" {
+				if len(report.NeedsHuman) != 0 {
+					t.Fatalf("needs-human = %#v, want none", report.NeedsHuman)
+				}
+			} else {
+				if len(report.NeedsHuman) != 1 || report.NeedsHuman[0].Step != "auto-gate" || !strings.Contains(report.NeedsHuman[0].Detail, tt.wantNeedsHuman) {
+					t.Fatalf("needs-human = %#v, want auto-gate detail containing %q", report.NeedsHuman, tt.wantNeedsHuman)
+				}
+			}
+			if len(tt.wantCalls) == 0 {
+				if report.Summary.PromotedCount != 0 || strings.TrimSpace(report.Promoted.SHA) != "" {
+					t.Fatalf("promoted = %#v summary=%#v, want no main merge", report.Promoted, report.Summary)
+				}
+			}
+			event := readPromoteEvents(t, repo, runID)
+			if !strings.Contains(event, `"event":"promote.attempt"`) {
+				t.Fatalf("promote ledger missing event:\n%s", event)
+			}
+		})
+	}
+}
+
 func TestPromoteKickBackRevertsItemsBeforePromotingRemainder(t *testing.T) {
 	repo := t.TempDir()
 	runID := "run-test-promote-kick"
@@ -497,11 +691,11 @@ func TestPromotePreconditionRejectionsAreLedgeredAsFailed(t *testing.T) {
 			wantErr:       "reserved for human promotion",
 		},
 		{
-			name:          "non-human-gate",
+			name:          "bogus-gate",
 			writer:        &recordingPromotionWriter{},
 			preProdBranch: "pre-prod",
-			gate:          "auto",
-			wantErr:       "requires adapters.gate human-merge",
+			gate:          "bogus",
+			wantErr:       "allowed values: human-merge, auto",
 		},
 	}
 
