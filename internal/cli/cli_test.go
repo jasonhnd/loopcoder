@@ -7,15 +7,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -1528,6 +1532,545 @@ func TestReadySetRequiresRepo(t *testing.T) {
 	}
 }
 
+func TestCompileRunsWithDualReadOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "ROADMAP.md"), []byte(`# ROADMAP
+
+## Auth Flow
+- doc: Design auth
+`), 0o644); err != nil {
+		t.Fatalf("write ROADMAP.md: %v", err)
+	}
+	writer := newCLIFakeIssueWriter()
+
+	exitCode := RunWithDeps([]string{"compile", "--repo", repo}, &stdout, &stderr, Deps{
+		NewIssueWriter: func(string) compiler.IssueWriter {
+			return writer
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got compiler.Report
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not compile JSON: %v\n%s", err, stdout.String())
+	}
+	if !got.PlanApprovalRequired || len(got.Created) != 1 || got.Created[0].Issue != 1 {
+		t.Fatalf("compile report = %#v, want one created issue and approval required", got)
+	}
+	for _, want := range []string{"COMPILE", "Plan approval required: yes", "Created: 1"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestCompileRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"compile"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
+func TestDiscoverRunsWithDualReadOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	writer := newCLIFakeIssueWriter()
+
+	exitCode := RunWithDeps([]string{"discover", "--repo", repo}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(path string) orchestration.GitHubReader {
+			if path != repo {
+				t.Fatalf("reader repo = %q, want %q", path, repo)
+			}
+			return cliFakeReader{
+				prs: []gh.PullRequest{{
+					Number:      44,
+					Title:       "Fix failure",
+					URL:         "https://github.com/owner/repo/pull/44",
+					HeadRefName: "loop/issue-44",
+				}},
+				checks: map[int][]gh.Check{
+					44: {{Name: "verify", Bucket: "fail"}},
+				},
+			}
+		},
+		NewIssueWriter: func(path string) compiler.IssueWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return writer
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got perception.Report
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not discover JSON: %v\n%s", err, stdout.String())
+	}
+	if len(got.Created) != 1 || got.Created[0].Issue != 1 || got.Summary.CreatedCount != 1 {
+		t.Fatalf("discover report = %#v, want one created issue", got)
+	}
+	for _, want := range []string{"DISCOVER", "Created: 1", "Skipped held: 0", "Skipped duplicate: 0"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestDiscoverRequiresRepo(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"discover"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "--repo is required") {
+		t.Fatalf("stderr missing required repo message: %q", stderr.String())
+	}
+}
+
+func TestTickHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"tick", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{
+		"loopcoder tick",
+		"--repo",
+		"--base-branch",
+		"--pre-prod-branch",
+		"--run-id",
+		"--worker-provider",
+		"--verifier-provider",
+		"--worker-model",
+		"--worker-effort",
+		"--verifier-model",
+		"--verifier-effort",
+		"--verifier-timeout",
+		"--throttle-limit",
+		"--pretty",
+		"--no-pretty",
+		"LOOPCODER_PRETTY",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestPromoteHelpDocumentsFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := Run([]string{"promote", "--help"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("Run returned exit code %d, want 0", exitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	help := stdout.String()
+	for _, want := range []string{"loopcoder promote", "--repo", "--pre-prod-branch", "--run-id", "--kick-back"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestPromoteRunsWithConfigDefaultsAndKickBacks(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`version: 1
+adapters:
+  gate: human-merge
+environment:
+  pre_prod_branch: staging
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{"promote", "--repo", repo, "--run-id", "run-test-promote", "--kick-back", "#101", "--kick-back", "merge-sha"}, &stdout, &stderr, Deps{
+		NewPromoteWriter: func(path string) orchestration.PromotionWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return cliFakePromotionWriter{}
+		},
+		Promote: func(_ context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			called = true
+			if opts.RepoPath != repo || opts.RunID != "run-test-promote" || opts.PreProdBranch != "staging" || opts.Gate != "human-merge" {
+				t.Fatalf("promote opts = %#v", opts)
+			}
+			if !reflect.DeepEqual(opts.KickBackItems, []string{"#101", "merge-sha"}) {
+				t.Fatalf("kick-back items = %#v", opts.KickBackItems)
+			}
+			if opts.Writer == nil {
+				t.Fatal("promotion writer was not set")
+			}
+			if opts.Clock == nil || opts.StatePush == nil {
+				t.Fatalf("promote opts missing clock or state push: %#v", opts)
+			}
+			return orchestration.PromoteReport{
+				Version:       orchestration.PromoteReportVersion,
+				RepoPath:      opts.RepoPath,
+				RunID:         opts.RunID,
+				PreProdBranch: opts.PreProdBranch,
+				MainBranch:    "main",
+				Gate:          opts.Gate,
+				Status:        orchestration.PromoteStatusSucceeded,
+				KickedBack: []orchestration.PromoteKickBackResult{{
+					Item:        "#101",
+					PRNumber:    101,
+					Branch:      opts.PreProdBranch,
+					RevertedSHA: "merge-sha",
+					SHA:         "revert-sha",
+					Status:      orchestration.PromoteStatusSucceeded,
+				}},
+				Promoted: orchestration.PromoteMainResult{
+					PreProdBranch: opts.PreProdBranch,
+					MainBranch:    "main",
+					Head:          opts.PreProdBranch,
+					SHA:           "main-sha",
+					Status:        orchestration.PromoteStatusSucceeded,
+				},
+				Sync: orchestration.PromoteSyncResult{
+					PreProdBranch: opts.PreProdBranch,
+					MainBranch:    "main",
+					SHA:           "main-sha",
+					Status:        orchestration.PromoteStatusSucceeded,
+				},
+				Summary: orchestration.PromoteSummary{
+					KickedBackCount: 1,
+					PromotedCount:   1,
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Promote dependency was not called")
+	}
+	var got orchestration.PromoteReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not promote JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.PromoteStatusSucceeded || got.Summary.PromotedCount != 1 {
+		t.Fatalf("promote report = %#v", got)
+	}
+	for _, want := range []string{"PROMOTE", "Status: succeeded", "Kicked back", "Promoted", "Pre-prod sync"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestTickRunsWithDualReadOutputAndConfigDefaults(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`version: 1
+adapters:
+  worker: codex
+  verifier: claude
+worker:
+  base_branch: develop
+  model: config-worker-model
+  reasoning_effort: config-worker-effort
+environment:
+  pre_prod_branch: staging
+verifier:
+  model: config-verifier-model
+  reasoning_effort: config-verifier-effort
+ci:
+  checks: [verify, go]
+evidence:
+  website:
+    preview_url: https://preview.example.com
+  cli:
+    example_output: |
+      $ loopcoder --version
+      version=dev
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo, "--run-id", "run-test-wave", "--no-pretty"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(path string) orchestration.GitHubReader {
+			if path != repo {
+				t.Fatalf("reader repo = %q, want %q", path, repo)
+			}
+			return cliFakeReader{}
+		},
+		NewIssueWriter: func(path string) compiler.IssueWriter {
+			if path != repo {
+				t.Fatalf("writer repo = %q, want %q", path, repo)
+			}
+			return newCLIFakeIssueWriter()
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			if opts.RepoPath != repo || opts.BaseBranch != "develop" || opts.PreProdBranch != "staging" || opts.RunID != "run-test-wave" {
+				t.Fatalf("tick opts repo/base/run = %#v", opts)
+			}
+			if !reflect.DeepEqual(opts.RequiredChecks, []string{"verify", "go"}) {
+				t.Fatalf("tick required checks = %#v", opts.RequiredChecks)
+			}
+			wantEvidence := []config.EvidenceArtifact{
+				{ProjectType: "website", PreviewURL: "https://preview.example.com"},
+				{ProjectType: "cli", ExampleOutput: "$ loopcoder --version\nversion=dev"},
+			}
+			if !reflect.DeepEqual(opts.ConfiguredEvidence, wantEvidence) {
+				t.Fatalf("tick configured evidence = %#v, want %#v", opts.ConfiguredEvidence, wantEvidence)
+			}
+			if opts.WorkerProvider != "codex" || opts.VerifierProvider != "claude" {
+				t.Fatalf("tick opts providers = %#v", opts)
+			}
+			if opts.WorkerModel != "config-worker-model" || opts.WorkerEffort != "config-worker-effort" {
+				t.Fatalf("tick worker model/effort = %#v", opts)
+			}
+			if opts.VerifierModel != "config-verifier-model" || opts.VerifierEffort != "config-verifier-effort" {
+				t.Fatalf("tick verifier model/effort = %#v", opts)
+			}
+			if opts.Clock == nil {
+				t.Fatal("tick opts clock is nil")
+			}
+			if got := opts.Clock(); !got.Equal(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)) {
+				t.Fatalf("tick opts clock = %s", got)
+			}
+			return orchestration.TickReport{
+				Version:       orchestration.TickReportVersion,
+				Repo:          "owner/repo",
+				RepoPath:      repo,
+				BaseBranch:    opts.BaseBranch,
+				PreProdBranch: opts.PreProdBranch,
+				RunID:         opts.RunID,
+				Status:        orchestration.TickStatusSucceeded,
+				StopReason:    orchestration.TickStopCompleted,
+				StartedAt:     "2026-07-02T12:00:00Z",
+				FinishedAt:    "2026-07-02T12:00:00Z",
+				Compile: compiler.Report{
+					Repo: "owner/repo",
+					Summary: compiler.Summary{
+						UnchangedCount: 1,
+						TotalCount:     1,
+					},
+				},
+				ReadySet: report.ReadySetReport{
+					Repo:       "owner/repo",
+					BaseBranch: opts.BaseBranch,
+					Ready: []report.ReadyIssue{{
+						Issue:  10,
+						Title:  "Ready",
+						Reason: "ready",
+					}},
+				},
+				DispatchWave: &orchestration.DispatchWaveReport{
+					Repo:       "owner/repo",
+					BaseBranch: opts.BaseBranch,
+					RunID:      opts.RunID,
+					Results: []orchestration.DispatchWaveIssueResult{{
+						Issue:  10,
+						Status: orchestration.DispatchWaveStatusSucceeded,
+						PR:     "https://github.com/owner/repo/pull/10",
+					}},
+				},
+				Reviews: []orchestration.TickReviewResult{{
+					Issue:           10,
+					PR:              "https://github.com/owner/repo/pull/10",
+					PRNumber:        10,
+					Verdict:         loopreview.VerdictPass,
+					SpecConformance: loopreview.SpecConformancePass,
+					Evidence:        "review passed",
+					Findings:        []loopreview.Finding{},
+				}},
+				NeedsHuman: []orchestration.TickIssue{},
+				Failures:   []orchestration.TickIssue{},
+				StatePush: &orchestration.TickStatePush{
+					Branch: statebranch.DefaultBranch,
+					Remote: statebranch.DefaultRemote,
+					Pushed: true,
+					Files:  []string{"runs/run-test-wave/state.json"},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	var got orchestration.TickReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not tick JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.TickStatusSucceeded || got.Summary.DispatchedPRCount != 1 {
+		t.Fatalf("tick report = %#v", got)
+	}
+	if strings.Contains(stdout.String(), "TICK") {
+		t.Fatalf("stdout should be JSON only, got:\n%s", stdout.String())
+	}
+	for _, want := range []string{"TICK", "Status: succeeded", "Dispatch", "Reviews", "State"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestTickNeedsHumanExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo, "--no-pretty"}, &stdout, &stderr, Deps{
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			return orchestration.TickReport{
+				Version:    orchestration.TickReportVersion,
+				Repo:       "owner/repo",
+				RepoPath:   repo,
+				BaseBranch: "main",
+				RunID:      "run-test-wave",
+				Status:     orchestration.TickStatusNeedsHuman,
+				StopReason: orchestration.TickStopReviewNeedsHuman,
+				NeedsHuman: []orchestration.TickIssue{{
+					Step:   "loopreview",
+					PR:     "https://github.com/owner/repo/pull/10",
+					Detail: "manual review required",
+				}},
+				Failures: []orchestration.TickIssue{},
+			}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.Len() == 0 || !strings.Contains(stderr.String(), "Status: needs-human") {
+		t.Fatalf("tick did not emit dual output; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestTriggerCronRunsTickWithExplicitRepo(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"cron",
+		"--repo", repo,
+		"--schedule", "@hourly",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("tick RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if opts.RunID == "" {
+				t.Fatal("tick RunID is empty")
+			}
+			return cliTriggerTickReport(opts, orchestration.TickStatusSucceeded, orchestration.TickStopCompleted), nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	var got orchestration.TriggerReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not trigger JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Kind != orchestration.TriggerKindCron || got.Schedule != "@hourly" || got.Status != orchestration.TriggerStatusSucceeded || got.Iterations != 1 {
+		t.Fatalf("trigger report = %#v", got)
+	}
+	for _, want := range []string{"TRIGGER", "Kind: cron", "Schedule: @hourly", "Ticks"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestTriggerGoalLoopMaxIterationsAliasRoutesNeedsHuman(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := 0
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"goal-loop",
+		"--repo", repo,
+		"--max_iterations", "2",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called++
+			return cliTriggerTickReport(opts, orchestration.TickStatusSucceeded, orchestration.TickStopCompleted), nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if called != 2 {
+		t.Fatalf("tick calls = %d, want 2", called)
+	}
+	var got orchestration.TriggerReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not trigger JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Status != orchestration.TriggerStatusNeedsHuman || got.StopReason != orchestration.TriggerStopMaxIterations || got.Iterations != 2 {
+		t.Fatalf("trigger report = %#v", got)
+	}
+}
+
+func TestTriggerHookRequiresEvent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"hook",
+		"--repo", t.TempDir(),
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--event is required") {
+		t.Fatalf("stderr missing required event message: %q", stderr.String())
+	}
+}
+
 func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -2325,6 +2868,12 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 		"-Provider", "codex",
 		"-Model", "gpt-5",
 		"-Effort", "high",
+		"-UpgradedModel", "gpt-6",
+		"-UpgradedEffort", "xhigh",
+		"-VerifierProvider", "claude",
+		"-VerifierModel", "claude-opus",
+		"-VerifierEffort", "max",
+		"-VerifierTimeout", "15s",
 	}, &stdout, &stderr, Deps{
 		Recover: func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
 			if opts.RepoPath != repo {
@@ -2341,6 +2890,12 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 			}
 			if opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
 				t.Fatalf("recover opts provider/model/effort = %#v", opts)
+			}
+			if opts.UpgradedModel != "gpt-6" || opts.UpgradedEffort != "xhigh" {
+				t.Fatalf("recover opts upgraded model/effort = %#v", opts)
+			}
+			if opts.VerifierProvider != "claude" || opts.VerifierModel != "claude-opus" || opts.VerifierEffort != "max" || opts.VerifierTimeout != 15*time.Second {
+				t.Fatalf("recover opts verifier fields = %#v", opts)
 			}
 			if opts.Stderr == nil {
 				t.Fatal("recover opts Stderr is nil")
@@ -2514,6 +3069,31 @@ func readSingleFile(t *testing.T, pattern string) string {
 	return string(data)
 }
 
+func cliTriggerTickReport(opts orchestration.TickOptions, status, stopReason string) orchestration.TickReport {
+	baseBranch := opts.BaseBranch
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	preProdBranch := opts.PreProdBranch
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
+	return orchestration.TickReport{
+		Version:       orchestration.TickReportVersion,
+		Repo:          "owner/repo",
+		RepoPath:      opts.RepoPath,
+		BaseBranch:    baseBranch,
+		PreProdBranch: preProdBranch,
+		RunID:         opts.RunID,
+		Status:        status,
+		StopReason:    stopReason,
+		StartedAt:     "2026-07-02T12:00:00Z",
+		FinishedAt:    "2026-07-02T12:00:00Z",
+		NeedsHuman:    []orchestration.TickIssue{},
+		Failures:      []orchestration.TickIssue{},
+	}
+}
+
 func validDispatchAttestation() attestation.AttestationRecord {
 	return attestation.AttestationRecord{
 		Role:        attestation.RoleWorker,
@@ -2565,9 +3145,29 @@ func int64TestPtr(value int64) *int64 {
 	return &value
 }
 
+type cliFakePromotionWriter struct{}
+
+func (cliFakePromotionWriter) KickBackFromPreProd(context.Context, string, string) (gh.PreProdKickBackResult, error) {
+	return gh.PreProdKickBackResult{}, nil
+}
+
+func (cliFakePromotionWriter) RouteKickBackToNeedsHuman(context.Context, int) (gh.NeedsHumanRouteResult, error) {
+	return gh.NeedsHumanRouteResult{}, nil
+}
+
+func (cliFakePromotionWriter) PromotePreProdToMain(context.Context, string) (gh.MainPromotionResult, error) {
+	return gh.MainPromotionResult{}, nil
+}
+
+func (cliFakePromotionWriter) SyncPreProdFromMain(context.Context, string) (gh.PreProdSyncResult, error) {
+	return gh.PreProdSyncResult{}, nil
+}
+
 type cliFakeReader struct {
 	issues []gh.Issue
 	views  map[int]gh.Issue
+	prs    []gh.PullRequest
+	checks map[int][]gh.Check
 }
 
 func (f cliFakeReader) RepoName(context.Context) (string, error) {
@@ -2586,9 +3186,93 @@ func (f cliFakeReader) ViewIssue(_ context.Context, number int) (gh.Issue, error
 }
 
 func (f cliFakeReader) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
-	return nil, nil
+	return append([]gh.PullRequest(nil), f.prs...), nil
 }
 
-func (f cliFakeReader) PRChecks(context.Context, int) ([]gh.Check, error) {
-	return nil, nil
+func (f cliFakeReader) PRChecks(_ context.Context, number int) ([]gh.Check, error) {
+	return append([]gh.Check(nil), f.checks[number]...), nil
+}
+
+type cliFakeIssueWriter struct {
+	issues     map[int]gh.Issue
+	nextNumber int
+}
+
+func newCLIFakeIssueWriter() *cliFakeIssueWriter {
+	return &cliFakeIssueWriter{
+		issues:     map[int]gh.Issue{},
+		nextNumber: 1,
+	}
+}
+
+func (f *cliFakeIssueWriter) RepoName(context.Context) (string, error) {
+	return "owner/repo", nil
+}
+
+func (f *cliFakeIssueWriter) ListIssues(context.Context, string) ([]gh.Issue, error) {
+	out := make([]gh.Issue, 0, len(f.issues))
+	for _, issue := range f.issues {
+		out = append(out, issue)
+	}
+	return out, nil
+}
+
+func (f *cliFakeIssueWriter) CreateIssue(_ context.Context, title, body string, labels []string) (gh.Issue, error) {
+	number := f.nextNumber
+	f.nextNumber++
+	issue := gh.Issue{
+		Number: number,
+		Title:  title,
+		Body:   body,
+		State:  "OPEN",
+		Labels: cliLabels(labels),
+	}
+	f.issues[number] = issue
+	return issue, nil
+}
+
+func (f *cliFakeIssueWriter) UpdateIssue(_ context.Context, number int, title, body string, addLabels, removeLabels []string) (gh.Issue, error) {
+	issue := f.issues[number]
+	issue.Title = title
+	issue.Body = body
+	issue.Labels = cliApplyLabelChanges(issue.Labels, addLabels, removeLabels)
+	f.issues[number] = issue
+	return issue, nil
+}
+
+func (f *cliFakeIssueWriter) CloseIssue(_ context.Context, number int) error {
+	issue := f.issues[number]
+	issue.State = "CLOSED"
+	f.issues[number] = issue
+	return nil
+}
+
+func cliLabels(names []string) []gh.Label {
+	labels := make([]gh.Label, 0, len(names))
+	for _, name := range names {
+		labels = append(labels, gh.Label{Name: name})
+	}
+	return labels
+}
+
+func cliApplyLabelChanges(labels []gh.Label, addLabels, removeLabels []string) []gh.Label {
+	remove := map[string]bool{}
+	for _, label := range removeLabels {
+		remove[label] = true
+	}
+	seen := map[string]bool{}
+	out := make([]gh.Label, 0, len(labels)+len(addLabels))
+	for _, label := range labels {
+		if remove[label.Name] {
+			continue
+		}
+		seen[label.Name] = true
+		out = append(out, label)
+	}
+	for _, label := range addLabels {
+		if !seen[label] {
+			out = append(out, gh.Label{Name: label})
+		}
+	}
+	return out
 }

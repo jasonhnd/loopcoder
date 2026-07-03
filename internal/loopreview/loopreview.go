@@ -10,12 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -31,6 +33,7 @@ const (
 	SpecConformanceNotApplicable = "not-applicable"
 
 	DefaultVerifierTimeout = 600 * time.Second
+	VerifierStallTimeout   = 120 * time.Second
 
 	reviewPacketChangedFilesBudgetBytes = 8 * 1024
 	reviewPacketDiffBudgetBytes         = 80 * 1024
@@ -158,13 +161,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = DefaultVerifierTimeout
-	}
-
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
 		return Result{}, err
+	}
+	resilience := config.ResilienceForRepo(repoPath)
+	if opts.Timeout <= 0 {
+		opts.Timeout = config.DurationSeconds(resilience.Verifier.HardCapSeconds, DefaultVerifierTimeout)
 	}
 	runner, err := deps.AgentLookup(opts.Provider)
 	if err != nil {
@@ -203,10 +206,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
-	agentCtx, cancelAgent := context.WithTimeout(ctx, opts.Timeout)
-	defer cancelAgent()
-
-	agentResult, agentErr := runner.Run(agentCtx, agent.Invocation{
+	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		Model:        opts.Model,
@@ -214,14 +214,17 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		ReadOnly:     true,
 		OutputSchema: VerdictJSONSchema,
 		LogPath:      logPath,
+		HardCap:      opts.Timeout,
+		StallTimeout: config.DurationSeconds(resilience.Verifier.StallTimeoutSeconds, VerifierStallTimeout),
+		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
+		Role:         "verifier",
 	})
+	if agentResult.Hung {
+		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	}
 	record := verifierAttestation(opts, agentResult)
 	fmt.Fprintln(warnings, record.Header())
-	if errors.Is(agentCtx.Err(), context.DeadlineExceeded) {
-		note := providerFailureNote(logPath, fmt.Sprintf("%s verifier timed out after %s", opts.Provider, formatTimeout(opts.Timeout)))
-		verdict := needsHumanVerdict("error", "", note)
-		return resultWithAttestation(verdict, record), nil
-	}
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
 		return resultWithAttestation(verdict, record), nil
@@ -288,6 +291,28 @@ func resultWithAttestation(verdict Verdict, record attestation.AttestationRecord
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
 	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}
+}
+
+func verifierHungVerdict(provider, logPath string, timeout time.Duration, reason string) Verdict {
+	var note string
+	switch reason {
+	case agent.HungReasonDeadline:
+		note = fmt.Sprintf("%s verifier timed out after %s", provider, formatTimeout(timeout))
+	case agent.HungReasonStall:
+		note = fmt.Sprintf("%s verifier hung (reason=hung hung_reason=stall; silent for %s)", provider, formatTimeout(VerifierStallTimeout))
+	default:
+		note = fmt.Sprintf("%s verifier hung (reason=hung hung_reason=%s)", provider, firstNonEmpty(reason, "unknown"))
+	}
+	return needsHumanVerdict("error", "", providerFailureNote(logPath, note))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func Render(w io.Writer, result Result) error {
@@ -879,10 +904,66 @@ func loadIssue(ctx context.Context, github GitHubClient, pr gh.PullRequest) (gh.
 			return issue, true
 		}
 	}
+	for _, number := range fallbackIssueNumbers(pr) {
+		issue, err := github.ViewIssue(ctx, number)
+		if err == nil {
+			return issue, true
+		}
+	}
 	return gh.Issue{
 		Title: pr.Title,
 		Body:  pr.Body,
 	}, false
+}
+
+func fallbackIssueNumbers(pr gh.PullRequest) []int {
+	numbers := []int{}
+	seen := map[int]bool{}
+	add := func(number int) {
+		if number <= 0 || seen[number] {
+			return
+		}
+		seen[number] = true
+		numbers = append(numbers, number)
+	}
+	if number := loopIssueBranchNumber(pr.HeadRefName); number > 0 {
+		add(number)
+	}
+	for _, number := range bodyIssueReferenceNumbers(pr.Body) {
+		add(number)
+	}
+	return numbers
+}
+
+func loopIssueBranchNumber(branch string) int {
+	match := loopIssueBranchPattern.FindStringSubmatch(strings.TrimSpace(branch))
+	if len(match) != 2 {
+		return 0
+	}
+	return atoiPositive(match[1])
+}
+
+func bodyIssueReferenceNumbers(body string) []int {
+	numbers := []int{}
+	for _, match := range closingIssueBodyPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 2 {
+			numbers = append(numbers, atoiPositive(match[1]))
+		}
+	}
+	for _, match := range bareIssueBodyPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 2 {
+			numbers = append(numbers, atoiPositive(match[1]))
+		}
+	}
+	return numbers
+}
+
+func atoiPositive(value string) int {
+	number, err := strconv.Atoi(value)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
 }
 
 func specSearchTexts(issue gh.Issue, issuePresent bool, pr gh.PullRequest) []string {
@@ -1161,7 +1242,12 @@ func nonNilFindings(findings []Finding) []Finding {
 	return findings
 }
 
-var specPathPattern = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
+var (
+	specPathPattern         = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
+	loopIssueBranchPattern  = regexp.MustCompile(`^loop/issue-(\d+)(?:$|[-_/].*)`)
+	closingIssueBodyPattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b`)
+	bareIssueBodyPattern    = regexp.MustCompile(`#(\d+)\b`)
+)
 
 func discoverSpecPath(texts ...string) string {
 	seen := map[string]bool{}

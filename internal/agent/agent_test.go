@@ -22,7 +22,7 @@ func TestLookup(t *testing.T) {
 			wantErr:  true,
 			errContains: []string{
 				`unknown provider "no-such-provider"`,
-				"supported providers: claude, codex",
+				"supported providers: claude, codex, gemini",
 			},
 		},
 	}

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-03
+
+The autonomous delivery loop, per [`docs/specs/0161-autonomous-delivery-loop.md`](docs/specs/0161-autonomous-delivery-loop.md). A human touches only two ends -- approving the plan and promoting to production -- while a deterministic orchestrator (`tick`) drives three LLM nodes (Planner = `compile`, Generator = worker, Evaluator = `loopreview`) around the loop in between.
+
+### Added
+
+- **`loopcoder tick`** -- one deterministic pass of the delivery loop: compile the ready set, dispatch a worker per ready issue, gate each result through the risk gate, and auto-merge passing work into the `pre-prod` branch. A tick never merges to `main` (invariant F1).
+- **Risk gate** -- classifies each worker PR (diff size, dangerous commands, CI signal, core-path touch) and either auto-merges into `pre-prod` or escalates to `needs-human`. Blanket-guards `internal/orchestration/*.go` and other loopcoder-core paths as red lines requiring human review.
+- **`pre-prod` environment + auto-revert-keeps-green** -- merged work lands on `pre-prod`, not `main`. When post-merge CI goes red and the failure is attributable to a specific merge, that merge is auto-reverted to keep `pre-prod` green; non-attributable or unknown failures escalate to `needs-human`. In-progress CI is left for a later tick.
+- **`loopcoder promote`** -- the production gate (invariant F3, human-only): promotes the whole `pre-prod` batch to `main`, or kicks back individual PRs. Promotion is idempotent and ledgered (invariant E2); kick-back reverts are idempotent and matched by anchored PR/SHA parsing.
+- **Failure-loop recover** -- a failed worker is retried up to a bounded number of attempts (default 2), same-config first and upgraded (higher effort) only on the final attempt, then escalated to `needs-human`.
+- **Self-hosting guard** -- changes to loopcoder-core orchestration paths are a red line: the loop can propose them but requires a human and a rebuild to take effect, so the loop can never silently rewrite its own safety machinery (invariant F4).
+- **Automation triggers** -- `cron`, goal-loop, and hook-driven entry points that run `tick` unattended within guardrail bounds.
+- **Discover (D1)** -- turns CI failures into deduplicated issues, excluding held/closed trackers, so the loop can self-refill its own work queue.
+- **Skills injection (D2)** -- relevant repo skills are injected into the worker prompt at dispatch.
+- **Evidence + report** -- `.delivery.yml` carries evidence/preview metadata; `loopcoder report` surfaces pending-promotion, needs-human, failures, and evidence as a program-rendered panel.
+- **Epic support** -- decomposition (`compile` emits a slice DAG with one plan approval), dependency graph and ordering (`go list` backbone, Kahn leaf-first, SCC condensation with graceful degradation on `go list`/parse failure), an equivalence gate for migrations (golden-master + differential + parallel-run), incremental migration discipline (Branch-by-Abstraction + build-tag toggle + dark-slice), and a batched promotion panel with reconciliation and a toggle inventory.
+- **Process watchdog** (per [`docs/specs/0390-process-watchdog.md`](docs/specs/0390-process-watchdog.md)) -- no spawned CLI subprocess can hang forever. A shared `internal/supervisedexec` helper bounds every subprocess with a hard wall-clock cap and gives the worker/verifier LLM CLIs output-stall detection; a detected hang is killed and fed into the recovery loop as a distinct `hung` outcome (same-config retry within the bounded budget, then `needs-human`). Every spawned child is tagged `LOOPCODER_MANAGED` and placed in a per-run kill-group (a Windows Job Object with kill-on-close, or a Unix process group with Linux `PR_SET_PDEATHSIG`) so a whole subtree is reaped at once and orphans are cleaned up on crash. `SIGINT`/`SIGTERM` gracefully terminates the instance's children, and `loopcoder ps` / `loopcoder kill` operate only on loopcoder-managed processes -- never by bare process name. Per-project caps live under `resilience.worker` / `resilience.verifier` in `.delivery.yml`.
+
+### Notes
+
+- All five failsafe invariants ship enforced: F1 (tick never merges to `main`), F2 (the Evaluator/verifier runs read-only), F3 (promote is human-only), F4 (guardrail bounds on automation and self-modification), F5 (attestation on every LLM node). Every slice was built against spec 0161 and gated through `loopreview` (Opus 4.8 1M, read-only verifier, attestation verified) before landing.
+
 ## [0.3.9] - 2026-07-02
 
 ### Fixed

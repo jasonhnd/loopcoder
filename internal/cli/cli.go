@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/relay"
@@ -46,25 +48,32 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader func(repoPath string) orchestration.GitHubReader
-	ProcessAlive    func(pid int) bool
-	Now             func() time.Time
-	IsTerminal      func(w io.Writer) bool
-	Stdin           io.Reader
-	BuildInfo       BuildInfo
-	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview      func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Recover         func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify          func(ctx context.Context, opts verify.Options) verify.Result
-	Doctor          func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init            func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade         func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	SkillInstall    func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush       func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull       func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease    func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter   func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive     func(pid int) bool
+	Now              func() time.Time
+	IsTerminal       func(w io.Writer) bool
+	Stdin            io.Reader
+	BuildInfo        BuildInfo
+	ComputeReadySet  func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick             func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover         func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote          func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify           func(ctx context.Context, opts verify.Options) verify.Result
+	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
+	Init             func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade          func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	SkillInstall     func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush        func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull        func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
@@ -72,6 +81,11 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
+	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
+	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
+	{Name: "tick", Summary: "run one unattended delivery pass"},
+	{Name: "trigger", Summary: "run automation triggers for tick"},
+	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
@@ -85,6 +99,8 @@ var commands = []Command{
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
 	{Name: "hook", Summary: "run an embedded loopcoder conductor hook (used by Claude Code hook settings)"},
+	{Name: "ps", Summary: "list loopcoder-managed worker processes"},
+	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
 }
 
 // Commands returns the registered subcommands in root help order.
@@ -96,6 +112,7 @@ func Commands() []Command {
 
 // Run executes the CLI and returns a process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
+	installShutdownOnSignal(stderr)
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
@@ -110,6 +127,15 @@ func DefaultDeps() Deps {
 		NewGitHubReader: func(repoPath string) orchestration.GitHubReader {
 			return gh.New(repoPath)
 		},
+		NewIssueWriter: func(repoPath string) compiler.IssueWriter {
+			return gh.New(repoPath)
+		},
+		NewPreProdWriter: func(repoPath string) orchestration.PreProdWriter {
+			return gh.New(repoPath)
+		},
+		NewPromoteWriter: func(repoPath string) orchestration.PromotionWriter {
+			return gh.New(repoPath)
+		},
 		ProcessAlive: process.Alive,
 		Now:          time.Now,
 		IsTerminal:   isTerminalWriter,
@@ -117,11 +143,23 @@ func DefaultDeps() Deps {
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
 		},
+		Tick: func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			return orchestration.Tick(ctx, opts)
+		},
+		Discover: func(ctx context.Context, opts perception.Options) (perception.Report, error) {
+			return perception.Run(ctx, opts)
+		},
+		Compile: func(ctx context.Context, opts compiler.Options) (compiler.Report, error) {
+			return compiler.Run(ctx, opts, compiler.DefaultDeps())
+		},
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
 		},
 		Loopreview: func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
+		},
+		Promote: func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			return orchestration.Promote(ctx, opts)
 		},
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
@@ -199,6 +237,21 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "init" {
 		return runInit(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "compile" {
+		return runCompile(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "discover" {
+		return runDiscover(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "tick" {
+		return runTick(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "trigger" {
+		return runTrigger(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "promote" {
+		return runPromote(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
 	}
@@ -231,6 +284,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "hook" {
 		return runHook(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "ps" {
+		return runPs(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "kill" {
+		return runKill(args[1:], stdout, stderr, deps)
 	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)
@@ -318,6 +377,45 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
 		fmt.Fprintln(w, "  --verifier-effort string    optional first-run verifier reasoning effort to persist")
 	}
+	if command.Name == "compile" {
+		fmt.Fprintln(w, "  --repo string   repository path (required)")
+	}
+	if command.Name == "discover" {
+		fmt.Fprintln(w, "  --repo string   repository path (required)")
+	}
+	if command.Name == "tick" {
+		fmt.Fprintln(w, "  --repo string                    repository path (required)")
+		fmt.Fprintln(w, "  --base-branch string             base branch for ready, dispatch, and review (default worker.base_branch or \"main\")")
+		fmt.Fprintln(w, "  --pre-prod-branch string         pre-prod branch for clean unattended integrations (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintln(w, "  --run-id string                  shared run id for this pass (default generated once)")
+		fmt.Fprintln(w, "  --worker-provider string         optional worker provider override for this pass")
+		fmt.Fprintln(w, "  --verifier-provider string       optional verifier provider override for this pass")
+		fmt.Fprintln(w, "  --worker-model string            optional worker model override for this pass")
+		fmt.Fprintln(w, "  --worker-effort string           optional worker reasoning effort override for this pass")
+		fmt.Fprintln(w, "  --verifier-model string          optional verifier model override for this pass")
+		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
+		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+	}
+	if command.Name == "trigger" {
+		fmt.Fprintln(w, "  <kind>                           trigger kind: cron, goal-loop, or hook")
+		fmt.Fprintln(w, "  --repo string                    repository path (required)")
+		fmt.Fprintln(w, "  --schedule string                cron schedule metadata (cron)")
+		fmt.Fprintln(w, "  --event string                   event name (hook)")
+		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
+		fmt.Fprintln(w, "  --max-iterations int             maximum tick firings before needs-human (goal-loop)")
+		fmt.Fprintln(w, "  --max_iterations int             alias for --max-iterations")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+	}
+	if command.Name == "promote" {
+		fmt.Fprintln(w, "  --repo string              repository path (required)")
+		fmt.Fprintln(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintln(w, "  --run-id string            run id for the promote ledger (default generated)")
+		fmt.Fprintln(w, "  --kick-back string         item to revert out of pre-prod before promoting; repeatable")
+	}
 	if command.Name == "upgrade" {
 		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
 	}
@@ -349,6 +447,12 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string                  optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string                 optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --upgraded-model string         optional upgraded retry worker model override")
+		fmt.Fprintln(w, "  --upgraded-effort string        optional upgraded retry worker effort override (default \"xhigh\" when needed)")
+		fmt.Fprintln(w, "  --verifier-provider string      optional verifier provider for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-model string         optional verifier model override for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-effort string        optional verifier effort override for recovered PRs")
+		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -583,6 +687,789 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	renderInitResult(stdout, stderr, result)
 	return 0
+}
+
+func runCompile(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+
+	fs := flag.NewFlagSet("compile", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "compile: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "compile: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 2
+	}
+	report, err := deps.Compile(context.Background(), compiler.Options{
+		RepoPath: resolvedRepo,
+		Writer:   deps.NewIssueWriter(resolvedRepo),
+		Now:      deps.Now(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 1
+	}
+	data, err := compiler.MarshalReportJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "compile: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "compile: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(compiler.RenderText(report))); err != nil {
+		fmt.Fprintf(stderr, "compile: write summary: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDiscover(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.Discover == nil {
+		deps.Discover = defaults.Discover
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "discover: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "discover: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 2
+	}
+	report, err := deps.Discover(context.Background(), perception.Options{
+		RepoPath: resolvedRepo,
+		CI:       deps.NewGitHubReader(resolvedRepo),
+		Writer:   deps.NewIssueWriter(resolvedRepo),
+		Now:      deps.Now(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 1
+	}
+	data, err := perception.MarshalReportJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "discover: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "discover: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(perception.RenderText(report))); err != nil {
+		fmt.Fprintf(stderr, "discover: write summary: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.NewPreProdWriter == nil {
+		deps.NewPreProdWriter = defaults.NewPreProdWriter
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = defaults.ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+	if deps.IsTerminal == nil {
+		deps.IsTerminal = defaults.IsTerminal
+	}
+	if deps.Tick == nil {
+		deps.Tick = defaults.Tick
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = defaults.ComputeReadySet
+	}
+	if deps.Dispatch == nil {
+		deps.Dispatch = defaults.Dispatch
+	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = defaults.Loopreview
+	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+
+	fs := flag.NewFlagSet("tick", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
+	var preProdBranch string
+	var preProdBranchAlias string
+	var runID string
+	var runIDAlias string
+	var workerProvider string
+	var workerProviderAlias string
+	var verifierProvider string
+	var verifierProviderAlias string
+	var workerModel string
+	var workerModelAlias string
+	var workerEffort string
+	var workerEffortAlias string
+	var verifierModel string
+	var verifierModelAlias string
+	var verifierEffort string
+	var verifierEffortAlias string
+	var verifierTimeout time.Duration
+	var verifierTimeoutAlias time.Duration
+	var throttleLimit int
+	var throttleLimitAlias int
+	var pretty bool
+	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&preProdBranch, "pre-prod-branch", "", "pre-prod branch for clean unattended integrations")
+	fs.StringVar(&preProdBranchAlias, "PreProdBranch", "", "pre-prod branch for clean unattended integrations")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&workerProvider, "worker-provider", "", "worker provider")
+	fs.StringVar(&workerProviderAlias, "WorkerProvider", "", "worker provider")
+	fs.StringVar(&verifierProvider, "verifier-provider", "", "verifier provider")
+	fs.StringVar(&verifierProviderAlias, "VerifierProvider", "", "verifier provider")
+	fs.StringVar(&workerModel, "worker-model", "", "worker model")
+	fs.StringVar(&workerModelAlias, "WorkerModel", "", "worker model")
+	fs.StringVar(&workerEffort, "worker-effort", "", "worker effort")
+	fs.StringVar(&workerEffortAlias, "WorkerEffort", "", "worker effort")
+	fs.StringVar(&verifierModel, "verifier-model", "", "verifier model")
+	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
+	fs.StringVar(&verifierEffort, "verifier-effort", "", "verifier effort")
+	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier effort")
+	fs.DurationVar(&verifierTimeout, "verifier-timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
+	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
+	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
+	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	baseBranchFlagSet := flagWasSet(fs, "base-branch") || flagWasSet(fs, "BaseBranch")
+	preProdBranchFlagSet := flagWasSet(fs, "pre-prod-branch") || flagWasSet(fs, "PreProdBranch")
+	workerModelFlagSet := flagWasSet(fs, "worker-model") || flagWasSet(fs, "WorkerModel")
+	workerEffortFlagSet := flagWasSet(fs, "worker-effort") || flagWasSet(fs, "WorkerEffort")
+	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
+	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
+	}
+	if preProdBranchAlias != "" {
+		preProdBranch = preProdBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	if workerProviderAlias != "" {
+		workerProvider = workerProviderAlias
+	}
+	if verifierProviderAlias != "" {
+		verifierProvider = verifierProviderAlias
+	}
+	if workerModelAlias != "" {
+		workerModel = workerModelAlias
+	}
+	if workerEffortAlias != "" {
+		workerEffort = workerEffortAlias
+	}
+	if verifierModelAlias != "" {
+		verifierModel = verifierModelAlias
+	}
+	if verifierEffortAlias != "" {
+		verifierEffort = verifierEffortAlias
+	}
+	if verifierTimeoutAlias != 0 {
+		verifierTimeout = verifierTimeoutAlias
+	}
+	if throttleLimitAlias != 0 {
+		throttleLimit = throttleLimitAlias
+	}
+	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "tick: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "tick: --repo is required")
+		return 2
+	}
+	if throttleLimit <= 0 {
+		fmt.Fprintln(stderr, "tick: --throttle-limit must be greater than zero")
+		return 2
+	}
+	if verifierTimeout <= 0 {
+		fmt.Fprintln(stderr, "tick: --verifier-timeout must be positive")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	if !baseBranchFlagSet && strings.TrimSpace(baseBranch) == "" {
+		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
+	}
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	if !preProdBranchFlagSet && strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
+	}
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
+	if strings.TrimSpace(workerProvider) == "" {
+		workerProvider = strings.TrimSpace(cfg.Adapters.Worker)
+	}
+	if strings.TrimSpace(verifierProvider) == "" {
+		verifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
+	}
+	workerModel, workerEffort = applyRoleModelEffort(
+		workerModel,
+		workerEffort,
+		workerModelFlagSet,
+		workerEffortFlagSet,
+		cfg.Worker.Model,
+		cfg.Worker.ReasoningEffort,
+	)
+	verifierModel, verifierEffort = applyRoleModelEffort(
+		verifierModel,
+		verifierEffort,
+		verifierModelFlagSet,
+		verifierEffortFlagSet,
+		cfg.Verifier.Model,
+		cfg.Verifier.ReasoningEffort,
+	)
+	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
+		Worker:   workerProvider,
+		Verifier: verifierProvider,
+	}); warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	tickReport, err := deps.Tick(context.Background(), orchestration.TickOptions{
+		Reader:             deps.NewGitHubReader(resolvedRepo),
+		IssueWriter:        deps.NewIssueWriter(resolvedRepo),
+		RepoPath:           resolvedRepo,
+		BaseBranch:         baseBranch,
+		PreProdBranch:      preProdBranch,
+		RunID:              runID,
+		WorkerProvider:     workerProvider,
+		WorkerModel:        workerModel,
+		WorkerEffort:       workerEffort,
+		VerifierProvider:   verifierProvider,
+		VerifierModel:      verifierModel,
+		VerifierEffort:     verifierEffort,
+		VerifierTimeout:    verifierTimeout,
+		ThrottleLimit:      throttleLimit,
+		RequiredChecks:     cfg.CI.Checks,
+		ConfiguredEvidence: cfg.Evidence.Artifacts(),
+		Thresholds:         cfg.Resilience.Worker,
+		Budget:             cfg.Guardrails.Budget,
+		CircuitBreaker:     cfg.Guardrails.CircuitBreaker,
+		ProcessAlive:       deps.ProcessAlive,
+		Clock:              deps.Now,
+		Stderr:             stderr,
+		Compile:            deps.Compile,
+		ComputeReadySet:    deps.ComputeReadySet,
+		Dispatch:           deps.Dispatch,
+		Loopreview:         deps.Loopreview,
+		Recover:            deps.Recover,
+		PreProdWriter:      deps.NewPreProdWriter(resolvedRepo),
+		StatePush:          deps.StatePush,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	data, err := orchestration.MarshalTickJSON(tickReport)
+	if err != nil {
+		fmt.Fprintf(stderr, "tick: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+		return 1
+	}
+	if shouldRenderPretty(noPretty) {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := renderTickPrettyAttestations(stderr, tickReport, mode); err != nil {
+			fmt.Fprintf(stderr, "tick: write pretty attestation: %v\n", err)
+			return 1
+		}
+	}
+	return orchestration.TickExitCode(tickReport)
+}
+
+func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "trigger: expected trigger kind: cron, goal-loop, or hook")
+		return 2
+	}
+	kind := strings.TrimSpace(args[0])
+	if kind == "" {
+		fmt.Fprintln(stderr, "trigger: expected trigger kind: cron, goal-loop, or hook")
+		return 2
+	}
+
+	defaults := DefaultDeps()
+	if deps.NewGitHubReader == nil {
+		deps.NewGitHubReader = defaults.NewGitHubReader
+	}
+	if deps.NewIssueWriter == nil {
+		deps.NewIssueWriter = defaults.NewIssueWriter
+	}
+	if deps.NewPreProdWriter == nil {
+		deps.NewPreProdWriter = defaults.NewPreProdWriter
+	}
+	if deps.ProcessAlive == nil {
+		deps.ProcessAlive = defaults.ProcessAlive
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+	if deps.IsTerminal == nil {
+		deps.IsTerminal = defaults.IsTerminal
+	}
+	if deps.Tick == nil {
+		deps.Tick = defaults.Tick
+	}
+	if deps.Compile == nil {
+		deps.Compile = defaults.Compile
+	}
+	if deps.ComputeReadySet == nil {
+		deps.ComputeReadySet = defaults.ComputeReadySet
+	}
+	if deps.Dispatch == nil {
+		deps.Dispatch = defaults.Dispatch
+	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = defaults.Loopreview
+	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+
+	fs := flag.NewFlagSet("trigger "+kind, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var schedule string
+	var scheduleAlias string
+	var event string
+	var eventAlias string
+	var goal string
+	var goalAlias string
+	var maxIterations int
+	var maxIterationsAlias int
+	var maxIterationsSnakeAlias int
+	var pretty bool
+	var prettyAlias bool
+	var noPretty bool
+	var noPrettyAlias bool
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&schedule, "schedule", "", "cron schedule")
+	fs.StringVar(&scheduleAlias, "Schedule", "", "cron schedule")
+	fs.StringVar(&event, "event", "", "hook event")
+	fs.StringVar(&eventAlias, "Event", "", "hook event")
+	fs.StringVar(&goal, "goal", "roadmap-exhausted", "goal predicate")
+	fs.StringVar(&goalAlias, "Goal", "", "goal predicate")
+	fs.IntVar(&maxIterations, "max-iterations", 0, "max iterations")
+	fs.IntVar(&maxIterationsSnakeAlias, "max_iterations", 0, "max iterations")
+	fs.IntVar(&maxIterationsAlias, "MaxIterations", 0, "max iterations")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if scheduleAlias != "" {
+		schedule = scheduleAlias
+	}
+	if eventAlias != "" {
+		event = eventAlias
+	}
+	if goalAlias != "" {
+		goal = goalAlias
+	}
+	if maxIterationsSnakeAlias != 0 {
+		maxIterations = maxIterationsSnakeAlias
+	}
+	if maxIterationsAlias != 0 {
+		maxIterations = maxIterationsAlias
+	}
+	pretty = pretty || prettyAlias
+	noPretty = noPretty || noPrettyAlias
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "trigger %s: unexpected argument %q\n", kind, fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintf(stderr, "trigger %s: --repo is required\n", kind)
+		return 2
+	}
+	if kind == orchestration.TriggerKindCron && strings.TrimSpace(schedule) == "" {
+		fmt.Fprintln(stderr, "trigger cron: --schedule is required")
+		return 2
+	}
+	if kind == orchestration.TriggerKindHook && strings.TrimSpace(event) == "" {
+		fmt.Fprintln(stderr, "trigger hook: --event is required")
+		return 2
+	}
+	if kind == orchestration.TriggerKindGoalLoop && maxIterations <= 0 {
+		fmt.Fprintln(stderr, "trigger goal-loop: --max-iterations is required and must be greater than zero")
+		return 2
+	}
+	if kind == orchestration.TriggerKindGoalLoop {
+		normalizedGoal := strings.TrimSpace(goal)
+		if normalizedGoal != "" && normalizedGoal != "roadmap-exhausted" && normalizedGoal != "no-ready-work" {
+			fmt.Fprintf(stderr, "trigger goal-loop: unsupported --goal %q\n", goal)
+			return 2
+		}
+	}
+	if kind != orchestration.TriggerKindCron && kind != orchestration.TriggerKindGoalLoop && kind != orchestration.TriggerKindHook {
+		fmt.Fprintf(stderr, "trigger: unknown trigger kind %q\n", kind)
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg)
+	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
+		Worker:   tickOptions.WorkerProvider,
+		Verifier: tickOptions.VerifierProvider,
+	}); warning != "" {
+		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	triggerReport, err := orchestration.RunTrigger(context.Background(), orchestration.TriggerOptions{
+		Kind:          kind,
+		RepoPath:      resolvedRepo,
+		Schedule:      schedule,
+		Event:         event,
+		Goal:          goal,
+		MaxIterations: maxIterations,
+		TickOptions:   tickOptions,
+		Tick:          deps.Tick,
+		Clock:         deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	data, err := orchestration.MarshalTriggerJSON(triggerReport)
+	if err != nil {
+		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "trigger %s: write output: %v\n", kind, err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderTriggerText(triggerReport))); err != nil {
+		fmt.Fprintf(stderr, "trigger %s: write summary: %v\n", kind, err)
+		return 1
+	}
+	if shouldRenderPretty(noPretty) {
+		mode := prettyModeForTarget(stderr, deps, pretty)
+		if err := renderTriggerPrettyAttestations(stderr, triggerReport, mode); err != nil {
+			fmt.Fprintf(stderr, "trigger %s: write pretty attestation: %v\n", kind, err)
+			return 1
+		}
+	}
+	return orchestration.TriggerExitCode(triggerReport)
+}
+
+func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config) orchestration.TickOptions {
+	baseBranch := strings.TrimSpace(cfg.Worker.BaseBranch)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	preProdBranch := strings.TrimSpace(cfg.Environment.PreProdBranch)
+	if preProdBranch == "" {
+		preProdBranch = "pre-prod"
+	}
+	return orchestration.TickOptions{
+		Reader:             deps.NewGitHubReader(repoPath),
+		IssueWriter:        deps.NewIssueWriter(repoPath),
+		RepoPath:           repoPath,
+		BaseBranch:         baseBranch,
+		PreProdBranch:      preProdBranch,
+		WorkerProvider:     strings.TrimSpace(cfg.Adapters.Worker),
+		WorkerModel:        strings.TrimSpace(cfg.Worker.Model),
+		WorkerEffort:       strings.TrimSpace(cfg.Worker.ReasoningEffort),
+		VerifierProvider:   strings.TrimSpace(cfg.Adapters.Verifier),
+		VerifierModel:      strings.TrimSpace(cfg.Verifier.Model),
+		VerifierEffort:     strings.TrimSpace(cfg.Verifier.ReasoningEffort),
+		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
+		ThrottleLimit:      4,
+		RequiredChecks:     cfg.CI.Checks,
+		ConfiguredEvidence: cfg.Evidence.Artifacts(),
+		Thresholds:         cfg.Resilience.Worker,
+		Budget:             cfg.Guardrails.Budget,
+		CircuitBreaker:     cfg.Guardrails.CircuitBreaker,
+		ProcessAlive:       deps.ProcessAlive,
+		Clock:              deps.Now,
+		Stderr:             stderr,
+		Compile:            deps.Compile,
+		ComputeReadySet:    deps.ComputeReadySet,
+		Dispatch:           deps.Dispatch,
+		Loopreview:         deps.Loopreview,
+		Recover:            deps.Recover,
+		PreProdWriter:      deps.NewPreProdWriter(repoPath),
+		StatePush:          deps.StatePush,
+	}
+}
+
+func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerReport, mode attestation.PrettyMode) error {
+	for _, tick := range report.Ticks {
+		if err := renderTickPrettyAttestations(w, tick, mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
+	defaults := DefaultDeps()
+	if deps.NewPromoteWriter == nil {
+		deps.NewPromoteWriter = defaults.NewPromoteWriter
+	}
+	if deps.Promote == nil {
+		deps.Promote = defaults.Promote
+	}
+	if deps.StatePush == nil {
+		deps.StatePush = defaults.StatePush
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
+
+	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var repoPath string
+	var repoAlias string
+	var preProdBranch string
+	var preProdBranchAlias string
+	var runID string
+	var runIDAlias string
+	var kickBack repeatStringFlag
+	var kickBackAlias repeatStringFlag
+
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&preProdBranch, "pre-prod-branch", "", "pre-prod branch")
+	fs.StringVar(&preProdBranchAlias, "PreProdBranch", "", "pre-prod branch")
+	fs.StringVar(&runID, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.Var(&kickBack, "kick-back", "kick-back item")
+	fs.Var(&kickBackAlias, "KickBack", "kick-back item")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	preProdBranchFlagSet := flagWasSet(fs, "pre-prod-branch") || flagWasSet(fs, "PreProdBranch")
+	if repoPath == "" {
+		repoPath = repoAlias
+	}
+	if preProdBranchAlias != "" {
+		preProdBranch = preProdBranchAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	kickBack = append(kickBack, kickBackAlias...)
+
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "promote: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "promote: --repo is required")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	if !preProdBranchFlagSet && strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
+	}
+	if strings.TrimSpace(preProdBranch) == "" {
+		preProdBranch = "pre-prod"
+	}
+
+	report, err := deps.Promote(context.Background(), orchestration.PromoteOptions{
+		Writer:        deps.NewPromoteWriter(resolvedRepo),
+		RepoPath:      resolvedRepo,
+		RunID:         runID,
+		PreProdBranch: preProdBranch,
+		Gate:          cfg.Adapters.Gate,
+		KickBackItems: []string(kickBack),
+		Clock:         deps.Now,
+		StatePush:     deps.StatePush,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	data, err := orchestration.MarshalPromoteJSON(report)
+	if err != nil {
+		fmt.Fprintf(stderr, "promote: %v\n", err)
+		return 1
+	}
+	if _, err := stdout.Write(data); err != nil {
+		fmt.Fprintf(stderr, "promote: write output: %v\n", err)
+		return 1
+	}
+	if _, err := stderr.Write([]byte(orchestration.RenderPromoteText(report))); err != nil {
+		fmt.Fprintf(stderr, "promote: write summary: %v\n", err)
+		return 1
+	}
+	return orchestration.PromoteExitCode(report)
+}
+
+func renderTickPrettyAttestations(w io.Writer, report orchestration.TickReport, mode attestation.PrettyMode) error {
+	if report.DispatchWave != nil {
+		for _, result := range report.DispatchWave.Results {
+			if result.Attestation == nil {
+				continue
+			}
+			if err := renderPrettyAttestation(w, *result.Attestation, mode); err != nil {
+				return err
+			}
+		}
+	}
+	for _, review := range report.Reviews {
+		if review.Attestation == nil {
+			continue
+		}
+		if err := renderPrettyAttestation(w, *review.Attestation, mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
@@ -1626,6 +2513,24 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 	return wasSet
 }
 
+type repeatStringFlag []string
+
+func (f *repeatStringFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(*f, ",")
+}
+
+func (f *repeatStringFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("value must not be empty")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
 func loadDeliveryConfig(repoPath string) (config.Config, error) {
 	cfg := config.Default()
 	loaded, err := config.Load(filepath.Join(repoPath, ".delivery.yml"))
@@ -1883,8 +2788,11 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Dispatch == nil {
 		deps.Dispatch = DefaultDeps().Dispatch
 	}
+	if deps.Loopreview == nil {
+		deps.Loopreview = DefaultDeps().Loopreview
+	}
 	if deps.Recover == nil {
-		deps.Recover = recoverWithDispatch(deps.Dispatch)
+		deps.Recover = recoverWithDispatch(deps.Dispatch, deps.Loopreview)
 	}
 
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
@@ -1903,6 +2811,12 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var upgradedModelAlias string
+	var upgradedEffortAlias string
+	var verifierProviderAlias string
+	var verifierModelAlias string
+	var verifierEffortAlias string
+	var verifierTimeoutAlias time.Duration
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1926,12 +2840,26 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
+	fs.StringVar(&upgradedModelAlias, "UpgradedModel", "", "upgraded model")
+	fs.StringVar(&opts.UpgradedEffort, "upgraded-effort", "", "upgraded effort")
+	fs.StringVar(&upgradedEffortAlias, "UpgradedEffort", "", "upgraded effort")
+	fs.StringVar(&opts.VerifierProvider, "verifier-provider", "", "verifier provider")
+	fs.StringVar(&verifierProviderAlias, "VerifierProvider", "", "verifier provider")
+	fs.StringVar(&opts.VerifierModel, "verifier-model", "", "verifier model")
+	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
+	fs.StringVar(&opts.VerifierEffort, "verifier-effort", "", "verifier effort")
+	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier effort")
+	fs.DurationVar(&opts.VerifierTimeout, "verifier-timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
+	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
 	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
+	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
+	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -1964,6 +2892,24 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if effortAlias != "" {
 		opts.Effort = effortAlias
+	}
+	if upgradedModelAlias != "" {
+		opts.UpgradedModel = upgradedModelAlias
+	}
+	if upgradedEffortAlias != "" {
+		opts.UpgradedEffort = upgradedEffortAlias
+	}
+	if verifierProviderAlias != "" {
+		opts.VerifierProvider = verifierProviderAlias
+	}
+	if verifierModelAlias != "" {
+		opts.VerifierModel = verifierModelAlias
+	}
+	if verifierEffortAlias != "" {
+		opts.VerifierEffort = verifierEffortAlias
+	}
+	if verifierTimeoutAlias != 0 {
+		opts.VerifierTimeout = verifierTimeoutAlias
 	}
 	opts.Stderr = stderr
 
@@ -2010,6 +2956,17 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		effortFlagSet,
 		cfg.Worker.Model,
 		cfg.Worker.ReasoningEffort,
+	)
+	if strings.TrimSpace(opts.VerifierProvider) == "" {
+		opts.VerifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
+	}
+	opts.VerifierModel, opts.VerifierEffort = applyRoleModelEffort(
+		opts.VerifierModel,
+		opts.VerifierEffort,
+		verifierModelFlagSet,
+		verifierEffortFlagSet,
+		cfg.Verifier.Model,
+		cfg.Verifier.ReasoningEffort,
 	)
 	opts.Budget = cfg.Guardrails.Budget
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
@@ -2231,7 +3188,7 @@ func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return result.ExitCode
 }
 
-func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
+func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options) (worker.Result, error), review func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)) func(context.Context, recovery.Options) (recovery.Result, error) {
 	return func(ctx context.Context, opts recovery.Options) (recovery.Result, error) {
 		recoverDeps := recovery.DefaultDeps()
 		recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
@@ -2250,9 +3207,6 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Effort:          dispatchOpts.Effort,
 				Stderr:          dispatchOpts.Stderr,
 			})
-			if err != nil {
-				return recovery.DispatchResult{}, err
-			}
 			return recovery.DispatchResult{
 				OK:          result.OK,
 				Issue:       result.Issue,
@@ -2264,8 +3218,10 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Status:      result.Status,
 				ExitCode:    result.ExitCode,
 				LogBytes:    result.LogBytes,
-			}, nil
+				Attestation: result.Attestation,
+			}, err
 		}
+		recoverDeps.Review = review
 		return recovery.Run(ctx, opts, recoverDeps)
 	}
 }

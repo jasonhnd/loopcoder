@@ -178,6 +178,19 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 			continue
 		}
 
+		if labels := needsHumanLabels(labelNames(issue.Labels)); len(labels) > 0 {
+			blocked = append(blocked, report.BlockedIssue{
+				Issue:          number,
+				Title:          issue.Title,
+				Classification: "needs-human",
+				Reason:         "blocked by labels: " + strings.Join(labels, ", "),
+				Dependencies:   dependencies,
+				OpenPRs:        prSummaries,
+				Attempts:       attemptSummaries,
+			})
+			continue
+		}
+
 		if len(unsatisfied) > 0 {
 			blocked = append(blocked, report.BlockedIssue{
 				Issue:          number,
@@ -234,18 +247,25 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 			Reason: "dependencies completed; no open PR; no live local attempt",
 		})
 	}
+	epicOrdering, orderingHints, badEpicIssues, err := loadEpicOrderingHints(opts.RepoPath)
+	if err != nil {
+		return report.ReadySetReport{}, err
+	}
+	applyEpicOrderingHints(ready, orderingHints)
+	ready, blocked = isolateBadEpicIssues(ready, blocked, badEpicIssues)
 
 	runID := runIDPtr(opts.RunID)
 	return report.ReadySetReport{
-		Version:     1,
-		Repo:        repoName,
-		RepoPath:    filepath.ToSlash(opts.RepoPath),
-		BaseBranch:  opts.BaseBranch,
-		RunID:       runID,
-		GeneratedAt: state.FormatTimestamp(opts.Now),
-		Ready:       ready,
-		Blocked:     blocked,
-		Summary:     summarizeReadySet(ready, blocked),
+		Version:      1,
+		Repo:         repoName,
+		RepoPath:     filepath.ToSlash(opts.RepoPath),
+		BaseBranch:   opts.BaseBranch,
+		RunID:        runID,
+		GeneratedAt:  state.FormatTimestamp(opts.Now),
+		Ready:        ready,
+		Blocked:      blocked,
+		EpicOrdering: epicOrdering,
+		Summary:      summarizeReadySet(ready, blocked),
 	}, nil
 }
 
@@ -300,6 +320,18 @@ func blockedDependencyNumbers(labels []string) []int {
 		}
 	}
 	return sortedInts(seen)
+}
+
+func needsHumanLabels(labels []string) []string {
+	out := make([]string, 0)
+	for _, label := range labels {
+		lower := strings.ToLower(strings.TrimSpace(label))
+		if strings.Contains(lower, "needs-human") || strings.Contains(lower, "needs:human") {
+			out = append(out, label)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func collectDependencyNumbers(issues []gh.Issue) []int {

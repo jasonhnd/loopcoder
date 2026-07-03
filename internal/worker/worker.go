@@ -13,11 +13,18 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+)
+
+const (
+	WorkerHardCap      = 30 * time.Minute
+	WorkerStallTimeout = 120 * time.Second
 )
 
 type Options struct {
@@ -81,6 +88,7 @@ type Deps struct {
 	PID         func() int
 	MkdirTemp   func(dir, pattern string) (string, error)
 	RemoveAll   func(path string) error
+	RepoSkills  func(repoPath string) (string, error)
 }
 
 func DefaultDeps() Deps {
@@ -97,6 +105,9 @@ func DefaultDeps() Deps {
 		PID:       os.Getpid,
 		MkdirTemp: os.MkdirTemp,
 		RemoveAll: os.RemoveAll,
+		RepoSkills: func(repoPath string) (string, error) {
+			return skills.BuildPromptSection(skills.PromptSectionOptions{RepoPath: repoPath})
+		},
 	}
 }
 
@@ -181,6 +192,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase := "worktree_created"
 	dispatchSucceeded := false
+	failureStatus := "failed"
 	defer func() {
 		if dispatchSucceeded {
 			tracker.transition("cleanup", "succeeded", tracker.exitCode, nil)
@@ -211,7 +223,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			failurePhase = "worktree_created"
 		}
 		errText := err.Error()
-		tracker.transition(failurePhase, "failed", tracker.exitCode, &errText)
+		tracker.transition(failurePhase, failureStatus, tracker.exitCode, &errText)
 		if briefErr := writeRecoveryBrief(ctx, recoveryBriefOptions{
 			repoPath:     repoPath,
 			runID:        opts.RunID,
@@ -224,7 +236,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			summaryPath:  summaryPath,
 			attempt:      opts.Attempt,
 			lastPhase:    failurePhase,
-			status:       "failed",
+			status:       failureStatus,
 			errorMessage: errText,
 			git:          deps.Git,
 			github:       github,
@@ -232,7 +244,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		}); briefErr != nil {
 			fmt.Fprintf(warnings, "[loopcoder] warning: failed to write recovery brief for %s: %v\n", jobID, briefErr)
 		}
-		fmt.Fprintf(warnings, "[loopcoder] preserved failed attempt artifacts: %s\n", scratch)
+		fmt.Fprintf(warnings, "[loopcoder] preserved %s attempt artifacts: %s\n", failureStatus, scratch)
 	}()
 
 	if err := deps.Git.FetchOriginBase(ctx, repoPath, opts.BaseBranch); err != nil {
@@ -244,12 +256,17 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	tracker.transition(activePhase, "running", nil, nil)
 
 	activePhase = "prompt_written"
+	repoSkills, err := deps.RepoSkills(worktreePath)
+	if err != nil {
+		return Result{}, fmt.Errorf("read repo skills: %w", err)
+	}
 	prompt := BuildPrompt(PromptOptions{
 		IssueNumber:     opts.IssueNumber,
 		IssueTitle:      opts.IssueTitle,
 		IssueBody:       opts.IssueBody,
 		Branch:          opts.Branch,
 		RecoveryContext: opts.RecoveryContext,
+		RepoSkills:      repoSkills,
 	})
 	if err := os.WriteFile(promptPath, []byte(prompt), 0o644); err != nil {
 		return Result{}, fmt.Errorf("write prompt: %w", err)
@@ -258,12 +275,17 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
+	resilience := config.ResilienceForRepo(repoPath)
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		LogPath:      logPath,
 		Model:        opts.Model,
 		Effort:       opts.Effort,
+		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		StallTimeout: config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
+		RunID:        opts.RunID,
+		Role:         "worker",
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int
@@ -272,6 +294,27 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		exitCodePtr = &exitCode
 	}
 	tracker.transition(activePhase, "running", exitCodePtr, nil)
+	if agentResult.Hung {
+		failureStatus = "hung"
+		hungErr := workerHungError(opts.Provider, agentResult.HungReason, logPath)
+		// The deferred failure handler records the "hung" transition (phase +
+		// error) on return; only the distinct hung run-event is emitted here.
+		tracker.appendEvent("worker_hung", "hung", map[string]string{
+			"reason":      "hung",
+			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
+			"provider":    opts.Provider,
+		})
+		return Result{
+			OK:          false,
+			Issue:       opts.IssueNumber,
+			Branch:      opts.Branch,
+			RunID:       opts.RunID,
+			AttemptPath: attemptPath,
+			Status:      "hung",
+			ExitCode:    agentResult.ExitCode,
+			LogBytes:    fileSize(logPath),
+		}, errors.New(hungErr)
+	}
 	if agentErr != nil {
 		return Result{}, fmt.Errorf("%s exec failed: %w", opts.Provider, agentErr)
 	}
@@ -353,6 +396,7 @@ type PromptOptions struct {
 	IssueBody       string
 	Branch          string
 	RecoveryContext string
+	RepoSkills      string
 }
 
 func BuildPrompt(opts PromptOptions) string {
@@ -369,6 +413,13 @@ func BuildPrompt(opts PromptOptions) string {
 - You may read files and run commands, but do NOT run git commit or git push — the harness commits and opens the PR.
 - When finished, print a 2-4 sentence final summary in English describing exactly what you changed.
 `, opts.IssueNumber, opts.Branch, opts.IssueTitle, opts.IssueBody)
+
+	if strings.TrimSpace(opts.RepoSkills) != "" {
+		prompt += fmt.Sprintf(`
+
+%s
+`, opts.RepoSkills)
+	}
 
 	if strings.TrimSpace(opts.RecoveryContext) != "" {
 		prompt += fmt.Sprintf(`
@@ -407,6 +458,19 @@ func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
 }
 
+func workerHungError(provider, reason, logPath string) string {
+	return fmt.Sprintf("%s exec hung (reason=hung hung_reason=%s). See %s", provider, firstNonEmpty(reason, "unknown"), logPath)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func MarshalResult(result Result) ([]byte, error) {
 	return json.Marshal(result)
 }
@@ -436,6 +500,9 @@ func withDefaults(deps Deps) Deps {
 	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = defaults.RemoveAll
+	}
+	if deps.RepoSkills == nil {
+		deps.RepoSkills = defaults.RepoSkills
 	}
 	return deps
 }
@@ -582,6 +649,27 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 		LogBytes:  t.logBytes,
 		ExitCode:  t.exitCode,
 		Error:     t.errorMessage,
+	}
+	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
+		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
+	}
+}
+
+func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
+	now := state.FormatTimestamp(t.now())
+	event := state.Event{
+		Timestamp: now,
+		RunID:     t.runID,
+		JobID:     t.jobID,
+		Issue:     t.issue,
+		Phase:     t.phase,
+		Status:    t.status,
+		LogBytes:  fileSize(t.logPath),
+		ExitCode:  t.exitCode,
+		Error:     t.errorMessage,
+		Event:     eventName,
+		Outcome:   outcome,
+		Details:   details,
 	}
 	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)

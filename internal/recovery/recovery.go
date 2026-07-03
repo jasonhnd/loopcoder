@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -47,27 +49,43 @@ type BriefInput struct {
 type Action string
 
 const (
-	ActionAdopt   Action = "adopt"
-	ActionBlocked Action = "blocked"
-	ActionRetry   Action = "retry"
+	ActionAdopt     Action = "adopt"
+	ActionBlocked   Action = "blocked"
+	ActionRetry     Action = "retry"
+	ActionSucceeded Action = "succeeded"
+
+	AttemptStrategySameConfig     = "same_config"
+	AttemptStrategyUpgradedConfig = "upgraded_config"
+
+	AttemptRecordVersion = 1
+	StatusHung           = "hung"
+	HungReasonLedger     = "reason=hung"
 )
 
 type Options struct {
-	RepoPath       string
-	IssueNumber    int
-	IssueTitle     string
-	IssueBody      string
-	RunID          string
-	BaseBranch     string
-	MaxAttempts    int
-	BackoffSeconds []int
-	Provider       string
-	Model          string
-	Effort         string
-	Budget         config.GuardrailBudget
-	CircuitBreaker config.GuardrailCircuitBreaker
-	Now            time.Time
-	Stderr         io.Writer
+	RepoPath         string
+	IssueNumber      int
+	IssueTitle       string
+	IssueBody        string
+	RunID            string
+	BaseBranch       string
+	MaxAttempts      int
+	BackoffSeconds   []int
+	Provider         string
+	Model            string
+	Effort           string
+	UpgradedModel    string
+	UpgradedEffort   string
+	FailureContext   string
+	SkipAdoptPR      bool
+	VerifierProvider string
+	VerifierModel    string
+	VerifierEffort   string
+	VerifierTimeout  time.Duration
+	Budget           config.GuardrailBudget
+	CircuitBreaker   config.GuardrailCircuitBreaker
+	Now              time.Time
+	Stderr           io.Writer
 }
 
 type DispatchOptions struct {
@@ -101,9 +119,12 @@ type DispatchResult struct {
 }
 
 type Result struct {
-	Action         Action
-	Report         string
-	DispatchResult *DispatchResult
+	Action           Action
+	Report           string
+	DispatchResult   *DispatchResult
+	ReviewResult     *loopreview.Result
+	RecoveryAttempts []AttemptRecord
+	AdoptedPR        *AdoptedPR
 }
 
 type PullRequestReader interface {
@@ -112,14 +133,18 @@ type PullRequestReader interface {
 }
 
 type DispatchFunc func(ctx context.Context, opts DispatchOptions) (DispatchResult, error)
+type ReviewFunc func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 type SleepFunc func(ctx context.Context, duration time.Duration) error
+type RecordAttemptFunc func(repoPath, runID string, record AttemptRecord) error
 
 type Deps struct {
-	GitHub       func(repoPath string) PullRequestReader
-	LoadAttempts func(repoPath, runID string) ([]state.Attempt, error)
-	ReadFile     func(path string) ([]byte, error)
-	Sleep        SleepFunc
-	Dispatch     DispatchFunc
+	GitHub        func(repoPath string) PullRequestReader
+	LoadAttempts  func(repoPath, runID string) ([]state.Attempt, error)
+	ReadFile      func(path string) ([]byte, error)
+	Sleep         SleepFunc
+	Dispatch      DispatchFunc
+	Review        ReviewFunc
+	RecordAttempt RecordAttemptFunc
 }
 
 type issuePR struct {
@@ -128,9 +153,34 @@ type issuePR struct {
 	HeadRefName string
 }
 
+type AdoptedPR struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url,omitempty"`
+	HeadRefName string `json:"head_ref_name,omitempty"`
+}
+
 type attemptHistoryEntry struct {
 	Record              state.Attempt
 	RecoveryContextPath string
+}
+
+type AttemptRecord struct {
+	Version             int                 `json:"version"`
+	Issue               int                 `json:"issue"`
+	RunID               string              `json:"run_id"`
+	Attempt             int                 `json:"attempt"`
+	Strategy            string              `json:"strategy"`
+	Status              string              `json:"status"`
+	Branch              string              `json:"branch,omitempty"`
+	PR                  string              `json:"pr,omitempty"`
+	RecoveryContextPath string              `json:"recovery_context_path,omitempty"`
+	Model               string              `json:"model,omitempty"`
+	Effort              string              `json:"effort,omitempty"`
+	Error               string              `json:"error,omitempty"`
+	StartedAt           string              `json:"started_at,omitempty"`
+	FinishedAt          string              `json:"finished_at,omitempty"`
+	DispatchResult      *DispatchResult     `json:"dispatch_result,omitempty"`
+	Review              *loopreview.Verdict `json:"review,omitempty"`
 }
 
 // Scrub redacts common secret shapes before text is written to recovery state.
@@ -176,9 +226,10 @@ func DefaultDeps() Deps {
 		GitHub: func(repoPath string) PullRequestReader {
 			return gh.New(repoPath)
 		},
-		LoadAttempts: state.LoadAttempts,
-		ReadFile:     os.ReadFile,
-		Sleep:        SleepContext,
+		LoadAttempts:  state.LoadAttempts,
+		ReadFile:      os.ReadFile,
+		Sleep:         SleepContext,
+		RecordAttempt: RecordAttempt,
 	}
 }
 
@@ -218,6 +269,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if strings.TrimSpace(opts.Provider) == "" {
 		opts.Provider = "codex"
 	}
+	if opts.VerifierTimeout == 0 {
+		opts.VerifierTimeout = loopreview.DefaultVerifierTimeout
+	}
 	if opts.IssueNumber <= 0 {
 		return Result{}, errors.New("issue number is required")
 	}
@@ -233,28 +287,16 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
-	allAttempts, err := deps.LoadAttempts(repoPath, opts.RunID)
+	attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, err := loadRecoverySnapshot(repoPath, opts, deps)
 	if err != nil {
 		return Result{}, err
 	}
-	attempts := attemptHistory(repoPath, opts.RunID, opts.IssueNumber, allAttempts)
-	priorAttempts := len(attempts)
-	latest := latestHistoryAttempt(attempts)
-	latestStatus := "missing-state"
-	latestBriefPath := ""
-	latestBriefText := ""
-	if latest != nil {
-		latestStatus = latest.Record.Status
-		latestBriefPath = latest.RecoveryContextPath
-		if strings.TrimSpace(latestBriefPath) != "" {
-			if data, readErr := deps.ReadFile(latestBriefPath); readErr == nil {
-				latestBriefText = string(data)
-			}
-		}
+	if strings.TrimSpace(latestBriefText) == "" {
+		latestBriefText = strings.TrimSpace(opts.FailureContext)
 	}
 
 	var adopted *issuePR
-	if deps.GitHub != nil {
+	if !opts.SkipAdoptPR && deps.GitHub != nil {
 		adopted = findOpenIssuePR(ctx, deps.GitHub(repoPath), opts.IssueNumber, attempts, opts.MaxAttempts)
 	}
 	if adopted != nil {
@@ -284,139 +326,197 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			}
 		}
 		return Result{
-			Action: ActionAdopt,
-			Report: renderAdoptReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, *adopted),
+			Action:    ActionAdopt,
+			Report:    renderAdoptReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, *adopted),
+			AdoptedPR: &AdoptedPR{Number: adopted.Number, URL: adopted.URL, HeadRefName: adopted.HeadRefName},
 		}, nil
-	}
-
-	if priorAttempts >= opts.MaxAttempts {
-		return Result{
-			Action: ActionBlocked,
-			Report: renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts),
-		}, nil
-	}
-
-	if opts.Budget.Enabled() {
-		now := opts.Now
-		if now.IsZero() {
-			now = time.Now().UTC()
-		}
-		decision := guardrails.EvaluateBudget(guardrails.BudgetOptions{
-			RepoPath:         repoPath,
-			RunID:            opts.RunID,
-			BaseBranch:       opts.BaseBranch,
-			Issue:            opts.IssueNumber,
-			Budget:           opts.Budget,
-			ProposedAttempts: 1,
-			Now:              now,
-		})
-		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
-			decision.Allowed = false
-			decision.Status = guardrails.StatusNeedsHuman
-			decision.Reason = "guardrails.budget.ledger-write-failed"
-			decision.Message = fmt.Sprintf("needs-human: guardrails.budget ledger write failed: %v", err)
-		}
-		if !decision.Allowed {
-			return Result{
-				Action: ActionBlocked,
-				Report: renderBudgetBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
-			}, nil
-		}
-	}
-
-	if opts.CircuitBreaker.Enabled() {
-		now := opts.Now
-		if now.IsZero() {
-			now = time.Now().UTC()
-		}
-		decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
-			RepoPath:       repoPath,
-			RunID:          opts.RunID,
-			BaseBranch:     opts.BaseBranch,
-			Issue:          opts.IssueNumber,
-			CircuitBreaker: opts.CircuitBreaker,
-			Now:            now,
-		})
-		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
-			decision = ledgerWriteFailedCircuitDecision(opts, repoPath, err)
-		}
-		if !decision.Allowed {
-			return Result{
-				Action: ActionBlocked,
-				Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
-			}, nil
-		}
 	}
 
 	if deps.Dispatch == nil {
 		return Result{}, errors.New("dispatch is not configured")
 	}
-	nextAttempt := priorAttempts + 1
-	retryBranch := fmt.Sprintf("loop/issue-%d-retry-%d", opts.IssueNumber, nextAttempt)
-	backoffSeconds := selectBackoffSeconds(priorAttempts, opts.BackoffSeconds)
-	report := renderRetryReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, retryBranch, backoffSeconds)
 
-	if err := deps.Sleep(ctx, time.Duration(backoffSeconds)*time.Second); err != nil {
-		return Result{Action: ActionRetry, Report: report}, err
-	}
-	dispatchResult, err := deps.Dispatch(ctx, DispatchOptions{
-		RepoPath:        repoPath,
-		IssueNumber:     opts.IssueNumber,
-		IssueTitle:      opts.IssueTitle,
-		IssueBody:       opts.IssueBody,
-		BaseBranch:      opts.BaseBranch,
-		Branch:          retryBranch,
-		RunID:           opts.RunID,
-		Attempt:         nextAttempt,
-		RecoveryContext: latestBriefText,
-		Provider:        opts.Provider,
-		Model:           opts.Model,
-		Effort:          opts.Effort,
-		Stderr:          opts.Stderr,
-	})
-	if err != nil {
-		if opts.CircuitBreaker.Enabled() {
-			decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, err.Error())
-			if !decision.Allowed {
-				allAttempts, loadErr := deps.LoadAttempts(repoPath, opts.RunID)
-				if loadErr == nil {
-					attempts = attemptHistory(repoPath, opts.RunID, opts.IssueNumber, allAttempts)
-					priorAttempts = len(attempts)
-					if latest = latestHistoryAttempt(attempts); latest != nil {
-						latestStatus = latest.Record.Status
-						latestBriefPath = latest.RecoveryContextPath
-						latestBriefText = ""
-						if strings.TrimSpace(latestBriefPath) != "" {
-							if data, readErr := deps.ReadFile(latestBriefPath); readErr == nil {
-								latestBriefText = string(data)
-							}
-						}
-					}
-				}
-				return Result{
-					Action: ActionBlocked,
-					Report: renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision),
-				}, nil
+	var report strings.Builder
+	recoveryAttempts := []AttemptRecord{}
+	localPriorAttempts := priorAttempts
+	var lastDispatchResult *DispatchResult
+	var lastReviewResult *loopreview.Result
+	for {
+		attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, err = loadRecoverySnapshot(repoPath, opts, deps)
+		if err != nil {
+			return Result{}, err
+		}
+		if localPriorAttempts > priorAttempts {
+			priorAttempts = localPriorAttempts
+		}
+		if strings.TrimSpace(latestBriefText) == "" {
+			latestBriefText = strings.TrimSpace(opts.FailureContext)
+		}
+		latestHung := latestFailureHung(attempts, latestStatus, latestBriefText) || lastRecoveryAttemptHung(recoveryAttempts)
+		if priorAttempts >= opts.MaxAttempts {
+			blockReason := ""
+			if latestHung {
+				blockReason = HungReasonLedger
+				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath))
 			}
+			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, blockReason))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
-		if dispatchResult.Attestation != nil {
-			return Result{Action: ActionRetry, Report: report, DispatchResult: &dispatchResult}, err
+
+		if blocked, blockedReport := evaluateRecoverGuardrails(repoPath, opts, attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText); blocked {
+			report.WriteString(blockedReport)
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
-		return Result{Action: ActionRetry, Report: report}, err
+
+		nextAttempt := priorAttempts + 1
+		localPriorAttempts = nextAttempt
+		strategy := strategyForAttempt(nextAttempt, opts.MaxAttempts)
+		if latestHung {
+			strategy = AttemptStrategySameConfig
+		}
+		model, effort := modelEffortForStrategy(opts, strategy)
+		retryBranch := fmt.Sprintf("loop/issue-%d-retry-%d", opts.IssueNumber, nextAttempt)
+		backoffSeconds := selectBackoffSeconds(priorAttempts, opts.BackoffSeconds)
+		report.WriteString(renderRetryReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, retryBranch, strategy, model, effort, backoffSeconds))
+
+		record := AttemptRecord{
+			Version:             AttemptRecordVersion,
+			Issue:               opts.IssueNumber,
+			RunID:               opts.RunID,
+			Attempt:             nextAttempt,
+			Strategy:            strategy,
+			Status:              "running",
+			Branch:              retryBranch,
+			RecoveryContextPath: latestBriefPath,
+			Model:               model,
+			Effort:              effort,
+			StartedAt:           state.FormatTimestamp(recoverNow(opts)),
+		}
+
+		if err := deps.Sleep(ctx, time.Duration(backoffSeconds)*time.Second); err != nil {
+			record.Status = "failed"
+			record.Error = err.Error()
+			record.FinishedAt = state.FormatTimestamp(recoverNow(opts))
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			return Result{Action: ActionRetry, Report: report.String(), RecoveryAttempts: recoveryAttempts}, err
+		}
+
+		dispatchResult, dispatchErr := deps.Dispatch(ctx, DispatchOptions{
+			RepoPath:        repoPath,
+			IssueNumber:     opts.IssueNumber,
+			IssueTitle:      opts.IssueTitle,
+			IssueBody:       opts.IssueBody,
+			BaseBranch:      opts.BaseBranch,
+			Branch:          retryBranch,
+			RunID:           opts.RunID,
+			Attempt:         nextAttempt,
+			RecoveryContext: latestBriefText,
+			Provider:        opts.Provider,
+			Model:           model,
+			Effort:          effort,
+			Stderr:          opts.Stderr,
+		})
+		lastDispatchResult = &dispatchResult
+		record.DispatchResult = &dispatchResult
+		record.PR = dispatchResult.PR
+		record.FinishedAt = state.FormatTimestamp(recoverNow(opts))
+		if dispatchErr != nil || !dispatchResult.OK || strings.TrimSpace(dispatchResult.PR) == "" {
+			record.Status = "failed"
+			record.Error = dispatchFailureDetail(dispatchResult, dispatchErr)
+			if dispatchFailureHung(dispatchResult, dispatchErr) {
+				record.Status = StatusHung
+				record.Error = ensureHungReason(record.Error)
+			}
+			if opts.CircuitBreaker.Enabled() {
+				decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, record.Error)
+				if !decision.Allowed {
+					record.Status = guardrails.StatusNeedsHuman
+					_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+					recoveryAttempts = append(recoveryAttempts, record)
+					attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, _ = loadRecoverySnapshot(repoPath, opts, deps)
+					report.WriteString(renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision))
+					return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+				}
+			}
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			if data, marshalErr := json.Marshal(dispatchResult); marshalErr == nil {
+				report.WriteString(string(data) + "\n")
+			}
+			opts.FailureContext = dispatchFailureContext(latestBriefText, record.Error)
+			continue
+		}
+
+		if opts.CircuitBreaker.Enabled() {
+			recordRetryCircuitOutcome(repoPath, opts, priorAttempts, true, dispatchResult.Status)
+		}
+
+		if deps.Review == nil || strings.TrimSpace(opts.VerifierProvider) == "" {
+			record.Status = "succeeded"
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			data, marshalErr := json.Marshal(dispatchResult)
+			if marshalErr != nil {
+				return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, marshalErr
+			}
+			report.WriteString(string(data) + "\n")
+			return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+
+		prNumber, ok := parsePRNumber(dispatchResult.PR)
+		if !ok {
+			record.Status = guardrails.StatusNeedsHuman
+			record.Error = "could not parse pull request number"
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+		reviewResult, reviewErr := deps.Review(ctx, loopreview.Options{
+			RepoPath:   repoPath,
+			PRNumber:   prNumber,
+			Provider:   opts.VerifierProvider,
+			Model:      opts.VerifierModel,
+			Effort:     opts.VerifierEffort,
+			BaseBranch: opts.BaseBranch,
+			Timeout:    opts.VerifierTimeout,
+			Stderr:     opts.Stderr,
+		})
+		lastReviewResult = &reviewResult
+		record.Review = &reviewResult.Verdict
+		if reviewErr != nil {
+			record.Status = guardrails.StatusNeedsHuman
+			record.Error = reviewErr.Error()
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewErr.Error()))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+		switch reviewResult.Verdict.Verdict {
+		case loopreview.VerdictPass:
+			record.Status = "succeeded"
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewResultReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewResult))
+			return Result{Action: ActionSucceeded, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
+		case loopreview.VerdictFail:
+			record.Status = "failed"
+			record.Error = firstNonEmpty(reviewResult.Verdict.Evidence, "verifier returned fail")
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewResultReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewResult))
+			opts.FailureContext = renderReviewFailureContext(opts.IssueNumber, dispatchResult.PR, reviewResult)
+			continue
+		default:
+			record.Status = guardrails.StatusNeedsHuman
+			record.Error = firstNonEmpty(reviewResult.Verdict.Evidence, "verifier returned needs-human")
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
 	}
-	if opts.CircuitBreaker.Enabled() {
-		recordRetryCircuitOutcome(repoPath, opts, priorAttempts, dispatchResult.OK || strings.TrimSpace(dispatchResult.PR) != "", dispatchResult.Status)
-	}
-	data, err := json.Marshal(dispatchResult)
-	if err != nil {
-		return Result{Action: ActionRetry, Report: report}, err
-	}
-	report += string(data) + "\n"
-	return Result{
-		Action:         ActionRetry,
-		Report:         report,
-		DispatchResult: &dispatchResult,
-	}, nil
 }
 
 func withRecoverDefaults(deps Deps) Deps {
@@ -433,7 +533,100 @@ func withRecoverDefaults(deps Deps) Deps {
 	if deps.Sleep == nil {
 		deps.Sleep = defaults.Sleep
 	}
+	if deps.RecordAttempt == nil {
+		deps.RecordAttempt = defaults.RecordAttempt
+	}
 	return deps
+}
+
+func RecordAttempt(repoPath, runID string, record AttemptRecord) error {
+	if strings.TrimSpace(runID) == "" || record.Issue <= 0 || record.Attempt <= 0 {
+		return nil
+	}
+	record.Version = AttemptRecordVersion
+	path := filepath.Join(state.RecoveryPath(repoPath, runID), fmt.Sprintf("issue-%d-attempts.jsonl", record.Issue))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create recovery attempt directory: %w", err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal recovery attempt record: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open recovery attempt record: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("append recovery attempt record: %w", err)
+	}
+	return nil
+}
+
+func loadRecoverySnapshot(repoPath string, opts Options, deps Deps) ([]attemptHistoryEntry, int, string, string, string, error) {
+	allAttempts, err := deps.LoadAttempts(repoPath, opts.RunID)
+	if err != nil {
+		return nil, 0, "", "", "", err
+	}
+	attempts := attemptHistory(repoPath, opts.RunID, opts.IssueNumber, allAttempts)
+	priorAttempts := len(attempts)
+	latest := latestHistoryAttempt(attempts)
+	latestStatus := "missing-state"
+	latestBriefPath := ""
+	latestBriefText := ""
+	if latest != nil {
+		latestStatus = latest.Record.Status
+		latestBriefPath = latest.RecoveryContextPath
+		if strings.TrimSpace(latestBriefPath) != "" {
+			if data, readErr := deps.ReadFile(latestBriefPath); readErr == nil {
+				latestBriefText = string(data)
+			}
+		}
+	}
+	return attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, nil
+}
+
+func evaluateRecoverGuardrails(repoPath string, opts Options, attempts []attemptHistoryEntry, priorAttempts int, latestStatus, latestBriefPath, latestBriefText string) (bool, string) {
+	if opts.Budget.Enabled() {
+		now := recoverNow(opts)
+		decision := guardrails.EvaluateBudget(guardrails.BudgetOptions{
+			RepoPath:         repoPath,
+			RunID:            opts.RunID,
+			BaseBranch:       opts.BaseBranch,
+			Issue:            opts.IssueNumber,
+			Budget:           opts.Budget,
+			ProposedAttempts: 1,
+			Now:              now,
+		})
+		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+			decision.Allowed = false
+			decision.Status = guardrails.StatusNeedsHuman
+			decision.Reason = "guardrails.budget.ledger-write-failed"
+			decision.Message = fmt.Sprintf("needs-human: guardrails.budget ledger write failed: %v", err)
+		}
+		if !decision.Allowed {
+			return true, renderBudgetBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision)
+		}
+	}
+
+	if opts.CircuitBreaker.Enabled() {
+		now := recoverNow(opts)
+		decision := guardrails.EvaluateCircuitBreaker(guardrails.CircuitOptions{
+			RepoPath:       repoPath,
+			RunID:          opts.RunID,
+			BaseBranch:     opts.BaseBranch,
+			Issue:          opts.IssueNumber,
+			CircuitBreaker: opts.CircuitBreaker,
+			Now:            now,
+		})
+		if _, err := guardrails.RecordDecision(repoPath, decision); err != nil {
+			decision = ledgerWriteFailedCircuitDecision(opts, repoPath, err)
+		}
+		if !decision.Allowed {
+			return true, renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision)
+		}
+	}
+	return false, ""
 }
 
 func resolveRepo(repoPath string) (string, error) {
@@ -578,6 +771,151 @@ func selectBackoffSeconds(priorAttempts int, backoff []int) int {
 	return backoff[index]
 }
 
+func strategyForAttempt(attempt, maxAttempts int) string {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	if attempt >= maxAttempts {
+		return AttemptStrategyUpgradedConfig
+	}
+	return AttemptStrategySameConfig
+}
+
+func modelEffortForStrategy(opts Options, strategy string) (string, string) {
+	model := opts.Model
+	effort := opts.Effort
+	if strategy != AttemptStrategyUpgradedConfig {
+		return model, effort
+	}
+	if strings.TrimSpace(opts.UpgradedModel) != "" {
+		model = opts.UpgradedModel
+	}
+	if strings.TrimSpace(opts.UpgradedEffort) != "" {
+		effort = opts.UpgradedEffort
+	} else {
+		effort = defaultUpgradedEffort(effort)
+	}
+	return model, effort
+}
+
+func defaultUpgradedEffort(current string) string {
+	switch strings.ToLower(strings.TrimSpace(current)) {
+	case "xhigh", "max":
+		return strings.TrimSpace(current)
+	default:
+		return "xhigh"
+	}
+}
+
+func recoverNow(opts Options) time.Time {
+	if !opts.Now.IsZero() {
+		return opts.Now.UTC()
+	}
+	return time.Now().UTC()
+}
+
+func latestFailureHung(attempts []attemptHistoryEntry, latestStatus, _ string) bool {
+	if statusOrDetailHung(latestStatus, "") {
+		return true
+	}
+	latest := latestHistoryAttempt(attempts)
+	return latest != nil && statusOrDetailHung(latest.Record.Status, latest.Record.Error)
+}
+
+func lastRecoveryAttemptHung(attempts []AttemptRecord) bool {
+	if len(attempts) == 0 {
+		return false
+	}
+	latest := attempts[len(attempts)-1]
+	return statusOrDetailHung(latest.Status, latest.Error)
+}
+
+func dispatchFailureHung(result DispatchResult, err error) bool {
+	return statusOrDetailHung(result.Status, dispatchFailureDetail(result, err))
+}
+
+func statusOrDetailHung(status, detail string) bool {
+	if strings.EqualFold(strings.TrimSpace(status), StatusHung) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(detail), HungReasonLedger)
+}
+
+func ensureHungReason(detail string) string {
+	detail = strings.TrimSpace(detail)
+	if strings.Contains(strings.ToLower(detail), HungReasonLedger) {
+		return detail
+	}
+	if detail == "" {
+		return HungReasonLedger
+	}
+	return HungReasonLedger + ": " + detail
+}
+
+func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempts int, latestBriefPath string) AttemptRecord {
+	now := state.FormatTimestamp(recoverNow(opts))
+	record := AttemptRecord{
+		Version:             AttemptRecordVersion,
+		Issue:               opts.IssueNumber,
+		RunID:               opts.RunID,
+		Attempt:             priorAttempts,
+		Strategy:            AttemptStrategySameConfig,
+		Status:              guardrails.StatusNeedsHuman,
+		RecoveryContextPath: latestBriefPath,
+		Error:               HungReasonLedger + ": retry limit reached after hung attempt",
+		StartedAt:           now,
+		FinishedAt:          now,
+	}
+	if err := deps.RecordAttempt(repoPath, opts.RunID, record); err != nil && opts.Stderr != nil {
+		fmt.Fprintf(opts.Stderr, "[loopcoder] warning: failed to record hung needs-human attempt for issue #%d: %v\n", opts.IssueNumber, err)
+	}
+	return record
+}
+
+func dispatchFailureDetail(result DispatchResult, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	if strings.TrimSpace(result.Status) != "" && strings.TrimSpace(result.Summary) != "" {
+		return result.Status + ": " + result.Summary
+	}
+	if strings.TrimSpace(result.Status) != "" {
+		return result.Status
+	}
+	return "dispatch did not produce a PR"
+}
+
+func dispatchFailureContext(previous, detail string) string {
+	var out bytes.Buffer
+	if strings.TrimSpace(previous) != "" {
+		out.WriteString(previous)
+		out.WriteString("\n\n")
+	}
+	out.WriteString("## Recovery attempt failure\n\n")
+	out.WriteString("```text\n")
+	out.WriteString(Scrub(strings.TrimSpace(detail)))
+	out.WriteString("\n```\n")
+	return out.String()
+}
+
+var retryPRNumberPattern = regexp.MustCompile(`(?i)(?:/pull/|#)([1-9]\d*)\s*$`)
+
+func parsePRNumber(value string) (int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if number, err := strconv.Atoi(value); err == nil && number > 0 {
+		return number, true
+	}
+	matches := retryPRNumberPattern.FindStringSubmatch(value)
+	if len(matches) != 2 {
+		return 0, false
+	}
+	number, err := strconv.Atoi(matches[1])
+	return number, err == nil && number > 0
+}
+
 func renderAdoptReport(issueNumber int, runID string, priorAttempts int, latestStatus string, pr issuePR) string {
 	var out bytes.Buffer
 	fmt.Fprintln(&out, "ADOPT EXISTING PR; NO RETRY")
@@ -590,7 +928,7 @@ func renderAdoptReport(issueNumber int, runID string, priorAttempts int, latestS
 	return out.String()
 }
 
-func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry) string {
+func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttempts int, latestStatus, latestBriefPath, latestBriefText string, attempts []attemptHistoryEntry, reason string) string {
 	var out bytes.Buffer
 	fmt.Fprintln(&out, "BLOCKED: retry limit reached")
 	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
@@ -598,6 +936,9 @@ func renderBlockedReport(issueNumber int, runID string, priorAttempts, maxAttemp
 	fmt.Fprintf(&out, "Prior attempts: %d\n", priorAttempts)
 	fmt.Fprintf(&out, "Max attempts: %d\n", maxAttempts)
 	fmt.Fprintf(&out, "Latest status: %s\n", latestStatus)
+	if strings.TrimSpace(reason) != "" {
+		fmt.Fprintf(&out, "Reason: %s\n", reason)
+	}
 	fmt.Fprintf(&out, "Latest recovery brief: %s\n", latestBriefPath)
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Latest recovery brief contents:")
@@ -732,7 +1073,7 @@ func retryAttemptCount(repoPath, runID string, issueNumber int) int {
 	return count
 }
 
-func renderRetryReport(issueNumber int, runID string, priorAttempts int, latestStatus, latestBriefPath, retryBranch string, backoffSeconds int) string {
+func renderRetryReport(issueNumber int, runID string, priorAttempts int, latestStatus, latestBriefPath, retryBranch, strategy, model, effort string, backoffSeconds int) string {
 	var out bytes.Buffer
 	fmt.Fprintf(&out, "RETRY: dispatching issue #%d attempt %d\n", issueNumber, priorAttempts+1)
 	fmt.Fprintf(&out, "RunId: %s\n", runID)
@@ -740,7 +1081,63 @@ func renderRetryReport(issueNumber int, runID string, priorAttempts int, latestS
 	fmt.Fprintf(&out, "Latest status: %s\n", latestStatus)
 	fmt.Fprintf(&out, "Latest recovery brief: %s\n", latestBriefPath)
 	fmt.Fprintf(&out, "Retry branch: %s\n", retryBranch)
+	fmt.Fprintf(&out, "Recovery strategy: %s\n", strategy)
+	if strings.TrimSpace(model) != "" {
+		fmt.Fprintf(&out, "Model: %s\n", model)
+	}
+	if strings.TrimSpace(effort) != "" {
+		fmt.Fprintf(&out, "Effort: %s\n", effort)
+	}
 	fmt.Fprintf(&out, "Backoff seconds: %d\n", backoffSeconds)
+	return out.String()
+}
+
+func renderReviewResultReport(issueNumber int, runID, pr string, result loopreview.Result) string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "REVIEW: recovered issue #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	fmt.Fprintf(&out, "PR: %s\n", pr)
+	fmt.Fprintf(&out, "Verdict: %s\n", result.Verdict.Verdict)
+	if strings.TrimSpace(result.Verdict.SpecConformance) != "" {
+		fmt.Fprintf(&out, "Spec conformance: %s\n", result.Verdict.SpecConformance)
+	}
+	if strings.TrimSpace(result.Verdict.Evidence) != "" {
+		fmt.Fprintf(&out, "Evidence: %s\n", result.Verdict.Evidence)
+	}
+	return out.String()
+}
+
+func renderReviewBlockedReport(issueNumber int, runID, pr, detail string) string {
+	var out bytes.Buffer
+	fmt.Fprintln(&out, "BLOCKED: recovery review needs-human")
+	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	if strings.TrimSpace(pr) != "" {
+		fmt.Fprintf(&out, "PR: %s\n", pr)
+	}
+	fmt.Fprintf(&out, "Review evidence: %s\n", detail)
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Human decision needed: inspect the recovered PR and verifier evidence, then decide whether to clarify the issue, close/supersede it, or explicitly start a new scoped run.")
+	return out.String()
+}
+
+func renderReviewFailureContext(issueNumber int, pr string, result loopreview.Result) string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "# Recovery context for failed loopreview on issue #%d\n\n", issueNumber)
+	if strings.TrimSpace(pr) != "" {
+		fmt.Fprintf(&out, "- PR: %s\n", pr)
+	}
+	fmt.Fprintf(&out, "- Verdict: %s\n", result.Verdict.Verdict)
+	if strings.TrimSpace(result.Verdict.SpecConformance) != "" {
+		fmt.Fprintf(&out, "- Spec conformance: %s\n", result.Verdict.SpecConformance)
+	}
+	fmt.Fprintln(&out)
+	writeSection(&out, "Verifier evidence", result.Verdict.Evidence)
+	var findings bytes.Buffer
+	for _, finding := range result.Verdict.Findings {
+		fmt.Fprintf(&findings, "- %s %s: %s\n", finding.Severity, finding.File, finding.Note)
+	}
+	writeSection(&out, "Verifier findings", findings.String())
 	return out.String()
 }
 

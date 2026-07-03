@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
@@ -17,6 +18,12 @@ type Invocation struct {
 	ReadOnly     bool
 	OutputSchema string
 	LogPath      string
+	HardCap      time.Duration
+	StallTimeout time.Duration
+	// RunID and Role tag the spawned provider process as loopcoder-managed and
+	// place it in a per-run kill-group (spec 0390, Decision 11).
+	RunID string
+	Role  string
 }
 
 type Result struct {
@@ -28,6 +35,8 @@ type Result struct {
 	StartedAt  string
 	EndedAt    string
 	DurationMS int64
+	Hung       bool
+	HungReason string
 }
 
 type Runner interface {

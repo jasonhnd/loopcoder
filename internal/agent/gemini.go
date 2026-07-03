@@ -70,21 +70,15 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	cmd.Stderr = logFile
 
 	startedAt := time.Now()
-	runErr := cmd.Run()
+	supervision, runErr := runProviderCommand(ctx, cmd, inv, "gemini")
 	endedAt := time.Now()
 	summary := parseGeminiSummary(stdout.Bytes())
 	metadata := parseGeminiInvocation(stdout.Bytes())
+	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
 	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			exitCode := exitErr.ExitCode()
-			if exitCode >= 0 {
-				return resultWithTiming(exitCode, summary, metadata, startedAt, endedAt), nil
-			}
-		}
-		return resultWithTiming(-1, summary, metadata, startedAt, endedAt), runErr
+		return result, runErr
 	}
-	return resultWithTiming(0, summary, metadata, startedAt, endedAt), nil
+	return result, nil
 }
 
 func geminiEffortAdvisory(effort string) string {

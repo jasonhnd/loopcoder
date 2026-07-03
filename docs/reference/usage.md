@@ -237,8 +237,9 @@ its own global configuration.
 Use `loopcoder init` or manually add a `.delivery.yml` file at the repository
 root. If it is absent, loopcoder uses the v1 defaults from the current design:
 GitHub issues, git worktrees, the Codex worker adapter, GitHub
-PRs/checks/merges, independent `loopreview` verification, human merge gating,
-and chat reporting.
+PRs/checks/merges, independent `loopreview` verification, pre-prod-only
+auto-integration for clean `tick` PRs, human production merge gating, and chat
+reporting.
 
 The current example is:
 
@@ -259,6 +260,20 @@ worker:
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
+environment:
+  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.
+# evidence:
+#   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.
+#   website:
+#     preview_url: https://preview.example.com
+#   cli:
+#     example_output: |
+#       $ loopcoder --version
+#       version=dev commit=unknown date=unknown
+#   library:
+#     test_results: go test ./...
+#   app:
+#     preview_build: dist/app-preview.zip
 # verifier:
 #   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
 #   # model:
@@ -269,6 +284,16 @@ ci:
 report:
   channel: chat
 ```
+
+`environment.pre_prod_branch` defaults to `pre-prod`. If that branch is absent,
+empty, reserved as `main`/production, or cannot accept the merge, `tick` skips
+auto-merge, records `needs-human`, and leaves production untouched.
+
+`evidence` is optional. When present, it is keyed by project type (`website`,
+`cli`, `library`, or `app`) and supports simple proof fields such as
+`preview_url`, `example_output`, `test_results`, and `preview_build`. `tick`
+copies those configured artifacts into the JSON report and the human-readable
+summary for dispatched, pending, and pre-prod items.
 
 The verifier role has its own optional model and reasoning-effort settings.
 Quote model IDs that contain YAML-special characters such as `[1m]`:
@@ -311,8 +336,17 @@ For compatibility signals such as `min_loopcoder_version`, see
    ambiguous, malformed, timed-out, or incomplete verifier output is still
    reported as `needs-human`.
 
-7. You name which PRs to merge. loopcoder merges only those named PRs by running
-   `gh pr merge`, following `.delivery.yml` merge settings when present.
+7. After `loopreview = pass`, `tick` runs a deterministic risk gate. Clean PRs
+   auto-merge into `environment.pre_prod_branch`; red-line PRs, red/missing CI,
+   loopcoder-core changes, and verifier non-pass results are reported as
+   `needs-human` and do not merge. After a pre-prod merge, `tick` reads the
+   configured CI checks on the pre-prod branch head; if that head is the
+   just-created merge commit and a required check is red, `tick` reverts that
+   commit on pre-prod and records the PR as `needs-human`.
+
+8. You name which pre-prod batch or PRs to promote to production/main.
+   loopcoder merges only those named targets by running the human-directed merge
+   path; `tick` never auto-merges to `main`.
 
 ## Version And Doctor
 

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 const (
@@ -35,7 +36,11 @@ const (
 	EnvInstallRepo = "LOOPCODER_INSTALL_REPO"
 	EnvAPIBaseURL  = "GITHUB_API_URL"
 	EnvBaseURL     = "GITHUB_BASE_URL"
+
+	commandHardCapDefault = 60 * time.Second
 )
+
+var commandHardCap = commandHardCapDefault
 
 type Options struct {
 	RequestedVersion string
@@ -322,6 +327,9 @@ func normalizeDeps(deps Deps) Deps {
 }
 
 func execRunCommand(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -329,18 +337,20 @@ func execRunCommand(ctx context.Context, name string, args ...string) (CommandRe
 	cmd.Stderr = &stderr
 
 	result := CommandResult{}
-	err := cmd.Run()
+	runResult, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: commandHardCap})
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
-	if err == nil {
+	if err != nil {
+		return result, err
+	}
+	if runResult.Outcome == supervisedexec.OutcomeDeadline {
+		return result, fmt.Errorf("%s timed out after %s", strings.Join(append([]string{name}, args...), " "), commandHardCap)
+	}
+	if runResult.ExitCode == 0 {
 		return result, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
-		return result, nil
-	}
-	return result, err
+	result.ExitCode = runResult.ExitCode
+	return result, nil
 }
 
 func releaseConfigFromEnv(deps Deps) releaseConfig {

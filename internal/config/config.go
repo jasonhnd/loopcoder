@@ -4,6 +4,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,6 +20,8 @@ type Config struct {
 	Verification Verification `yaml:"verification"`
 	Resilience   Resilience   `yaml:"resilience"`
 	Guardrails   Guardrails   `yaml:"guardrails"`
+	Environment  Environment  `yaml:"environment"`
+	Evidence     Evidence     `yaml:"evidence"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -70,7 +75,8 @@ type Browser struct {
 }
 
 type Resilience struct {
-	Worker ResilienceWorker `yaml:"worker"`
+	Worker   ResilienceWorker   `yaml:"worker"`
+	Verifier ResilienceVerifier `yaml:"verifier"`
 }
 
 type ResilienceWorker struct {
@@ -79,10 +85,70 @@ type ResilienceWorker struct {
 	HungAfterSeconds         int   `yaml:"hung_after_seconds"`
 	MaxAttempts              int   `yaml:"max_attempts"`
 	RetryBackoffSeconds      []int `yaml:"retry_backoff_seconds"`
+	// Process-watchdog caps for the worker provider CLI (spec 0390, Decision 7).
+	// Absent/zero falls back to the built-in default.
+	HardCapSeconds      int `yaml:"hard_cap_seconds"`
+	StallTimeoutSeconds int `yaml:"stall_timeout_seconds"`
+}
+
+// ResilienceVerifier holds process-watchdog caps for the verifier provider CLI.
+type ResilienceVerifier struct {
+	HardCapSeconds      int `yaml:"hard_cap_seconds"`
+	StallTimeoutSeconds int `yaml:"stall_timeout_seconds"`
 }
 
 type Report struct {
 	Channel string `yaml:"channel"`
+}
+
+type Environment struct {
+	PreProdBranch string `yaml:"pre_prod_branch"`
+}
+
+type Evidence struct {
+	Website EvidenceArtifact `yaml:"website"`
+	CLI     EvidenceArtifact `yaml:"cli"`
+	Library EvidenceArtifact `yaml:"library"`
+	App     EvidenceArtifact `yaml:"app"`
+}
+
+type EvidenceArtifact struct {
+	ProjectType   string `yaml:"-" json:"project_type"`
+	PreviewURL    string `yaml:"preview_url" json:"preview_url,omitempty"`
+	ExampleOutput string `yaml:"example_output" json:"example_output,omitempty"`
+	TestResults   string `yaml:"test_results" json:"test_results,omitempty"`
+	PreviewBuild  string `yaml:"preview_build" json:"preview_build,omitempty"`
+}
+
+func (e Evidence) Artifacts() []EvidenceArtifact {
+	artifacts := make([]EvidenceArtifact, 0, 4)
+	for _, candidate := range []EvidenceArtifact{
+		e.artifact("website", e.Website),
+		e.artifact("cli", e.CLI),
+		e.artifact("library", e.Library),
+		e.artifact("app", e.App),
+	} {
+		if !candidate.empty() {
+			artifacts = append(artifacts, candidate)
+		}
+	}
+	return artifacts
+}
+
+func (e Evidence) artifact(projectType string, artifact EvidenceArtifact) EvidenceArtifact {
+	artifact.ProjectType = projectType
+	artifact.PreviewURL = strings.TrimSpace(artifact.PreviewURL)
+	artifact.ExampleOutput = strings.TrimSpace(artifact.ExampleOutput)
+	artifact.TestResults = strings.TrimSpace(artifact.TestResults)
+	artifact.PreviewBuild = strings.TrimSpace(artifact.PreviewBuild)
+	return artifact
+}
+
+func (a EvidenceArtifact) empty() bool {
+	return strings.TrimSpace(a.PreviewURL) == "" &&
+		strings.TrimSpace(a.ExampleOutput) == "" &&
+		strings.TrimSpace(a.TestResults) == "" &&
+		strings.TrimSpace(a.PreviewBuild) == ""
 }
 
 type Guardrails struct {
@@ -131,7 +197,16 @@ func Default() Config {
 				HungAfterSeconds:         300,
 				MaxAttempts:              3,
 				RetryBackoffSeconds:      []int{10, 30, 120},
+				HardCapSeconds:           1800,
+				StallTimeoutSeconds:      120,
 			},
+			Verifier: ResilienceVerifier{
+				HardCapSeconds:      600,
+				StallTimeoutSeconds: 120,
+			},
+		},
+		Environment: Environment{
+			PreProdBranch: "pre-prod",
 		},
 	}
 }
@@ -158,6 +233,25 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
+// falling back to built-in defaults when the file is missing or unreadable.
+func ResilienceForRepo(repoPath string) Resilience {
+	cfg, err := Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err != nil {
+		return Default().Resilience
+	}
+	return cfg.Resilience
+}
+
+// DurationSeconds converts a positive seconds value to a Duration, falling back
+// to def when seconds is zero or negative.
+func DurationSeconds(seconds int, def time.Duration) time.Duration {
+	if seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return def
 }
 
 func validateGuardrailBudget(b GuardrailBudget) error {

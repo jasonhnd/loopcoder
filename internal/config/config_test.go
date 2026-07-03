@@ -39,6 +39,12 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	if cfg.Verifier.Model != "" || cfg.Verifier.ReasoningEffort != "" {
 		t.Fatalf("Verifier = %#v, want inherited empty config", cfg.Verifier)
 	}
+	if cfg.Environment.PreProdBranch != "pre-prod" {
+		t.Fatalf("Environment.PreProdBranch = %q, want pre-prod", cfg.Environment.PreProdBranch)
+	}
+	if got := cfg.Evidence.Artifacts(); len(got) != 0 {
+		t.Fatalf("Evidence.Artifacts() = %#v, want empty", got)
+	}
 }
 
 func TestParseReadsConfiguredSections(t *testing.T) {
@@ -84,6 +90,19 @@ resilience:
     retry_backoff_seconds: [1, 2, 3]
 report:
   channel: chat
+environment:
+  pre_prod_branch: staging
+evidence:
+  website:
+    preview_url: https://preview.example.com
+  cli:
+    example_output: |
+      $ loopcoder --version
+      version=dev
+  library:
+    test_results: go test ./...
+  app:
+    preview_build: dist/app-preview.zip
 guardrails:
   budget:
     max_runs: 3
@@ -162,6 +181,18 @@ guardrails:
 	}
 	if cfg.Report.Channel != "chat" {
 		t.Fatalf("Report.Channel = %q, want chat", cfg.Report.Channel)
+	}
+	if cfg.Environment.PreProdBranch != "staging" {
+		t.Fatalf("Environment.PreProdBranch = %q, want staging", cfg.Environment.PreProdBranch)
+	}
+	wantEvidence := []EvidenceArtifact{
+		{ProjectType: "website", PreviewURL: "https://preview.example.com"},
+		{ProjectType: "cli", ExampleOutput: "$ loopcoder --version\nversion=dev"},
+		{ProjectType: "library", TestResults: "go test ./..."},
+		{ProjectType: "app", PreviewBuild: "dist/app-preview.zip"},
+	}
+	if !reflect.DeepEqual(cfg.Evidence.Artifacts(), wantEvidence) {
+		t.Fatalf("Evidence.Artifacts() = %#v, want %#v", cfg.Evidence.Artifacts(), wantEvidence)
 	}
 	if cfg.Guardrails.Budget.MaxRuns == nil || *cfg.Guardrails.Budget.MaxRuns != 3 {
 		t.Fatalf("Guardrails.Budget.MaxRuns = %#v, want 3", cfg.Guardrails.Budget.MaxRuns)

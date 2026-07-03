@@ -2,6 +2,7 @@
 package scaffold
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,22 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/execresult"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 const (
 	DeliveryFilename = ".delivery.yml"
 	RoadmapFilename  = "ROADMAP.md"
+
+	ghHardCapDefault = 60 * time.Second
+)
+
+var (
+	ghCommand = "gh"
+	ghHardCap = ghHardCapDefault
 )
 
 type Options struct {
@@ -81,6 +93,7 @@ type LabelSpec struct {
 
 var defaultLabels = []LabelSpec{
 	{Name: "delivery:unit", Color: "0e8a16", Description: "loopcoder work unit"},
+	{Name: "epic", Color: "5319e7", Description: "loopcoder epic work"},
 	{Name: "status:ready", Color: "1d76db", Description: "ready for worker dispatch"},
 	{Name: "status:implementing", Color: "fbca04", Description: "worker implementation in progress"},
 	{Name: "status:in-review", Color: "5319e7", Description: "pull request awaiting verification"},
@@ -189,6 +202,20 @@ func DeliveryTemplate(opts Options) string {
 	writeOptionalScalar(&b, "  ", "reasoning_effort", workerEffort)
 	b.WriteString("  base_branch: main\n")
 	b.WriteString("  command_hint: \"implement the issue, run relevant checks, commit\"\n")
+	b.WriteString("environment:\n")
+	b.WriteString("  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; main remains human-only.\n")
+	b.WriteString("# evidence:\n")
+	b.WriteString("#   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.\n")
+	b.WriteString("#   website:\n")
+	b.WriteString("#     preview_url: https://preview.example.com\n")
+	b.WriteString("#   cli:\n")
+	b.WriteString("#     example_output: |\n")
+	b.WriteString("#       $ loopcoder --version\n")
+	b.WriteString("#       version=dev commit=unknown date=unknown\n")
+	b.WriteString("#   library:\n")
+	b.WriteString("#     test_results: go test ./...\n")
+	b.WriteString("#   app:\n")
+	b.WriteString("#     preview_build: dist/app-preview.zip\n")
 	if hasVerifier {
 		b.WriteString("verifier:\n")
 		b.WriteString("  # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.\n")
@@ -257,27 +284,32 @@ const RoadmapTemplate = `# ROADMAP
 <!--
 Template for loopcoder work units.
 
-Fields:
-- id: Stable short identifier used by depends_on.
-- title: Short human-readable work unit title.
-- scope: Brief description of what is included in the work unit.
-- depends_on: List of work unit ids that must finish first; use [] when none.
+Format:
+- Each ## heading is one topic or unit.
+- Each "- doc:" or "- code:" list item is one slice and becomes one issue.
+- code slices depend on the doc slices in the same unit unless "(needs: ...)" is set.
+- Slice refs are <unit-slug>/<kind>-<n>; within the same unit, <kind>-<n> works.
+- Use "## [epic] ..." for a slice DAG; add "- doc:" / "- code:" lines for explicit slices.
 
 The example below is illustrative only, not a real roadmap.
 -->
 
-` + "```yaml" + `
-- id: docs-example
-  title: Add example docs page
-  scope: Create a short documentation page for one workflow.
-  depends_on: []
+## Example docs page
+Create a short documentation page for one workflow.
 
-- id: checks-example
-  title: Add docs link check
-  scope: Add a lightweight check that verifies the docs page is linked.
-  depends_on:
-    - docs-example
-` + "```" + `
+- doc: Design the example docs page
+- code: Add the example docs page
+
+## Example checks
+Add a lightweight check that verifies the docs page is linked.
+
+- code: Add docs link check (needs: example-docs-page/code-1)
+
+## [epic] Example migration
+Describe one large task here. compile will emit an epic slice DAG.
+
+- doc: Design the migration slice plan
+- code: Add the first isolated migration slice
 `
 
 func ensureLabels(ctx context.Context, repoPath string, runner GitHubRunner) ([]LabelResult, []string) {
@@ -347,7 +379,25 @@ func (osFileSystem) WriteFile(name string, data []byte, perm fs.FileMode) error 
 type execGitHubRunner struct{}
 
 func (execGitHubRunner) Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "gh", args...)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, ghCommand, args...)
 	cmd.Dir = dir
-	return cmd.CombinedOutput()
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: ghHardCap})
+	if err != nil {
+		return output.Bytes(), err
+	}
+	if result.Outcome == supervisedexec.OutcomeDeadline {
+		return output.Bytes(), fmt.Errorf("gh %s timed out after %s", strings.Join(args, " "), ghHardCap)
+	}
+	if result.ExitCode != 0 {
+		return output.Bytes(), execresult.CommandExitError(cmd, result.ExitCode)
+	}
+	return output.Bytes(), nil
 }
