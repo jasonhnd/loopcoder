@@ -226,9 +226,13 @@ layers:
   the orphaned `attempt.json` (status `running`, stale heartbeat) on the next run
   and routes it into recovery.
 
-Crash-safe OS-level reaping (Windows Job Object with kill-on-close, Linux
-`PR_SET_PDEATHSIG`, other-Unix process groups) is deferred as a follow-up because
-it is platform-uneven; it is not required for the 0.4.0 fold.
+Both layers use the loopcoder-managed **kill-group** of Decision 11: graceful
+cleanup terminates the whole group, so a child that spawned its own subtree — a
+provider CLI with helper processes — is fully reaped rather than orphaned (the
+exact failure that motivated this spec). The group's kill-on-close (Windows Job
+Object) and `PR_SET_PDEATHSIG` (Linux) reap orphans even on a hard crash; macOS,
+which has no death signal, still falls back to passive resume for crash orphans.
+Passive resume remains the recovery path for the abandoned *work* on any platform.
 
 ### 10. Soft stall step
 
@@ -236,6 +240,37 @@ On the first detected stall, the supervisor fires `OnStall` (a progress/log
 event, e.g. "worker N silent for Xs") and, if `StallGrace > 0`, waits that grace
 before killing. This gives a short, bounded soft window before the kill; the hard
 cap remains the absolute backstop regardless of the soft step.
+
+### 11. Process ownership: loopcoder-managed marker and kill-group
+
+loopcoder must identify and terminate its OWN spawned processes without ever
+touching unrelated processes that share a binary name. On a real machine the
+user's Claude and Codex **desktop apps**, other CLI sessions, and the loopcoder
+**CLI session itself** all appear as `claude` / `codex` / `loopcoder` processes.
+Killing by process name is therefore **forbidden** — it kills the user's apps and
+can kill the controlling session itself.
+
+Every process loopcoder spawns (the worker/verifier LLM CLIs and every exec-site
+subprocess) is tagged and grouped at spawn:
+
+- **Env marker:** `LOOPCODER_MANAGED=1`, `LOOPCODER_RUN_ID=<run>`, and
+  `LOOPCODER_ROLE=worker|verifier|git|gh|...` are set on the child environment.
+- **Kill-group:** the child is placed in a per-run kill-group — a named **Job
+  Object** on Windows (`loopcoder/<run>`, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+  and its own **process group** on Unix (`Setpgid`, plus `PR_SET_PDEATHSIG` on
+  Linux). The group is the single handle that terminates the whole subtree at
+  once and reaps orphans on parent close.
+
+Two operator commands consume this:
+
+- `loopcoder ps` — lists only loopcoder-managed processes (from the tracked
+  attempt PIDs and the kill-groups); never unrelated `claude`/`codex` processes.
+- `loopcoder kill [--run <id> | --all]` — terminates only loopcoder-managed
+  processes, by group / PID-tree; never by bare process name.
+
+This makes "identify and safely reap loopcoder's own processes" a first-class,
+collision-free capability, and is the mechanism Decision 9's graceful cleanup and
+crash-safe reaping are built on.
 
 ## Invariants
 
@@ -252,8 +287,11 @@ cap remains the absolute backstop regardless of the soft step.
 - Not a machine-wide resource scheduler or cross-instance concurrency throttle.
   Limiting how many LLM CLIs run at once across projects is the parked
   multi-project scheduler's job. The watchdog only detects and handles hangs.
-- No central watchdog daemon and no global PID registry.
-- No crash-safe OS-level child reaping in this fold (deferred follow-up).
+- No central watchdog daemon and no global machine-wide PID scan.
+- **Never terminate a process by bare name** (`claude`/`codex`/`loopcoder`) —
+  those names collide with the user's desktop apps and the controlling CLI
+  session. Only loopcoder-managed processes are terminated, by kill-group /
+  PID-tree (Decision 11).
 - No new runtime dependency; cross-platform Go only.
 - No change to the human merge/promote gate.
 
@@ -272,9 +310,14 @@ Filed as code issues on `feat/0.4.0`. Order: **W1 → (W2 ∥ W3) → W4**.
    `doctor`, `upgrade`, `compile/ordering`, and `process` through the hard-cap
    tier; fix the `process_windows` no-context liveness spawn. Depends on W1;
    file-disjoint from W2, so it runs in parallel with W2.
-4. **W4 — cleanup + config + report.** Graceful-shutdown child cleanup
-   (`SIGINT`/`SIGTERM`); per-project `HardCap`/`StallTimeout` config with the
-   Decision 7 defaults; `report` surfacing of `hung` attempts. Depends on W2.
+4. **W4 — process ownership, cleanup, config, report.** Tag every spawned child
+   (`LOOPCODER_MANAGED`/`LOOPCODER_RUN_ID`/`LOOPCODER_ROLE`) and place it in a
+   per-run kill-group (Windows Job Object with kill-on-close; Unix process group
+   + Linux `PR_SET_PDEATHSIG`); graceful-shutdown on `SIGINT`/`SIGTERM` kills the
+   group; add `loopcoder ps` and `loopcoder kill [--run|--all]` acting only on
+   loopcoder-managed processes (never by bare name); per-project
+   `HardCap`/`StallTimeout` config with the Decision 7 defaults; `report`
+   surfacing of `hung` attempts. Depends on W2.
 
 Each slice is cross-platform Go, adds no runtime dependency, and preserves the
 human merge gate.
@@ -296,7 +339,13 @@ human merge gate.
 - Thresholds are per-project configurable with the Decision 7 defaults.
 - Concurrent loopcoder instances supervise only their own children; no instance
   can kill another project's process.
-- On `SIGINT`/`SIGTERM`, loopcoder kills its supervised children before exiting;
-  hard-crash orphans are recovered by the existing passive resume path.
+- Every spawned child carries `LOOPCODER_MANAGED`/`LOOPCODER_RUN_ID` and is
+  placed in a per-run kill-group (Windows Job Object; Unix process group).
+- On `SIGINT`/`SIGTERM`, loopcoder terminates its kill-group (the whole subtree,
+  including a child's own helper processes) before exiting; on a hard crash,
+  Windows Job Object kill-on-close and Linux `PR_SET_PDEATHSIG` reap orphans, and
+  passive resume recovers the abandoned work.
+- `loopcoder ps` / `loopcoder kill` act only on loopcoder-managed processes;
+  neither ever targets a process by bare `claude`/`codex`/`loopcoder` name.
 - Kill terminates the process and drains its wait with no zombie and no
   read-then-kill race; behavior holds on both Windows and Unix.
