@@ -72,6 +72,15 @@ func TestBuildPromptWithAndWithoutRecoveryContext(t *testing.T) {
 	}
 }
 
+func TestWorkerWatchdogDefaultsAreRaised(t *testing.T) {
+	if WorkerHardCap != 45*time.Minute {
+		t.Fatalf("WorkerHardCap = %s, want 45m", WorkerHardCap)
+	}
+	if WorkerStallTimeout != 5*time.Minute {
+		t.Fatalf("WorkerStallTimeout = %s, want 5m", WorkerStallTimeout)
+	}
+}
+
 func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()

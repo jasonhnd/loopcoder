@@ -117,6 +117,65 @@ func TestRunSteadyLogGrowthDoesNotStall(t *testing.T) {
 	}
 }
 
+func TestRunWorktreeActivityExtendsStallWindow(t *testing.T) {
+	tests := []struct {
+		name       string
+		command    func(worktreePath string) []string
+		want       Outcome
+		wantKilled bool
+		minElapsed time.Duration
+	}{
+		{
+			name: "worktree file mtime advances without log growth",
+			command: func(worktreePath string) []string {
+				return []string{"touch-loop", filepath.Join(worktreePath, "activity.txt"), "100ms", "8", "0"}
+			},
+			want:       OutcomeCompleted,
+			wantKilled: false,
+			minElapsed: 500 * time.Millisecond,
+		},
+		{
+			name: "silent worktree and log still stalls",
+			command: func(string) []string {
+				return []string{"sleep", "10s"}
+			},
+			want:       OutcomeStalled,
+			wantKilled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			worktreePath := filepath.Join(root, "wt")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatalf("mkdir worktree: %v", err)
+			}
+			logPath := filepath.Join(root, "worker.log")
+			cmd := helperCommand(t, tt.command(worktreePath)...)
+
+			result, err := Run(context.Background(), cmd, Options{
+				HardCap:      10 * time.Second,
+				StallTimeout: 300 * time.Millisecond,
+				LogPath:      logPath,
+				WorktreePath: worktreePath,
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			if result.Outcome != tt.want {
+				t.Fatalf("Outcome = %v, want %v", result.Outcome, tt.want)
+			}
+			if result.Killed != tt.wantKilled {
+				t.Fatalf("Killed = %v, want %v", result.Killed, tt.wantKilled)
+			}
+			if result.Elapsed < tt.minElapsed {
+				t.Fatalf("Elapsed = %s, want at least %s", result.Elapsed, tt.minElapsed)
+			}
+		})
+	}
+}
+
 func TestRunStallTimeoutZeroDisablesStallDetection(t *testing.T) {
 	cmd := helperCommand(t, "sleep-exit", "80ms", "0")
 
@@ -267,6 +326,16 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "touch-loop":
+		path := args[0]
+		interval := parseDuration(args[1])
+		count := parseInt(args[2])
+		code := parseInt(args[3])
+		for i := 0; i < count; i++ {
+			appendFile(path, fmt.Sprintf("touch %d", i))
+			time.Sleep(interval)
+		}
+		os.Exit(code)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
@@ -309,22 +378,26 @@ func parseInt(value string) int {
 }
 
 func appendLog(path, line string) {
+	appendFile(path, line)
+}
+
+func appendFile(path, line string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir log dir: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mkdir file dir: %v\n", err)
 		os.Exit(2)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open log: %v\n", err)
+		fmt.Fprintf(os.Stderr, "open file: %v\n", err)
 		os.Exit(2)
 	}
 	if _, err := fmt.Fprintln(f, line); err != nil {
-		fmt.Fprintf(os.Stderr, "write log: %v\n", err)
+		fmt.Fprintf(os.Stderr, "write file: %v\n", err)
 		_ = f.Close()
 		os.Exit(2)
 	}
 	if err := f.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "close log: %v\n", err)
+		fmt.Fprintf(os.Stderr, "close file: %v\n", err)
 		os.Exit(2)
 	}
 }

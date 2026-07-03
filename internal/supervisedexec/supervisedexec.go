@@ -1,5 +1,5 @@
 // Package supervisedexec runs prepared commands under a hard cap and optional
-// log-growth stall detection.
+// log/worktree stall detection.
 package supervisedexec
 
 import (
@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -21,7 +22,7 @@ type Outcome int
 
 const (
 	OutcomeCompleted Outcome = iota // process exited on its own (any exit code)
-	OutcomeStalled                  // killed: no log growth for StallTimeout
+	OutcomeStalled                  // killed: no log/worktree progress for StallTimeout
 	OutcomeDeadline                 // killed: exceeded HardCap
 )
 
@@ -30,6 +31,7 @@ type Options struct {
 	HardCap      time.Duration
 	StallTimeout time.Duration
 	LogPath      string
+	WorktreePath string
 	StallGrace   time.Duration
 	OnStall      func(silentFor time.Duration)
 	// RunID and Role tag the spawned child as loopcoder-managed and place it in
@@ -55,6 +57,10 @@ type logObservation struct {
 	exists  bool
 	size    int64
 	modTime time.Time
+}
+
+type worktreeObservation struct {
+	modTimes map[string]time.Time
 }
 
 // Run starts cmd, supervises it, and waits until the process exits or is
@@ -106,9 +112,11 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	var stallTicks *time.Ticker
 	var stallC <-chan time.Time
 	var lastLog logObservation
+	var lastWorktree worktreeObservation
 	lastProgress := start
 	if opts.StallTimeout > 0 {
 		lastLog = observeLog(opts.LogPath)
+		lastWorktree = observeWorktree(opts.WorktreePath)
 		stallTicks = time.NewTicker(stallPollInterval(opts.StallTimeout))
 		defer stallTicks.Stop()
 		stallC = stallTicks.C
@@ -126,8 +134,12 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		case <-stallC:
 			now := time.Now()
 			currentLog := observeLog(opts.LogPath)
-			if currentLog.changedFrom(lastLog) {
-				lastLog = currentLog
+			currentWorktree := observeWorktree(opts.WorktreePath)
+			logProgress := currentLog.changedFrom(lastLog)
+			worktreeProgress := currentWorktree.changedFrom(lastWorktree)
+			lastLog = currentLog
+			lastWorktree = currentWorktree
+			if logProgress || worktreeProgress {
 				lastProgress = now
 				continue
 			}
@@ -236,6 +248,44 @@ func observeLog(path string) logObservation {
 
 func (o logObservation) changedFrom(prev logObservation) bool {
 	return o.exists != prev.exists || o.size != prev.size || !o.modTime.Equal(prev.modTime)
+}
+
+func observeWorktree(path string) worktreeObservation {
+	if path == "" {
+		return worktreeObservation{}
+	}
+	modTimes := map[string]time.Time{}
+	err := filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if current != path && entry.IsDir() && entry.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		info, err := os.Stat(current)
+		if err != nil {
+			return nil
+		}
+		modTimes[current] = info.ModTime()
+		return nil
+	})
+	if err != nil && len(modTimes) == 0 {
+		return worktreeObservation{}
+	}
+	return worktreeObservation{modTimes: modTimes}
+}
+
+func (o worktreeObservation) changedFrom(prev worktreeObservation) bool {
+	if len(o.modTimes) == 0 {
+		return false
+	}
+	for path, modTime := range o.modTimes {
+		prevModTime, ok := prev.modTimes[path]
+		if !ok || modTime.After(prevModTime) {
+			return true
+		}
+	}
+	return false
 }
 
 func stallPollInterval(timeout time.Duration) time.Duration {

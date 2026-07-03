@@ -271,7 +271,7 @@ func TestComputeReadySetHungAttemptWithLivePidBlocksAsLive(t *testing.T) {
 			Attempt:        1,
 			Status:         "running",
 			PID:            &pid,
-			LastProgressAt: "2026-06-26T11:50:00Z",
+			LastProgressAt: "2026-06-26T11:49:00Z",
 			Branch:         "loop/issue-8",
 		}},
 		Thresholds:   config.Default().Resilience.Worker,

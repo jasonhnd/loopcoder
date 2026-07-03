@@ -35,6 +35,9 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 				if opts.LogPath == "" {
 					t.Fatal("LogPath was empty")
 				}
+				if opts.WorktreePath == "" {
+					t.Fatal("WorktreePath was empty")
+				}
 				return supervisedexec.Result{Outcome: tt.outcome, Killed: true}, nil
 			})
 			defer restore()
