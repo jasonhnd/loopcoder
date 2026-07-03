@@ -435,7 +435,7 @@ func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
-	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGit := &workerFakeGit{status: ""}
 	fakeAgent := &workerFakeAgent{
 		resultSet: true,
 		result: agent.Result{
@@ -516,6 +516,181 @@ func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
 		if !strings.Contains(string(events), want) {
 			t.Fatalf("events missing %q:\n%s", want, string(events))
 		}
+	}
+}
+
+func TestDispatchHungHarvestBeforeDiscard(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         string
+		existingPRs    map[string][]gh.PullRequestReference
+		wantErr        bool
+		wantStatus     string
+		wantPR         string
+		wantAddAll     int
+		wantCommit     int
+		wantPush       int
+		wantCreatePR   int
+		wantRename     int
+		wantAttestRole attestation.Role
+	}{
+		{
+			name:       "hung empty worktree does not harvest",
+			status:     "",
+			wantErr:    true,
+			wantStatus: "hung",
+		},
+		{
+			name:           "hung committable worktree harvests needs-human PR",
+			status:         " M file.go\n",
+			wantStatus:     "needs-human",
+			wantPR:         "https://github.com/owner/repo/pull/101",
+			wantAddAll:     1,
+			wantCommit:     1,
+			wantPush:       1,
+			wantCreatePR:   1,
+			wantRename:     1,
+			wantAttestRole: attestation.RoleConductor,
+		},
+		{
+			name:   "hung committable worktree with existing harvested PR is no-op",
+			status: " M file.go\n",
+			existingPRs: map[string][]gh.PullRequestReference{
+				"loop/issue-101-retry-2": {{Number: 12, URL: "https://github.com/owner/repo/pull/12"}},
+			},
+			wantStatus:     "needs-human",
+			wantPR:         "https://github.com/owner/repo/pull/12",
+			wantAttestRole: attestation.RoleConductor,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			scratchRoot := t.TempDir()
+			var warnings strings.Builder
+			fakeGit := &workerFakeGit{status: tt.status}
+			fakeAgent := &workerFakeAgent{
+				resultSet: true,
+				result: agent.Result{
+					ExitCode:   -1,
+					Hung:       true,
+					HungReason: agent.HungReasonStall,
+				},
+				log: "provider stopped producing output\n",
+			}
+			fakeGitHub := &workerFakeGitHub{
+				prURL:     "https://github.com/owner/repo/pull/101",
+				prsByHead: tt.existingPRs,
+			}
+
+			result, err := Dispatch(context.Background(), Options{
+				RepoPath:    repo,
+				IssueNumber: 101,
+				IssueTitle:  "Implement dispatch",
+				RunID:       "run-test",
+				Attempt:     2,
+				Provider:    "codex",
+				Stderr:      &warnings,
+			}, Deps{
+				Git: fakeGit,
+				GitHub: func(string) GitHubClient {
+					return fakeGitHub
+				},
+				AgentLookup: func(provider string) (agent.Runner, error) {
+					return fakeAgent, nil
+				},
+				AcquireLock: func(string, time.Duration) (Lock, error) {
+					return &workerFakeLock{}, nil
+				},
+				Now: fixedNow,
+				PID: func() int {
+					return 4321
+				},
+				MkdirTemp: func(dir, pattern string) (string, error) {
+					return os.MkdirTemp(scratchRoot, pattern)
+				},
+				RemoveAll: os.RemoveAll,
+			})
+
+			if tt.wantErr && err == nil {
+				t.Fatal("Dispatch returned nil error, want hung failure")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Dispatch returned error: %v", err)
+			}
+			if result.Status != tt.wantStatus {
+				t.Fatalf("result status = %q, want %q: %#v", result.Status, tt.wantStatus, result)
+			}
+			if tt.wantPR != "" && result.PR != tt.wantPR {
+				t.Fatalf("result PR = %q, want %q", result.PR, tt.wantPR)
+			}
+			if fakeGit.addAllCalls != tt.wantAddAll || fakeGit.commitCalls != tt.wantCommit || fakeGit.pushCalls != tt.wantPush {
+				t.Fatalf("git calls add/commit/push = %d/%d/%d, want %d/%d/%d",
+					fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls,
+					tt.wantAddAll, tt.wantCommit, tt.wantPush)
+			}
+			if fakeGit.branchRenameCalls != tt.wantRename {
+				t.Fatalf("branch rename calls = %d, want %d", fakeGit.branchRenameCalls, tt.wantRename)
+			}
+			if tt.wantRename > 0 && fakeGit.lastRenamedBranch != "loop/issue-101-retry-2" {
+				t.Fatalf("renamed branch = %q, want retry branch", fakeGit.lastRenamedBranch)
+			}
+			if fakeGitHub.createPRCalls != tt.wantCreatePR {
+				t.Fatalf("CreatePR calls = %d, want %d", fakeGitHub.createPRCalls, tt.wantCreatePR)
+			}
+
+			attempts, err := state.LoadAttempts(repo, "run-test")
+			if err != nil {
+				t.Fatalf("LoadAttempts returned error: %v", err)
+			}
+			if len(attempts) != 1 {
+				t.Fatalf("LoadAttempts returned %d attempts, want 1", len(attempts))
+			}
+			attempt := attempts[0]
+			if attempt.Status != tt.wantStatus {
+				t.Fatalf("attempt status = %q, want %q: %#v", attempt.Status, tt.wantStatus, attempt)
+			}
+			if tt.wantStatus == "needs-human" {
+				if attempt.Branch != "loop/issue-101-retry-2" {
+					t.Fatalf("attempt branch = %q, want retry branch", attempt.Branch)
+				}
+				if result.Attestation == nil || result.Attestation.Role != tt.wantAttestRole {
+					t.Fatalf("result attestation = %#v, want role %s", result.Attestation, tt.wantAttestRole)
+				}
+				if attempt.Attestation == nil || attempt.Attestation.Role != tt.wantAttestRole {
+					t.Fatalf("attempt attestation = %#v, want role %s", attempt.Attestation, tt.wantAttestRole)
+				}
+			}
+			if tt.wantCreatePR > 0 {
+				if fakeGitHub.lastPRHead != "loop/issue-101-retry-2" || fakeGitHub.lastPRBase != "main" {
+					t.Fatalf("PR head/base = %q/%q, want retry branch/main", fakeGitHub.lastPRHead, fakeGitHub.lastPRBase)
+				}
+				if len(fakeGitHub.lastPRLabels) != 1 || fakeGitHub.lastPRLabels[0] != "needs-human" {
+					t.Fatalf("PR labels = %#v, want needs-human", fakeGitHub.lastPRLabels)
+				}
+				for _, want := range []string{
+					"Refs #101",
+					"Part of #101",
+					"harvested from hung/killed worker - possibly incomplete",
+					"# Recovery context for issue #101",
+					" M file.go",
+					"provider stopped producing output",
+					"role: worker",
+					"hung_reason: stall",
+				} {
+					if !strings.Contains(fakeGitHub.lastPRBody, want) {
+						t.Fatalf("harvest PR body missing %q:\n%s", want, fakeGitHub.lastPRBody)
+					}
+				}
+				if strings.Contains(fakeGitHub.lastPRBody, "Closes #101") {
+					t.Fatalf("harvest PR body must not close issue:\n%s", fakeGitHub.lastPRBody)
+				}
+				if !strings.Contains(fakeGit.lastCommitMessage, "refs #101") || strings.Contains(strings.ToLower(fakeGit.lastCommitMessage), "closes #101") {
+					t.Fatalf("harvest commit message = %q, want refs and no closes", fakeGit.lastCommitMessage)
+				}
+			}
+		})
 	}
 }
 
@@ -644,6 +819,8 @@ type workerFakeGit struct {
 	addAllCalls       int
 	commitCalls       int
 	pushCalls         int
+	branchRenameCalls int
+	lastRenamedBranch string
 	lastCommitMessage string
 }
 
@@ -691,6 +868,12 @@ func (f *workerFakeGit) PushUpstream(context.Context, string, string) error {
 	return f.err
 }
 
+func (f *workerFakeGit) BranchRename(_ context.Context, _, branch string) error {
+	f.branchRenameCalls++
+	f.lastRenamedBranch = branch
+	return f.err
+}
+
 func (f *workerFakeGit) BranchDelete(context.Context, string, string) error {
 	return nil
 }
@@ -698,9 +881,14 @@ func (f *workerFakeGit) BranchDelete(context.Context, string, string) error {
 type workerFakeGitHub struct {
 	prURL         string
 	prs           []gh.PullRequestReference
+	prsByHead     map[string][]gh.PullRequestReference
 	err           error
 	createPRCalls int
 	lastPRBody    string
+	lastPRHead    string
+	lastPRBase    string
+	lastPRTitle   string
+	lastPRLabels  []string
 }
 
 func (f *workerFakeGitHub) RepoName(context.Context) (string, error) {
@@ -710,21 +898,28 @@ func (f *workerFakeGitHub) RepoName(context.Context) (string, error) {
 	return "owner/repo", nil
 }
 
-func (f *workerFakeGitHub) CreatePR(_ context.Context, _, _, _, body string) (string, error) {
+func (f *workerFakeGitHub) CreatePR(_ context.Context, head, base, title, body string, labels ...string) (string, error) {
 	f.createPRCalls++
 	if f.err != nil {
 		return "", f.err
 	}
+	f.lastPRHead = head
+	f.lastPRBase = base
+	f.lastPRTitle = title
 	f.lastPRBody = body
+	f.lastPRLabels = append([]string(nil), labels...)
 	if f.prURL == "" {
 		return "https://github.com/owner/repo/pull/1", nil
 	}
 	return f.prURL, nil
 }
 
-func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullRequestReference, error) {
+func (f *workerFakeGitHub) ListHeadPRs(_ context.Context, branch string) ([]gh.PullRequestReference, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.prsByHead != nil {
+		return f.prsByHead[branch], nil
 	}
 	return f.prs, nil
 }

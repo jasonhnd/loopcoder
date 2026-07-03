@@ -74,6 +74,9 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	if err := client.PushUpstream(ctx, "wt", "loop/issue-101"); err != nil {
 		t.Fatalf("PushUpstream returned error: %v", err)
 	}
+	if err := client.BranchRename(ctx, "wt", "loop/issue-101-retry-2"); err != nil {
+		t.Fatalf("BranchRename returned error: %v", err)
+	}
 	if err := client.WorktreeRemove(ctx, "repo", "wt"); err != nil {
 		t.Fatalf("WorktreeRemove returned error: %v", err)
 	}
@@ -95,6 +98,7 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 		{"wt", "add", "-A"},
 		{"wt", "commit", "-m", "title (closes #101)"},
 		{"wt", "push", "-u", "origin", "loop/issue-101"},
+		{"wt", "branch", "-M", "loop/issue-101-retry-2"},
 		{"repo", "worktree", "remove", "--force", "wt"},
 		{"repo", "branch", "-D", "loop/issue-101"},
 	}

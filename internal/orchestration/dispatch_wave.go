@@ -375,6 +375,15 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		enrichDispatchWaveFailure(&result, opts)
 		return result
 	}
+	if dispatchResult.Status == DispatchWaveStatusNeedsHuman {
+		result.Status = DispatchWaveStatusNeedsHuman
+		result.Branch = dispatchResult.Branch
+		result.PR = dispatchResult.PR
+		result.AttemptPath = dispatchResult.AttemptPath
+		result.Attestation = dispatchResult.Attestation
+		result.Error = firstNonEmpty(dispatchResult.Summary, "worker dispatch returned needs-human")
+		return result
+	}
 	result.Status = DispatchWaveStatusSucceeded
 	result.Branch = dispatchResult.Branch
 	result.PR = dispatchResult.PR

@@ -421,6 +421,14 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		record.DispatchResult = &dispatchResult
 		record.PR = dispatchResult.PR
 		record.FinishedAt = state.FormatTimestamp(recoverNow(opts))
+		if dispatchErr == nil && dispatchResult.Status == guardrails.StatusNeedsHuman {
+			record.Status = guardrails.StatusNeedsHuman
+			record.Error = firstNonEmpty(dispatchResult.Summary, "worker dispatch returned needs-human")
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
 		if dispatchErr != nil || !dispatchResult.OK || strings.TrimSpace(dispatchResult.PR) == "" {
 			record.Status = "failed"
 			record.Error = dispatchFailureDetail(dispatchResult, dispatchErr)

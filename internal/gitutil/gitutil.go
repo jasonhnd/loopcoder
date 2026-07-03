@@ -193,6 +193,12 @@ func (c *Client) PushUpstream(ctx context.Context, repoPath, branch string) erro
 	return err
 }
 
+// BranchRename force-renames the current branch in repoPath.
+func (c *Client) BranchRename(ctx context.Context, repoPath, branch string) error {
+	_, err := c.run(ctx, repoPath, "branch", "-M", branch)
+	return err
+}
+
 // BranchDelete deletes a local branch forcefully.
 func (c *Client) BranchDelete(ctx context.Context, repoPath, branch string) error {
 	_, err := c.run(ctx, repoPath, "branch", "-D", branch)

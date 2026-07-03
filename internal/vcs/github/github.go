@@ -33,7 +33,7 @@ type Reader interface {
 }
 
 type Writer interface {
-	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
+	CreatePR(ctx context.Context, head, base, title, body string, labels ...string) (string, error)
 	ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error)
 	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (PreProdMergeResult, error)
 	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (PreProdRevertResult, error)
@@ -400,8 +400,16 @@ func (c *CLI) CompareBranches(ctx context.Context, base, head string) ([]string,
 	return parseNameOnlyOutput(nameOnly), string(diff), nil
 }
 
-func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (string, error) {
-	output, err := c.run(ctx, "gh", "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body)
+func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string, labels ...string) (string, error) {
+	labels = normalizeLabelArgs(labels)
+	if err := c.ensureLabels(ctx, labels); err != nil {
+		return "", err
+	}
+	args := []string{"pr", "create", "--head", head, "--base", base, "--title", title, "--body", body}
+	for _, label := range labels {
+		args = append(args, "--label", label)
+	}
+	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
 		return "", err
 	}

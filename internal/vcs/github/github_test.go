@@ -184,6 +184,31 @@ func TestCreatePRRunsGhPRCreate(t *testing.T) {
 	}
 }
 
+func TestCreatePRRunsGhPRCreateWithLabels(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00create\x00--head\x00loop/issue-101-retry-2\x00--base\x00main\x00--title\x00Title\x00--body\x00Body\x00--label\x00needs-human": []byte("https://github.com/owner/repo/pull/102\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.CreatePR(context.Background(), "loop/issue-101-retry-2", "main", "Title", "Body", "needs-human")
+	if err != nil {
+		t.Fatalf("CreatePR returned error: %v", err)
+	}
+	if got != "https://github.com/owner/repo/pull/102" {
+		t.Fatalf("CreatePR URL = %q", got)
+	}
+
+	want := [][]string{
+		{"repo", "gh", "label", "create", "needs-human", "--color", "b60205", "--description", "human decision required"},
+		{"repo", "gh", "pr", "create", "--head", "loop/issue-101-retry-2", "--base", "main", "--title", "Title", "--body", "Body", "--label", "needs-human"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{

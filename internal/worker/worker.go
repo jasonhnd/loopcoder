@@ -66,12 +66,13 @@ type GitClient interface {
 	AddAll(ctx context.Context, repoPath string) error
 	Commit(ctx context.Context, repoPath, message string) error
 	PushUpstream(ctx context.Context, repoPath, branch string) error
+	BranchRename(ctx context.Context, repoPath, branch string) error
 	BranchDelete(ctx context.Context, repoPath, branch string) error
 }
 
 type GitHubClient interface {
 	RepoName(ctx context.Context) (string, error)
-	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
+	CreatePR(ctx context.Context, head, base, title, body string, labels ...string) (string, error)
 	ListHeadPRs(ctx context.Context, branch string) ([]gh.PullRequestReference, error)
 }
 
@@ -143,6 +144,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if opts.Attempt <= 0 {
 		opts.Attempt = 1
 	}
+	cleanupBranch := opts.Branch
 
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
@@ -192,10 +194,11 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase := "worktree_created"
 	dispatchSucceeded := false
+	finalCleanupStatus := "succeeded"
 	failureStatus := "failed"
 	defer func() {
 		if dispatchSucceeded {
-			tracker.transition("cleanup", "succeeded", tracker.exitCode, nil)
+			tracker.transition("cleanup", finalCleanupStatus, tracker.exitCode, nil)
 			if opts.KeepWorktree {
 				fmt.Fprintf(warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", worktreePath, scratch)
 				return
@@ -203,8 +206,8 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			if cleanupErr := deps.Git.WorktreeRemove(context.Background(), repoPath, worktreePath); cleanupErr != nil {
 				fmt.Fprintf(warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", worktreePath, cleanupErr)
 			}
-			if cleanupErr := deps.Git.BranchDelete(context.Background(), repoPath, opts.Branch); cleanupErr != nil {
-				fmt.Fprintf(warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", opts.Branch, cleanupErr)
+			if cleanupErr := deps.Git.BranchDelete(context.Background(), repoPath, cleanupBranch); cleanupErr != nil {
+				fmt.Fprintf(warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", cleanupBranch, cleanupErr)
 			}
 			if cleanupErr := deps.RemoveAll(scratch); cleanupErr != nil {
 				fmt.Fprintf(warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", scratch, cleanupErr)
@@ -304,6 +307,121 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
 			"provider":    opts.Provider,
 		})
+		dirty, statusErr := deps.Git.StatusPorcelain(ctx, worktreePath)
+		if statusErr != nil {
+			return Result{}, fmt.Errorf("git status --porcelain: %w", statusErr)
+		}
+		if strings.TrimSpace(dirty) != "" {
+			harvestBranch := buildHarvestBranchName(opts.IssueNumber, opts.Attempt)
+			existingPR, existingErr := openHeadPR(ctx, github, harvestBranch)
+			if existingErr != nil {
+				return Result{}, fmt.Errorf("lookup harvested PR for %s: %w", harvestBranch, existingErr)
+			}
+			harvestAttestation := buildHarvestConductorAttestation(opts, agentResult, deps.Now())
+			if err := harvestAttestation.Validate(); err != nil {
+				return Result{}, fmt.Errorf("validate harvest conductor attestation: %w", err)
+			}
+			tracker.branch = harvestBranch
+			tracker.setAttestation(harvestAttestation)
+			tracker.setUsage(harvestAttestation.Usage)
+			if existingPR != nil {
+				msg := fmt.Sprintf("harvested PR already exists for hung worker: %s", existingPR.URL)
+				tracker.transition("harvest_pr_existing", "needs-human", tracker.exitCode, &msg)
+				finalCleanupStatus = "needs-human"
+				dispatchSucceeded = true
+				return Result{
+					OK:          true,
+					Issue:       opts.IssueNumber,
+					Branch:      harvestBranch,
+					RunID:       opts.RunID,
+					PR:          existingPR.URL,
+					Summary:     msg,
+					AttemptPath: attemptPath,
+					Status:      "needs-human",
+					ExitCode:    0,
+					LogBytes:    fileSize(logPath),
+					Attestation: &harvestAttestation,
+				}, nil
+			}
+
+			if opts.Branch != harvestBranch {
+				activePhase = "harvest_branch_renamed"
+				if err := deps.Git.BranchRename(ctx, worktreePath, harvestBranch); err != nil {
+					return Result{}, fmt.Errorf("git branch -M %s: %w", harvestBranch, err)
+				}
+				opts.Branch = harvestBranch
+				cleanupBranch = harvestBranch
+				tracker.transition(activePhase, "running", tracker.exitCode, nil)
+			}
+
+			briefPath := state.RecoveryBriefPath(repoPath, opts.RunID, jobID)
+			if err := writeRecoveryBrief(ctx, recoveryBriefOptions{
+				repoPath:     repoPath,
+				runID:        opts.RunID,
+				jobID:        jobID,
+				issueNumber:  opts.IssueNumber,
+				issueTitle:   opts.IssueTitle,
+				branch:       harvestBranch,
+				worktreePath: worktreePath,
+				logPath:      logPath,
+				summaryPath:  summaryPath,
+				attempt:      opts.Attempt,
+				lastPhase:    "codex_exited",
+				status:       "hung",
+				errorMessage: hungErr,
+				git:          deps.Git,
+				github:       github,
+				warnings:     warnings,
+			}); err != nil {
+				return Result{}, err
+			}
+			brief, err := os.ReadFile(briefPath)
+			if err != nil {
+				return Result{}, fmt.Errorf("read recovery brief: %w", err)
+			}
+
+			activePhase = "harvest_staged"
+			if err := deps.Git.AddAll(ctx, worktreePath); err != nil {
+				return Result{}, fmt.Errorf("git add -A: %w", err)
+			}
+			tracker.transition(activePhase, "running", tracker.exitCode, nil)
+
+			activePhase = "harvest_committed"
+			if err := deps.Git.Commit(ctx, worktreePath, buildHarvestCommitMessage(opts.IssueTitle, opts.IssueNumber)); err != nil {
+				return Result{}, fmt.Errorf("git commit: %w", err)
+			}
+			tracker.transition(activePhase, "running", tracker.exitCode, nil)
+
+			activePhase = "harvest_pushed"
+			if err := deps.Git.PushUpstream(ctx, worktreePath, harvestBranch); err != nil {
+				return Result{}, fmt.Errorf("git push -u origin %s: %w", harvestBranch, err)
+			}
+			tracker.transition(activePhase, "running", tracker.exitCode, nil)
+
+			activePhase = "harvest_pr_opened"
+			body := buildHarvestPRBody(opts.IssueNumber, string(brief), buildPartialWorkerAttestation(opts, agentResult))
+			prURL, err := github.CreatePR(ctx, harvestBranch, opts.BaseBranch, buildHarvestPRTitle(opts.IssueTitle), body, "needs-human")
+			if err != nil {
+				return Result{}, fmt.Errorf("gh pr create: %w", err)
+			}
+			tracker.transition(activePhase, "needs-human", tracker.exitCode, nil)
+			finalCleanupStatus = "needs-human"
+			dispatchSucceeded = true
+			summary := "harvested from hung/killed worker - possibly incomplete; needs human review"
+			return Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      harvestBranch,
+				RunID:       opts.RunID,
+				PR:          prURL,
+				Summary:     summary,
+				AttemptPath: attemptPath,
+				Status:      "needs-human",
+				ExitCode:    0,
+				LogBytes:    fileSize(logPath),
+				Attestation: &harvestAttestation,
+			}, nil
+		}
 		return Result{
 			OK:          false,
 			Issue:       opts.IssueNumber,
@@ -454,8 +572,107 @@ func buildCommitMessage(title string, issueNumber int) string {
 	return fmt.Sprintf("%s (closes #%d)", title, issueNumber)
 }
 
+func buildHarvestBranchName(issueNumber, attempt int) string {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return fmt.Sprintf("loop/issue-%d-retry-%d", issueNumber, attempt)
+}
+
+func buildHarvestCommitMessage(title string, issueNumber int) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "Harvest hung worker deliverable"
+	}
+	return fmt.Sprintf("Harvest: %s (refs #%d)", title, issueNumber)
+}
+
 func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
+}
+
+func buildHarvestPRTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "harvested worker deliverable"
+	}
+	return "needs-human: " + title + " (harvested from hung worker)"
+}
+
+func buildHarvestPRBody(issueNumber int, recoveryBrief, partialAttestation string) string {
+	return fmt.Sprintf(`Refs #%d
+Part of #%d
+
+NEEDS HUMAN: harvested from hung/killed worker - possibly incomplete.
+
+## Recovery brief
+
+%s
+
+## Hung worker partial attestation
+
+`+"```text"+`
+%s
+`+"```"+`
+`, issueNumber, issueNumber, strings.TrimSpace(recoveryBrief), strings.TrimSpace(partialAttestation))
+}
+
+func buildPartialWorkerAttestation(opts Options, result agent.Result) string {
+	var out strings.Builder
+	fmt.Fprintln(&out, "role: worker")
+	fmt.Fprintf(&out, "provider: %s\n", firstNonEmpty(opts.Provider, "unknown"))
+	fmt.Fprintf(&out, "model: %s\n", firstNonEmpty(result.Model, opts.Model, "unknown"))
+	fmt.Fprintf(&out, "effort: %s\n", firstNonEmpty(result.Effort, opts.Effort, "unknown"))
+	fmt.Fprintln(&out, "permission: write")
+	fmt.Fprintf(&out, "action: implement issue #%d\n", opts.IssueNumber)
+	fmt.Fprintf(&out, "exit_code: %d\n", result.ExitCode)
+	fmt.Fprintf(&out, "hung: true\n")
+	fmt.Fprintf(&out, "hung_reason: %s\n", firstNonEmpty(result.HungReason, "unknown"))
+	if strings.TrimSpace(result.StartedAt) != "" {
+		fmt.Fprintf(&out, "started_at: %s\n", result.StartedAt)
+	}
+	if strings.TrimSpace(result.EndedAt) != "" {
+		fmt.Fprintf(&out, "ended_at: %s\n", result.EndedAt)
+	}
+	if result.Usage.TotalTokens != nil {
+		fmt.Fprintf(&out, "total_tokens: %d\n", *result.Usage.TotalTokens)
+	}
+	return out.String()
+}
+
+func buildHarvestConductorAttestation(opts Options, result agent.Result, now time.Time) attestation.AttestationRecord {
+	totalTokens := int64(0)
+	timestamp := state.FormatTimestamp(now)
+	durationMS := result.DurationMS
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleConductor,
+		Provider:    firstNonEmpty(opts.Provider, "loopcoder"),
+		Model:       firstNonEmpty(opts.Model, result.Model, "loopcoder-harvest"),
+		ModelSource: attestation.ModelSourceSelfReported,
+		Effort:      firstNonEmpty(opts.Effort, result.Effort, "default"),
+		Permission:  attestation.PermissionOrchestrate,
+		Action:      fmt.Sprintf("harvest hung worker deliverable for issue #%d", opts.IssueNumber),
+		ExitCode:    0,
+		StartedAt:   firstNonEmpty(result.StartedAt, timestamp),
+		EndedAt:     firstNonEmpty(result.EndedAt, timestamp),
+		DurationMS:  durationMS,
+		Usage:       attestation.Usage{TotalTokens: &totalTokens},
+		Verified:    false,
+	}
+}
+
+func openHeadPR(ctx context.Context, github GitHubClient, branch string) (*gh.PullRequestReference, error) {
+	prs, err := github.ListHeadPRs(ctx, branch)
+	if err != nil {
+		return nil, err
+	}
+	if len(prs) == 0 {
+		return nil, nil
+	}
+	return &prs[0], nil
 }
 
 func workerHungError(provider, reason, logPath string) string {
