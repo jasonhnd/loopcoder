@@ -809,6 +809,57 @@ func TestRecoverLoopReviewPassStopsMidLoop(t *testing.T) {
 	}
 }
 
+func TestRecoverBlocksNeedsHumanDispatchResultWithoutReview(t *testing.T) {
+	repo := t.TempDir()
+	reviewCalls := 0
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:         repo,
+		IssueNumber:      103,
+		IssueTitle:       "Implement recover",
+		RunID:            "run-test",
+		MaxAttempts:      3,
+		BackoffSeconds:   []int{0},
+		VerifierProvider: "claude",
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			return DispatchResult{
+				OK:          true,
+				Issue:       103,
+				Branch:      "loop/issue-103-retry-1",
+				PR:          "https://github.com/owner/repo/pull/103",
+				Status:      guardrails.StatusNeedsHuman,
+				Summary:     "harvested from hung/killed worker - possibly incomplete",
+				Attestation: recoverAttestation(103, 321),
+			}, nil
+		},
+		Review: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			reviewCalls++
+			return loopreview.Result{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
+	}
+	if reviewCalls != 0 {
+		t.Fatalf("review calls = %d, want 0 for needs-human dispatch result", reviewCalls)
+	}
+	if result.DispatchResult == nil || result.DispatchResult.Status != guardrails.StatusNeedsHuman {
+		t.Fatalf("dispatch result = %#v", result.DispatchResult)
+	}
+	if len(result.RecoveryAttempts) != 1 || result.RecoveryAttempts[0].Status != guardrails.StatusNeedsHuman {
+		t.Fatalf("recovery attempts = %#v, want needs-human", result.RecoveryAttempts)
+	}
+	if !strings.Contains(result.Report, "BLOCKED: recovery review needs-human") ||
+		!strings.Contains(result.Report, "harvested from hung/killed worker") {
+		t.Fatalf("report missing needs-human harvest evidence:\n%s", result.Report)
+	}
+}
+
 func TestRecoverRetryErrorPreservesPartialDispatchAttestation(t *testing.T) {
 	repo := t.TempDir()
 

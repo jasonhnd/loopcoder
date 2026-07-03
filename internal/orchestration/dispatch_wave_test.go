@@ -183,6 +183,39 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 	}
 }
 
+func TestDispatchWavePropagatesNeedsHumanDispatchResult(t *testing.T) {
+	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			1: {Number: 1, Title: "One"},
+		}},
+		RepoPath:      t.TempDir(),
+		RunID:         "run-test-wave",
+		IssueNumbers:  []int{1},
+		ThrottleLimit: 1,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(1), nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			result := waveWorkerResult(opts)
+			result.Status = DispatchWaveStatusNeedsHuman
+			result.PR = "https://github.com/owner/repo/pull/1"
+			result.Attestation = waveAttestation(opts.IssueNumber, 101)
+			return result, nil
+		},
+		LoadAttempts: noAttempts,
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+	if len(report.Results) != 1 {
+		t.Fatalf("result count = %d, want 1", len(report.Results))
+	}
+	got := report.Results[0]
+	if got.Status != DispatchWaveStatusNeedsHuman || got.PR != "https://github.com/owner/repo/pull/1" {
+		t.Fatalf("needs-human dispatch result = %#v", got)
+	}
+}
+
 func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
 	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
 		Reader: fakeReader{views: map[int]gh.Issue{

@@ -15,9 +15,10 @@ import (
 func TestClientRunsExpectedGitCommands(t *testing.T) {
 	runner := &fakeGitRunner{
 		outputs: map[string][]byte{
-			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}": []byte("abc123\n"),
-			"repo\x00show\x00origin/main:docs/specs/design.md":         []byte("# Design\n"),
-			"repo\x00status\x00--porcelain":                            []byte(" M file.go\n"),
+			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}":       []byte("abc123\n"),
+			"repo\x00show\x00origin/main:docs/specs/design.md":               []byte("# Design\n"),
+			"repo\x00status\x00--porcelain":                                  []byte(" M file.go\n"),
+			"wt\x00ls-remote\x00origin\x00refs/heads/loop/issue-101-retry-2": []byte("def456\trefs/heads/loop/issue-101-retry-2\n"),
 		},
 	}
 	client := NewWithRunner(runner)
@@ -74,6 +75,9 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	if err := client.PushUpstream(ctx, "wt", "loop/issue-101"); err != nil {
 		t.Fatalf("PushUpstream returned error: %v", err)
 	}
+	if err := client.PushUpstreamForceWithLease(ctx, "wt", "loop/issue-101-retry-2"); err != nil {
+		t.Fatalf("PushUpstreamForceWithLease returned error: %v", err)
+	}
 	if err := client.WorktreeRemove(ctx, "repo", "wt"); err != nil {
 		t.Fatalf("WorktreeRemove returned error: %v", err)
 	}
@@ -95,6 +99,8 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 		{"wt", "add", "-A"},
 		{"wt", "commit", "-m", "title (closes #101)"},
 		{"wt", "push", "-u", "origin", "loop/issue-101"},
+		{"wt", "ls-remote", "origin", "refs/heads/loop/issue-101-retry-2"},
+		{"wt", "push", "--force-with-lease=refs/heads/loop/issue-101-retry-2:def456", "-u", "origin", "HEAD:refs/heads/loop/issue-101-retry-2"},
 		{"repo", "worktree", "remove", "--force", "wt"},
 		{"repo", "branch", "-D", "loop/issue-101"},
 	}

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -431,11 +432,12 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	}
 }
 
-func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
+func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoAttestation(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
-	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGit := &workerFakeGit{}
+	fakeGitHub := &workerFakeGitHub{}
 	fakeAgent := &workerFakeAgent{
 		resultSet: true,
 		result: agent.Result{
@@ -456,7 +458,7 @@ func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
 	}, Deps{
 		Git: fakeGit,
 		GitHub: func(string) GitHubClient {
-			return &workerFakeGitHub{}
+			return fakeGitHub
 		},
 		AgentLookup: func(provider string) (agent.Runner, error) {
 			return fakeAgent, nil
@@ -478,6 +480,12 @@ func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
 	}
 	if result.Status != "hung" || result.OK || result.Attestation != nil {
 		t.Fatalf("hung result = %#v, want status hung, not ok, no attestation", result)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
+		t.Fatalf("hung empty worktree made harvest git calls: add=%d commit=%d push=%d forcePush=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
+	}
+	if fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("CreatePR calls = %d, want 0", fakeGitHub.createPRCalls)
 	}
 	for _, want := range []string{"exec hung", "reason=hung", "hung_reason=stall"} {
 		if !strings.Contains(err.Error(), want) {
@@ -516,6 +524,250 @@ func TestDispatchHungWritesHungStateAndNoAttestation(t *testing.T) {
 		if !strings.Contains(string(events), want) {
 			t.Fatalf("events missing %q:\n%s", want, string(events))
 		}
+	}
+}
+
+func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n?? new.go\n"}
+	totalTokens := int64(77)
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+			Model:      "gpt-worker",
+			Effort:     "high",
+			Usage: attestation.Usage{
+				TotalTokens: &totalTokens,
+			},
+			StartedAt:  "2026-06-28T00:00:00Z",
+			EndedAt:    "2026-06-28T00:02:00Z",
+			DurationMS: 120000,
+		},
+		log: "provider stopped producing output\nlast useful log line\n",
+	}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Attempt:     2,
+		Branch:      "loop/issue-101-retry-2",
+		Provider:    "codex",
+		Model:       "gpt-conductor",
+		Effort:      "xhigh",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if !result.OK || result.Status != "needs-human" || result.Branch != "loop/issue-101-retry-2" || result.PR != "https://github.com/owner/repo/pull/101" {
+		t.Fatalf("harvest result = %#v", result)
+	}
+	if result.Attestation == nil {
+		t.Fatal("harvest result missing attestation")
+	}
+	if result.Attestation.Role != attestation.RoleConductor || result.Attestation.Permission != attestation.PermissionOrchestrate || result.Attestation.Verified {
+		t.Fatalf("harvest attestation = %#v, want unverified conductor orchestrate", result.Attestation)
+	}
+	if err := result.Attestation.Validate(); err != nil {
+		t.Fatalf("harvest attestation does not validate: %v", err)
+	}
+	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 1 {
+		t.Fatalf("harvest git calls add=%d commit=%d push=%d forcePush=%d, want add/commit/force only", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
+	}
+	if fakeGit.lastForcePushBranch != "loop/issue-101-retry-2" {
+		t.Fatalf("force push branch = %q", fakeGit.lastForcePushBranch)
+	}
+	if strings.Contains(strings.ToLower(fakeGit.lastCommitMessage), "closes") || !strings.Contains(fakeGit.lastCommitMessage, "Harvest issue #101 from hung worker") {
+		t.Fatalf("harvest commit message = %q", fakeGit.lastCommitMessage)
+	}
+	if fakeGitHub.createPRCalls != 1 || fakeGitHub.lastPRHead != "loop/issue-101-retry-2" || fakeGitHub.lastPRBase != "main" {
+		t.Fatalf("CreatePR calls/head/base = %d/%q/%q", fakeGitHub.createPRCalls, fakeGitHub.lastPRHead, fakeGitHub.lastPRBase)
+	}
+	for _, want := range []string{
+		"Refs #101",
+		"Part of #101",
+		"needs-human",
+		"harvested from a hung/killed worker",
+		"possibly incomplete",
+		"## Recovery brief",
+		" M file.go",
+		"?? new.go",
+		"last useful log line",
+		"## Hung worker partial attestation",
+		"role=worker",
+		"provider=codex",
+		"model=gpt-worker",
+		"total_tokens=77",
+	} {
+		if !strings.Contains(fakeGitHub.lastPRBody, want) {
+			t.Fatalf("harvest PR body missing %q:\n%s", want, fakeGitHub.lastPRBody)
+		}
+	}
+	for _, forbidden := range []string{"Closes #101", "closes #101", `"role":"worker"`} {
+		if strings.Contains(fakeGitHub.lastPRBody, forbidden) {
+			t.Fatalf("harvest PR body contains forbidden %q:\n%s", forbidden, fakeGitHub.lastPRBody)
+		}
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("LoadAttempts returned %d attempts, want 1", len(attempts))
+	}
+	got := attempts[0]
+	if got.Status != "needs-human" || got.Branch != "loop/issue-101-retry-2" {
+		t.Fatalf("harvest attempt = %#v, want needs-human retry branch", got)
+	}
+	if got.Attestation == nil || got.Attestation.Role != attestation.RoleConductor {
+		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Attestation)
+	}
+}
+
+func TestDispatchHungHarvestUsesForceWithLeaseForPreExistingRemoteBranch(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n", remoteBranchExists: true}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "hung\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Attempt:     2,
+		Provider:    "codex",
+		Stderr:      io.Discard,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if fakeGit.forcePushCalls != 1 || !fakeGit.remoteBranchExists {
+		t.Fatalf("force-with-lease path not exercised: calls=%d remoteExists=%v", fakeGit.forcePushCalls, fakeGit.remoteBranchExists)
+	}
+}
+
+func TestDispatchHungHarvestNoOpsWhenHarvestPRExistsForDifferentAttempt(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "hung\n",
+	}
+	fakeGitHub := &workerFakeGitHub{
+		openPRs: []gh.PullRequest{{
+			Number:      77,
+			Title:       "[needs-human] Harvested issue #101 from hung/killed worker",
+			URL:         "https://github.com/owner/repo/pull/77",
+			HeadRefName: "loop/issue-101-retry-1",
+		}},
+	}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Attempt:     3,
+		Provider:    "codex",
+		Stderr:      io.Discard,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if result.Status != "needs-human" || result.PR != "https://github.com/owner/repo/pull/77" || result.Branch != "loop/issue-101-retry-1" {
+		t.Fatalf("idempotent harvest result = %#v", result)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.forcePushCalls != 0 || fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("idempotent harvest made calls add=%d commit=%d force=%d createPR=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.forcePushCalls, fakeGitHub.createPRCalls)
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != "needs-human" || attempts[0].Branch != "loop/issue-101-retry-1" {
+		t.Fatalf("idempotent harvest attempt = %#v", attempts)
 	}
 }
 
@@ -638,13 +890,16 @@ func assertNoAttestationFootprint(t *testing.T, surface, text string, record att
 }
 
 type workerFakeGit struct {
-	status            string
-	err               error
-	worktreeSetup     func(worktreePath string) error
-	addAllCalls       int
-	commitCalls       int
-	pushCalls         int
-	lastCommitMessage string
+	status              string
+	err                 error
+	worktreeSetup       func(worktreePath string) error
+	remoteBranchExists  bool
+	addAllCalls         int
+	commitCalls         int
+	pushCalls           int
+	forcePushCalls      int
+	lastCommitMessage   string
+	lastForcePushBranch string
 }
 
 func (f *workerFakeGit) FetchOriginBase(context.Context, string, string) error {
@@ -688,6 +943,15 @@ func (f *workerFakeGit) Commit(_ context.Context, _, message string) error {
 
 func (f *workerFakeGit) PushUpstream(context.Context, string, string) error {
 	f.pushCalls++
+	if f.remoteBranchExists {
+		return os.ErrExist
+	}
+	return f.err
+}
+
+func (f *workerFakeGit) PushUpstreamForceWithLease(_ context.Context, _, branch string) error {
+	f.forcePushCalls++
+	f.lastForcePushBranch = branch
 	return f.err
 }
 
@@ -698,8 +962,12 @@ func (f *workerFakeGit) BranchDelete(context.Context, string, string) error {
 type workerFakeGitHub struct {
 	prURL         string
 	prs           []gh.PullRequestReference
+	openPRs       []gh.PullRequest
 	err           error
 	createPRCalls int
+	lastPRHead    string
+	lastPRBase    string
+	lastPRTitle   string
 	lastPRBody    string
 }
 
@@ -710,11 +978,14 @@ func (f *workerFakeGitHub) RepoName(context.Context) (string, error) {
 	return "owner/repo", nil
 }
 
-func (f *workerFakeGitHub) CreatePR(_ context.Context, _, _, _, body string) (string, error) {
+func (f *workerFakeGitHub) CreatePR(_ context.Context, head, base, title, body string) (string, error) {
 	f.createPRCalls++
 	if f.err != nil {
 		return "", f.err
 	}
+	f.lastPRHead = head
+	f.lastPRBase = base
+	f.lastPRTitle = title
 	f.lastPRBody = body
 	if f.prURL == "" {
 		return "https://github.com/owner/repo/pull/1", nil
@@ -727,6 +998,13 @@ func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullReques
 		return nil, f.err
 	}
 	return f.prs, nil
+}
+
+func (f *workerFakeGitHub) ListOpenPRs(context.Context) ([]gh.PullRequest, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.openPRs, nil
 }
 
 type workerFakeAgent struct {
