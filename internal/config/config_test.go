@@ -24,11 +24,11 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	if cfg.Resilience.Worker.HeartbeatIntervalSeconds != 15 {
 		t.Fatalf("HeartbeatIntervalSeconds = %d, want 15", cfg.Resilience.Worker.HeartbeatIntervalSeconds)
 	}
-	if cfg.Resilience.Worker.StaleAfterSeconds != 120 {
-		t.Fatalf("StaleAfterSeconds = %d, want 120", cfg.Resilience.Worker.StaleAfterSeconds)
+	if cfg.Resilience.Worker.StaleAfterSeconds != 300 {
+		t.Fatalf("StaleAfterSeconds = %d, want 300", cfg.Resilience.Worker.StaleAfterSeconds)
 	}
-	if cfg.Resilience.Worker.HungAfterSeconds != 300 {
-		t.Fatalf("HungAfterSeconds = %d, want 300", cfg.Resilience.Worker.HungAfterSeconds)
+	if cfg.Resilience.Worker.HungAfterSeconds != 900 {
+		t.Fatalf("HungAfterSeconds = %d, want 900", cfg.Resilience.Worker.HungAfterSeconds)
 	}
 	if cfg.Resilience.Worker.MaxAttempts != 3 {
 		t.Fatalf("MaxAttempts = %d, want 3", cfg.Resilience.Worker.MaxAttempts)

@@ -117,6 +117,72 @@ func TestRunSteadyLogGrowthDoesNotStall(t *testing.T) {
 	}
 }
 
+func TestRunWorktreeActivityExtendsStallWindow(t *testing.T) {
+	tests := []struct {
+		name         string
+		command      func(t *testing.T, worktreePath string) *exec.Cmd
+		stallTimeout time.Duration
+		wantOutcome  Outcome
+		wantKilled   bool
+	}{
+		{
+			name: "worktree file mtime advances without log growth",
+			command: func(t *testing.T, worktreePath string) *exec.Cmd {
+				return helperCommand(t, "touch-loop", filepath.Join(worktreePath, "artifact.txt"), "200ms", "15", "0")
+			},
+			stallTimeout: 2 * time.Second,
+			wantOutcome:  OutcomeCompleted,
+		},
+		{
+			name: "silent with no log or worktree mtime growth",
+			command: func(t *testing.T, _ string) *exec.Cmd {
+				return helperCommand(t, "sleep", "2s")
+			},
+			stallTimeout: 300 * time.Millisecond,
+			wantOutcome:  OutcomeStalled,
+			wantKilled:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "worker.log")
+			worktreePath := filepath.Join(dir, "wt")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatalf("MkdirAll worktree: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(worktreePath, "artifact.txt"), []byte("initial\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile worktree artifact: %v", err)
+			}
+			if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+				t.Fatalf("WriteFile log: %v", err)
+			}
+
+			result, err := Run(context.Background(), tt.command(t, worktreePath), Options{
+				HardCap:      10 * time.Second,
+				StallTimeout: tt.stallTimeout,
+				LogPath:      logPath,
+				WorktreePath: worktreePath,
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			if result.Outcome != tt.wantOutcome {
+				t.Fatalf("Outcome = %v, want %v", result.Outcome, tt.wantOutcome)
+			}
+			if result.Killed != tt.wantKilled {
+				t.Fatalf("Killed = %v, want %v", result.Killed, tt.wantKilled)
+			}
+			if info, err := os.Stat(logPath); err != nil {
+				t.Fatalf("Stat log: %v", err)
+			} else if info.Size() != 0 {
+				t.Fatalf("log size = %d, want 0 to prove liveness did not come from log growth", info.Size())
+			}
+		})
+	}
+}
+
 func TestRunStallTimeoutZeroDisablesStallDetection(t *testing.T) {
 	cmd := helperCommand(t, "sleep-exit", "80ms", "0")
 
@@ -267,6 +333,16 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "touch-loop":
+		filePath := args[0]
+		interval := parseDuration(args[1])
+		count := parseInt(args[2])
+		code := parseInt(args[3])
+		for i := 0; i < count; i++ {
+			touchFileWithAdvancedMtime(filePath, i)
+			time.Sleep(interval)
+		}
+		os.Exit(code)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
@@ -325,6 +401,22 @@ func appendLog(path, line string) {
 	}
 	if err := f.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "close log: %v\n", err)
+		os.Exit(2)
+	}
+}
+
+func touchFileWithAdvancedMtime(path string, index int) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir worktree dir: %v\n", err)
+		os.Exit(2)
+	}
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("touch %d\n", index)), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write worktree file: %v\n", err)
+		os.Exit(2)
+	}
+	advanced := time.Now().Add(time.Duration(index+1) * time.Second)
+	if err := os.Chtimes(path, advanced, advanced); err != nil {
+		fmt.Fprintf(os.Stderr, "chtimes worktree file: %v\n", err)
 		os.Exit(2)
 	}
 }

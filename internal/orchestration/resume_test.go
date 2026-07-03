@@ -98,7 +98,7 @@ func TestComputeResumeClassifiesGitHubPRAndLocalState(t *testing.T) {
 				Attempt:        1,
 				Status:         "running",
 				HeartbeatAt:    "2026-06-26T11:59:55Z",
-				LastProgressAt: "2026-06-26T11:57:00Z",
+				LastProgressAt: "2026-06-26T11:54:00Z",
 				Branch:         "loop/issue-9",
 			},
 			{
@@ -106,7 +106,7 @@ func TestComputeResumeClassifiesGitHubPRAndLocalState(t *testing.T) {
 				Issue:          10,
 				Attempt:        1,
 				Status:         "running",
-				LastProgressAt: "2026-06-26T11:50:00Z",
+				LastProgressAt: "2026-06-26T11:40:00Z",
 				Branch:         "loop/issue-10",
 			},
 			{

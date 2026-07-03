@@ -394,7 +394,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --worker-effort string           optional worker reasoning effort override for this pass")
 		fmt.Fprintln(w, "  --verifier-model string          optional verifier model override for this pass")
 		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
-		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 20m0s)")
 		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
@@ -452,7 +452,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-provider string      optional verifier provider for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-model string         optional verifier model override for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-effort string        optional verifier effort override for recovered PRs")
-		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
+		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 20m0s)")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -461,7 +461,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
-		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 20m0s)")
 		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty            suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
 	}

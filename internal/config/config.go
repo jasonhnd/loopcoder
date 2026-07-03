@@ -193,16 +193,16 @@ func Default() Config {
 		Resilience: Resilience{
 			Worker: ResilienceWorker{
 				HeartbeatIntervalSeconds: 15,
-				StaleAfterSeconds:        120,
-				HungAfterSeconds:         300,
+				StaleAfterSeconds:        300,
+				HungAfterSeconds:         900,
 				MaxAttempts:              3,
 				RetryBackoffSeconds:      []int{10, 30, 120},
-				HardCapSeconds:           1800,
-				StallTimeoutSeconds:      120,
+				HardCapSeconds:           2700,
+				StallTimeoutSeconds:      300,
 			},
 			Verifier: ResilienceVerifier{
-				HardCapSeconds:      600,
-				StallTimeoutSeconds: 120,
+				HardCapSeconds:      1200,
+				StallTimeoutSeconds: 300,
 			},
 		},
 		Environment: Environment{

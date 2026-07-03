@@ -25,6 +25,7 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			worktreePath := t.TempDir()
 			restore := stubRunSupervised(t, func(_ context.Context, _ *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {
 				if opts.HardCap != 123*time.Millisecond {
 					t.Fatalf("HardCap = %s, want 123ms", opts.HardCap)
@@ -35,12 +36,15 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 				if opts.LogPath == "" {
 					t.Fatal("LogPath was empty")
 				}
+				if opts.WorktreePath != worktreePath {
+					t.Fatalf("WorktreePath = %q, want %q", opts.WorktreePath, worktreePath)
+				}
 				return supervisedexec.Result{Outcome: tt.outcome, Killed: true}, nil
 			})
 			defer restore()
 
 			result, err := tt.runner.Run(context.Background(), Invocation{
-				WorktreePath: t.TempDir(),
+				WorktreePath: worktreePath,
 				Prompt:       "do work",
 				LogPath:      filepath.Join(t.TempDir(), "provider.log"),
 				HardCap:      123 * time.Millisecond,
