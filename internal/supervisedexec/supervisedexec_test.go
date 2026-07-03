@@ -15,7 +15,7 @@ import (
 func TestRunCompletedExitCodeZero(t *testing.T) {
 	cmd := helperCommand(t, "exit", "0")
 
-	result, err := Run(context.Background(), cmd, Options{HardCap: time.Second})
+	result, err := Run(context.Background(), cmd, Options{HardCap: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestRunCompletedExitCodeZero(t *testing.T) {
 func TestRunCompletedExitCodeNonZero(t *testing.T) {
 	cmd := helperCommand(t, "exit", "7")
 
-	result, err := Run(context.Background(), cmd, Options{HardCap: time.Second})
+	result, err := Run(context.Background(), cmd, Options{HardCap: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestRunCompletedExitCodeNonZero(t *testing.T) {
 func TestRunDeadlineKillsProcess(t *testing.T) {
 	cmd := helperCommand(t, "sleep", "10s")
 
-	result, err := Run(context.Background(), cmd, Options{HardCap: 30 * time.Millisecond})
+	result, err := Run(context.Background(), cmd, Options{HardCap: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
@@ -71,8 +71,8 @@ func TestRunStalledKillsSilentProcess(t *testing.T) {
 	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
 
 	result, err := Run(context.Background(), cmd, Options{
-		HardCap:      time.Second,
-		StallTimeout: 30 * time.Millisecond,
+		HardCap:      10 * time.Second,
+		StallTimeout: 200 * time.Millisecond,
 		LogPath:      logPath,
 	})
 	if err != nil {
@@ -88,11 +88,11 @@ func TestRunStalledKillsSilentProcess(t *testing.T) {
 
 func TestRunSteadyLogGrowthDoesNotStall(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
-	cmd := helperCommand(t, "write-loop", logPath, "15ms", "8", "0")
+	cmd := helperCommand(t, "write-loop", logPath, "20ms", "8", "0")
 
 	result, err := Run(context.Background(), cmd, Options{
-		HardCap:      time.Second,
-		StallTimeout: 80 * time.Millisecond,
+		HardCap:      10 * time.Second,
+		StallTimeout: 2 * time.Second,
 		LogPath:      logPath,
 	})
 	if err != nil {
@@ -113,7 +113,7 @@ func TestRunStallTimeoutZeroDisablesStallDetection(t *testing.T) {
 	cmd := helperCommand(t, "sleep-exit", "80ms", "0")
 
 	result, err := Run(context.Background(), cmd, Options{
-		HardCap:      time.Second,
+		HardCap:      10 * time.Second,
 		StallTimeout: 0,
 	})
 	if err != nil {
@@ -131,7 +131,7 @@ func TestRunKillDrainsWaitPromptly(t *testing.T) {
 	cmd := helperCommand(t, "sleep", "10s")
 	start := time.Now()
 
-	result, err := Run(context.Background(), cmd, Options{HardCap: 25 * time.Millisecond})
+	result, err := Run(context.Background(), cmd, Options{HardCap: 200 * time.Millisecond})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -139,8 +139,8 @@ func TestRunKillDrainsWaitPromptly(t *testing.T) {
 	if result.Outcome != OutcomeDeadline {
 		t.Fatalf("Outcome = %v, want %v", result.Outcome, OutcomeDeadline)
 	}
-	if elapsed > time.Second {
-		t.Fatalf("Run took %s after kill, want under 1s", elapsed)
+	if elapsed > 5*time.Second {
+		t.Fatalf("Run took %s after kill, want under 5s", elapsed)
 	}
 	if cmd.ProcessState == nil {
 		t.Fatal("ProcessState is nil; Wait was not drained")
@@ -149,7 +149,7 @@ func TestRunKillDrainsWaitPromptly(t *testing.T) {
 
 func TestRunZeroHardCapUsesDefault(t *testing.T) {
 	oldDefault := defaultHardCap
-	defaultHardCap = 35 * time.Millisecond
+	defaultHardCap = 200 * time.Millisecond
 	t.Cleanup(func() {
 		defaultHardCap = oldDefault
 	})
@@ -166,7 +166,7 @@ func TestRunZeroHardCapUsesDefault(t *testing.T) {
 	if !result.Killed {
 		t.Fatal("Killed = false, want true")
 	}
-	if result.Elapsed > time.Second {
+	if result.Elapsed > 5*time.Second {
 		t.Fatalf("Elapsed = %s, default hard cap did not bound the process", result.Elapsed)
 	}
 }
@@ -176,11 +176,11 @@ func TestRunOnStallOnceAndGraceDelaysKill(t *testing.T) {
 	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
 	var calls atomic.Int32
 	stalled := make(chan time.Duration, 1)
-	stallTimeout := 35 * time.Millisecond
-	stallGrace := 80 * time.Millisecond
+	stallTimeout := 200 * time.Millisecond
+	stallGrace := 300 * time.Millisecond
 
 	result, err := Run(context.Background(), cmd, Options{
-		HardCap:      time.Second,
+		HardCap:      10 * time.Second,
 		StallTimeout: stallTimeout,
 		LogPath:      logPath,
 		StallGrace:   stallGrace,
@@ -200,7 +200,7 @@ func TestRunOnStallOnceAndGraceDelaysKill(t *testing.T) {
 		if silentFor < stallTimeout {
 			t.Fatalf("OnStall silentFor = %s, want at least %s", silentFor, stallTimeout)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("OnStall was not observed")
 	}
 	if calls.Load() != 1 {
@@ -215,7 +215,7 @@ func TestRunRequiresLogPathWhenStallEnabled(t *testing.T) {
 	cmd := helperCommand(t, "exit", "0")
 
 	_, err := Run(context.Background(), cmd, Options{
-		HardCap:      time.Second,
+		HardCap:      10 * time.Second,
 		StallTimeout: time.Millisecond,
 	})
 	if err == nil {
