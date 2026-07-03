@@ -87,25 +87,33 @@ func TestRunStalledKillsSilentProcess(t *testing.T) {
 }
 
 func TestRunSteadyLogGrowthDoesNotStall(t *testing.T) {
+	// The process must stay alive across several stall polls (poll interval =
+	// StallTimeout/4, capped at 500ms) while the log keeps growing, so the
+	// growth-resets-lastProgress path is actually exercised. A quick process
+	// that exits before the first poll would not test it. Margins are generous
+	// (100ms writes vs a 3s stall timeout) to stay robust on a slow -race runner.
 	logPath := filepath.Join(t.TempDir(), "worker.log")
-	cmd := helperCommand(t, "write-loop", logPath, "20ms", "8", "0")
+	cmd := helperCommand(t, "write-loop", logPath, "100ms", "15", "0")
 
 	result, err := Run(context.Background(), cmd, Options{
-		HardCap:      10 * time.Second,
-		StallTimeout: 2 * time.Second,
+		HardCap:      30 * time.Second,
+		StallTimeout: 3 * time.Second,
 		LogPath:      logPath,
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if result.Outcome != OutcomeCompleted {
-		t.Fatalf("Outcome = %v, want %v", result.Outcome, OutcomeCompleted)
+		t.Fatalf("Outcome = %v, want %v (steady growth must not stall)", result.Outcome, OutcomeCompleted)
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
 	}
 	if result.Killed {
 		t.Fatal("Killed = true, want false")
+	}
+	if result.Elapsed < 500*time.Millisecond {
+		t.Fatalf("Elapsed = %s, want >= 500ms so at least one stall poll ran during growth", result.Elapsed)
 	}
 }
 

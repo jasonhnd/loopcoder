@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/kickback"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -214,32 +215,13 @@ func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]
 		if detail == "" {
 			detail = strings.TrimSpace(stdout.String())
 		}
-		err := commandExitError(cmd, result.ExitCode)
+		err := execresult.CommandExitError(cmd, result.ExitCode)
 		if detail != "" {
 			return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
 		}
 		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return stdout.Bytes(), nil
-}
-
-type exitStatusError struct {
-	code int
-}
-
-func (e exitStatusError) Error() string {
-	return fmt.Sprintf("exit status %d", e.code)
-}
-
-func (e exitStatusError) ExitCode() int {
-	return e.code
-}
-
-func commandExitError(cmd *exec.Cmd, code int) error {
-	if cmd.ProcessState != nil {
-		return &exec.ExitError{ProcessState: cmd.ProcessState}
-	}
-	return exitStatusError{code: code}
 }
 
 func (c *CLI) RepoName(ctx context.Context) (string, error) {

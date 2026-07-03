@@ -866,7 +866,9 @@ func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempt
 		StartedAt:           now,
 		FinishedAt:          now,
 	}
-	_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+	if err := deps.RecordAttempt(repoPath, opts.RunID, record); err != nil && opts.Stderr != nil {
+		fmt.Fprintf(opts.Stderr, "[loopcoder] warning: failed to record hung needs-human attempt for issue #%d: %v\n", opts.IssueNumber, err)
+	}
 	return record
 }
 

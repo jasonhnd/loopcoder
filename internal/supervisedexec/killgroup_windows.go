@@ -20,9 +20,14 @@ type windowsKillGroup struct {
 }
 
 func newKillGroup(runID string) killGroup {
-	_ = runID
 	g := &windowsKillGroup{}
-	job, err := windows.CreateJobObject(nil, nil)
+	var name *uint16
+	if runID != "" {
+		if n, err := windows.UTF16PtrFromString("loopcoder/" + runID); err == nil {
+			name = n
+		}
+	}
+	job, err := windows.CreateJobObject(nil, name)
 	if err != nil {
 		return g // job == 0: degrades to per-process kill
 	}

@@ -59,6 +59,11 @@ type logObservation struct {
 
 // Run starts cmd, supervises it, and waits until the process exits or is
 // terminated by the parent context, the hard cap, or the optional stall signal.
+//
+// On a setup error (a nil cmd, a missing LogPath when stall detection is
+// requested, or a failed cmd.Start) Run returns a non-nil error together with a
+// zero-value Result whose Outcome is OutcomeCompleted. Callers must therefore
+// check the returned error before interpreting Result.Outcome.
 func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	start := time.Now()
 	if ctx == nil {

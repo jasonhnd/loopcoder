@@ -21,8 +21,10 @@ var taskkillCommand = func(pid int) (string, []string) {
 	return "taskkill", []string{"/F", "/T", "/PID", strconv.Itoa(pid)}
 }
 
-// KillTree terminates pid and its whole descendant tree via `taskkill /T`, which
-// reaps children whose parent-chain has already broken (a plain kill does not).
+// KillTree terminates pid and its descendant tree via `taskkill /F /T`, which
+// walks the live parent-PID tree (best effort). Robust reaping of a subtree
+// whose parent-chain has already broken comes from the in-process Job Object's
+// kill-on-close (see internal/supervisedexec), not this out-of-process walk.
 func KillTree(pid int) error {
 	if pid <= 0 {
 		return nil

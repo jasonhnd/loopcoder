@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -396,26 +397,7 @@ func (execGitHubRunner) Run(ctx context.Context, dir string, args ...string) ([]
 		return output.Bytes(), fmt.Errorf("gh %s timed out after %s", strings.Join(args, " "), ghHardCap)
 	}
 	if result.ExitCode != 0 {
-		return output.Bytes(), commandExitError(cmd, result.ExitCode)
+		return output.Bytes(), execresult.CommandExitError(cmd, result.ExitCode)
 	}
 	return output.Bytes(), nil
-}
-
-type exitStatusError struct {
-	code int
-}
-
-func (e exitStatusError) Error() string {
-	return fmt.Sprintf("exit status %d", e.code)
-}
-
-func (e exitStatusError) ExitCode() int {
-	return e.code
-}
-
-func commandExitError(cmd *exec.Cmd, code int) error {
-	if cmd.ProcessState != nil {
-		return &exec.ExitError{ProcessState: cmd.ProcessState}
-	}
-	return exitStatusError{code: code}
 }

@@ -42,7 +42,12 @@ type managedRow struct {
 
 // loadManagedProcesses lists the live loopcoder-managed worker processes for a
 // repo by reading persisted attempt sidecars — never by scanning the machine or
-// matching a bare process name.
+// matching a bare process name. Identification is by tracked attempt PID
+// (status=="running" and still alive); it does not cross-check the live
+// process's LOOPCODER_MANAGED env, so after a crashed loopcoder OS PID reuse
+// could in theory misattribute a PID. This is the spec-sanctioned mechanism
+// (env cross-check is platform-uneven and out of scope) and is mitigated by
+// status tracking.
 func loadManagedProcesses(repoPath string) []managedRow {
 	var rows []managedRow
 	entries, err := os.ReadDir(state.RunsRoot(repoPath))
