@@ -1,10 +1,10 @@
 ---
 id: 423
 title: Operational reliability hardening (harvest-before-discard + honest signals)
-status: draft
+status: accepted
 date: 2026-07-03
 issue: 423
-pr: null
+pr: 424
 supersedes: []
 superseded_by: []
 ---
