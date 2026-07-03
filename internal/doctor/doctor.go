@@ -41,8 +41,9 @@ type BuildInfo struct {
 }
 
 type Options struct {
-	RepoPath  string
-	BuildInfo BuildInfo
+	RepoPath   string
+	BaseBranch string
+	BuildInfo  BuildInfo
 }
 
 type Deps struct {
@@ -122,9 +123,13 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	if repoPath == "" {
 		repoPath = "."
 	}
+	baseBranch := strings.TrimSpace(opts.BaseBranch)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
 	build := normalizeBuildInfo(opts.BuildInfo)
 
-	delivery := loadDelivery(repoPath, deps)
+	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
 	checks := make([]Check, 0, 10)
 
 	gitCheck, gitPresent := checkGit(deps)
@@ -269,12 +274,14 @@ func checkGH(ctx context.Context, deps Deps) (Check, bool) {
 }
 
 type deliveryState struct {
-	Path    string
-	Present bool
-	Valid   bool
-	Config  config.Config
-	Meta    deliveryMetadata
-	Err     error
+	Path        string
+	Present     bool
+	Valid       bool
+	BaseBranch  string
+	BasePresent bool
+	Config      config.Config
+	Meta        deliveryMetadata
+	Err         error
 }
 
 type deliveryMetadata struct {
@@ -282,49 +289,62 @@ type deliveryMetadata struct {
 	MinLoopcoderVersion string `yaml:"min_loopcoder_version"`
 }
 
-func loadDelivery(repoPath string, deps Deps) deliveryState {
+func loadDelivery(ctx context.Context, repoPath string, baseBranch string, deps Deps) deliveryState {
 	path := filepath.Join(repoPath, ".delivery.yml")
 	cfg, err := deps.LoadConfig(path)
 	if err != nil {
+		present := !errors.Is(err, os.ErrNotExist)
 		return deliveryState{
-			Path:    path,
-			Present: !errors.Is(err, os.ErrNotExist),
-			Valid:   false,
-			Config:  config.Default(),
-			Err:     err,
+			Path:        path,
+			Present:     present,
+			Valid:       false,
+			BaseBranch:  baseBranch,
+			BasePresent: !present && baseDeliveryConfigExists(ctx, repoPath, baseBranch, deps),
+			Config:      config.Default(),
+			Err:         err,
 		}
 	}
 	data, err := deps.ReadFile(path)
 	if err != nil {
 		return deliveryState{
-			Path:    path,
-			Present: true,
-			Valid:   false,
-			Config:  cfg,
-			Err:     fmt.Errorf("read delivery metadata: %w", err),
+			Path:       path,
+			Present:    true,
+			Valid:      false,
+			BaseBranch: baseBranch,
+			Config:     cfg,
+			Err:        fmt.Errorf("read delivery metadata: %w", err),
 		}
 	}
 	var meta deliveryMetadata
 	if err := yaml.Unmarshal(data, &meta); err != nil {
 		return deliveryState{
-			Path:    path,
-			Present: true,
-			Valid:   false,
-			Config:  cfg,
-			Err:     fmt.Errorf("parse delivery metadata: %w", err),
+			Path:       path,
+			Present:    true,
+			Valid:      false,
+			BaseBranch: baseBranch,
+			Config:     cfg,
+			Err:        fmt.Errorf("parse delivery metadata: %w", err),
 		}
 	}
 	return deliveryState{
-		Path:    path,
-		Present: true,
-		Valid:   true,
-		Config:  cfg,
-		Meta:    meta,
+		Path:       path,
+		Present:    true,
+		Valid:      true,
+		BaseBranch: baseBranch,
+		Config:     cfg,
+		Meta:       meta,
 	}
 }
 
 func checkDeliveryConfig(delivery deliveryState) Check {
 	if !delivery.Present {
+		if delivery.BasePresent {
+			return Check{
+				Name:    ".delivery.yml",
+				Status:  StatusWarn,
+				Message: fmt.Sprintf("absent from working tree but present on %s; run from base or use --config-from-base", delivery.BaseBranch),
+			}
+		}
 		return Check{
 			Name:    ".delivery.yml",
 			Status:  StatusWarn,
@@ -343,6 +363,11 @@ func checkDeliveryConfig(delivery deliveryState) Check {
 		Status:  StatusOK,
 		Message: "present and valid",
 	}
+}
+
+func baseDeliveryConfigExists(ctx context.Context, repoPath string, baseBranch string, deps Deps) bool {
+	result, err := deps.RunCommand(ctx, repoPath, "git", "show", strings.TrimSpace(baseBranch)+":.delivery.yml")
+	return err == nil && result.ExitCode == 0
 }
 
 type providerSpec struct {

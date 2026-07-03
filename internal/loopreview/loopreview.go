@@ -45,14 +45,15 @@ const (
 )
 
 type Options struct {
-	RepoPath   string
-	PRNumber   int
-	Provider   string
-	Model      string
-	Effort     string
-	BaseBranch string
-	Timeout    time.Duration
-	Stderr     io.Writer
+	RepoPath       string
+	PRNumber       int
+	Provider       string
+	Model          string
+	Effort         string
+	BaseBranch     string
+	ConfigFromBase bool
+	Timeout        time.Duration
+	Stderr         io.Writer
 }
 
 type Result struct {
@@ -165,7 +166,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	resilience := config.ResilienceForRepo(repoPath)
+	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = config.DurationSeconds(resilience.Verifier.HardCapSeconds, DefaultVerifierTimeout)
 	}

@@ -345,6 +345,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                 suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
@@ -368,7 +369,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --pretty                 render human-readable attestation instead of durable output")
 	}
 	if command.Name == "doctor" {
-		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
 	}
 	if command.Name == "init" {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
@@ -396,6 +398,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
 		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
 		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
+		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -407,6 +410,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
 		fmt.Fprintln(w, "  --max-iterations int             maximum tick firings before needs-human (goal-loop)")
 		fmt.Fprintln(w, "  --max_iterations int             alias for --max-iterations")
+		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -415,6 +419,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or \"pre-prod\")")
 		fmt.Fprintln(w, "  --run-id string            run id for the promote ledger (default generated)")
 		fmt.Fprintln(w, "  --kick-back string         item to revert out of pre-prod before promoting; repeatable")
+		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "upgrade" {
 		fmt.Fprintln(w, "  --version string   release version to install (default latest stable)")
@@ -425,6 +430,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
+		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "status" {
 		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
@@ -434,6 +440,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --base-branch string   base branch for branch and dependency reasoning (default \"main\")")
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
+		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
 		fmt.Fprintln(w, "  --repo string                   repository path (required)")
@@ -453,6 +460,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-model string         optional verifier model override for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-effort string        optional verifier effort override for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
+		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -461,6 +469,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
+		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
 		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty            suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
@@ -481,6 +490,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
+		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
@@ -589,14 +599,21 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var repoPath string
 	var repoAlias string
+	var baseBranch string
+	var baseBranchAlias string
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if repoAlias != "" {
 		repoPath = repoAlias
+	}
+	if baseBranchAlias != "" {
+		baseBranch = baseBranchAlias
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "doctor: unexpected argument %q\n", fs.Arg(0))
@@ -610,7 +627,8 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 
 	report := deps.Doctor(context.Background(), doctor.Options{
-		RepoPath: resolvedRepo,
+		RepoPath:   resolvedRepo,
+		BaseBranch: baseBranch,
 		BuildInfo: doctor.BuildInfo{
 			Version: deps.BuildInfo.Version,
 			Commit:  deps.BuildInfo.Commit,
@@ -889,6 +907,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var verifierTimeoutAlias time.Duration
 	var throttleLimit int
 	var throttleLimitAlias int
+	var configFromBase bool
+	var configFromBaseAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -918,6 +938,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
 	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
@@ -968,6 +990,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if throttleLimitAlias != 0 {
 		throttleLimit = throttleLimitAlias
 	}
+	configFromBase = configFromBase || configFromBaseAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 
@@ -993,7 +1016,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 2
 	}
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 1
@@ -1049,6 +1072,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		WorkerProvider:     workerProvider,
 		WorkerModel:        workerModel,
 		WorkerEffort:       workerEffort,
+		ConfigFromBase:     configFromBase,
 		VerifierProvider:   verifierProvider,
 		VerifierModel:      verifierModel,
 		VerifierEffort:     verifierEffort,
@@ -1160,6 +1184,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var maxIterations int
 	var maxIterationsAlias int
 	var maxIterationsSnakeAlias int
+	var configFromBase bool
+	var configFromBaseAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -1176,6 +1202,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&maxIterations, "max-iterations", 0, "max iterations")
 	fs.IntVar(&maxIterationsSnakeAlias, "max_iterations", 0, "max iterations")
 	fs.IntVar(&maxIterationsAlias, "MaxIterations", 0, "max iterations")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
@@ -1202,6 +1230,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if maxIterationsAlias != 0 {
 		maxIterations = maxIterationsAlias
 	}
+	configFromBase = configFromBase || configFromBaseAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 
@@ -1242,12 +1271,12 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 2
 	}
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, "main", configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 1
 	}
-	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg)
+	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg, configFromBase)
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   tickOptions.WorkerProvider,
 		Verifier: tickOptions.VerifierProvider,
@@ -1293,7 +1322,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return orchestration.TriggerExitCode(triggerReport)
 }
 
-func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config) orchestration.TickOptions {
+func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config, configFromBase bool) orchestration.TickOptions {
 	baseBranch := strings.TrimSpace(cfg.Worker.BaseBranch)
 	if baseBranch == "" {
 		baseBranch = "main"
@@ -1311,6 +1340,7 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		WorkerProvider:     strings.TrimSpace(cfg.Adapters.Worker),
 		WorkerModel:        strings.TrimSpace(cfg.Worker.Model),
 		WorkerEffort:       strings.TrimSpace(cfg.Worker.ReasoningEffort),
+		ConfigFromBase:     configFromBase,
 		VerifierProvider:   strings.TrimSpace(cfg.Adapters.Verifier),
 		VerifierModel:      strings.TrimSpace(cfg.Verifier.Model),
 		VerifierEffort:     strings.TrimSpace(cfg.Verifier.ReasoningEffort),
@@ -1369,6 +1399,8 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var runIDAlias string
 	var kickBack repeatStringFlag
 	var kickBackAlias repeatStringFlag
+	var configFromBase bool
+	var configFromBaseAlias bool
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1378,6 +1410,8 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.Var(&kickBack, "kick-back", "kick-back item")
 	fs.Var(&kickBackAlias, "KickBack", "kick-back item")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1393,6 +1427,7 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 		runID = runIDAlias
 	}
 	kickBack = append(kickBack, kickBackAlias...)
+	configFromBase = configFromBase || configFromBaseAlias
 
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "promote: unexpected argument %q\n", fs.Arg(0))
@@ -1408,7 +1443,7 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
 		return 2
 	}
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, "main", configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
 		return 1
@@ -1963,6 +1998,8 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var outputFormatAlias string
 	var includeClosed bool
 	var includeClosedAlias bool
+	var configFromBase bool
+	var configFromBaseAlias bool
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1974,6 +2011,8 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 	fs.BoolVar(&includeClosed, "include-closed", false, "include closed issues")
 	fs.BoolVar(&includeClosedAlias, "IncludeClosed", false, "include closed issues")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1991,6 +2030,7 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 		outputFormat = outputFormatAlias
 	}
 	includeClosed = includeClosed || includeClosedAlias
+	configFromBase = configFromBase || configFromBaseAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "ready-set: --repo is required")
@@ -2009,11 +2049,8 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
-	if err == nil {
-		cfg = loaded
-	} else if !errors.Is(err, os.ErrNotExist) {
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
+	if err != nil {
 		fmt.Fprintf(stderr, "ready-set: %v\n", err)
 		return 1
 	}
@@ -2093,6 +2130,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var configFromBaseAlias bool
 	var keepWorktreeAlias bool
 	var pretty bool
 	var prettyAlias bool
@@ -2123,6 +2161,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
@@ -2171,6 +2211,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		opts.Effort = effortAlias
 	}
+	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -2196,7 +2237,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.RepoPath = resolvedRepo
 
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
@@ -2544,16 +2585,15 @@ func (f *repeatStringFlag) Set(value string) error {
 	return nil
 }
 
-func loadDeliveryConfig(repoPath string) (config.Config, error) {
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(repoPath, ".delivery.yml"))
-	if err == nil {
-		return loaded, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
-	}
-	return cfg, err
+func loadDeliveryConfig(repoPath string, baseBranch string, configFromBase bool) (config.Config, error) {
+	return loadDeliveryConfigWithOptions(repoPath, config.LoadOptions{
+		BaseBranch:     baseBranch,
+		ConfigFromBase: configFromBase,
+	})
+}
+
+func loadDeliveryConfigWithOptions(repoPath string, opts config.LoadOptions) (config.Config, error) {
+	return config.LoadForRepo(context.Background(), repoPath, opts)
 }
 
 func applyRoleModelEffort(model, effort string, modelFlagSet, effortFlagSet bool, roleModel, roleEffort string) (string, string) {
@@ -2608,6 +2648,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effort string
 	var effortAlias string
+	var configFromBase bool
+	var configFromBaseAlias bool
 	var throttleLimit int
 	var throttleLimitAlias int
 	var pretty bool
@@ -2633,6 +2675,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
@@ -2670,6 +2714,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		effort = effortAlias
 	}
+	configFromBase = configFromBase || configFromBaseAlias
 	if throttleLimitAlias != 0 {
 		throttleLimit = throttleLimitAlias
 	}
@@ -2737,7 +2782,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
 		return 1
@@ -2761,6 +2806,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Provider:        provider,
 		Model:           model,
 		Effort:          effort,
+		ConfigFromBase:  configFromBase,
 		ThrottleLimit:   throttleLimit,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
@@ -2824,6 +2870,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var configFromBaseAlias bool
 	var upgradedModelAlias string
 	var upgradedEffortAlias string
 	var verifierProviderAlias string
@@ -2853,6 +2900,8 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
 	fs.StringVar(&upgradedModelAlias, "UpgradedModel", "", "upgraded model")
 	fs.StringVar(&opts.UpgradedEffort, "upgraded-effort", "", "upgraded effort")
@@ -2906,6 +2955,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		opts.Effort = effortAlias
 	}
+	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	if upgradedModelAlias != "" {
 		opts.UpgradedModel = upgradedModelAlias
 	}
@@ -2957,7 +3007,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.RepoPath = resolvedRepo
 
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "recover: %v\n", err)
 		return 1
@@ -3019,6 +3069,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effortAlias string
 	var baseBranchAlias string
+	var configFromBaseAlias bool
 	var timeoutAlias time.Duration
 	var pretty bool
 	var prettyAlias bool
@@ -3037,6 +3088,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.DurationVar(&opts.Timeout, "timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "verifier timeout")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
@@ -3067,6 +3120,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias
 	}
+	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	if timeoutAlias != 0 {
 		opts.Timeout = timeoutAlias
 	}
@@ -3098,7 +3152,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.RepoPath = resolvedRepo
 	opts.Stderr = stderr
 
-	cfg, err := loadDeliveryConfig(resolvedRepo)
+	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return 1
@@ -3218,6 +3272,7 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Provider:        dispatchOpts.Provider,
 				Model:           dispatchOpts.Model,
 				Effort:          dispatchOpts.Effort,
+				ConfigFromBase:  dispatchOpts.ConfigFromBase,
 				Stderr:          dispatchOpts.Stderr,
 			})
 			return recovery.DispatchResult{
@@ -3351,6 +3406,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var baseBranchAlias string
 	var runID string
 	var runIDAlias string
+	var configFromBase bool
+	var configFromBaseAlias bool
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -3358,6 +3415,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
+	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3371,6 +3430,7 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if runIDAlias != "" {
 		runID = runIDAlias
 	}
+	configFromBase = configFromBase || configFromBaseAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "resume: --repo is required")
@@ -3383,11 +3443,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	cfg := config.Default()
-	loaded, err := config.Load(filepath.Join(resolvedRepo, ".delivery.yml"))
-	if err == nil {
-		cfg = loaded
-	} else if !errors.Is(err, os.ErrNotExist) {
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
+	if err != nil {
 		fmt.Fprintf(stderr, "resume: %v\n", err)
 		return 1
 	}

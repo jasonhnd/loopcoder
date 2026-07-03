@@ -1,6 +1,9 @@
 package config
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,8 +51,138 @@ func TestParseOverridesWatchdogThresholds(t *testing.T) {
 }
 
 func TestResilienceForRepoDefaultsWhenMissing(t *testing.T) {
-	r := ResilienceForRepo(t.TempDir())
+	r, err := ResilienceForRepo(context.Background(), t.TempDir(), LoadOptions{
+		BaseBranch: "main",
+		ShowBaseConfig: func(context.Context, string, string) ([]byte, error) {
+			return nil, errors.New("not found")
+		},
+	})
+	if err != nil {
+		t.Fatalf("ResilienceForRepo returned error: %v", err)
+	}
 	if r.Worker.HardCapSeconds != 1800 || r.Verifier.HardCapSeconds != 600 {
 		t.Fatalf("missing-config resilience = worker %d / verifier %d, want defaults", r.Worker.HardCapSeconds, r.Verifier.HardCapSeconds)
+	}
+}
+
+func TestLoadForRepoLoudConfigResolution(t *testing.T) {
+	baseConfig := []byte("version: 1\nworker:\n  base_branch: trunk\nresilience:\n  worker:\n    hard_cap_seconds: 42\n")
+	tests := []struct {
+		name           string
+		configFromBase bool
+		show           ShowBaseConfigFunc
+		wantErr        bool
+		wantBaseBranch string
+		wantHardCap    int
+	}{
+		{
+			name: "cwd lacks and base has errors loud",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantErr: true,
+		},
+		{
+			name:           "config-from-base reads base config",
+			configFromBase: true,
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantBaseBranch: "trunk",
+			wantHardCap:    42,
+		},
+		{
+			name: "no config anywhere uses defaults",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return nil, errors.New("not found")
+			},
+			wantHardCap: 1800,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadForRepo(context.Background(), t.TempDir(), LoadOptions{
+				BaseBranch:     "main",
+				ConfigFromBase: tt.configFromBase,
+				ShowBaseConfig: tt.show,
+			})
+			if tt.wantErr {
+				var mismatch ConfigMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Fatalf("err = %v, want ConfigMismatchError", err)
+				}
+				if !strings.Contains(err.Error(), "probably the wrong branch") || !strings.Contains(err.Error(), "--config-from-base") {
+					t.Fatalf("mismatch error message = %q", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadForRepo returned error: %v", err)
+			}
+			if tt.wantBaseBranch != "" && cfg.Worker.BaseBranch != tt.wantBaseBranch {
+				t.Fatalf("Worker.BaseBranch = %q, want %q", cfg.Worker.BaseBranch, tt.wantBaseBranch)
+			}
+			if cfg.Resilience.Worker.HardCapSeconds != tt.wantHardCap {
+				t.Fatalf("worker hard cap = %d, want %d", cfg.Resilience.Worker.HardCapSeconds, tt.wantHardCap)
+			}
+		})
+	}
+}
+
+func TestResilienceForRepoLoudConfigResolution(t *testing.T) {
+	baseConfig := []byte("version: 1\nresilience:\n  verifier:\n    hard_cap_seconds: 44\n")
+	tests := []struct {
+		name           string
+		configFromBase bool
+		show           ShowBaseConfigFunc
+		wantErr        bool
+		wantHardCap    int
+	}{
+		{
+			name: "cwd lacks and base has errors loud",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantErr: true,
+		},
+		{
+			name:           "config-from-base reads base resilience",
+			configFromBase: true,
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantHardCap: 44,
+		},
+		{
+			name: "no config anywhere uses defaults",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return nil, errors.New("not found")
+			},
+			wantHardCap: 600,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resilience, err := ResilienceForRepo(context.Background(), t.TempDir(), LoadOptions{
+				BaseBranch:     "main",
+				ConfigFromBase: tt.configFromBase,
+				ShowBaseConfig: tt.show,
+			})
+			if tt.wantErr {
+				var mismatch ConfigMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Fatalf("err = %v, want ConfigMismatchError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResilienceForRepo returned error: %v", err)
+			}
+			if resilience.Verifier.HardCapSeconds != tt.wantHardCap {
+				t.Fatalf("verifier hard cap = %d, want %d", resilience.Verifier.HardCapSeconds, tt.wantHardCap)
+			}
+		})
 	}
 }

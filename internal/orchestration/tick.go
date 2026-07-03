@@ -73,6 +73,7 @@ type TickOptions struct {
 	WorkerProvider         string
 	WorkerModel            string
 	WorkerEffort           string
+	ConfigFromBase         bool
 	VerifierProvider       string
 	VerifierModel          string
 	VerifierEffort         string
@@ -381,6 +382,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		Provider:        opts.WorkerProvider,
 		Model:           opts.WorkerModel,
 		Effort:          opts.WorkerEffort,
+		ConfigFromBase:  opts.ConfigFromBase,
 		ThrottleLimit:   opts.ThrottleLimit,
 		Thresholds:      opts.Thresholds,
 		Budget:          opts.Budget,
@@ -467,14 +469,15 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		}
 		review.PRNumber = prNumber
 		result, err := opts.Loopreview(ctx, loopreview.Options{
-			RepoPath:   opts.RepoPath,
-			PRNumber:   prNumber,
-			Provider:   opts.VerifierProvider,
-			Model:      opts.VerifierModel,
-			Effort:     opts.VerifierEffort,
-			BaseBranch: opts.BaseBranch,
-			Timeout:    opts.VerifierTimeout,
-			Stderr:     opts.Stderr,
+			RepoPath:       opts.RepoPath,
+			PRNumber:       prNumber,
+			Provider:       opts.VerifierProvider,
+			Model:          opts.VerifierModel,
+			Effort:         opts.VerifierEffort,
+			BaseBranch:     opts.BaseBranch,
+			ConfigFromBase: opts.ConfigFromBase,
+			Timeout:        opts.VerifierTimeout,
+			Stderr:         opts.Stderr,
 		})
 		if err != nil {
 			review.Verdict = loopreview.VerdictNeedsHuman
@@ -566,6 +569,7 @@ func withTickDefaults(opts TickOptions) TickOptions {
 					Provider:        dispatchOpts.Provider,
 					Model:           dispatchOpts.Model,
 					Effort:          dispatchOpts.Effort,
+					ConfigFromBase:  dispatchOpts.ConfigFromBase,
 					Stderr:          dispatchOpts.Stderr,
 				})
 				return recovery.DispatchResult{
@@ -681,6 +685,7 @@ func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *Ti
 		VerifierModel:    opts.VerifierModel,
 		VerifierEffort:   opts.VerifierEffort,
 		VerifierTimeout:  opts.VerifierTimeout,
+		ConfigFromBase:   opts.ConfigFromBase,
 		Budget:           opts.Budget,
 		CircuitBreaker:   opts.CircuitBreaker,
 		Now:              opts.Clock(),
@@ -751,14 +756,15 @@ func runTickRecoveredPR(ctx context.Context, opts TickOptions, tickReport *TickR
 	}
 	if reviewResult == nil {
 		result, err := opts.Loopreview(ctx, loopreview.Options{
-			RepoPath:   opts.RepoPath,
-			PRNumber:   prNumber,
-			Provider:   opts.VerifierProvider,
-			Model:      opts.VerifierModel,
-			Effort:     opts.VerifierEffort,
-			BaseBranch: opts.BaseBranch,
-			Timeout:    opts.VerifierTimeout,
-			Stderr:     opts.Stderr,
+			RepoPath:       opts.RepoPath,
+			PRNumber:       prNumber,
+			Provider:       opts.VerifierProvider,
+			Model:          opts.VerifierModel,
+			Effort:         opts.VerifierEffort,
+			BaseBranch:     opts.BaseBranch,
+			ConfigFromBase: opts.ConfigFromBase,
+			Timeout:        opts.VerifierTimeout,
+			Stderr:         opts.Stderr,
 		})
 		if err != nil {
 			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
@@ -796,14 +802,15 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 	}
 	pr := firstNonEmpty(adopted.URL, fmt.Sprintf("#%d", adopted.Number))
 	result, err := opts.Loopreview(ctx, loopreview.Options{
-		RepoPath:   opts.RepoPath,
-		PRNumber:   adopted.Number,
-		Provider:   opts.VerifierProvider,
-		Model:      opts.VerifierModel,
-		Effort:     opts.VerifierEffort,
-		BaseBranch: opts.BaseBranch,
-		Timeout:    opts.VerifierTimeout,
-		Stderr:     opts.Stderr,
+		RepoPath:       opts.RepoPath,
+		PRNumber:       adopted.Number,
+		Provider:       opts.VerifierProvider,
+		Model:          opts.VerifierModel,
+		Effort:         opts.VerifierEffort,
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Timeout:        opts.VerifierTimeout,
+		Stderr:         opts.Stderr,
 	})
 	if err != nil {
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{

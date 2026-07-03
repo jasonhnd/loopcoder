@@ -2,12 +2,15 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,6 +26,27 @@ type Config struct {
 	Environment  Environment  `yaml:"environment"`
 	Evidence     Evidence     `yaml:"evidence"`
 	Report       Report       `yaml:"report"`
+}
+
+type ShowBaseConfigFunc func(ctx context.Context, repoPath, baseBranch string) ([]byte, error)
+
+type LoadOptions struct {
+	BaseBranch     string
+	ConfigFromBase bool
+	ShowBaseConfig ShowBaseConfigFunc
+}
+
+type ConfigMismatchError struct {
+	BaseBranch string
+}
+
+func (e ConfigMismatchError) Error() string {
+	return ConfigMismatchMessage(e.BaseBranch)
+}
+
+func ConfigMismatchMessage(baseBranch string) string {
+	baseBranch = normalizeBaseBranch(baseBranch)
+	return fmt.Sprintf(".delivery.yml is absent from working tree but present on %s; probably the wrong branch; checkout the base or pass --config-from-base", baseBranch)
 }
 
 type Adapters struct {
@@ -235,14 +259,38 @@ func Parse(data []byte) (Config, error) {
 	return cfg, nil
 }
 
-// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
-// falling back to built-in defaults when the file is missing or unreadable.
-func ResilienceForRepo(repoPath string) Resilience {
-	cfg, err := Load(filepath.Join(repoPath, ".delivery.yml"))
-	if err != nil {
-		return Default().Resilience
+func LoadForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Config, error) {
+	cfg := Default()
+	loaded, err := Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err == nil {
+		return loaded, nil
 	}
-	return cfg.Resilience
+	if !errors.Is(err, os.ErrNotExist) {
+		return cfg, err
+	}
+	baseBranch := normalizeBaseBranch(opts.BaseBranch)
+	baseConfig, ok := showBaseConfig(ctx, repoPath, baseBranch, opts.ShowBaseConfig)
+	if !ok {
+		return cfg, nil
+	}
+	if opts.ConfigFromBase {
+		loaded, err := Parse(baseConfig)
+		if err != nil {
+			return cfg, err
+		}
+		return loaded, nil
+	}
+	return cfg, ConfigMismatchError{BaseBranch: baseBranch}
+}
+
+// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
+// falling back to built-in defaults when the file is genuinely absent.
+func ResilienceForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Resilience, error) {
+	cfg, err := LoadForRepo(ctx, repoPath, opts)
+	if err != nil {
+		return Resilience{}, err
+	}
+	return cfg.Resilience, nil
 }
 
 // DurationSeconds converts a positive seconds value to a Duration, falling back
@@ -278,4 +326,34 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_attempts must be greater than zero")
 	}
 	return nil
+}
+
+func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowBaseConfigFunc) ([]byte, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if show == nil {
+		show = defaultShowBaseConfig
+	}
+	data, err := show(ctx, repoPath, baseBranch)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func defaultShowBaseConfig(ctx context.Context, repoPath, baseBranch string) ([]byte, error) {
+	content, err := gitutil.New().Show(ctx, repoPath, normalizeBaseBranch(baseBranch)+":.delivery.yml")
+	if err != nil {
+		return nil, err
+	}
+	return []byte(content), nil
+}
+
+func normalizeBaseBranch(baseBranch string) string {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		return "main"
+	}
+	return baseBranch
 }

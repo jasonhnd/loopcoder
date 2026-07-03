@@ -292,6 +292,36 @@ func TestRunWarnsWhenDeliveryConfigAbsentAndUsesDefaultProviders(t *testing.T) {
 	}
 }
 
+func TestRunReportsDeliveryConfigWorkingTreeBaseMismatch(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.configErr = os.ErrNotExist
+	env.commands[cmdKey("git", "show", "main:.delivery.yml")] = CommandResult{
+		Stdout: "version: 1\n",
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo", BaseBranch: "main"}, env.deps())
+
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	delivery := requireCheck(t, report, ".delivery.yml")
+	if delivery.Status != StatusWarn {
+		t.Fatalf("delivery status = %s, want warn (%s)", delivery.Status, delivery.Message)
+	}
+	for _, want := range []string{
+		"absent from working tree",
+		"present on main",
+		"--config-from-base",
+	} {
+		if !strings.Contains(delivery.Message, want) {
+			t.Fatalf("delivery message = %q, want containing %q", delivery.Message, want)
+		}
+	}
+	if strings.Contains(delivery.Message, "documented defaults apply") {
+		t.Fatalf("delivery message should supersede defaults message: %q", delivery.Message)
+	}
+}
+
 func TestRunReportsInvalidDeliveryConfigWithoutHardExit(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.configErr = errors.New("parse delivery config: broken yaml")

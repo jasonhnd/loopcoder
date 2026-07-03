@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -140,6 +141,73 @@ func TestVersionDefaultsToDevBuildInfo(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("version output missing %q:\n%s", want, output)
 		}
+	}
+}
+
+func TestLoadDeliveryConfigLoudResolution(t *testing.T) {
+	baseConfig := []byte("version: 1\nworker:\n  model: base-worker-model\nci:\n  checks: [verify]\n")
+	tests := []struct {
+		name           string
+		configFromBase bool
+		show           config.ShowBaseConfigFunc
+		wantErr        bool
+		wantModel      string
+		wantChecks     []string
+	}{
+		{
+			name: "cwd lacks and base has errors loud",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantErr: true,
+		},
+		{
+			name:           "config-from-base reads base config",
+			configFromBase: true,
+			show: func(context.Context, string, string) ([]byte, error) {
+				return baseConfig, nil
+			},
+			wantModel:  "base-worker-model",
+			wantChecks: []string{"verify"},
+		},
+		{
+			name: "no config anywhere uses defaults",
+			show: func(context.Context, string, string) ([]byte, error) {
+				return nil, errors.New("not found")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadDeliveryConfigWithOptions(t.TempDir(), config.LoadOptions{
+				BaseBranch:     "main",
+				ConfigFromBase: tt.configFromBase,
+				ShowBaseConfig: tt.show,
+			})
+			if tt.wantErr {
+				var mismatch config.ConfigMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Fatalf("err = %v, want ConfigMismatchError", err)
+				}
+				if !strings.Contains(err.Error(), "probably the wrong branch") {
+					t.Fatalf("mismatch error = %q", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadDeliveryConfigWithOptions returned error: %v", err)
+			}
+			if tt.wantModel != "" && cfg.Worker.Model != tt.wantModel {
+				t.Fatalf("worker model = %q, want %q", cfg.Worker.Model, tt.wantModel)
+			}
+			if tt.wantChecks != nil && !reflect.DeepEqual(cfg.CI.Checks, tt.wantChecks) {
+				t.Fatalf("CI checks = %#v, want %#v", cfg.CI.Checks, tt.wantChecks)
+			}
+			if tt.wantModel == "" && cfg.Resilience.Worker.HardCapSeconds != 1800 {
+				t.Fatalf("default worker hard cap = %d, want 1800", cfg.Resilience.Worker.HardCapSeconds)
+			}
+		})
 	}
 }
 

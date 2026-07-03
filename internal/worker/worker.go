@@ -40,6 +40,7 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
+	ConfigFromBase  bool
 	KeepWorktree    bool
 	Stderr          io.Writer
 }
@@ -275,7 +276,13 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	resilience := config.ResilienceForRepo(repoPath)
+	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
