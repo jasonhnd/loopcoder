@@ -99,6 +99,8 @@ var commands = []Command{
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
 	{Name: "hook", Summary: "run an embedded loopcoder conductor hook (used by Claude Code hook settings)"},
+	{Name: "ps", Summary: "list loopcoder-managed worker processes"},
+	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
 }
 
 // Commands returns the registered subcommands in root help order.
@@ -110,6 +112,7 @@ func Commands() []Command {
 
 // Run executes the CLI and returns a process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
+	installShutdownOnSignal(stderr)
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
@@ -281,6 +284,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "hook" {
 		return runHook(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "ps" {
+		return runPs(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "kill" {
+		return runKill(args[1:], stdout, stderr, deps)
 	}
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)

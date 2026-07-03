@@ -17,6 +17,22 @@ var tasklistCommand = func(pid int) (string, []string) {
 	return "tasklist", []string{"/FI", fmt.Sprintf("PID eq %d", pid), "/NH"}
 }
 
+var taskkillCommand = func(pid int) (string, []string) {
+	return "taskkill", []string{"/F", "/T", "/PID", strconv.Itoa(pid)}
+}
+
+// KillTree terminates pid and its whole descendant tree via `taskkill /T`, which
+// reaps children whose parent-chain has already broken (a plain kill does not).
+func KillTree(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	name, args := taskkillCommand(pid)
+	cmd := exec.CommandContext(context.Background(), name, args...)
+	_, err := supervisedexec.Run(context.Background(), cmd, supervisedexec.Options{HardCap: livenessHardCap})
+	return err
+}
+
 func Alive(pid int) bool {
 	if pid <= 0 {
 		return false
