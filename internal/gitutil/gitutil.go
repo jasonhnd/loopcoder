@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -78,7 +79,7 @@ func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) (
 		if detail == "" {
 			detail = strings.TrimSpace(stdout.String())
 		}
-		err := commandExitError(cmd, result.ExitCode)
+		err := execresult.CommandExitError(cmd, result.ExitCode)
 		if detail != "" {
 			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(allArgs, " "), err, detail)
 		}
@@ -90,25 +91,6 @@ func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) (
 func gitArgs(repoPath string, args ...string) []string {
 	allArgs := append([]string{"-C", repoPath}, args...)
 	return allArgs
-}
-
-type exitStatusError struct {
-	code int
-}
-
-func (e exitStatusError) Error() string {
-	return fmt.Sprintf("exit status %d", e.code)
-}
-
-func (e exitStatusError) ExitCode() int {
-	return e.code
-}
-
-func commandExitError(cmd *exec.Cmd, code int) error {
-	if cmd.ProcessState != nil {
-		return &exec.ExitError{ProcessState: cmd.ProcessState}
-	}
-	return exitStatusError{code: code}
 }
 
 func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]byte, error) {

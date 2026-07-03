@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/process"
 )
 
 func writeAttemptSidecar(t *testing.T, repo, runID, job, body string) {
@@ -85,5 +89,50 @@ func TestRunKillRunFilterMatchesNothingIsSafe(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "terminated 0 loopcoder-managed process tree(s)") {
 		t.Fatalf("runKill should have matched nothing: %q", out.String())
+	}
+}
+
+func TestRunKillTerminatesMatchingRun(t *testing.T) {
+	if os.Getenv("LC_MANAGE_KILL_HELPER") == "1" {
+		time.Sleep(60 * time.Second) // parent kills this well before it returns
+		return
+	}
+	// Spawn a real throwaway child (this test binary re-executed into the helper
+	// branch; its output goes to the null device) and register it as a running
+	// attempt, then terminate it by run id and confirm it actually died.
+	child := exec.Command(os.Args[0], "-test.run=^TestRunKillTerminatesMatchingRun$")
+	child.Env = append(os.Environ(), "LC_MANAGE_KILL_HELPER=1")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start helper child: %v", err)
+	}
+	pid := child.Process.Pid
+	waited := make(chan struct{})
+	go func() { _ = child.Wait(); close(waited) }()
+	defer func() { _ = child.Process.Kill() }() // safety net if the assertion path fails
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !process.Alive(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("child pid %d never became alive", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	repo := t.TempDir()
+	runID := "run-20260101T000000Z-issue-5"
+	body := fmt.Sprintf(`{"issue":5,"provider":"codex","pid":%d,"status":"running","started_at":"t"}`, pid)
+	writeAttemptSidecar(t, repo, runID, "job-5-1", body)
+
+	var out, errb bytes.Buffer
+	if code := runKill([]string{"--repo", repo, "--run", runID}, &out, &errb, Deps{}); code != 0 {
+		t.Fatalf("runKill = %d, stderr=%q", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "terminated 1 loopcoder-managed process tree(s)") {
+		t.Fatalf("runKill output = %q", out.String())
+	}
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("child was not terminated by runKill")
 	}
 }

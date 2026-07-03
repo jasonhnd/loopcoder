@@ -297,7 +297,8 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if agentResult.Hung {
 		failureStatus = "hung"
 		hungErr := workerHungError(opts.Provider, agentResult.HungReason, logPath)
-		tracker.transition(activePhase, "hung", exitCodePtr, &hungErr)
+		// The deferred failure handler records the "hung" transition (phase +
+		// error) on return; only the distinct hung run-event is emitted here.
 		tracker.appendEvent("worker_hung", "hung", map[string]string{
 			"reason":      "hung",
 			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),

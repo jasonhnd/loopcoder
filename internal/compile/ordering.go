@@ -28,6 +28,9 @@ var (
 )
 
 func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	backbone := unavailableGoListBackbone()
 	if _, err := os.Stat(filepath.Join(repoPath, "go.mod")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
