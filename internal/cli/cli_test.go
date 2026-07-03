@@ -204,8 +204,8 @@ func TestLoadDeliveryConfigLoudResolution(t *testing.T) {
 			if tt.wantChecks != nil && !reflect.DeepEqual(cfg.CI.Checks, tt.wantChecks) {
 				t.Fatalf("CI checks = %#v, want %#v", cfg.CI.Checks, tt.wantChecks)
 			}
-			if tt.wantModel == "" && cfg.Resilience.Worker.HardCapSeconds != 1800 {
-				t.Fatalf("default worker hard cap = %d, want 1800", cfg.Resilience.Worker.HardCapSeconds)
+			if tt.wantModel == "" && cfg.Resilience.Worker.HardCapSeconds != 2700 {
+				t.Fatalf("default worker hard cap = %d, want 2700", cfg.Resilience.Worker.HardCapSeconds)
 			}
 		})
 	}

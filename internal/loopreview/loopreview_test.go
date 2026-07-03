@@ -15,6 +15,12 @@ import (
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
+func TestVerifierWatchdogDefaultsAreRaised(t *testing.T) {
+	if DefaultVerifierTimeout != 15*time.Minute || VerifierStallTimeout != 5*time.Minute {
+		t.Fatalf("verifier watchdog defaults = hard cap %s stall %s, want 15m0s/5m0s", DefaultVerifierTimeout, VerifierStallTimeout)
+	}
+}
+
 func TestParseVerdictAcceptsStructuredVerdicts(t *testing.T) {
 	tests := []struct {
 		name     string
