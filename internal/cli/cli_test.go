@@ -2415,6 +2415,12 @@ verifier:
   reasoning_effort: config-verifier-effort
 ci:
   checks: [verify, go]
+domain:
+  red_lines:
+    - category: disclosure-compliance
+      detail: unresolved disclosure approval
+      path_globs:
+        - disclosure/**
 evidence:
   website:
     preview_url: https://preview.example.com
@@ -2457,6 +2463,14 @@ evidence:
 			}
 			if !reflect.DeepEqual(opts.ConfiguredEvidence, wantEvidence) {
 				t.Fatalf("tick configured evidence = %#v, want %#v", opts.ConfiguredEvidence, wantEvidence)
+			}
+			wantRedLines := []orchestration.RiskRedLine{{
+				Category:  "disclosure-compliance",
+				Detail:    "unresolved disclosure approval",
+				PathGlobs: []string{"disclosure/**"},
+			}}
+			if !reflect.DeepEqual(opts.AdditionalRiskRedLines, wantRedLines) {
+				t.Fatalf("tick additional risk red lines = %#v, want %#v", opts.AdditionalRiskRedLines, wantRedLines)
 			}
 			if opts.WorkerProvider != "codex" || opts.VerifierProvider != "claude" {
 				t.Fatalf("tick opts providers = %#v", opts)
@@ -2550,6 +2564,35 @@ evidence:
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
 		}
+	}
+}
+
+func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain.RedLines = []config.DomainRedLine{{
+		Category:  "disclosure-compliance",
+		Detail:    "unresolved disclosure approval",
+		PathGlobs: []string{"disclosure/**"},
+	}}
+	opts := tickOptionsFromConfig(t.TempDir(), io.Discard, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{}
+		},
+		NewIssueWriter: func(string) compiler.IssueWriter {
+			return newCLIFakeIssueWriter()
+		},
+		NewPreProdWriter: func(string) orchestration.PreProdWriter {
+			return nil
+		},
+	}, cfg, false, "")
+
+	want := []orchestration.RiskRedLine{{
+		Category:  "disclosure-compliance",
+		Detail:    "unresolved disclosure approval",
+		PathGlobs: []string{"disclosure/**"},
+	}}
+	if !reflect.DeepEqual(opts.AdditionalRiskRedLines, want) {
+		t.Fatalf("AdditionalRiskRedLines = %#v, want %#v", opts.AdditionalRiskRedLines, want)
 	}
 }
 

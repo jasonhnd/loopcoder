@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -69,8 +71,9 @@ type RiskGateDecision struct {
 }
 
 type RiskRedLine struct {
-	Category string `json:"category"`
-	Detail   string `json:"detail"`
+	Category  string   `json:"category"`
+	Detail    string   `json:"detail"`
+	PathGlobs []string `json:"-"`
 }
 
 func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecision, error) {
@@ -111,7 +114,12 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	}
 	decision.RedLines = append(decision.RedLines, buildRedLines(requiredChecks, checks, checksErr)...)
 	decision.RedLines = append(decision.RedLines, corePathRedLines(decision.ChangedFiles)...)
-	decision.RedLines = append(decision.RedLines, normalizeAdditionalRedLines(opts.AdditionalRedLines)...)
+	additionalRedLines, err := evaluateAdditionalRedLines(opts.AdditionalRedLines, decision.ChangedFiles)
+	if err != nil {
+		decision.Status = RiskGateStatusNeedsHuman
+		return decision, err
+	}
+	decision.RedLines = append(decision.RedLines, additionalRedLines...)
 
 	if len(decision.RedLines) > 0 {
 		decision.Status = RiskGateStatusNeedsHuman
@@ -360,12 +368,38 @@ func isLoopcoderCoreOrchestrationPath(file string) bool {
 	return path.Dir(file) == "internal/orchestration" && path.Ext(file) == ".go" && path.Base(file) != "doc.go"
 }
 
-func normalizeAdditionalRedLines(lines []RiskRedLine) []RiskRedLine {
+func DomainRedLines(lines []config.DomainRedLine) []RiskRedLine {
 	out := make([]RiskRedLine, 0, len(lines))
 	for _, line := range lines {
+		out = append(out, RiskRedLine{
+			Category:  line.Category,
+			Detail:    line.Detail,
+			PathGlobs: append([]string(nil), line.PathGlobs...),
+		})
+	}
+	return out
+}
+
+func evaluateAdditionalRedLines(lines []RiskRedLine, changedFiles []string) ([]RiskRedLine, error) {
+	out := make([]RiskRedLine, 0, len(lines))
+	for index, line := range lines {
 		category := strings.TrimSpace(line.Category)
 		detail := strings.TrimSpace(line.Detail)
-		if category == "" && detail == "" {
+		globs, err := normalizeRiskPathGlobs(line.PathGlobs)
+		if err != nil {
+			return nil, fmt.Errorf("invalid additional red line %d: %w", index+1, err)
+		}
+		if category == "" && detail == "" && len(globs) == 0 {
+			continue
+		}
+		if len(line.PathGlobs) > 0 && len(globs) == 0 {
+			return nil, fmt.Errorf("invalid additional red line %d: path_globs has no non-empty matchers", index+1)
+		}
+		matches, err := additionalRedLineMatches(globs, changedFiles)
+		if err != nil {
+			return nil, fmt.Errorf("invalid additional red line %d: %w", index+1, err)
+		}
+		if !matches {
 			continue
 		}
 		if category == "" {
@@ -376,7 +410,121 @@ func normalizeAdditionalRedLines(lines []RiskRedLine) []RiskRedLine {
 		}
 		out = append(out, RiskRedLine{Category: category, Detail: detail})
 	}
-	return out
+	return out, nil
+}
+
+func normalizeRiskPathGlobs(globs []string) ([]string, error) {
+	if len(globs) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(globs))
+	for index, glob := range globs {
+		normalized := normalizeRiskPathGlob(glob)
+		if normalized == "" {
+			continue
+		}
+		if err := validateRiskPathGlob(normalized); err != nil {
+			return nil, fmt.Errorf("path_globs[%d] %q: %w", index, glob, err)
+		}
+		out = append(out, normalized)
+	}
+	return out, nil
+}
+
+func normalizeRiskPathGlob(glob string) string {
+	glob = strings.TrimSpace(filepathSlash(glob))
+	glob = strings.TrimPrefix(glob, "./")
+	glob = strings.TrimPrefix(glob, "/")
+	if glob == "" {
+		return ""
+	}
+	if strings.HasSuffix(glob, "/") {
+		glob += "**"
+	}
+	glob = path.Clean(glob)
+	if glob == "." {
+		return ""
+	}
+	return glob
+}
+
+func validateRiskPathGlob(glob string) error {
+	if glob == ".." || strings.HasPrefix(glob, "../") {
+		return fmt.Errorf("must be repo-relative")
+	}
+	if strings.ContainsAny(glob, "[]") {
+		return fmt.Errorf("character classes are not supported")
+	}
+	if _, err := path.Match(glob, ""); err != nil {
+		return err
+	}
+	return nil
+}
+
+func additionalRedLineMatches(globs []string, changedFiles []string) (bool, error) {
+	if len(globs) == 0 {
+		return true, nil
+	}
+	for _, glob := range globs {
+		for _, file := range changedFiles {
+			matches, err := matchRiskPathGlob(glob, file)
+			if err != nil {
+				return false, err
+			}
+			if matches {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func matchRiskPathGlob(glob, file string) (bool, error) {
+	glob = normalizeRiskPathGlob(glob)
+	file = normalizeRepoPath(file)
+	if glob == "" || file == "" {
+		return false, nil
+	}
+	value := file
+	if !strings.Contains(glob, "/") {
+		value = path.Base(file)
+	}
+	if !strings.Contains(glob, "**") {
+		return path.Match(glob, value)
+	}
+	re, err := regexp.Compile(riskPathGlobRegexp(glob))
+	if err != nil {
+		return false, err
+	}
+	return re.MatchString(value), nil
+}
+
+func riskPathGlobRegexp(glob string) string {
+	var out strings.Builder
+	out.WriteString("^")
+	for i := 0; i < len(glob); {
+		switch {
+		case strings.HasPrefix(glob[i:], "**/"):
+			out.WriteString("(?:.*/)?")
+			i += 3
+		case strings.HasPrefix(glob[i:], "**"):
+			out.WriteString(".*")
+			i += 2
+		default:
+			ch := glob[i]
+			switch ch {
+			case '*':
+				out.WriteString("[^/]*")
+			case '?':
+				out.WriteString("[^/]")
+			default:
+				out.WriteString(regexp.QuoteMeta(string(ch)))
+			}
+			i++
+		}
+	}
+	out.WriteString("$")
+	return out.String()
 }
 
 func normalizeRepoPath(file string) string {
