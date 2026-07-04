@@ -94,7 +94,7 @@ type Deps struct {
 	PID         func() int
 	MkdirTemp   func(dir, pattern string) (string, error)
 	RemoveAll   func(path string) error
-	RepoSkills  func(repoPath string) (string, error)
+	RepoSkills  func(repoPath string, domainSkills config.DomainSkills) (string, error)
 }
 
 func DefaultDeps() Deps {
@@ -111,8 +111,14 @@ func DefaultDeps() Deps {
 		PID:       os.Getpid,
 		MkdirTemp: os.MkdirTemp,
 		RemoveAll: os.RemoveAll,
-		RepoSkills: func(repoPath string) (string, error) {
-			return skills.BuildPromptSection(skills.PromptSectionOptions{RepoPath: repoPath})
+		RepoSkills: func(repoPath string, domainSkills config.DomainSkills) (string, error) {
+			return skills.BuildPromptSection(skills.PromptSectionOptions{
+				RepoPath:            repoPath,
+				Paths:               domainSkills.Paths,
+				MachineLibraryPaths: domainSkills.MachineLibrary.Paths,
+				Select:              domainSkills.Select,
+				BudgetBytes:         domainSkills.PromptBudgetBytes,
+			})
 		},
 	}
 }
@@ -263,7 +269,15 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	tracker.transition(activePhase, "running", nil, nil)
 
 	activePhase = "prompt_written"
-	repoSkills, err := deps.RepoSkills(worktreePath)
+	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       warnings,
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	repoSkills, err := deps.RepoSkills(worktreePath, cfg.Domain.Skills)
 	if err != nil {
 		return Result{}, fmt.Errorf("read repo skills: %w", err)
 	}
@@ -282,14 +296,6 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
-		BaseBranch:     opts.BaseBranch,
-		ConfigFromBase: opts.ConfigFromBase,
-		Warnings:       warnings,
-	})
-	if err != nil {
-		return Result{}, err
-	}
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
 	if err != nil {
 		return Result{}, err
