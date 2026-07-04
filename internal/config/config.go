@@ -26,6 +26,8 @@ type Config struct {
 	Guardrails   Guardrails   `yaml:"guardrails"`
 	Environment  Environment  `yaml:"environment"`
 	Evidence     Evidence     `yaml:"evidence"`
+	Domain       Domain       `yaml:"domain,omitempty"`
+	MCP          MCP          `yaml:"mcp,omitempty"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -144,6 +146,87 @@ type EvidenceArtifact struct {
 	ExampleOutput string `yaml:"example_output" json:"example_output,omitempty"`
 	TestResults   string `yaml:"test_results" json:"test_results,omitempty"`
 	PreviewBuild  string `yaml:"preview_build" json:"preview_build,omitempty"`
+}
+
+// Domain is the optional 0.5.0 domain-profile schema. This slice only parses
+// the schema; runtime stages intentionally do not consume it yet.
+type Domain struct {
+	Name         string             `yaml:"name,omitempty"`
+	Description  string             `yaml:"description,omitempty"`
+	Skills       DomainSkills       `yaml:"skills,omitempty"`
+	Verification DomainVerification `yaml:"verification,omitempty"`
+	Evidence     DomainEvidence     `yaml:"evidence,omitempty"`
+	RedLines     []DomainRedLine    `yaml:"red_lines,omitempty"`
+	PartialWork  DomainPartialWork  `yaml:"partial_work,omitempty"`
+	Liveness     DomainLiveness     `yaml:"liveness,omitempty"`
+}
+
+type DomainSkills struct {
+	Paths             []string             `yaml:"paths,omitempty"`
+	MachineLibrary    DomainMachineLibrary `yaml:"machine_library,omitempty"`
+	Select            []string             `yaml:"select,omitempty"`
+	PromptBudgetBytes int                  `yaml:"prompt_budget_bytes,omitempty"`
+}
+
+type DomainMachineLibrary struct {
+	Paths []string `yaml:"paths,omitempty"`
+}
+
+type DomainVerification struct {
+	Rubric            DomainRubric `yaml:"rubric,omitempty"`
+	ReviewPacketOrder []string     `yaml:"review_packet_order,omitempty"`
+}
+
+type DomainRubric struct {
+	Paths     []string `yaml:"paths,omitempty"`
+	Checklist []string `yaml:"checklist,omitempty"`
+}
+
+type DomainEvidence struct {
+	Producer DomainEvidenceProducer `yaml:"producer,omitempty"`
+}
+
+type DomainEvidenceProducer struct {
+	Command             string   `yaml:"command,omitempty"`
+	Outputs             []string `yaml:"outputs,omitempty"`
+	TimeoutSeconds      int      `yaml:"timeout_seconds,omitempty"`
+	IncludeInLoopreview *bool    `yaml:"include_in_loopreview,omitempty"`
+}
+
+type DomainRedLine struct {
+	Category  string   `yaml:"category,omitempty"`
+	Detail    string   `yaml:"detail,omitempty"`
+	PathGlobs []string `yaml:"path_globs,omitempty"`
+}
+
+type DomainPartialWork struct {
+	Mode string `yaml:"mode,omitempty"`
+}
+
+type DomainLiveness struct {
+	Mode string `yaml:"mode,omitempty"`
+}
+
+// MCP is the optional 0.5.0 MCP server schema. Provider wiring lands in later
+// slices; this config package only preserves the parsed declaration.
+type MCP struct {
+	Servers []MCPServer `yaml:"servers,omitempty"`
+}
+
+type MCPServer struct {
+	Name      string   `yaml:"name,omitempty"`
+	Transport string   `yaml:"transport,omitempty"`
+	Command   string   `yaml:"command,omitempty"`
+	Args      []string `yaml:"args,omitempty"`
+	URL       string   `yaml:"url,omitempty"`
+	Auth      MCPAuth  `yaml:"auth,omitempty"`
+	Roles     []string `yaml:"roles,omitempty"`
+	ReadOnly  bool     `yaml:"read_only,omitempty"`
+}
+
+type MCPAuth struct {
+	Header string `yaml:"header,omitempty"`
+	Env    string `yaml:"env,omitempty"`
 }
 
 func (e Evidence) Artifacts() []EvidenceArtifact {

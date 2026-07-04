@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
@@ -44,6 +46,257 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	}
 	if got := cfg.Evidence.Artifacts(); len(got) != 0 {
 		t.Fatalf("Evidence.Artifacts() = %#v, want empty", got)
+	}
+}
+
+func TestParseAbsentDomainAndMCPKeepCurrentDefaults(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nci:\n  checks: [verify]\n"))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	want := Default()
+	want.Version = 1
+	want.CI.Checks = []string{"verify"}
+	if !reflect.DeepEqual(cfg, want) {
+		t.Fatalf("Parse without domain/mcp = %#v, want %#v", cfg, want)
+	}
+}
+
+func TestDefaultMarshalOmitsAbsentDomainAndMCP(t *testing.T) {
+	data, err := yaml.Marshal(Default())
+	if err != nil {
+		t.Fatalf("yaml.Marshal(Default()) returned error: %v", err)
+	}
+	text := string(data)
+	for _, notWant := range []string{"domain:", "mcp:"} {
+		if strings.Contains(text, notWant) {
+			t.Fatalf("yaml.Marshal(Default()) contained %q:\n%s", notWant, text)
+		}
+	}
+}
+
+func TestParseReadsDomainAndMCPSections(t *testing.T) {
+	data := []byte(`
+version: 1
+domain:
+  name: docs
+  description: corporate IR document production
+  skills:
+    paths:
+      - .claude/skills/*/SKILL.md
+      - governance/**/skill.md
+    machine_library:
+      paths:
+        - .loopcoder/skill-library/**/*.md
+    select:
+      - governance
+      - disclosure
+    prompt_budget_bytes: 4096
+  verification:
+    rubric:
+      paths:
+        - governance/qa-checklist.md
+      checklist:
+        - Rendered PDF matches the approved governance spec.
+    review_packet_order:
+      - rendered_artifact
+      - rubric
+      - changed_files
+      - diff
+      - issue
+      - spec
+  evidence:
+    producer:
+      command: make render-ir-pdf
+      outputs:
+        - out/report.pdf
+      timeout_seconds: 300
+      include_in_loopreview: true
+  red_lines:
+    - category: disclosure-compliance
+      detail: unresolved disclosure or legal approval requirement
+      path_globs:
+        - disclosure/**
+  partial_work:
+    mode: harvest-needs-human
+  liveness:
+    mode: worktree-mtime
+mcp:
+  servers:
+    - name: governance-index
+      transport: stdio
+      command: ./tools/governance-mcp
+      args: ["--root", "."]
+      roles: [worker, verifier]
+      read_only: true
+    - name: disclosure-system
+      transport: http
+      url: https://mcp.example.com/disclosure
+      auth:
+        header: Authorization
+        env: DISCLOSURE_MCP_TOKEN
+      roles: [worker]
+      read_only: false
+`)
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	wantInclude := true
+	wantDomain := Domain{
+		Name:        "docs",
+		Description: "corporate IR document production",
+		Skills: DomainSkills{
+			Paths: []string{
+				".claude/skills/*/SKILL.md",
+				"governance/**/skill.md",
+			},
+			MachineLibrary: DomainMachineLibrary{
+				Paths: []string{".loopcoder/skill-library/**/*.md"},
+			},
+			Select:            []string{"governance", "disclosure"},
+			PromptBudgetBytes: 4096,
+		},
+		Verification: DomainVerification{
+			Rubric: DomainRubric{
+				Paths:     []string{"governance/qa-checklist.md"},
+				Checklist: []string{"Rendered PDF matches the approved governance spec."},
+			},
+			ReviewPacketOrder: []string{
+				"rendered_artifact",
+				"rubric",
+				"changed_files",
+				"diff",
+				"issue",
+				"spec",
+			},
+		},
+		Evidence: DomainEvidence{
+			Producer: DomainEvidenceProducer{
+				Command:             "make render-ir-pdf",
+				Outputs:             []string{"out/report.pdf"},
+				TimeoutSeconds:      300,
+				IncludeInLoopreview: &wantInclude,
+			},
+		},
+		RedLines: []DomainRedLine{{
+			Category:  "disclosure-compliance",
+			Detail:    "unresolved disclosure or legal approval requirement",
+			PathGlobs: []string{"disclosure/**"},
+		}},
+		PartialWork: DomainPartialWork{Mode: "harvest-needs-human"},
+		Liveness:    DomainLiveness{Mode: "worktree-mtime"},
+	}
+	if !reflect.DeepEqual(cfg.Domain, wantDomain) {
+		t.Fatalf("Domain = %#v, want %#v", cfg.Domain, wantDomain)
+	}
+
+	wantMCP := MCP{
+		Servers: []MCPServer{
+			{
+				Name:      "governance-index",
+				Transport: "stdio",
+				Command:   "./tools/governance-mcp",
+				Args:      []string{"--root", "."},
+				Roles:     []string{"worker", "verifier"},
+				ReadOnly:  true,
+			},
+			{
+				Name:      "disclosure-system",
+				Transport: "http",
+				URL:       "https://mcp.example.com/disclosure",
+				Auth: MCPAuth{
+					Header: "Authorization",
+					Env:    "DISCLOSURE_MCP_TOKEN",
+				},
+				Roles: []string{"worker"},
+			},
+		},
+	}
+	if !reflect.DeepEqual(cfg.MCP, wantMCP) {
+		t.Fatalf("MCP = %#v, want %#v", cfg.MCP, wantMCP)
+	}
+}
+
+func TestParseReadsPartialDomainAndMCPSections(t *testing.T) {
+	data := []byte(`
+domain:
+  skills:
+    paths:
+      - docs/skills/*.md
+  evidence:
+    producer:
+      command: make render
+mcp:
+  servers:
+    - name: local-index
+`)
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(cfg.Domain.Skills.Paths, []string{"docs/skills/*.md"}) {
+		t.Fatalf("Domain.Skills.Paths = %#v, want docs/skills/*.md", cfg.Domain.Skills.Paths)
+	}
+	if cfg.Domain.Evidence.Producer.Command != "make render" {
+		t.Fatalf("Domain.Evidence.Producer.Command = %q, want make render", cfg.Domain.Evidence.Producer.Command)
+	}
+	if cfg.Domain.Evidence.Producer.IncludeInLoopreview != nil {
+		t.Fatalf("IncludeInLoopreview = %#v, want nil for absent optional bool", cfg.Domain.Evidence.Producer.IncludeInLoopreview)
+	}
+	if !reflect.DeepEqual(cfg.Domain.Verification, DomainVerification{}) {
+		t.Fatalf("Domain.Verification = %#v, want zero value", cfg.Domain.Verification)
+	}
+	if len(cfg.MCP.Servers) != 1 || cfg.MCP.Servers[0].Name != "local-index" {
+		t.Fatalf("MCP.Servers = %#v, want one partial local-index server", cfg.MCP.Servers)
+	}
+	if cfg.MCP.Servers[0].Auth != (MCPAuth{}) || cfg.MCP.Servers[0].ReadOnly {
+		t.Fatalf("partial MCP server = %#v, want zero auth and read_only false", cfg.MCP.Servers[0])
+	}
+}
+
+func TestParseDomainAndMCPTolerateUnknownFields(t *testing.T) {
+	data := []byte(`
+version: 1
+future_top_level: ok
+domain:
+  future_domain_field: ok
+  skills:
+    future_skills_field: ok
+    paths:
+      - governance/skill.md
+  evidence:
+    producer:
+      command: make render
+      future_producer_field: ok
+mcp:
+  future_mcp_field: ok
+  servers:
+    - name: governance-index
+      transport: stdio
+      future_server_field: ok
+      auth:
+        header: Authorization
+        future_auth_field: ok
+`)
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse returned error for unknown fields: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.Domain.Skills.Paths, []string{"governance/skill.md"}) {
+		t.Fatalf("Domain.Skills.Paths = %#v, want governance/skill.md", cfg.Domain.Skills.Paths)
+	}
+	if cfg.Domain.Evidence.Producer.Command != "make render" {
+		t.Fatalf("Domain.Evidence.Producer.Command = %q, want make render", cfg.Domain.Evidence.Producer.Command)
+	}
+	if len(cfg.MCP.Servers) != 1 || cfg.MCP.Servers[0].Name != "governance-index" || cfg.MCP.Servers[0].Auth.Header != "Authorization" {
+		t.Fatalf("MCP.Servers = %#v, want known fields parsed despite unknown fields", cfg.MCP.Servers)
 	}
 }
 
