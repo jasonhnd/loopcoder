@@ -405,6 +405,117 @@ mcp:
 	}
 }
 
+func TestDispatchPassesDomainLivenessLogOnlyToAgent(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+domain:
+  liveness:
+    mode: log-only
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented liveness.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 469,
+		IssueTitle:  "Domain liveness",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/469"}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if fakeAgent.invocation.LivenessMode != "log-only" {
+		t.Fatalf("LivenessMode = %q, want log-only", fakeAgent.invocation.LivenessMode)
+	}
+	if fakeAgent.invocation.LivenessCommand != "" {
+		t.Fatalf("LivenessCommand = %q, want empty", fakeAgent.invocation.LivenessCommand)
+	}
+}
+
+func TestDispatchPassesDomainCustomLivenessCommandToAgent(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+domain:
+  liveness:
+    mode: custom
+    command: echo alive
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented custom liveness.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 469,
+		IssueTitle:  "Domain liveness",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/469"}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if fakeAgent.invocation.LivenessMode != "custom" {
+		t.Fatalf("LivenessMode = %q, want custom", fakeAgent.invocation.LivenessMode)
+	}
+	if fakeAgent.invocation.LivenessCommand != "echo alive" {
+		t.Fatalf("LivenessCommand = %q, want echo alive", fakeAgent.invocation.LivenessCommand)
+	}
+}
+
 func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 	record := buildWorkerAttestation(Options{
 		IssueNumber: 101,
@@ -739,6 +850,102 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 	if got.Attestation == nil || got.Attestation.Role != attestation.RoleConductor {
 		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Attestation)
+	}
+}
+
+func TestDispatchHungReportOnlyPreservesPartialWorkWithoutHarvestPR(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+domain:
+  partial_work:
+    mode: report-only
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n?? new.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "provider stopped producing output\nlast useful log line\n",
+	}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Attempt:     2,
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err == nil {
+		t.Fatal("Dispatch returned nil error, want hung failure")
+	}
+	if result.OK || result.Status != "hung" || result.PR != "" || result.Attestation != nil {
+		t.Fatalf("report-only hung result = %#v, want hung without PR or attestation", result)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
+		t.Fatalf("report-only made harvest git calls: add=%d commit=%d push=%d force=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
+	}
+	if fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("CreatePR calls = %d, want 0", fakeGitHub.createPRCalls)
+	}
+	for _, want := range []string{"report-only", "preserved partial work", "no harvest PR opened"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warnings missing %q:\n%s", want, warnings.String())
+		}
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Attestation != nil {
+		t.Fatalf("report-only attempt = %#v, want hung with no attestation", attempts)
+	}
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test", "job-101-4321"))
+	if err != nil {
+		t.Fatalf("ReadFile recovery brief: %v", err)
+	}
+	for _, want := range []string{" M file.go", "?? new.go", "last useful log line"} {
+		if !strings.Contains(string(brief), want) {
+			t.Fatalf("recovery brief missing %q:\n%s", want, string(brief))
+		}
+	}
+	events, err := os.ReadFile(state.EventsPath(repo, "run-test"))
+	if err != nil {
+		t.Fatalf("ReadFile events: %v", err)
+	}
+	for _, want := range []string{`"event":"worker_partial_work_reported"`, `"mode":"report-only"`} {
+		if !strings.Contains(string(events), want) {
+			t.Fatalf("events missing %q:\n%s", want, string(events))
+		}
 	}
 }
 

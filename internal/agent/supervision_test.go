@@ -39,17 +39,25 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 				if opts.WorktreePath != worktreePath {
 					t.Fatalf("WorktreePath = %q, want %q", opts.WorktreePath, worktreePath)
 				}
+				if opts.LivenessMode != supervisedexec.LivenessModeLogOnly {
+					t.Fatalf("LivenessMode = %q, want %q", opts.LivenessMode, supervisedexec.LivenessModeLogOnly)
+				}
+				if opts.LivenessCommand != "echo alive" {
+					t.Fatalf("LivenessCommand = %q, want echo alive", opts.LivenessCommand)
+				}
 				return supervisedexec.Result{Outcome: tt.outcome, Killed: true}, nil
 			})
 			defer restore()
 
 			result, err := tt.runner.Run(context.Background(), Invocation{
-				WorktreePath: worktreePath,
-				Prompt:       "do work",
-				LogPath:      filepath.Join(t.TempDir(), "provider.log"),
-				HardCap:      123 * time.Millisecond,
-				StallTimeout: 45 * time.Millisecond,
-				OutputSchema: "",
+				WorktreePath:    worktreePath,
+				Prompt:          "do work",
+				LogPath:         filepath.Join(t.TempDir(), "provider.log"),
+				HardCap:         123 * time.Millisecond,
+				StallTimeout:    45 * time.Millisecond,
+				LivenessMode:    "log-only",
+				LivenessCommand: "echo alive",
+				OutputSchema:    "",
 			})
 			if err != nil {
 				t.Fatalf("Run returned error: %v", err)
