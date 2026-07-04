@@ -109,9 +109,26 @@ func DefaultDeps() Deps {
 		MkdirTemp: os.MkdirTemp,
 		RemoveAll: os.RemoveAll,
 		RepoSkills: func(repoPath string) (string, error) {
-			return skills.BuildPromptSection(skills.PromptSectionOptions{RepoPath: repoPath})
+			return buildRepoSkillsPromptSection(repoPath)
 		},
 	}
+}
+
+func buildRepoSkillsPromptSection(repoPath string) (string, error) {
+	cfg, err := config.Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return skills.BuildPromptSection(skills.PromptSectionOptions{RepoPath: repoPath})
+		}
+		return "", err
+	}
+	return skills.BuildPromptSection(skills.PromptSectionOptions{
+		RepoPath:            repoPath,
+		Paths:               cfg.Domain.Skills.Paths,
+		MachineLibraryPaths: cfg.Domain.Skills.MachineLibrary.Paths,
+		Select:              cfg.Domain.Skills.Select,
+		BudgetBytes:         cfg.Domain.Skills.PromptBudgetBytes,
+	})
 }
 
 func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err error) {

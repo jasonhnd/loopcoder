@@ -321,6 +321,71 @@ This implementation detail should stay out of the prompt.
 	}
 }
 
+func TestDefaultDepsRepoSkillsConsumesDomainSkillsConfig(t *testing.T) {
+	repo := t.TempDir()
+	writeWorkerRepoFile(t, repo, ".delivery.yml", `
+version: 1
+domain:
+  skills:
+    paths:
+      - .claude/skills/*/SKILL.md
+      - governance/skill.md
+    machine_library:
+      paths:
+        - .loopcoder/skill-library/**/*.md
+    select:
+      - go-style
+      - disclosure
+    prompt_budget_bytes: 2048
+`)
+	writeWorkerRepoFile(t, repo, ".claude/skills/go-style/SKILL.md", `---
+name: go-style
+description: Repository Go conventions
+---
+
+# Go Style
+
+Implementation detail should stay out.
+`)
+	writeWorkerRepoFile(t, repo, "governance/skill.md", `---
+description: Disclosure controls
+tags:
+  - disclosure
+---
+
+# Governance
+`)
+	writeWorkerRepoFile(t, repo, ".loopcoder/skill-library/generated/disclosure.md", `---
+name: Disclosure Library
+description: Generated disclosure metadata
+tags: [disclosure, generated]
+---
+
+# Disclosure Library
+`)
+
+	section, err := DefaultDeps().RepoSkills(repo)
+	if err != nil {
+		t.Fatalf("RepoSkills returned error: %v", err)
+	}
+	for _, want := range []string{
+		"Discovery rule: include repo-local skill metadata files from configured `domain.skills` globs.",
+		"Budget: 2048 bytes.",
+		"Path: `.claude/skills/go-style/SKILL.md`",
+		"Path: `governance/skill.md`",
+		"Path: `.loopcoder/skill-library/generated/disclosure.md`",
+		"Tags: disclosure",
+		"Tags: disclosure, generated",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("repo skills section missing %q:\n%s", want, section)
+		}
+	}
+	if strings.Contains(section, "Implementation detail should stay out.") {
+		t.Fatalf("repo skills section included skill body text:\n%s", section)
+	}
+}
+
 func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 	record := buildWorkerAttestation(Options{
 		IssueNumber: 101,
@@ -919,6 +984,17 @@ func TestDispatchHardFailsInvalidAttestationBeforeDelivery(t *testing.T) {
 	}
 	if got.ExitCode == nil || *got.ExitCode != 0 {
 		t.Fatalf("failed attempt exit code = %#v, want 0", got.ExitCode)
+	}
+}
+
+func writeWorkerRepoFile(t *testing.T, repo, relPath, content string) {
+	t.Helper()
+	path := filepath.Join(repo, filepath.FromSlash(relPath))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", relPath, err)
 	}
 }
 
