@@ -3174,18 +3174,29 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Dispatch:        deps.Dispatch,
 		OnIssueComplete: streamWaveCompletion,
 	})
+	if dispatchWaveReportHasContent(waveReport) {
+		if _, writeErr := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); writeErr != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", writeErr)
+			return 1
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
-		return 1
-	}
-	if _, err := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); err != nil {
-		fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", err)
+		if dispatchWaveReportHasContent(waveReport) {
+			fmt.Fprintf(stderr, "dispatch-wave: pending relay records may remain; run `loopcoder relay list --repo %s` or `loopcoder relay flush --repo %s`.\n", resolvedRepo, resolvedRepo)
+		}
 		return 1
 	}
 	if orchestration.DispatchWaveHasFailures(waveReport) {
 		return 1
 	}
 	return 0
+}
+
+func dispatchWaveReportHasContent(report orchestration.DispatchWaveReport) bool {
+	return strings.TrimSpace(report.RunID) != "" ||
+		len(report.IssuesRequested) > 0 ||
+		len(report.Results) > 0
 }
 
 func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -3890,7 +3901,11 @@ func resolveRepo(repoPath string) (string, error) {
 }
 
 func checkRelayGate(repoPath string, stdout, stderr io.Writer) (int, bool) {
-	records := relaygate.Check(repoPath)
+	records, err := relaygate.CheckWithError(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "relay gate: could not read pending records: %v; proceeding\n", err)
+		return 0, false
+	}
 	if len(records) == 0 {
 		return 0, false
 	}
