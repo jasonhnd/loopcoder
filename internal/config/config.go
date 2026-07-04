@@ -148,8 +148,8 @@ type EvidenceArtifact struct {
 	PreviewBuild  string `yaml:"preview_build" json:"preview_build,omitempty"`
 }
 
-// Domain is the optional 0.5.0 domain-profile schema. This slice only parses
-// the schema; runtime stages intentionally do not consume it yet.
+// Domain is the optional 0.5.0 domain-profile schema. Runtime slices consume
+// individual fields as they land; absent fields keep current behavior.
 type Domain struct {
 	Name         string             `yaml:"name,omitempty"`
 	Description  string             `yaml:"description,omitempty"`

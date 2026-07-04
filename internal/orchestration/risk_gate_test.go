@@ -47,6 +47,87 @@ func TestEvaluateRiskGateNonCorePathStaysClean(t *testing.T) {
 	}
 }
 
+func TestEvaluateRiskGateAdditionalRedLinePathGlobs(t *testing.T) {
+	tests := []struct {
+		name        string
+		changedFile string
+		pathGlobs   []string
+		wantStatus  string
+		wantCount   int
+	}{
+		{
+			name:        "matches nested domain path",
+			changedFile: "disclosure/reports/q4/packet.md",
+			pathGlobs:   []string{"disclosure/**"},
+			wantStatus:  RiskGateStatusNeedsHuman,
+			wantCount:   1,
+		},
+		{
+			name:        "does not match unrelated path",
+			changedFile: "README.md",
+			pathGlobs:   []string{"disclosure/**"},
+			wantStatus:  RiskGateStatusClean,
+			wantCount:   0,
+		},
+		{
+			name:        "basename glob matches changed file",
+			changedFile: "docs/policy.md",
+			pathGlobs:   []string{"*.md"},
+			wantStatus:  RiskGateStatusNeedsHuman,
+			wantCount:   1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+				Reader:         cleanRiskReader(390, tt.changedFile),
+				PRNumber:       390,
+				RequiredChecks: []string{"verify"},
+				AdditionalRedLines: []RiskRedLine{{
+					Category:  "disclosure-compliance",
+					Detail:    "requires disclosure approval",
+					PathGlobs: tt.pathGlobs,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("EvaluateRiskGate returned error: %v", err)
+			}
+			if decision.Status != tt.wantStatus || len(decision.RedLines) != tt.wantCount {
+				t.Fatalf("decision = %#v, want status %q red line count %d", decision, tt.wantStatus, tt.wantCount)
+			}
+			if tt.wantCount > 0 {
+				if decision.RedLines[0].Category != "disclosure-compliance" || len(decision.RedLines[0].PathGlobs) != 0 {
+					t.Fatalf("red lines = %#v, want concrete configured veto without matcher metadata", decision.RedLines)
+				}
+			}
+		})
+	}
+}
+
+func TestEvaluateRiskGateInvalidAdditionalRedLineMatcherIsError(t *testing.T) {
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         cleanRiskReader(391, "README.md"),
+		PRNumber:       391,
+		RequiredChecks: []string{"verify"},
+		AdditionalRedLines: []RiskRedLine{{
+			Category:  "bad-config",
+			Detail:    "broken matcher must not silently pass",
+			PathGlobs: []string{"docs/[broken"},
+		}},
+	})
+	if err == nil {
+		t.Fatal("EvaluateRiskGate returned nil error, want invalid matcher error")
+	}
+	if !strings.Contains(err.Error(), "invalid additional red line 1") ||
+		!strings.Contains(err.Error(), "path_globs[0]") {
+		t.Fatalf("error = %v, want additional red line path_globs context", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman {
+		t.Fatalf("decision status = %q, want %q", decision.Status, RiskGateStatusNeedsHuman)
+	}
+}
+
 func TestEvaluateRiskGateDangerousCommandsNeedHuman(t *testing.T) {
 	cases := []struct {
 		name string
@@ -109,6 +190,70 @@ func TestEvaluateRiskGateAcceptsEitherPassingCheckSignal(t *testing.T) {
 			}
 			if decision.Status != RiskGateStatusClean || len(decision.RedLines) != 0 {
 				t.Fatalf("decision = %#v, want clean risk gate when either check signal passes", decision)
+			}
+		})
+	}
+}
+
+func TestAdditionalRedLinesCannotLowerBuiltInRedLineFloor(t *testing.T) {
+	tests := []struct {
+		name         string
+		reader       fakeReader
+		required     []string
+		bypass       RiskRedLine
+		wantCategory string
+		wantDetail   string
+	}{
+		{
+			name:         "destructive cannot be renamed",
+			reader:       destructiveRiskReader(392),
+			required:     []string{"verify"},
+			bypass:       RiskRedLine{Category: "domain-safe", Detail: "pretend destructive changes are safe", PathGlobs: []string{"**"}},
+			wantCategory: RiskRedLineDestructive,
+			wantDetail:   "mass deletion",
+		},
+		{
+			name: "build not green cannot be suppressed",
+			reader: fakeReader{
+				checks:    map[int][]gh.Check{392: {{Name: "verify", Bucket: "fail"}}},
+				diffFiles: map[int][]string{392: {"README.md"}},
+				diffs:     map[int]string{392: modifiedDiff("README.md")},
+			},
+			required:     []string{"verify"},
+			bypass:       RiskRedLine{Category: RiskRedLineBuild, Detail: "checks are acceptable", PathGlobs: []string{"README.md"}},
+			wantCategory: RiskRedLineBuild,
+			wantDetail:   "required checks not green",
+		},
+		{
+			name:         "loopcoder core cannot be bypassed by nonmatching domain glob",
+			reader:       cleanRiskReader(392, "internal/orchestration/risk_gate.go"),
+			required:     []string{"verify"},
+			bypass:       RiskRedLine{Category: "domain-safe", Detail: "core is safe", PathGlobs: []string{"docs/**"}},
+			wantCategory: RiskRedLineCore,
+			wantDetail:   "human rebuild and tick restart",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+				Reader:             tt.reader,
+				PRNumber:           392,
+				RequiredChecks:     tt.required,
+				AdditionalRedLines: []RiskRedLine{tt.bypass},
+			})
+			if err != nil {
+				t.Fatalf("EvaluateRiskGate returned error: %v", err)
+			}
+			if decision.Status != RiskGateStatusNeedsHuman {
+				t.Fatalf("status = %q, want %q", decision.Status, RiskGateStatusNeedsHuman)
+			}
+			line, ok := findRiskRedLine(decision.RedLines, tt.wantCategory)
+			if !ok {
+				t.Fatalf("red lines = %#v, want built-in category %q", decision.RedLines, tt.wantCategory)
+			}
+			if !strings.Contains(line.Detail, tt.wantDetail) {
+				t.Fatalf("built-in red line detail = %q, want containing %q", line.Detail, tt.wantDetail)
 			}
 		})
 	}
@@ -223,6 +368,15 @@ func TestLoopcoderCoreOrchestrationGoFilesAreBlanketGuarded(t *testing.T) {
 			}
 		})
 	}
+}
+
+func findRiskRedLine(lines []RiskRedLine, category string) (RiskRedLine, bool) {
+	for _, line := range lines {
+		if line.Category == category {
+			return line, true
+		}
+	}
+	return RiskRedLine{}, false
 }
 
 func TestRiskGateOptionsExposeNoCoreBypassSurface(t *testing.T) {
