@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -41,6 +42,7 @@ const (
 	reviewPacketGeneratedDiffFileBytes  = 2 * 1024
 	reviewPacketGeneratedSizeBytes      = 128 * 1024
 	reviewPacketIssueBudgetBytes        = 12 * 1024
+	reviewPacketRubricBudgetBytes       = 24 * 1024
 	reviewPacketSpecBudgetBytes         = 40 * 1024
 	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
 	providerFailureLogBudgetBytes       = 4 * 1024
@@ -122,6 +124,7 @@ type ReviewPacketLimits struct {
 	GeneratedSizeBytes     int
 	GeneratedPatterns      []string
 	IssueBytes             int
+	RubricBytes            int
 	SpecBytes              int
 	TotalPromptBytes       int
 }
@@ -134,6 +137,8 @@ type reviewInputs struct {
 	ChangedFiles            []string
 	GeneratedAttributeRules []generatedAttributeRule
 	Spec                    specInput
+	Rubric                  rubricInput
+	ReviewPacketOrder       []string
 }
 
 type specInput struct {
@@ -143,6 +148,19 @@ type specInput struct {
 	Reason         string
 	ExpectedAbsent bool
 	ExpectedReason string
+}
+
+type rubricInput struct {
+	Configured bool
+	Checklist  []string
+	Files      []rubricFileInput
+}
+
+type rubricFileInput struct {
+	Path      string
+	Content   string
+	Available bool
+	Reason    string
 }
 
 func DefaultDeps() Deps {
@@ -181,7 +199,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
+	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
 		BaseBranch:     opts.BaseBranch,
 		ConfigFromBase: opts.ConfigFromBase,
 		Warnings:       warnings,
@@ -189,6 +207,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	resilience := cfg.Resilience
 	if opts.Timeout <= 0 {
 		opts.Timeout = config.DurationSeconds(resilience.Verifier.HardCapSeconds, DefaultVerifierTimeout)
 	}
@@ -219,6 +238,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	inputs.Rubric = loadRubric(ctx, deps.Git, repoPath, opts.BaseBranch, cfg.Domain.Verification.Rubric)
+	inputs.ReviewPacketOrder = cfg.Domain.Verification.ReviewPacketOrder
 	prompt, packet := buildPromptWithLimits(opts, inputs, deps.ReviewPacketLimits)
 	if packet.Insufficient {
 		note := "review packet insufficient: " + packet.InsufficientReason
@@ -273,6 +294,15 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			File:     inputs.Spec.Path,
 			Note:     "merged design/spec unavailable: " + inputs.Spec.Reason,
 		})
+	}
+	if note := missingRubricEvidenceNote(packet.Rubric); note != "" {
+		verdict.Verdict = VerdictNeedsHuman
+		verdict.Findings = append(nonNilFindings(verdict.Findings), Finding{
+			Severity: "warning",
+			File:     firstMissingRubricPath(packet.Rubric),
+			Note:     note,
+		})
+		appendVerdictEvidence(&verdict, note)
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
 	return resultWithAttestation(verdict, record), nil
@@ -429,8 +459,10 @@ type reviewPacket struct {
 	SpecPathChanged          bool
 	SpecPathAdded            bool
 	SpecContent              packetSection
+	Rubric                   rubricSection
 	ChangedFiles             changedFilesSection
 	Diff                     packetSection
+	ReviewPacketOrder        []string
 	Limits                   ReviewPacketLimits
 	TotalPromptBudgetApplied bool
 	Insufficient             bool
@@ -454,6 +486,19 @@ type changedFilesSection struct {
 	OmittedBytes int
 	OmittedLines int
 	Truncated    bool
+}
+
+type rubricSection struct {
+	Configured     bool
+	ChecklistCount int
+	FileCount      int
+	MissingFiles   []rubricMissingFile
+	Content        packetSection
+}
+
+type rubricMissingFile struct {
+	Path   string
+	Reason string
 }
 
 func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacketLimits) (string, reviewPacket) {
@@ -529,8 +574,10 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 		SpecPathChanged:    specPathChanged,
 		SpecPathAdded:      specPathAdded,
 		SpecContent:        truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
+		Rubric:             buildRubricSection(inputs.Rubric, limits.RubricBytes),
 		ChangedFiles:       buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
 		Diff:               buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
+		ReviewPacketOrder:  append([]string(nil), inputs.ReviewPacketOrder...),
 		Limits:             limits,
 	}
 }
@@ -546,11 +593,13 @@ Return only JSON matching this schema:
 
 # Review contract
 - Use the bounded review packet below as the primary evidence.
-- Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, and merged design/spec.
+- Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, merged design/spec, and any configured domain rubric.
+- When a Rubric section is configured, apply it as required review criteria.
 - For complete packets with no relevant TRUNCATED markers, decide from the packet instead of exploring the repository.
 - Use "pass" only when the PR satisfies the issue and spec and you found no blocking concerns.
 - Use "fail" for concrete implementation defects, missing acceptance criteria, regressions, or test gaps that should be fixed by a worker.
 - Use "needs-human" when evidence is incomplete, ambiguous, unavailable, or unsafe to decide automatically.
+- Missing configured rubric files are missing evidence; return "needs-human" and cite the missing rubric file paths.
 - If the packet classifies a missing merged spec as expected/non-blocking because a documentation-only PR introduces that referenced spec, do not return "needs-human" solely for that expected absence; keep spec_conformance "not-applicable" and decide from the issue and bounded packet.
 - For code PRs or mixed code/documentation PRs, an unavailable merged design/spec remains missing evidence and must be treated as "needs-human" when spec conformance cannot be checked safely.
 - Return "needs-human" if a TRUNCATED marker could hide a relevant acceptance criterion, risky changed file, or code needed for a safe decision. Cite the marker in evidence.
@@ -575,6 +624,7 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 		GeneratedSizeBytes:     reviewPacketGeneratedSizeBytes,
 		GeneratedPatterns:      defaultGeneratedPatterns,
 		IssueBytes:             reviewPacketIssueBudgetBytes,
+		RubricBytes:            reviewPacketRubricBudgetBytes,
 		SpecBytes:              reviewPacketSpecBudgetBytes,
 		TotalPromptBytes:       reviewPacketTotalPromptBudgetBytes,
 	}
@@ -599,6 +649,9 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	if limits.IssueBytes <= 0 {
 		limits.IssueBytes = defaults.IssueBytes
 	}
+	if limits.RubricBytes <= 0 {
+		limits.RubricBytes = defaults.RubricBytes
+	}
 	if limits.SpecBytes <= 0 {
 		limits.SpecBytes = defaults.SpecBytes
 	}
@@ -616,6 +669,7 @@ func reduceReviewPacketBudgets(limits *ReviewPacketLimits, bytesToRemove int) bo
 	for _, budget := range []*int{
 		&limits.DiffBytes,
 		&limits.SpecBytes,
+		&limits.RubricBytes,
 		&limits.IssueBytes,
 		&limits.ChangedFilesBytes,
 		&limits.DiffFileBytes,
@@ -649,42 +703,288 @@ func formatReviewPacket(packet reviewPacket) string {
 	fmt.Fprintf(&out, "Head: %s\n", packet.HeadRef)
 	fmt.Fprintf(&out, "Base: %s\n\n", packet.BaseBranch)
 
-	fmt.Fprintf(&out, "# Changed files\n")
-	fmt.Fprintf(&out, "Total changed files: %d\n", packet.ChangedFiles.TotalFiles)
-	fmt.Fprintf(&out, "Documentation-only: %s\n", yesNo(packet.DocumentationOnly))
-	fmt.Fprintf(&out, "Referenced spec changed in PR: %s\n", yesNo(packet.SpecPathChanged))
-	fmt.Fprintf(&out, "Referenced spec added in PR: %s\n", yesNo(packet.SpecPathAdded))
-	fmt.Fprintf(&out, "Budget: %d bytes\n", packet.Limits.ChangedFilesBytes)
-	fmt.Fprintf(&out, "%s\n\n", formatChangedFilesSection(packet.ChangedFiles))
-
-	fmt.Fprintf(&out, "# Diff excerpts\n")
-	fmt.Fprintf(&out, "Total diff budget: %d bytes\n", packet.Limits.DiffBytes)
-	fmt.Fprintf(&out, "Per-file diff budget: %d bytes\n", packet.Limits.DiffFileBytes)
-	fmt.Fprintf(&out, "%s\n\n", formatPacketSection("diff", packet.Diff))
-
-	fmt.Fprintf(&out, "# Issue\n")
-	fmt.Fprintf(&out, "Number: %s\n", packet.IssueNumber)
-	fmt.Fprintf(&out, "Title: %s\n", packet.IssueTitle)
-	fmt.Fprintf(&out, "Issue-body budget: %d bytes\n", packet.Limits.IssueBytes)
-	fmt.Fprintf(&out, "%s\n\n", formatPacketSection("issue body", packet.IssueBody))
-
-	fmt.Fprintf(&out, "# Merged design/spec from origin/%s\n", packet.BaseBranch)
-	fmt.Fprintf(&out, "Path: %s\n", packet.SpecPath)
-	if packet.SpecAvailable {
-		fmt.Fprintf(&out, "Status: available\n")
-		fmt.Fprintf(&out, "Spec budget: %d bytes\n", packet.Limits.SpecBytes)
-		fmt.Fprintf(&out, "%s\n", formatPacketSection("merged spec", packet.SpecContent))
-	} else if packet.SpecExpectedAbsent {
-		fmt.Fprintf(&out, "Status: expected absent from origin/%s\n", packet.BaseBranch)
-		fmt.Fprintf(&out, "Classification: expected/non-blocking\n")
-		fmt.Fprintf(&out, "Reason: %s\n", packet.SpecExpectedReason)
-		fmt.Fprintf(&out, "Spec conformance: not-applicable\n")
-	} else {
-		fmt.Fprintf(&out, "Status: unavailable\n")
-		fmt.Fprintf(&out, "Classification: missing evidence\n")
-		fmt.Fprintf(&out, "Reason: %s\n", packet.SpecReason)
+	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured) {
+		switch section {
+		case reviewPacketSectionChangedFiles:
+			formatChangedFilesPacketSection(&out, packet)
+		case reviewPacketSectionDiff:
+			formatDiffPacketSection(&out, packet)
+		case reviewPacketSectionIssue:
+			formatIssuePacketSection(&out, packet)
+		case reviewPacketSectionSpec:
+			formatSpecPacketSection(&out, packet)
+		case reviewPacketSectionRubric:
+			formatRubricPacketSection(&out, packet)
+		}
 	}
 	return out.String()
+}
+
+const (
+	reviewPacketSectionChangedFiles = "changed_files"
+	reviewPacketSectionDiff         = "diff"
+	reviewPacketSectionIssue        = "issue"
+	reviewPacketSectionSpec         = "spec"
+	reviewPacketSectionRubric       = "rubric"
+)
+
+var defaultReviewPacketSections = []string{
+	reviewPacketSectionChangedFiles,
+	reviewPacketSectionDiff,
+	reviewPacketSectionIssue,
+	reviewPacketSectionSpec,
+}
+
+func reviewPacketSections(configured []string, includeRubric bool) []string {
+	known := map[string]bool{
+		reviewPacketSectionChangedFiles: true,
+		reviewPacketSectionDiff:         true,
+		reviewPacketSectionIssue:        true,
+		reviewPacketSectionSpec:         true,
+		reviewPacketSectionRubric:       includeRubric,
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(defaultReviewPacketSections)+1)
+	for _, raw := range configured {
+		section := normalizeReviewPacketSection(raw)
+		if !known[section] || seen[section] {
+			continue
+		}
+		seen[section] = true
+		out = append(out, section)
+	}
+	for _, section := range defaultReviewPacketSections {
+		if seen[section] {
+			continue
+		}
+		seen[section] = true
+		out = append(out, section)
+	}
+	if includeRubric && !seen[reviewPacketSectionRubric] {
+		out = append(out, reviewPacketSectionRubric)
+	}
+	return out
+}
+
+func normalizeReviewPacketSection(section string) string {
+	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(section, "-", "_")))
+}
+
+func formatChangedFilesPacketSection(out *strings.Builder, packet reviewPacket) {
+	fmt.Fprintf(out, "# Changed files\n")
+	fmt.Fprintf(out, "Total changed files: %d\n", packet.ChangedFiles.TotalFiles)
+	fmt.Fprintf(out, "Documentation-only: %s\n", yesNo(packet.DocumentationOnly))
+	fmt.Fprintf(out, "Referenced spec changed in PR: %s\n", yesNo(packet.SpecPathChanged))
+	fmt.Fprintf(out, "Referenced spec added in PR: %s\n", yesNo(packet.SpecPathAdded))
+	fmt.Fprintf(out, "Budget: %d bytes\n", packet.Limits.ChangedFilesBytes)
+	fmt.Fprintf(out, "%s\n\n", formatChangedFilesSection(packet.ChangedFiles))
+}
+
+func formatDiffPacketSection(out *strings.Builder, packet reviewPacket) {
+	fmt.Fprintf(out, "# Diff excerpts\n")
+	fmt.Fprintf(out, "Total diff budget: %d bytes\n", packet.Limits.DiffBytes)
+	fmt.Fprintf(out, "Per-file diff budget: %d bytes\n", packet.Limits.DiffFileBytes)
+	fmt.Fprintf(out, "%s\n\n", formatPacketSection("diff", packet.Diff))
+}
+
+func formatIssuePacketSection(out *strings.Builder, packet reviewPacket) {
+	fmt.Fprintf(out, "# Issue\n")
+	fmt.Fprintf(out, "Number: %s\n", packet.IssueNumber)
+	fmt.Fprintf(out, "Title: %s\n", packet.IssueTitle)
+	fmt.Fprintf(out, "Issue-body budget: %d bytes\n", packet.Limits.IssueBytes)
+	fmt.Fprintf(out, "%s\n\n", formatPacketSection("issue body", packet.IssueBody))
+}
+
+func formatSpecPacketSection(out *strings.Builder, packet reviewPacket) {
+	fmt.Fprintf(out, "# Merged design/spec from origin/%s\n", packet.BaseBranch)
+	fmt.Fprintf(out, "Path: %s\n", packet.SpecPath)
+	if packet.SpecAvailable {
+		fmt.Fprintf(out, "Status: available\n")
+		fmt.Fprintf(out, "Spec budget: %d bytes\n", packet.Limits.SpecBytes)
+		fmt.Fprintf(out, "%s\n", formatPacketSection("merged spec", packet.SpecContent))
+	} else if packet.SpecExpectedAbsent {
+		fmt.Fprintf(out, "Status: expected absent from origin/%s\n", packet.BaseBranch)
+		fmt.Fprintf(out, "Classification: expected/non-blocking\n")
+		fmt.Fprintf(out, "Reason: %s\n", packet.SpecExpectedReason)
+		fmt.Fprintf(out, "Spec conformance: not-applicable\n")
+	} else {
+		fmt.Fprintf(out, "Status: unavailable\n")
+		fmt.Fprintf(out, "Classification: missing evidence\n")
+		fmt.Fprintf(out, "Reason: %s\n", packet.SpecReason)
+	}
+	fmt.Fprintf(out, "\n")
+}
+
+func formatRubricPacketSection(out *strings.Builder, packet reviewPacket) {
+	if !packet.Rubric.Configured {
+		return
+	}
+	fmt.Fprintf(out, "# Rubric\n")
+	fmt.Fprintf(out, "Status: %s\n", rubricStatus(packet.Rubric))
+	fmt.Fprintf(out, "Checklist items: %d\n", packet.Rubric.ChecklistCount)
+	fmt.Fprintf(out, "Configured files: %d\n", packet.Rubric.FileCount)
+	fmt.Fprintf(out, "Rubric budget: %d bytes\n", packet.Limits.RubricBytes)
+	if len(packet.Rubric.MissingFiles) > 0 {
+		fmt.Fprintf(out, "Missing configured rubric files:\n")
+		for _, missing := range packet.Rubric.MissingFiles {
+			fmt.Fprintf(out, "- %s: %s\n", missing.Path, missing.Reason)
+		}
+	}
+	fmt.Fprintf(out, "%s\n\n", formatPacketSection("rubric", packet.Rubric.Content))
+}
+
+func rubricStatus(rubric rubricSection) string {
+	if len(rubric.MissingFiles) > 0 {
+		return "missing evidence"
+	}
+	return "available"
+}
+
+func buildRubricSection(input rubricInput, byteBudget int) rubricSection {
+	section := rubricSection{
+		Configured:     input.Configured,
+		ChecklistCount: len(input.Checklist),
+		FileCount:      len(input.Files),
+	}
+	if !input.Configured {
+		return section
+	}
+
+	var out strings.Builder
+	if len(input.Checklist) > 0 {
+		out.WriteString("## Inline checklist\n")
+		for _, item := range input.Checklist {
+			fmt.Fprintf(&out, "- %s\n", item)
+		}
+	}
+	for _, file := range input.Files {
+		if !file.Available {
+			section.MissingFiles = append(section.MissingFiles, rubricMissingFile{
+				Path:   file.Path,
+				Reason: firstNonEmpty(file.Reason, "unavailable"),
+			})
+			continue
+		}
+		if out.Len() > 0 {
+			out.WriteString("\n")
+		}
+		fmt.Fprintf(&out, "## %s\n", file.Path)
+		content := strings.TrimRight(file.Content, "\n")
+		if strings.TrimSpace(content) == "" {
+			out.WriteString("(empty)\n")
+			continue
+		}
+		out.WriteString(content)
+		out.WriteString("\n")
+	}
+	section.Content = truncatePacketSection(out.String(), byteBudget)
+	return section
+}
+
+func loadRubric(ctx context.Context, git GitClient, repoPath, baseBranch string, rubric config.DomainRubric) rubricInput {
+	input := rubricInput{
+		Checklist: normalizeRubricChecklist(rubric.Checklist),
+	}
+	if len(rubric.Paths) == 0 && len(input.Checklist) == 0 {
+		return input
+	}
+	input.Configured = true
+	if strings.TrimSpace(baseBranch) == "" {
+		baseBranch = "main"
+	}
+	for _, rawPath := range rubric.Paths {
+		pathLabel := strings.TrimSpace(rawPath)
+		cleanPath, err := cleanRubricPath(rawPath)
+		if err != nil {
+			input.Files = append(input.Files, rubricFileInput{
+				Path:      firstNonEmpty(pathLabel, "(empty rubric path)"),
+				Available: false,
+				Reason:    err.Error(),
+			})
+			continue
+		}
+		content, err := git.Show(ctx, repoPath, "origin/"+baseBranch+":"+cleanPath)
+		if err != nil {
+			input.Files = append(input.Files, rubricFileInput{
+				Path:      cleanPath,
+				Available: false,
+				Reason:    err.Error(),
+			})
+			continue
+		}
+		input.Files = append(input.Files, rubricFileInput{
+			Path:      cleanPath,
+			Content:   content,
+			Available: true,
+		})
+	}
+	return input
+}
+
+func normalizeRubricChecklist(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func cleanRubricPath(rawPath string) (string, error) {
+	normalized := strings.TrimSpace(strings.ReplaceAll(rawPath, `\`, `/`))
+	normalized = strings.TrimPrefix(normalized, "./")
+	if normalized == "" {
+		return "", fmt.Errorf("must be a non-empty repo-relative path")
+	}
+	if strings.HasPrefix(normalized, "/") {
+		return "", fmt.Errorf("must be repo-relative")
+	}
+	if strings.Contains(normalized, ":") {
+		return "", fmt.Errorf("must be repo-relative")
+	}
+	if strings.ContainsRune(normalized, 0) {
+		return "", fmt.Errorf("must not contain NUL bytes")
+	}
+	cleaned := path.Clean(normalized)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("must be repo-relative")
+	}
+	return cleaned, nil
+}
+
+func missingRubricEvidenceNote(rubric rubricSection) string {
+	if !rubric.Configured || len(rubric.MissingFiles) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(rubric.MissingFiles))
+	for _, missing := range rubric.MissingFiles {
+		parts = append(parts, fmt.Sprintf("%s (%s)", missing.Path, missing.Reason))
+	}
+	return "configured rubric evidence unavailable: " + strings.Join(parts, "; ")
+}
+
+func firstMissingRubricPath(rubric rubricSection) string {
+	if len(rubric.MissingFiles) == 0 {
+		return ""
+	}
+	return rubric.MissingFiles[0].Path
+}
+
+func appendVerdictEvidence(verdict *Verdict, note string) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return
+	}
+	if strings.TrimSpace(verdict.Evidence) == "" {
+		verdict.Evidence = note
+		return
+	}
+	if strings.Contains(verdict.Evidence, note) {
+		return
+	}
+	verdict.Evidence = strings.TrimSpace(verdict.Evidence) + "\n" + note
 }
 
 func formatPacketSection(label string, section packetSection) string {
