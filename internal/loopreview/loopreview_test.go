@@ -267,6 +267,61 @@ func TestBuildPromptMarksDocFirstSpecAbsenceExpected(t *testing.T) {
 	}
 }
 
+func TestBuildPromptDefaultOrderRemainsSourceFirstWithoutDomainVerification(t *testing.T) {
+	prompt, _ := buildPromptWithLimits(loopreviewPromptTestOptions(), loopreviewPromptTestInputs(), ReviewPacketLimits{})
+
+	assertPromptOrder(t, prompt,
+		"# PR",
+		"# Changed files",
+		"# Diff excerpts",
+		"# Issue",
+		"# Merged design/spec",
+	)
+	if strings.Contains(prompt, "# Rubric") {
+		t.Fatalf("prompt unexpectedly contains rubric section:\n%s", prompt)
+	}
+}
+
+func TestBuildPromptInjectsRubricAndHonorsConfiguredSectionOrder(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Rubric = rubricInput{
+		Configured: true,
+		Checklist:  []string{"Rendered artifact matches the approved governance spec."},
+		Files: []rubricFileInput{{
+			Path:      "governance/qa-checklist.md",
+			Content:   "Confirm disclosure approval is documented.\n",
+			Available: true,
+		}},
+	}
+	inputs.ReviewPacketOrder = []string{"rubric", "issue", "spec", "changed_files", "diff"}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{})
+	if !packet.Rubric.Configured {
+		t.Fatal("rubric was not marked configured")
+	}
+	assertPromptOrder(t, prompt,
+		"# PR",
+		"# Rubric",
+		"# Issue",
+		"# Merged design/spec",
+		"# Changed files",
+		"# Diff excerpts",
+	)
+	for _, want := range []string{
+		"When a Rubric section is configured, apply it as required review criteria.",
+		"Missing configured rubric files are missing evidence",
+		"Status: available",
+		"## Inline checklist",
+		"- Rendered artifact matches the approved governance spec.",
+		"## governance/qa-checklist.md",
+		"Confirm disclosure approval is documented.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildReviewPacketTruncatesChangedFilesBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.ChangedFiles = []string{
@@ -434,6 +489,40 @@ func TestBuildReviewPacketOrdersSourceBeforeGeneratedDiffs(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPacketTruncatesRubricBudget(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Rubric = rubricInput{
+		Configured: true,
+		Checklist:  []string{"Keep this checklist item."},
+		Files: []rubricFileInput{{
+			Path:      "governance/qa-checklist.md",
+			Content:   "keep rubric context\n" + strings.Repeat("omitted rubric context\n", 40) + "TAIL_RUBRIC_SHOULD_NOT_APPEAR\n",
+			Available: true,
+		}},
+	}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		RubricBytes: len("## Inline checklist\n- Keep this checklist item.\n") + len("\n## governance/qa-checklist.md\nkeep rubric context\n") + 1,
+	})
+	if !packet.Rubric.Content.Truncated {
+		t.Fatal("rubric was not truncated")
+	}
+	for _, want := range []string{
+		"# Rubric",
+		"keep rubric context",
+		"[TRUNCATED rubric: omitted",
+		"bytes",
+		"lines",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "TAIL_RUBRIC_SHOULD_NOT_APPEAR") {
+		t.Fatalf("prompt contains omitted rubric tail:\n%s", prompt)
+	}
+}
+
 func TestBuildReviewPacketDoesNotClassifyLargeSourceBySizeOnly(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.ChangedFiles = []string{"internal/large.go", "internal/foo.go"}
@@ -455,6 +544,184 @@ func TestBuildReviewPacketDoesNotClassifyLargeSourceBySizeOnly(t *testing.T) {
 	}
 	if strings.Contains(prompt, "[TRUNCATED diff for internal/large.go") {
 		t.Fatalf("large source diff was classified as generated:\n%s", prompt)
+	}
+}
+
+func TestRunLoadsDomainRubricAndPreservesPassWhenEvidenceAvailable(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  verification:
+    rubric:
+      paths:
+        - governance/qa-checklist.md
+      checklist:
+        - Inline rubric item.
+    review_packet_order:
+      - rubric
+      - changed_files
+      - diff
+      - issue
+      - spec
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md":       "# Design\n",
+			"origin/main:governance/qa-checklist.md": "Rubric file criterion.\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("internal/foo.go", "+ package foo\n"),
+		files: []string{"internal/foo.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue, spec, and rubric","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want pass exit 0", result)
+	}
+	for _, want := range []string{
+		"# Rubric",
+		"Inline rubric item.",
+		"Rubric file criterion.",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+	assertPromptOrder(t, fakeAgent.invocation.Prompt, "# PR", "# Rubric", "# Changed files", "# Diff excerpts", "# Issue", "# Merged design/spec")
+}
+
+func TestRunForcesNeedsHumanWhenConfiguredRubricFileIsMissing(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  verification:
+    rubric:
+      paths:
+        - governance/missing-checklist.md
+      checklist:
+        - Inline rubric item still loads.
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+		showErrs: map[string]error{
+			"origin/main:governance/missing-checklist.md": errors.New("path does not exist in origin/main"),
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("internal/foo.go", "+ package foo\n"),
+		files: []string{"internal/foo.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"would pass without the missing rubric file","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	for _, want := range []string{
+		"configured rubric evidence unavailable",
+		"governance/missing-checklist.md",
+		"path does not exist in origin/main",
+	} {
+		if !strings.Contains(result.Verdict.Evidence, want) {
+			t.Fatalf("evidence missing %q:\n%s", want, result.Verdict.Evidence)
+		}
+	}
+	if fakeAgent.calls != 1 {
+		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
+	}
+	for _, want := range []string{
+		"# Rubric",
+		"Status: missing evidence",
+		"Missing configured rubric files:",
+		"Inline rubric item still loads.",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
 	}
 }
 
@@ -1198,6 +1465,21 @@ func loopreviewNewFileDiff(path, body string) string {
 		"+++ b/" + path + "\n" +
 		"@@ -0,0 +1 @@\n" +
 		body
+}
+
+func assertPromptOrder(t *testing.T, prompt string, labels ...string) {
+	t.Helper()
+	previous := -1
+	for _, label := range labels {
+		index := strings.Index(prompt, label)
+		if index < 0 {
+			t.Fatalf("prompt missing %q:\n%s", label, prompt)
+		}
+		if index <= previous {
+			t.Fatalf("prompt section %q appeared out of order:\n%s", label, prompt)
+		}
+		previous = index
+	}
 }
 
 func runWithAgentResult(t *testing.T, agentResult agent.Result, showErr error, stderr *strings.Builder) Result {
