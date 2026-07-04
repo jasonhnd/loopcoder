@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +96,85 @@ func TestBuildClaudeArgs(t *testing.T) {
 				t.Fatalf("BuildClaudeArgs() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBuildClaudeReadOnlyMCPArgs(t *testing.T) {
+	logPath := filepath.Join("logs", "claude.log")
+	got := BuildClaudeArgs(Invocation{
+		LogPath:  logPath,
+		ReadOnly: true,
+		Role:     "verifier",
+		MCPServers: []MCPServer{{
+			Name:      "shared-read",
+			Transport: "http",
+			URL:       "https://mcp.example.com/shared",
+			Auth: MCPAuth{
+				Header: "Authorization",
+				Env:    "SHARED_MCP_TOKEN",
+			},
+			Roles:    []string{"verifier"},
+			ReadOnly: true,
+		}},
+	})
+	want := []string{
+		"--print",
+		"--permission-mode", "plan",
+		"--no-session-persistence",
+		"--allowedTools", "Read Grep Glob mcp__shared-read__*",
+		"--output-format", "stream-json", "--verbose",
+		"--mcp-config", filepath.Join("logs", "claude-mcp.json"),
+		"--strict-mcp-config",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildClaudeArgs() = %#v, want %#v", got, want)
+	}
+	assertArgsDoNotContain(t, got, "--safe-mode", "dangerously-skip-permissions")
+}
+
+func TestWriteClaudeMCPConfigUsesEnvPlaceholders(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "claude.log")
+	err := writeClaudeMCPConfig(logPath, []MCPServer{
+		{
+			Name:      "local-index",
+			Transport: "stdio",
+			Command:   "./tools/local-index",
+			Args:      []string{"--root", "."},
+		},
+		{
+			Name:      "shared-read",
+			Transport: "http",
+			URL:       "https://mcp.example.com/shared",
+			Auth: MCPAuth{
+				Header: "Authorization",
+				Env:    "SHARED_MCP_TOKEN",
+			},
+			ReadOnly: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("writeClaudeMCPConfig returned error: %v", err)
+	}
+	data, err := os.ReadFile(claudeMCPConfigPath(logPath))
+	if err != nil {
+		t.Fatalf("read claude MCP config: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		`"local-index"`,
+		`"type": "stdio"`,
+		`"command": "./tools/local-index"`,
+		`"shared-read"`,
+		`"type": "http"`,
+		`"url": "https://mcp.example.com/shared"`,
+		`"Authorization": "Bearer ${SHARED_MCP_TOKEN}"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("claude MCP config missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "secret") {
+		t.Fatalf("claude MCP config should not contain hardcoded secrets:\n%s", text)
 	}
 }
 

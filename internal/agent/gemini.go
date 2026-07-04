@@ -24,6 +24,7 @@ func init() {
 }
 
 func BuildGeminiArgs(inv Invocation) []string {
+	mcpServers := mcpServersForArgs(inv)
 	args := []string{
 		"--prompt", inv.Prompt,
 	}
@@ -31,6 +32,9 @@ func BuildGeminiArgs(inv Invocation) []string {
 		args = append(args, "--skip-trust", "--extensions", "none")
 	} else {
 		args = append(args, "--yolo")
+	}
+	for _, server := range mcpServers {
+		args = append(args, "--allowed-mcp-server-names", strings.TrimSpace(server.Name))
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "-m", inv.Model)
@@ -44,6 +48,10 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("gemini log path is required")
 	}
+	mcpServers, err := mcpServersForInvocation(inv)
+	if err != nil {
+		return Result{ExitCode: -1}, fmt.Errorf("gemini MCP configuration: %w", err)
+	}
 
 	logFile, err := os.Create(inv.LogPath)
 	if err != nil {
@@ -54,16 +62,16 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if advisory := geminiEffortAdvisory(inv.Effort); advisory != "" {
 		fmt.Fprintln(logFile, advisory)
 	}
-	if inv.ReadOnly {
-		if err := os.WriteFile(geminiReadOnlySettingsPath(inv.LogPath), []byte(geminiReadOnlySettings), 0o644); err != nil {
-			return Result{ExitCode: -1}, fmt.Errorf("write gemini read-only settings: %w", err)
+	if inv.ReadOnly || len(mcpServers) > 0 {
+		if err := writeGeminiSettings(inv.LogPath, inv.ReadOnly, mcpServers); err != nil {
+			return Result{ExitCode: -1}, err
 		}
 	}
 
 	var stdout bytes.Buffer
 	cmd := exec.CommandContext(ctx, "gemini", BuildGeminiArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
-	if inv.ReadOnly {
+	if inv.ReadOnly || len(mcpServers) > 0 {
 		cmd.Env = append(os.Environ(), "GEMINI_CLI_SYSTEM_SETTINGS_PATH="+geminiReadOnlySettingsPath(inv.LogPath))
 	}
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
@@ -267,3 +275,94 @@ func geminiReadOnlySettingsPath(logPath string) string {
 }
 
 const geminiReadOnlySettings = `{"tools":{"core":[]}}`
+
+func writeGeminiSettings(logPath string, readOnly bool, servers []MCPServer) error {
+	data, err := geminiSettingsJSON(readOnly, servers)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(geminiReadOnlySettingsPath(logPath), data, 0o600); err != nil {
+		return fmt.Errorf("write gemini settings: %w", err)
+	}
+	return nil
+}
+
+func geminiSettingsJSON(readOnly bool, servers []MCPServer) ([]byte, error) {
+	if readOnly && len(servers) == 0 {
+		return []byte(geminiReadOnlySettings), nil
+	}
+
+	settings := geminiSettings{}
+	if readOnly {
+		settings.Tools = &geminiTools{Core: []string{}}
+	}
+	if len(servers) > 0 {
+		settings.MCPServers = make(map[string]geminiMCPServer, len(servers))
+		settings.MCP = &geminiMCPPolicy{Allowed: make([]string, 0, len(servers))}
+		for _, server := range servers {
+			converted, err := geminiMCPServerConfig(server)
+			if err != nil {
+				return nil, fmt.Errorf("render gemini MCP config for %q: %w", server.Name, err)
+			}
+			name := strings.TrimSpace(server.Name)
+			settings.MCPServers[name] = converted
+			settings.MCP.Allowed = append(settings.MCP.Allowed, name)
+		}
+	}
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("render gemini settings: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+type geminiSettings struct {
+	Tools      *geminiTools               `json:"tools,omitempty"`
+	MCPServers map[string]geminiMCPServer `json:"mcpServers,omitempty"`
+	MCP        *geminiMCPPolicy           `json:"mcp,omitempty"`
+}
+
+type geminiTools struct {
+	Core []string `json:"core"`
+}
+
+type geminiMCPPolicy struct {
+	Allowed []string `json:"allowed,omitempty"`
+}
+
+type geminiMCPServer struct {
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	HTTPURL string            `json:"httpUrl,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+func geminiMCPServerConfig(server MCPServer) (geminiMCPServer, error) {
+	transport, err := mcpServerTransport(server)
+	if err != nil {
+		return geminiMCPServer{}, err
+	}
+	switch transport {
+	case "stdio":
+		return geminiMCPServer{
+			Type:    "stdio",
+			Command: strings.TrimSpace(server.Command),
+			Args:    append([]string(nil), server.Args...),
+		}, nil
+	case "http":
+		config := geminiMCPServer{
+			Type:    "http",
+			HTTPURL: strings.TrimSpace(server.URL),
+		}
+		if mcpAuthConfigured(server.Auth) {
+			config.Headers = map[string]string{
+				strings.TrimSpace(server.Auth.Header): mcpAuthHeaderValue(server.Auth),
+			}
+		}
+		return config, nil
+	default:
+		return geminiMCPServer{}, fmt.Errorf("unsupported transport %q", server.Transport)
+	}
+}
