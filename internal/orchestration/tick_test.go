@@ -180,6 +180,57 @@ func TestTickConfiguredEvidenceSurfacesInJSONAndText(t *testing.T) {
 	}
 }
 
+func TestTickRenderedArtifactsSurfaceInJSONAndText(t *testing.T) {
+	opts := reviewReadyTickOptions(t.TempDir(), 34, "https://github.com/owner/repo/pull/340")
+	artifact := loopreview.RenderedArtifact{
+		Source:         "domain.evidence.producer",
+		Status:         "available",
+		DeclaredOutput: "out/report.pdf",
+		Path:           "out/report.pdf",
+		Kind:           "pdf",
+		Bytes:          1234,
+		Summary:        "PDF binary summary: version=1.7 bytes=1234 sha256=abc",
+	}
+	opts.Loopreview = func(context.Context, loopreview.Options) (loopreview.Result, error) {
+		result := tickLoopreview(loopreview.VerdictPass, "review passed with rendered artifact")
+		result.Verdict.RenderedArtifacts = []loopreview.RenderedArtifact{artifact}
+		return result, nil
+	}
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if len(report.Reviews) != 1 || !reflect.DeepEqual(report.Reviews[0].RenderedArtifacts, []loopreview.RenderedArtifact{artifact}) {
+		t.Fatalf("review rendered artifacts = %#v, want %#v", report.Reviews, artifact)
+	}
+
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	for _, want := range []string{
+		`"rendered_artifacts"`,
+		`"source": "domain.evidence.producer"`,
+		`"path": "out/report.pdf"`,
+		`"kind": "pdf"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing %q:\n%s", want, string(data))
+		}
+	}
+
+	text := RenderTickText(report)
+	for _, want := range []string{
+		"rendered_artifact: domain.evidence.producer available path=out/report.pdf",
+		"summary=PDF binary summary: version=1.7 bytes=1234 sha256=abc",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("tick text missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestTickConfiguredEvidenceAbsentOmitsJSONAndText(t *testing.T) {
 	opts := reviewReadyTickOptions(t.TempDir(), 32, "https://github.com/owner/repo/pull/320")
 

@@ -142,6 +142,7 @@ type TickReviewResult struct {
 	SpecConformance    string                         `json:"spec_conformance,omitempty"`
 	Evidence           string                         `json:"evidence,omitempty"`
 	ConfiguredEvidence []config.EvidenceArtifact      `json:"configured_evidence,omitempty"`
+	RenderedArtifacts  []loopreview.RenderedArtifact  `json:"rendered_artifacts,omitempty"`
 	Findings           []loopreview.Finding           `json:"findings"`
 	Error              string                         `json:"error,omitempty"`
 	Attestation        *attestation.AttestationRecord `json:"attestation,omitempty"`
@@ -491,11 +492,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 			})
 			continue
 		}
-		review.Verdict = result.Verdict.Verdict
-		review.SpecConformance = result.Verdict.SpecConformance
-		review.Evidence = result.Verdict.Evidence
-		review.Findings = result.Verdict.Findings
-		review.Attestation = result.Verdict.Attestation
+		review = tickReviewResultFromLoopreview(item.Issue, item.PR, prNumber, result)
 		tickReport.Reviews = append(tickReport.Reviews, review)
 		switch result.Verdict.Verdict {
 		case loopreview.VerdictPass:
@@ -837,14 +834,15 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 
 func tickReviewResultFromLoopreview(issueNumber int, pr string, prNumber int, result loopreview.Result) TickReviewResult {
 	return TickReviewResult{
-		Issue:           issueNumber,
-		PR:              pr,
-		PRNumber:        prNumber,
-		Verdict:         result.Verdict.Verdict,
-		SpecConformance: result.Verdict.SpecConformance,
-		Evidence:        result.Verdict.Evidence,
-		Findings:        append([]loopreview.Finding(nil), result.Verdict.Findings...),
-		Attestation:     result.Verdict.Attestation,
+		Issue:             issueNumber,
+		PR:                pr,
+		PRNumber:          prNumber,
+		Verdict:           result.Verdict.Verdict,
+		SpecConformance:   result.Verdict.SpecConformance,
+		Evidence:          result.Verdict.Evidence,
+		RenderedArtifacts: copyRenderedArtifacts(result.Verdict.RenderedArtifacts),
+		Findings:          append([]loopreview.Finding(nil), result.Verdict.Findings...),
+		Attestation:       result.Verdict.Attestation,
 	}
 }
 
@@ -1468,6 +1466,7 @@ func RenderTickText(report TickReport) string {
 				fmt.Fprintf(&out, "  evidence: %s\n", review.Evidence)
 			}
 			renderTickConfiguredEvidence(&out, review.ConfiguredEvidence)
+			renderTickRenderedArtifacts(&out, review.RenderedArtifacts)
 			if strings.TrimSpace(review.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", review.Error)
 			}
@@ -1642,6 +1641,7 @@ func normalizeTickReport(report TickReport) TickReport {
 		if report.Reviews[i].Findings == nil {
 			report.Reviews[i].Findings = []loopreview.Finding{}
 		}
+		report.Reviews[i].RenderedArtifacts = normalizeRenderedArtifacts(report.Reviews[i].RenderedArtifacts)
 	}
 	if report.RiskGates == nil {
 		report.RiskGates = []TickRiskGateResult{}
@@ -1828,6 +1828,10 @@ func copyConfiguredEvidence(evidence []config.EvidenceArtifact) []config.Evidenc
 	return append([]config.EvidenceArtifact(nil), evidence...)
 }
 
+func copyRenderedArtifacts(artifacts []loopreview.RenderedArtifact) []loopreview.RenderedArtifact {
+	return append([]loopreview.RenderedArtifact(nil), artifacts...)
+}
+
 func tickHasReportTarget(issue int, pr string) bool {
 	return issue > 0 || strings.TrimSpace(pr) != ""
 }
@@ -1853,6 +1857,61 @@ func renderTickConfiguredEvidence(out *bytes.Buffer, evidence []config.EvidenceA
 		}
 		fmt.Fprintf(out, "  configured_evidence: %s %s\n", item.ProjectType, strings.Join(parts, " "))
 	}
+}
+
+func renderTickRenderedArtifacts(out *bytes.Buffer, artifacts []loopreview.RenderedArtifact) {
+	artifacts = normalizeRenderedArtifacts(artifacts)
+	for _, artifact := range artifacts {
+		parts := make([]string, 0, 6)
+		if artifact.Path != "" {
+			parts = append(parts, "path="+formatTickEvidenceValue(artifact.Path))
+		}
+		if artifact.DeclaredOutput != "" && artifact.DeclaredOutput != artifact.Path {
+			parts = append(parts, "declared_output="+formatTickEvidenceValue(artifact.DeclaredOutput))
+		}
+		if artifact.Kind != "" {
+			parts = append(parts, "kind="+formatTickEvidenceValue(artifact.Kind))
+		}
+		if artifact.Bytes > 0 {
+			parts = append(parts, fmt.Sprintf("bytes=%d", artifact.Bytes))
+		}
+		if artifact.Summary != "" {
+			parts = append(parts, "summary="+formatTickEvidenceValue(artifact.Summary))
+		}
+		if artifact.Error != "" {
+			parts = append(parts, "error="+formatTickEvidenceValue(artifact.Error))
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		fmt.Fprintf(out, "  rendered_artifact: %s %s %s\n", artifact.Source, artifact.Status, strings.Join(parts, " "))
+	}
+}
+
+func normalizeRenderedArtifacts(artifacts []loopreview.RenderedArtifact) []loopreview.RenderedArtifact {
+	out := make([]loopreview.RenderedArtifact, 0, len(artifacts))
+	for _, item := range artifacts {
+		item.Source = strings.TrimSpace(item.Source)
+		item.Status = strings.TrimSpace(item.Status)
+		item.DeclaredOutput = strings.TrimSpace(item.DeclaredOutput)
+		item.Path = strings.TrimSpace(item.Path)
+		item.Kind = strings.TrimSpace(item.Kind)
+		item.MediaType = strings.TrimSpace(item.MediaType)
+		item.SHA256 = strings.TrimSpace(item.SHA256)
+		item.Summary = strings.TrimSpace(item.Summary)
+		item.Error = strings.TrimSpace(item.Error)
+		if item.Source == "" && item.Path == "" && item.Summary == "" && item.Error == "" {
+			continue
+		}
+		if item.Status == "" {
+			item.Status = "available"
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func formatTickEvidenceValue(value string) string {
