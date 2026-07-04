@@ -20,7 +20,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -293,18 +295,24 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		return Result{}, err
 	}
 	resilience := cfg.Resilience
+	domainPolicy, err := resolveDomainWorkerPolicy(ctx, repoPath, opts.BaseBranch, opts.ConfigFromBase, cfg)
+	if err != nil {
+		return Result{}, err
+	}
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
-		WorktreePath: worktreePath,
-		Prompt:       prompt,
-		LogPath:      logPath,
-		Stderr:       warnings,
-		Model:        opts.Model,
-		Effort:       opts.Effort,
-		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
-		StallTimeout: config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
-		RunID:        opts.RunID,
-		Role:         "worker",
-		MCPServers:   mcpServers,
+		WorktreePath:    worktreePath,
+		Prompt:          prompt,
+		LogPath:         logPath,
+		Stderr:          warnings,
+		Model:           opts.Model,
+		Effort:          opts.Effort,
+		HardCap:         config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
+		LivenessMode:    domainPolicy.AgentLivenessMode(),
+		LivenessCommand: domainPolicy.LivenessCommand,
+		RunID:           opts.RunID,
+		Role:            "worker",
+		MCPServers:      mcpServers,
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int
@@ -323,6 +331,37 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
 			"provider":    opts.Provider,
 		})
+		if domainPolicy.PartialWorkMode == partialWorkModeReportOnly {
+			dirty, dirtyErr := deps.Git.StatusPorcelain(ctx, worktreePath)
+			if dirtyErr != nil {
+				return Result{
+					OK:          false,
+					Issue:       opts.IssueNumber,
+					Branch:      opts.Branch,
+					RunID:       opts.RunID,
+					AttemptPath: attemptPath,
+					Status:      "hung",
+					ExitCode:    agentResult.ExitCode,
+					LogBytes:    fileSize(logPath),
+				}, fmt.Errorf("%s; report-only partial-work check failed: %w", hungErr, dirtyErr)
+			}
+			if strings.TrimSpace(dirty) != "" {
+				fmt.Fprintf(warnings, "[loopcoder] domain.partial_work.mode=report-only preserved partial work at %s; no harvest PR opened\n", scratch)
+				tracker.appendEvent("worker_partial_work_reported", "hung", map[string]string{
+					"mode": "report-only",
+				})
+			}
+			return Result{
+				OK:          false,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				AttemptPath: attemptPath,
+				Status:      "hung",
+				ExitCode:    agentResult.ExitCode,
+				LogBytes:    fileSize(logPath),
+			}, errors.New(hungErr)
+		}
 		harvest, harvestErr := harvestHungWorktree(ctx, hungHarvestOptions{
 			repoPath:     repoPath,
 			runID:        opts.RunID,
@@ -790,6 +829,111 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+const (
+	partialWorkModeHarvestNeedsHuman = "harvest-needs-human"
+	partialWorkModeReportOnly        = "report-only"
+)
+
+type domainWorkerPolicy struct {
+	PartialWorkMode string
+	LivenessMode    supervisedexec.LivenessMode
+	LivenessCommand string
+}
+
+func (p domainWorkerPolicy) AgentLivenessMode() string {
+	if p.LivenessMode == "" || p.LivenessMode == supervisedexec.LivenessModeWorktreeMTime {
+		return ""
+	}
+	return string(p.LivenessMode)
+}
+
+func resolveDomainWorkerPolicy(ctx context.Context, repoPath, baseBranch string, configFromBase bool, cfg config.Config) (domainWorkerPolicy, error) {
+	policy := domainWorkerPolicy{
+		PartialWorkMode: partialWorkModeHarvestNeedsHuman,
+		LivenessMode:    supervisedexec.LivenessModeWorktreeMTime,
+	}
+
+	switch mode := strings.ToLower(strings.TrimSpace(cfg.Domain.PartialWork.Mode)); mode {
+	case "", partialWorkModeHarvestNeedsHuman:
+		policy.PartialWorkMode = partialWorkModeHarvestNeedsHuman
+	case partialWorkModeReportOnly:
+		policy.PartialWorkMode = partialWorkModeReportOnly
+	default:
+		return domainWorkerPolicy{}, fmt.Errorf("invalid delivery config: domain.partial_work.mode must be %q or %q, got %q", partialWorkModeHarvestNeedsHuman, partialWorkModeReportOnly, cfg.Domain.PartialWork.Mode)
+	}
+
+	switch mode := strings.ToLower(strings.TrimSpace(cfg.Domain.Liveness.Mode)); mode {
+	case "", string(supervisedexec.LivenessModeWorktreeMTime):
+		policy.LivenessMode = supervisedexec.LivenessModeWorktreeMTime
+	case string(supervisedexec.LivenessModeLogOnly):
+		policy.LivenessMode = supervisedexec.LivenessModeLogOnly
+	case string(supervisedexec.LivenessModeCustom):
+		command, err := readDomainLivenessCommand(ctx, repoPath, baseBranch, configFromBase)
+		if err != nil {
+			return domainWorkerPolicy{}, err
+		}
+		if strings.TrimSpace(command) == "" {
+			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.command is required when domain.liveness.mode is custom")
+		}
+		policy.LivenessMode = supervisedexec.LivenessModeCustom
+		policy.LivenessCommand = strings.TrimSpace(command)
+	default:
+		return domainWorkerPolicy{}, fmt.Errorf("invalid delivery config: domain.liveness.mode must be %q, %q, or %q, got %q", supervisedexec.LivenessModeWorktreeMTime, supervisedexec.LivenessModeLogOnly, supervisedexec.LivenessModeCustom, cfg.Domain.Liveness.Mode)
+	}
+
+	return policy, nil
+}
+
+func readDomainLivenessCommand(ctx context.Context, repoPath, baseBranch string, configFromBase bool) (string, error) {
+	data, err := readDeliveryConfigForDomainPolicy(ctx, repoPath, baseBranch, configFromBase)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", nil
+	}
+	var raw struct {
+		Domain struct {
+			Liveness struct {
+				Command string `yaml:"command"`
+			} `yaml:"liveness"`
+		} `yaml:"domain"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("parse domain.liveness.command: %w", err)
+	}
+	return strings.TrimSpace(raw.Domain.Liveness.Command), nil
+}
+
+func readDeliveryConfigForDomainPolicy(ctx context.Context, repoPath, baseBranch string, configFromBase bool) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Join(repoPath, ".delivery.yml"))
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read delivery config for domain policy: %w", err)
+	}
+	if !configFromBase {
+		return nil, nil
+	}
+	content, err := gitutil.New().Show(ctx, repoPath, normalizeDomainPolicyBaseBranch(baseBranch)+":.delivery.yml")
+	if err != nil {
+		if gitutil.IsPathAbsentOnRef(err, ".delivery.yml") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read base delivery config for domain policy: %w", err)
+	}
+	return []byte(content), nil
+}
+
+func normalizeDomainPolicyBaseBranch(baseBranch string) string {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		return "main"
+	}
+	return baseBranch
 }
 
 func MarshalResult(result Result) ([]byte, error) {

@@ -20,13 +20,15 @@ var runSupervised = supervisedexec.Run
 
 func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, provider string) (supervisedexec.Result, error) {
 	opts := supervisedexec.Options{
-		HardCap:      inv.HardCap,
-		StallTimeout: inv.StallTimeout,
-		LogPath:      inv.LogPath,
-		WorktreePath: inv.WorktreePath,
-		Stderr:       inv.Stderr,
-		RunID:        inv.RunID,
-		Role:         inv.Role,
+		HardCap:         inv.HardCap,
+		StallTimeout:    inv.StallTimeout,
+		LogPath:         inv.LogPath,
+		WorktreePath:    inv.WorktreePath,
+		Stderr:          inv.Stderr,
+		RunID:           inv.RunID,
+		Role:            inv.Role,
+		LivenessMode:    supervisedexec.LivenessMode(inv.LivenessMode),
+		LivenessCommand: inv.LivenessCommand,
 	}
 	if inv.StallTimeout > 0 {
 		opts.OnStall = appendStallLine(inv.LogPath, provider)

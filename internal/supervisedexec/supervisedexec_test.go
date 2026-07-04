@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -176,6 +177,113 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 				t.Fatalf("Elapsed = %s, want >= %s so worktree activity crossed the stall window", result.Elapsed, tt.minElapsed)
 			}
 		})
+	}
+}
+
+func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "worker.log")
+	worktreePath := filepath.Join(root, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	cmd := helperCommand(t, "write-worktree-loop", logPath, worktreePath, "100ms", "20", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 400 * time.Millisecond,
+		LogPath:      logPath,
+		WorktreePath: worktreePath,
+		LivenessMode: LivenessModeLogOnly,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v when log-only ignores worktree writes", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+}
+
+func TestRunCustomLivenessExtendsStallWindow(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "write-then-sleep", logPath, "1200ms")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:                10 * time.Second,
+		StallTimeout:           800 * time.Millisecond,
+		LogPath:                logPath,
+		LivenessMode:           LivenessModeCustom,
+		LivenessCommand:        "echo alive",
+		LivenessCommandHardCap: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v because custom liveness reports progress", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile log: %v", err)
+	}
+	for _, want := range []string{"custom liveness ok", "alive"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("custom liveness log missing %q:\n%s", want, string(data))
+		}
+	}
+}
+
+func TestRunCustomLivenessFailureDoesNotSelfSignal(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:                10 * time.Second,
+		StallTimeout:           300 * time.Millisecond,
+		LogPath:                logPath,
+		LivenessMode:           LivenessModeCustom,
+		LivenessCommand:        shellExitCommand(1),
+		LivenessCommandHardCap: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v when custom liveness fails", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile log: %v", err)
+	}
+	if !strings.Contains(string(data), "custom liveness failed") {
+		t.Fatalf("log missing failed custom liveness probe:\n%s", string(data))
+	}
+}
+
+func TestRunCustomLivenessRequiresCommand(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "exit", "0")
+
+	_, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: time.Millisecond,
+		LogPath:      logPath,
+		LivenessMode: LivenessModeCustom,
+	})
+	if err == nil {
+		t.Fatal("Run error = nil, want missing custom liveness command error")
+	}
+	if !strings.Contains(err.Error(), "LivenessCommand is required") {
+		t.Fatalf("Run error = %v, want LivenessCommand message", err)
 	}
 }
 
@@ -404,6 +512,13 @@ func helperCommand(t *testing.T, args ...string) *exec.Cmd {
 	cmd := exec.Command(os.Args[0], cmdArgs...)
 	cmd.Env = append(os.Environ(), "GO_WANT_SUPERVISEDEXEC_HELPER=1")
 	return cmd
+}
+
+func shellExitCommand(code int) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("exit /b %d", code)
+	}
+	return fmt.Sprintf("exit %d", code)
 }
 
 func helperSeparatorIndex(args []string) int {
