@@ -90,6 +90,92 @@ func TestBuildCodexArgs(t *testing.T) {
 	}
 }
 
+func TestBuildCodexArgsWithMCPServers(t *testing.T) {
+	got := BuildCodexArgs(Invocation{
+		WorktreePath: "wt",
+		LogPath:      "codex.log",
+		Role:         "worker",
+		MCPServers: []MCPServer{
+			{
+				Name:      "worker-index",
+				Transport: "stdio",
+				Command:   "./tools/worker-index",
+				Args:      []string{"--root", "."},
+				Roles:     []string{"worker"},
+			},
+			{
+				Name:      "shared-read",
+				Transport: "http",
+				URL:       "https://mcp.example.com/shared",
+				Auth: MCPAuth{
+					Header: "Authorization",
+					Env:    "SHARED_MCP_TOKEN",
+				},
+				Roles:    []string{"worker", "verifier"},
+				ReadOnly: true,
+			},
+			{
+				Name:      "verifier-only",
+				Transport: "stdio",
+				Command:   "./tools/verifier-only",
+				Roles:     []string{"verifier"},
+				ReadOnly:  true,
+			},
+		},
+	})
+	want := []string{
+		"exec",
+		"--cd", "wt",
+		"--dangerously-bypass-approvals-and-sandbox",
+		"--skip-git-repo-check",
+		"--ignore-user-config",
+		"-c", `mcp_servers."worker-index".command="./tools/worker-index"`,
+		"-c", `mcp_servers."worker-index".args=["--root", "."]`,
+		"-c", `mcp_servers."shared-read".url="https://mcp.example.com/shared"`,
+		"-c", `mcp_servers."shared-read".bearer_token_env_var="SHARED_MCP_TOKEN"`,
+		"-o", "summary.txt",
+		"-",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildCodexArgs() = %#v, want %#v", got, want)
+	}
+	assertArgsDoNotContain(t, got, "verifier-only")
+}
+
+func TestBuildCodexArgsWithEnvHTTPHeader(t *testing.T) {
+	got := BuildCodexArgs(Invocation{
+		WorktreePath: "wt",
+		LogPath:      "codex.log",
+		Role:         "worker",
+		MCPServers: []MCPServer{{
+			Name:      "custom-auth",
+			Transport: "http",
+			URL:       "https://mcp.example.com/custom",
+			Auth: MCPAuth{
+				Header: "X-Api-Key",
+				Env:    "CUSTOM_MCP_TOKEN",
+			},
+			Roles: []string{"worker"},
+		}},
+	})
+	wantContains := []string{
+		`mcp_servers."custom-auth".url="https://mcp.example.com/custom"`,
+		`mcp_servers."custom-auth".env_http_headers."X-Api-Key"="CUSTOM_MCP_TOKEN"`,
+	}
+	for _, want := range wantContains {
+		found := false
+		for _, arg := range got {
+			if arg == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("BuildCodexArgs() = %#v, want arg %q", got, want)
+		}
+	}
+}
+
 func TestBuildCodexReadOnlyVerifierArgs(t *testing.T) {
 	schema := `{"type":"object"}`
 	got := BuildCodexArgs(Invocation{

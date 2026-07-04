@@ -100,6 +100,84 @@ func TestBuildGeminiArgs(t *testing.T) {
 	}
 }
 
+func TestBuildGeminiArgsWithMCPServers(t *testing.T) {
+	got := BuildGeminiArgs(Invocation{
+		Prompt: "do the work",
+		Role:   "worker",
+		MCPServers: []MCPServer{
+			{
+				Name:      "worker-index",
+				Transport: "stdio",
+				Command:   "./tools/worker-index",
+				Args:      []string{"--root", "."},
+				Roles:     []string{"worker"},
+			},
+			{
+				Name:      "shared-read",
+				Transport: "http",
+				URL:       "https://mcp.example.com/shared",
+				Roles:     []string{"worker", "verifier"},
+				ReadOnly:  true,
+			},
+		},
+	})
+	want := []string{
+		"--prompt", "do the work",
+		"--yolo",
+		"--allowed-mcp-server-names", "worker-index",
+		"--allowed-mcp-server-names", "shared-read",
+		"--output-format", "json",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildGeminiArgs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGeminiSettingsJSONWithReadOnlyMCP(t *testing.T) {
+	data, err := geminiSettingsJSON(true, []MCPServer{
+		{
+			Name:      "local-index",
+			Transport: "stdio",
+			Command:   "./tools/local-index",
+			Args:      []string{"--root", "."},
+			ReadOnly:  true,
+		},
+		{
+			Name:      "shared-read",
+			Transport: "http",
+			URL:       "https://mcp.example.com/shared",
+			Auth: MCPAuth{
+				Header: "Authorization",
+				Env:    "SHARED_MCP_TOKEN",
+			},
+			ReadOnly: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("geminiSettingsJSON returned error: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		`"tools": {`,
+		`"core": []`,
+		`"mcpServers": {`,
+		`"local-index"`,
+		`"command": "./tools/local-index"`,
+		`"shared-read"`,
+		`"type": "http"`,
+		`"httpUrl": "https://mcp.example.com/shared"`,
+		`"Authorization": "Bearer ${SHARED_MCP_TOKEN}"`,
+		`"allowed": [`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("gemini settings missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "secret") {
+		t.Fatalf("gemini settings should not contain hardcoded secrets:\n%s", text)
+	}
+}
+
 func TestGeminiEffortAdvisory(t *testing.T) {
 	got := geminiEffortAdvisory(" high ")
 	for _, want := range []string{"advisory", "gemini ignores effort \"high\"", "no reasoning-effort knob"} {
