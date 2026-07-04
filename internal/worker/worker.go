@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
+	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -279,7 +280,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
+	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
 		BaseBranch:     opts.BaseBranch,
 		ConfigFromBase: opts.ConfigFromBase,
 		Warnings:       warnings,
@@ -287,6 +288,11 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if err != nil {
 		return Result{}, err
 	}
+	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
+	if err != nil {
+		return Result{}, err
+	}
+	resilience := cfg.Resilience
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
@@ -298,6 +304,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		StallTimeout: config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
 		RunID:        opts.RunID,
 		Role:         "worker",
+		MCPServers:   mcpServers,
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int

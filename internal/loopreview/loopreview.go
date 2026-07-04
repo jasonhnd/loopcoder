@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
+	"github.com/jasonhnd/loopcoder/internal/mcp"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -249,6 +250,10 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
 		return Result{}, err
 	}
+	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleVerifier, true)
+	if err != nil {
+		return Result{}, err
+	}
 
 	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
@@ -263,6 +268,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		StallTimeout: config.DurationSeconds(resilience.Verifier.StallTimeoutSeconds, VerifierStallTimeout),
 		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
 		Role:         "verifier",
+		MCPServers:   mcpServers,
 	})
 	if agentResult.Hung {
 		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)

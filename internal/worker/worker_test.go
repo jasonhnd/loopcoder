@@ -321,6 +321,90 @@ This implementation detail should stay out of the prompt.
 	}
 }
 
+func TestDispatchPassesConfiguredWorkerMCPServers(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+mcp:
+  servers:
+    - name: worker-index
+      transport: stdio
+      command: ./tools/worker-index
+      args: ["--root", "."]
+      roles: [worker]
+      read_only: false
+    - name: shared-read
+      transport: http
+      url: https://mcp.example.com/shared
+      auth:
+        header: Authorization
+        env: SHARED_MCP_TOKEN
+      roles: [worker, verifier]
+      read_only: true
+    - name: verifier-only
+      transport: stdio
+      command: ./tools/verifier-only
+      roles: [verifier]
+      read_only: true
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented MCP.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 465,
+		IssueTitle:  "MCP invocation contract",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/465"}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+
+	servers := fakeAgent.invocation.MCPServers
+	if len(servers) != 2 {
+		t.Fatalf("MCPServers = %#v, want worker-index and shared-read", servers)
+	}
+	if servers[0].Name != "worker-index" || servers[0].Command != "./tools/worker-index" || servers[0].ReadOnly {
+		t.Fatalf("first MCP server = %#v, want writable worker-index", servers[0])
+	}
+	if len(servers[0].Args) != 2 || servers[0].Args[0] != "--root" || servers[0].Args[1] != "." {
+		t.Fatalf("worker-index args = %#v, want --root .", servers[0].Args)
+	}
+	if servers[1].Name != "shared-read" || servers[1].URL != "https://mcp.example.com/shared" || !servers[1].ReadOnly {
+		t.Fatalf("second MCP server = %#v, want read-only shared-read", servers[1])
+	}
+	if servers[1].Auth.Header != "Authorization" || servers[1].Auth.Env != "SHARED_MCP_TOKEN" {
+		t.Fatalf("shared-read auth = %#v, want env-backed Authorization", servers[1].Auth)
+	}
+}
+
 func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 	record := buildWorkerAttestation(Options{
 		IssueNumber: 101,

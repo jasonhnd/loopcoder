@@ -300,6 +300,21 @@ mcp:
 	}
 }
 
+func TestParseRejectsUnknownMCPRole(t *testing.T) {
+	_, err := Parse([]byte(`
+mcp:
+  servers:
+    - name: future
+      roles: [planner]
+`))
+	if err == nil {
+		t.Fatal("Parse returned nil error for unknown MCP role")
+	}
+	if !strings.Contains(err.Error(), "mcp.servers[0].roles") || !strings.Contains(err.Error(), "planner") {
+		t.Fatalf("Parse error = %v, want MCP role context", err)
+	}
+}
+
 func TestParseReadsConfiguredSections(t *testing.T) {
 	data := []byte(`
 version: 1
