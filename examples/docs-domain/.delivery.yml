@@ -1,0 +1,69 @@
+version: 1
+
+adapters:
+  worker: codex
+  verifier: claude
+  gate: human-merge
+
+ci:
+  checks:
+    - verify
+  tests:
+    - go test ./...
+  typecheck:
+    - go vet ./...
+  build:
+    - go build ./...
+
+domain:
+  name: docs
+  description: fixture corporate IR document production profile
+  skills:
+    paths:
+      - governance/**/skill.md
+    machine_library:
+      paths:
+        - machine-library/**/*.md
+    select:
+      - governance
+      - disclosure
+    prompt_budget_bytes: 2048
+  verification:
+    rubric:
+      paths:
+        - governance/qa-checklist.md
+      checklist:
+        - Rendered report text must match the approved governance spec.
+        - Disclosure notes must be present or explicitly marked not applicable.
+    review_packet_order:
+      - rendered_artifact
+      - rubric
+      - changed_files
+      - diff
+      - issue
+      - spec
+  evidence:
+    producer:
+      command: go run ./tools/docs_domain_tool.go render
+      outputs:
+        - out/report.txt
+      timeout_seconds: 30
+      include_in_loopreview: true
+  red_lines:
+    - category: disclosure-compliance
+      detail: disclosure or legal approval changes require human review
+      path_globs:
+        - disclosure/**
+  partial_work:
+    mode: report-only
+  liveness:
+    mode: worktree-mtime
+
+mcp:
+  servers:
+    - name: governance-index
+      transport: stdio
+      command: go
+      args: ["run", "./tools/docs_domain_tool.go", "mcp"]
+      roles: [worker, verifier]
+      read_only: true
