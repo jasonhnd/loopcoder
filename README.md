@@ -125,6 +125,9 @@ failure:
 - `3` means the `loopreview` command itself failed before or after a clean
   verdict, such as invalid flags, a bad `--repo`, configuration load failure,
   provider/git setup failure, or output/relay write failure.
+- `4` is reserved for the cross-command relay hard gate: a pending local-only
+  Worker/Verifier pretty block must be surfaced with `loopcoder relay flush`
+  before mechanical progress continues.
 
 `loopcoder status` renders delivery status from local `.loopcoder/` run state.
 Installed conductor hooks enforce the local flow: `conductor-relay-guard`

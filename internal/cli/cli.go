@@ -25,6 +25,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/relay"
+	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -89,6 +90,7 @@ var commands = []Command{
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
+	{Name: "relay", Summary: "flush or list pending local attestation relay blocks"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -103,7 +105,10 @@ var commands = []Command{
 	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
 }
 
-const loopreviewCommandFailureExitCode = 3
+const (
+	loopreviewCommandFailureExitCode = 3
+	relayGateExitCode                = 4
+)
 
 // Commands returns the registered subcommands in root help order.
 func Commands() []Command {
@@ -272,6 +277,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "dispatch" {
 		return runDispatch(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "relay" {
+		return runRelay(args[1:], stdout, stderr)
+	}
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
 	}
@@ -328,6 +336,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "skill" {
 		printSkillHelp(w)
+		return
+	}
+	if command.Name == "relay" {
+		printRelayHelp(w)
 		return
 	}
 
@@ -482,6 +494,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  1   clean verifier verdict: fail")
 		fmt.Fprintln(w, "  2   clean verifier verdict: needs-human")
 		fmt.Fprintln(w, "  3   command failure before/after a clean verdict (flags, repo, config, provider/git, or output error)")
+		fmt.Fprintln(w, "  4   pending local relay block; run `loopcoder relay flush` before mechanical progress")
 	}
 	if command.Name == "verify-local" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -544,6 +557,18 @@ func printLeaseHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --help             show command help")
 }
 
+func printRelayHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder relay flush --repo <path>")
+	fmt.Fprintln(w, "  loopcoder relay list --repo <path>")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flush or list pending local-only Worker/Verifier attestation relay blocks.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
+	fmt.Fprintln(w, "  --help          show command help")
+}
+
 func findCommand(name string) (Command, bool) {
 	for _, command := range commands {
 		if command.Name == name {
@@ -596,6 +621,81 @@ func printVersion(w io.Writer, build BuildInfo) {
 		runtime.GOOS,
 		runtime.GOARCH,
 	)
+}
+
+func runRelay(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "relay: expected flush or list")
+		printRelayHelp(stderr)
+		return 2
+	}
+	if isHelp(args[0]) {
+		printRelayHelp(stdout)
+		return 0
+	}
+
+	switch args[0] {
+	case "flush":
+		return runRelayFlush(args[1:], stdout, stderr)
+	case "list":
+		return runRelayList(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "relay: unknown subcommand %q\n", args[0])
+		printRelayHelp(stderr)
+		return 2
+	}
+}
+
+func runRelayFlush(args []string, stdout, stderr io.Writer) int {
+	repoPath, ok := parseRelayRepo("relay flush", args, stderr)
+	if !ok {
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "relay flush: %v\n", err)
+		return 2
+	}
+	relaygate.Flush(resolvedRepo, stdout)
+	return 0
+}
+
+func runRelayList(args []string, stdout, stderr io.Writer) int {
+	repoPath, ok := parseRelayRepo("relay list", args, stderr)
+	if !ok {
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "relay list: %v\n", err)
+		return 2
+	}
+	for _, rec := range relaygate.List(resolvedRepo) {
+		fmt.Fprintf(stdout, "role=%s pr=%d nonce=%s\n", rec.Role, rec.PRNumber, rec.Nonce)
+	}
+	return 0
+}
+
+func parseRelayRepo(name string, args []string, stderr io.Writer) (string, bool) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+
+	if err := fs.Parse(args); err != nil {
+		return "", false
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", name, fs.Arg(0))
+		return "", false
+	}
+	return repoPath, true
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -1467,6 +1567,9 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
 		return 2
 	}
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 	cfg, err := loadDeliveryConfig(resolvedRepo, "main", configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
@@ -2072,6 +2175,9 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "ready-set: %v\n", err)
 		return 2
 	}
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
@@ -2260,6 +2366,9 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	opts.RepoPath = resolvedRepo
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
@@ -2305,6 +2414,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 	if invocationID == "" {
 		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
 	}
+	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        result.RunID,
@@ -2315,7 +2425,17 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 		PR:           result.PR,
 		CreatedAt:    now,
 		Header:       record.Header(),
-		Pretty:       record.Pretty(attestation.PrettyOptions{Mode: mode}),
+		Pretty:       pretty,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = relaygate.Write(relaygate.WriteOptions{
+		RepoPath: opts.RepoPath,
+		RunID:    result.RunID,
+		Role:     string(record.Role),
+		PRNumber: prNumberFromPR(result.PR),
+		Block:    pretty,
 	})
 	return err
 }
@@ -2329,18 +2449,56 @@ func relayInvocationIDFromAttemptPath(attemptPath string) string {
 }
 
 func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
+	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+	runID := fmt.Sprintf("loopreview-pr-%d", opts.PRNumber)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
-		RunID:        fmt.Sprintf("loopreview-pr-%d", opts.PRNumber),
+		RunID:        runID,
 		InvocationID: fmt.Sprintf("loopreview-pr-%d-%d", opts.PRNumber, now.UTC().UnixNano()),
 		Command:      "loopreview",
 		Role:         attestation.RoleVerifier,
 		PRNumber:     opts.PRNumber,
 		CreatedAt:    now,
 		Header:       record.Header(),
-		Pretty:       record.Pretty(attestation.PrettyOptions{Mode: mode}),
+		Pretty:       pretty,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = relaygate.Write(relaygate.WriteOptions{
+		RepoPath: opts.RepoPath,
+		RunID:    runID,
+		Role:     string(attestation.RoleVerifier),
+		PRNumber: opts.PRNumber,
+		Block:    pretty,
 	})
 	return err
+}
+
+func prNumberFromPR(pr string) int {
+	value := strings.TrimSpace(pr)
+	if value == "" {
+		return 0
+	}
+	if idx := strings.LastIndex(value, "/pull/"); idx >= 0 {
+		value = value[idx+len("/pull/"):]
+	}
+	value = strings.TrimPrefix(value, "#")
+	var digits strings.Builder
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			break
+		}
+		digits.WriteRune(r)
+	}
+	if digits.Len() == 0 {
+		return 0
+	}
+	number, err := strconv.Atoi(digits.String())
+	if err != nil {
+		return 0
+	}
+	return number
 }
 
 func renderDispatch(w io.Writer, result worker.Result) error {
@@ -2805,6 +2963,9 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
 		return 2
 	}
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
@@ -3030,6 +3191,9 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	opts.RepoPath = resolvedRepo
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
@@ -3175,6 +3339,9 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.RepoPath = resolvedRepo
 	opts.Stderr = stderr
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
@@ -3269,6 +3436,16 @@ func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if hasPR == hasBranch {
 		fmt.Fprintln(stderr, "verify-local: exactly one of --pr-number or --branch is required")
 		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "verify-local: %v\n", err)
+		return 2
+	}
+	opts.RepoPath = resolvedRepo
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
 	}
 
 	result := deps.Verify(context.Background(), opts)
@@ -3393,6 +3570,9 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 2
+	}
+	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
+		return exitCode
 	}
 
 	report, err := runstatus.Load(runstatus.Options{
@@ -3550,4 +3730,31 @@ func resolveRepo(repoPath string) (string, error) {
 		return "", fmt.Errorf("repo path is not a directory: %s", absolute)
 	}
 	return absolute, nil
+}
+
+func checkRelayGate(repoPath string, stdout, stderr io.Writer) (int, bool) {
+	records := relaygate.Check(repoPath)
+	if len(records) == 0 {
+		return 0, false
+	}
+	if err := renderRelayGate(stdout, repoPath, records); err != nil {
+		fmt.Fprintf(stderr, "relay gate: write output: %v\n", err)
+		return 1, true
+	}
+	return relayGateExitCode, true
+}
+
+func renderRelayGate(w io.Writer, repoPath string, records []relaygate.Record) error {
+	if _, err := fmt.Fprintln(w, "loopcoder relay gate: pending local-only Worker/Verifier attestation block(s) must be relayed before this command can run."); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Run `loopcoder relay flush --repo %s` to print and acknowledge the pending block(s).\n\n", repoPath); err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if _, err := io.WriteString(w, rec.Block); err != nil {
+			return err
+		}
+	}
+	return nil
 }
