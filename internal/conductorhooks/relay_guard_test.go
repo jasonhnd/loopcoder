@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 const workerHeader = `[attestation] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`
@@ -98,11 +99,15 @@ func writeVerifierLedger(t *testing.T, root string) (ledgerPath, block string) {
 }
 
 func dispatchPostTool(root string, response map[string]any) map[string]any {
+	return dispatchPostToolForTool(root, "Bash", response)
+}
+
+func dispatchPostToolForTool(root, toolName string, response map[string]any) map[string]any {
 	return map[string]any{
 		"session_id":      "session-1",
 		"cwd":             root,
 		"hook_event_name": "PostToolUse",
-		"tool_name":       "Bash",
+		"tool_name":       toolName,
 		"tool_input": map[string]any{
 			"command": `loopcoder dispatch --repo . --issue-number 101 --issue-title "Implement"`,
 		},
@@ -111,15 +116,62 @@ func dispatchPostTool(root string, response map[string]any) map[string]any {
 }
 
 func loopreviewPostTool(root string, response map[string]any) map[string]any {
+	return loopreviewPostToolForTool(root, "Bash", response)
+}
+
+func loopreviewPostToolForTool(root, toolName string, response map[string]any) map[string]any {
 	return map[string]any{
 		"session_id":      "session-1",
 		"cwd":             root,
 		"hook_event_name": "PostToolUse",
-		"tool_name":       "Bash",
+		"tool_name":       toolName,
 		"tool_input": map[string]any{
 			"command": `loopcoder loopreview --repo . --pr-number 202`,
 		},
 		"tool_response": response,
+	}
+}
+
+func requireRelayRecordStatus(t *testing.T, root, stateDir, ledgerPath, wantStatus string) *relayRecord {
+	t.Helper()
+	statePath, err := stateFilePath("session-1", root, stateDir, relayStateSub)
+	if err != nil {
+		t.Fatalf("stateFilePath: %v", err)
+	}
+	state, err := readRelayState(statePath, "session-1")
+	if err != nil {
+		t.Fatalf("read relay state: %v", err)
+	}
+	cleanLedger := filepath.Clean(ledgerPath)
+	for _, rec := range state.Records {
+		if rec == nil || filepath.Clean(rec.LedgerPath) != cleanLedger {
+			continue
+		}
+		if rec.Status != wantStatus {
+			t.Fatalf("record status = %q, want %q (record=%#v)", rec.Status, wantStatus, rec)
+		}
+		return rec
+	}
+	t.Fatalf("ledger record %s not found in state: %#v", ledgerPath, state.Records)
+	return nil
+}
+
+func TestIsShellToolRecognizesSupportedToolNames(t *testing.T) {
+	cases := []struct {
+		toolName string
+		want     bool
+	}{
+		{"Bash", true},
+		{"PowerShell", true},
+		{"pwsh", true},
+		{"run_shell_command", true},
+		{"shell_command", true},
+		{"cmd", false},
+	}
+	for _, tc := range cases {
+		if got := isShellTool(tc.toolName); got != tc.want {
+			t.Errorf("isShellTool(%q) = %v, want %v", tc.toolName, got, tc.want)
+		}
 	}
 }
 
@@ -241,6 +293,123 @@ func TestRelaySwallowedVerifierBlockBlocksStop(t *testing.T) {
 	secondStop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
 	if secondStop.ExitCode != 0 {
 		t.Fatalf("expected second Stop exit 0, got %d", secondStop.ExitCode)
+	}
+}
+
+func TestRelayPowerShellToolRecordsDispatchAndLoopreview(t *testing.T) {
+	tests := []struct {
+		name        string
+		writeLedger func(*testing.T, string) (string, string)
+		input       func(string, map[string]any) map[string]any
+		wantRole    string
+		wantCommand string
+	}{
+		{
+			name:        "dispatch worker",
+			writeLedger: writeWorkerLedger,
+			input: func(root string, response map[string]any) map[string]any {
+				return dispatchPostToolForTool(root, "PowerShell", response)
+			},
+			wantRole:    "worker",
+			wantCommand: "dispatch",
+		},
+		{
+			name:        "loopreview verifier",
+			writeLedger: writeVerifierLedger,
+			input: func(root string, response map[string]any) map[string]any {
+				return loopreviewPostToolForTool(root, "PowerShell", response)
+			},
+			wantRole:    "verifier",
+			wantCommand: "loopreview",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			stateDir := filepath.Join(root, "state")
+			env := relayHookEnv(stateDir)
+			ledgerPath, _ := tt.writeLedger(t, root)
+
+			postTool := RunRelayGuard(mustJSON(t, tt.input(root, map[string]any{
+				"stdout":    "completed without visible attestation\n",
+				"stderr":    "",
+				"exit_code": 0,
+			})), Options{Env: mapEnv(env)})
+			if postTool.ExitCode != 0 {
+				t.Fatalf("expected PostToolUse exit 0, got %d", postTool.ExitCode)
+			}
+
+			rec := requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+			if rec.Role != tt.wantRole || rec.Command != tt.wantCommand {
+				t.Fatalf("record role/command = %s/%s, want %s/%s", rec.Role, rec.Command, tt.wantRole, tt.wantCommand)
+			}
+		})
+	}
+}
+
+func TestRelayBackgroundRunRecordsPendingAndStopBlocks(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, block := writeWorkerLedger(t, root)
+
+	postTool := RunRelayGuard(mustJSON(t, dispatchPostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    "running in background\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{Env: mapEnv(env)})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+	requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+
+	stop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
+	if stop.ExitCode != 2 {
+		t.Fatalf("expected Stop exit 2, got %d", stop.ExitCode)
+	}
+	if !strings.Contains(stop.Stderr, strings.TrimRight(block, "\n")) {
+		t.Fatalf("expected Stop stderr to include pending ledger block; stderr=%q", stop.Stderr)
+	}
+}
+
+func TestRelayPendingBackgroundRunCanBeSurfacedByLaterEvent(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, _ := writeWorkerLedger(t, root)
+	firstSeen := time.Now()
+
+	postTool := RunRelayGuard(mustJSON(t, dispatchPostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    "running in background\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{
+		Env: mapEnv(env),
+		Now: func() time.Time { return firstSeen },
+	})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected background PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+	requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+
+	later := firstSeen.Add(time.Duration(recentLedgerGraceMs)*time.Millisecond + time.Minute)
+	surfaced := RunRelayGuard(mustJSON(t, dispatchPostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    workerHeader + "\n",
+		"stderr":    workerPretty + "\n",
+		"exit_code": 0,
+	})), Options{
+		Env: mapEnv(env),
+		Now: func() time.Time { return later },
+	})
+	if surfaced.ExitCode != 0 {
+		t.Fatalf("expected surfaced PostToolUse exit 0, got %d", surfaced.ExitCode)
+	}
+	requireRelayRecordStatus(t, root, stateDir, ledgerPath, "surfaced")
+
+	stop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
+	if stop.ExitCode != 0 {
+		t.Fatalf("expected Stop after later surfacing to allow, got %d (stderr=%q)", stop.ExitCode, stop.Stderr)
 	}
 }
 
