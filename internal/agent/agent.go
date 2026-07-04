@@ -26,6 +26,25 @@ type Invocation struct {
 	// place it in a per-run kill-group (spec 0390, Decision 11).
 	RunID string
 	Role  string
+	// MCPServers carries provider-neutral MCP declarations. Provider-specific
+	// flags and config files are still owned by each runner.
+	MCPServers []MCPServer
+}
+
+type MCPServer struct {
+	Name      string
+	Transport string
+	Command   string
+	Args      []string
+	URL       string
+	Auth      MCPAuth
+	Roles     []string
+	ReadOnly  bool
+}
+
+type MCPAuth struct {
+	Header string
+	Env    string
 }
 
 type Result struct {

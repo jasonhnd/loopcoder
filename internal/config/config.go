@@ -341,6 +341,9 @@ func Parse(data []byte) (Config, error) {
 	if err := validateGuardrailCircuitBreaker(cfg.Guardrails.CircuitBreaker); err != nil {
 		return Config{}, err
 	}
+	if err := validateMCP(cfg.MCP); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -413,6 +416,19 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 	}
 	if c.MaxNoProgressAttempts != nil && *c.MaxNoProgressAttempts <= 0 {
 		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_attempts must be greater than zero")
+	}
+	return nil
+}
+
+func validateMCP(m MCP) error {
+	for index, server := range m.Servers {
+		for _, role := range server.Roles {
+			switch strings.ToLower(strings.TrimSpace(role)) {
+			case "worker", "verifier":
+			default:
+				return fmt.Errorf("invalid delivery config: mcp.servers[%d].roles contains unknown role %q", index, role)
+			}
+		}
 	}
 	return nil
 }

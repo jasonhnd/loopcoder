@@ -1141,6 +1141,98 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 }
 
+func TestRunPassesConfiguredReadOnlyVerifierMCPServers(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+mcp:
+  servers:
+    - name: worker-only
+      transport: stdio
+      command: ./tools/worker-only
+      roles: [worker]
+      read_only: true
+    - name: verifier-write
+      transport: stdio
+      command: ./tools/verifier-write
+      roles: [verifier]
+      read_only: false
+    - name: verifier-read
+      transport: http
+      url: https://mcp.example.com/verifier
+      auth:
+        header: Authorization
+        env: VERIFIER_MCP_TOKEN
+      roles: [worker, verifier]
+      read_only: true
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n\nAcceptance criteria here.\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      465,
+			Title:       "MCP invocation contract",
+			HeadRefName: "loop/issue-465",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 465,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 465,
+			Title:  "MCP invocation contract",
+			Body:   "Implement per docs/specs/design.md.",
+		},
+		diff:  "diff --git a/internal/agent/agent.go b/internal/agent/agent.go\n",
+		files: []string{"internal/agent/agent.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   465,
+		Provider:   "claude",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass {
+		t.Fatalf("verdict = %q, want pass", result.Verdict.Verdict)
+	}
+	servers := fakeAgent.invocation.MCPServers
+	if len(servers) != 1 {
+		t.Fatalf("MCPServers = %#v, want only verifier-read", servers)
+	}
+	if servers[0].Name != "verifier-read" || servers[0].URL != "https://mcp.example.com/verifier" || !servers[0].ReadOnly {
+		t.Fatalf("verifier MCP server = %#v, want read-only verifier-read", servers[0])
+	}
+	if servers[0].Auth.Header != "Authorization" || servers[0].Auth.Env != "VERIFIER_MCP_TOKEN" {
+		t.Fatalf("verifier MCP auth = %#v, want env-backed Authorization", servers[0].Auth)
+	}
+}
+
 func TestRunDocFirstNewSpecCanPassWithoutMergedSpec(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
