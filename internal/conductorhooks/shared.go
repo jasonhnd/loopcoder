@@ -344,7 +344,7 @@ func isoTimestamp(t time.Time) string {
 
 func isShellTool(toolName string) bool {
 	switch toolName {
-	case "Bash", "run_shell_command", "shell_command":
+	case "Bash", "PowerShell", "pwsh", "run_shell_command", "shell_command":
 		return true
 	}
 	return false

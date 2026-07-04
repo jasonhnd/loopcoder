@@ -119,6 +119,10 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 		return allow()
 	}
 
+	responseText := collectStringsFromRaw(in.ToolResponse)
+	seenAt := isoTimestamp(now)
+	stateChanged := markSurfacedPendingRecords(state, enforced, responseText, seenAt)
+
 	cutoffMs := now.UnixMilli() - recentLedgerGraceMs
 	discovered, err := discoverLedgerRecords(in.CWD)
 	if err != nil {
@@ -139,12 +143,10 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 		records = append(records, rec)
 	}
 
-	if len(records) == 0 {
+	if len(records) == 0 && !stateChanged {
 		return allow()
 	}
 
-	responseText := collectStringsFromRaw(in.ToolResponse)
-	seenAt := isoTimestamp(now)
 	for _, rec := range records {
 		command := rec.command
 		if command == "" {
@@ -171,6 +173,28 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 		return allow()
 	}
 	return allow()
+}
+
+func markSurfacedPendingRecords(state *relayState, enforced *relayTarget, responseText, seenAt string) bool {
+	if responseText == "" {
+		return false
+	}
+	changed := false
+	for _, rec := range state.Records {
+		if rec == nil || rec.Status != "pending" || rec.Role != enforced.role {
+			continue
+		}
+		if rec.Command != "" && rec.Command != enforced.kind {
+			continue
+		}
+		if !containsSurfacedAttestation(responseText, ledgerRecord{role: rec.Role, header: rec.Header}) {
+			continue
+		}
+		rec.Status = "surfaced"
+		rec.UpdatedAt = seenAt
+		changed = true
+	}
+	return changed
 }
 
 // handleStop blocks completion when any recorded relay attestation is still

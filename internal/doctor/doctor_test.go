@@ -103,6 +103,54 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 			},
 		},
 		{
+			name: "old Bash-only PostToolUse matcher",
+			setup: func(env *fakeDoctorEnv) {
+				env.settingsFile = []byte(`{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-attest",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-relay-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-attest",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-relay-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}`)
+			},
+			want: StatusWarn,
+			contains: []string{
+				"missing loopcoder conductor hooks",
+				"matcher=Bash|PowerShell",
+				"run: loopcoder skill install",
+			},
+		},
+		{
 			name: "hooks present but loopcoder missing from PATH",
 			setup: func(env *fakeDoctorEnv) {
 				delete(env.paths, "loopcoder")
