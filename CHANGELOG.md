@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-04
+
+Generalize loopcoder from a code-delivery loop into a general autonomous-delivery engine for any verifiable, repo-based, AI-doable work -- documents, content, data, governance packets, reports, and code -- via configurable **domain profiles**, per [`docs/specs/0459-domain-profiles.md`](docs/specs/0459-domain-profiles.md). Code becomes the first domain profile, not the definition of the engine. The core loop (`tick`, `compile`, `dispatch`, `dispatch-wave`, `loopreview`, `risk-gate`, `promote`, guardrails, watchdog, relay, recovery) keeps its ordering and authority unchanged; 0.5.0 only adds optional plug points those existing stages consume. An absent or empty `domain` section behaves exactly like the 0.4.x code profile.
+
+### Added
+
+- **Domain profile bundle** -- a new optional top-level `.delivery.yml domain` section declares a project's domain as a bundle of plug points (skills, verification rubric, evidence producer, red lines, partial-work/liveness policy) plus an `mcp` section. All fields are additive, optional, snake_case, and `omitempty`/`Default()`-safe (0161 M3).
+- **Configurable skill sources** (plug point 1) -- `domain.skills` extends worker skill discovery with ordered repo globs (including recursive `**`), an optional machine-readable skill library, `select` filtering by normalized name/path-stem/tag, and a prompt byte budget. The `.claude/skills/*/SKILL.md` rule remains the default; discovery stays metadata-first and bounded (never inlines skill bodies past budget).
+- **Injectable verification rubric** (plug point 2) -- `domain.verification.rubric` copies repo QA-checklist files and inline checklist items into a bounded "Rubric" review-packet section, and `review_packet_order` configures top-level section ordering (docs profiles can put rendered artifact + rubric before diff excerpts). A missing configured rubric file is missing evidence and forces `needs-human`. The closed verdict enum and H5 exit-code split are preserved.
+- **Rendered-artifact evidence producer** (plug point 3) -- `domain.evidence.producer` runs a configured command in the PR worktree after worker output and before `loopreview`, collects an allow-list of declared outputs, and feeds a bounded rendered-artifact section into the verifier packet. `verification.browser` becomes a compatibility rendered-artifact producer class so document/data/content domains can feed their actual product to the verifier. A failed, timed-out, or absent declared output routes `needs-human`.
+- **Append-only domain red lines** (plug point 4) -- `.delivery.yml domain.red_lines[]` append to the deterministic risk-gate floor via the existing `AdditionalRedLines` path with strict matcher validation. Domain red lines may only add vetoes; they cannot lower, rename, or bypass the built-in destructive, build-not-green, or loopcoder-core red lines (0161 M2/M4).
+- **MCP servers** (plug point 5) -- an optional `mcp.servers` section plus a pure-append `MCPServers` field on `agent.Invocation` let workers and verifiers reach local stdio and external HTTP MCP servers. `roles` gates which invocations receive a server; remote auth must come from env vars or secret references (never hardcoded); loopcoder's local `read_only` classification -- not a server self-report -- decides verifier availability, and `Invocation.ReadOnly` remains the one permission boundary. Provider runners (codex/claude/gemini) translate invocation MCP servers into their native config and fail closed when `ReadOnly` cannot be represented safely.
+- **Configurable partial-work and liveness policy** -- `domain.partial_work.mode` (`harvest-needs-human` default, or `report-only`) and `domain.liveness.mode` (`worktree-mtime` default, `log-only`, or `custom`) make the 0.4.2 H1/H2 fold-ins domain-configurable without weakening hard caps, guardrails, relay, or the rule that salvaged work is never auto-merged.
+- **Docs-domain validation** -- an `examples/` docs domain profile plus validation proving the target end-to-end: governance spec, QA rubric, deterministic CI, rendered evidence, disclosure/compliance red lines, and promotion approval.
+
+### Notes
+
+- The core engine is unchanged: every plug point feeds an existing stage. The self-hosting guard (0161 M2/F4) classifies all domain-support machinery as loopcoder-core, routes it `needs-human`, and requires a human rebuild plus tick restart before it can affect a running loop -- so 0.5.0 was itself built through the 0.4.x loop under a human merge gate. Each of the nine code slices was built against spec 0459 and gated through `loopreview` (Opus 4.8 1M, read-only verifier, attestation verified) before landing.
+
 ## [0.4.2] - 2026-07-03
 
 ### Fixed
