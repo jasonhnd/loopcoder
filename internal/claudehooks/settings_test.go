@@ -25,8 +25,8 @@ func TestMergeSettingsInstallsPowerShellPostToolUseMatcher(t *testing.T) {
 	if !changed {
 		t.Fatal("MergeSettings changed = false, want true for empty settings")
 	}
-	if !strings.Contains(string(merged), `"matcher": "Bash|PowerShell"`) {
-		t.Fatalf("merged settings missing PowerShell matcher:\n%s", merged)
+	if !strings.Contains(string(merged), `"matcher": "Bash|PowerShell|pwsh"`) {
+		t.Fatalf("merged settings missing PowerShell/pwsh matcher:\n%s", merged)
 	}
 	missing, err := MissingHooks(merged)
 	if err != nil {

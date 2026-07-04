@@ -15,7 +15,7 @@ const (
 	SettingsRelPath = ".claude/settings.json"
 
 	hookTimeout             = 10
-	postToolUseShellMatcher = "Bash|PowerShell"
+	postToolUseShellMatcher = "Bash|PowerShell|pwsh"
 )
 
 // requiredHookNames are the conductor hook subcommands wired into a project's
@@ -127,7 +127,7 @@ func MergeSettings(data []byte) ([]byte, bool, error) {
 }
 
 // pruneStalePostToolUseMatchers removes loopcoder's own conductor hook commands
-// from older Bash-only PostToolUse entries after the current Bash|PowerShell
+// from older Bash-only PostToolUse entries after the current Bash|PowerShell|pwsh
 // entry has been installed. Unrelated user hook commands in those entries are
 // preserved.
 func pruneStalePostToolUseMatchers(hooks map[string]any) bool {

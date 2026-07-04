@@ -129,7 +129,7 @@ func TestInstallSkillMergesHookSettingsFreshAndIdempotent(t *testing.T) {
 	first := fsys.read(t, settingsPath)
 	assertNoMissingRequiredHooks(t, first)
 	assertHookCommandCounts(t, first, 2)
-	assertPostToolUseMatcher(t, first, "Bash|PowerShell")
+	assertPostToolUseMatcher(t, first, "Bash|PowerShell|pwsh")
 
 	result, err = InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, skillDepsForTest(fsys))
 	if err != nil {
@@ -143,7 +143,7 @@ func TestInstallSkillMergesHookSettingsFreshAndIdempotent(t *testing.T) {
 		t.Fatalf("settings changed on idempotent re-run:\nfirst=%s\nsecond=%s", first, second)
 	}
 	assertHookCommandCounts(t, second, 2)
-	assertPostToolUseMatcher(t, second, "Bash|PowerShell")
+	assertPostToolUseMatcher(t, second, "Bash|PowerShell|pwsh")
 }
 
 func TestInstallSkillPreservesExistingClaudeSettings(t *testing.T) {
@@ -193,7 +193,7 @@ func TestInstallSkillPreservesExistingClaudeSettings(t *testing.T) {
 	data := fsys.read(t, settingsPath)
 	assertNoMissingRequiredHooks(t, data)
 	assertHookCommandCounts(t, data, 2)
-	assertPostToolUseMatcher(t, data, "Bash|PowerShell")
+	assertPostToolUseMatcher(t, data, "Bash|PowerShell|pwsh")
 	if !strings.Contains(string(data), "Bash(git status)") {
 		t.Fatalf("settings lost unrelated permissions:\n%s", data)
 	}

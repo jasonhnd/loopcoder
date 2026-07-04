@@ -115,7 +115,8 @@ func Write(opts WriteOptions) (string, error) {
 	return path, nil
 }
 
-// Check returns pending records. It fails open: any read/parse error returns nil.
+// Check returns pending records. It fails open when the pending directory cannot
+// be read. Individual bad records are skipped by readPending.
 func Check(cwd string) []Record {
 	records, err := readPending(cwd)
 	if err != nil {
@@ -129,14 +130,25 @@ func List(cwd string) []Record {
 	return Check(cwd)
 }
 
-// Flush prints all pending blocks and acknowledges them. It is best-effort and
-// intentionally fail-open so it can serve as the escape valve.
-func Flush(cwd string, w io.Writer) {
+// Flush prints all pending blocks and acknowledges only records whose block was
+// successfully written. It is intentionally fail-open on read errors so it can
+// serve as the escape valve.
+func Flush(cwd string, w io.Writer) error {
 	records := Check(cwd)
-	for _, rec := range records {
-		_, _ = io.WriteString(w, rec.Block)
+	if len(records) == 0 {
+		_, err := fmt.Fprintln(w, "no pending relays")
+		return err
 	}
-	_ = Ack(cwd, records)
+	acknowledged := make([]Record, 0, len(records))
+	for _, rec := range records {
+		if _, err := io.WriteString(w, rec.Block); err != nil {
+			_ = Ack(cwd, acknowledged)
+			return fmt.Errorf("write pending relay %s: %w", rec.Nonce, err)
+		}
+		acknowledged = append(acknowledged, rec)
+	}
+	_ = Ack(cwd, acknowledged)
+	return nil
 }
 
 // Ack clears the supplied pending records.
@@ -172,21 +184,21 @@ func readPending(cwd string) ([]Record, error) {
 		path := filepath.Join(dir, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
-			return nil, err
+			continue
 		}
 		if info.Size() > maxRecordSize {
-			return nil, fmt.Errorf("pending relay record too large: %s", path)
+			continue
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		var rec Record
 		if err := json.Unmarshal(data, &rec); err != nil {
-			return nil, err
+			continue
 		}
 		if rec.Version != recordVersion || strings.TrimSpace(rec.Nonce) == "" || strings.TrimSpace(rec.Role) == "" || strings.TrimSpace(rec.Block) == "" {
-			return nil, fmt.Errorf("invalid pending relay record: %s", path)
+			continue
 		}
 		records = append(records, rec)
 	}

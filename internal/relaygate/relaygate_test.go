@@ -2,6 +2,7 @@ package relaygate
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,35 @@ func TestCheckFailsOpenOnMissingOrCorruptState(t *testing.T) {
 	}
 }
 
+func TestCheckSkipsBadFilesWithoutBypassingValidRecords(t *testing.T) {
+	repo := t.TempDir()
+	path, err := Write(WriteOptions{
+		RepoPath: repo,
+		RunID:    "run-test",
+		Role:     "worker",
+		PRNumber: 101,
+		Block:    testPrettyBlock,
+	})
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt pending: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "oversized.json"), bytes.Repeat([]byte("x"), maxRecordSize+1), 0o600); err != nil {
+		t.Fatalf("write oversized pending: %v", err)
+	}
+
+	records := Check(repo)
+	if len(records) != 1 {
+		t.Fatalf("Check returned %d records, want valid record only", len(records))
+	}
+	if records[0].Nonce != Nonce("run-test", 101, "worker") {
+		t.Fatalf("Check returned record %#v, want valid pending record", records[0])
+	}
+}
+
 func TestFlushPrintsVerbatimAndClears(t *testing.T) {
 	repo := t.TempDir()
 	if _, err := Write(WriteOptions{
@@ -71,11 +101,54 @@ func TestFlushPrintsVerbatimAndClears(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	Flush(repo, &stdout)
+	if err := Flush(repo, &stdout); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
 	if stdout.String() != testPrettyBlock {
 		t.Fatalf("Flush stdout = %q, want %q", stdout.String(), testPrettyBlock)
 	}
 	if records := Check(repo); len(records) != 0 {
 		t.Fatalf("Check after Flush returned %d records, want 0", len(records))
 	}
+}
+
+func TestFlushEmptyPrintsConfirmation(t *testing.T) {
+	repo := t.TempDir()
+
+	var stdout bytes.Buffer
+	if err := Flush(repo, &stdout); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
+	if stdout.String() != "no pending relays\n" {
+		t.Fatalf("Flush stdout = %q, want no-pending confirmation", stdout.String())
+	}
+}
+
+func TestFlushWriteErrorDoesNotAckUnsurfacedRecord(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := Write(WriteOptions{
+		RepoPath: repo,
+		RunID:    "run-test",
+		Role:     "worker",
+		PRNumber: 101,
+		Block:    testPrettyBlock,
+	}); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+
+	writer := failingWriter{err: errors.New("stdout closed")}
+	if err := Flush(repo, writer); err == nil {
+		t.Fatal("Flush returned nil error, want write error")
+	}
+	if records := Check(repo); len(records) != 1 {
+		t.Fatalf("Check after failed Flush returned %d records, want unsurfaced record pending", len(records))
+	}
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }
