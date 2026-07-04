@@ -322,6 +322,49 @@ func TestBuildPromptInjectsRubricAndHonorsConfiguredSectionOrder(t *testing.T) {
 	}
 }
 
+func TestBuildPromptInjectsRenderedArtifactsAndHonorsConfiguredSectionOrder(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.RenderedArtifacts = []renderedArtifactInput{{
+		Artifact: RenderedArtifact{
+			Source:         "domain.evidence.producer",
+			Status:         "available",
+			DeclaredOutput: "out/report.md",
+			Path:           "out/report.md",
+			Kind:           "markdown",
+			MediaType:      "text/markdown",
+			Bytes:          31,
+			Summary:        "markdown file content included inline with bounded excerpt",
+		},
+		Content:             truncatePacketSection("# Rendered report\nApproved.\n", 4096),
+		IncludeInLoopreview: true,
+	}}
+	inputs.ReviewPacketOrder = []string{"rendered_artifact", "issue", "spec", "changed_files", "diff"}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{})
+	if !packet.RenderedArtifacts.Configured {
+		t.Fatal("rendered artifacts were not marked configured")
+	}
+	assertPromptOrder(t, prompt,
+		"# PR",
+		"# Rendered artifacts",
+		"# Issue",
+		"# Merged design/spec",
+		"# Changed files",
+		"# Diff excerpts",
+	)
+	for _, want := range []string{
+		"When a Rendered artifacts section is configured, treat it as required product evidence",
+		"Source: domain.evidence.producer",
+		"Declared output: out/report.md",
+		"```markdown",
+		"# Rendered report",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildReviewPacketTruncatesChangedFilesBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.ChangedFiles = []string{
@@ -630,6 +673,393 @@ func TestRunLoadsDomainRubricAndPreservesPassWhenEvidenceAvailable(t *testing.T)
 		}
 	}
 	assertPromptOrder(t, fakeAgent.invocation.Prompt, "# PR", "# Rubric", "# Changed files", "# Diff excerpts", "# Issue", "# Merged design/spec")
+}
+
+func TestRunExecutesDomainEvidenceProducerAndFeedsRenderedArtifact(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  verification:
+    review_packet_order:
+      - rendered_artifact
+      - changed_files
+      - diff
+      - issue
+      - spec
+  evidence:
+    producer:
+      command: make render
+      outputs:
+        - out/report.md
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("content/source.md", "+ source\n"),
+		files: []string{"content/source.md"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"rendered artifact satisfies issue and spec","spec_conformance":"pass"}`,
+	}
+	var producerInvocation EvidenceProducerInvocation
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		RunEvidenceProducer: func(_ context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult {
+			producerInvocation = invocation
+			outDir := filepath.Join(invocation.WorktreePath, "out")
+			if err := os.MkdirAll(outDir, 0o755); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			if err := os.WriteFile(filepath.Join(outDir, "report.md"), []byte("# Rendered report\nApproved.\n"), 0o644); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			return EvidenceProducerResult{ExitCode: 0}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want pass exit 0", result)
+	}
+	if producerInvocation.Command != "make render" || producerInvocation.WorktreePath == "" {
+		t.Fatalf("producer invocation = %#v, want make render in PR worktree", producerInvocation)
+	}
+	for _, want := range []string{
+		"# Rendered artifacts",
+		"Source: domain.evidence.producer",
+		"Declared output: out/report.md",
+		"# Rendered report",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+	if len(result.Verdict.RenderedArtifacts) != 1 {
+		t.Fatalf("rendered artifacts = %#v, want one", result.Verdict.RenderedArtifacts)
+	}
+	artifact := result.Verdict.RenderedArtifacts[0]
+	if artifact.Source != "domain.evidence.producer" || artifact.Path != "out/report.md" || artifact.Kind != "markdown" || artifact.Status != "available" || artifact.SHA256 == "" {
+		t.Fatalf("artifact = %#v, want available markdown report with sha", artifact)
+	}
+}
+
+func TestRunProducerFailureReturnsNeedsHumanWithoutVerifier(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  evidence:
+    producer:
+      command: make render
+      outputs:
+        - out/report.md
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := loopreviewStandardFakeGitHub()
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"would pass","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		RunEvidenceProducer: func(context.Context, EvidenceProducerInvocation) EvidenceProducerResult {
+			return EvidenceProducerResult{ExitCode: 7, Output: "render failed"}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	if fakeAgent.calls != 0 {
+		t.Fatalf("agent calls = %d, want 0", fakeAgent.calls)
+	}
+	for _, want := range []string{"domain evidence producer exited with code 7", "render failed"} {
+		if !strings.Contains(result.Verdict.Evidence, want) {
+			t.Fatalf("evidence missing %q:\n%s", want, result.Verdict.Evidence)
+		}
+	}
+	if len(result.Verdict.RenderedArtifacts) != 1 || result.Verdict.RenderedArtifacts[0].Status != "error" {
+		t.Fatalf("rendered artifacts = %#v, want producer error artifact", result.Verdict.RenderedArtifacts)
+	}
+}
+
+func TestRunProducerMissingOutputReturnsNeedsHumanWithoutVerifier(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  evidence:
+    producer:
+      command: make render
+      outputs:
+        - out/missing.pdf
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := loopreviewStandardFakeGitHub()
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"would pass","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		RunEvidenceProducer: func(context.Context, EvidenceProducerInvocation) EvidenceProducerResult {
+			return EvidenceProducerResult{ExitCode: 0}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || fakeAgent.calls != 0 {
+		t.Fatalf("result=%#v agent calls=%d, want needs-human without verifier", result, fakeAgent.calls)
+	}
+	if !strings.Contains(result.Verdict.Evidence, "out/missing.pdf (missing)") {
+		t.Fatalf("evidence = %q, want missing output", result.Verdict.Evidence)
+	}
+	if len(result.Verdict.RenderedArtifacts) != 1 || result.Verdict.RenderedArtifacts[0].DeclaredOutput != "out/missing.pdf" || result.Verdict.RenderedArtifacts[0].Status != "missing" {
+		t.Fatalf("rendered artifacts = %#v, want missing output artifact", result.Verdict.RenderedArtifacts)
+	}
+}
+
+func TestRunProducerIncludeFalseSurfacesArtifactWithoutPacketSection(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  evidence:
+    producer:
+      command: make render
+      outputs:
+        - out/report.md
+      include_in_loopreview: false
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := loopreviewStandardFakeGitHub()
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		RunEvidenceProducer: func(_ context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult {
+			outDir := filepath.Join(invocation.WorktreePath, "out")
+			if err := os.MkdirAll(outDir, 0o755); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			if err := os.WriteFile(filepath.Join(outDir, "report.md"), []byte("# Rendered report\n"), 0o644); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			return EvidenceProducerResult{ExitCode: 0}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass {
+		t.Fatalf("result = %#v, want pass", result)
+	}
+	if strings.Contains(fakeAgent.invocation.Prompt, "# Rendered artifacts") {
+		t.Fatalf("prompt included rendered artifacts despite include_in_loopreview=false:\n%s", fakeAgent.invocation.Prompt)
+	}
+	if len(result.Verdict.RenderedArtifacts) != 1 || result.Verdict.RenderedArtifacts[0].Path != "out/report.md" {
+		t.Fatalf("rendered artifacts = %#v, want reported artifact", result.Verdict.RenderedArtifacts)
+	}
+}
+
+func TestRunFeedsBrowserPreviewAsRenderedArtifact(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`verification:
+  browser:
+    enabled: auto
+evidence:
+  website:
+    preview_url: https://preview.example.test/pr-152
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := loopreviewStandardFakeGitHub()
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"browser preview evidence and diff satisfy issue","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass {
+		t.Fatalf("result = %#v, want pass", result)
+	}
+	for _, want := range []string{"# Rendered artifacts", "Source: verification.browser", "preview_url=https://preview.example.test/pr-152"} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+	if len(result.Verdict.RenderedArtifacts) != 1 || result.Verdict.RenderedArtifacts[0].Source != "verification.browser" {
+		t.Fatalf("rendered artifacts = %#v, want browser preview artifact", result.Verdict.RenderedArtifacts)
+	}
+}
+
+func TestCollectDeclaredRenderedArtifactSummarizesPDFWithoutInlineContent(t *testing.T) {
+	worktree := t.TempDir()
+	outDir := filepath.Join(worktree, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatalf("mkdir output dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "report.pdf"), []byte("%PDF-1.7\n%binary\n\x00\x01"), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	artifacts, err := collectDeclaredRenderedArtifacts(worktree, []string{"out/report.pdf"}, true)
+	if err != nil {
+		t.Fatalf("collectDeclaredRenderedArtifacts returned error: %v", err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %#v, want one", artifacts)
+	}
+	artifact := artifacts[0]
+	if artifact.Artifact.Kind != "pdf" || artifact.Artifact.MediaType != "application/pdf" || artifact.Artifact.SHA256 == "" {
+		t.Fatalf("artifact = %#v, want PDF manifest with hash", artifact.Artifact)
+	}
+	if !strings.Contains(artifact.Artifact.Summary, "PDF binary summary: version=1.7") {
+		t.Fatalf("summary = %q, want deterministic PDF summary", artifact.Artifact.Summary)
+	}
+	if strings.TrimSpace(artifact.Content.Text) != "" {
+		t.Fatalf("PDF content was inlined unexpectedly: %#v", artifact.Content)
+	}
 }
 
 func TestRunForcesNeedsHumanWhenConfiguredRubricFileIsMissing(t *testing.T) {
@@ -1666,6 +2096,26 @@ func assertViewedIssues(t *testing.T, fakeGitHub *loopreviewFakeGitHub, want ...
 		if fakeGitHub.viewedIssues[i] != want[i] {
 			t.Fatalf("viewed issues = %#v, want %#v", fakeGitHub.viewedIssues, want)
 		}
+	}
+}
+
+func loopreviewStandardFakeGitHub() *loopreviewFakeGitHub {
+	return &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("content/source.md", "+ source\n"),
+		files: []string{"content/source.md"},
 	}
 }
 

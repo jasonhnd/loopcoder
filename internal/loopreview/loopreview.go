@@ -2,15 +2,22 @@
 package loopreview
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,9 +50,14 @@ const (
 	reviewPacketGeneratedDiffFileBytes  = 2 * 1024
 	reviewPacketGeneratedSizeBytes      = 128 * 1024
 	reviewPacketIssueBudgetBytes        = 12 * 1024
+	reviewPacketRenderedArtifactBytes   = 24 * 1024
 	reviewPacketRubricBudgetBytes       = 24 * 1024
 	reviewPacketSpecBudgetBytes         = 40 * 1024
 	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
+	renderedArtifactFileBudgetBytes     = 8 * 1024
+	renderedArtifactMaxDirectoryFiles   = 32
+	renderedArtifactProducerTimeout     = 5 * time.Minute
+	producerFailureLogBudgetBytes       = 4 * 1024
 	providerFailureLogBudgetBytes       = 4 * 1024
 )
 
@@ -75,11 +87,27 @@ type Result struct {
 }
 
 type Verdict struct {
-	Verdict         string                         `json:"verdict"`
-	Findings        []Finding                      `json:"findings"`
-	Evidence        string                         `json:"evidence"`
-	SpecConformance string                         `json:"spec_conformance"`
-	Attestation     *attestation.AttestationRecord `json:"attestation,omitempty"`
+	Verdict           string                         `json:"verdict"`
+	Findings          []Finding                      `json:"findings"`
+	Evidence          string                         `json:"evidence"`
+	SpecConformance   string                         `json:"spec_conformance"`
+	RenderedArtifacts []RenderedArtifact             `json:"rendered_artifacts,omitempty"`
+	Attestation       *attestation.AttestationRecord `json:"attestation,omitempty"`
+}
+
+type RenderedArtifact struct {
+	Source         string `json:"source"`
+	Status         string `json:"status"`
+	DeclaredOutput string `json:"declared_output,omitempty"`
+	Path           string `json:"path,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	MediaType      string `json:"media_type,omitempty"`
+	Bytes          int64  `json:"bytes,omitempty"`
+	SHA256         string `json:"sha256,omitempty"`
+	Files          int    `json:"files,omitempty"`
+	Truncated      bool   `json:"truncated,omitempty"`
+	Summary        string `json:"summary,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 type Finding struct {
@@ -108,14 +136,30 @@ type Lock interface {
 }
 
 type Deps struct {
-	Git                GitClient
-	GitHub             func(repoPath string) GitHubClient
-	AgentLookup        func(provider string) (agent.Runner, error)
-	AcquireLock        func(repoPath string, timeout time.Duration) (Lock, error)
-	MkdirTemp          func(dir, pattern string) (string, error)
-	RemoveAll          func(path string) error
-	ReviewPacketLimits ReviewPacketLimits
+	Git                 GitClient
+	GitHub              func(repoPath string) GitHubClient
+	AgentLookup         func(provider string) (agent.Runner, error)
+	AcquireLock         func(repoPath string, timeout time.Duration) (Lock, error)
+	MkdirTemp           func(dir, pattern string) (string, error)
+	RemoveAll           func(path string) error
+	RunEvidenceProducer EvidenceProducerRunner
+	ReviewPacketLimits  ReviewPacketLimits
 }
+
+type EvidenceProducerInvocation struct {
+	Command      string
+	WorktreePath string
+	Timeout      time.Duration
+}
+
+type EvidenceProducerResult struct {
+	ExitCode int
+	Output   string
+	TimedOut bool
+	Err      error
+}
+
+type EvidenceProducerRunner func(ctx context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult
 
 type ReviewPacketLimits struct {
 	ChangedFilesBytes      int
@@ -125,6 +169,7 @@ type ReviewPacketLimits struct {
 	GeneratedSizeBytes     int
 	GeneratedPatterns      []string
 	IssueBytes             int
+	RenderedArtifactBytes  int
 	RubricBytes            int
 	SpecBytes              int
 	TotalPromptBytes       int
@@ -139,6 +184,7 @@ type reviewInputs struct {
 	GeneratedAttributeRules []generatedAttributeRule
 	Spec                    specInput
 	Rubric                  rubricInput
+	RenderedArtifacts       []renderedArtifactInput
 	ReviewPacketOrder       []string
 }
 
@@ -174,8 +220,9 @@ func DefaultDeps() Deps {
 		AcquireLock: func(repoPath string, timeout time.Duration) (Lock, error) {
 			return lockfile.Acquire(repoPath, timeout)
 		},
-		MkdirTemp: os.MkdirTemp,
-		RemoveAll: os.RemoveAll,
+		MkdirTemp:           os.MkdirTemp,
+		RemoveAll:           os.RemoveAll,
+		RunEvidenceProducer: runEvidenceProducerCommand,
 	}
 }
 
@@ -240,15 +287,32 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 	inputs.Rubric = loadRubric(ctx, deps.Git, repoPath, opts.BaseBranch, cfg.Domain.Verification.Rubric)
+	inputs.RenderedArtifacts = configuredRenderedArtifacts(cfg)
 	inputs.ReviewPacketOrder = cfg.Domain.Verification.ReviewPacketOrder
+	producer := cfg.Domain.Evidence.Producer
+	if evidenceProducerConfigured(producer) {
+		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
+			return Result{}, err
+		}
+		produced, producerErr := runConfiguredEvidenceProducer(ctx, deps, worktreePath, producer, opts.Timeout)
+		inputs.RenderedArtifacts = append(inputs.RenderedArtifacts, produced...)
+		if producerErr != nil {
+			verdict := needsHumanVerdict("warning", "", producerErr.Error())
+			verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
+			return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		}
+	}
 	prompt, packet := buildPromptWithLimits(opts, inputs, deps.ReviewPacketLimits)
 	if packet.Insufficient {
 		note := "review packet insufficient: " + packet.InsufficientReason
 		verdict := needsHumanVerdict("warning", "", note)
+		verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
 		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
 	}
-	if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
-		return Result{}, err
+	if !evidenceProducerConfigured(producer) {
+		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
+			return Result{}, err
+		}
 	}
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleVerifier, true)
 	if err != nil {
@@ -288,8 +352,10 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	verdict, err := ParseVerdict(agentResult.Summary)
 	if err != nil {
 		verdict = needsHumanVerdict("error", "", fmt.Sprintf("structured verdict parse failed: %v", err))
+		verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
 		return resultWithAttestation(verdict, record), nil
 	}
+	verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
 	if inputs.Spec.ExpectedAbsent {
 		verdict.SpecConformance = SpecConformanceNotApplicable
 	} else if !inputs.Spec.Available {
@@ -466,6 +532,7 @@ type reviewPacket struct {
 	SpecPathAdded            bool
 	SpecContent              packetSection
 	Rubric                   rubricSection
+	RenderedArtifacts        renderedArtifactsSection
 	ChangedFiles             changedFilesSection
 	Diff                     packetSection
 	ReviewPacketOrder        []string
@@ -505,6 +572,18 @@ type rubricSection struct {
 type rubricMissingFile struct {
 	Path   string
 	Reason string
+}
+
+type renderedArtifactInput struct {
+	Artifact            RenderedArtifact
+	Content             packetSection
+	IncludeInLoopreview bool
+}
+
+type renderedArtifactsSection struct {
+	Configured bool
+	Artifacts  []renderedArtifactInput
+	Content    packetSection
 }
 
 func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacketLimits) (string, reviewPacket) {
@@ -581,6 +660,7 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 		SpecPathAdded:      specPathAdded,
 		SpecContent:        truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
 		Rubric:             buildRubricSection(inputs.Rubric, limits.RubricBytes),
+		RenderedArtifacts:  buildRenderedArtifactsSection(inputs.RenderedArtifacts, limits.RenderedArtifactBytes),
 		ChangedFiles:       buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
 		Diff:               buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
 		ReviewPacketOrder:  append([]string(nil), inputs.ReviewPacketOrder...),
@@ -601,11 +681,13 @@ Return only JSON matching this schema:
 - Use the bounded review packet below as the primary evidence.
 - Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, merged design/spec, and any configured domain rubric.
 - When a Rubric section is configured, apply it as required review criteria.
+- When a Rendered artifacts section is configured, treat it as required product evidence for the changed output.
 - For complete packets with no relevant TRUNCATED markers, decide from the packet instead of exploring the repository.
 - Use "pass" only when the PR satisfies the issue and spec and you found no blocking concerns.
 - Use "fail" for concrete implementation defects, missing acceptance criteria, regressions, or test gaps that should be fixed by a worker.
 - Use "needs-human" when evidence is incomplete, ambiguous, unavailable, or unsafe to decide automatically.
 - Missing configured rubric files are missing evidence; return "needs-human" and cite the missing rubric file paths.
+- Missing, failed, or truncated rendered artifacts are missing evidence when they matter to the domain output; return "needs-human" unless the remaining packet is still sufficient to decide safely.
 - If the packet classifies a missing merged spec as expected/non-blocking because a documentation-only PR introduces that referenced spec, do not return "needs-human" solely for that expected absence; keep spec_conformance "not-applicable" and decide from the issue and bounded packet.
 - For code PRs or mixed code/documentation PRs, an unavailable merged design/spec remains missing evidence and must be treated as "needs-human" when spec conformance cannot be checked safely.
 - Return "needs-human" if a TRUNCATED marker could hide a relevant acceptance criterion, risky changed file, or code needed for a safe decision. Cite the marker in evidence.
@@ -630,6 +712,7 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 		GeneratedSizeBytes:     reviewPacketGeneratedSizeBytes,
 		GeneratedPatterns:      defaultGeneratedPatterns,
 		IssueBytes:             reviewPacketIssueBudgetBytes,
+		RenderedArtifactBytes:  reviewPacketRenderedArtifactBytes,
 		RubricBytes:            reviewPacketRubricBudgetBytes,
 		SpecBytes:              reviewPacketSpecBudgetBytes,
 		TotalPromptBytes:       reviewPacketTotalPromptBudgetBytes,
@@ -655,6 +738,9 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	if limits.IssueBytes <= 0 {
 		limits.IssueBytes = defaults.IssueBytes
 	}
+	if limits.RenderedArtifactBytes <= 0 {
+		limits.RenderedArtifactBytes = defaults.RenderedArtifactBytes
+	}
 	if limits.RubricBytes <= 0 {
 		limits.RubricBytes = defaults.RubricBytes
 	}
@@ -675,6 +761,7 @@ func reduceReviewPacketBudgets(limits *ReviewPacketLimits, bytesToRemove int) bo
 	for _, budget := range []*int{
 		&limits.DiffBytes,
 		&limits.SpecBytes,
+		&limits.RenderedArtifactBytes,
 		&limits.RubricBytes,
 		&limits.IssueBytes,
 		&limits.ChangedFilesBytes,
@@ -709,7 +796,7 @@ func formatReviewPacket(packet reviewPacket) string {
 	fmt.Fprintf(&out, "Head: %s\n", packet.HeadRef)
 	fmt.Fprintf(&out, "Base: %s\n\n", packet.BaseBranch)
 
-	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured) {
+	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured, packet.RenderedArtifacts.Configured) {
 		switch section {
 		case reviewPacketSectionChangedFiles:
 			formatChangedFilesPacketSection(&out, packet)
@@ -721,17 +808,20 @@ func formatReviewPacket(packet reviewPacket) string {
 			formatSpecPacketSection(&out, packet)
 		case reviewPacketSectionRubric:
 			formatRubricPacketSection(&out, packet)
+		case reviewPacketSectionRenderedArtifact:
+			formatRenderedArtifactsPacketSection(&out, packet)
 		}
 	}
 	return out.String()
 }
 
 const (
-	reviewPacketSectionChangedFiles = "changed_files"
-	reviewPacketSectionDiff         = "diff"
-	reviewPacketSectionIssue        = "issue"
-	reviewPacketSectionSpec         = "spec"
-	reviewPacketSectionRubric       = "rubric"
+	reviewPacketSectionChangedFiles     = "changed_files"
+	reviewPacketSectionDiff             = "diff"
+	reviewPacketSectionIssue            = "issue"
+	reviewPacketSectionSpec             = "spec"
+	reviewPacketSectionRubric           = "rubric"
+	reviewPacketSectionRenderedArtifact = "rendered_artifact"
 )
 
 var defaultReviewPacketSections = []string{
@@ -741,13 +831,14 @@ var defaultReviewPacketSections = []string{
 	reviewPacketSectionSpec,
 }
 
-func reviewPacketSections(configured []string, includeRubric bool) []string {
+func reviewPacketSections(configured []string, includeRubric bool, includeRenderedArtifacts bool) []string {
 	known := map[string]bool{
-		reviewPacketSectionChangedFiles: true,
-		reviewPacketSectionDiff:         true,
-		reviewPacketSectionIssue:        true,
-		reviewPacketSectionSpec:         true,
-		reviewPacketSectionRubric:       includeRubric,
+		reviewPacketSectionChangedFiles:     true,
+		reviewPacketSectionDiff:             true,
+		reviewPacketSectionIssue:            true,
+		reviewPacketSectionSpec:             true,
+		reviewPacketSectionRubric:           includeRubric,
+		reviewPacketSectionRenderedArtifact: includeRenderedArtifacts,
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(defaultReviewPacketSections)+1)
@@ -768,6 +859,9 @@ func reviewPacketSections(configured []string, includeRubric bool) []string {
 	}
 	if includeRubric && !seen[reviewPacketSectionRubric] {
 		out = append(out, reviewPacketSectionRubric)
+	}
+	if includeRenderedArtifacts && !seen[reviewPacketSectionRenderedArtifact] {
+		out = append(out, reviewPacketSectionRenderedArtifact)
 	}
 	return out
 }
@@ -839,6 +933,17 @@ func formatRubricPacketSection(out *strings.Builder, packet reviewPacket) {
 	fmt.Fprintf(out, "%s\n\n", formatPacketSection("rubric", packet.Rubric.Content))
 }
 
+func formatRenderedArtifactsPacketSection(out *strings.Builder, packet reviewPacket) {
+	if !packet.RenderedArtifacts.Configured {
+		return
+	}
+	fmt.Fprintf(out, "# Rendered artifacts\n")
+	fmt.Fprintf(out, "Status: available\n")
+	fmt.Fprintf(out, "Configured artifacts: %d\n", len(packet.RenderedArtifacts.Artifacts))
+	fmt.Fprintf(out, "Rendered artifact budget: %d bytes\n", packet.Limits.RenderedArtifactBytes)
+	fmt.Fprintf(out, "%s\n\n", formatPacketSection("rendered artifacts", packet.RenderedArtifacts.Content))
+}
+
 func rubricStatus(rubric rubricSection) string {
 	if len(rubric.MissingFiles) > 0 {
 		return "missing evidence"
@@ -885,6 +990,589 @@ func buildRubricSection(input rubricInput, byteBudget int) rubricSection {
 	}
 	section.Content = truncatePacketSection(out.String(), byteBudget)
 	return section
+}
+
+func buildRenderedArtifactsSection(inputs []renderedArtifactInput, byteBudget int) renderedArtifactsSection {
+	packetInputs := make([]renderedArtifactInput, 0, len(inputs))
+	for _, input := range inputs {
+		if input.IncludeInLoopreview {
+			packetInputs = append(packetInputs, input)
+		}
+	}
+	section := renderedArtifactsSection{
+		Configured: len(packetInputs) > 0,
+		Artifacts:  append([]renderedArtifactInput(nil), packetInputs...),
+	}
+	if len(packetInputs) == 0 {
+		return section
+	}
+
+	var out strings.Builder
+	for _, input := range packetInputs {
+		artifact := input.Artifact
+		if out.Len() > 0 {
+			out.WriteString("\n")
+		}
+		label := firstNonEmpty(artifact.Path, artifact.DeclaredOutput, artifact.Source)
+		fmt.Fprintf(&out, "## %s\n", label)
+		fmt.Fprintf(&out, "Source: %s\n", firstNonEmpty(artifact.Source, "unknown"))
+		fmt.Fprintf(&out, "Status: %s\n", firstNonEmpty(artifact.Status, "available"))
+		if strings.TrimSpace(artifact.DeclaredOutput) != "" {
+			fmt.Fprintf(&out, "Declared output: %s\n", artifact.DeclaredOutput)
+		}
+		if strings.TrimSpace(artifact.Kind) != "" {
+			fmt.Fprintf(&out, "Kind: %s\n", artifact.Kind)
+		}
+		if strings.TrimSpace(artifact.MediaType) != "" {
+			fmt.Fprintf(&out, "Media type: %s\n", artifact.MediaType)
+		}
+		if artifact.Bytes > 0 {
+			fmt.Fprintf(&out, "Bytes: %d\n", artifact.Bytes)
+		}
+		if strings.TrimSpace(artifact.SHA256) != "" {
+			fmt.Fprintf(&out, "SHA-256: %s\n", artifact.SHA256)
+		}
+		if artifact.Files > 0 {
+			fmt.Fprintf(&out, "Files: %d\n", artifact.Files)
+		}
+		if strings.TrimSpace(artifact.Summary) != "" {
+			fmt.Fprintf(&out, "Summary: %s\n", artifact.Summary)
+		}
+		if strings.TrimSpace(artifact.Error) != "" {
+			fmt.Fprintf(&out, "Error: %s\n", artifact.Error)
+		}
+		if strings.TrimSpace(input.Content.Text) != "" {
+			fmt.Fprintf(&out, "\n```%s\n%s\n```\n", artifactFenceLanguage(artifact), strings.TrimRight(input.Content.Text, "\n"))
+			if input.Content.Truncated {
+				fmt.Fprintf(&out, "[TRUNCATED rendered artifact %s: omitted %d bytes, %d lines]\n", label, input.Content.OmittedBytes, input.Content.OmittedLines)
+			}
+		}
+	}
+	section.Content = truncatePacketSection(out.String(), byteBudget)
+	return section
+}
+
+func artifactFenceLanguage(artifact RenderedArtifact) string {
+	switch artifact.Kind {
+	case "markdown":
+		return "markdown"
+	case "json":
+		return "json"
+	case "csv":
+		return "csv"
+	case "html":
+		return "html"
+	default:
+		return "text"
+	}
+}
+
+func configuredRenderedArtifacts(cfg config.Config) []renderedArtifactInput {
+	if strings.EqualFold(strings.TrimSpace(cfg.Verification.Browser.Enabled), "never") {
+		return nil
+	}
+	out := []renderedArtifactInput{}
+	for _, artifact := range cfg.Evidence.Artifacts() {
+		if artifact.ProjectType != "website" {
+			continue
+		}
+		parts := []string{}
+		if artifact.PreviewURL != "" {
+			parts = append(parts, "preview_url="+artifact.PreviewURL)
+		}
+		if artifact.PreviewBuild != "" {
+			parts = append(parts, "preview_build="+artifact.PreviewBuild)
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		summary := strings.Join(parts, " ")
+		out = append(out, renderedArtifactInput{
+			Artifact: RenderedArtifact{
+				Source:  "verification.browser",
+				Status:  "available",
+				Kind:    "browser-preview",
+				Summary: summary,
+			},
+			Content: packetSection{
+				Text:          summary + "\n",
+				OriginalBytes: len(summary) + 1,
+				OriginalLines: 1,
+			},
+			IncludeInLoopreview: true,
+		})
+	}
+	return out
+}
+
+func evidenceProducerConfigured(producer config.DomainEvidenceProducer) bool {
+	return strings.TrimSpace(producer.Command) != ""
+}
+
+func producerIncludeInLoopreview(producer config.DomainEvidenceProducer) bool {
+	if producer.IncludeInLoopreview == nil {
+		return true
+	}
+	return *producer.IncludeInLoopreview
+}
+
+func runConfiguredEvidenceProducer(ctx context.Context, deps Deps, worktreePath string, producer config.DomainEvidenceProducer, verifierTimeout time.Duration) ([]renderedArtifactInput, error) {
+	command := strings.TrimSpace(producer.Command)
+	source := "domain.evidence.producer"
+	if command == "" {
+		return nil, nil
+	}
+	outputs := normalizeRenderedArtifactOutputs(producer.Outputs)
+	if len(outputs) == 0 {
+		artifact := renderedArtifactFailure(source, "", "producer declares no outputs to collect")
+		return []renderedArtifactInput{artifact}, errors.New("domain evidence producer declares no outputs to collect")
+	}
+
+	timeout := evidenceProducerTimeout(producer.TimeoutSeconds, verifierTimeout)
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result := deps.RunEvidenceProducer(runCtx, EvidenceProducerInvocation{
+		Command:      command,
+		WorktreePath: worktreePath,
+		Timeout:      timeout,
+	})
+	if result.TimedOut || errors.Is(result.Err, context.DeadlineExceeded) || runCtx.Err() == context.DeadlineExceeded {
+		note := fmt.Sprintf("domain evidence producer timed out after %s", formatTimeout(timeout))
+		if tail := boundedProducerOutput(result.Output); tail != "" {
+			note += "\nproducer log tail:\n" + tail
+		}
+		return []renderedArtifactInput{renderedArtifactFailure(source, "", note)}, errors.New(note)
+	}
+	if result.Err != nil {
+		note := "domain evidence producer failed: " + result.Err.Error()
+		if tail := boundedProducerOutput(result.Output); tail != "" {
+			note += "\nproducer log tail:\n" + tail
+		}
+		return []renderedArtifactInput{renderedArtifactFailure(source, "", note)}, errors.New(note)
+	}
+	if result.ExitCode != 0 {
+		note := fmt.Sprintf("domain evidence producer exited with code %d", result.ExitCode)
+		if tail := boundedProducerOutput(result.Output); tail != "" {
+			note += "\nproducer log tail:\n" + tail
+		}
+		return []renderedArtifactInput{renderedArtifactFailure(source, "", note)}, errors.New(note)
+	}
+
+	artifacts, err := collectDeclaredRenderedArtifacts(worktreePath, outputs, producerIncludeInLoopreview(producer))
+	if err != nil {
+		return artifacts, err
+	}
+	return artifacts, nil
+}
+
+func normalizeRenderedArtifactOutputs(outputs []string) []string {
+	out := make([]string, 0, len(outputs))
+	seen := map[string]bool{}
+	for _, raw := range outputs {
+		cleaned, err := cleanRepoRelativePath(raw)
+		if err != nil {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				value = "(empty output path)"
+			}
+			if !seen[value] {
+				seen[value] = true
+				out = append(out, value)
+			}
+			continue
+		}
+		if !seen[cleaned] {
+			seen[cleaned] = true
+			out = append(out, cleaned)
+		}
+	}
+	return out
+}
+
+func evidenceProducerTimeout(seconds int, verifierTimeout time.Duration) time.Duration {
+	timeout := config.DurationSeconds(seconds, renderedArtifactProducerTimeout)
+	if verifierTimeout > 0 && timeout > verifierTimeout {
+		return verifierTimeout
+	}
+	return timeout
+}
+
+func collectDeclaredRenderedArtifacts(worktreePath string, outputs []string, includeInLoopreview bool) ([]renderedArtifactInput, error) {
+	artifacts := []renderedArtifactInput{}
+	problems := []string{}
+	for _, rawOutput := range outputs {
+		output, err := cleanRepoRelativePath(rawOutput)
+		if err != nil {
+			label := strings.TrimSpace(rawOutput)
+			if label == "" {
+				label = "(empty output path)"
+			}
+			artifacts = append(artifacts, renderedArtifactFailure("domain.evidence.producer", label, err.Error()))
+			problems = append(problems, fmt.Sprintf("%s (%s)", label, err.Error()))
+			continue
+		}
+		fullPath, err := safeWorktreePath(worktreePath, output)
+		if err != nil {
+			artifacts = append(artifacts, renderedArtifactFailure("domain.evidence.producer", output, err.Error()))
+			problems = append(problems, fmt.Sprintf("%s (%s)", output, err.Error()))
+			continue
+		}
+		info, err := os.Lstat(fullPath)
+		if err != nil {
+			reason := "missing"
+			if !errors.Is(err, os.ErrNotExist) {
+				reason = err.Error()
+			}
+			artifacts = append(artifacts, renderedArtifactFailure("domain.evidence.producer", output, reason))
+			problems = append(problems, fmt.Sprintf("%s (%s)", output, reason))
+			continue
+		}
+		if info.IsDir() {
+			collected, err := collectRenderedArtifactDirectory(worktreePath, output, fullPath, includeInLoopreview)
+			artifacts = append(artifacts, collected...)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%s (%s)", output, err.Error()))
+			}
+			continue
+		}
+		artifact, err := collectRenderedArtifactFile(worktreePath, output, output, fullPath, info, includeInLoopreview)
+		artifacts = append(artifacts, artifact)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s (%s)", output, err.Error()))
+		}
+	}
+	if len(problems) > 0 {
+		return artifacts, fmt.Errorf("domain evidence producer output unavailable: %s", strings.Join(problems, "; "))
+	}
+	return artifacts, nil
+}
+
+func collectRenderedArtifactDirectory(worktreePath, declaredOutput, fullPath string, includeInLoopreview bool) ([]renderedArtifactInput, error) {
+	type fileEntry struct {
+		rel  string
+		full string
+		info fs.FileInfo
+	}
+	files := []fileEntry{}
+	truncated := false
+	walkErr := filepath.WalkDir(fullPath, func(current string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if current == fullPath {
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(worktreePath, current)
+		if err != nil {
+			return err
+		}
+		if len(files) >= renderedArtifactMaxDirectoryFiles {
+			truncated = true
+			return filepath.SkipAll
+		}
+		files = append(files, fileEntry{
+			rel:  normalizeRepoPath(filepath.ToSlash(rel)),
+			full: current,
+			info: info,
+		})
+		return nil
+	})
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].rel < files[j].rel
+	})
+
+	var manifest strings.Builder
+	fmt.Fprintf(&manifest, "Directory manifest for %s\n", declaredOutput)
+	for _, file := range files {
+		kind, mediaType := classifyRenderedArtifactFile(file.rel, nil)
+		fmt.Fprintf(&manifest, "- %s kind=%s media_type=%s bytes=%d\n", file.rel, kind, mediaType, file.info.Size())
+	}
+	if truncated {
+		fmt.Fprintf(&manifest, "[TRUNCATED directory manifest: showing first %d files]\n", renderedArtifactMaxDirectoryFiles)
+	}
+	artifacts := []renderedArtifactInput{{
+		Artifact: RenderedArtifact{
+			Source:         "domain.evidence.producer",
+			Status:         "available",
+			DeclaredOutput: declaredOutput,
+			Path:           declaredOutput,
+			Kind:           "directory",
+			Files:          len(files),
+			Truncated:      truncated,
+			Summary:        fmt.Sprintf("directory output with %d collected file(s)", len(files)),
+		},
+		Content: packetSection{
+			Text:          manifest.String(),
+			OriginalBytes: manifest.Len(),
+			OriginalLines: countLines(manifest.String()),
+		},
+		IncludeInLoopreview: includeInLoopreview,
+	}}
+	for _, file := range files {
+		artifact, err := collectRenderedArtifactFile(worktreePath, declaredOutput, file.rel, file.full, file.info, includeInLoopreview)
+		artifacts = append(artifacts, artifact)
+		if err != nil {
+			return artifacts, err
+		}
+	}
+	return artifacts, walkErr
+}
+
+func collectRenderedArtifactFile(_ string, declaredOutput, repoPath, fullPath string, info fs.FileInfo, includeInLoopreview bool) (renderedArtifactInput, error) {
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(fullPath)
+		summary := "symlink"
+		if err == nil {
+			summary = "symlink -> " + target
+		}
+		return renderedArtifactInput{
+			Artifact: RenderedArtifact{
+				Source:         "domain.evidence.producer",
+				Status:         "available",
+				DeclaredOutput: declaredOutput,
+				Path:           repoPath,
+				Kind:           "symlink",
+				Summary:        summary,
+			},
+			Content: packetSection{
+				Text:          summary + "\n",
+				OriginalBytes: len(summary) + 1,
+				OriginalLines: 1,
+			},
+			IncludeInLoopreview: includeInLoopreview,
+		}, nil
+	}
+
+	prefix, readErr := readFilePrefix(fullPath, renderedArtifactFileBudgetBytes)
+	kind, mediaType := classifyRenderedArtifactFile(repoPath, prefix)
+	sum, hashErr := sha256File(fullPath)
+	summary := renderedArtifactSummary(repoPath, kind, info.Size(), sum, prefix)
+	artifact := renderedArtifactInput{
+		Artifact: RenderedArtifact{
+			Source:         "domain.evidence.producer",
+			Status:         "available",
+			DeclaredOutput: declaredOutput,
+			Path:           repoPath,
+			Kind:           kind,
+			MediaType:      mediaType,
+			Bytes:          info.Size(),
+			SHA256:         sum,
+			Summary:        summary,
+		},
+		IncludeInLoopreview: includeInLoopreview,
+	}
+	if readErr == nil && inlineRenderedArtifact(kind, prefix) {
+		text := string(prefix)
+		omitted := int(info.Size()) - len(prefix)
+		if omitted < 0 {
+			omitted = 0
+		}
+		artifact.Content = packetSection{
+			Text:          text,
+			OriginalBytes: int(info.Size()),
+			OriginalLines: countLines(text),
+			OmittedBytes:  omitted,
+			Truncated:     omitted > 0,
+		}
+	}
+	if readErr != nil {
+		artifact.Artifact.Status = "error"
+		artifact.Artifact.Error = readErr.Error()
+		return artifact, readErr
+	}
+	if hashErr != nil {
+		artifact.Artifact.Status = "error"
+		artifact.Artifact.Error = hashErr.Error()
+		return artifact, hashErr
+	}
+	return artifact, nil
+}
+
+func renderedArtifactFailure(source, declaredOutput, reason string) renderedArtifactInput {
+	reason = strings.TrimSpace(reason)
+	status := "missing"
+	if strings.TrimSpace(declaredOutput) == "" {
+		status = "error"
+	}
+	return renderedArtifactInput{
+		Artifact: RenderedArtifact{
+			Source:         source,
+			Status:         status,
+			DeclaredOutput: strings.TrimSpace(declaredOutput),
+			Error:          reason,
+			Summary:        reason,
+		},
+		Content: packetSection{
+			Text:          reason + "\n",
+			OriginalBytes: len(reason) + 1,
+			OriginalLines: 1,
+		},
+		IncludeInLoopreview: true,
+	}
+}
+
+func safeWorktreePath(worktreePath, repoPath string) (string, error) {
+	absRoot, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return "", err
+	}
+	fullPath := filepath.Join(absRoot, filepath.FromSlash(repoPath))
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("must stay within PR worktree")
+	}
+	return absPath, nil
+}
+
+func readFilePrefix(filePath string, limit int) ([]byte, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	buf := make([]byte, limit)
+	n, err := io.ReadFull(file, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func sha256File(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func classifyRenderedArtifactFile(repoPath string, prefix []byte) (string, string) {
+	switch strings.ToLower(path.Ext(repoPath)) {
+	case ".md", ".markdown":
+		return "markdown", "text/markdown"
+	case ".json", ".jsonl":
+		return "json", "application/json"
+	case ".csv", ".tsv":
+		return "csv", "text/csv"
+	case ".html", ".htm":
+		return "html", "text/html"
+	case ".txt", ".text", ".log", ".xml", ".yaml", ".yml":
+		return "text", "text/plain"
+	case ".pdf":
+		return "pdf", "application/pdf"
+	}
+	if len(prefix) > 0 && utf8.Valid(prefix) && !bytes.Contains(prefix, []byte{0}) {
+		return "text", "text/plain"
+	}
+	return "binary", "application/octet-stream"
+}
+
+func inlineRenderedArtifact(kind string, prefix []byte) bool {
+	if len(prefix) == 0 || !utf8.Valid(prefix) || bytes.Contains(prefix, []byte{0}) {
+		return false
+	}
+	switch kind {
+	case "text", "markdown", "json", "csv", "html":
+		return true
+	default:
+		return false
+	}
+}
+
+func renderedArtifactSummary(repoPath, kind string, size int64, sha string, prefix []byte) string {
+	switch kind {
+	case "text", "markdown", "json", "csv", "html":
+		return fmt.Sprintf("%s file content included inline with bounded excerpt", kind)
+	case "pdf":
+		version := "unknown"
+		if bytes.HasPrefix(prefix, []byte("%PDF-")) {
+			line := strings.SplitN(string(prefix), "\n", 2)[0]
+			version = strings.TrimSpace(strings.TrimPrefix(line, "%PDF-"))
+		}
+		return fmt.Sprintf("PDF binary summary: version=%s bytes=%d sha256=%s", version, size, sha)
+	default:
+		return fmt.Sprintf("%s artifact manifest: path=%s bytes=%d sha256=%s", kind, repoPath, size, sha)
+	}
+}
+
+func publicRenderedArtifacts(inputs []renderedArtifactInput) []RenderedArtifact {
+	out := make([]RenderedArtifact, 0, len(inputs))
+	for _, input := range inputs {
+		if strings.TrimSpace(input.Artifact.Source) == "" && strings.TrimSpace(input.Artifact.Path) == "" && strings.TrimSpace(input.Artifact.Summary) == "" {
+			continue
+		}
+		out = append(out, input.Artifact)
+	}
+	return out
+}
+
+func boundedProducerOutput(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+	if len(output) > producerFailureLogBudgetBytes {
+		output = output[len(output)-producerFailureLogBudgetBytes:]
+	}
+	return strings.TrimSpace(output)
+}
+
+func runEvidenceProducerCommand(ctx context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	file, args := shellCommand(invocation.Command)
+	cmd := exec.CommandContext(ctx, file, args...)
+	cmd.Dir = invocation.WorktreePath
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := cmd.Run()
+	timedOut := ctx.Err() == context.DeadlineExceeded
+	exitCode := 0
+	if err != nil {
+		exitCode = 127
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	return EvidenceProducerResult{
+		ExitCode: exitCode,
+		Output:   output.String(),
+		TimedOut: timedOut,
+		Err:      err,
+	}
+}
+
+func shellCommand(command string) (string, []string) {
+	if runtime.GOOS == "windows" {
+		return "cmd", []string{"/c", command}
+	}
+	return "sh", []string{"-c", command}
 }
 
 func loadRubric(ctx context.Context, git GitClient, repoPath, baseBranch string, rubric config.DomainRubric) rubricInput {
@@ -939,6 +1627,10 @@ func normalizeRubricChecklist(items []string) []string {
 }
 
 func cleanRubricPath(rawPath string) (string, error) {
+	return cleanRepoRelativePath(rawPath)
+}
+
+func cleanRepoRelativePath(rawPath string) (string, error) {
 	normalized := strings.TrimSpace(strings.ReplaceAll(rawPath, `\`, `/`))
 	normalized = strings.TrimPrefix(normalized, "./")
 	if normalized == "" {
@@ -1772,6 +2464,9 @@ func withDefaults(deps Deps) Deps {
 	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = defaults.RemoveAll
+	}
+	if deps.RunEvidenceProducer == nil {
+		deps.RunEvidenceProducer = defaults.RunEvidenceProducer
 	}
 	return deps
 }
