@@ -19,7 +19,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -42,6 +44,11 @@ type Options struct {
 	Effort          string
 	ConfigFromBase  bool
 	KeepWorktree    bool
+	PartialWorkMode string
+	LivenessMode    string
+	LivenessCommand string
+	LivenessArgs    []string
+	LivenessTimeout time.Duration
 	Stderr          io.Writer
 }
 
@@ -195,12 +202,13 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase := "worktree_created"
 	dispatchSucceeded := false
+	preserveAttemptArtifacts := false
 	cleanupStatus := "succeeded"
 	failureStatus := "failed"
 	defer func() {
 		if dispatchSucceeded {
 			tracker.transition("cleanup", cleanupStatus, tracker.exitCode, nil)
-			if opts.KeepWorktree {
+			if opts.KeepWorktree || preserveAttemptArtifacts {
 				fmt.Fprintf(warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", worktreePath, scratch)
 				return
 			}
@@ -279,25 +287,30 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
-		BaseBranch:     opts.BaseBranch,
-		ConfigFromBase: opts.ConfigFromBase,
-		Warnings:       warnings,
-	})
+	runtimePolicy, err := loadDomainRuntimePolicy(ctx, repoPath, opts, warnings)
 	if err != nil {
 		return Result{}, err
 	}
+	resilience := runtimePolicy.Resilience
+	opts.PartialWorkMode = runtimePolicy.PartialWorkMode
+	livenessCommand := supervisedexec.LivenessCommand{
+		Command: runtimePolicy.Liveness.Command,
+		Args:    append([]string(nil), runtimePolicy.Liveness.Args...),
+		Timeout: runtimePolicy.Liveness.Timeout,
+	}
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
-		WorktreePath: worktreePath,
-		Prompt:       prompt,
-		LogPath:      logPath,
-		Stderr:       warnings,
-		Model:        opts.Model,
-		Effort:       opts.Effort,
-		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
-		StallTimeout: config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
-		RunID:        opts.RunID,
-		Role:         "worker",
+		WorktreePath:    worktreePath,
+		Prompt:          prompt,
+		LogPath:         logPath,
+		Stderr:          warnings,
+		Model:           opts.Model,
+		Effort:          opts.Effort,
+		HardCap:         config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
+		LivenessMode:    runtimePolicy.Liveness.Mode,
+		LivenessCommand: livenessCommand,
+		RunID:           opts.RunID,
+		Role:            "worker",
 	})
 	activePhase = "codex_exited"
 	var exitCodePtr *int
@@ -349,7 +362,12 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			tracker.setAttestation(harvest.Attestation)
 			tracker.setUsage(harvest.Attestation.Usage)
 			tracker.transition(harvest.Phase, "needs-human", &exitCode, nil)
-			tracker.appendEvent("worker_harvested", "needs-human", map[string]string{
+			eventName := "worker_harvested"
+			if harvest.Mode == "report-only" {
+				eventName = "worker_partial_reported"
+				preserveAttemptArtifacts = true
+			}
+			tracker.appendEvent(eventName, "needs-human", map[string]string{
 				"branch": harvest.Branch,
 				"pr":     harvest.PR,
 				"mode":   harvest.Mode,
@@ -558,6 +576,42 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		return nil, nil
 	}
 
+	if partialWorkMode(opts.opts.PartialWorkMode) == "report-only" {
+		if err := writeRecoveryBrief(ctx, recoveryBriefOptions{
+			repoPath:     opts.repoPath,
+			runID:        opts.runID,
+			jobID:        opts.jobID,
+			issueNumber:  opts.opts.IssueNumber,
+			issueTitle:   opts.opts.IssueTitle,
+			branch:       opts.opts.Branch,
+			worktreePath: opts.worktreePath,
+			logPath:      opts.logPath,
+			summaryPath:  opts.summaryPath,
+			attempt:      opts.opts.Attempt,
+			lastPhase:    "codex_exited",
+			status:       "needs-human",
+			errorMessage: opts.errorMessage,
+			git:          opts.git,
+			github:       opts.github,
+			warnings:     opts.warnings,
+		}); err != nil {
+			fmt.Fprintf(opts.warnings, "[loopcoder] warning: failed to write report-only partial-work recovery brief for %s: %v\n", opts.jobID, err)
+		}
+		started := opts.now()
+		ended := opts.now()
+		record := buildPartialWorkReportAttestation(opts.opts, started, ended)
+		if err := record.Validate(); err != nil {
+			return nil, fmt.Errorf("validate report-only partial-work conductor attestation: %w", err)
+		}
+		return &hungHarvestResult{
+			Branch:      opts.opts.Branch,
+			Summary:     "partial work preserved from hung/killed worker - report-only mode; no PR opened",
+			Phase:       "partial_work_reported",
+			Mode:        "report-only",
+			Attestation: record,
+		}, nil
+	}
+
 	harvestBranch := harvestBranchName(opts.opts.IssueNumber, opts.opts.Attempt)
 	briefText := ""
 	briefPath := state.RecoveryBriefPath(opts.repoPath, opts.runID, opts.jobID)
@@ -712,6 +766,14 @@ func formatHungWorkerPartialAttestation(opts Options, result agent.Result) strin
 }
 
 func buildHarvestConductorAttestation(opts Options, started, ended time.Time) attestation.AttestationRecord {
+	return buildPartialConductorAttestation(opts, started, ended, fmt.Sprintf("harvest hung worker issue #%d", opts.IssueNumber))
+}
+
+func buildPartialWorkReportAttestation(opts Options, started, ended time.Time) attestation.AttestationRecord {
+	return buildPartialConductorAttestation(opts, started, ended, fmt.Sprintf("report partial work issue #%d", opts.IssueNumber))
+}
+
+func buildPartialConductorAttestation(opts Options, started, ended time.Time, action string) attestation.AttestationRecord {
 	if started.IsZero() {
 		started = time.Now().UTC()
 	}
@@ -729,7 +791,7 @@ func buildHarvestConductorAttestation(opts Options, started, ended time.Time) at
 		ModelSource: attestation.ModelSourceSelfReported,
 		Effort:      opts.Effort,
 		Permission:  attestation.PermissionOrchestrate,
-		Action:      fmt.Sprintf("harvest hung worker issue #%d", opts.IssueNumber),
+		Action:      action,
 		ExitCode:    0,
 		StartedAt:   state.FormatTimestamp(started),
 		EndedAt:     state.FormatTimestamp(ended),
@@ -738,6 +800,17 @@ func buildHarvestConductorAttestation(opts Options, started, ended time.Time) at
 			TotalTokens: &totalTokens,
 		},
 		Verified: false,
+	}
+}
+
+func partialWorkMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", "harvest-needs-human":
+		return "harvest-needs-human"
+	case "report-only":
+		return "report-only"
+	default:
+		return strings.TrimSpace(strings.ToLower(mode))
 	}
 }
 
@@ -819,6 +892,135 @@ func withDefaults(deps Deps) Deps {
 		deps.RepoSkills = defaults.RepoSkills
 	}
 	return deps
+}
+
+type domainRuntimePolicy struct {
+	Resilience      config.Resilience
+	PartialWorkMode string
+	Liveness        domainLivenessPolicy
+}
+
+type domainLivenessPolicy struct {
+	Mode    string
+	Command string
+	Args    []string
+	Timeout time.Duration
+}
+
+type rawDomainRuntimeConfig struct {
+	Domain struct {
+		Liveness struct {
+			Command        string   `yaml:"command,omitempty"`
+			Args           []string `yaml:"args,omitempty"`
+			TimeoutSeconds int      `yaml:"timeout_seconds,omitempty"`
+		} `yaml:"liveness,omitempty"`
+	} `yaml:"domain,omitempty"`
+}
+
+func loadDomainRuntimePolicy(ctx context.Context, repoPath string, opts Options, warnings io.Writer) (domainRuntimePolicy, error) {
+	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       warnings,
+	})
+	if err != nil {
+		return domainRuntimePolicy{}, err
+	}
+
+	rawRuntime, err := loadRawDomainRuntime(ctx, repoPath, opts.BaseBranch, opts.ConfigFromBase)
+	if err != nil {
+		return domainRuntimePolicy{}, err
+	}
+
+	partialMode := partialWorkMode(firstNonEmpty(opts.PartialWorkMode, cfg.Domain.PartialWork.Mode))
+	if partialMode != "harvest-needs-human" && partialMode != "report-only" {
+		return domainRuntimePolicy{}, fmt.Errorf("invalid domain.partial_work.mode %q; want harvest-needs-human or report-only", firstNonEmpty(opts.PartialWorkMode, cfg.Domain.PartialWork.Mode))
+	}
+
+	livenessMode := livenessMode(firstNonEmpty(opts.LivenessMode, cfg.Domain.Liveness.Mode))
+	switch livenessMode {
+	case supervisedexec.LivenessModeWorktreeMTime, supervisedexec.LivenessModeLogOnly, supervisedexec.LivenessModeCustom:
+	default:
+		return domainRuntimePolicy{}, fmt.Errorf("invalid domain.liveness.mode %q; want worktree-mtime, log-only, or custom", firstNonEmpty(opts.LivenessMode, cfg.Domain.Liveness.Mode))
+	}
+
+	command := firstNonEmpty(opts.LivenessCommand, rawRuntime.Domain.Liveness.Command)
+	args := append([]string(nil), rawRuntime.Domain.Liveness.Args...)
+	if opts.LivenessArgs != nil {
+		args = append([]string(nil), opts.LivenessArgs...)
+	}
+	timeout := time.Duration(rawRuntime.Domain.Liveness.TimeoutSeconds) * time.Second
+	if opts.LivenessTimeout > 0 {
+		timeout = opts.LivenessTimeout
+	}
+	if livenessMode == supervisedexec.LivenessModeCustom && strings.TrimSpace(command) == "" {
+		return domainRuntimePolicy{}, errors.New("domain.liveness.mode custom requires domain.liveness.command")
+	}
+
+	return domainRuntimePolicy{
+		Resilience:      cfg.Resilience,
+		PartialWorkMode: partialMode,
+		Liveness: domainLivenessPolicy{
+			Mode:    livenessMode,
+			Command: command,
+			Args:    args,
+			Timeout: timeout,
+		},
+	}, nil
+}
+
+func loadRawDomainRuntime(ctx context.Context, repoPath, baseBranch string, configFromBase bool) (rawDomainRuntimeConfig, error) {
+	data, ok, err := readRawDeliveryConfig(ctx, repoPath, baseBranch, configFromBase)
+	if err != nil || !ok {
+		return rawDomainRuntimeConfig{}, err
+	}
+	var raw rawDomainRuntimeConfig
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return rawDomainRuntimeConfig{}, fmt.Errorf("parse delivery domain runtime config: %w", err)
+	}
+	return raw, nil
+}
+
+func readRawDeliveryConfig(ctx context.Context, repoPath, baseBranch string, configFromBase bool) ([]byte, bool, error) {
+	data, err := os.ReadFile(filepath.Join(repoPath, ".delivery.yml"))
+	if err == nil {
+		return data, true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, fmt.Errorf("read delivery domain runtime config: %w", err)
+	}
+	if !configFromBase {
+		return nil, false, nil
+	}
+	content, err := gitutil.New().Show(ctx, repoPath, workerBaseBranch(baseBranch)+":.delivery.yml")
+	if err != nil {
+		if gitutil.IsPathAbsentOnRef(err, ".delivery.yml") {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return []byte(content), true, nil
+}
+
+func workerBaseBranch(baseBranch string) string {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		return "main"
+	}
+	return baseBranch
+}
+
+func livenessMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", supervisedexec.LivenessModeWorktreeMTime:
+		return supervisedexec.LivenessModeWorktreeMTime
+	case supervisedexec.LivenessModeLogOnly:
+		return supervisedexec.LivenessModeLogOnly
+	case supervisedexec.LivenessModeCustom:
+		return supervisedexec.LivenessModeCustom
+	default:
+		return strings.TrimSpace(strings.ToLower(mode))
+	}
 }
 
 func resolveRepo(repoPath string) (string, error) {

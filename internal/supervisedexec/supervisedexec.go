@@ -3,6 +3,7 @@
 package supervisedexec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -28,19 +31,35 @@ const (
 	OutcomeDeadline                 // killed: exceeded HardCap
 )
 
+const (
+	LivenessModeWorktreeMTime = "worktree-mtime"
+	LivenessModeLogOnly       = "log-only"
+	LivenessModeCustom        = "custom"
+
+	maxCustomLivenessOutputBytes = 8 * 1024
+)
+
 // Options configures process supervision.
 type Options struct {
-	HardCap      time.Duration
-	StallTimeout time.Duration
-	LogPath      string
-	WorktreePath string
-	Stderr       io.Writer
-	StallGrace   time.Duration
-	OnStall      func(silentFor time.Duration)
+	HardCap         time.Duration
+	StallTimeout    time.Duration
+	LogPath         string
+	WorktreePath    string
+	Stderr          io.Writer
+	StallGrace      time.Duration
+	OnStall         func(silentFor time.Duration)
+	LivenessMode    string
+	LivenessCommand LivenessCommand
 	// RunID and Role tag the spawned child as loopcoder-managed and place it in
 	// a per-run kill-group (spec 0390, Decision 11). Both may be empty.
 	RunID string
 	Role  string
+}
+
+type LivenessCommand struct {
+	Command string
+	Args    []string
+	Timeout time.Duration
 }
 
 // Result reports the outcome of a supervised command.
@@ -68,6 +87,14 @@ type worktreeObservation struct {
 	rootErr       error
 }
 
+type customLivenessObservation struct {
+	ok       bool
+	exitCode int
+	output   string
+	timedOut bool
+	errText  string
+}
+
 // Run starts cmd, supervises it, and waits until the process exits or is
 // terminated by the parent context, the hard cap, or the optional stall signal.
 //
@@ -87,6 +114,17 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	opts = normalizeOptions(opts)
 	if opts.StallTimeout > 0 && opts.LogPath == "" {
 		return Result{Elapsed: time.Since(start)}, errors.New("supervisedexec: LogPath is required when StallTimeout > 0")
+	}
+	if opts.StallTimeout > 0 {
+		switch opts.LivenessMode {
+		case LivenessModeWorktreeMTime, LivenessModeLogOnly:
+		case LivenessModeCustom:
+			if strings.TrimSpace(opts.LivenessCommand.Command) == "" {
+				return Result{Elapsed: time.Since(start)}, errors.New("supervisedexec: custom liveness command is required when LivenessMode is custom")
+			}
+		default:
+			return Result{Elapsed: time.Since(start)}, fmt.Errorf("supervisedexec: invalid liveness mode %q", opts.LivenessMode)
+		}
 	}
 
 	group := newKillGroup(opts.RunID)
@@ -118,18 +156,26 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	var stallC <-chan time.Time
 	var lastLog logObservation
 	var lastWorktree worktreeObservation
+	var lastCustom customLivenessObservation
 	var lastWorktreeWalk time.Time
 	var worktreeSignalDisabled bool
 	var worktreeWarningEmitted bool
 	lastProgress := start
 	if opts.StallTimeout > 0 {
 		lastLog = observeLog(opts.LogPath)
-		lastWorktree = observeWorktree(opts.WorktreePath)
-		lastWorktreeWalk = start
-		if lastWorktree.rootErr != nil {
-			warnWorktreeUnavailable(opts.Stderr, opts.WorktreePath, lastWorktree.rootErr, &worktreeWarningEmitted)
-			worktreeSignalDisabled = true
-			lastWorktree = worktreeObservation{}
+		switch opts.LivenessMode {
+		case LivenessModeWorktreeMTime:
+			lastWorktree = observeWorktree(opts.WorktreePath)
+			lastWorktreeWalk = start
+			if lastWorktree.rootErr != nil {
+				warnWorktreeUnavailable(opts.Stderr, opts.WorktreePath, lastWorktree.rootErr, &worktreeWarningEmitted)
+				worktreeSignalDisabled = true
+				lastWorktree = worktreeObservation{}
+			}
+		case LivenessModeCustom:
+			lastCustom = runCustomLiveness(ctx, opts.WorktreePath, opts.LivenessCommand, opts.StallTimeout)
+			logCustomLiveness(opts.LogPath, opts.LivenessCommand, lastCustom)
+			lastLog = observeLog(opts.LogPath)
 		}
 		stallTicks = time.NewTicker(stallPollInterval(opts.StallTimeout))
 		defer stallTicks.Stop()
@@ -152,7 +198,8 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			currentWorktree := lastWorktree
 			logProgress := currentLog.changedFrom(lastLog)
 			worktreeProgress := false
-			if !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
+			customProgress := false
+			if opts.LivenessMode == LivenessModeWorktreeMTime && !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
 				currentWorktree = observeWorktree(opts.WorktreePath)
 				lastWorktreeWalk = now
 				if currentWorktree.rootErr != nil {
@@ -164,8 +211,16 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 					lastWorktree = currentWorktree
 				}
 			}
-			lastLog = currentLog
-			if logProgress || worktreeProgress {
+			if opts.LivenessMode == LivenessModeCustom {
+				currentCustom := runCustomLiveness(ctx, opts.WorktreePath, opts.LivenessCommand, opts.StallTimeout)
+				logCustomLiveness(opts.LogPath, opts.LivenessCommand, currentCustom)
+				customProgress = currentCustom.changedFrom(lastCustom)
+				lastCustom = currentCustom
+				lastLog = observeLog(opts.LogPath)
+			} else {
+				lastLog = currentLog
+			}
+			if logProgress || worktreeProgress || customProgress {
 				lastProgress = now
 				continue
 			}
@@ -187,7 +242,21 @@ func normalizeOptions(opts Options) Options {
 	if opts.StallGrace < 0 {
 		opts.StallGrace = 0
 	}
+	opts.LivenessMode = normalizeLivenessMode(opts.LivenessMode)
 	return opts
+}
+
+func normalizeLivenessMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", LivenessModeWorktreeMTime:
+		return LivenessModeWorktreeMTime
+	case LivenessModeLogOnly:
+		return LivenessModeLogOnly
+	case LivenessModeCustom:
+		return LivenessModeCustom
+	default:
+		return strings.TrimSpace(strings.ToLower(mode))
+	}
 }
 
 func completedResult(start time.Time, wr waitResult) (Result, error) {
@@ -311,6 +380,136 @@ func observeWorktree(path string) worktreeObservation {
 
 func (o worktreeObservation) advancedFrom(prev worktreeObservation) bool {
 	return o.exists && (!prev.exists || o.latestModTime.After(prev.latestModTime))
+}
+
+func runCustomLiveness(ctx context.Context, worktreePath string, command LivenessCommand, stallTimeout time.Duration) customLivenessObservation {
+	timeout := customLivenessTimeout(stallTimeout, command.Timeout)
+	cmd := customLivenessCommand(ctx, command)
+	if strings.TrimSpace(worktreePath) != "" {
+		cmd.Dir = worktreePath
+	}
+	var output limitedBuffer
+	output.limit = maxCustomLivenessOutputBytes
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	result, err := Run(ctx, cmd, Options{HardCap: timeout})
+	exitCode := result.ExitCode
+	if result.Outcome != OutcomeCompleted || (err != nil && cmd.ProcessState == nil) {
+		exitCode = -1
+	}
+	observation := customLivenessObservation{
+		exitCode: exitCode,
+		output:   strings.TrimRight(output.String(), "\r\n"),
+	}
+	if result.Outcome == OutcomeDeadline {
+		observation.timedOut = true
+		if err != nil {
+			observation.errText = err.Error()
+		} else {
+			observation.errText = fmt.Sprintf("deadline exceeded after %s", timeout)
+		}
+		return observation
+	}
+	if result.Outcome == OutcomeCompleted && err == nil && result.ExitCode == 0 {
+		observation.ok = true
+		return observation
+	}
+	if err != nil {
+		observation.errText = err.Error()
+	}
+	return observation
+}
+
+func customLivenessCommand(ctx context.Context, command LivenessCommand) *exec.Cmd {
+	if len(command.Args) > 0 {
+		return exec.CommandContext(ctx, command.Command, command.Args...)
+	}
+	if runtime.GOOS == "windows" {
+		return exec.CommandContext(ctx, "cmd", "/C", command.Command)
+	}
+	return exec.CommandContext(ctx, "sh", "-c", command.Command)
+}
+
+func customLivenessTimeout(stallTimeout, configured time.Duration) time.Duration {
+	if stallTimeout <= 0 {
+		stallTimeout = time.Second
+	}
+	maximum := stallTimeout / 2
+	if maximum < 100*time.Millisecond {
+		maximum = stallTimeout
+	}
+	if maximum <= 0 {
+		maximum = 100 * time.Millisecond
+	}
+	if configured > 0 && configured < maximum {
+		return configured
+	}
+	timeout := stallTimeout / 4
+	if timeout < 100*time.Millisecond {
+		timeout = 100 * time.Millisecond
+	}
+	if timeout > 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	if timeout > maximum {
+		timeout = maximum
+	}
+	return timeout
+}
+
+func (o customLivenessObservation) changedFrom(prev customLivenessObservation) bool {
+	return o.ok && (!prev.ok || o.exitCode != prev.exitCode || o.output != prev.output)
+}
+
+func logCustomLiveness(logPath string, command LivenessCommand, observation customLivenessObservation) {
+	if strings.TrimSpace(logPath) == "" {
+		return
+	}
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	fmt.Fprintf(file, "\n[loopcoder] custom liveness command=%q exit=%d", commandLineForLog(command), observation.exitCode)
+	if observation.timedOut {
+		fmt.Fprint(file, " timeout=true")
+	}
+	if observation.errText != "" {
+		fmt.Fprintf(file, " error=%s", observation.errText)
+	}
+	fmt.Fprintln(file)
+	if strings.TrimSpace(observation.output) != "" {
+		fmt.Fprintln(file, strings.TrimRight(observation.output, "\r\n"))
+	}
+}
+
+func commandLineForLog(command LivenessCommand) string {
+	if len(command.Args) == 0 {
+		return command.Command
+	}
+	parts := append([]string{command.Command}, command.Args...)
+	return strings.Join(parts, " ")
+}
+
+type limitedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		return len(p), nil
+	}
+	remaining := b.limit - b.Buffer.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.Buffer.Write(p[:remaining])
+		} else {
+			_, _ = b.Buffer.Write(p)
+		}
+	}
+	return len(p), nil
 }
 
 func stallPollInterval(timeout time.Duration) time.Duration {

@@ -14,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -318,6 +319,71 @@ This implementation detail should stay out of the prompt.
 	}
 	if strings.Contains(fakeAgent.invocation.Prompt, "This implementation detail should stay out of the prompt") {
 		t.Fatalf("agent prompt included skill body text:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestDispatchWiresDomainCustomLivenessFromConfig(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  liveness:
+    mode: custom
+    command: git
+    args:
+      - status
+      - --short
+    timeout_seconds: 2
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M internal/worker/worker.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented dispatch.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Provider:    "codex",
+		Stderr:      io.Discard,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if fakeAgent.invocation.LivenessMode != supervisedexec.LivenessModeCustom {
+		t.Fatalf("LivenessMode = %q, want custom", fakeAgent.invocation.LivenessMode)
+	}
+	if fakeAgent.invocation.LivenessCommand.Command != "git" {
+		t.Fatalf("LivenessCommand.Command = %q, want git", fakeAgent.invocation.LivenessCommand.Command)
+	}
+	if got := strings.Join(fakeAgent.invocation.LivenessCommand.Args, " "); got != "status --short" {
+		t.Fatalf("LivenessCommand.Args = %q, want status --short", got)
+	}
+	if fakeAgent.invocation.LivenessCommand.Timeout != 2*time.Second {
+		t.Fatalf("LivenessCommand.Timeout = %s, want 2s", fakeAgent.invocation.LivenessCommand.Timeout)
 	}
 }
 
@@ -655,6 +721,104 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 	if got.Attestation == nil || got.Attestation.Role != attestation.RoleConductor {
 		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Attestation)
+	}
+}
+
+func TestDispatchHungWithReportOnlyPartialWorkDoesNotOpenPR(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  partial_work:
+    mode: report-only
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n?? artifact.md\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result: agent.Result{
+			ExitCode:   -1,
+			Hung:       true,
+			HungReason: agent.HungReasonStall,
+		},
+		log: "provider stopped producing output\npartial artifact ready\n",
+	}
+	fakeGitHub := &workerFakeGitHub{}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		RunID:       "run-test",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if !result.OK || result.Status != "needs-human" || result.PR != "" || result.Branch != "loop/issue-101" {
+		t.Fatalf("report-only result = %#v", result)
+	}
+	if !strings.Contains(result.Summary, "report-only mode; no PR opened") {
+		t.Fatalf("summary = %q, want report-only detail", result.Summary)
+	}
+	if result.Attestation == nil || result.Attestation.Role != attestation.RoleConductor || result.Attestation.Action != "report partial work issue #101" {
+		t.Fatalf("report-only attestation = %#v", result.Attestation)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
+		t.Fatalf("report-only mode made git delivery calls: add=%d commit=%d push=%d force=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
+	}
+	if fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("CreatePR calls = %d, want 0", fakeGitHub.createPRCalls)
+	}
+	if !strings.Contains(warnings.String(), "kept worktree") {
+		t.Fatalf("warnings missing preserved worktree note:\n%s", warnings.String())
+	}
+
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test", "job-101-4321"))
+	if err != nil {
+		t.Fatalf("ReadFile recovery brief: %v", err)
+	}
+	briefText := string(brief)
+	for _, want := range []string{"- Status: needs-human", " M file.go", "?? artifact.md", "partial artifact ready"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("report-only recovery brief missing %q:\n%s", want, briefText)
+		}
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != "needs-human" || attempts[0].Phase != "cleanup" {
+		t.Fatalf("report-only attempt = %#v", attempts)
+	}
+	events, err := os.ReadFile(state.EventsPath(repo, "run-test"))
+	if err != nil {
+		t.Fatalf("ReadFile events: %v", err)
+	}
+	if !strings.Contains(string(events), `"event":"worker_partial_reported"`) || !strings.Contains(string(events), `"mode":"report-only"`) {
+		t.Fatalf("report-only event missing:\n%s", string(events))
 	}
 }
 

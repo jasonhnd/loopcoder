@@ -179,6 +179,105 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 	}
 }
 
+func TestRunLogOnlyLivenessIgnoresWorktreeActivity(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "worker.log")
+	worktreePath := filepath.Join(root, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	cmd := helperCommand(t, "write-worktree-loop", logPath, worktreePath, "100ms", "24", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      30 * time.Second,
+		StallTimeout: 300 * time.Millisecond,
+		LogPath:      logPath,
+		WorktreePath: worktreePath,
+		LivenessMode: LivenessModeLogOnly,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v because log-only ignores worktree mtime", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+}
+
+func TestRunCustomLivenessOutputExtendsStallWindow(t *testing.T) {
+	t.Setenv("GO_WANT_SUPERVISEDEXEC_HELPER", "1")
+	root := t.TempDir()
+	logPath := filepath.Join(root, "worker.log")
+	progressPath := filepath.Join(root, "progress.txt")
+	cmd := helperCommand(t, "sleep-exit", "1200ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      30 * time.Second,
+		StallTimeout: 700 * time.Millisecond,
+		LogPath:      logPath,
+		LivenessMode: LivenessModeCustom,
+		LivenessCommand: LivenessCommand{
+			Command: os.Args[0],
+			Args:    []string{"-test.run=TestHelperProcess", "--", "custom-progress", progressPath},
+			Timeout: 300 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v because custom output kept advancing", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile log: %v", err)
+	}
+	if !strings.Contains(string(data), "custom liveness command") {
+		t.Fatalf("log missing custom liveness output:\n%s", string(data))
+	}
+}
+
+func TestRunCustomLivenessCommandIsBounded(t *testing.T) {
+	t.Setenv("GO_WANT_SUPERVISEDEXEC_HELPER", "1")
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "sleep", "10s")
+
+	start := time.Now()
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 250 * time.Millisecond,
+		LogPath:      logPath,
+		LivenessMode: LivenessModeCustom,
+		LivenessCommand: LivenessCommand{
+			Command: os.Args[0],
+			Args:    []string{"-test.run=TestHelperProcess", "--", "sleep", "10s"},
+			Timeout: 50 * time.Millisecond,
+		},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v", result.Outcome, OutcomeStalled)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Run took %s; custom liveness command was not bounded promptly", elapsed)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile log: %v", err)
+	}
+	if !strings.Contains(string(data), "timeout=true") {
+		t.Fatalf("log missing custom liveness timeout:\n%s", string(data))
+	}
+}
+
 func TestWorktreePollIntervalDecouplesFromLogPollAtScale(t *testing.T) {
 	stallTimeout := 5 * time.Minute
 	logInterval := stallPollInterval(stallTimeout)
@@ -392,6 +491,19 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "custom-progress":
+		path := args[0]
+		value := 0
+		if data, err := os.ReadFile(path); err == nil {
+			value = parseInt(strings.TrimSpace(string(data)))
+		}
+		value++
+		if err := os.WriteFile(path, []byte(strconv.Itoa(value)), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write progress: %v\n", err)
+			os.Exit(2)
+		}
+		fmt.Println(value)
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
