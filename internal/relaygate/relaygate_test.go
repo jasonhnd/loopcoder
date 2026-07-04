@@ -112,6 +112,39 @@ func TestFlushPrintsVerbatimAndClears(t *testing.T) {
 	}
 }
 
+func TestFlushReturnsAckErrorAndLeavesPendingRecord(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := Write(WriteOptions{
+		RepoPath: repo,
+		RunID:    "run-test",
+		Role:     "worker",
+		PRNumber: 101,
+		Block:    testPrettyBlock,
+	}); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+
+	removeErr := errors.New("remove denied")
+	oldRemove := removePendingRecord
+	removePendingRecord = func(string) error { return removeErr }
+	t.Cleanup(func() { removePendingRecord = oldRemove })
+
+	var stdout bytes.Buffer
+	err := Flush(repo, &stdout)
+	if err == nil {
+		t.Fatal("Flush returned nil error, want Ack error")
+	}
+	if !strings.Contains(err.Error(), "acknowledge pending relays") || !strings.Contains(err.Error(), removeErr.Error()) {
+		t.Fatalf("Flush error = %q, want acknowledgement failure", err.Error())
+	}
+	if stdout.String() != testPrettyBlock {
+		t.Fatalf("Flush stdout = %q, want surfaced block %q", stdout.String(), testPrettyBlock)
+	}
+	if records := Check(repo); len(records) != 1 {
+		t.Fatalf("Check after failed Ack returned %d records, want record still pending", len(records))
+	}
+}
+
 func TestFlushEmptyPrintsConfirmation(t *testing.T) {
 	repo := t.TempDir()
 
@@ -145,10 +178,58 @@ func TestFlushWriteErrorDoesNotAckUnsurfacedRecord(t *testing.T) {
 	}
 }
 
+func TestFlushWriteErrorSurfacesAckErrorForAlreadySurfacedRecords(t *testing.T) {
+	repo := t.TempDir()
+	for _, pr := range []int{101, 102} {
+		if _, err := Write(WriteOptions{
+			RepoPath: repo,
+			RunID:    "run-test",
+			Role:     "worker",
+			PRNumber: pr,
+			Block:    testPrettyBlock,
+		}); err != nil {
+			t.Fatalf("Write returned error: %v", err)
+		}
+	}
+
+	removeErr := errors.New("remove denied")
+	oldRemove := removePendingRecord
+	removePendingRecord = func(string) error { return removeErr }
+	t.Cleanup(func() { removePendingRecord = oldRemove })
+
+	writer := failOnWriteN{failAt: 2, err: errors.New("stdout closed")}
+	err := Flush(repo, &writer)
+	if err == nil {
+		t.Fatal("Flush returned nil error, want write and Ack errors")
+	}
+	for _, want := range []string{"write pending relay", "stdout closed", "acknowledge surfaced pending relays", "remove denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Flush error missing %q: %v", want, err)
+		}
+	}
+	if records := Check(repo); len(records) != 2 {
+		t.Fatalf("Check after failed Flush returned %d records, want both records still pending", len(records))
+	}
+}
+
 type failingWriter struct {
 	err error
 }
 
 func (w failingWriter) Write([]byte) (int, error) {
 	return 0, w.err
+}
+
+type failOnWriteN struct {
+	writes int
+	failAt int
+	err    error
+}
+
+func (w *failOnWriteN) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failAt {
+		return 0, w.err
+	}
+	return len(p), nil
 }

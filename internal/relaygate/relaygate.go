@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,8 @@ const (
 	recordVersion = 1
 	maxRecordSize = 256 * 1024
 )
+
+var removePendingRecord = os.Remove
 
 // Record is one unacknowledged local-only pretty attestation block.
 type Record struct {
@@ -118,11 +121,17 @@ func Write(opts WriteOptions) (string, error) {
 // Check returns pending records. It fails open when the pending directory cannot
 // be read. Individual bad records are skipped by readPending.
 func Check(cwd string) []Record {
-	records, err := readPending(cwd)
+	records, err := CheckWithError(cwd)
 	if err != nil {
 		return nil
 	}
 	return records
+}
+
+// CheckWithError returns pending records plus any real pending-directory read
+// error. A missing pending directory is not an error.
+func CheckWithError(cwd string) ([]Record, error) {
+	return readPending(cwd)
 }
 
 // List returns pending records for display. Read errors are fail-open.
@@ -142,12 +151,17 @@ func Flush(cwd string, w io.Writer) error {
 	acknowledged := make([]Record, 0, len(records))
 	for _, rec := range records {
 		if _, err := io.WriteString(w, rec.Block); err != nil {
-			_ = Ack(cwd, acknowledged)
-			return fmt.Errorf("write pending relay %s: %w", rec.Nonce, err)
+			writeErr := fmt.Errorf("write pending relay %s: %w", rec.Nonce, err)
+			if ackErr := Ack(cwd, acknowledged); ackErr != nil {
+				return errors.Join(writeErr, fmt.Errorf("acknowledge surfaced pending relays: %w", ackErr))
+			}
+			return writeErr
 		}
 		acknowledged = append(acknowledged, rec)
 	}
-	_ = Ack(cwd, acknowledged)
+	if err := Ack(cwd, acknowledged); err != nil {
+		return fmt.Errorf("acknowledge pending relays: %w", err)
+	}
 	return nil
 }
 
@@ -159,7 +173,7 @@ func Ack(cwd string, records []Record) error {
 			continue
 		}
 		path := filepath.Join(pendingDir(cwd), rec.Nonce+".json")
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+		if err := removePendingRecord(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -168,6 +182,16 @@ func Ack(cwd string, records []Record) error {
 
 func readPending(cwd string) ([]Record, error) {
 	dir := pendingDir(cwd)
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("pending relay path is not a directory: %s", dir)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {

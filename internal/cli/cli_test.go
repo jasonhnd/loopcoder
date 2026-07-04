@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,6 +327,30 @@ func TestRelayFlushEmptyPrintsConfirmation(t *testing.T) {
 	}
 }
 
+func TestRelayFlushAckFailureExitsNonZeroAndPrintsError(t *testing.T) {
+	repo := t.TempDir()
+	block := cliPendingPrettyBlock("worker")
+	rec := writePendingRelayForCLITest(t, repo, "worker", 101, block)
+
+	stdout := &relayFlushAckSabotageWriter{
+		t:    t,
+		path: filepath.Join(repo, ".loopcoder", "relay", "pending", rec.Nonce+".json"),
+	}
+	var stderr bytes.Buffer
+	exitCode := runRelayFlush([]string{"--repo", repo}, stdout, &stderr)
+	if exitCode != 1 {
+		t.Fatalf("relay flush exit = %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != block {
+		t.Fatalf("relay flush stdout = %q, want surfaced block %q", stdout.String(), block)
+	}
+	for _, want := range []string{"relay flush:", "acknowledge pending relays"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+}
+
 func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 	repo := t.TempDir()
 	block := cliPendingPrettyBlock("worker")
@@ -477,6 +502,57 @@ func TestRelayGateFailOpenOnCorruptState(t *testing.T) {
 	exitCode = RunWithDeps([]string{"relay", "flush", "--repo", repo}, &stdout, &stderr, Deps{})
 	if exitCode != 0 {
 		t.Fatalf("relay flush with corrupt state exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+}
+
+func TestRelayGateWarnsAndFailsOpenOnRealPendingReadError(t *testing.T) {
+	repo := t.TempDir()
+	relayDir := filepath.Join(repo, ".loopcoder", "relay")
+	if err := os.MkdirAll(relayDir, 0o755); err != nil {
+		t.Fatalf("mkdir relay dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(relayDir, "pending"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write pending file: %v", err)
+	}
+
+	called := false
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"verify-local", "--repo", repo, "--pr-number", "101"}, &stdout, &stderr, Deps{
+		Verify: func(context.Context, verify.Options) verify.Result {
+			called = true
+			return verify.Result{Summary: verify.Summary{Verdict: verify.StatusPass, LocalCommandGates: "not-configured"}, ExitCode: 0}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("verify-local with relay read error exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("verify-local did not run through relay read error")
+	}
+	if !strings.Contains(stderr.String(), "relay gate: could not read pending records:") || !strings.Contains(stderr.String(), "proceeding") {
+		t.Fatalf("stderr missing relay warning: %q", stderr.String())
+	}
+}
+
+func TestRelayGateMissingPendingDirectoryStaysSilent(t *testing.T) {
+	repo := t.TempDir()
+
+	called := false
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"verify-local", "--repo", repo, "--pr-number", "101"}, &stdout, &stderr, Deps{
+		Verify: func(context.Context, verify.Options) verify.Result {
+			called = true
+			return verify.Result{Summary: verify.Summary{Verdict: verify.StatusPass, LocalCommandGates: "not-configured"}, ExitCode: 0}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("verify-local with missing relay state exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("verify-local did not run with missing relay state")
+	}
+	if strings.Contains(stderr.String(), "relay gate:") {
+		t.Fatalf("stderr contains relay warning for missing directory: %q", stderr.String())
 	}
 }
 
@@ -3550,6 +3626,95 @@ func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *te
 	}
 }
 
+func TestDispatchWaveCompletionErrorStillWritesAggregateReport(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	relayDir := filepath.Join(repo, ".loopcoder", "relay")
+	if err := os.MkdirAll(relayDir, 0o755); err != nil {
+		t.Fatalf("mkdir relay dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(relayDir, "pending"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write pending file: %v", err)
+	}
+
+	now := time.Date(2026, 6, 30, 1, 2, 3, 0, time.UTC)
+	record201 := validDispatchAttestation()
+	record201.Action = "implement issue #201"
+	record202 := validDispatchAttestation()
+	record202.Action = "implement issue #202"
+
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--repo", repo,
+		"--issue-numbers", "201,202",
+		"--run-id", "run-test-wave",
+		"--throttle-limit", "1",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Now: func() time.Time {
+			return now
+		},
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				views: map[int]gh.Issue{
+					201: {Number: 201, Title: "Wave 201", Body: "Body 201"},
+					202: {Number: 202, Title: "Wave 202", Body: "Body 202"},
+				},
+			}
+		},
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			return report.ReadySetReport{
+				Repo:       "owner/repo",
+				BaseBranch: "main",
+				Ready: []report.ReadyIssue{
+					{Issue: 201, Title: "Wave 201", Reason: "ready"},
+					{Issue: 202, Title: "Wave 202", Reason: "ready"},
+				},
+			}, nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			record := &record201
+			if opts.IssueNumber == 202 {
+				record = &record202
+			}
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-" + strconv.Itoa(opts.IssueNumber),
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/" + strconv.Itoa(opts.IssueNumber),
+				AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-" + strconv.Itoa(opts.IssueNumber) + ".attempt.json",
+				Status:      "succeeded",
+				Attestation: record,
+			}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	text := stdout.String()
+	if !strings.HasPrefix(text, "DISPATCH WAVE\n") {
+		t.Fatalf("stdout should start with aggregate report, got:\n%s", text)
+	}
+	for _, want := range []string{"RunId: run-test-wave", "- #201 succeeded", "- #202 succeeded", "Verify successful PRs"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+	for _, want := range []string{
+		"relay gate: could not read pending records:",
+		"dispatch-wave: write relay record for worker #201:",
+		"dispatch-wave: pending relay records may remain;",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -3829,6 +3994,36 @@ func cliPendingPrettyBlock(role string) string {
 		"role=" + role,
 		"pr=101",
 	}, "\n") + "\n"
+}
+
+type relayFlushAckSabotageWriter struct {
+	t         *testing.T
+	path      string
+	buf       bytes.Buffer
+	sabotaged bool
+}
+
+func (w *relayFlushAckSabotageWriter) Write(p []byte) (int, error) {
+	if _, err := w.buf.Write(p); err != nil {
+		return 0, err
+	}
+	if !w.sabotaged {
+		w.sabotaged = true
+		if err := os.Remove(w.path); err != nil {
+			w.t.Fatalf("remove pending file before sabotage: %v", err)
+		}
+		if err := os.Mkdir(w.path, 0o755); err != nil {
+			w.t.Fatalf("mkdir pending record path: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(w.path, "child"), []byte("keep directory non-empty"), 0o600); err != nil {
+			w.t.Fatalf("write pending record child: %v", err)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *relayFlushAckSabotageWriter) String() string {
+	return w.buf.String()
 }
 
 func writePendingRelayForCLITest(t *testing.T, repo, role string, pr int, block string) relaygate.Record {

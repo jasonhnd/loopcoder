@@ -55,16 +55,24 @@ func relayHookEnv(stateDir string) map[string]string {
 }
 
 func writeWorkerLedger(t *testing.T, root string) (ledgerPath, block string) {
+	return writeWorkerLedgerForCommand(t, root, "dispatch", "job-101-1.attest")
+}
+
+func writeWorkerDispatchWaveLedger(t *testing.T, root string) (ledgerPath, block string) {
+	return writeWorkerLedgerForCommand(t, root, "dispatch-wave", "wave-101-1.attest")
+}
+
+func writeWorkerLedgerForCommand(t *testing.T, root, command, filename string) (ledgerPath, block string) {
 	t.Helper()
 	dir := filepath.Join(root, ".loopcoder", "relay", "run-test")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir worker ledger dir: %v", err)
 	}
-	ledgerPath = filepath.Join(dir, "job-101-1.attest")
+	ledgerPath = filepath.Join(dir, filename)
 	block = workerHeader + "\n" + workerPretty + "\n"
 	content := strings.Join([]string{
 		"# loopcoder relay attestation",
-		"# command=dispatch",
+		"# command=" + command,
 		"# role=worker",
 		"# run_id=run-test",
 		"# issue=101",
@@ -110,6 +118,19 @@ func dispatchPostToolForTool(root, toolName string, response map[string]any) map
 		"tool_name":       toolName,
 		"tool_input": map[string]any{
 			"command": `loopcoder dispatch --repo . --issue-number 101 --issue-title "Implement"`,
+		},
+		"tool_response": response,
+	}
+}
+
+func dispatchWavePostToolForTool(root, toolName string, response map[string]any) map[string]any {
+	return map[string]any{
+		"session_id":      "session-1",
+		"cwd":             root,
+		"hook_event_name": "PostToolUse",
+		"tool_name":       toolName,
+		"tool_input": map[string]any{
+			"command": `loopcoder dispatch-wave --repo . --issue-numbers 101`,
 		},
 		"tool_response": response,
 	}
@@ -240,6 +261,77 @@ func TestRelaySwallowedWorkerBlockBlocksStop(t *testing.T) {
 	}
 }
 
+func TestRelayStopSkipsUnreadableLedgerButBlocksReadablePending(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, block := writeWorkerLedger(t, root)
+	missingPath := filepath.Join(root, ".loopcoder", "relay", "run-test", "missing.attest")
+
+	statePath, err := stateFilePath("session-1", root, stateDir, relayStateSub)
+	if err != nil {
+		t.Fatalf("stateFilePath: %v", err)
+	}
+	state := relayState{
+		Version:       1,
+		SessionIDHash: hashText("session-1")[:32],
+		CreatedAt:     "2026-06-28T00:00:00Z",
+		UpdatedAt:     "2026-06-28T00:00:00Z",
+		Records: map[string]*relayRecord{
+			"missing": {
+				ID:         "missing",
+				Role:       "worker",
+				Command:    "dispatch",
+				Status:     "pending",
+				LedgerPath: missingPath,
+				Header:     workerHeader,
+				RecordedAt: "2026-06-28T00:00:00Z",
+				UpdatedAt:  "2026-06-28T00:00:00Z",
+			},
+			"readable": {
+				ID:         "readable",
+				Role:       "worker",
+				Command:    "dispatch",
+				Status:     "pending",
+				LedgerPath: ledgerPath,
+				Header:     workerHeader,
+				RecordedAt: "2026-06-28T00:00:01Z",
+				UpdatedAt:  "2026-06-28T00:00:01Z",
+			},
+		},
+	}
+	if err := writeStateJSON(statePath, &state); err != nil {
+		t.Fatalf("write relay state: %v", err)
+	}
+
+	firstStop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
+	if firstStop.ExitCode != 2 {
+		t.Fatalf("expected Stop exit 2, got %d (stderr=%q)", firstStop.ExitCode, firstStop.Stderr)
+	}
+	if !strings.Contains(firstStop.Stderr, strings.TrimRight(block, "\n")) {
+		t.Fatalf("expected Stop stderr to include readable block; stderr=%q", firstStop.Stderr)
+	}
+	if !strings.Contains(firstStop.Stderr, "skipped unreadable relay ledger") || !strings.Contains(firstStop.Stderr, filepath.ToSlash(missingPath)) {
+		t.Fatalf("expected Stop stderr to note skipped missing ledger; stderr=%q", firstStop.Stderr)
+	}
+
+	updated, err := readRelayState(statePath, "session-1")
+	if err != nil {
+		t.Fatalf("read relay state: %v", err)
+	}
+	if updated.Records["readable"].Status != "surfaced_by_hook" {
+		t.Fatalf("readable status = %q, want surfaced_by_hook", updated.Records["readable"].Status)
+	}
+	if updated.Records["missing"].Status != "skipped_unreadable_by_hook" {
+		t.Fatalf("missing status = %q, want skipped_unreadable_by_hook", updated.Records["missing"].Status)
+	}
+
+	secondStop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
+	if secondStop.ExitCode != 0 {
+		t.Fatalf("expected second Stop exit 0, got %d", secondStop.ExitCode)
+	}
+}
+
 func TestRelaySurfacedVerifierBlockAllowsStop(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
@@ -314,6 +406,15 @@ func TestRelayPowerShellToolRecordsDispatchAndLoopreview(t *testing.T) {
 			wantCommand: "dispatch",
 		},
 		{
+			name:        "dispatch-wave worker",
+			writeLedger: writeWorkerDispatchWaveLedger,
+			input: func(root string, response map[string]any) map[string]any {
+				return dispatchWavePostToolForTool(root, "PowerShell", response)
+			},
+			wantRole:    "worker",
+			wantCommand: "dispatch-wave",
+		},
+		{
 			name:        "loopreview verifier",
 			writeLedger: writeVerifierLedger,
 			input: func(root string, response map[string]any) map[string]any {
@@ -370,6 +471,34 @@ func TestRelayBackgroundRunRecordsPendingAndStopBlocks(t *testing.T) {
 	}
 	if !strings.Contains(stop.Stderr, strings.TrimRight(block, "\n")) {
 		t.Fatalf("expected Stop stderr to include pending ledger block; stderr=%q", stop.Stderr)
+	}
+}
+
+func TestRelayBackgroundDispatchWaveRecordsPendingAndStopBlocks(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, block := writeWorkerDispatchWaveLedger(t, root)
+
+	postTool := RunRelayGuard(mustJSON(t, dispatchWavePostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    "running in background\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{Env: mapEnv(env)})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+	rec := requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+	if rec.Role != "worker" || rec.Command != "dispatch-wave" {
+		t.Fatalf("record role/command = %s/%s, want worker/dispatch-wave", rec.Role, rec.Command)
+	}
+
+	stop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
+	if stop.ExitCode != 2 {
+		t.Fatalf("expected Stop exit 2, got %d", stop.ExitCode)
+	}
+	if !strings.Contains(stop.Stderr, strings.TrimRight(block, "\n")) {
+		t.Fatalf("expected Stop stderr to include pending dispatch-wave ledger block; stderr=%q", stop.Stderr)
 	}
 }
 
@@ -459,6 +588,9 @@ func TestRelayScopeOffDisablesGuard(t *testing.T) {
 func TestRelayCommandRecognition(t *testing.T) {
 	if got := relayCommand(`loopcoder dispatch --repo .`); got == nil || got.kind != "dispatch" || got.role != "worker" {
 		t.Errorf("relayCommand(dispatch) = %+v, want dispatch/worker", got)
+	}
+	if got := relayCommand(`loopcoder dispatch-wave --repo . --issue-numbers 101`); got == nil || got.kind != "dispatch-wave" || got.role != "worker" {
+		t.Errorf("relayCommand(dispatch-wave) = %+v, want dispatch-wave/worker", got)
 	}
 	if got := relayCommand(`"C:\Tools\loopcoder.exe" loopreview --repo .`); got == nil || got.kind != "loopreview" || got.role != "verifier" {
 		t.Errorf("relayCommand(quoted loopreview) = %+v, want loopreview/verifier", got)

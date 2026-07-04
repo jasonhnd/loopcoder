@@ -2,6 +2,7 @@ package conductorhooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -222,32 +223,61 @@ func handleStop(statePath string, now time.Time) Result {
 	}
 
 	blocks := make([]string, 0, len(pending))
+	readable := make([]*relayRecord, 0, len(pending))
+	skipped := make([]*relayRecord, 0)
+	skipNotes := make([]string, 0)
 	for _, rec := range pending {
 		lr, err := readLedgerRecord(rec.LedgerPath)
 		if err != nil {
-			return allow()
+			skipped = append(skipped, rec)
+			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: %v", filepath.ToSlash(rec.LedgerPath), err))
+			continue
+		}
+		if lr == nil {
+			skipped = append(skipped, rec)
+			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: no attestation block found", filepath.ToSlash(rec.LedgerPath)))
+			continue
 		}
 		blocks = append(blocks, lr.block)
+		readable = append(readable, rec)
 	}
 
 	surfacedAt := isoTimestamp(now)
-	for _, rec := range pending {
+	for _, rec := range readable {
 		state.Records[rec.ID].Status = "surfaced_by_hook"
 		state.Records[rec.ID].UpdatedAt = surfacedAt
 	}
-	state.UpdatedAt = surfacedAt
-	trimStateRecords(&state)
-	if err := writeStateJSON(statePath, &state); err != nil {
+	for _, rec := range skipped {
+		state.Records[rec.ID].Status = "skipped_unreadable_by_hook"
+		state.Records[rec.ID].UpdatedAt = surfacedAt
+	}
+	if len(readable) > 0 || len(skipped) > 0 {
+		state.UpdatedAt = surfacedAt
+		trimStateRecords(&state)
+		if err := writeStateJSON(statePath, &state); err != nil {
+			return allow()
+		}
+	}
+
+	if len(blocks) == 0 {
 		return allow()
 	}
 
-	return block(strings.Join([]string{
+	lines := []string{
 		"loopcoder local verbatim attestation relay was missing from the completed command output.",
 		"The missing local-only attestation block(s) are printed below:",
 		"",
+	}
+	if len(skipNotes) > 0 {
+		lines = append(lines, "Some pending relay records could not be read and were skipped:")
+		lines = append(lines, skipNotes...)
+		lines = append(lines, "")
+	}
+	lines = append(lines,
 		strings.Join(blocks, "\n"),
 		"Keep these attestations local-only: do not copy them into PRs, issues, comments, commits, merge artifacts, docs, or tracked files.",
-	}, "\n"))
+	)
+	return block(strings.Join(lines, "\n"))
 }
 
 // pendingRecords returns records whose status is "pending", ordered by the time
@@ -486,6 +516,7 @@ func recordCommandMatches(kind string, rec ledgerRecord) bool {
 		return rec.command == kind
 	}
 	return (kind == "dispatch" && rec.role == "worker") ||
+		(kind == "dispatch-wave" && rec.role == "worker") ||
 		(kind == "loopreview" && rec.role == "verifier")
 }
 
@@ -512,8 +543,8 @@ func relayCommand(command string) *relayTarget {
 			continue
 		}
 		switch words[i+1] {
-		case "dispatch":
-			return &relayTarget{kind: "dispatch", role: "worker"}
+		case "dispatch", "dispatch-wave":
+			return &relayTarget{kind: words[i+1], role: "worker"}
 		case "loopreview":
 			return &relayTarget{kind: "loopreview", role: "verifier"}
 		}
