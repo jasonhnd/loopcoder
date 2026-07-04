@@ -146,7 +146,7 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 			want: StatusWarn,
 			contains: []string{
 				"missing loopcoder conductor hooks",
-				"matcher=Bash|PowerShell",
+				"matcher=Bash|PowerShell|pwsh",
 				"run: loopcoder skill install",
 			},
 		},

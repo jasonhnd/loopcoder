@@ -65,7 +65,7 @@ host hook that verifies actual surfacing.
 the verbatim pretty block). Introduce a small `relaygate` package:
 
 - Every **mechanical** subcommand — `dispatch`, `dispatch-wave`, `loopreview`,
-  `ready-set`, `status`, `verify-local`, `recover`, and the promote/merge helpers —
+  `ready-set`, `verify-local`, `recover`, and the promote/merge helpers —
   calls `relaygate.Check(cwd)` at startup. While an **unacknowledged** pending relay
   exists, the command **exits non-zero with a reserved exit code** after printing the
   pending block(s) verbatim to stdout plus how to clear them.
@@ -73,7 +73,7 @@ the verbatim pretty block). Introduce a small `relaygate` package:
   them — the single sanctioned surfacing point. `loopcoder relay list` shows pending
   without clearing.
 
-Effect: the conductor cannot dispatch the next slice, review, check status, or merge
+Effect: the conductor cannot dispatch the next slice, review, verify locally, or merge
 until it has run a command whose stdout **is** the pending block. This is independent
 of host, tool type, and background execution — it closes both holes above by
 construction.
@@ -104,15 +104,19 @@ completes**, interleaved with its result. Parallelism no longer requires
 
 ## Invariants
 
-- **R1** — Every mechanical subcommand refuses to start while an unacknowledged
-  pending relay exists (fail-closed **for mechanical progress only**), printing the
-  pending block(s) verbatim + clear instructions and exiting with the reserved code.
+- **R1** — Gated mechanical/progress commands are `dispatch`, `dispatch-wave`,
+  `loopreview`, `ready-set`, `verify-local`, `recover`, and `promote`; they refuse
+  to start while an unacknowledged pending relay exists (fail-closed **for
+  mechanical progress only**), printing the pending block(s) verbatim + clear
+  instructions and exiting with the reserved code. Exempt/inspection commands are
+  `relay flush`, `relay list`, `doctor`, `attest`, `status`, `--help`, and
+  `--version`.
 - **R2** — `loopcoder relay flush` prints all pending blocks verbatim to stdout and
   clears them; `loopcoder relay list` shows pending without clearing.
 - **R3** — `dispatch` / `loopreview` write the pending relay atomically (nonce, role,
   PR, verbatim block) to the gitignored `.loopcoder` ledger.
 - **R4 (NO LOCKOUT)** — The gate exempts the commands needed to clear or inspect it
-  (`relay flush`, `relay list`, `doctor`, `attest`, `--help`, `--version`) and
+  (`relay flush`, `relay list`, `doctor`, `attest`, `status`, `--help`, `--version`) and
   **fails open** on any gate-state read error. A valid run must never be permanently
   refused; `relay flush` always succeeds. Works headless / in CI.
 - **R5** — `conductor-relay-guard` covers PowerShell/pwsh + Bash and background runs;
@@ -144,7 +148,7 @@ completes**, interleaved with its result. Parallelism no longer requires
   `.claude/settings.json` PostToolUse `matcher`, `hooks/claude-settings.snippet.json`,
   `internal/claudehooks/settings.go`.
 - Subcommand entry points to gate: `internal/cli/cli.go` (`runDispatch`,
-  `runDispatchWave`, `runLoopreview`, `runReadySet`, `runStatus`, `runVerifyLocal`,
+  `runDispatchWave`, `runLoopreview`, `runReadySet`, `runVerifyLocal`,
   `runRecover`, `runPromote`), plus a new `relay` command group.
 - Reserved exit code: extend the H5 exit-code scheme in
   `internal/loopreview/loopreview.go` / `internal/cli/cli.go` with a distinct

@@ -656,7 +656,10 @@ func runRelayFlush(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "relay flush: %v\n", err)
 		return 2
 	}
-	relaygate.Flush(resolvedRepo, stdout)
+	if err := relaygate.Flush(resolvedRepo, stdout); err != nil {
+		fmt.Fprintf(stderr, "relay flush: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
@@ -1125,6 +1128,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 2
 	}
+	preExistingRelayNonces := relayRecordNonces(relaygate.Check(resolvedRepo))
 	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
@@ -1212,6 +1216,17 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 1
 	}
+	var ownRelayRecords []relaygate.Record
+	prettyMode := attestation.PrettyModePlain
+	renderPretty := shouldRenderPretty(noPretty)
+	if renderPretty {
+		prettyMode = prettyModeForTarget(stderr, deps, pretty)
+		ownRelayRecords, err = writeTickRelayRecords(resolvedRepo, tickReport, prettyMode, preExistingRelayNonces)
+		if err != nil {
+			fmt.Fprintf(stderr, "tick: write relay records: %v\n", err)
+			return 1
+		}
+	}
 	if _, err := stdout.Write(data); err != nil {
 		fmt.Fprintf(stderr, "tick: write output: %v\n", err)
 		return 1
@@ -1220,10 +1235,13 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
 		return 1
 	}
-	if shouldRenderPretty(noPretty) {
-		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := renderTickPrettyAttestations(stderr, tickReport, mode); err != nil {
+	if renderPretty {
+		if err := renderTickPrettyAttestations(stderr, tickReport, prettyMode); err != nil {
 			fmt.Fprintf(stderr, "tick: write pretty attestation: %v\n", err)
+			return 1
+		}
+		if err := relaygate.Ack(resolvedRepo, ownRelayRecords); err != nil {
+			fmt.Fprintf(stderr, "tick: acknowledge relay records: %v\n", err)
 			return 1
 		}
 	}
@@ -1388,6 +1406,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 2
 	}
+	preExistingRelayNonces := relayRecordNonces(relaygate.Check(resolvedRepo))
 	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
@@ -1425,6 +1444,17 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "trigger %s: %v\n", kind, err)
 		return 1
 	}
+	var ownRelayRecords []relaygate.Record
+	prettyMode := attestation.PrettyModePlain
+	renderPretty := shouldRenderPretty(noPretty)
+	if renderPretty {
+		prettyMode = prettyModeForTarget(stderr, deps, pretty)
+		ownRelayRecords, err = writeTriggerRelayRecords(resolvedRepo, triggerReport, prettyMode, preExistingRelayNonces)
+		if err != nil {
+			fmt.Fprintf(stderr, "trigger %s: write relay records: %v\n", kind, err)
+			return 1
+		}
+	}
 	if _, err := stdout.Write(data); err != nil {
 		fmt.Fprintf(stderr, "trigger %s: write output: %v\n", kind, err)
 		return 1
@@ -1433,10 +1463,13 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "trigger %s: write summary: %v\n", kind, err)
 		return 1
 	}
-	if shouldRenderPretty(noPretty) {
-		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := renderTriggerPrettyAttestations(stderr, triggerReport, mode); err != nil {
+	if renderPretty {
+		if err := renderTriggerPrettyAttestations(stderr, triggerReport, prettyMode); err != nil {
 			fmt.Fprintf(stderr, "trigger %s: write pretty attestation: %v\n", kind, err)
+			return 1
+		}
+		if err := relaygate.Ack(resolvedRepo, ownRelayRecords); err != nil {
+			fmt.Fprintf(stderr, "trigger %s: acknowledge relay records: %v\n", kind, err)
 			return 1
 		}
 	}
@@ -1495,6 +1528,87 @@ func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerRe
 		}
 	}
 	return nil
+}
+
+func relayRecordNonces(records []relaygate.Record) map[string]bool {
+	nonces := make(map[string]bool, len(records))
+	for _, rec := range records {
+		nonce := strings.TrimSpace(rec.Nonce)
+		if nonce != "" {
+			nonces[nonce] = true
+		}
+	}
+	return nonces
+}
+
+func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+	var records []relaygate.Record
+	for _, tick := range report.Ticks {
+		tickRecords, err := writeTickRelayRecords(repoPath, tick, mode, preExisting)
+		if err != nil {
+			return records, err
+		}
+		records = append(records, tickRecords...)
+	}
+	return records, nil
+}
+
+func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+	var records []relaygate.Record
+	if report.DispatchWave != nil {
+		runID := strings.TrimSpace(report.DispatchWave.RunID)
+		if runID == "" {
+			runID = strings.TrimSpace(report.RunID)
+		}
+		for _, result := range report.DispatchWave.Results {
+			if result.Attestation == nil {
+				continue
+			}
+			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Attestation.Role), prNumberFromPR(result.PR), *result.Attestation, mode, preExisting)
+			if err != nil {
+				return records, err
+			}
+			if ok {
+				records = append(records, rec)
+			}
+		}
+	}
+	for _, review := range report.Reviews {
+		if review.Attestation == nil {
+			continue
+		}
+		prNumber := review.PRNumber
+		if prNumber == 0 {
+			prNumber = prNumberFromPR(review.PR)
+		}
+		runID := fmt.Sprintf("loopreview-pr-%d", prNumber)
+		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Attestation.Role), prNumber, *review.Attestation, mode, preExisting)
+		if err != nil {
+			return records, err
+		}
+		if ok {
+			records = append(records, rec)
+		}
+	}
+	return records, nil
+}
+
+func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record attestation.AttestationRecord, mode attestation.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
+	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+	nonce := relaygate.Nonce(runID, prNumber, role)
+	if _, err := relaygate.Write(relaygate.WriteOptions{
+		RepoPath: repoPath,
+		RunID:    runID,
+		Role:     role,
+		PRNumber: prNumber,
+		Block:    pretty,
+	}); err != nil {
+		return relaygate.Record{}, false, err
+	}
+	if preExisting[nonce] {
+		return relaygate.Record{}, false, nil
+	}
+	return relaygate.Record{Nonce: nonce}, true, nil
 }
 
 func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -3570,9 +3684,6 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 2
-	}
-	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
-		return exitCode
 	}
 
 	report, err := runstatus.Load(runstatus.Options{

@@ -205,13 +205,6 @@ func TestRelayGateBlocksMechanicalCommands(t *testing.T) {
 			},
 		},
 		{
-			name: "status",
-			args: func(repo string) []string {
-				return []string{"status", "--repo", repo}
-			},
-			deps: func(t *testing.T) Deps { return Deps{} },
-		},
-		{
 			name: "verify-local",
 			args: func(repo string) []string {
 				return []string{"verify-local", "--repo", repo, "--pr-number", "101"}
@@ -320,6 +313,19 @@ func TestRelayListNonDestructiveAndFlushClears(t *testing.T) {
 	}
 }
 
+func TestRelayFlushEmptyPrintsConfirmation(t *testing.T) {
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"relay", "flush", "--repo", repo}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("relay flush exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.String() != "no pending relays\n" {
+		t.Fatalf("relay flush stdout = %q, want no-pending confirmation", stdout.String())
+	}
+}
+
 func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 	repo := t.TempDir()
 	block := cliPendingPrettyBlock("worker")
@@ -346,6 +352,37 @@ func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 		}
 		if !called {
 			t.Fatal("doctor did not run")
+		}
+	})
+	t.Run("status", func(t *testing.T) {
+		record := validDispatchAttestation()
+		exitCode := 0
+		if _, err := state.WriteAttempt(repo, "run-test", state.AttemptRecord{
+			Version:        1,
+			JobID:          "job-101-1",
+			Issue:          101,
+			Attempt:        1,
+			Provider:       "codex",
+			Phase:          "codex_exited",
+			Status:         "succeeded",
+			StartedAt:      record.StartedAt,
+			HeartbeatAt:    record.EndedAt,
+			LastProgressAt: record.EndedAt,
+			ExitCode:       &exitCode,
+			Attestation:    &record,
+		}); err != nil {
+			t.Fatalf("WriteAttempt: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		gotExit := RunWithDeps([]string{"status", "--repo", repo, "--run", "run-test"}, &stdout, &stderr, Deps{})
+		if gotExit != 0 {
+			t.Fatalf("status exit = %d, stderr=%q", gotExit, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "RUN STATUS") {
+			t.Fatalf("status stdout missing report:\n%s", stdout.String())
+		}
+		if strings.Contains(stdout.String(), "loopcoder relay gate") {
+			t.Fatalf("status was gated:\n%s", stdout.String())
 		}
 	})
 	t.Run("attest", func(t *testing.T) {
@@ -379,6 +416,35 @@ func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 			t.Fatalf("relay flush stdout = %q, want %q", stdout.String(), block)
 		}
 	})
+}
+
+func TestRelayGateNeverGatesAutomationCommands(t *testing.T) {
+	repo := t.TempDir()
+	writePendingRelayForCLITest(t, repo, "worker", 101, cliPendingPrettyBlock("worker"))
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "hook conductor-attest", args: []string{"hook", "conductor-attest"}},
+		{name: "hook conductor-relay-guard", args: []string{"hook", "conductor-relay-guard"}},
+		{name: "attest", args: []string{"attest", "--provider", "codex-cli", "--model", "gpt-5", "--action", "test", "--duration-ms", "1", "--total-tokens", "1"}},
+		{name: "version", args: []string{"version"}},
+		{name: "root help", args: []string{"--help"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, Deps{})
+			if exitCode != 0 {
+				t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+			}
+			if strings.Contains(stdout.String(), "loopcoder relay gate") || strings.Contains(stderr.String(), "loopcoder relay gate") {
+				t.Fatalf("automation command was gated; stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
 }
 
 func TestRelayGateFailOpenOnCorruptState(t *testing.T) {
@@ -2411,6 +2477,66 @@ evidence:
 	}
 }
 
+func TestTickSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	stale := writePendingRelayForCLITest(t, repo, "worker", 202, cliPendingPrettyBlock("worker"))
+	record := validDispatchAttestation()
+	called := false
+
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo, "--run-id", "run-test-wave"}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			return orchestration.TickReport{
+				Version:       orchestration.TickReportVersion,
+				Repo:          "owner/repo",
+				RepoPath:      repo,
+				BaseBranch:    opts.BaseBranch,
+				PreProdBranch: opts.PreProdBranch,
+				RunID:         opts.RunID,
+				Status:        orchestration.TickStatusSucceeded,
+				StopReason:    orchestration.TickStopCompleted,
+				StartedAt:     "2026-07-02T12:00:00Z",
+				FinishedAt:    "2026-07-02T12:00:00Z",
+				DispatchWave: &orchestration.DispatchWaveReport{
+					Repo:       "owner/repo",
+					BaseBranch: opts.BaseBranch,
+					RunID:      opts.RunID,
+					Results: []orchestration.DispatchWaveIssueResult{{
+						Issue:       101,
+						Status:      orchestration.DispatchWaveStatusSucceeded,
+						PR:          "https://github.com/owner/repo/pull/101",
+						Attestation: &record,
+					}},
+				},
+				Reviews:    []orchestration.TickReviewResult{},
+				NeedsHuman: []orchestration.TickIssue{},
+				Failures:   []orchestration.TickIssue{},
+			}, nil
+		},
+	})
+	if exitCode == relayGateExitCode {
+		t.Fatalf("tick exit = relay gate code %d; stderr=%q", exitCode, stderr.String())
+	}
+	if exitCode != 0 {
+		t.Fatalf("tick exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	if !strings.Contains(stderr.String(), "attestation: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+		t.Fatalf("tick stderr missing self-surfaced worker block:\n%s", stderr.String())
+	}
+	pending := relaygate.Check(repo)
+	if len(pending) != 1 || pending[0].Nonce != stale.Nonce {
+		t.Fatalf("pending relay records after tick = %#v, want only stale startup record", pending)
+	}
+}
+
 func TestTickNeedsHumanExitCode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -2486,6 +2612,61 @@ func TestTriggerCronRunsTickWithExplicitRepo(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
 		}
+	}
+}
+
+func TestTriggerSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	stale := writePendingRelayForCLITest(t, repo, "worker", 202, cliPendingPrettyBlock("worker"))
+	record := validDispatchAttestation()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"trigger",
+		"cron",
+		"--repo", repo,
+		"--schedule", "@hourly",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Now: func() time.Time {
+			return time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		},
+		Tick: func(_ context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error) {
+			called = true
+			report := cliTriggerTickReport(opts, orchestration.TickStatusSucceeded, orchestration.TickStopCompleted)
+			report.DispatchWave = &orchestration.DispatchWaveReport{
+				Repo:       "owner/repo",
+				BaseBranch: opts.BaseBranch,
+				RunID:      opts.RunID,
+				Results: []orchestration.DispatchWaveIssueResult{{
+					Issue:       101,
+					Status:      orchestration.DispatchWaveStatusSucceeded,
+					PR:          "https://github.com/owner/repo/pull/101",
+					Attestation: &record,
+				}},
+			}
+			return report, nil
+		},
+	})
+	if exitCode == relayGateExitCode {
+		t.Fatalf("trigger exit = relay gate code %d; stderr=%q", exitCode, stderr.String())
+	}
+	if exitCode != 0 {
+		t.Fatalf("trigger exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Tick dependency was not called")
+	}
+	if !strings.Contains(stderr.String(), "attestation: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+		t.Fatalf("trigger stderr missing self-surfaced worker block:\n%s", stderr.String())
+	}
+	pending := relaygate.Check(repo)
+	if len(pending) != 1 || pending[0].Nonce != stale.Nonce {
+		t.Fatalf("pending relay records after trigger = %#v, want only stale startup record", pending)
 	}
 }
 
