@@ -99,21 +99,24 @@ loopcoder dispatch-wave --repo .                  # dispatch the current ready w
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude
 loopcoder resume        --repo .                  # reconcile a run after an interruption
 loopcoder status        --repo .                  # render local-only run status
+loopcoder relay list    --repo .                  # inspect pending local relay blocks
+loopcoder relay flush   --repo .                  # print pending relay blocks verbatim and clear them
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>   # bounded retry of a failed attempt
 loopcoder loopreview    --repo . --pr-number 43 --provider claude   # read-only independent verifier
 loopcoder verify-local  --repo . --pr-number 43   # run a repo's local check commands on a PR
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
-`dispatch`, `loopreview`, and `dispatch-wave` emit local-only human-readable
-pretty attestation blocks to stderr by default while keeping machine stdout
-stable. The durable local machine surfaces are the `dispatch` / `loopreview`
-result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge
-artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress
-the display; `attest --pretty` remains the direct human-readable Conductor
-self-attestation form.
+`dispatch` and `loopreview` emit local-only human-readable pretty attestation
+blocks to stderr by default, while foreground `dispatch-wave` streams each
+Worker pretty block to stdout as that Worker completes and still prints the
+aggregate wave report. The durable local machine surfaces are the `dispatch` /
+`loopreview` result JSON and gitignored `.loopcoder/` run records, not PR
+bodies or merge artifacts. Use `--pretty` to force emoji output and
+`--no-pretty` to suppress the display; `attest --pretty` remains the direct
+human-readable Conductor self-attestation form.
 
-### loopreview exit codes
+### loopreview exit codes and relay gate
 
 `loopcoder loopreview` reserves process exit codes `0`, `1`, and `2` for clean
 verifier verdicts only, so CI can distinguish a review decision from a command
@@ -125,14 +128,20 @@ failure:
 - `3` means the `loopreview` command itself failed before or after a clean
   verdict, such as invalid flags, a bad `--repo`, configuration load failure,
   provider/git setup failure, or output/relay write failure.
-- `4` is reserved for the cross-command relay hard gate: a pending local-only
-  Worker/Verifier pretty block must be surfaced with `loopcoder relay flush`
-  before mechanical progress continues.
+- `4` is reserved for the cross-command relay hard gate on mechanical progress
+  commands: a pending local-only Worker/Verifier pretty block must be surfaced
+  with `loopcoder relay flush --repo <path>` before the command can run.
+
+The `relay` command group is the recovery and inspection surface:
+`loopcoder relay flush --repo <path>` prints pending blocks verbatim to stdout
+and clears them, while `loopcoder relay list --repo <path>` lists pending
+records without acknowledging them.
 
 `loopcoder status` renders delivery status from local `.loopcoder/` run state.
 Installed conductor hooks enforce the local flow: `conductor-relay-guard`
-prevents hidden `dispatch` or `loopreview` attestation blocks from completing a
-turn, and `conductor-attest` requires a Conductor self-attestation before a
+prevents hidden `dispatch`, `dispatch-wave`, or `loopreview` attestation blocks
+from completing a turn, including PowerShell/pwsh and backgrounded command
+output, and `conductor-attest` requires a Conductor self-attestation before a
 delivery or merge turn finishes. Install them into project
 `.claude/settings.json` with `loopcoder skill install --repo <repo>`;
 `loopcoder doctor` warns when they are missing.
@@ -153,7 +162,7 @@ delivery or merge turn finishes. Install them into project
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net, with `codex` and `claude` provider verification proven by real smoke runs.
-- Attestation -- worker and verifier invocations produce validated local-only records with `verified: true` covering provider, real parsed model, effort, permission, duration, and token usage. `dispatch`, `loopreview`, and `dispatch-wave` emit human-readable pretty attestation blocks to stderr by default; the durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge comments do not carry attestation headers or canonical JSON. The display shows provider vendor plus CLI tool, detected/self-reported model source, host-local timestamps, seconds duration, and grouped token counts. `--pretty` forces emoji and `--no-pretty` suppresses the display. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). The `conductor-relay-guard` and `conductor-attest` hooks keep `dispatch` / `loopreview` relay and self-attestation obligations on local visible surfaces. Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md), [`docs/specs/0282-default-pretty-attestation.md`](docs/specs/0282-default-pretty-attestation.md), [`docs/specs/0306-local-only-attestation.md`](docs/specs/0306-local-only-attestation.md), and [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md).
+- Attestation -- worker and verifier invocations produce validated local-only records with `verified: true` covering provider, real parsed model, effort, permission, duration, and token usage. `dispatch` and `loopreview` emit human-readable pretty attestation blocks to stderr by default; `dispatch-wave` streams each Worker pretty block to stdout as that Worker completes. The durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge comments do not carry attestation headers or canonical JSON. The display shows provider vendor plus CLI tool, detected/self-reported model source, host-local timestamps, seconds duration, and grouped token counts. `--pretty` forces emoji and `--no-pretty` suppresses the display. `loopcoder attest` emits Conductor self-attestation (`model_source: self-reported`, `verified: false`). The relay hard gate blocks mechanical progress with exit code `4` while pending Worker/Verifier blocks are unacknowledged; `loopcoder relay flush` prints and clears them, and `loopcoder relay list` inspects them. The `conductor-relay-guard` and `conductor-attest` hooks keep relay and self-attestation obligations on local visible surfaces. Missing required identity or usage fails closed: dispatch opens no PR, `loopreview` returns `needs-human`, and `loopcoder attest` exits non-zero. The attestation layer is verified end-to-end on `codex` and `claude`. See [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), [`docs/specs/0214-human-readable-attestation.md`](docs/specs/0214-human-readable-attestation.md), [`docs/specs/0282-default-pretty-attestation.md`](docs/specs/0282-default-pretty-attestation.md), [`docs/specs/0306-local-only-attestation.md`](docs/specs/0306-local-only-attestation.md), [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md), and [`docs/specs/0447-relay-enforcement-hardgate.md`](docs/specs/0447-relay-enforcement-hardgate.md).
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 - Self-hosting -- loopcoder planned, dispatched, reviewed, and merged most of its own development, including the rewrite from PowerShell to Go, multi-provider workers, attestation, delivery guardrails, loopreview reliability hardening, default-on pretty attestation relay, skill propagation, attestation display polish, honest model attribution, verifier model pin, the local-only attestation contract, and conductor local enforcement.
 
@@ -175,7 +184,7 @@ delivery or merge turn finishes. Install them into project
 
 ## Status
 
-v0.4.2 is the current cross-platform native Go CLI. It is an operational-reliability hardening release per [`docs/specs/0423-operational-reliability-hardening.md`](docs/specs/0423-operational-reliability-hardening.md) and #407: hung/stalled workers harvest committable work before discard (H1), worker/verifier liveness includes worktree-mtime progress with raised watchdog windows (H2), `loopreview` builds source-first review packets before generated/large diffs (H3), config resolution fails loud when `.delivery.yml` exists on the base branch but not the working tree and supports `--config-from-base` (H4), and `loopreview` reserves exit codes `0`/`1`/`2` for clean verdicts while command failures exit `3` (H5). It retains provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview`, `.delivery.yml` role slots including a pinned Claude verifier model and effort, default-on `auto` production promotion with `human-merge` opt-out, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are validated local-only records; their pretty attestation blocks emit to stderr by default for conductor relay, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation remains a documented target rather than current behavior. loopcoder's own repository remains explicitly configured with `gate: human-merge` for self-hosting safety.
+v0.4.2 is the current cross-platform native Go CLI. It is an operational-reliability hardening release per [`docs/specs/0423-operational-reliability-hardening.md`](docs/specs/0423-operational-reliability-hardening.md), [`docs/specs/0447-relay-enforcement-hardgate.md`](docs/specs/0447-relay-enforcement-hardgate.md), #407, and #447: hung/stalled workers harvest committable work before discard (H1), worker/verifier liveness includes worktree-mtime progress with raised watchdog windows (H2), `loopreview` builds source-first review packets before generated/large diffs (H3), config resolution fails loud when `.delivery.yml` exists on the base branch but not the working tree and supports `--config-from-base` (H4), `loopreview` reserves exit codes `0`/`1`/`2` for clean verdicts while command failures exit `3` (H5), and pending Worker/Verifier relay blocks hard-gate mechanical progress with exit code `4` until `loopcoder relay flush` surfaces and clears them. It retains provider-pluggable workers (`codex` and `claude` verified; `gemini` experimental/unverified), opt-in delivery guardrails, independent `loopreview`, `.delivery.yml` role slots including a pinned Claude verifier model and effort, default-on `auto` production promotion with `human-merge` opt-out, doc-first workflow, real self-hosting, and per-invocation Worker, Verifier, and Conductor attestation. Worker and Verifier records are validated local-only records; `dispatch` and `loopreview` emit pretty attestation blocks to stderr, foreground `dispatch-wave` streams Worker pretty blocks to stdout as each Worker completes, and durable machine evidence lives in `dispatch` / `loopreview` result JSON plus gitignored `.loopcoder/` run records. PR bodies and merge artifacts have zero attestation footprint. Conductor local enforcement includes the `conductor-relay-guard` and `conductor-attest` hooks -- invoked as `loopcoder hook <name>` embedded in the binary so they resolve in any repo -- plus PowerShell/pwsh and background relay coverage, `loopcoder status`, install-time hook wiring, and doctor warnings for missing hooks. The LLM review verdict itself remains non-deterministic, and `gemini` verifier validation remains a documented target rather than current behavior. loopcoder's own repository remains explicitly configured with `gate: human-merge` for self-hosting safety.
 
 ## License
 

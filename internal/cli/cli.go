@@ -514,8 +514,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
-		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stdout (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "hook" {
 		fmt.Fprintln(w, "  <name>    hook to run: conductor-attest or conductor-relay-guard")
@@ -3095,6 +3095,63 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		cfg.Worker.ReasoningEffort,
 	)
 
+	prettyMode := prettyModeForTarget(stdout, deps, pretty)
+	renderPretty := shouldRenderPretty(noPretty)
+	writeWaveRelayRecord := func(runID string, result orchestration.DispatchWaveIssueResult) error {
+		if result.Attestation == nil {
+			return nil
+		}
+		invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
+		if invocationID == "" {
+			invocationID = fmt.Sprintf("dispatch-wave-issue-%d-%d", result.Issue, deps.Now().UTC().UnixNano())
+		}
+		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		if _, err := relay.Write(relay.Entry{
+			RepoPath:     resolvedRepo,
+			RunID:        runID,
+			InvocationID: invocationID,
+			Command:      "dispatch-wave",
+			Role:         result.Attestation.Role,
+			Issue:        result.Issue,
+			PR:           result.PR,
+			CreatedAt:    deps.Now(),
+			Header:       result.Attestation.Header(),
+			Pretty:       prettyBlock,
+		}); err != nil {
+			return err
+		}
+		prNumber := prNumberFromPR(result.PR)
+		if prNumber == 0 {
+			prNumber = result.Issue
+		}
+		_, err := relaygate.Write(relaygate.WriteOptions{
+			RepoPath: resolvedRepo,
+			RunID:    runID,
+			Role:     string(result.Attestation.Role),
+			PRNumber: prNumber,
+			Block:    prettyBlock,
+		})
+		return err
+	}
+	streamWaveCompletion := func(completion orchestration.DispatchWaveIssueComplete) error {
+		result := completion.Result
+		if result.Attestation == nil {
+			return nil
+		}
+		if err := writeWaveRelayRecord(completion.RunID, result); err != nil {
+			return fmt.Errorf("write relay record for worker #%d: %w", result.Issue, err)
+		}
+		if !renderPretty {
+			return nil
+		}
+		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		text := orchestration.RenderDispatchWaveIssueCompletion(result, prettyBlock)
+		if _, err := stdout.Write([]byte(text)); err != nil {
+			return fmt.Errorf("write worker #%d completion: %w", result.Issue, err)
+		}
+		return nil
+	}
+
 	waveReport, err := orchestration.DispatchWave(context.Background(), orchestration.DispatchWaveOptions{
 		Reader:          deps.NewGitHubReader(resolvedRepo),
 		RepoPath:        resolvedRepo,
@@ -3115,6 +3172,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Stderr:          stderr,
 		ComputeReadySet: deps.ComputeReadySet,
 		Dispatch:        deps.Dispatch,
+		OnIssueComplete: streamWaveCompletion,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
@@ -3123,18 +3181,6 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if _, err := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", err)
 		return 1
-	}
-	if shouldRenderPretty(noPretty) {
-		mode := prettyModeForTarget(stderr, deps, pretty)
-		for _, result := range waveReport.Results {
-			if result.Attestation == nil {
-				continue
-			}
-			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
-				fmt.Fprintf(stderr, "dispatch-wave: write pretty attestation: %v\n", err)
-				return 1
-			}
-		}
 	}
 	if orchestration.DispatchWaveHasFailures(waveReport) {
 		return 1

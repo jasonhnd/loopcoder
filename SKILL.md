@@ -72,18 +72,39 @@ JSON, never GitHub artifacts.
 
 ## Local-only relay and status
 
-Per [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md),
-Worker and Verifier attestation relay is a local visible-output obligation.
-Never swallow the attestation block: do not redirect, hide, or suppress stderr
-from `loopcoder dispatch`, `loopcoder dispatch-wave`, or
-`loopcoder loopreview`. Each Worker and Verifier pretty attestation block must
-appear verbatim in local visible command output and must be relayed verbatim,
-never summarized, merged, rewrapped, or hand-reformatted.
+Per [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md)
+and [`docs/specs/0447-relay-enforcement-hardgate.md`](docs/specs/0447-relay-enforcement-hardgate.md),
+Worker and Verifier attestation relay is a hard local visible-output
+obligation. Never swallow the attestation block: do not redirect, hide, or
+suppress stderr from `loopcoder dispatch` or `loopcoder loopreview`, and keep
+foreground `loopcoder dispatch-wave` stdout visible because each Worker pretty
+block streams there as that Worker completes. Each Worker and Verifier pretty
+attestation block must be relayed verbatim, never summarized, merged,
+rewrapped, or hand-reformatted.
+
+The Go binary enforces a cross-command relay gate for mechanical progress. When
+an unacknowledged pending Worker or Verifier relay exists, `dispatch`,
+`dispatch-wave`, `loopreview`, `ready-set`, `verify-local`, `recover`, and
+`promote` refuse to proceed, print the pending local-only block(s) plus recovery
+instructions to stdout, and exit with reserved code `4`. Use
+`loopcoder relay flush --repo .` in the foreground to print all pending blocks
+verbatim to stdout and clear them; use `loopcoder relay list --repo .` to
+inspect pending blocks without clearing. The exempt/inspection set is
+`relay flush`, `relay list`, `doctor`, `attest`, `status`, help, and version.
+Autonomous `tick` and `trigger` write and then self-acknowledge the relay
+records they surface themselves, while leaving any pre-existing pending relay
+records pending.
 
 Claude Code enforcement is provided by
-`loopcoder hook conductor-relay-guard`, embedded in the loopcoder binary, which
-uses gitignored local relay state to backstop hidden Worker blocks from
-`loopcoder dispatch` and hidden Verifier blocks from `loopcoder loopreview`.
+`loopcoder hook conductor-relay-guard`, embedded in the loopcoder binary. It
+covers Bash, PowerShell, and pwsh tool events, treats backgrounded
+`dispatch`/`dispatch-wave`/`loopreview` output as pending until surfaced, and
+uses gitignored local relay state to block the Stop event while required blocks
+remain hidden. The honest ceiling remains: the Go gate halts mechanical
+progress and re-emits pending blocks, and the Claude Code hook verifies visible
+surfacing where installed, but no binary can force an adversarial host LLM to
+type into the user channel without host cooperation.
+
 These blocks remain local-only; do not copy attestation or `loopcoder status`
 output into PR bodies, issue or PR comments, commit messages, merge artifacts,
 docs, examples, fixtures, or any other tracked file.

@@ -3418,7 +3418,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	}
 }
 
-func TestDispatchWavePrettyDefaultNonInteractiveWritesPlainBlocksWithoutChangingStdout(t *testing.T) {
+func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -3454,13 +3454,16 @@ func TestDispatchWavePrettyDefaultNonInteractiveWritesPlainBlocksWithoutChanging
 			},
 		},
 	}
-	wantStdout := orchestration.RenderDispatchWaveText(expectedReport)
+	wantStdout := orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[0], record201.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain})) +
+		orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[1], record202.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain})) +
+		orchestration.RenderDispatchWaveText(expectedReport)
 
 	exitCode := RunWithDeps([]string{
 		"dispatch-wave",
 		"--repo", repo,
 		"--issue-numbers", "201,202",
 		"--run-id", "run-test-wave",
+		"--throttle-limit", "1",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -3522,22 +3525,28 @@ func TestDispatchWavePrettyDefaultNonInteractiveWritesPlainBlocksWithoutChanging
 	if stdout.String() != wantStdout {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
-	gotStderr := stderr.String()
-	if count := strings.Count(gotStderr, "attestation: verified"); count != 2 {
-		t.Fatalf("stderr pretty block count = %d, want 2:\n%s", count, gotStderr)
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	gotStdout := stdout.String()
+	if count := strings.Count(gotStdout, "attestation: verified"); count != 2 {
+		t.Fatalf("stdout pretty block count = %d, want 2:\n%s", count, gotStdout)
 	}
 	for _, want := range []string{
 		"  action      \"implement issue #201\"",
 		"  action      \"implement issue #202\"",
 	} {
-		if !strings.Contains(gotStderr, want) {
-			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		if !strings.Contains(gotStdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, gotStdout)
 		}
 	}
 	for _, disallowed := range []string{"✅", "❌", "⚠"} {
-		if strings.Contains(gotStderr, disallowed) {
-			t.Fatalf("plain stderr contains %q:\n%s", disallowed, gotStderr)
+		if strings.Contains(gotStdout, disallowed) {
+			t.Fatalf("plain stdout contains %q:\n%s", disallowed, gotStdout)
 		}
+	}
+	if pending := relaygate.Check(repo); len(pending) != 2 {
+		t.Fatalf("pending relay records = %d, want 2", len(pending))
 	}
 }
 
