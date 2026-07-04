@@ -15,6 +15,12 @@ import (
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
+func TestVerifierWatchdogDefaultsAreRaised(t *testing.T) {
+	if DefaultVerifierTimeout != 15*time.Minute || VerifierStallTimeout != 5*time.Minute {
+		t.Fatalf("verifier watchdog defaults = hard cap %s stall %s, want 15m0s/5m0s", DefaultVerifierTimeout, VerifierStallTimeout)
+	}
+}
+
 func TestParseVerdictAcceptsStructuredVerdicts(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -353,6 +359,250 @@ func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 	}
 	if strings.Contains(prompt, "TAIL_TOTAL_DIFF_B_SHOULD_NOT_APPEAR") || strings.Contains(prompt, "TAIL_TOTAL_DIFF_C_SHOULD_NOT_APPEAR") {
 		t.Fatalf("prompt contains omitted total diff tail:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPacketOrdersSourceBeforeGeneratedDiffs(t *testing.T) {
+	tests := []struct {
+		name                    string
+		generatedPath           string
+		generatedAttributeRules []generatedAttributeRule
+	}{
+		{
+			name:          "default generated glob",
+			generatedPath: "tests/baseline/large.jsonl",
+		},
+		{
+			name:                    "gitattributes generated marker",
+			generatedPath:           "snapshots/large.txt",
+			generatedAttributeRules: parseGeneratedAttributeRules("snapshots/** linguist-generated=true\n"),
+		},
+		{
+			name:                    "gitattributes diff disabled marker",
+			generatedPath:           "golden/large.txt",
+			generatedAttributeRules: parseGeneratedAttributeRules("golden/** linguist-diff=false\n"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputs := loopreviewPromptTestInputs()
+			inputs.GeneratedAttributeRules = tt.generatedAttributeRules
+			inputs.ChangedFiles = []string{tt.generatedPath, "internal/foo.go"}
+			inputs.Diff = loopreviewDiffPatch(tt.generatedPath, "+ generated header\n"+strings.Repeat("+ generated data row\n", 80)+"+ GENERATED_TAIL_SHOULD_NOT_APPEAR\n") +
+				loopreviewDiffPatch("internal/foo.go", "+ package foo\n+ const SourceLastLine = \"SOURCE_LAST_LINE\"\n")
+
+			prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+				DiffBytes:              700,
+				DiffFileBytes:          4096,
+				GeneratedDiffFileBytes: 120,
+			})
+
+			if !packet.Diff.Truncated {
+				t.Fatal("diff was not truncated")
+			}
+			sourceIndex := strings.Index(prompt, "## internal/foo.go")
+			generatedIndex := strings.Index(prompt, "## "+tt.generatedPath)
+			if sourceIndex < 0 {
+				t.Fatalf("prompt missing source diff:\n%s", prompt)
+			}
+			if generatedIndex < 0 {
+				t.Fatalf("prompt missing generated diff note:\n%s", prompt)
+			}
+			if generatedIndex < sourceIndex {
+				t.Fatalf("generated diff appeared before source diff:\n%s", prompt)
+			}
+			for _, want := range []string{
+				"SOURCE_LAST_LINE",
+				"[TRUNCATED diff for " + tt.generatedPath + ": omitted",
+				"[TRUNCATED diff: omitted",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing %q:\n%s", want, prompt)
+				}
+			}
+			for _, unwanted := range []string{
+				"[TRUNCATED diff for internal/foo.go",
+				"GENERATED_TAIL_SHOULD_NOT_APPEAR",
+				"omitted files: internal/foo.go",
+			} {
+				if strings.Contains(prompt, unwanted) {
+					t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildReviewPacketDoesNotClassifyLargeSourceBySizeOnly(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{"internal/large.go", "internal/foo.go"}
+	inputs.Diff = loopreviewDiffPatch("internal/large.go", "+ "+strings.Repeat("source ", 60)+"LEGIT_SOURCE_DEEP_LINE\n") +
+		loopreviewDiffPatch("internal/foo.go", "+ package foo\n")
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DiffBytes:              1200,
+		DiffFileBytes:          900,
+		GeneratedDiffFileBytes: 80,
+		GeneratedSizeBytes:     100,
+	})
+
+	if packet.Diff.Truncated {
+		t.Fatalf("large source diff was truncated as generated:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "LEGIT_SOURCE_DEEP_LINE") {
+		t.Fatalf("prompt missing large source tail:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "[TRUNCATED diff for internal/large.go") {
+		t.Fatalf("large source diff was classified as generated:\n%s", prompt)
+	}
+}
+
+func TestGatherInputsParsesGeneratedAttributes(t *testing.T) {
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:.gitattributes":       "snapshots/** linguist-generated=true\ngolden/** linguist-diff=false\nmanual/** -linguist-generated\n",
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("snapshots/out.txt", "+ snapshot\n"),
+		files: []string{"snapshots/out.txt"},
+	}
+
+	inputs, err := gatherInputs(context.Background(), Deps{Git: fakeGit}, fakeGitHub, t.TempDir(), Options{
+		PRNumber:   152,
+		BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("gatherInputs returned error: %v", err)
+	}
+	if !generatedByAttributes("snapshots/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("snapshots/out.txt was not classified from .gitattributes: %#v", inputs.GeneratedAttributeRules)
+	}
+	if !generatedByAttributes("golden/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("golden/out.txt was not classified from linguist-diff=false: %#v", inputs.GeneratedAttributeRules)
+	}
+	if generatedByAttributes("manual/out.txt", inputs.GeneratedAttributeRules) {
+		t.Fatalf("manual/out.txt was classified despite an explicit unset: %#v", inputs.GeneratedAttributeRules)
+	}
+}
+
+func TestGatherInputsWarnsWhenGeneratedAttributesGitShowFails(t *testing.T) {
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+		showErrs: map[string]error{
+			"origin/main:.gitattributes": errors.New("git show failed"),
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      152,
+			Title:       "PR",
+			HeadRefName: "loop/issue-152",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 152,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 152,
+			Title:  "Issue",
+			Body:   "See docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("internal/foo.go", "+ package foo\n"),
+		files: []string{"internal/foo.go"},
+	}
+	var stderr strings.Builder
+
+	inputs, err := gatherInputs(context.Background(), Deps{Git: fakeGit}, fakeGitHub, t.TempDir(), Options{
+		PRNumber:   152,
+		BaseBranch: "main",
+		Stderr:     &stderr,
+	})
+	if err != nil {
+		t.Fatalf("gatherInputs returned error: %v", err)
+	}
+	if len(inputs.GeneratedAttributeRules) != 0 {
+		t.Fatalf("GeneratedAttributeRules = %#v, want fallback without attribute rules", inputs.GeneratedAttributeRules)
+	}
+	for _, want := range []string{"warning", "generated-file classification via .gitattributes is unavailable", "falling back to glob and size heuristics"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestLoadGeneratedAttributeRulesDiscriminatesBaseRefFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		showErr  error
+		wantWarn bool
+	}{
+		{
+			name:    "path absent from valid base is silent",
+			showErr: errors.New("git show origin/main:.gitattributes: exit status 128: fatal: Path '.gitattributes' does not exist in 'main'"),
+		},
+		{
+			name:    "path exists on disk but absent from valid base is silent",
+			showErr: errors.New("git show origin/main:.gitattributes: exit status 128: fatal: .gitattributes exists on disk, but not in 'main'"),
+		},
+		{
+			name:     "bad base pathspec warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: error: pathspec 'main' did not match any file(s) known to git"),
+			wantWarn: true,
+		},
+		{
+			name:     "invalid object name warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: invalid object name 'main'"),
+			wantWarn: true,
+		},
+		{
+			name:     "ambiguous argument warns and falls back",
+			showErr:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: ambiguous argument 'main:.gitattributes': unknown revision or path not in the working tree"),
+			wantWarn: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeGit := &loopreviewFakeGit{
+				showErrs: map[string]error{
+					"origin/main:.gitattributes": tt.showErr,
+				},
+			}
+			var warnings strings.Builder
+
+			rules := loadGeneratedAttributeRules(context.Background(), fakeGit, t.TempDir(), "main", &warnings)
+			if len(rules) != 0 {
+				t.Fatalf("rules = %#v, want fallback without attribute rules", rules)
+			}
+			if tt.wantWarn {
+				for _, want := range []string{"warning", "generated-file classification via .gitattributes is unavailable", "falling back to glob and size heuristics"} {
+					if !strings.Contains(warnings.String(), want) {
+						t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+					}
+				}
+				return
+			}
+			if warnings.Len() != 0 {
+				t.Fatalf("warnings = %q, want none", warnings.String())
+			}
+		})
 	}
 }
 
@@ -1052,6 +1302,7 @@ type loopreviewFakeGit struct {
 	removed   bool
 	show      map[string]string
 	showErr   error
+	showErrs  map[string]error
 }
 
 func (f *loopreviewFakeGit) FetchOriginBase(_ context.Context, _ string, baseBranch string) error {
@@ -1075,6 +1326,9 @@ func (f *loopreviewFakeGit) WorktreeRemove(context.Context, string, string) erro
 }
 
 func (f *loopreviewFakeGit) Show(_ context.Context, _ string, revPath string) (string, error) {
+	if err := f.showErrs[revPath]; err != nil {
+		return "", err
+	}
 	if f.showErr != nil {
 		return "", f.showErr
 	}

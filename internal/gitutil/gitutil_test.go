@@ -15,9 +15,10 @@ import (
 func TestClientRunsExpectedGitCommands(t *testing.T) {
 	runner := &fakeGitRunner{
 		outputs: map[string][]byte{
-			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}": []byte("abc123\n"),
-			"repo\x00show\x00origin/main:docs/specs/design.md":         []byte("# Design\n"),
-			"repo\x00status\x00--porcelain":                            []byte(" M file.go\n"),
+			"repo\x00rev-parse\x00--verify\x00loop/issue-101^{commit}":       []byte("abc123\n"),
+			"repo\x00show\x00origin/main:docs/specs/design.md":               []byte("# Design\n"),
+			"repo\x00status\x00--porcelain":                                  []byte(" M file.go\n"),
+			"wt\x00ls-remote\x00origin\x00refs/heads/loop/issue-101-retry-2": []byte("def456\trefs/heads/loop/issue-101-retry-2\n"),
 		},
 	}
 	client := NewWithRunner(runner)
@@ -74,6 +75,9 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	if err := client.PushUpstream(ctx, "wt", "loop/issue-101"); err != nil {
 		t.Fatalf("PushUpstream returned error: %v", err)
 	}
+	if err := client.PushUpstreamForceWithLease(ctx, "wt", "loop/issue-101-retry-2"); err != nil {
+		t.Fatalf("PushUpstreamForceWithLease returned error: %v", err)
+	}
 	if err := client.WorktreeRemove(ctx, "repo", "wt"); err != nil {
 		t.Fatalf("WorktreeRemove returned error: %v", err)
 	}
@@ -95,8 +99,32 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 		{"wt", "add", "-A"},
 		{"wt", "commit", "-m", "title (closes #101)"},
 		{"wt", "push", "-u", "origin", "loop/issue-101"},
+		{"wt", "ls-remote", "origin", "refs/heads/loop/issue-101-retry-2"},
+		{"wt", "push", "--force-with-lease=refs/heads/loop/issue-101-retry-2:def456", "-u", "origin", "HEAD:refs/heads/loop/issue-101-retry-2"},
 		{"repo", "worktree", "remove", "--force", "wt"},
 		{"repo", "branch", "-D", "loop/issue-101"},
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
+		t.Fatalf("git calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestPushUpstreamForceWithLeaseUsesAbsentRefLeaseWhenRemoteBranchMissing(t *testing.T) {
+	runner := &fakeGitRunner{
+		outputs: map[string][]byte{
+			"wt\x00ls-remote\x00origin\x00refs/heads/loop/issue-439-retry-1": []byte(""),
+		},
+	}
+	client := NewWithRunner(runner)
+
+	err := client.PushUpstreamForceWithLease(context.Background(), "wt", "loop/issue-439-retry-1")
+	if err != nil {
+		t.Fatalf("PushUpstreamForceWithLease returned error: %v", err)
+	}
+
+	want := [][]string{
+		{"wt", "ls-remote", "origin", "refs/heads/loop/issue-439-retry-1"},
+		{"wt", "push", "--force-with-lease=refs/heads/loop/issue-439-retry-1:", "-u", "origin", "HEAD:refs/heads/loop/issue-439-retry-1"},
 	}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("git calls = %#v, want %#v", runner.calls, want)
@@ -110,6 +138,83 @@ func TestClientPropagatesRunnerError(t *testing.T) {
 	err := client.FetchOriginBase(context.Background(), "repo", "main")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("FetchOriginBase error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestIsPathAbsentOnRefDiscriminatesBadRefs(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		path string
+		want bool
+	}{
+		{
+			name: "os not exist sentinel",
+			err:  os.ErrNotExist,
+			path: ".delivery.yml",
+			want: true,
+		},
+		{
+			name: "path does not exist in valid ref",
+			err:  errors.New("git show origin/main:.delivery.yml: exit status 128: fatal: Path '.delivery.yml' does not exist in 'origin/main'"),
+			path: ".delivery.yml",
+			want: true,
+		},
+		{
+			name: "path exists on disk but absent from valid ref",
+			err:  errors.New("git show origin/main:.gitattributes: exit status 128: fatal: path '.gitattributes' exists on disk, but not in 'origin/main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "unquoted path exists on disk but absent from valid ref",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: .gitattributes exists on disk, but not in 'main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "quoted path exists on disk but absent from valid ref",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: '.gitattributes' exists on disk, but not in 'main'"),
+			path: ".gitattributes",
+			want: true,
+		},
+		{
+			name: "bad base pathspec is real failure despite wrapped rev path",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: error: pathspec 'main' did not match any file(s) known to git"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "invalid object name is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: invalid object name 'main'"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "ambiguous argument is real failure",
+			err:  errors.New("git show main:.gitattributes: exit status 128: fatal: ambiguous argument 'main:.gitattributes': unknown revision or path not in the working tree"),
+			path: ".gitattributes",
+			want: false,
+		},
+		{
+			name: "missing reliable phrasing is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: not a git repository"),
+			path: ".delivery.yml",
+			want: false,
+		},
+		{
+			name: "old not found signal is real failure",
+			err:  errors.New("git show main:.delivery.yml: exit status 128: fatal: .delivery.yml not found in main"),
+			path: ".delivery.yml",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPathAbsentOnRef(tt.err, tt.path); got != tt.want {
+				t.Fatalf("IsPathAbsentOnRef(%v, %q) = %v, want %v", tt.err, tt.path, got, tt.want)
+			}
+		})
 	}
 }
 

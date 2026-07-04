@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -114,6 +115,118 @@ func TestRunSteadyLogGrowthDoesNotStall(t *testing.T) {
 	}
 	if result.Elapsed < 500*time.Millisecond {
 		t.Fatalf("Elapsed = %s, want >= 500ms so at least one stall poll ran during growth", result.Elapsed)
+	}
+}
+
+func TestRunWorktreeActivityStallDetection(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         func(logPath, worktreePath string) []string
+		stallTimeout time.Duration
+		wantOutcome  Outcome
+		wantKilled   bool
+		minElapsed   time.Duration
+	}{
+		{
+			name: "worktree mtime advance extends stall window",
+			args: func(logPath, worktreePath string) []string {
+				return []string{"write-worktree-loop", logPath, worktreePath, "100ms", "24", "0"}
+			},
+			stallTimeout: 1200 * time.Millisecond,
+			wantOutcome:  OutcomeCompleted,
+			minElapsed:   1500 * time.Millisecond,
+		},
+		{
+			name: "silent worker still stalls",
+			args: func(logPath, _ string) []string {
+				return []string{"write-then-sleep", logPath, "10s"}
+			},
+			stallTimeout: 300 * time.Millisecond,
+			wantOutcome:  OutcomeStalled,
+			wantKilled:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			logPath := filepath.Join(root, "worker.log")
+			worktreePath := filepath.Join(root, "wt")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatalf("mkdir worktree: %v", err)
+			}
+			cmd := helperCommand(t, tt.args(logPath, worktreePath)...)
+
+			result, err := Run(context.Background(), cmd, Options{
+				HardCap:      30 * time.Second,
+				StallTimeout: tt.stallTimeout,
+				LogPath:      logPath,
+				WorktreePath: worktreePath,
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			if result.Outcome != tt.wantOutcome {
+				t.Fatalf("Outcome = %v, want %v", result.Outcome, tt.wantOutcome)
+			}
+			if result.Killed != tt.wantKilled {
+				t.Fatalf("Killed = %v, want %v", result.Killed, tt.wantKilled)
+			}
+			if tt.minElapsed > 0 && result.Elapsed < tt.minElapsed {
+				t.Fatalf("Elapsed = %s, want >= %s so worktree activity crossed the stall window", result.Elapsed, tt.minElapsed)
+			}
+		})
+	}
+}
+
+func TestWorktreePollIntervalDecouplesFromLogPollAtScale(t *testing.T) {
+	stallTimeout := 5 * time.Minute
+	logInterval := stallPollInterval(stallTimeout)
+	walkInterval := worktreePollInterval(stallTimeout, logInterval)
+	if logInterval != 500*time.Millisecond {
+		t.Fatalf("log interval = %s, want 500ms", logInterval)
+	}
+	if walkInterval != 30*time.Second {
+		t.Fatalf("worktree interval = %s, want 30s", walkInterval)
+	}
+
+	start := time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Minute)
+	lastWalk := start
+	logPolls := 0
+	walks := 1 // initial observation before the ticker loop
+	for tick := start.Add(logInterval); !tick.After(end); tick = tick.Add(logInterval) {
+		logPolls++
+		if shouldWalkWorktree(tick, lastWalk, walkInterval) {
+			walks++
+			lastWalk = tick
+		}
+	}
+	if walks >= logPolls/10 {
+		t.Fatalf("worktree walks = %d over %d log polls, want far less than log cadence", walks, logPolls)
+	}
+}
+
+func TestObserveWorktreeRootErrorWarnsAndReturnsZeroObservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing")
+	observation := observeWorktree(path)
+	if observation.rootErr == nil {
+		t.Fatal("rootErr = nil, want root walk error")
+	}
+	if observation.exists || !observation.latestModTime.IsZero() {
+		t.Fatalf("observation = %#v, want no file activity", observation)
+	}
+
+	var warnings strings.Builder
+	emitted := false
+	warnWorktreeUnavailable(&warnings, path, observation.rootErr, &emitted)
+	if !emitted {
+		t.Fatal("warning was not marked emitted")
+	}
+	for _, want := range []string{"warning", "worktree liveness signal unavailable", "falling back to log-only"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+		}
 	}
 }
 
@@ -267,6 +380,18 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "write-worktree-loop":
+		logPath := args[0]
+		worktreePath := args[1]
+		interval := parseDuration(args[2])
+		count := parseInt(args[3])
+		code := parseInt(args[4])
+		appendLog(logPath, "first")
+		for i := 0; i < count; i++ {
+			updateWorktreeActivity(worktreePath, i)
+			time.Sleep(interval)
+		}
+		os.Exit(code)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
@@ -325,6 +450,23 @@ func appendLog(path, line string) {
 	}
 	if err := f.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "close log: %v\n", err)
+		os.Exit(2)
+	}
+}
+
+func updateWorktreeActivity(worktreePath string, index int) {
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir worktree: %v\n", err)
+		os.Exit(2)
+	}
+	path := filepath.Join(worktreePath, "activity.txt")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("activity %d\n", index)), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "write activity: %v\n", err)
+		os.Exit(2)
+	}
+	mtime := time.Now().Add(time.Duration(index+1) * time.Second)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		fmt.Fprintf(os.Stderr, "chtimes activity: %v\n", err)
 		os.Exit(2)
 	}
 }

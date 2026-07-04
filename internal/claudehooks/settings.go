@@ -14,7 +14,8 @@ import (
 const (
 	SettingsRelPath = ".claude/settings.json"
 
-	hookTimeout = 10
+	hookTimeout             = 10
+	postToolUseShellMatcher = "Bash|PowerShell|pwsh"
 )
 
 // requiredHookNames are the conductor hook subcommands wired into a project's
@@ -59,7 +60,7 @@ func RequiredHooks() []RequiredHook {
 		command := commandForHook(name)
 		hooks = append(hooks, RequiredHook{
 			Event:   "PostToolUse",
-			Matcher: "Bash",
+			Matcher: postToolUseShellMatcher,
 			Script:  name,
 			Command: command,
 		})
@@ -110,6 +111,9 @@ func MergeSettings(data []byte) ([]byte, bool, error) {
 	if pruneDeprecatedHooks(hooks) {
 		changed = true
 	}
+	if pruneStalePostToolUseMatchers(hooks) {
+		changed = true
+	}
 
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -120,6 +124,49 @@ func MergeSettings(data []byte) ([]byte, bool, error) {
 		changed = false
 	}
 	return out, changed, nil
+}
+
+// pruneStalePostToolUseMatchers removes loopcoder's own conductor hook commands
+// from older Bash-only PostToolUse entries after the current Bash|PowerShell|pwsh
+// entry has been installed. Unrelated user hook commands in those entries are
+// preserved.
+func pruneStalePostToolUseMatchers(hooks map[string]any) bool {
+	entries, ok := hooks["PostToolUse"].([]any)
+	if !ok {
+		return false
+	}
+	requiredCommands := map[string]bool{}
+	for _, name := range requiredHookNames {
+		requiredCommands[commandForHook(name)] = true
+	}
+
+	changed := false
+	kept := make([]any, 0, len(entries))
+	for _, raw := range entries {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		matcher, _ := entry["matcher"].(string)
+		if matcher == postToolUseShellMatcher {
+			kept = append(kept, entry)
+			continue
+		}
+		if pruneMatchingEntryCommands(entry, requiredCommands) {
+			changed = true
+		}
+		if commands, had := entry["hooks"].([]any); had && len(commands) == 0 {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if len(kept) == 0 {
+		delete(hooks, "PostToolUse")
+	} else {
+		hooks["PostToolUse"] = kept
+	}
+	return changed
 }
 
 // MissingHooks returns required loopcoder conductor hook entries absent from
@@ -496,6 +543,32 @@ func pruneEntryCommands(entry map[string]any) bool {
 			continue
 		}
 		if value, _ := command["command"].(string); isDeprecatedCommand(value) {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	if changed {
+		entry["hooks"] = filtered
+	}
+	return changed
+}
+
+func pruneMatchingEntryCommands(entry map[string]any, remove map[string]bool) bool {
+	commands, ok := entry["hooks"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	filtered := make([]any, 0, len(commands))
+	for _, raw := range commands {
+		command, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		value, _ := command["command"].(string)
+		if remove[value] {
 			changed = true
 			continue
 		}

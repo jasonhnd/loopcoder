@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ type Invocation struct {
 	ReadOnly     bool
 	OutputSchema string
 	LogPath      string
+	Stderr       io.Writer
 	HardCap      time.Duration
 	StallTimeout time.Duration
 	// RunID and Role tag the spawned provider process as loopcoder-managed and

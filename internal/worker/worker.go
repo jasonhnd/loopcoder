@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	WorkerHardCap      = 30 * time.Minute
-	WorkerStallTimeout = 120 * time.Second
+	WorkerHardCap      = 45 * time.Minute
+	WorkerStallTimeout = 5 * time.Minute
 )
 
 type Options struct {
@@ -40,6 +40,7 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
+	ConfigFromBase  bool
 	KeepWorktree    bool
 	Stderr          io.Writer
 }
@@ -66,6 +67,7 @@ type GitClient interface {
 	AddAll(ctx context.Context, repoPath string) error
 	Commit(ctx context.Context, repoPath, message string) error
 	PushUpstream(ctx context.Context, repoPath, branch string) error
+	PushUpstreamForceWithLease(ctx context.Context, repoPath, branch string) error
 	BranchDelete(ctx context.Context, repoPath, branch string) error
 }
 
@@ -73,6 +75,7 @@ type GitHubClient interface {
 	RepoName(ctx context.Context) (string, error)
 	CreatePR(ctx context.Context, head, base, title, body string) (string, error)
 	ListHeadPRs(ctx context.Context, branch string) ([]gh.PullRequestReference, error)
+	ListOpenPRs(ctx context.Context) ([]gh.PullRequest, error)
 }
 
 type Lock interface {
@@ -192,10 +195,11 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase := "worktree_created"
 	dispatchSucceeded := false
+	cleanupStatus := "succeeded"
 	failureStatus := "failed"
 	defer func() {
 		if dispatchSucceeded {
-			tracker.transition("cleanup", "succeeded", tracker.exitCode, nil)
+			tracker.transition("cleanup", cleanupStatus, tracker.exitCode, nil)
 			if opts.KeepWorktree {
 				fmt.Fprintf(warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", worktreePath, scratch)
 				return
@@ -275,11 +279,19 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	activePhase = "codex_started"
 	tracker.transition(activePhase, "running", nil, nil)
-	resilience := config.ResilienceForRepo(repoPath)
+	resilience, err := config.ResilienceForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       warnings,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
 		LogPath:      logPath,
+		Stderr:       warnings,
 		Model:        opts.Model,
 		Effort:       opts.Effort,
 		HardCap:      config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
@@ -304,6 +316,60 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
 			"provider":    opts.Provider,
 		})
+		harvest, harvestErr := harvestHungWorktree(ctx, hungHarvestOptions{
+			repoPath:     repoPath,
+			runID:        opts.RunID,
+			jobID:        jobID,
+			worktreePath: worktreePath,
+			logPath:      logPath,
+			summaryPath:  summaryPath,
+			opts:         opts,
+			agentResult:  agentResult,
+			errorMessage: hungErr,
+			git:          deps.Git,
+			github:       github,
+			now:          deps.Now,
+			warnings:     warnings,
+		})
+		if harvestErr != nil {
+			return Result{
+				OK:          false,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				AttemptPath: attemptPath,
+				Status:      "hung",
+				ExitCode:    agentResult.ExitCode,
+				LogBytes:    fileSize(logPath),
+			}, fmt.Errorf("%s; harvest failed: %w", hungErr, harvestErr)
+		}
+		if harvest != nil {
+			exitCode := 0
+			tracker.branch = harvest.Branch
+			tracker.setAttestation(harvest.Attestation)
+			tracker.setUsage(harvest.Attestation.Usage)
+			tracker.transition(harvest.Phase, "needs-human", &exitCode, nil)
+			tracker.appendEvent("worker_harvested", "needs-human", map[string]string{
+				"branch": harvest.Branch,
+				"pr":     harvest.PR,
+				"mode":   harvest.Mode,
+			})
+			dispatchSucceeded = true
+			cleanupStatus = "needs-human"
+			return Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      harvest.Branch,
+				RunID:       opts.RunID,
+				PR:          harvest.PR,
+				Summary:     harvest.Summary,
+				AttemptPath: attemptPath,
+				Status:      "needs-human",
+				ExitCode:    exitCode,
+				LogBytes:    fileSize(logPath),
+				Attestation: &harvest.Attestation,
+			}, nil
+		}
 		return Result{
 			OK:          false,
 			Issue:       opts.IssueNumber,
@@ -456,6 +522,254 @@ func buildCommitMessage(title string, issueNumber int) string {
 
 func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
+}
+
+type hungHarvestOptions struct {
+	repoPath     string
+	runID        string
+	jobID        string
+	worktreePath string
+	logPath      string
+	summaryPath  string
+	opts         Options
+	agentResult  agent.Result
+	errorMessage string
+	git          GitClient
+	github       GitHubClient
+	now          func() time.Time
+	warnings     io.Writer
+}
+
+type hungHarvestResult struct {
+	Branch      string
+	PR          string
+	Summary     string
+	Phase       string
+	Mode        string
+	Attestation attestation.AttestationRecord
+}
+
+func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHarvestResult, error) {
+	dirty, err := opts.git.StatusPorcelain(ctx, opts.worktreePath)
+	if err != nil {
+		return nil, fmt.Errorf("git status --porcelain before harvest: %w", err)
+	}
+	if strings.TrimSpace(dirty) == "" {
+		return nil, nil
+	}
+
+	harvestBranch := harvestBranchName(opts.opts.IssueNumber, opts.opts.Attempt)
+	briefText := ""
+	briefPath := state.RecoveryBriefPath(opts.repoPath, opts.runID, opts.jobID)
+	if err := writeRecoveryBrief(ctx, recoveryBriefOptions{
+		repoPath:     opts.repoPath,
+		runID:        opts.runID,
+		jobID:        opts.jobID,
+		issueNumber:  opts.opts.IssueNumber,
+		issueTitle:   opts.opts.IssueTitle,
+		branch:       harvestBranch,
+		worktreePath: opts.worktreePath,
+		logPath:      opts.logPath,
+		summaryPath:  opts.summaryPath,
+		attempt:      opts.opts.Attempt,
+		lastPhase:    "codex_exited",
+		status:       "hung",
+		errorMessage: opts.errorMessage,
+		git:          opts.git,
+		github:       opts.github,
+		warnings:     opts.warnings,
+	}); err != nil {
+		fmt.Fprintf(opts.warnings, "[loopcoder] warning: failed to write harvest recovery brief for %s: %v\n", opts.jobID, err)
+	} else if data, readErr := os.ReadFile(briefPath); readErr != nil {
+		fmt.Fprintf(opts.warnings, "[loopcoder] warning: failed to read harvest recovery brief %s: %v\n", briefPath, readErr)
+	} else {
+		briefText = string(data)
+	}
+
+	started := opts.now()
+	existing := findOpenHarvestPR(ctx, opts.github, opts.opts.IssueNumber, harvestBranch, opts.warnings)
+	ended := opts.now()
+	if existing != nil {
+		record := buildHarvestConductorAttestation(opts.opts, started, ended)
+		if err := record.Validate(); err != nil {
+			return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
+		}
+		return &hungHarvestResult{
+			Branch:      firstNonEmpty(existing.HeadRefName, harvestBranch),
+			PR:          existing.URL,
+			Summary:     "harvested from hung/killed worker - existing needs-human PR already open",
+			Phase:       "harvest_adopted",
+			Mode:        "existing-pr",
+			Attestation: record,
+		}, nil
+	}
+
+	if err := opts.git.AddAll(ctx, opts.worktreePath); err != nil {
+		return nil, fmt.Errorf("git add -A for harvest: %w", err)
+	}
+	if err := opts.git.Commit(ctx, opts.worktreePath, buildHarvestCommitMessage(opts.opts.IssueTitle, opts.opts.IssueNumber)); err != nil {
+		return nil, fmt.Errorf("git commit harvest: %w", err)
+	}
+	if err := opts.git.PushUpstreamForceWithLease(ctx, opts.worktreePath, harvestBranch); err != nil {
+		return nil, fmt.Errorf("git push --force-with-lease origin %s: %w", harvestBranch, err)
+	}
+
+	ended = opts.now()
+	record := buildHarvestConductorAttestation(opts.opts, started, ended)
+	if err := record.Validate(); err != nil {
+		return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
+	}
+	body := buildHarvestPRBody(opts.opts, opts.agentResult, briefText)
+	prURL, err := opts.github.CreatePR(ctx, harvestBranch, opts.opts.BaseBranch, buildHarvestPRTitle(opts.opts.IssueTitle, opts.opts.IssueNumber), body)
+	if err != nil {
+		return nil, fmt.Errorf("gh pr create harvest: %w", err)
+	}
+	return &hungHarvestResult{
+		Branch:      harvestBranch,
+		PR:          prURL,
+		Summary:     "harvested from hung/killed worker - possibly incomplete; needs human review",
+		Phase:       "harvest_pr_opened",
+		Mode:        "created-pr",
+		Attestation: record,
+	}, nil
+}
+
+func harvestBranchName(issueNumber, attempt int) string {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return fmt.Sprintf("loop/issue-%d-retry-%d", issueNumber, attempt)
+}
+
+func buildHarvestCommitMessage(title string, issueNumber int) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return fmt.Sprintf("Harvest issue #%d from hung worker", issueNumber)
+	}
+	return fmt.Sprintf("Harvest issue #%d from hung worker: %s", issueNumber, title)
+}
+
+func buildHarvestPRTitle(title string, issueNumber int) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return fmt.Sprintf("[needs-human] Harvested issue #%d from hung/killed worker", issueNumber)
+	}
+	return fmt.Sprintf("[needs-human] Harvested issue #%d from hung/killed worker: %s", issueNumber, title)
+}
+
+func buildHarvestPRBody(opts Options, result agent.Result, recoveryBrief string) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "Refs #%d\n\n", opts.IssueNumber)
+	fmt.Fprintln(&out, "This needs-human PR was harvested from a hung/killed worker and is possibly incomplete. Human review is required before any merge.")
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "## Recovery brief")
+	if strings.TrimSpace(recoveryBrief) == "" {
+		fmt.Fprintln(&out, "(recovery brief unavailable)")
+	} else {
+		fmt.Fprintln(&out, strings.TrimRight(recoveryBrief, "\r\n"))
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "## Hung worker partial attestation")
+	fmt.Fprintln(&out, "```text")
+	fmt.Fprintln(&out, formatHungWorkerPartialAttestation(opts, result))
+	fmt.Fprintln(&out, "```")
+	return out.String()
+}
+
+func formatHungWorkerPartialAttestation(opts Options, result agent.Result) string {
+	lines := []string{
+		"role=worker",
+		"provider=" + firstNonEmpty(opts.Provider, "unknown"),
+		"model=" + firstNonEmpty(result.Model, opts.Model, "unknown"),
+		"model_source=parsed",
+		"effort=" + firstNonEmpty(result.Effort, opts.Effort, "unknown"),
+		"permission=write",
+		fmt.Sprintf("action=implement issue #%d", opts.IssueNumber),
+		fmt.Sprintf("exit_code=%d", result.ExitCode),
+		"hung=true",
+		"hung_reason=" + firstNonEmpty(result.HungReason, "unknown"),
+		"verified=false",
+	}
+	if result.StartedAt != "" {
+		lines = append(lines, "started_at="+result.StartedAt)
+	}
+	if result.EndedAt != "" {
+		lines = append(lines, "ended_at="+result.EndedAt)
+	}
+	if result.DurationMS > 0 {
+		lines = append(lines, fmt.Sprintf("duration_ms=%d", result.DurationMS))
+	}
+	if result.Usage.TotalTokens != nil {
+		lines = append(lines, fmt.Sprintf("total_tokens=%d", *result.Usage.TotalTokens))
+	}
+	if result.Usage.InputTokens != nil {
+		lines = append(lines, fmt.Sprintf("input_tokens=%d", *result.Usage.InputTokens))
+	}
+	if result.Usage.OutputTokens != nil {
+		lines = append(lines, fmt.Sprintf("output_tokens=%d", *result.Usage.OutputTokens))
+	}
+	return recovery.Scrub(strings.Join(lines, "\n"))
+}
+
+func buildHarvestConductorAttestation(opts Options, started, ended time.Time) attestation.AttestationRecord {
+	if started.IsZero() {
+		started = time.Now().UTC()
+	}
+	if ended.IsZero() {
+		ended = started
+	}
+	if ended.Before(started) {
+		ended = started
+	}
+	totalTokens := int64(0)
+	return attestation.AttestationRecord{
+		Role:        attestation.RoleConductor,
+		Provider:    firstNonEmpty(opts.Provider, "loopcoder"),
+		Model:       firstNonEmpty(opts.Model, "loopcoder-harvest"),
+		ModelSource: attestation.ModelSourceSelfReported,
+		Effort:      opts.Effort,
+		Permission:  attestation.PermissionOrchestrate,
+		Action:      fmt.Sprintf("harvest hung worker issue #%d", opts.IssueNumber),
+		ExitCode:    0,
+		StartedAt:   state.FormatTimestamp(started),
+		EndedAt:     state.FormatTimestamp(ended),
+		DurationMS:  ended.Sub(started).Milliseconds(),
+		Usage: attestation.Usage{
+			TotalTokens: &totalTokens,
+		},
+		Verified: false,
+	}
+}
+
+func findOpenHarvestPR(ctx context.Context, github GitHubClient, issueNumber int, currentHarvestBranch string, warnings io.Writer) *gh.PullRequest {
+	if github == nil {
+		return nil
+	}
+	if warnings == nil {
+		warnings = io.Discard
+	}
+	if prs, err := github.ListHeadPRs(ctx, currentHarvestBranch); err == nil && len(prs) > 0 {
+		return &gh.PullRequest{
+			Number:      prs[0].Number,
+			URL:         prs[0].URL,
+			HeadRefName: currentHarvestBranch,
+		}
+	} else if err != nil {
+		fmt.Fprintf(warnings, "[loopcoder] warning: harvest idempotency check could not list PRs for head %s: %v; proceeding with harvest, duplicate needs-human PR may result\n", currentHarvestBranch, err)
+	}
+	openPRs, err := github.ListOpenPRs(ctx)
+	if err != nil {
+		fmt.Fprintf(warnings, "[loopcoder] warning: harvest idempotency check could not list open PRs for issue #%d: %v; proceeding with harvest, duplicate needs-human PR may result\n", issueNumber, err)
+		return nil
+	}
+	prefix := fmt.Sprintf("loop/issue-%d-retry-", issueNumber)
+	for _, pr := range openPRs {
+		if strings.HasPrefix(strings.TrimSpace(pr.HeadRefName), prefix) {
+			prCopy := pr
+			return &prCopy
+		}
+	}
+	return nil
 }
 
 func workerHungError(provider, reason, logPath string) string {

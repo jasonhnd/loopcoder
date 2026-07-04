@@ -2,12 +2,16 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,6 +27,28 @@ type Config struct {
 	Environment  Environment  `yaml:"environment"`
 	Evidence     Evidence     `yaml:"evidence"`
 	Report       Report       `yaml:"report"`
+}
+
+type ShowBaseConfigFunc func(ctx context.Context, repoPath, baseBranch string) ([]byte, error)
+
+type LoadOptions struct {
+	BaseBranch     string
+	ConfigFromBase bool
+	ShowBaseConfig ShowBaseConfigFunc
+	Warnings       io.Writer
+}
+
+type ConfigMismatchError struct {
+	BaseBranch string
+}
+
+func (e ConfigMismatchError) Error() string {
+	return ConfigMismatchMessage(e.BaseBranch)
+}
+
+func ConfigMismatchMessage(baseBranch string) string {
+	baseBranch = normalizeBaseBranch(baseBranch)
+	return fmt.Sprintf(".delivery.yml is absent from working tree but present on %s; probably the wrong branch; checkout the base or pass --config-from-base", baseBranch)
 }
 
 type Adapters struct {
@@ -197,12 +223,12 @@ func Default() Config {
 				HungAfterSeconds:         300,
 				MaxAttempts:              3,
 				RetryBackoffSeconds:      []int{10, 30, 120},
-				HardCapSeconds:           1800,
-				StallTimeoutSeconds:      120,
+				HardCapSeconds:           2700,
+				StallTimeoutSeconds:      300,
 			},
 			Verifier: ResilienceVerifier{
-				HardCapSeconds:      600,
-				StallTimeoutSeconds: 120,
+				HardCapSeconds:      900,
+				StallTimeoutSeconds: 300,
 			},
 		},
 		Environment: Environment{
@@ -235,14 +261,42 @@ func Parse(data []byte) (Config, error) {
 	return cfg, nil
 }
 
-// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
-// falling back to built-in defaults when the file is missing or unreadable.
-func ResilienceForRepo(repoPath string) Resilience {
-	cfg, err := Load(filepath.Join(repoPath, ".delivery.yml"))
-	if err != nil {
-		return Default().Resilience
+func LoadForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Config, error) {
+	cfg := Default()
+	loaded, err := Load(filepath.Join(repoPath, ".delivery.yml"))
+	if err == nil {
+		return loaded, nil
 	}
-	return cfg.Resilience
+	if !errors.Is(err, os.ErrNotExist) {
+		return cfg, err
+	}
+	baseBranch := normalizeBaseBranch(opts.BaseBranch)
+	baseConfig, ok, checkErr := showBaseConfig(ctx, repoPath, baseBranch, opts.ShowBaseConfig)
+	if checkErr != nil {
+		warnBaseConfigCheckFailed(opts.Warnings, baseBranch, checkErr)
+		return cfg, nil
+	}
+	if !ok {
+		return cfg, nil
+	}
+	if opts.ConfigFromBase {
+		loaded, err := Parse(baseConfig)
+		if err != nil {
+			return cfg, err
+		}
+		return loaded, nil
+	}
+	return cfg, ConfigMismatchError{BaseBranch: baseBranch}
+}
+
+// ResilienceForRepo loads the resilience config from repoPath/.delivery.yml,
+// falling back to built-in defaults when the file is genuinely absent.
+func ResilienceForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Resilience, error) {
+	cfg, err := LoadForRepo(ctx, repoPath, opts)
+	if err != nil {
+		return Resilience{}, err
+	}
+	return cfg.Resilience, nil
 }
 
 // DurationSeconds converts a positive seconds value to a Duration, falling back
@@ -278,4 +332,47 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_attempts must be greater than zero")
 	}
 	return nil
+}
+
+func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowBaseConfigFunc) ([]byte, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if show == nil {
+		show = defaultShowBaseConfig
+	}
+	data, err := show(ctx, repoPath, baseBranch)
+	if err != nil {
+		if gitutil.IsPathAbsentOnRef(err, ".delivery.yml") {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+func defaultShowBaseConfig(ctx context.Context, repoPath, baseBranch string) ([]byte, error) {
+	content, err := gitutil.New().Show(ctx, repoPath, normalizeBaseBranch(baseBranch)+":.delivery.yml")
+	if err != nil {
+		return nil, err
+	}
+	return []byte(content), nil
+}
+
+func normalizeBaseBranch(baseBranch string) string {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		return "main"
+	}
+	return baseBranch
+}
+
+func warnBaseConfigCheckFailed(w io.Writer, baseBranch string, err error) {
+	if err == nil {
+		return
+	}
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "[loopcoder] warning: base .delivery.yml consistency check could not run for %s: %v; using defaults (configuration may be stale)\n", normalizeBaseBranch(baseBranch), err)
 }

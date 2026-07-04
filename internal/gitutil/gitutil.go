@@ -3,7 +3,9 @@ package gitutil
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -166,6 +168,34 @@ func (c *Client) Show(ctx context.Context, repoPath, revPath string) (string, er
 	return string(output), nil
 }
 
+// IsPathAbsentOnRef reports whether err is the reliable git show signal for a
+// path that is absent from an otherwise valid ref.
+func IsPathAbsentOnRef(err error, path string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	quotedPath := "'" + path + "'"
+	for _, signal := range []string{
+		"path " + quotedPath + " does not exist in '",
+		"path " + quotedPath + " exists on disk, but not in '",
+		quotedPath + " exists on disk, but not in '",
+		path + " exists on disk, but not in '",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 // StatusPorcelain returns git status --porcelain output.
 func (c *Client) StatusPorcelain(ctx context.Context, repoPath string) (string, error) {
 	output, err := c.run(ctx, repoPath, "status", "--porcelain")
@@ -193,8 +223,42 @@ func (c *Client) PushUpstream(ctx context.Context, repoPath, branch string) erro
 	return err
 }
 
+// PushUpstreamForceWithLease force-updates a scratch branch and sets upstream.
+// Present remote branches pin the lease to their ls-remote SHA; absent remote
+// branches intentionally use an empty expected SHA so git requires ref absence.
+func (c *Client) PushUpstreamForceWithLease(ctx context.Context, repoPath, branch string) error {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	remoteRef := "refs/heads/" + branch
+	expected, err := c.remoteBranchSHA(ctx, repoPath, remoteRef)
+	if err != nil {
+		return err
+	}
+	lease := "--force-with-lease=" + remoteRef + ":" + expected
+	_, err = c.run(ctx, repoPath, "push", lease, "-u", "origin", "HEAD:"+remoteRef)
+	return err
+}
+
 // BranchDelete deletes a local branch forcefully.
 func (c *Client) BranchDelete(ctx context.Context, repoPath, branch string) error {
 	_, err := c.run(ctx, repoPath, "branch", "-D", branch)
 	return err
+}
+
+func (c *Client) remoteBranchSHA(ctx context.Context, repoPath, remoteRef string) (string, error) {
+	output, err := c.run(ctx, repoPath, "ls-remote", "origin", remoteRef)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		return "", nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(fields[0]), nil
 }

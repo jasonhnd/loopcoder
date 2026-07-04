@@ -2,6 +2,7 @@ package conductorhooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -119,6 +120,10 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 		return allow()
 	}
 
+	responseText := collectStringsFromRaw(in.ToolResponse)
+	seenAt := isoTimestamp(now)
+	stateChanged := markSurfacedPendingRecords(state, enforced, responseText, seenAt)
+
 	cutoffMs := now.UnixMilli() - recentLedgerGraceMs
 	discovered, err := discoverLedgerRecords(in.CWD)
 	if err != nil {
@@ -139,12 +144,10 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 		records = append(records, rec)
 	}
 
-	if len(records) == 0 {
+	if len(records) == 0 && !stateChanged {
 		return allow()
 	}
 
-	responseText := collectStringsFromRaw(in.ToolResponse)
-	seenAt := isoTimestamp(now)
 	for _, rec := range records {
 		command := rec.command
 		if command == "" {
@@ -173,6 +176,28 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 	return allow()
 }
 
+func markSurfacedPendingRecords(state *relayState, enforced *relayTarget, responseText, seenAt string) bool {
+	if responseText == "" {
+		return false
+	}
+	changed := false
+	for _, rec := range state.Records {
+		if rec == nil || rec.Status != "pending" || rec.Role != enforced.role {
+			continue
+		}
+		if rec.Command != "" && rec.Command != enforced.kind {
+			continue
+		}
+		if !containsSurfacedAttestation(responseText, ledgerRecord{role: rec.Role, header: rec.Header}) {
+			continue
+		}
+		rec.Status = "surfaced"
+		rec.UpdatedAt = seenAt
+		changed = true
+	}
+	return changed
+}
+
 // handleStop blocks completion when any recorded relay attestation is still
 // pending (never surfaced in visible output), printing each missing ledger block
 // verbatim.
@@ -198,32 +223,61 @@ func handleStop(statePath string, now time.Time) Result {
 	}
 
 	blocks := make([]string, 0, len(pending))
+	readable := make([]*relayRecord, 0, len(pending))
+	skipped := make([]*relayRecord, 0)
+	skipNotes := make([]string, 0)
 	for _, rec := range pending {
 		lr, err := readLedgerRecord(rec.LedgerPath)
 		if err != nil {
-			return allow()
+			skipped = append(skipped, rec)
+			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: %v", filepath.ToSlash(rec.LedgerPath), err))
+			continue
+		}
+		if lr == nil {
+			skipped = append(skipped, rec)
+			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: no attestation block found", filepath.ToSlash(rec.LedgerPath)))
+			continue
 		}
 		blocks = append(blocks, lr.block)
+		readable = append(readable, rec)
 	}
 
 	surfacedAt := isoTimestamp(now)
-	for _, rec := range pending {
+	for _, rec := range readable {
 		state.Records[rec.ID].Status = "surfaced_by_hook"
 		state.Records[rec.ID].UpdatedAt = surfacedAt
 	}
-	state.UpdatedAt = surfacedAt
-	trimStateRecords(&state)
-	if err := writeStateJSON(statePath, &state); err != nil {
+	for _, rec := range skipped {
+		state.Records[rec.ID].Status = "skipped_unreadable_by_hook"
+		state.Records[rec.ID].UpdatedAt = surfacedAt
+	}
+	if len(readable) > 0 || len(skipped) > 0 {
+		state.UpdatedAt = surfacedAt
+		trimStateRecords(&state)
+		if err := writeStateJSON(statePath, &state); err != nil {
+			return allow()
+		}
+	}
+
+	if len(blocks) == 0 {
 		return allow()
 	}
 
-	return block(strings.Join([]string{
+	lines := []string{
 		"loopcoder local verbatim attestation relay was missing from the completed command output.",
 		"The missing local-only attestation block(s) are printed below:",
 		"",
+	}
+	if len(skipNotes) > 0 {
+		lines = append(lines, "Some pending relay records could not be read and were skipped:")
+		lines = append(lines, skipNotes...)
+		lines = append(lines, "")
+	}
+	lines = append(lines,
 		strings.Join(blocks, "\n"),
 		"Keep these attestations local-only: do not copy them into PRs, issues, comments, commits, merge artifacts, docs, or tracked files.",
-	}, "\n"))
+	)
+	return block(strings.Join(lines, "\n"))
 }
 
 // pendingRecords returns records whose status is "pending", ordered by the time
@@ -462,6 +516,7 @@ func recordCommandMatches(kind string, rec ledgerRecord) bool {
 		return rec.command == kind
 	}
 	return (kind == "dispatch" && rec.role == "worker") ||
+		(kind == "dispatch-wave" && rec.role == "worker") ||
 		(kind == "loopreview" && rec.role == "verifier")
 }
 
@@ -488,8 +543,8 @@ func relayCommand(command string) *relayTarget {
 			continue
 		}
 		switch words[i+1] {
-		case "dispatch":
-			return &relayTarget{kind: "dispatch", role: "worker"}
+		case "dispatch", "dispatch-wave":
+			return &relayTarget{kind: words[i+1], role: "worker"}
 		case "loopreview":
 			return &relayTarget{kind: "loopreview", role: "verifier"}
 		}

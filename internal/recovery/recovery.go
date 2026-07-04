@@ -74,6 +74,7 @@ type Options struct {
 	Provider         string
 	Model            string
 	Effort           string
+	ConfigFromBase   bool
 	UpgradedModel    string
 	UpgradedEffort   string
 	FailureContext   string
@@ -101,6 +102,7 @@ type DispatchOptions struct {
 	Provider        string
 	Model           string
 	Effort          string
+	ConfigFromBase  bool
 	Stderr          io.Writer
 }
 
@@ -415,6 +417,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			Provider:        opts.Provider,
 			Model:           model,
 			Effort:          effort,
+			ConfigFromBase:  opts.ConfigFromBase,
 			Stderr:          opts.Stderr,
 		})
 		lastDispatchResult = &dispatchResult
@@ -448,6 +451,15 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			continue
 		}
 
+		if strings.EqualFold(strings.TrimSpace(dispatchResult.Status), guardrails.StatusNeedsHuman) {
+			record.Status = guardrails.StatusNeedsHuman
+			record.Error = firstNonEmpty(dispatchResult.Summary, "dispatch produced a needs-human PR")
+			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+			recoveryAttempts = append(recoveryAttempts, record)
+			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+
 		if opts.CircuitBreaker.Enabled() {
 			recordRetryCircuitOutcome(repoPath, opts, priorAttempts, true, dispatchResult.Status)
 		}
@@ -474,14 +486,15 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 		reviewResult, reviewErr := deps.Review(ctx, loopreview.Options{
-			RepoPath:   repoPath,
-			PRNumber:   prNumber,
-			Provider:   opts.VerifierProvider,
-			Model:      opts.VerifierModel,
-			Effort:     opts.VerifierEffort,
-			BaseBranch: opts.BaseBranch,
-			Timeout:    opts.VerifierTimeout,
-			Stderr:     opts.Stderr,
+			RepoPath:       repoPath,
+			PRNumber:       prNumber,
+			Provider:       opts.VerifierProvider,
+			Model:          opts.VerifierModel,
+			Effort:         opts.VerifierEffort,
+			BaseBranch:     opts.BaseBranch,
+			ConfigFromBase: opts.ConfigFromBase,
+			Timeout:        opts.VerifierTimeout,
+			Stderr:         opts.Stderr,
 		})
 		lastReviewResult = &reviewResult
 		record.Review = &reviewResult.Verdict

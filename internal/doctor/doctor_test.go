@@ -103,6 +103,54 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 			},
 		},
 		{
+			name: "old Bash-only PostToolUse matcher",
+			setup: func(env *fakeDoctorEnv) {
+				env.settingsFile = []byte(`{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-attest",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-relay-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-attest",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "loopcoder hook conductor-relay-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}`)
+			},
+			want: StatusWarn,
+			contains: []string{
+				"missing loopcoder conductor hooks",
+				"matcher=Bash|PowerShell|pwsh",
+				"run: loopcoder skill install",
+			},
+		},
+		{
 			name: "hooks present but loopcoder missing from PATH",
 			setup: func(env *fakeDoctorEnv) {
 				delete(env.paths, "loopcoder")
@@ -289,6 +337,36 @@ func TestRunWarnsWhenDeliveryConfigAbsentAndUsesDefaultProviders(t *testing.T) {
 	}
 	if requireCheck(t, report, "provider claude").Status != StatusOK {
 		t.Fatal("default verifier provider claude was not checked")
+	}
+}
+
+func TestRunReportsDeliveryConfigWorkingTreeBaseMismatch(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.configErr = os.ErrNotExist
+	env.commands[cmdKey("git", "show", "main:.delivery.yml")] = CommandResult{
+		Stdout: "version: 1\n",
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo", BaseBranch: "main"}, env.deps())
+
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	delivery := requireCheck(t, report, ".delivery.yml")
+	if delivery.Status != StatusWarn {
+		t.Fatalf("delivery status = %s, want warn (%s)", delivery.Status, delivery.Message)
+	}
+	for _, want := range []string{
+		"absent from working tree",
+		"present on main",
+		"--config-from-base",
+	} {
+		if !strings.Contains(delivery.Message, want) {
+			t.Fatalf("delivery message = %q, want containing %q", delivery.Message, want)
+		}
+	}
+	if strings.Contains(delivery.Message, "documented defaults apply") {
+		t.Fatalf("delivery message should supersede defaults message: %q", delivery.Message)
 	}
 }
 
