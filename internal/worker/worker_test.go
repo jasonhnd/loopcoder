@@ -321,6 +321,127 @@ This implementation detail should stay out of the prompt.
 	}
 }
 
+func TestDispatchInjectsDomainConfiguredSkillsFromWorktree(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+domain:
+  skills:
+    paths:
+      - governance/**/skill.md
+    machine_library:
+      paths:
+        - .loopcoder/skill-library/**/*.md
+    select:
+      - governance
+      - disclosure
+    prompt_budget_bytes: 2048
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{
+		status: " M internal/worker/worker.go\n",
+		worktreeSetup: func(worktreePath string) error {
+			if err := os.MkdirAll(filepath.Join(worktreePath, ".claude", "skills", "go-style"), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(worktreePath, ".claude", "skills", "go-style", "SKILL.md"), []byte(`---
+name: go-style
+description: Repository Go conventions
+---
+
+# Go Style
+`), 0o644); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Join(worktreePath, "governance", "review"), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(worktreePath, "governance", "review", "skill.md"), []byte(`---
+name: Governance Review
+description: Governance review conventions
+tags: [governance]
+---
+
+# Governance Review
+
+Full governance body should stay out of the prompt.
+`), 0o644); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Join(worktreePath, ".loopcoder", "skill-library"), 0o755); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(worktreePath, ".loopcoder", "skill-library", "disclosure.md"), []byte(`---
+description: Disclosure library metadata
+---
+
+# Disclosure Library
+`), 0o644)
+		},
+	}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented domain skills.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 463,
+		IssueTitle:  "Configurable skill discovery",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/463"}
+		},
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	for _, want := range []string{
+		"Discovery paths:",
+		"- skills: `governance/**/skill.md`",
+		"- machine_library: `.loopcoder/skill-library/**/*.md`",
+		"Selection filter: governance, disclosure.",
+		"Budget: 2048 bytes.",
+		"Path: `governance/review/skill.md`",
+		"Summary: Governance review conventions",
+		"Tags: `governance`",
+		"Path: `.loopcoder/skill-library/disclosure.md`",
+		"Summary: Disclosure library metadata",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("agent prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+	for _, notWant := range []string{
+		"Path: `.claude/skills/go-style/SKILL.md`",
+		"Full governance body should stay out of the prompt",
+	} {
+		if strings.Contains(fakeAgent.invocation.Prompt, notWant) {
+			t.Fatalf("agent prompt contained %q:\n%s", notWant, fakeAgent.invocation.Prompt)
+		}
+	}
+}
+
 func TestDispatchPassesConfiguredWorkerMCPServers(t *testing.T) {
 	repo := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
