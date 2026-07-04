@@ -28,6 +28,12 @@ const (
 type ReadySetFunc func(ctx context.Context, opts Options) (report.ReadySetReport, error)
 type WorkerDispatchFunc func(ctx context.Context, opts worker.Options) (worker.Result, error)
 type LoadAttemptsFunc func(repoPath, runID string) ([]state.Attempt, error)
+type DispatchWaveIssueCompleteFunc func(DispatchWaveIssueComplete) error
+
+type DispatchWaveIssueComplete struct {
+	RunID  string
+	Result DispatchWaveIssueResult
+}
 
 type DispatchWaveOptions struct {
 	Reader         GitHubReader
@@ -51,6 +57,7 @@ type DispatchWaveOptions struct {
 	ComputeReadySet ReadySetFunc
 	Dispatch        WorkerDispatchFunc
 	LoadAttempts    LoadAttemptsFunc
+	OnIssueComplete DispatchWaveIssueCompleteFunc
 }
 
 type DispatchWaveReport struct {
@@ -210,6 +217,8 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 	}
 
 	var wg sync.WaitGroup
+	var completeMu sync.Mutex
+	var completeErr error
 	sem := make(chan struct{}, opts.ThrottleLimit)
 	for _, index := range dispatchJobs {
 		select {
@@ -226,7 +235,18 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 		go func(index int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			results[index] = dispatchWaveIssue(ctx, opts, selected[index])
+			result := dispatchWaveIssue(ctx, opts, selected[index])
+			results[index] = result
+			if opts.OnIssueComplete != nil {
+				completeMu.Lock()
+				if err := opts.OnIssueComplete(DispatchWaveIssueComplete{
+					RunID:  opts.RunID,
+					Result: result,
+				}); err != nil && completeErr == nil {
+					completeErr = err
+				}
+				completeMu.Unlock()
+			}
 		}(index)
 	}
 	wg.Wait()
@@ -238,7 +258,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 	if !opts.Now.IsZero() {
 		finished = opts.Now.UTC()
 	}
-	return DispatchWaveReport{
+	report := DispatchWaveReport{
 		Repo:            firstNonEmpty(preflight.Repo, opts.RepoPath),
 		RepoPath:        filepath.ToSlash(opts.RepoPath),
 		BaseBranch:      opts.BaseBranch,
@@ -247,7 +267,11 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 		StartedAt:       state.FormatTimestamp(started),
 		FinishedAt:      state.FormatTimestamp(finished),
 		Results:         results,
-	}, nil
+	}
+	if completeErr != nil {
+		return report, completeErr
+	}
+	return report, nil
 }
 
 func recordDispatchWaveCircuitOutcomes(opts DispatchWaveOptions, selected []int, results []DispatchWaveIssueResult, priorAttemptCounts map[int]int, now time.Time) {
@@ -454,6 +478,32 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 	fmt.Fprintln(&out, "- Verify successful PRs before calling them merge-eligible.")
 	fmt.Fprintln(&out, "- Recover failed attempts before retrying the issue.")
 	fmt.Fprintln(&out, "- Run resume after human review, merge, or interruption.")
+	return out.String()
+}
+
+func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty string) string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "DISPATCH WAVE WORKER #%d %s\n", result.Issue, result.Status)
+	if strings.TrimSpace(result.Branch) != "" {
+		fmt.Fprintf(&out, "branch: %s\n", result.Branch)
+	}
+	if strings.TrimSpace(result.PR) != "" {
+		fmt.Fprintf(&out, "pr: %s\n", result.PR)
+	}
+	if strings.TrimSpace(result.AttemptPath) != "" {
+		fmt.Fprintf(&out, "attempt: %s\n", filepath.ToSlash(result.AttemptPath))
+	}
+	if strings.TrimSpace(result.RecoveryContextPath) != "" {
+		fmt.Fprintf(&out, "recovery: %s\n", filepath.ToSlash(result.RecoveryContextPath))
+	}
+	if strings.TrimSpace(result.Error) != "" {
+		fmt.Fprintf(&out, "error: %s\n", result.Error)
+	}
+	pretty = strings.TrimRight(pretty, "\r\n")
+	if pretty != "" {
+		fmt.Fprintln(&out, pretty)
+	}
+	fmt.Fprintln(&out)
 	return out.String()
 }
 

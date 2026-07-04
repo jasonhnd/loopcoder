@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -267,6 +268,116 @@ func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
 	}
 	if got := strings.Count(string(data), `"attestation"`); got != 2 {
 		t.Fatalf("marshaled results contain %d attestation fields, want 2: %s", got, string(data))
+	}
+}
+
+func TestDispatchWaveStreamsWorkerCompletionBlocksAsWorkersFinish(t *testing.T) {
+	var out bytes.Buffer
+	started := make(chan int, 2)
+	releaseSlow := make(chan struct{})
+	completed := make(chan int, 2)
+
+	reportDone := make(chan struct {
+		report DispatchWaveReport
+		err    error
+	}, 1)
+	go func() {
+		report, err := DispatchWave(context.Background(), DispatchWaveOptions{
+			Reader: fakeReader{views: map[int]gh.Issue{
+				1: {Number: 1, Title: "One"},
+				2: {Number: 2, Title: "Two"},
+			}},
+			RepoPath:      t.TempDir(),
+			RunID:         "run-test-wave",
+			IssueNumbers:  []int{1, 2},
+			ThrottleLimit: 2,
+			ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+				return readySetReport(1, 2), nil
+			},
+			Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+				started <- opts.IssueNumber
+				if opts.IssueNumber == 1 {
+					<-releaseSlow
+				}
+				result := waveWorkerResult(opts)
+				result.Attestation = waveAttestation(opts.IssueNumber, int64(opts.IssueNumber*100))
+				return result, nil
+			},
+			LoadAttempts: noAttempts,
+			OnIssueComplete: func(completion DispatchWaveIssueComplete) error {
+				pretty := completion.Result.Attestation.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain})
+				out.WriteString(RenderDispatchWaveIssueCompletion(completion.Result, pretty))
+				completed <- completion.Result.Issue
+				return nil
+			},
+		})
+		reportDone <- struct {
+			report DispatchWaveReport
+			err    error
+		}{report: report, err: err}
+	}()
+
+	seen := map[int]bool{}
+	for len(seen) < 2 {
+		select {
+		case issue := <-started:
+			seen[issue] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for workers to start")
+		}
+	}
+	select {
+	case issue := <-completed:
+		if issue != 2 {
+			t.Fatalf("first completed issue = %d, want 2", issue)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first worker completion")
+	}
+	close(releaseSlow)
+	select {
+	case issue := <-completed:
+		if issue != 1 {
+			t.Fatalf("second completed issue = %d, want 1", issue)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second worker completion")
+	}
+
+	select {
+	case got := <-reportDone:
+		if got.err != nil {
+			t.Fatalf("DispatchWave returned error: %v", got.err)
+		}
+		if len(got.report.Results) != 2 {
+			t.Fatalf("result count = %d, want 2", len(got.report.Results))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for dispatch wave")
+	}
+
+	text := out.String()
+	for _, want := range []string{
+		"DISPATCH WAVE WORKER #2 succeeded",
+		"  action      \"implement issue #2\"",
+		"DISPATCH WAVE WORKER #1 succeeded",
+		"  action      \"implement issue #1\"",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("streamed output missing %q:\n%s", want, text)
+		}
+	}
+	blockTwoStart := strings.Index(text, "DISPATCH WAVE WORKER #2")
+	blockOneStart := strings.Index(text, "DISPATCH WAVE WORKER #1")
+	if blockTwoStart == -1 || blockOneStart == -1 || blockTwoStart > blockOneStart {
+		t.Fatalf("streamed output not in completion order:\n%s", text)
+	}
+	blockTwoEnd := blockTwoStart + strings.Index(text[blockTwoStart:], "\n\n")
+	if blockTwoEnd < blockTwoStart {
+		t.Fatalf("streamed issue #2 block missing terminator:\n%s", text)
+	}
+	if blockOneStart < blockTwoEnd {
+		t.Fatalf("streamed blocks interleaved:\n%s", text)
 	}
 }
 

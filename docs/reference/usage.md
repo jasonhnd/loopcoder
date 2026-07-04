@@ -180,10 +180,19 @@ hook command is missing or when `loopcoder` does not resolve on `PATH`.
 `loopcoder hook conductor-attest` enforces the local Conductor self-attestation
 step before a delivery or merge turn can finish.
 `loopcoder hook conductor-relay-guard` enforces local visible relay of Worker
-and Verifier attestation from `loopcoder dispatch` and
-`loopcoder loopreview`. Do not redirect, hide, or suppress those commands'
-stderr; the same verbatim relay obligation applies to `loopcoder dispatch-wave`
-whenever it emits per-Worker blocks.
+and Verifier attestation from `loopcoder dispatch`, `loopcoder dispatch-wave`,
+and `loopcoder loopreview`. Do not redirect, hide, or suppress `dispatch` or
+`loopreview` stderr, and keep foreground `dispatch-wave` stdout visible because
+each Worker pretty block streams there as that Worker completes. The relay guard
+covers Bash, PowerShell, and pwsh tool events and treats backgrounded command
+output as pending until the block is surfaced.
+
+The Go binary also hard-gates mechanical progress while pending local relay
+blocks are unacknowledged. A gated command exits with reserved code `4`, prints
+the pending block(s) plus recovery instructions to stdout, and refuses to run.
+Use `loopcoder relay flush --repo <project>` in the foreground to print pending
+blocks verbatim and clear them, or `loopcoder relay list --repo <project>` to
+inspect pending records without clearing.
 
 Report delivery run state with the program-rendered local status command:
 
@@ -496,6 +505,9 @@ loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2>
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
 
+loopcoder relay list --repo .
+loopcoder relay flush --repo .
+
 loopcoder resume --repo . --run-id <run-id>
 
 loopcoder recover \
@@ -533,6 +545,18 @@ loopcoder state pull --repo .
 loopcoder lease acquire --repo . --run-id <run-id>
 loopcoder lease release --repo . --run-id <run-id>
 ```
+
+## Exit Codes
+
+- `loopcoder loopreview` reserves `0`, `1`, and `2` for clean verifier verdicts:
+  `pass`, `fail`, and `needs-human`.
+- `loopcoder loopreview` exits `3` when the command itself fails before or after
+  a clean verdict, such as invalid flags, repository/config/provider setup
+  failure, or output/relay write failure.
+- Mechanical progress commands exit `4` when the relay hard gate finds pending
+  local-only Worker/Verifier blocks. Run `loopcoder relay flush --repo <path>`
+  to print and acknowledge them, or `loopcoder relay list --repo <path>` to
+  inspect without clearing.
 
 ## Verifier Provider Status
 
@@ -573,10 +597,12 @@ explicit pinned model, the attested model is the pinned/configured model when
 that exact model appears in provider-reported usage; a token-dominant auxiliary
 model does not override it. Missing required identity or usage fails closed:
 `dispatch` opens no PR, and `loopreview` returns `needs-human` with the
-incomplete-attestation finding. Attestation surfaces are local-only: stderr
-pretty blocks, `dispatch` / `loopreview` result JSON, and gitignored
-`.loopcoder/` run records. PR bodies, merge commits, and merge comments are not
-attestation surfaces and must not contain attestation headers or canonical JSON.
+incomplete-attestation finding. Attestation surfaces are local-only:
+`dispatch` / `loopreview` stderr pretty blocks, foreground `dispatch-wave`
+stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
+gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
+comments are not attestation surfaces and must not contain attestation headers
+or canonical JSON.
 
 For every successful `loopcoder dispatch`, stdout contains three
 newline-terminated records in this order:
@@ -600,10 +626,11 @@ Worker attestation can read either the local header or the nested
 `attestation` object. The canonical JSON line is the exact machine rendering of
 that same record and is not wrapped in Markdown on stdout.
 
-`loopcoder dispatch`, `loopcoder loopreview`, and `loopcoder dispatch-wave`
-emit the human-readable pretty attestation block to stderr by default. The
-default block uses emoji on an interactive TTY and plain ASCII on a non-TTY.
-`dispatch-wave` emits one Worker block per dispatched issue.
+`loopcoder dispatch` and `loopcoder loopreview` emit the human-readable pretty
+attestation block to stderr by default. Foreground `loopcoder dispatch-wave`
+streams one Worker pretty block per dispatched issue to stdout as that Worker
+completes, before the final aggregate wave report. The default block uses emoji
+on an interactive TTY and plain ASCII on a non-TTY.
 
 The pretty block displays the provider vendor (`OpenAI`, `Anthropic`, or
 `Google`) plus a separate `tool` line with the canonical CLI adapter (`codex`,
@@ -621,16 +648,19 @@ and wins over any force or default setting. When pretty output is shown,
 `NO_COLOR`, `LOOPCODER_PLAIN=1`, or `LOOPCODER_NO_EMOJI=1` forces the plain
 ASCII form.
 
-Pretty output is diagnostic stderr only. It never appears between the three
-`dispatch` stdout records, and it does not change `loopreview` verdict JSON,
-canonical JSON, or the stable `Header()` / `[attestation] ...` contracts.
+Pretty output is diagnostic local output only. It never appears between the
+three `dispatch` stdout records, and it does not change `loopreview` verdict
+JSON, canonical JSON, or the stable `Header()` / `[attestation] ...` contracts.
 Together with result JSON and gitignored `.loopcoder/` run records, it is a
 local attestation surface only. It is not copied into PR bodies, comments,
 commits, merge commit bodies, merge comments, or other repository-visible
-artifacts. The conductor must keep `dispatch`, `dispatch-wave`, and
-`loopreview` stderr visible and relay each Worker or Verifier pretty block
-verbatim for human reporting; `conductor-relay-guard` locally backstops hidden
-or suppressed `dispatch` and `loopreview` blocks where hooks are active.
+artifacts. The conductor must keep `dispatch` and `loopreview` stderr visible,
+keep foreground `dispatch-wave` stdout visible, and relay each Worker or
+Verifier pretty block verbatim for human reporting. The `relay` command group
+is the explicit recovery surface: `relay flush` prints pending blocks verbatim
+to stdout and clears them, while `relay list` inspects pending records without
+clearing. `conductor-relay-guard` locally backstops hidden or suppressed
+`dispatch`, `dispatch-wave`, and `loopreview` blocks where hooks are active.
 Machine consumers should continue to parse local canonical JSON or stable
 headers.
 

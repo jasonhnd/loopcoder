@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **H3 source-first review packet** -- `loopreview` admits source/config diffs before generated or very large diffs so generated artifacts cannot consume the whole review budget ahead of the code under review.
 - **H4 loud config resolution** -- both config loaders fail loud when `.delivery.yml` is absent from the working tree but present on the base branch, `doctor` reports the mismatch, and `--config-from-base` is the explicit opt-in to read config from base.
 - **H5 distinguishable loopreview exit codes** -- `loopreview` now reserves `0`/`1`/`2` for clean verifier verdicts (`pass`/`fail`/`needs-human`) and returns `3` when the command itself fails, such as bad flags, bad `--repo`, config/provider/git setup failure, or output/relay write failure.
+- **Relay-enforcement hard gate** per [`docs/specs/0447-relay-enforcement-hardgate.md`](docs/specs/0447-relay-enforcement-hardgate.md) -- mechanical commands refuse to proceed with reserved exit code `4` while unacknowledged local Worker/Verifier relay blocks are pending, and `loopcoder relay flush` / `loopcoder relay list` provide the foreground clear and inspection surfaces.
+- **Relay guard coverage** -- `conductor-relay-guard` covers PowerShell/pwsh in addition to Bash and treats backgrounded `dispatch`, `dispatch-wave`, and `loopreview` output as pending until surfaced.
+- **Foreground streaming dispatch-wave** -- `dispatch-wave` keeps workers concurrent while streaming each completed Worker's pretty attestation block to stdout as a contiguous unit, removing the need to background a wave just to keep parallelism.
 
 ### Notes
 
