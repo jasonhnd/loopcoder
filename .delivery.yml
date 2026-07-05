@@ -41,7 +41,7 @@ verifier:
 #     Optional. Absent = 300; kill the verifier provider CLI after this many seconds with no log output or worktree file activity (stall).
 #     stall_timeout_seconds: 300
 ci:
-  checks: [verify, go]
+  checks: [verify, go, staticcheck, govulncheck]
   # Optional. Absent = no local test command gate.
   # tests:
   #   - bun run test
