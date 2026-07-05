@@ -14,12 +14,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-const goListHardCapDefault = 120 * time.Second
+const goListHardCapDefault = lcdefaults.CompileGoListHardCap
 
 var (
 	goListCommand = "go"

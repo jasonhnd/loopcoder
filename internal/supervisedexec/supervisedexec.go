@@ -16,14 +16,16 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
 // DefaultHardCap is the package-level fallback used when Options.HardCap is
 // zero or negative. Callers should still pass a site-specific cap.
-const DefaultHardCap = 30 * time.Minute
+const DefaultHardCap = lcdefaults.SupervisedExecHardCap
 
 var defaultHardCap = DefaultHardCap
-var worktreeLivenessMaxFiles = 20000
+var worktreeLivenessMaxFiles = lcdefaults.WorktreeLivenessMaxFiles
 
 const livenessArgvCommandPrefix = "\x00loopcoder-liveness-argv:"
 
@@ -539,7 +541,7 @@ func customLivenessHardCap(opts Options, remainingHardCap time.Duration) time.Du
 		cap = opts.StallTimeout / 2
 	}
 	if cap <= 0 {
-		cap = 5 * time.Second
+		cap = lcdefaults.ProcessLivenessCommandCap
 	}
 	if cap < 100*time.Millisecond {
 		cap = opts.StallTimeout
@@ -547,8 +549,8 @@ func customLivenessHardCap(opts Options, remainingHardCap time.Duration) time.Du
 	if cap <= 0 {
 		cap = 100 * time.Millisecond
 	}
-	if cap > 5*time.Second {
-		cap = 5 * time.Second
+	if cap > lcdefaults.ProcessLivenessCommandCap {
+		cap = lcdefaults.ProcessLivenessCommandCap
 	}
 	if opts.HardCap > 0 && cap > opts.HardCap {
 		cap = opts.HardCap
@@ -599,12 +601,11 @@ func appendCustomLivenessLog(logPath, command, output string, result Result, run
 }
 
 func boundedCustomLivenessOutput(output string) string {
-	const maxBytes = 4096
 	output = strings.TrimRight(strings.ReplaceAll(output, "\r\n", "\n"), "\r\n")
-	if len(output) <= maxBytes {
+	if len(output) <= lcdefaults.CustomLivenessOutputMaxBytes {
 		return output
 	}
-	return output[:maxBytes] + "\n[loopcoder] custom liveness output truncated"
+	return output[:lcdefaults.CustomLivenessOutputMaxBytes] + "\n[loopcoder] custom liveness output truncated"
 }
 
 func warnWorktreeUnavailable(w io.Writer, path string, err error, emitted *bool) {

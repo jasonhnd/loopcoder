@@ -12,16 +12,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"gopkg.in/yaml.v3"
 )
 
-const commandHardCapDefault = 60 * time.Second
+const commandHardCapDefault = lcdefaults.DoctorCommandHardCap
 
 var commandHardCap = commandHardCapDefault
 
@@ -125,7 +125,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	}
 	baseBranch := strings.TrimSpace(opts.BaseBranch)
 	if baseBranch == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	build := normalizeBuildInfo(opts.BuildInfo)
 

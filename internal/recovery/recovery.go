@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -252,16 +253,16 @@ func SleepContext(ctx context.Context, duration time.Duration) error {
 func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	deps = withRecoverDefaults(deps)
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if opts.MaxAttempts == 0 {
-		opts.MaxAttempts = 3
+		opts.MaxAttempts = lcdefaults.WorkerMaxAttempts
 	}
 	if opts.MaxAttempts < 0 {
 		return Result{}, errors.New("max attempts must be non-negative")
 	}
 	if opts.BackoffSeconds == nil {
-		opts.BackoffSeconds = []int{10, 30, 120}
+		opts.BackoffSeconds = lcdefaults.WorkerRetryBackoffSeconds()
 	}
 	for _, seconds := range opts.BackoffSeconds {
 		if seconds < 0 {
@@ -786,7 +787,7 @@ func selectBackoffSeconds(priorAttempts int, backoff []int) int {
 
 func strategyForAttempt(attempt, maxAttempts int) string {
 	if maxAttempts <= 0 {
-		maxAttempts = 3
+		maxAttempts = lcdefaults.WorkerMaxAttempts
 	}
 	if attempt >= maxAttempts {
 		return AttemptStrategyUpgradedConfig
@@ -1036,8 +1037,8 @@ func ledgerWriteFailedCircuitDecision(opts Options, repoPath string, err error) 
 		Allowed:         false,
 		Status:          guardrails.StatusNeedsHuman,
 		Reason:          "guardrails.circuit_breaker.ledger-write-failed",
-		DeliveryScopeID: fmt.Sprintf("%s:%d", firstNonEmpty(opts.BaseBranch, "main"), opts.IssueNumber),
-		BaseBranch:      firstNonEmpty(opts.BaseBranch, "main"),
+		DeliveryScopeID: fmt.Sprintf("%s:%d", firstNonEmpty(opts.BaseBranch, lcdefaults.BaseBranch), opts.IssueNumber),
+		BaseBranch:      firstNonEmpty(opts.BaseBranch, lcdefaults.BaseBranch),
 		Issue:           opts.IssueNumber,
 		RunID:           opts.RunID,
 		DecisionAt:      now,

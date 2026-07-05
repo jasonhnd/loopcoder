@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/equivalence"
 	"github.com/jasonhnd/loopcoder/internal/kickback"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -207,7 +208,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		RepoPath:      opts.RepoPath,
 		RunID:         opts.RunID,
 		PreProdBranch: opts.PreProdBranch,
-		MainBranch:    "main",
+		MainBranch:    lcdefaults.BaseBranch,
 		Gate:          opts.Gate,
 		Status:        PromoteStatusSucceeded,
 		StartedAt:     state.FormatTimestamp(started),
@@ -236,7 +237,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		report.Summary.FailureCount++
 		report.Promoted = PromoteMainResult{
 			PreProdBranch: opts.PreProdBranch,
-			MainBranch:    "main",
+			MainBranch:    lcdefaults.BaseBranch,
 			Head:          opts.PreProdBranch,
 			Status:        PromoteStatusFailed,
 			Error:         err.Error(),
@@ -253,7 +254,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		})
 		report.Promoted = PromoteMainResult{
 			PreProdBranch: opts.PreProdBranch,
-			MainBranch:    "main",
+			MainBranch:    lcdefaults.BaseBranch,
 			Head:          opts.PreProdBranch,
 			Status:        PromoteStatusFailed,
 			Error:         detail,
@@ -352,7 +353,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 				report.Summary.FailureCount++
 				report.Promoted = PromoteMainResult{
 					PreProdBranch: opts.PreProdBranch,
-					MainBranch:    "main",
+					MainBranch:    lcdefaults.BaseBranch,
 					Head:          opts.PreProdBranch,
 					Status:        PromoteStatusFailed,
 					Error:         fmt.Sprintf("route kick-back PR #%d to needs-human: %v", kicked.PRNumber, err),
@@ -370,7 +371,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	promoted, err := opts.Writer.PromotePreProdToMain(ctx, opts.PreProdBranch)
 	report.Promoted = PromoteMainResult{
 		PreProdBranch:     opts.PreProdBranch,
-		MainBranch:        "main",
+		MainBranch:        lcdefaults.BaseBranch,
 		Head:              opts.PreProdBranch,
 		PriorStableCommit: priorStableCommit,
 		Status:            PromoteStatusSucceeded,
@@ -383,7 +384,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		return finish()
 	}
 	report.Promoted.PreProdBranch = firstNonEmpty(promoted.PreProdBranch, opts.PreProdBranch)
-	report.Promoted.MainBranch = firstNonEmpty(promoted.MainBranch, "main")
+	report.Promoted.MainBranch = firstNonEmpty(promoted.MainBranch, lcdefaults.BaseBranch)
 	report.Promoted.Head = promoted.Head
 	report.Promoted.SHA = promoted.SHA
 	report.Promoted.URL = promoted.URL
@@ -395,7 +396,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 	synced, err := opts.Writer.SyncPreProdFromMain(ctx, opts.PreProdBranch)
 	report.Sync = PromoteSyncResult{
 		PreProdBranch: opts.PreProdBranch,
-		MainBranch:    "main",
+		MainBranch:    lcdefaults.BaseBranch,
 		Status:        PromoteStatusSucceeded,
 	}
 	if err != nil {
@@ -406,7 +407,7 @@ func Promote(ctx context.Context, opts PromoteOptions) (PromoteReport, error) {
 		return finish()
 	}
 	report.Sync.PreProdBranch = firstNonEmpty(synced.PreProdBranch, opts.PreProdBranch)
-	report.Sync.MainBranch = firstNonEmpty(synced.MainBranch, "main")
+	report.Sync.MainBranch = firstNonEmpty(synced.MainBranch, lcdefaults.BaseBranch)
 	report.Sync.SHA = synced.SHA
 	report.Sync.URL = synced.URL
 	return finish()
@@ -419,7 +420,7 @@ func runPromoteProductionKeepsGreen(ctx context.Context, opts PromoteOptions, re
 	if report == nil || report.Promoted.Status != PromoteStatusSucceeded || report.Promoted.AlreadyUpToDate {
 		return
 	}
-	mainBranch := firstNonEmpty(report.Promoted.MainBranch, "main")
+	mainBranch := firstNonEmpty(report.Promoted.MainBranch, lcdefaults.BaseBranch)
 	mergeSHA := strings.TrimSpace(report.Promoted.SHA)
 	if mergeSHA == "" {
 		detail := "production promotion did not return a merge commit SHA"
@@ -643,14 +644,14 @@ func recordPromoteAttempt(ctx context.Context, opts PromoteOptions, report *Prom
 }
 
 func readPromotePriorStableCommit(ctx context.Context, opts PromoteOptions) string {
-	sha, err := opts.Writer.BranchHeadSHA(ctx, "main")
+	sha, err := opts.Writer.BranchHeadSHA(ctx, lcdefaults.BaseBranch)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not read main head before promotion: %v\n", err)
+		fmt.Fprintf(os.Stderr, "warning: could not read %s head before promotion: %v\n", lcdefaults.BaseBranch, err)
 		return ""
 	}
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
-		fmt.Fprintln(os.Stderr, "warning: main head read before promotion returned an empty SHA")
+		fmt.Fprintf(os.Stderr, "warning: %s head read before promotion returned an empty SHA\n", lcdefaults.BaseBranch)
 	}
 	return sha
 }
@@ -820,7 +821,7 @@ func normalizePromoteReport(report PromoteReport) PromoteReport {
 		report.Version = PromoteReportVersion
 	}
 	if strings.TrimSpace(report.MainBranch) == "" {
-		report.MainBranch = "main"
+		report.MainBranch = lcdefaults.BaseBranch
 	}
 	report.Gate = normalizePromotionGate(report.Gate)
 	if report.KickedBack == nil {

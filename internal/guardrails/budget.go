@@ -13,6 +13,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
@@ -158,7 +159,7 @@ func EvaluateBudget(opts BudgetOptions) Decision {
 	}
 	baseBranch := strings.TrimSpace(opts.BaseBranch)
 	if baseBranch == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	proposedAttempts := opts.ProposedAttempts
 	if proposedAttempts <= 0 {
@@ -278,7 +279,7 @@ func EvaluateCircuitBreaker(opts CircuitOptions) Decision {
 	}
 	baseBranch := strings.TrimSpace(opts.BaseBranch)
 	if baseBranch == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 
 	decision := Decision{
@@ -819,7 +820,7 @@ func FrozenIssues(repoPath, baseBranch string) (map[int]FrozenIssue, error) {
 		return nil, err
 	}
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	out := map[int]FrozenIssue{}
 	for _, ledger := range ledgers {

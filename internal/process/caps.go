@@ -2,8 +2,8 @@
 
 package process
 
-import "time"
+import lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 
-const livenessHardCapDefault = 5 * time.Second
+const livenessHardCapDefault = lcdefaults.ProcessLivenessCommandCap
 
 var livenessHardCap = livenessHardCapDefault

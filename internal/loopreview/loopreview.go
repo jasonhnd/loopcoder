@@ -26,6 +26,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
@@ -42,33 +43,27 @@ const (
 	SpecConformanceFail          = "fail"
 	SpecConformanceNotApplicable = "not-applicable"
 
-	DefaultVerifierTimeout = 15 * time.Minute
-	VerifierStallTimeout   = 5 * time.Minute
+	DefaultVerifierTimeout = lcdefaults.VerifierTimeout
+	VerifierStallTimeout   = lcdefaults.VerifierStallTimeout
 
-	reviewPacketChangedFilesBudgetBytes = 8 * 1024
-	reviewPacketDiffBudgetBytes         = 80 * 1024
-	reviewPacketDiffFileBudgetBytes     = 24 * 1024
-	reviewPacketGeneratedDiffFileBytes  = 2 * 1024
-	reviewPacketGeneratedSizeBytes      = 128 * 1024
-	reviewPacketIssueBudgetBytes        = 12 * 1024
-	reviewPacketRenderedArtifactBytes   = 24 * 1024
-	reviewPacketRubricBudgetBytes       = 24 * 1024
-	reviewPacketSpecBudgetBytes         = 40 * 1024
-	reviewPacketTotalPromptBudgetBytes  = 160 * 1024
-	renderedArtifactFileBudgetBytes     = 8 * 1024
-	renderedArtifactMaxDirectoryFiles   = 32
-	renderedArtifactProducerTimeout     = 5 * time.Minute
-	producerFailureLogBudgetBytes       = 4 * 1024
-	providerFailureLogBudgetBytes       = 4 * 1024
+	reviewPacketChangedFilesBudgetBytes = lcdefaults.ReviewPacketChangedFilesBudgetBytes
+	reviewPacketDiffBudgetBytes         = lcdefaults.ReviewPacketDiffBudgetBytes
+	reviewPacketDiffFileBudgetBytes     = lcdefaults.ReviewPacketDiffFileBudgetBytes
+	reviewPacketGeneratedDiffFileBytes  = lcdefaults.ReviewPacketGeneratedDiffFileBytes
+	reviewPacketGeneratedSizeBytes      = lcdefaults.ReviewPacketGeneratedSizeBytes
+	reviewPacketIssueBudgetBytes        = lcdefaults.ReviewPacketIssueBudgetBytes
+	reviewPacketRenderedArtifactBytes   = lcdefaults.ReviewPacketRenderedArtifactBudgetBytes
+	reviewPacketRubricBudgetBytes       = lcdefaults.ReviewPacketRubricBudgetBytes
+	reviewPacketSpecBudgetBytes         = lcdefaults.ReviewPacketSpecBudgetBytes
+	reviewPacketTotalPromptBudgetBytes  = lcdefaults.ReviewPacketTotalPromptBudgetBytes
+	renderedArtifactFileBudgetBytes     = lcdefaults.RenderedArtifactFileBudgetBytes
+	renderedArtifactMaxDirectoryFiles   = lcdefaults.RenderedArtifactMaxDirectoryFiles
+	renderedArtifactProducerTimeout     = lcdefaults.RenderedArtifactProducerTimeout
+	producerFailureLogBudgetBytes       = lcdefaults.ProducerFailureLogBudgetBytes
+	providerFailureLogBudgetBytes       = lcdefaults.ProviderFailureLogBudgetBytes
 )
 
-var defaultGeneratedPatterns = []string{
-	"tests/baseline/**",
-	"*.lock",
-	"dist/**",
-	"*.min.*",
-	"vendor/**",
-}
+var defaultGeneratedPatterns = lcdefaults.ReviewPacketGeneratedPatterns()
 
 type Options struct {
 	RepoPath       string
@@ -243,7 +238,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, errors.New("provider is required")
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
@@ -617,7 +612,7 @@ func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacke
 func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLimits) reviewPacket {
 	baseBranch := opts.BaseBranch
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 
 	issueTitle := "(issue unavailable)"
@@ -1608,7 +1603,7 @@ func loadRubric(ctx context.Context, git GitClient, repoPath, baseBranch string,
 	}
 	input.Configured = true
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	for _, rawPath := range rubric.Paths {
 		pathLabel := strings.TrimSpace(rawPath)
@@ -2076,7 +2071,7 @@ type generatedAttributeRule struct {
 
 func loadGeneratedAttributeRules(ctx context.Context, git GitClient, repoPath, baseBranch string, warnings io.Writer) []generatedAttributeRule {
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	revPath := "origin/" + baseBranch + ":.gitattributes"
 	content, err := git.Show(ctx, repoPath, revPath)
@@ -2270,7 +2265,7 @@ func classifySpecAbsence(spec specInput, baseBranch string, changedFiles []strin
 		return spec
 	}
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	if !isDocsSpecPath(spec.Path) || !docsOnlyChangedFiles(changedFiles) {
 		return spec

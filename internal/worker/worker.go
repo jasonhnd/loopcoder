@@ -14,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
@@ -25,8 +26,8 @@ import (
 )
 
 const (
-	WorkerHardCap      = 45 * time.Minute
-	WorkerStallTimeout = 5 * time.Minute
+	WorkerHardCap      = lcdefaults.WorkerHardCap
+	WorkerStallTimeout = lcdefaults.WorkerStallTimeout
 )
 
 type Options struct {
@@ -201,7 +202,7 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 		return nil, fmt.Errorf("provider %q resolved to nil runner", opts.Provider)
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if strings.TrimSpace(opts.Branch) == "" {
 		opts.Branch = fmt.Sprintf("loop/issue-%d", opts.IssueNumber)

@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
 // Result is the outcome of running a hook.
@@ -35,13 +37,13 @@ type Options struct {
 }
 
 const (
-	maxStateFiles       = 128
-	maxStateAgeMillis   = int64(7) * 24 * 60 * 60 * 1000
-	maxTextField        = 4096
-	maxStateRecords     = 256
-	maxLedgerFiles      = 256
-	maxLedgerBytes      = int64(256 * 1024)
-	recentLedgerGraceMs = int64(10 * 60 * 1000)
+	maxStateFiles       = lcdefaults.ConductorHookMaxStateFiles
+	maxStateAgeMillis   = lcdefaults.ConductorHookMaxStateAgeMillis
+	maxTextField        = lcdefaults.ConductorHookMaxTextField
+	maxStateRecords     = lcdefaults.ConductorHookMaxStateRecords
+	maxLedgerFiles      = lcdefaults.ConductorHookMaxLedgerFiles
+	maxLedgerBytes      = lcdefaults.ConductorHookMaxLedgerBytes
+	recentLedgerGraceMs = lcdefaults.ConductorHookRecentLedgerGraceMs
 )
 
 // allow is the fail-open / permit result.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -68,7 +69,7 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 		return report.ReadySetReport{}, fmt.Errorf("github reader is required")
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if opts.Now.IsZero() {
 		opts.Now = time.Now().UTC()

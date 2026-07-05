@@ -11,15 +11,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/kickback"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-const ghHardCapDefault = 60 * time.Second
-const ghListLimit = 1000
+const ghHardCapDefault = lcdefaults.GitHubCommandHardCap
+const ghListLimit = lcdefaults.GitHubListLimit
 
 var ghHardCap = ghHardCapDefault
 
@@ -571,6 +571,7 @@ func (c *CLI) RouteKickBackToNeedsHuman(ctx context.Context, prNumber int) (Need
 
 func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (MainPromotionResult, error) {
 	preProdBranch = strings.TrimSpace(preProdBranch)
+	mainBranch := lcdefaults.BaseBranch
 	if preProdBranch == "" {
 		return MainPromotionResult{}, fmt.Errorf("pre-prod branch is required")
 	}
@@ -594,15 +595,15 @@ func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (M
 		"api",
 		"--method", "POST",
 		"repos/" + repo + "/merges",
-		"-f", "base=main",
+		"-f", "base=" + mainBranch,
 		"-f", "head=" + preProdBranch,
-		"-f", "commit_message=loopcoder promote " + preProdBranch + " to main",
+		"-f", "commit_message=loopcoder promote " + preProdBranch + " to " + mainBranch,
 	}, &payload); err != nil {
 		return MainPromotionResult{}, err
 	}
 	return MainPromotionResult{
 		PreProdBranch:   preProdBranch,
-		MainBranch:      "main",
+		MainBranch:      mainBranch,
 		Head:            preProdBranch,
 		SHA:             payload.SHA,
 		URL:             payload.HTMLURL,
@@ -632,29 +633,30 @@ func (c *CLI) RevertProductionMerge(ctx context.Context, mainBranch, mergeCommit
 
 func (c *CLI) SyncPreProdFromMain(ctx context.Context, preProdBranch string) (PreProdSyncResult, error) {
 	preProdBranch = strings.TrimSpace(preProdBranch)
+	mainBranch := lcdefaults.BaseBranch
 	if preProdBranch == "" {
 		return PreProdSyncResult{}, fmt.Errorf("pre-prod branch is required")
 	}
 	if isReservedProductionBranch(preProdBranch) {
 		return PreProdSyncResult{}, fmt.Errorf("pre-prod branch %q is reserved for human promotion", preProdBranch)
 	}
-	if _, err := c.run(ctx, "git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
+	if _, err := c.run(ctx, "git", "fetch", "origin", "+refs/heads/"+mainBranch+":refs/remotes/origin/"+mainBranch); err != nil {
 		return PreProdSyncResult{}, err
 	}
-	shaBytes, err := c.run(ctx, "git", "rev-parse", "refs/remotes/origin/main")
+	shaBytes, err := c.run(ctx, "git", "rev-parse", "refs/remotes/origin/"+mainBranch)
 	if err != nil {
 		return PreProdSyncResult{}, err
 	}
 	sha := strings.TrimSpace(string(shaBytes))
 	if sha == "" {
-		return PreProdSyncResult{}, fmt.Errorf("main branch sync produced an empty commit SHA")
+		return PreProdSyncResult{}, fmt.Errorf("%s branch sync produced an empty commit SHA", mainBranch)
 	}
-	if _, err := c.run(ctx, "git", "push", "origin", "refs/remotes/origin/main:refs/heads/"+preProdBranch); err != nil {
+	if _, err := c.run(ctx, "git", "push", "origin", "refs/remotes/origin/"+mainBranch+":refs/heads/"+preProdBranch); err != nil {
 		return PreProdSyncResult{}, err
 	}
 	return PreProdSyncResult{
 		PreProdBranch: preProdBranch,
-		MainBranch:    "main",
+		MainBranch:    mainBranch,
 		SHA:           sha,
 		URL:           commitURL(ctx, c, sha),
 	}, nil

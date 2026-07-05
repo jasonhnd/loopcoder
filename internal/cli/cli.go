@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -401,8 +402,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "tick" {
 		fmt.Fprintln(w, "  --repo string                    repository path (required)")
-		fmt.Fprintln(w, "  --base-branch string             base branch for ready, dispatch, and review (default worker.base_branch or \"main\")")
-		fmt.Fprintln(w, "  --pre-prod-branch string         pre-prod branch for clean unattended integrations (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintf(w, "  --base-branch string             base branch for ready, dispatch, and review (default worker.base_branch or %q)\n", lcdefaults.BaseBranch)
+		fmt.Fprintf(w, "  --pre-prod-branch string         pre-prod branch for clean unattended integrations (default environment.pre_prod_branch or %q)\n", lcdefaults.PreProdBranch)
 		fmt.Fprintln(w, "  --run-id string                  shared run id for this pass (default generated once)")
 		fmt.Fprintln(w, "  --worker-provider string         optional worker provider override for this pass")
 		fmt.Fprintln(w, "  --verifier-provider string       optional verifier provider override for this pass")
@@ -411,7 +412,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-model string          optional verifier model override for this pass")
 		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
 		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
-		fmt.Fprintln(w, "  --throttle-limit int             maximum concurrent dispatches (default 4)")
+		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
@@ -419,7 +420,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "trigger" {
 		fmt.Fprintln(w, "  <kind>                           trigger kind: cron, goal-loop, or hook")
 		fmt.Fprintln(w, "  --repo string                    repository path (required)")
-		fmt.Fprintln(w, "  --base-branch string             base branch for config checks and tick (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string             base branch for config checks and tick (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --schedule string                cron schedule metadata (cron)")
 		fmt.Fprintln(w, "  --event string                   event name (hook)")
 		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
@@ -431,7 +432,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "promote" {
 		fmt.Fprintln(w, "  --repo string              repository path (required)")
-		fmt.Fprintln(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or \"pre-prod\")")
+		fmt.Fprintf(w, "  --pre-prod-branch string   pre-prod branch to promote (default environment.pre_prod_branch or %q)\n", lcdefaults.PreProdBranch)
 		fmt.Fprintln(w, "  --run-id string            run id for the promote ledger (default generated)")
 		fmt.Fprintln(w, "  --kick-back string         item to revert out of pre-prod before promoting; repeatable")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
@@ -441,7 +442,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "ready-set" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
-		fmt.Fprintln(w, "  --base-branch string   base branch for dependency reasoning (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string   base branch for dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
@@ -453,7 +454,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "resume" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
-		fmt.Fprintln(w, "  --base-branch string   base branch for branch and dependency reasoning (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
@@ -463,9 +464,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue-title string            GitHub issue title (required)")
 		fmt.Fprintln(w, "  --issue-body string             GitHub issue body")
 		fmt.Fprintln(w, "  --run-id string                 run id containing attempt history (required)")
-		fmt.Fprintln(w, "  --base-branch string            retry base branch (default \"main\")")
-		fmt.Fprintln(w, "  --max-attempts int              retry limit (default 3)")
-		fmt.Fprintln(w, "  --backoff-seconds string        comma-separated retry backoff schedule (default \"10,30,120\")")
+		fmt.Fprintf(w, "  --base-branch string            retry base branch (default %q)\n", lcdefaults.BaseBranch)
+		fmt.Fprintf(w, "  --max-attempts int              retry limit (default %d)\n", lcdefaults.WorkerMaxAttempts)
+		fmt.Fprintf(w, "  --backoff-seconds string        comma-separated retry backoff schedule (default %q)\n", csvInts(lcdefaults.WorkerRetryBackoffSeconds()))
 		fmt.Fprintln(w, "  --provider string               worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string                  optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string                 optional worker reasoning effort override for this run")
@@ -481,7 +482,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --pr-number int        pull request number to review (required)")
 		fmt.Fprintln(w, "  --provider string      verifier provider (required)")
-		fmt.Fprintln(w, "  --base-branch string   base branch for merged spec lookup (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string   base branch for merged spec lookup (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
@@ -500,11 +501,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --pr-number int        pull request number to verify (required unless --branch is set)")
 		fmt.Fprintln(w, "  --branch string        branch to verify (required unless --pr-number is set)")
-		fmt.Fprintln(w, "  --base-branch string   base branch for isolated checkout (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string   base branch for isolated checkout (default %q)\n", lcdefaults.BaseBranch)
 	}
 	if command.Name == "dispatch-wave" {
 		fmt.Fprintln(w, "  --repo string              repository path (required)")
-		fmt.Fprintln(w, "  --base-branch string       base branch passed to dispatch (default \"main\")")
+		fmt.Fprintf(w, "  --base-branch string       base branch passed to dispatch (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string            shared run id for the wave (default generated once)")
 		fmt.Fprintln(w, "  --issue-numbers string     comma-separated issue numbers to dispatch")
 		fmt.Fprintln(w, "  --from-ready-set           read ready-set JSON from stdin")
@@ -513,7 +514,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
-		fmt.Fprintln(w, "  --throttle-limit int       maximum concurrent dispatches (default 4)")
+		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stdout (LOOPCODER_NO_PRETTY)")
 	}
@@ -715,7 +716,7 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var baseBranchAlias string
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
-	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 
 	if err := fs.Parse(args); err != nil {
@@ -1048,7 +1049,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier effort")
 	fs.DurationVar(&verifierTimeout, "verifier-timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
 	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
-	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
+	fs.IntVar(&throttleLimit, "throttle-limit", lcdefaults.DispatchWaveThrottleLimit, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
@@ -1138,13 +1139,13 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
 	}
 	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	if !preProdBranchFlagSet && strings.TrimSpace(preProdBranch) == "" {
 		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
 	}
 	if strings.TrimSpace(preProdBranch) == "" {
-		preProdBranch = "pre-prod"
+		preProdBranch = lcdefaults.PreProdBranch
 	}
 	if strings.TrimSpace(workerProvider) == "" {
 		workerProvider = strings.TrimSpace(cfg.Adapters.Worker)
@@ -1325,7 +1326,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
-	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&schedule, "schedule", "", "cron schedule")
 	fs.StringVar(&scheduleAlias, "Schedule", "", "cron schedule")
@@ -1485,11 +1486,11 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
 	}
 	if baseBranch == "" {
-		baseBranch = "main"
+		baseBranch = lcdefaults.BaseBranch
 	}
 	preProdBranch := strings.TrimSpace(cfg.Environment.PreProdBranch)
 	if preProdBranch == "" {
-		preProdBranch = "pre-prod"
+		preProdBranch = lcdefaults.PreProdBranch
 	}
 	return orchestration.TickOptions{
 		Reader:             deps.NewGitHubReader(repoPath),
@@ -1505,7 +1506,7 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		VerifierModel:      strings.TrimSpace(cfg.Verifier.Model),
 		VerifierEffort:     strings.TrimSpace(cfg.Verifier.ReasoningEffort),
 		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
-		ThrottleLimit:      4,
+		ThrottleLimit:      lcdefaults.DispatchWaveThrottleLimit,
 		RequiredChecks:     cfg.CI.Checks,
 		ConfiguredEvidence: cfg.Evidence.Artifacts(),
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
@@ -1690,7 +1691,7 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
 		return exitCode
 	}
-	cfg, err := loadDeliveryConfig(resolvedRepo, "main", configFromBase)
+	cfg, err := loadDeliveryConfig(resolvedRepo, lcdefaults.BaseBranch, configFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "promote: %v\n", err)
 		return 1
@@ -1699,7 +1700,7 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 		preProdBranch = strings.TrimSpace(cfg.Environment.PreProdBranch)
 	}
 	if strings.TrimSpace(preProdBranch) == "" {
-		preProdBranch = "pre-prod"
+		preProdBranch = lcdefaults.PreProdBranch
 	}
 
 	writer := deps.NewPromoteWriter(resolvedRepo)
@@ -2250,7 +2251,7 @@ func runReadySet(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
-	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
@@ -2395,7 +2396,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
 	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
 	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
-	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&opts.Branch, "branch", "", "branch")
 	fs.StringVar(&branchAlias, "Branch", "", "branch")
@@ -2961,7 +2962,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
-	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
@@ -2979,7 +2980,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
-	fs.IntVar(&throttleLimit, "throttle-limit", 4, "throttle limit")
+	fs.IntVar(&throttleLimit, "throttle-limit", lcdefaults.DispatchWaveThrottleLimit, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
@@ -3250,11 +3251,11 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
 	fs.StringVar(&opts.RunID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
-	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
-	fs.IntVar(&opts.MaxAttempts, "max-attempts", 3, "max attempts")
+	fs.IntVar(&opts.MaxAttempts, "max-attempts", lcdefaults.WorkerMaxAttempts, "max attempts")
 	fs.IntVar(&maxAttemptsAlias, "MaxAttempts", 0, "max attempts")
-	fs.StringVar(&backoffSecondsValue, "backoff-seconds", "10,30,120", "backoff seconds")
+	fs.StringVar(&backoffSecondsValue, "backoff-seconds", csvInts(lcdefaults.WorkerRetryBackoffSeconds()), "backoff seconds")
 	fs.StringVar(&backoffSecondsAlias, "BackoffSeconds", "", "backoff seconds")
 	fs.StringVar(&opts.Provider, "provider", "codex", "provider")
 	fs.StringVar(&providerAlias, "Provider", "", "provider")
@@ -3451,7 +3452,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
-	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
@@ -3585,7 +3586,7 @@ func runVerifyLocal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&prNumberAlias, "PrNumber", 0, "pull request number")
 	fs.StringVar(&opts.Branch, "branch", "", "branch")
 	fs.StringVar(&branchAlias, "Branch", "", "branch")
-	fs.StringVar(&opts.BaseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 
 	if err := fs.Parse(args); err != nil {
@@ -3692,6 +3693,14 @@ func parseBackoffSeconds(value string) ([]int, error) {
 	return out, nil
 }
 
+func csvInts(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ",")
+}
+
 func parseIssueNumbers(value string) ([]int, error) {
 	parts := strings.Split(value, ",")
 	out := make([]int, 0, len(parts))
@@ -3789,7 +3798,7 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
-	fs.StringVar(&baseBranch, "base-branch", "main", "base branch")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")

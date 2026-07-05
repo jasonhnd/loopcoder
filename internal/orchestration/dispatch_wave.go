@@ -11,6 +11,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -96,10 +97,10 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 		opts.LoadAttempts = state.LoadAttempts
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if opts.ThrottleLimit <= 0 {
-		opts.ThrottleLimit = 4
+		opts.ThrottleLimit = lcdefaults.DispatchWaveThrottleLimit
 	}
 	started := opts.Now
 	if started.IsZero() {

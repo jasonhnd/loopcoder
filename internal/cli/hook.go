@@ -6,9 +6,10 @@ import (
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/conductorhooks"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
-const maxHookInputBytes int64 = 1 << 20
+const maxHookInputBytes int64 = lcdefaults.HookInputMaxBytes
 
 // runHook runs one embedded conductor hook by name. It is wired into a project's
 // Claude Code settings via `loopcoder hook <name>` and MUST fail open: any of our

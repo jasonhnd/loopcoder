@@ -13,11 +13,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
 const (
 	recordVersion = 1
-	maxRecordSize = 256 * 1024
+	maxRecordSize = lcdefaults.RelayGateMaxRecordSize
 )
 
 var removePendingRecord = os.Remove
