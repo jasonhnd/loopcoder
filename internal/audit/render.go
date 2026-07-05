@@ -42,7 +42,11 @@ func RenderText(w io.Writer, result Result) error {
 		if finding.Line > 0 {
 			location = fmt.Sprintf("%s:%d", location, finding.Line)
 		}
-		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message); err != nil {
+		waiver := ""
+		if finding.Waived {
+			waiver = fmt.Sprintf(" waived=%s", finding.WaiverID)
+		}
+		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s%s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message, waiver); err != nil {
 			return err
 		}
 		if strings.TrimSpace(finding.Evidence) != "" {
@@ -57,6 +61,16 @@ func RenderText(w io.Writer, result Result) error {
 		}
 		for _, item := range result.NeedsHuman {
 			if _, err := fmt.Fprintf(w, "- %s: %s\n", item.Layer, item.Reason); err != nil {
+				return err
+			}
+		}
+	}
+	if len(result.BaselineNotices) > 0 {
+		if _, err := fmt.Fprintln(w, "baseline_notices:"); err != nil {
+			return err
+		}
+		for _, item := range result.BaselineNotices {
+			if _, err := fmt.Fprintf(w, "- %s %s: %s\n", item.Status, item.ID, item.Reason); err != nil {
 				return err
 			}
 		}

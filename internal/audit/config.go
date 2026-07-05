@@ -70,6 +70,9 @@ func BuildPlan(repoPath string, cfg config.Audit, opts Options) (Plan, error) {
 		Review: ReviewConfig{
 			RubricPath: strings.TrimSpace(cfg.Review.RubricPath),
 		},
+		Baseline: BaselineConfig{
+			Path: strings.TrimSpace(cfg.Baseline.Path),
+		},
 	}, nil
 }
 

@@ -302,7 +302,7 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		RecoveryContext: dispatch.opts.RecoveryContext,
 		RepoSkills:      repoSkills,
 	})
-	if err := os.WriteFile(dispatch.promptPath, []byte(prompt), 0o644); err != nil {
+	if err := os.WriteFile(dispatch.promptPath, []byte(prompt), 0o600); err != nil {
 		return agent.Invocation{}, fmt.Errorf("write prompt: %w", err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
@@ -1291,7 +1291,7 @@ func writeRecoveryBrief(ctx context.Context, opts recoveryBriefOptions) error {
 		ExistingPRText: existingPRText,
 		LogTail:        readLogTail(opts.logPath, 50),
 	})
-	if err := os.WriteFile(briefPath, []byte(brief), 0o644); err != nil {
+	if err := os.WriteFile(briefPath, []byte(brief), 0o600); err != nil {
 		return fmt.Errorf("write recovery brief: %w", err)
 	}
 	return nil

@@ -581,7 +581,7 @@ func appendCustomLivenessLog(logPath, command, output string, result Result, run
 	if strings.TrimSpace(logPath) == "" {
 		return
 	}
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
 	}

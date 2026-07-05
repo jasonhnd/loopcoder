@@ -82,7 +82,7 @@ func hungReason(outcome supervisedexec.Outcome) string {
 
 func appendStallLine(logPath, provider string) func(time.Duration) {
 	return func(silentFor time.Duration) {
-		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, sensitiveFileMode)
 		if err != nil {
 			return
 		}

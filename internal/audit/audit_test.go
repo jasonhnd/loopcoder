@@ -225,6 +225,128 @@ audit:
 	}
 }
 
+func TestRunAppliesBaselineAndReportsStaleWaiversWithoutGate(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "docs", "security"), 0o755); err != nil {
+		t.Fatalf("create security docs dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "security", "audit-baseline.yml"), []byte(`
+version: 1
+waivers:
+  - id: staticcheck-sa1000
+    rule: SA1000
+    path: a.go
+    normalized_evidence: bad regexp
+    original_severity: medium
+    justification: Existing parser fixture used to exercise baseline suppression.
+    date_added: 2026-07-05
+    review_by: 2099-01-01
+  - id: stale-waiver
+    rule: SA9999
+    path: stale.go
+    normalized_evidence: stale
+    original_severity: medium
+    justification: Exercises report-only stale waiver behavior.
+    date_added: 2026-07-05
+    review_by: 2099-01-01
+`), 0o600); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	writeAuditConfig(t, repo, `
+audit:
+  baseline:
+    path: docs/security/audit-baseline.yml
+  sast:
+    commands:
+      - id: staticcheck
+        argv: ["staticcheck", "-f", "json", "./..."]
+        parser: staticcheck-json
+    native:
+      secrets: false
+      file_permissions: false
+`)
+
+	result, err := Run(context.Background(), Options{RepoPath: repo}, Deps{Runner: fakeRunner(func(context.Context, CommandInvocation) CommandRunResult {
+		return CommandRunResult{
+			ExitCode: 1,
+			Stdout:   `{"code":"SA1000","severity":"error","location":{"file":"a.go","line":1},"message":"bad regexp"}`,
+			Duration: time.Millisecond,
+		}
+	})})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict != VerdictClean || ExitCode(result) != 0 {
+		t.Fatalf("result verdict/exit = %s/%d, want clean/0; result=%#v", result.Verdict, ExitCode(result), result)
+	}
+	if len(result.Findings) != 1 || !result.Findings[0].Waived || result.Findings[0].WaiverID != "staticcheck-sa1000" {
+		t.Fatalf("finding was not waived by normalized evidence: %#v", result.Findings)
+	}
+	if len(result.BaselineNotices) != 1 || result.BaselineNotices[0].ID != "stale-waiver" || result.BaselineNotices[0].Status != "stale" {
+		t.Fatalf("baseline notices = %#v, want one stale waiver", result.BaselineNotices)
+	}
+	if len(result.NeedsHuman) != 0 {
+		t.Fatalf("stale waiver should not gate as needs-human: %#v", result.NeedsHuman)
+	}
+}
+
+func TestExpiredBaselineWaiverNeedsHumanWithoutStaleDoubleEmit(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "docs", "security"), 0o755); err != nil {
+		t.Fatalf("create security docs dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "security", "audit-baseline.yml"), []byte(`
+version: 1
+waivers:
+  - id: expired-waiver
+    rule: SA1000
+    path: a.go
+    normalized_evidence: bad regexp
+    original_severity: medium
+    justification: Exercises expired waiver gating.
+    date_added: 2026-07-05
+    review_by: 2000-01-01
+`), 0o600); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	writeAuditConfig(t, repo, `
+audit:
+  baseline:
+    path: docs/security/audit-baseline.yml
+  sast:
+    commands:
+      - id: staticcheck
+        argv: ["staticcheck", "-f", "json", "./..."]
+        parser: staticcheck-json
+    native:
+      secrets: false
+      file_permissions: false
+`)
+
+	result, err := Run(context.Background(), Options{RepoPath: repo}, Deps{Runner: fakeRunner(func(context.Context, CommandInvocation) CommandRunResult {
+		return CommandRunResult{
+			ExitCode: 1,
+			Stdout:   `{"code":"SA1000","severity":"error","location":{"file":"a.go","line":1},"message":"bad regexp"}`,
+			Duration: time.Millisecond,
+		}
+	})})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict != VerdictNeedsHuman || ExitCode(result) != 2 {
+		t.Fatalf("result verdict/exit = %s/%d, want needs-human/2", result.Verdict, ExitCode(result))
+	}
+	if len(result.Findings) != 1 || result.Findings[0].Waived {
+		t.Fatalf("expired waiver should not suppress finding: %#v", result.Findings)
+	}
+	if len(result.NeedsHuman) != 1 || !strings.Contains(result.NeedsHuman[0].Reason, "expired-waiver") {
+		t.Fatalf("needs-human = %#v, want one expired waiver reason", result.NeedsHuman)
+	}
+	if len(result.BaselineNotices) != 0 {
+		t.Fatalf("expired waiver should not also be reported stale: %#v", result.BaselineNotices)
+	}
+}
+
 func TestRunDetectsTrackedWorktreeMutation(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

@@ -17,6 +17,7 @@ Every document is exactly one of these types:
 - [`BACKLOG.md`](BACKLOG.md): backlog and deferred work.
 - [`domains.md`](domains.md): domain profile guidance and docs-domain example.
 - [`learnings.md`](learnings.md): append-only operational learnings.
+- [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.

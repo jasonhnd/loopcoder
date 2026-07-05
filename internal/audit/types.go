@@ -53,6 +53,7 @@ type Result struct {
 	Findings        []Finding                      `json:"findings"`
 	ToolResults     []ToolResult                   `json:"tool_results"`
 	NeedsHuman      []NeedsHuman                   `json:"needs_human"`
+	BaselineNotices []BaselineNotice               `json:"baseline_notices,omitempty"`
 	Attestation     *attestation.AttestationRecord `json:"-"`
 	RuntimeFailures []string                       `json:"runtime_failures,omitempty"`
 }
@@ -90,6 +91,12 @@ type NeedsHuman struct {
 	Reason string `json:"reason"`
 }
 
+type BaselineNotice struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
 type SASTCommand struct {
 	ID      string
 	Argv    []string
@@ -110,10 +117,15 @@ type Plan struct {
 	Commands  []SASTCommand
 	Native    NativeConfig
 	Review    ReviewConfig
+	Baseline  BaselineConfig
 }
 
 type ReviewConfig struct {
 	RubricPath string
+}
+
+type BaselineConfig struct {
+	Path string
 }
 
 type CommandInvocation struct {
