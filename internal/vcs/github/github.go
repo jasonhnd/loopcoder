@@ -19,6 +19,7 @@ import (
 )
 
 const ghHardCapDefault = 60 * time.Second
+const ghListLimit = 1000
 
 var ghHardCap = ghHardCapDefault
 
@@ -265,13 +266,18 @@ func (c *CLI) ListIssues(ctx context.Context, state string) ([]Issue, error) {
 		state = "open"
 	}
 	var issues []Issue
-	err := c.runJSON(ctx, []string{
+	if err := c.runJSON(ctx, []string{
 		"issue", "list",
 		"--state", state,
-		"--limit", "1000",
+		"--limit", fmt.Sprintf("%d", ghListLimit),
 		"--json", "number,title,body,labels,state,stateReason",
-	}, &issues)
-	return issues, err
+	}, &issues); err != nil {
+		return issues, err
+	}
+	if len(issues) >= ghListLimit {
+		return issues, ghListTruncationError("issue list", ghListLimit)
+	}
+	return issues, nil
 }
 
 func (c *CLI) ViewIssue(ctx context.Context, number int) (Issue, error) {
@@ -285,13 +291,18 @@ func (c *CLI) ViewIssue(ctx context.Context, number int) (Issue, error) {
 
 func (c *CLI) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
 	var prs []PullRequest
-	err := c.runJSON(ctx, []string{
+	if err := c.runJSON(ctx, []string{
 		"pr", "list",
 		"--state", "open",
-		"--limit", "1000",
+		"--limit", fmt.Sprintf("%d", ghListLimit),
 		"--json", "number,title,url,headRefName,isDraft,labels,closingIssuesReferences",
-	}, &prs)
-	return prs, err
+	}, &prs); err != nil {
+		return prs, err
+	}
+	if len(prs) >= ghListLimit {
+		return prs, ghListTruncationError("pull request list", ghListLimit)
+	}
+	return prs, nil
 }
 
 func (c *CLI) ViewPR(ctx context.Context, number int) (PullRequest, error) {
@@ -414,12 +425,18 @@ func (c *CLI) CreatePR(ctx context.Context, head, base, title, body string) (str
 
 func (c *CLI) ListHeadPRs(ctx context.Context, branch string) ([]PullRequestReference, error) {
 	var prs []PullRequestReference
-	err := c.runJSON(ctx, []string{
+	if err := c.runJSON(ctx, []string{
 		"pr", "list",
 		"--head", branch,
+		"--limit", fmt.Sprintf("%d", ghListLimit),
 		"--json", "number,url",
-	}, &prs)
-	return prs, err
+	}, &prs); err != nil {
+		return prs, err
+	}
+	if len(prs) >= ghListLimit {
+		return prs, ghListTruncationError("head pull request list", ghListLimit)
+	}
+	return prs, nil
 }
 
 func (c *CLI) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (PreProdMergeResult, error) {
@@ -455,7 +472,7 @@ func (c *CLI) MergeToPreProd(ctx context.Context, prNumber int, preProdBranch st
 		SHA     string `json:"sha"`
 		HTMLURL string `json:"html_url"`
 	}
-	if err := c.runJSON(ctx, []string{
+	if err := c.runJSONAllowEmpty(ctx, []string{
 		"api",
 		"--method", "POST",
 		"repos/" + repo + "/merges",
@@ -573,7 +590,7 @@ func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (M
 		SHA     string `json:"sha"`
 		HTMLURL string `json:"html_url"`
 	}
-	if err := c.runJSON(ctx, []string{
+	if err := c.runJSONAllowEmpty(ctx, []string{
 		"api",
 		"--method", "POST",
 		"repos/" + repo + "/merges",
@@ -940,7 +957,7 @@ func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []stri
 			Body:   body,
 			State:  "OPEN",
 			Labels: labelsFromNames(labels),
-		}, nil
+		}, fmt.Errorf("create issue #%d succeeded but follow-up view failed: %w", number, viewErr)
 	}
 	return issue, nil
 }
@@ -970,7 +987,7 @@ func (c *CLI) UpdateIssue(ctx context.Context, number int, title, body string, a
 			Body:   body,
 			State:  "OPEN",
 			Labels: labelsFromNames(addLabels),
-		}, nil
+		}, fmt.Errorf("update issue #%d succeeded but follow-up view failed: %w", number, err)
 	}
 	return issue, nil
 }
@@ -980,13 +997,28 @@ func (c *CLI) CloseIssue(ctx context.Context, number int) error {
 	return err
 }
 
+func ghListTruncationError(kind string, limit int) error {
+	return fmt.Errorf("gh %s reached --limit %d; results may be truncated", kind, limit)
+}
+
 func (c *CLI) runJSON(ctx context.Context, args []string, target any) error {
+	return c.runJSONWithOptions(ctx, args, target, false)
+}
+
+func (c *CLI) runJSONAllowEmpty(ctx context.Context, args []string, target any) error {
+	return c.runJSONWithOptions(ctx, args, target, true)
+}
+
+func (c *CLI) runJSONWithOptions(ctx context.Context, args []string, target any, allowEmpty bool) error {
 	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
 		return err
 	}
 	if len(bytes.TrimSpace(output)) == 0 {
-		return nil
+		if allowEmpty {
+			return nil
+		}
+		return fmt.Errorf("gh %s returned empty output where JSON was expected", strings.Join(args, " "))
 	}
 	return parseJSONOutput(output, target)
 }

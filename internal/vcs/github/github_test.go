@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -36,6 +37,79 @@ func TestParseJSONOutputParsesObject(t *testing.T) {
 	}
 	if payload.NameWithOwner != "owner/repo" {
 		t.Fatalf("NameWithOwner = %q, want owner/repo", payload.NameWithOwner)
+	}
+}
+
+func TestRunJSONRejectsEmptyOutput(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00issue\x00view\x007\x00--json\x00number,title,body,state,stateReason,labels,closedByPullRequestsReferences": nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	_, err := client.ViewIssue(context.Background(), 7)
+	if err == nil {
+		t.Fatal("ViewIssue returned nil error for empty JSON output")
+	}
+	if !strings.Contains(err.Error(), "empty output where JSON was expected") {
+		t.Fatalf("error = %q, want empty JSON diagnostic", err.Error())
+	}
+}
+
+func TestListIssuesReportsTruncationAtLimit(t *testing.T) {
+	issues := make([]Issue, ghListLimit)
+	for i := range issues {
+		issues[i] = Issue{Number: i + 1, Title: fmt.Sprintf("Issue %d", i+1), State: "OPEN"}
+	}
+	payload, err := json.Marshal(issues)
+	if err != nil {
+		t.Fatalf("marshal issues: %v", err)
+	}
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00issue\x00list\x00--state\x00open\x00--limit\x001000\x00--json\x00number,title,body,labels,state,stateReason": payload,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.ListIssues(context.Background(), "open")
+	if err == nil {
+		t.Fatal("ListIssues returned nil error at limit cap")
+	}
+	if len(got) != ghListLimit {
+		t.Fatalf("ListIssues returned %d issues, want %d partial results", len(got), ghListLimit)
+	}
+	if !strings.Contains(err.Error(), "reached --limit 1000") {
+		t.Fatalf("error = %q, want truncation diagnostic", err.Error())
+	}
+}
+
+func TestListOpenPRsReportsTruncationAtLimit(t *testing.T) {
+	prs := make([]PullRequest, ghListLimit)
+	for i := range prs {
+		prs[i] = PullRequest{Number: i + 1, Title: fmt.Sprintf("PR %d", i+1)}
+	}
+	payload, err := json.Marshal(prs)
+	if err != nil {
+		t.Fatalf("marshal prs: %v", err)
+	}
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00list\x00--state\x00open\x00--limit\x001000\x00--json\x00number,title,url,headRefName,isDraft,labels,closingIssuesReferences": payload,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.ListOpenPRs(context.Background())
+	if err == nil {
+		t.Fatal("ListOpenPRs returned nil error at limit cap")
+	}
+	if len(got) != ghListLimit {
+		t.Fatalf("ListOpenPRs returned %d PRs, want %d partial results", len(got), ghListLimit)
+	}
+	if !strings.Contains(err.Error(), "reached --limit 1000") {
+		t.Fatalf("error = %q, want truncation diagnostic", err.Error())
 	}
 }
 
@@ -187,7 +261,7 @@ func TestCreatePRRunsGhPRCreate(t *testing.T) {
 func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00list\x00--head\x00loop/issue-101\x00--json\x00number,url": []byte(`[{"number":5,"url":"https://github.com/owner/repo/pull/5"}]`),
+			"repo\x00gh\x00pr\x00list\x00--head\x00loop/issue-101\x00--limit\x001000\x00--json\x00number,url": []byte(`[{"number":5,"url":"https://github.com/owner/repo/pull/5"}]`),
 		},
 	}
 	client := NewWithRunner("repo", runner)
@@ -226,6 +300,28 @@ func TestMergeToPreProdRunsGitHubMergeAPI(t *testing.T) {
 	}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestMergeToPreProdEmptyMergeResponseIsAlreadyUpToDate(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences":                                                                []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner":                                                                                                                         []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=pre-prod\x00-f\x00head=loop/issue-101\x00-f\x00commit_message=loopcoder pre-prod merge PR #101": nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.MergeToPreProd(context.Background(), 101, "pre-prod")
+	if err != nil {
+		t.Fatalf("MergeToPreProd returned error: %v", err)
+	}
+	if got.PRNumber != 101 || got.Branch != "pre-prod" || got.Head != "loop/issue-101" {
+		t.Fatalf("MergeToPreProd identity = %#v", got)
+	}
+	if got.SHA != "" || got.URL != "" {
+		t.Fatalf("MergeToPreProd empty body = %#v, want success without SHA or URL", got)
 	}
 }
 
@@ -768,6 +864,26 @@ func TestCreateIssueRunsGhIssueCreate(t *testing.T) {
 	}
 }
 
+func TestCreateIssueReturnsPartialIssueAndReadbackError(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00issue\x00create\x00--title\x00Code: Add feature\x00--body\x00Body": []byte("https://github.com/owner/repo/issues/7\n"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	created, err := client.CreateIssue(context.Background(), "Code: Add feature", "Body", nil)
+	if err == nil {
+		t.Fatal("CreateIssue returned nil error when follow-up ViewIssue failed")
+	}
+	if created.Number != 7 || created.Title != "Code: Add feature" || created.Body != "Body" || created.State != "OPEN" {
+		t.Fatalf("partial created issue = %#v", created)
+	}
+	if !strings.Contains(err.Error(), "follow-up view failed") {
+		t.Fatalf("error = %q, want follow-up view diagnostic", err.Error())
+	}
+}
+
 func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
@@ -788,6 +904,26 @@ func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
 	}
 	if err := client.CloseIssue(context.Background(), 7); err != nil {
 		t.Fatalf("CloseIssue returned error: %v", err)
+	}
+}
+
+func TestUpdateIssueReturnsPartialIssueAndReadbackError(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			"repo\x00gh\x00issue\x00edit\x007\x00--title\x00Epic: Add feature\x00--body\x00New body": nil,
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	updated, err := client.UpdateIssue(context.Background(), 7, "Epic: Add feature", "New body", nil, nil)
+	if err == nil {
+		t.Fatal("UpdateIssue returned nil error when follow-up ViewIssue failed")
+	}
+	if updated.Number != 7 || updated.Title != "Epic: Add feature" || updated.Body != "New body" || updated.State != "OPEN" {
+		t.Fatalf("partial updated issue = %#v", updated)
+	}
+	if !strings.Contains(err.Error(), "follow-up view failed") {
+		t.Fatalf("error = %q, want follow-up view diagnostic", err.Error())
 	}
 }
 
