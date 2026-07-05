@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-06
+
+Add `loopcoder audit`, a read-only built-in security audit, per [`docs/specs/0518-loopcoder-audit.md`](docs/specs/0518-loopcoder-audit.md). It institutionalizes catching the class of issue that led to the 0.5.1 hardening — on demand and in CI — with two layers: a deterministic SAST floor (CI-gateable) and an adversarial LLM security-review lens. Built by loopcoder itself under the self-hosting guard.
+
+### Added
+
+- **`loopcoder audit` command** — a read-only audit that emits structured findings (severity/file/rule/evidence) with H5-style exit codes: `0` clean, `1` findings at/above the configured severity threshold, `2` needs-human, `3` command/runtime failure.
+- **Layer 1 — deterministic SAST floor** — runs a configurable command set (default Go: `govulncheck`, `staticcheck`, `gosec`) plus native secret and file-permission/sensitive-write scans, normalizes all output into one finding schema with secret redaction, and is CI-gateable (no LLM; deterministic sort; timestamp-independent fingerprints).
+- **Layer 2 — LLM security-review lens** — an adversarial, language-agnostic, design-level review that reuses the read-only verifier path (`agent.Runner` with `Invocation.ReadOnly`) with a built-in threat-model rubric plus any repo-configured rubric; attested exactly like a read-only verifier and degrading to `needs-human` on infrastructure/timeout/parse failure (never a silent clean). Only read-only-classified MCP servers are offered to the invocation.
+- **Configurable via `.delivery.yml audit`** — severity threshold, SAST command set, native-scan toggles, review rubric path, and a baseline/waiver file (additive, `omitempty`/`Default()`-safe, unknown-field-tolerant per 0161 M3).
+- **Required CI `audit` check** — loopcoder now audits itself in CI through the deterministic floor and is green on its own tree; `audit` is added to `.delivery.yml ci.checks`. A promotion red-line for audit status is deferred.
+- **`loopcoder doctor` audit readiness** — reports config validity, effective threshold, the SAST commands that will run, required tools on `PATH`, parser recognition, rubric/baseline validity (including stale/expired waivers), the required-check wiring, and Layer-2 read-only verifier provider resolution.
+- **Docs + example security rubric** describing the two layers, exit codes, config, thresholding, baselines/waivers, CI usage, and local-only attestation.
+
+### Fixed
+
+- **Worker-layer prompt and recovery-brief writes hardened to `0o600`** — closing a 0.5.1 shared-host-disclosure gap the new audit surfaced (the earlier A1 hardening had covered only the agent layer, not the worker-layer scratch writes).
+- **`golang.org/x/sys` bumped to v0.46.0** — clearing a real dependency vulnerability the self-audit's `govulncheck` flagged.
+
+### Notes
+
+- The deterministic floor is what gates CI; the LLM lens is not a required hosted CI dependency. Audit findings and Layer-2 attestation are local-only. The 0161 E1 `ReadOnly` boundary, the 0.4.2 H5 exit-code discipline, the self-hosting guard, the 0.5.1 hardening, and the 0.5.2 behavior-preservation are all preserved. Wiring the self-audit surfaced real findings — the worker `0o600` gap and an `x/sys` vulnerability — which were fixed rather than waived: the audit's first act was to harden loopcoder itself.
+
 ## [0.5.2] - 2026-07-05
 
 Behavior-preserving core refactor, per [`docs/specs/0507-core-refactor.md`](docs/specs/0507-core-refactor.md). This release has **zero observable behavior change**: it decomposes god-functions and centralizes scattered defaults for readability, testability, and reduced drift. Every slice proved behavior-preservation via golden/inventory tests and independent verifier path-tracing, and was gated by the full 0.5.1 CI suite (build/vet/test/`-race`/staticcheck/govulncheck). Built by loopcoder itself under the self-hosting guard.
