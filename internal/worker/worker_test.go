@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -1392,6 +1394,275 @@ func TestDispatchHardFailsInvalidAttestationBeforeDelivery(t *testing.T) {
 	}
 }
 
+func TestPrepareDispatchDefaultsAndResolvesDependencies(t *testing.T) {
+	repo := t.TempDir()
+	fakeAgent := &workerFakeAgent{}
+	fakeGitHub := &workerFakeGitHub{}
+	var gotProvider string
+	var gotRepoPath string
+
+	dispatch, err := prepareDispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 509,
+		IssueTitle:  "Split worker dispatch",
+	}, Deps{
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			gotProvider = provider
+			return fakeAgent, nil
+		},
+		GitHub: func(repoPath string) GitHubClient {
+			gotRepoPath = repoPath
+			return fakeGitHub
+		},
+		Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if gotProvider != "codex" {
+		t.Fatalf("AgentLookup provider = %q, want codex", gotProvider)
+	}
+	if dispatch.opts.Provider != "codex" || dispatch.opts.BaseBranch != "main" || dispatch.opts.Branch != "loop/issue-509" || dispatch.opts.Attempt != 1 {
+		t.Fatalf("normalized options = %#v", dispatch.opts)
+	}
+	if dispatch.opts.RunID != state.RunIDForIssue(509, fixedNow()) {
+		t.Fatalf("RunID = %q, want generated run ID", dispatch.opts.RunID)
+	}
+	if !filepath.IsAbs(dispatch.repoPath) || gotRepoPath != dispatch.repoPath {
+		t.Fatalf("repo path = %q, GitHub saw %q", dispatch.repoPath, gotRepoPath)
+	}
+	if dispatch.agentRun != fakeAgent || dispatch.github != fakeGitHub {
+		t.Fatalf("resolved deps agent=%#v github=%#v", dispatch.agentRun, dispatch.github)
+	}
+	if dispatch.warnings == nil {
+		t.Fatal("warnings writer was nil")
+	}
+}
+
+func TestDispatchHelperSeamsSuccessPath(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var removedScratch string
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/509"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Split dispatch into helpers.", 0),
+		log:       "codex ok\n",
+	}
+
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 509,
+		IssueTitle:  "Split worker dispatch",
+		IssueBody:   "Body",
+		RunID:       "run-seam",
+		Provider:    "codex",
+		Model:       "gpt-worker",
+		Effort:      "high",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: func(path string) error {
+			removedScratch = path
+			return os.RemoveAll(path)
+		},
+		RepoSkills: func(repoPath string, domainSkills config.DomainSkills) (string, error) {
+			if repoPath == "" {
+				t.Fatal("RepoSkills repoPath was empty")
+			}
+			return "## Repo-local skills\nSummary: seam coverage\n", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	if fakeGit.fetchCalls != 1 || fakeGit.fetchBase != "main" {
+		t.Fatalf("fetch calls/base = %d/%q, want 1/main", fakeGit.fetchCalls, fakeGit.fetchBase)
+	}
+	if fakeGit.worktreeAddCalls != 1 || fakeGit.worktreeBranch != "loop/issue-509" || fakeGit.worktreeBase != "main" {
+		t.Fatalf("worktree add = calls %d branch %q base %q", fakeGit.worktreeAddCalls, fakeGit.worktreeBranch, fakeGit.worktreeBase)
+	}
+	if dispatch.jobID != "job-509-2468" || dispatch.attemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-seam", "workers", "job-509-2468.attempt.json") {
+		t.Fatalf("attempt identity job=%q path=%q", dispatch.jobID, dispatch.attemptPath)
+	}
+	attempts, err := state.LoadAttempts(repo, "run-seam")
+	if err != nil {
+		t.Fatalf("LoadAttempts after prepareWorktree: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Phase != "worktree_created" || attempts[0].Status != "running" {
+		t.Fatalf("prepareWorktree attempt = %#v", attempts)
+	}
+
+	invocation, err := buildInvocation(ctx, dispatch)
+	if err != nil {
+		t.Fatalf("buildInvocation returned error: %v", err)
+	}
+	if invocation.WorktreePath != dispatch.worktreePath || invocation.LogPath != dispatch.logPath || invocation.RunID != "run-seam" || invocation.Role != "worker" {
+		t.Fatalf("invocation identity = %#v", invocation)
+	}
+	if invocation.Model != "gpt-worker" || invocation.Effort != "high" || invocation.HardCap != WorkerHardCap || invocation.StallTimeout != WorkerStallTimeout {
+		t.Fatalf("invocation supervision/model = %#v", invocation)
+	}
+	if !strings.Contains(invocation.Prompt, "## Repo-local skills") || !strings.Contains(invocation.Prompt, "Summary: seam coverage") {
+		t.Fatalf("invocation prompt missing repo skills:\n%s", invocation.Prompt)
+	}
+	promptInfo, err := os.Stat(dispatch.promptPath)
+	if err != nil {
+		t.Fatalf("stat prompt: %v", err)
+	}
+	if runtime.GOOS != "windows" && promptInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("prompt mode = %#o, want 0644", promptInfo.Mode().Perm())
+	}
+
+	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
+	if agentErr != nil {
+		t.Fatalf("runAgent returned error: %v", agentErr)
+	}
+	if agentResult.ExitCode != 0 || dispatch.activePhase != "codex_exited" || dispatch.tracker.exitCode == nil || *dispatch.tracker.exitCode != 0 {
+		t.Fatalf("runAgent state result=%#v phase=%q exit=%#v", agentResult, dispatch.activePhase, dispatch.tracker.exitCode)
+	}
+
+	result, err := commitAndOpenPR(ctx, dispatch, agentResult)
+	if err != nil {
+		t.Fatalf("commitAndOpenPR returned error: %v", err)
+	}
+	if !result.OK || result.Status != "succeeded" || result.PR != "https://github.com/owner/repo/pull/509" || result.Summary != "Split dispatch into helpers." {
+		t.Fatalf("commit result = %#v", result)
+	}
+	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.pushCalls != 1 || fakeGitHub.createPRCalls != 1 {
+		t.Fatalf("delivery calls add=%d commit=%d push=%d pr=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGitHub.createPRCalls)
+	}
+	if fakeGit.lastCommitMessage != "Split worker dispatch (closes #509)" || fakeGitHub.lastPRBody != "Closes #509\n\nSplit dispatch into helpers." {
+		t.Fatalf("commit/PR text = %q / %q", fakeGit.lastCommitMessage, fakeGitHub.lastPRBody)
+	}
+
+	cleanup(ctx, dispatch, nil)
+	if fakeGit.removeCalls != 1 || fakeGit.branchDeleteCalls != 1 || removedScratch != dispatch.scratch {
+		t.Fatalf("cleanup calls remove=%d branchDelete=%d scratch=%q want %q", fakeGit.removeCalls, fakeGit.branchDeleteCalls, removedScratch, dispatch.scratch)
+	}
+	attempts, err = state.LoadAttempts(repo, "run-seam")
+	if err != nil {
+		t.Fatalf("LoadAttempts after cleanup: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Phase != "cleanup" || attempts[0].Status != "succeeded" {
+		t.Fatalf("cleanup attempt = %#v", attempts)
+	}
+}
+
+func TestHandleHungReportOnlyAndWriteRecoveryHelpers(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M partial.go\n"}
+	fakeGitHub := &workerFakeGitHub{}
+
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 509,
+		IssueTitle:  "Split worker dispatch",
+		RunID:       "run-hung",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return &workerFakeAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 1357
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	dispatch.domainPolicy = domainWorkerPolicy{PartialWorkMode: partialWorkModeReportOnly}
+	if err := os.WriteFile(dispatch.logPath, []byte("provider stalled\nlast useful line\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	agentResult := agent.Result{
+		ExitCode:   -1,
+		Hung:       true,
+		HungReason: agent.HungReasonStall,
+	}
+
+	result, err := handleHungOrPartialWork(ctx, dispatch, agentResult)
+	if err == nil {
+		t.Fatal("handleHungOrPartialWork returned nil error, want hung error")
+	}
+	if result.OK || result.Status != "hung" || result.Branch != "loop/issue-509" || result.Attestation != nil {
+		t.Fatalf("hung helper result = %#v", result)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.forcePushCalls != 0 || fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("report-only helper made delivery calls add=%d commit=%d force=%d pr=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.forcePushCalls, fakeGitHub.createPRCalls)
+	}
+	if !strings.Contains(warnings.String(), "report-only preserved partial work") {
+		t.Fatalf("warnings missing report-only note:\n%s", warnings.String())
+	}
+
+	writeRecovery(ctx, dispatch, err)
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-hung", "job-509-1357"))
+	if err != nil {
+		t.Fatalf("read recovery brief: %v", err)
+	}
+	for _, want := range []string{"- Status: hung", "- Last phase: worktree_created", " M partial.go", "last useful line"} {
+		if !strings.Contains(string(brief), want) {
+			t.Fatalf("recovery brief missing %q:\n%s", want, string(brief))
+		}
+	}
+	attempts, err := state.LoadAttempts(repo, "run-hung")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Attestation != nil {
+		t.Fatalf("hung recovery attempt = %#v", attempts)
+	}
+	events, err := os.ReadFile(state.EventsPath(repo, "run-hung"))
+	if err != nil {
+		t.Fatalf("ReadFile events: %v", err)
+	}
+	for _, want := range []string{`"event":"worker_hung"`, `"event":"worker_partial_work_reported"`, `"status":"hung"`} {
+		if !strings.Contains(string(events), want) {
+			t.Fatalf("events missing %q:\n%s", want, string(events))
+		}
+	}
+}
+
 func fixedNow() time.Time {
 	return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
 }
@@ -1434,6 +1705,16 @@ type workerFakeGit struct {
 	err                 error
 	worktreeSetup       func(worktreePath string) error
 	remoteBranchExists  bool
+	fetchCalls          int
+	fetchBase           string
+	worktreeAddCalls    int
+	worktreeBranch      string
+	worktreeBase        string
+	worktreePath        string
+	removeCalls         int
+	removePath          string
+	branchDeleteCalls   int
+	deletedBranch       string
 	addAllCalls         int
 	commitCalls         int
 	pushCalls           int
@@ -1442,11 +1723,17 @@ type workerFakeGit struct {
 	lastForcePushBranch string
 }
 
-func (f *workerFakeGit) FetchOriginBase(context.Context, string, string) error {
+func (f *workerFakeGit) FetchOriginBase(_ context.Context, _, baseBranch string) error {
+	f.fetchCalls++
+	f.fetchBase = baseBranch
 	return f.err
 }
 
-func (f *workerFakeGit) WorktreeAdd(_ context.Context, _ string, _ string, worktreePath string, _ string) error {
+func (f *workerFakeGit) WorktreeAdd(_ context.Context, _, branch, worktreePath, baseBranch string) error {
+	f.worktreeAddCalls++
+	f.worktreeBranch = branch
+	f.worktreeBase = baseBranch
+	f.worktreePath = worktreePath
 	if f.err != nil {
 		return f.err
 	}
@@ -1459,7 +1746,9 @@ func (f *workerFakeGit) WorktreeAdd(_ context.Context, _ string, _ string, workt
 	return nil
 }
 
-func (f *workerFakeGit) WorktreeRemove(context.Context, string, string) error {
+func (f *workerFakeGit) WorktreeRemove(_ context.Context, _, worktreePath string) error {
+	f.removeCalls++
+	f.removePath = worktreePath
 	return nil
 }
 
@@ -1495,7 +1784,9 @@ func (f *workerFakeGit) PushUpstreamForceWithLease(_ context.Context, _, branch 
 	return f.err
 }
 
-func (f *workerFakeGit) BranchDelete(context.Context, string, string) error {
+func (f *workerFakeGit) BranchDelete(_ context.Context, _, branch string) error {
+	f.branchDeleteCalls++
+	f.deletedBranch = branch
 	return nil
 }
 

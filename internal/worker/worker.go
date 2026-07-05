@@ -122,7 +122,62 @@ func DefaultDeps() Deps {
 	}
 }
 
+type dispatchContext struct {
+	opts     Options
+	deps     Deps
+	warnings io.Writer
+	repoPath string
+	github   GitHubClient
+	agentRun agent.Runner
+
+	scratch      string
+	worktreePath string
+	promptPath   string
+	summaryPath  string
+	logPath      string
+	jobID        string
+	attemptPath  string
+	tracker      *attemptTracker
+
+	domainPolicy      domainWorkerPolicy
+	activePhase       string
+	dispatchSucceeded bool
+	cleanupStatus     string
+	failureStatus     string
+}
+
 func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err error) {
+	dispatch, err := prepareDispatch(ctx, opts, deps)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		writeRecovery(ctx, dispatch, err)
+		return Result{}, err
+	}
+	defer func() {
+		cleanup(ctx, dispatch, err)
+	}()
+
+	invocation, err := buildInvocation(ctx, dispatch)
+	if err != nil {
+		return Result{}, err
+	}
+	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
+	if agentResult.Hung {
+		result, err = handleHungOrPartialWork(ctx, dispatch, agentResult)
+		return result, err
+	}
+	if agentErr != nil {
+		return Result{}, fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
+	}
+	if agentResult.ExitCode != 0 {
+		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
+	}
+	return commitAndOpenPR(ctx, dispatch, agentResult)
+}
+
+func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchContext, error) {
 	deps = withDefaults(deps)
 	warnings := opts.Stderr
 	if warnings == nil {
@@ -130,20 +185,20 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	}
 
 	if opts.IssueNumber <= 0 {
-		return Result{}, errors.New("issue number is required")
+		return nil, errors.New("issue number is required")
 	}
 	if strings.TrimSpace(opts.IssueTitle) == "" {
-		return Result{}, errors.New("issue title is required")
+		return nil, errors.New("issue title is required")
 	}
 	if strings.TrimSpace(opts.Provider) == "" {
 		opts.Provider = "codex"
 	}
 	agentRunner, lookupErr := deps.AgentLookup(opts.Provider)
 	if lookupErr != nil {
-		return Result{}, lookupErr
+		return nil, lookupErr
 	}
 	if agentRunner == nil {
-		return Result{}, fmt.Errorf("provider %q resolved to nil runner", opts.Provider)
+		return nil, fmt.Errorf("provider %q resolved to nil runner", opts.Provider)
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
 		opts.BaseBranch = "main"
@@ -157,7 +212,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	repoPath, err := resolveRepo(opts.RepoPath)
 	if err != nil {
-		return Result{}, err
+		return nil, err
 	}
 	if strings.TrimSpace(opts.RunID) == "" {
 		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
@@ -165,346 +220,347 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 
 	github := deps.GitHub(repoPath)
 	if github == nil {
-		return Result{}, errors.New("github client is not configured")
+		return nil, errors.New("github client is not configured")
 	}
 	if repoName, err := github.RepoName(ctx); err != nil {
-		return Result{}, fmt.Errorf("resolve GitHub repo: %w", err)
+		return nil, fmt.Errorf("resolve GitHub repo: %w", err)
 	} else if strings.TrimSpace(repoName) == "" {
-		return Result{}, errors.New("resolve GitHub repo: empty repo name")
+		return nil, errors.New("resolve GitHub repo: empty repo name")
 	}
 
-	scratch, err := deps.MkdirTemp("", "loopcoder-*")
+	return &dispatchContext{
+		opts:     opts,
+		deps:     deps,
+		warnings: warnings,
+		repoPath: repoPath,
+		github:   github,
+		agentRun: agentRunner,
+	}, nil
+}
+
+func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
+	scratch, err := dispatch.deps.MkdirTemp("", "loopcoder-*")
 	if err != nil {
-		return Result{}, fmt.Errorf("create scratch directory: %w", err)
+		return fmt.Errorf("create scratch directory: %w", err)
 	}
-
-	worktreePath := filepath.Join(scratch, "wt")
-	promptPath := filepath.Join(scratch, "prompt.txt")
-	summaryPath := filepath.Join(scratch, "summary.txt")
-	logPath := filepath.Join(scratch, "codex.log")
-	jobID := fmt.Sprintf("job-%d-%d", opts.IssueNumber, deps.PID())
-	attemptPath := state.AttemptPath(repoPath, opts.RunID, jobID)
-
-	tracker := newAttemptTracker(attemptTrackerOptions{
-		repoPath:    repoPath,
-		runID:       opts.RunID,
-		jobID:       jobID,
-		issue:       opts.IssueNumber,
-		attempt:     opts.Attempt,
-		provider:    opts.Provider,
-		pid:         deps.PID(),
-		branch:      opts.Branch,
-		logPath:     logPath,
-		startedAt:   deps.Now(),
-		now:         deps.Now,
-		warnings:    warnings,
-		attemptPath: attemptPath,
+	dispatch.scratch = scratch
+	dispatch.worktreePath = filepath.Join(scratch, "wt")
+	dispatch.promptPath = filepath.Join(scratch, "prompt.txt")
+	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
+	dispatch.logPath = filepath.Join(scratch, "codex.log")
+	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	dispatch.attemptPath = state.AttemptPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	dispatch.tracker = newAttemptTracker(attemptTrackerOptions{
+		repoPath:    dispatch.repoPath,
+		runID:       dispatch.opts.RunID,
+		jobID:       dispatch.jobID,
+		issue:       dispatch.opts.IssueNumber,
+		attempt:     dispatch.opts.Attempt,
+		provider:    dispatch.opts.Provider,
+		pid:         dispatch.deps.PID(),
+		branch:      dispatch.opts.Branch,
+		logPath:     dispatch.logPath,
+		startedAt:   dispatch.deps.Now(),
+		now:         dispatch.deps.Now,
+		warnings:    dispatch.warnings,
+		attemptPath: dispatch.attemptPath,
 	})
+	dispatch.activePhase = "worktree_created"
+	dispatch.cleanupStatus = "succeeded"
+	dispatch.failureStatus = "failed"
 
-	activePhase := "worktree_created"
-	dispatchSucceeded := false
-	cleanupStatus := "succeeded"
-	failureStatus := "failed"
-	defer func() {
-		if dispatchSucceeded {
-			tracker.transition("cleanup", cleanupStatus, tracker.exitCode, nil)
-			if opts.KeepWorktree {
-				fmt.Fprintf(warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", worktreePath, scratch)
-				return
-			}
-			if cleanupErr := deps.Git.WorktreeRemove(context.Background(), repoPath, worktreePath); cleanupErr != nil {
-				fmt.Fprintf(warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", worktreePath, cleanupErr)
-			}
-			if cleanupErr := deps.Git.BranchDelete(context.Background(), repoPath, opts.Branch); cleanupErr != nil {
-				fmt.Fprintf(warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", opts.Branch, cleanupErr)
-			}
-			if cleanupErr := deps.RemoveAll(scratch); cleanupErr != nil {
-				fmt.Fprintf(warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", scratch, cleanupErr)
-			}
-			return
-		}
-		if err == nil {
-			return
-		}
-
-		failurePhase := activePhase
-		if failurePhase == "" {
-			failurePhase = tracker.phase
-		}
-		if failurePhase == "" {
-			failurePhase = "worktree_created"
-		}
-		errText := err.Error()
-		tracker.transition(failurePhase, failureStatus, tracker.exitCode, &errText)
-		if briefErr := writeRecoveryBrief(ctx, recoveryBriefOptions{
-			repoPath:     repoPath,
-			runID:        opts.RunID,
-			jobID:        jobID,
-			issueNumber:  opts.IssueNumber,
-			issueTitle:   opts.IssueTitle,
-			branch:       opts.Branch,
-			worktreePath: worktreePath,
-			logPath:      logPath,
-			summaryPath:  summaryPath,
-			attempt:      opts.Attempt,
-			lastPhase:    failurePhase,
-			status:       failureStatus,
-			errorMessage: errText,
-			git:          deps.Git,
-			github:       github,
-			warnings:     warnings,
-		}); briefErr != nil {
-			fmt.Fprintf(warnings, "[loopcoder] warning: failed to write recovery brief for %s: %v\n", jobID, briefErr)
-		}
-		fmt.Fprintf(warnings, "[loopcoder] preserved %s attempt artifacts: %s\n", failureStatus, scratch)
-	}()
-
-	if err := deps.Git.FetchOriginBase(ctx, repoPath, opts.BaseBranch); err != nil {
-		return Result{}, fmt.Errorf("git fetch origin %s: %w", opts.BaseBranch, err)
+	if err := dispatch.deps.Git.FetchOriginBase(ctx, dispatch.repoPath, dispatch.opts.BaseBranch); err != nil {
+		return fmt.Errorf("git fetch origin %s: %w", dispatch.opts.BaseBranch, err)
 	}
-	if err := addWorktreeWithLock(ctx, deps, repoPath, opts.Branch, worktreePath, opts.BaseBranch); err != nil {
-		return Result{}, err
+	if err := addWorktreeWithLock(ctx, dispatch.deps, dispatch.repoPath, dispatch.opts.Branch, dispatch.worktreePath, dispatch.opts.BaseBranch); err != nil {
+		return err
 	}
-	tracker.transition(activePhase, "running", nil, nil)
+	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	return nil
+}
 
-	activePhase = "prompt_written"
-	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
-		BaseBranch:     opts.BaseBranch,
-		ConfigFromBase: opts.ConfigFromBase,
-		Warnings:       warnings,
+func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invocation, error) {
+	dispatch.activePhase = "prompt_written"
+	cfg, err := config.LoadForRepo(ctx, dispatch.repoPath, config.LoadOptions{
+		BaseBranch:     dispatch.opts.BaseBranch,
+		ConfigFromBase: dispatch.opts.ConfigFromBase,
+		Warnings:       dispatch.warnings,
 	})
 	if err != nil {
-		return Result{}, err
+		return agent.Invocation{}, err
 	}
-	repoSkills, err := deps.RepoSkills(worktreePath, cfg.Domain.Skills)
+	repoSkills, err := dispatch.deps.RepoSkills(dispatch.worktreePath, cfg.Domain.Skills)
 	if err != nil {
-		return Result{}, fmt.Errorf("read repo skills: %w", err)
+		return agent.Invocation{}, fmt.Errorf("read repo skills: %w", err)
 	}
 	prompt := BuildPrompt(PromptOptions{
-		IssueNumber:     opts.IssueNumber,
-		IssueTitle:      opts.IssueTitle,
-		IssueBody:       opts.IssueBody,
-		Branch:          opts.Branch,
-		RecoveryContext: opts.RecoveryContext,
+		IssueNumber:     dispatch.opts.IssueNumber,
+		IssueTitle:      dispatch.opts.IssueTitle,
+		IssueBody:       dispatch.opts.IssueBody,
+		Branch:          dispatch.opts.Branch,
+		RecoveryContext: dispatch.opts.RecoveryContext,
 		RepoSkills:      repoSkills,
 	})
-	if err := os.WriteFile(promptPath, []byte(prompt), 0o644); err != nil {
-		return Result{}, fmt.Errorf("write prompt: %w", err)
+	if err := os.WriteFile(dispatch.promptPath, []byte(prompt), 0o644); err != nil {
+		return agent.Invocation{}, fmt.Errorf("write prompt: %w", err)
 	}
-	tracker.transition(activePhase, "running", nil, nil)
+	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
 
-	activePhase = "codex_started"
-	tracker.transition(activePhase, "running", nil, nil)
+	dispatch.activePhase = "codex_started"
+	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
 	if err != nil {
-		return Result{}, err
+		return agent.Invocation{}, err
 	}
 	resilience := cfg.Resilience
 	domainPolicy, err := resolveDomainWorkerPolicy(cfg)
 	if err != nil {
-		return Result{}, err
+		return agent.Invocation{}, err
 	}
-	agentResult, agentErr := agentRunner.Run(ctx, agent.Invocation{
-		WorktreePath:    worktreePath,
+	dispatch.domainPolicy = domainPolicy
+	return agent.Invocation{
+		WorktreePath:    dispatch.worktreePath,
 		Prompt:          prompt,
-		LogPath:         logPath,
-		Stderr:          warnings,
-		Model:           opts.Model,
-		Effort:          opts.Effort,
+		LogPath:         dispatch.logPath,
+		Stderr:          dispatch.warnings,
+		Model:           dispatch.opts.Model,
+		Effort:          dispatch.opts.Effort,
 		HardCap:         config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
 		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
 		LivenessMode:    domainPolicy.AgentLivenessMode(),
 		LivenessCommand: domainPolicy.LivenessCommand,
-		RunID:           opts.RunID,
+		RunID:           dispatch.opts.RunID,
 		Role:            "worker",
 		MCPServers:      mcpServers,
-	})
-	activePhase = "codex_exited"
+	}, nil
+}
+
+func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.Invocation) (agent.Result, error) {
+	agentResult, agentErr := dispatch.agentRun.Run(ctx, invocation)
+	dispatch.activePhase = "codex_exited"
 	var exitCodePtr *int
 	if agentResult.ExitCode >= 0 {
 		exitCode := agentResult.ExitCode
 		exitCodePtr = &exitCode
 	}
-	tracker.transition(activePhase, "running", exitCodePtr, nil)
-	if agentResult.Hung {
-		failureStatus = "hung"
-		hungErr := workerHungError(opts.Provider, agentResult.HungReason, logPath)
-		// The deferred failure handler records the "hung" transition (phase +
-		// error) on return; only the distinct hung run-event is emitted here.
-		tracker.appendEvent("worker_hung", "hung", map[string]string{
-			"reason":      "hung",
-			"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
-			"provider":    opts.Provider,
-		})
-		if domainPolicy.PartialWorkMode == partialWorkModeReportOnly {
-			dirty, dirtyErr := deps.Git.StatusPorcelain(ctx, worktreePath)
-			if dirtyErr != nil {
-				return Result{
-					OK:          false,
-					Issue:       opts.IssueNumber,
-					Branch:      opts.Branch,
-					RunID:       opts.RunID,
-					AttemptPath: attemptPath,
-					Status:      "hung",
-					ExitCode:    agentResult.ExitCode,
-					LogBytes:    fileSize(logPath),
-				}, fmt.Errorf("%s; report-only partial-work check failed: %w", hungErr, dirtyErr)
-			}
-			if strings.TrimSpace(dirty) != "" {
-				fmt.Fprintf(warnings, "[loopcoder] domain.partial_work.mode=report-only preserved partial work at %s; no harvest PR opened\n", scratch)
-				tracker.appendEvent("worker_partial_work_reported", "hung", map[string]string{
-					"mode": "report-only",
-				})
-			}
-			return Result{
-				OK:          false,
-				Issue:       opts.IssueNumber,
-				Branch:      opts.Branch,
-				RunID:       opts.RunID,
-				AttemptPath: attemptPath,
-				Status:      "hung",
-				ExitCode:    agentResult.ExitCode,
-				LogBytes:    fileSize(logPath),
-			}, errors.New(hungErr)
-		}
-		harvest, harvestErr := harvestHungWorktree(ctx, hungHarvestOptions{
-			repoPath:     repoPath,
-			runID:        opts.RunID,
-			jobID:        jobID,
-			worktreePath: worktreePath,
-			logPath:      logPath,
-			summaryPath:  summaryPath,
-			opts:         opts,
-			agentResult:  agentResult,
-			errorMessage: hungErr,
-			git:          deps.Git,
-			github:       github,
-			now:          deps.Now,
-			warnings:     warnings,
-		})
-		if harvestErr != nil {
-			return Result{
-				OK:          false,
-				Issue:       opts.IssueNumber,
-				Branch:      opts.Branch,
-				RunID:       opts.RunID,
-				AttemptPath: attemptPath,
-				Status:      "hung",
-				ExitCode:    agentResult.ExitCode,
-				LogBytes:    fileSize(logPath),
-			}, fmt.Errorf("%s; harvest failed: %w", hungErr, harvestErr)
-		}
-		if harvest != nil {
-			exitCode := 0
-			tracker.branch = harvest.Branch
-			tracker.setAttestation(harvest.Attestation)
-			tracker.setUsage(harvest.Attestation.Usage)
-			tracker.transition(harvest.Phase, "needs-human", &exitCode, nil)
-			tracker.appendEvent("worker_harvested", "needs-human", map[string]string{
-				"branch": harvest.Branch,
-				"pr":     harvest.PR,
-				"mode":   harvest.Mode,
-			})
-			dispatchSucceeded = true
-			cleanupStatus = "needs-human"
-			return Result{
-				OK:          true,
-				Issue:       opts.IssueNumber,
-				Branch:      harvest.Branch,
-				RunID:       opts.RunID,
-				PR:          harvest.PR,
-				Summary:     harvest.Summary,
-				AttemptPath: attemptPath,
-				Status:      "needs-human",
-				ExitCode:    exitCode,
-				LogBytes:    fileSize(logPath),
-				Attestation: &harvest.Attestation,
-			}, nil
-		}
-		return Result{
-			OK:          false,
-			Issue:       opts.IssueNumber,
-			Branch:      opts.Branch,
-			RunID:       opts.RunID,
-			AttemptPath: attemptPath,
-			Status:      "hung",
-			ExitCode:    agentResult.ExitCode,
-			LogBytes:    fileSize(logPath),
-		}, errors.New(hungErr)
-	}
-	if agentErr != nil {
-		return Result{}, fmt.Errorf("%s exec failed: %w", opts.Provider, agentErr)
-	}
-	if agentResult.ExitCode != 0 {
-		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", opts.Provider, agentResult.ExitCode, logPath)
-	}
+	dispatch.tracker.transition(dispatch.activePhase, "running", exitCodePtr, nil)
+	return agentResult, agentErr
+}
 
-	attestationRecord := buildWorkerAttestation(opts, agentResult)
-	tracker.setAttestation(attestationRecord)
-	tracker.writeAttempt()
+func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	dispatch.failureStatus = "hung"
+	hungErr := workerHungError(dispatch.opts.Provider, agentResult.HungReason, dispatch.logPath)
+	// The deferred failure handler records the "hung" transition (phase +
+	// error) on return; only the distinct hung run-event is emitted here.
+	dispatch.tracker.appendEvent("worker_hung", "hung", map[string]string{
+		"reason":      "hung",
+		"hung_reason": firstNonEmpty(agentResult.HungReason, "unknown"),
+		"provider":    dispatch.opts.Provider,
+	})
+	if dispatch.domainPolicy.PartialWorkMode == partialWorkModeReportOnly {
+		dirty, dirtyErr := dispatch.deps.Git.StatusPorcelain(ctx, dispatch.worktreePath)
+		if dirtyErr != nil {
+			return hungResult(dispatch, agentResult), fmt.Errorf("%s; report-only partial-work check failed: %w", hungErr, dirtyErr)
+		}
+		if strings.TrimSpace(dirty) != "" {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] domain.partial_work.mode=report-only preserved partial work at %s; no harvest PR opened\n", dispatch.scratch)
+			dispatch.tracker.appendEvent("worker_partial_work_reported", "hung", map[string]string{
+				"mode": "report-only",
+			})
+		}
+		return hungResult(dispatch, agentResult), errors.New(hungErr)
+	}
+	harvest, harvestErr := harvestHungWorktree(ctx, hungHarvestOptions{
+		repoPath:     dispatch.repoPath,
+		runID:        dispatch.opts.RunID,
+		jobID:        dispatch.jobID,
+		worktreePath: dispatch.worktreePath,
+		logPath:      dispatch.logPath,
+		summaryPath:  dispatch.summaryPath,
+		opts:         dispatch.opts,
+		agentResult:  agentResult,
+		errorMessage: hungErr,
+		git:          dispatch.deps.Git,
+		github:       dispatch.github,
+		now:          dispatch.deps.Now,
+		warnings:     dispatch.warnings,
+	})
+	if harvestErr != nil {
+		return hungResult(dispatch, agentResult), fmt.Errorf("%s; harvest failed: %w", hungErr, harvestErr)
+	}
+	if harvest != nil {
+		exitCode := 0
+		dispatch.tracker.branch = harvest.Branch
+		dispatch.tracker.setAttestation(harvest.Attestation)
+		dispatch.tracker.setUsage(harvest.Attestation.Usage)
+		dispatch.tracker.transition(harvest.Phase, "needs-human", &exitCode, nil)
+		dispatch.tracker.appendEvent("worker_harvested", "needs-human", map[string]string{
+			"branch": harvest.Branch,
+			"pr":     harvest.PR,
+			"mode":   harvest.Mode,
+		})
+		dispatch.dispatchSucceeded = true
+		dispatch.cleanupStatus = "needs-human"
+		return Result{
+			OK:          true,
+			Issue:       dispatch.opts.IssueNumber,
+			Branch:      harvest.Branch,
+			RunID:       dispatch.opts.RunID,
+			PR:          harvest.PR,
+			Summary:     harvest.Summary,
+			AttemptPath: dispatch.attemptPath,
+			Status:      "needs-human",
+			ExitCode:    exitCode,
+			LogBytes:    fileSize(dispatch.logPath),
+			Attestation: &harvest.Attestation,
+		}, nil
+	}
+	return hungResult(dispatch, agentResult), errors.New(hungErr)
+}
+
+func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	attestationRecord := buildWorkerAttestation(dispatch.opts, agentResult)
+	dispatch.tracker.setAttestation(attestationRecord)
+	dispatch.tracker.writeAttempt()
 	if err := attestationRecord.Validate(); err != nil {
 		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
 	}
-	tracker.setUsage(attestationRecord.Usage)
-	tracker.writeAttempt()
+	dispatch.tracker.setUsage(attestationRecord.Usage)
+	dispatch.tracker.writeAttempt()
 	if _, err := attestationRecord.CanonicalJSON(); err != nil {
 		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
 	}
 
-	summary := fmt.Sprintf("(%s produced no summary)", opts.Provider)
+	summary := fmt.Sprintf("(%s produced no summary)", dispatch.opts.Provider)
 	if trimmed := strings.TrimSpace(agentResult.Summary); trimmed != "" {
 		summary = trimmed
 	}
 
-	activePhase = "dirty_checked"
-	dirty, err := deps.Git.StatusPorcelain(ctx, worktreePath)
+	dispatch.activePhase = "dirty_checked"
+	dirty, err := dispatch.deps.Git.StatusPorcelain(ctx, dispatch.worktreePath)
 	if err != nil {
 		return Result{}, fmt.Errorf("git status --porcelain: %w", err)
 	}
 	if strings.TrimSpace(dirty) == "" {
-		return Result{}, fmt.Errorf("codex made no file changes for issue #%d (nothing to commit)", opts.IssueNumber)
+		return Result{}, fmt.Errorf("codex made no file changes for issue #%d (nothing to commit)", dispatch.opts.IssueNumber)
 	}
-	tracker.transition(activePhase, "running", tracker.exitCode, nil)
+	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
-	if err := deps.Git.AddAll(ctx, worktreePath); err != nil {
+	if err := dispatch.deps.Git.AddAll(ctx, dispatch.worktreePath); err != nil {
 		return Result{}, fmt.Errorf("git add -A: %w", err)
 	}
-	activePhase = "committed"
-	if err := deps.Git.Commit(ctx, worktreePath, buildCommitMessage(opts.IssueTitle, opts.IssueNumber)); err != nil {
+	dispatch.activePhase = "committed"
+	if err := dispatch.deps.Git.Commit(ctx, dispatch.worktreePath, buildCommitMessage(dispatch.opts.IssueTitle, dispatch.opts.IssueNumber)); err != nil {
 		return Result{}, fmt.Errorf("git commit: %w", err)
 	}
-	tracker.transition(activePhase, "running", tracker.exitCode, nil)
+	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
-	activePhase = "pushed"
-	if err := deps.Git.PushUpstream(ctx, worktreePath, opts.Branch); err != nil {
-		return Result{}, fmt.Errorf("git push -u origin %s: %w", opts.Branch, err)
+	dispatch.activePhase = "pushed"
+	if err := dispatch.deps.Git.PushUpstream(ctx, dispatch.worktreePath, dispatch.opts.Branch); err != nil {
+		return Result{}, fmt.Errorf("git push -u origin %s: %w", dispatch.opts.Branch, err)
 	}
-	tracker.transition(activePhase, "running", tracker.exitCode, nil)
+	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
-	activePhase = "pr_opened"
-	body := buildPRBody(opts.IssueNumber, summary)
-	prURL, err := github.CreatePR(ctx, opts.Branch, opts.BaseBranch, opts.IssueTitle, body)
+	dispatch.activePhase = "pr_opened"
+	body := buildPRBody(dispatch.opts.IssueNumber, summary)
+	prURL, err := dispatch.github.CreatePR(ctx, dispatch.opts.Branch, dispatch.opts.BaseBranch, dispatch.opts.IssueTitle, body)
 	if err != nil {
 		return Result{}, fmt.Errorf("gh pr create: %w", err)
 	}
-	tracker.transition(activePhase, "succeeded", tracker.exitCode, nil)
-	dispatchSucceeded = true
+	dispatch.tracker.transition(dispatch.activePhase, "succeeded", dispatch.tracker.exitCode, nil)
+	dispatch.dispatchSucceeded = true
 
 	exitCode := 0
-	logBytes := fileSize(logPath)
+	logBytes := fileSize(dispatch.logPath)
 	return Result{
 		OK:          true,
-		Issue:       opts.IssueNumber,
-		Branch:      opts.Branch,
-		RunID:       opts.RunID,
+		Issue:       dispatch.opts.IssueNumber,
+		Branch:      dispatch.opts.Branch,
+		RunID:       dispatch.opts.RunID,
 		PR:          prURL,
 		Summary:     summary,
-		AttemptPath: attemptPath,
+		AttemptPath: dispatch.attemptPath,
 		Status:      "succeeded",
 		ExitCode:    exitCode,
 		LogBytes:    logBytes,
 		Attestation: &attestationRecord,
 	}, nil
+}
+
+func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error) {
+	if dispatch == nil || dispatch.tracker == nil || failure == nil {
+		return
+	}
+	failurePhase := dispatch.activePhase
+	if failurePhase == "" {
+		failurePhase = dispatch.tracker.phase
+	}
+	if failurePhase == "" {
+		failurePhase = "worktree_created"
+	}
+	errText := failure.Error()
+	dispatch.tracker.transition(failurePhase, dispatch.failureStatus, dispatch.tracker.exitCode, &errText)
+	if briefErr := writeRecoveryBrief(ctx, recoveryBriefOptions{
+		repoPath:     dispatch.repoPath,
+		runID:        dispatch.opts.RunID,
+		jobID:        dispatch.jobID,
+		issueNumber:  dispatch.opts.IssueNumber,
+		issueTitle:   dispatch.opts.IssueTitle,
+		branch:       dispatch.opts.Branch,
+		worktreePath: dispatch.worktreePath,
+		logPath:      dispatch.logPath,
+		summaryPath:  dispatch.summaryPath,
+		attempt:      dispatch.opts.Attempt,
+		lastPhase:    failurePhase,
+		status:       dispatch.failureStatus,
+		errorMessage: errText,
+		git:          dispatch.deps.Git,
+		github:       dispatch.github,
+		warnings:     dispatch.warnings,
+	}); briefErr != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write recovery brief for %s: %v\n", dispatch.jobID, briefErr)
+	}
+	fmt.Fprintf(dispatch.warnings, "[loopcoder] preserved %s attempt artifacts: %s\n", dispatch.failureStatus, dispatch.scratch)
+}
+
+func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
+	if dispatch == nil || dispatch.tracker == nil {
+		return
+	}
+	if dispatch.dispatchSucceeded {
+		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
+		if dispatch.opts.KeepWorktree {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", dispatch.worktreePath, dispatch.scratch)
+			return
+		}
+		if cleanupErr := dispatch.deps.Git.WorktreeRemove(context.Background(), dispatch.repoPath, dispatch.worktreePath); cleanupErr != nil {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", dispatch.worktreePath, cleanupErr)
+		}
+		if cleanupErr := dispatch.deps.Git.BranchDelete(context.Background(), dispatch.repoPath, dispatch.opts.Branch); cleanupErr != nil {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", dispatch.opts.Branch, cleanupErr)
+		}
+		if cleanupErr := dispatch.deps.RemoveAll(dispatch.scratch); cleanupErr != nil {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", dispatch.scratch, cleanupErr)
+		}
+		return
+	}
+	if failure == nil {
+		return
+	}
+	writeRecovery(ctx, dispatch, failure)
+}
+
+func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
+	return Result{
+		OK:          false,
+		Issue:       dispatch.opts.IssueNumber,
+		Branch:      dispatch.opts.Branch,
+		RunID:       dispatch.opts.RunID,
+		AttemptPath: dispatch.attemptPath,
+		Status:      "hung",
+		ExitCode:    agentResult.ExitCode,
+		LogBytes:    fileSize(dispatch.logPath),
+	}
 }
 
 type PromptOptions struct {
