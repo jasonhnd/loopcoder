@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/config"
 )
 
 type Invocation struct {
@@ -33,21 +34,9 @@ type Invocation struct {
 	MCPServers []MCPServer
 }
 
-type MCPServer struct {
-	Name      string
-	Transport string
-	Command   string
-	Args      []string
-	URL       string
-	Auth      MCPAuth
-	Roles     []string
-	ReadOnly  bool
-}
+type MCPServer = config.MCPServer
 
-type MCPAuth struct {
-	Header string
-	Env    string
-}
+type MCPAuth = config.MCPAuth
 
 type Result struct {
 	ExitCode   int

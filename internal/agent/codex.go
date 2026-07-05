@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/config"
 )
 
 type ExecCodexRunner struct{}
@@ -203,188 +204,20 @@ func mcpServersForArgs(inv Invocation) []MCPServer {
 }
 
 func mcpServersForInvocation(inv Invocation) ([]MCPServer, error) {
-	if len(inv.MCPServers) == 0 {
-		return nil, nil
-	}
-
-	role := normalizeMCPRole(inv.Role)
-	if role != "" && !validMCPRole(role) {
-		return nil, fmt.Errorf("invalid invocation role %q", inv.Role)
-	}
-
-	requiresRole := false
-	for index, server := range inv.MCPServers {
-		if err := validateMCPRoles(index, server.Roles); err != nil {
-			return nil, err
-		}
-		if len(server.Roles) > 0 {
-			requiresRole = true
-		}
-	}
-	if requiresRole && role == "" {
-		return nil, errors.New("invocation role is required when MCP servers declare role filters")
-	}
-
-	servers := make([]MCPServer, 0, len(inv.MCPServers))
-	for index, server := range inv.MCPServers {
-		if !mcpRoleAllowed(server.Roles, role) {
-			continue
-		}
-		if err := validateMCPServer(index, server); err != nil {
-			return nil, err
-		}
-		if inv.ReadOnly && !server.ReadOnly {
-			return nil, fmt.Errorf("mcp.servers[%d] %q is not locally classified read-only for a read-only invocation", index, server.Name)
-		}
-		servers = append(servers, server)
-	}
-	if len(servers) == 0 {
-		return nil, nil
-	}
-	return servers, nil
-}
-
-func validateMCPRoles(index int, roles []string) error {
-	for _, role := range roles {
-		normalized := normalizeMCPRole(role)
-		if !validMCPRole(normalized) {
-			return fmt.Errorf("mcp.servers[%d].roles contains unknown role %q", index, role)
-		}
-	}
-	return nil
-}
-
-func validateMCPServer(index int, server MCPServer) error {
-	if !validMCPServerName(server.Name) {
-		return fmt.Errorf("mcp.servers[%d].name %q is not a safe provider MCP server name", index, server.Name)
-	}
-
-	transport, err := mcpServerTransport(server)
-	if err != nil {
-		return fmt.Errorf("mcp.servers[%d] %q: %w", index, server.Name, err)
-	}
-	switch transport {
-	case "stdio":
-		if strings.TrimSpace(server.Command) == "" {
-			return fmt.Errorf("mcp.servers[%d] %q stdio transport requires command", index, server.Name)
-		}
-		if strings.TrimSpace(server.URL) != "" {
-			return fmt.Errorf("mcp.servers[%d] %q stdio transport cannot include url", index, server.Name)
-		}
-		if mcpAuthConfigured(server.Auth) {
-			return fmt.Errorf("mcp.servers[%d] %q stdio transport cannot use HTTP auth", index, server.Name)
-		}
-	case "http":
-		if strings.TrimSpace(server.URL) == "" {
-			return fmt.Errorf("mcp.servers[%d] %q http transport requires url", index, server.Name)
-		}
-		if strings.TrimSpace(server.Command) != "" || len(server.Args) > 0 {
-			return fmt.Errorf("mcp.servers[%d] %q http transport cannot include command or args", index, server.Name)
-		}
-		if !validMCPHTTPURL(server.URL) {
-			return fmt.Errorf("mcp.servers[%d] %q http transport requires an http or https url", index, server.Name)
-		}
-		if err := validateMCPAuth(index, server); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("mcp.servers[%d] %q has unsupported transport %q", index, server.Name, server.Transport)
-	}
-	return nil
-}
-
-func validateMCPAuth(index int, server MCPServer) error {
-	header := strings.TrimSpace(server.Auth.Header)
-	envName := strings.TrimSpace(server.Auth.Env)
-	if header == "" && envName == "" {
-		return nil
-	}
-	if header == "" || envName == "" {
-		return fmt.Errorf("mcp.servers[%d] %q http auth requires both header and env", index, server.Name)
-	}
-	if !validHTTPHeaderName(header) {
-		return fmt.Errorf("mcp.servers[%d] %q http auth header %q is invalid", index, server.Name, header)
-	}
-	if !validEnvName(envName) {
-		return fmt.Errorf("mcp.servers[%d] %q http auth env %q is invalid", index, server.Name, envName)
-	}
-	return nil
+	return config.MCPServersForInvocation(config.MCP{Servers: inv.MCPServers}, config.MCPInvocationOptions{
+		Role:                     inv.Role,
+		ReadOnly:                 inv.ReadOnly,
+		InvocationRoleError:      "invalid invocation role",
+		InvocationRoleErrorValue: inv.Role,
+	})
 }
 
 func mcpServerTransport(server MCPServer) (string, error) {
-	transport := strings.ToLower(strings.TrimSpace(server.Transport))
-	if transport == "" {
-		switch {
-		case strings.TrimSpace(server.URL) != "":
-			return "http", nil
-		case strings.TrimSpace(server.Command) != "":
-			return "stdio", nil
-		default:
-			return "", errors.New("transport is required")
-		}
-	}
-	switch transport {
-	case "stdio", "http":
-		return transport, nil
-	default:
-		return "", fmt.Errorf("unsupported transport %q", server.Transport)
-	}
-}
-
-func normalizeMCPRole(role string) string {
-	return strings.ToLower(strings.TrimSpace(role))
-}
-
-func validMCPRole(role string) bool {
-	switch role {
-	case "worker", "verifier":
-		return true
-	default:
-		return false
-	}
-}
-
-func mcpRoleAllowed(roles []string, role string) bool {
-	if len(roles) == 0 {
-		return true
-	}
-	for _, candidate := range roles {
-		if normalizeMCPRole(candidate) == role {
-			return true
-		}
-	}
-	return false
-}
-
-func validMCPServerName(name string) bool {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return false
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '_' || r == '-':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func validMCPHTTPURL(rawURL string) bool {
-	rawURL = strings.TrimSpace(rawURL)
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" {
-		return false
-	}
-	return parsed.Scheme == "https" || parsed.Scheme == "http"
+	return config.MCPServerTransport(server)
 }
 
 func mcpAuthConfigured(auth MCPAuth) bool {
-	return strings.TrimSpace(auth.Header) != "" || strings.TrimSpace(auth.Env) != ""
+	return config.MCPAuthConfigured(auth)
 }
 
 func mcpAuthHeaderValue(auth MCPAuth) string {
@@ -396,40 +229,6 @@ func mcpAuthHeaderValue(auth MCPAuth) string {
 		return "Bearer ${" + envName + "}"
 	}
 	return "${" + envName + "}"
-}
-
-func validHTTPHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func validEnvName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for index, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r == '_':
-		case index > 0 && r >= '0' && r <= '9':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func tomlQuotedKey(value string) string {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,6 +233,23 @@ type MCPAuth struct {
 	Env    string `yaml:"env,omitempty"`
 }
 
+type MCPReadOnlyPolicy int
+
+const (
+	MCPReadOnlyReject MCPReadOnlyPolicy = iota
+	MCPReadOnlyFilter
+)
+
+type MCPInvocationOptions struct {
+	Role                     string
+	ReadOnly                 bool
+	ReadOnlyPolicy           MCPReadOnlyPolicy
+	RequireRole              bool
+	ErrorPrefix              string
+	InvocationRoleError      string
+	InvocationRoleErrorValue string
+}
+
 func (e Evidence) Artifacts() []EvidenceArtifact {
 	artifacts := make([]EvidenceArtifact, 0, 4)
 	for _, candidate := range []EvidenceArtifact{
@@ -427,16 +445,276 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 }
 
 func validateMCP(m MCP) error {
+	return validateMCPDeclarations(m, "invalid delivery config: ")
+}
+
+func validateMCPDeclarations(m MCP, errorPrefix string) error {
 	for index, server := range m.Servers {
-		for _, role := range server.Roles {
-			switch strings.ToLower(strings.TrimSpace(role)) {
-			case "worker", "verifier":
-			default:
-				return fmt.Errorf("invalid delivery config: mcp.servers[%d].roles contains unknown role %q", index, role)
-			}
+		if err := validateMCPServerRoles(index, server.Roles, errorPrefix); err != nil {
+			return err
+		}
+		if !mcpServerCanReachProvider(server) {
+			continue
+		}
+		if err := validateMCPServer(index, server, errorPrefix); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func MCPServersForInvocation(m MCP, opts MCPInvocationOptions) ([]MCPServer, error) {
+	role := normalizeMCPRole(opts.Role)
+	if opts.RequireRole || role != "" {
+		if !validMCPRole(role) {
+			label := opts.InvocationRoleError
+			if label == "" {
+				label = "invalid MCP invocation role"
+			}
+			value := role
+			if opts.InvocationRoleErrorValue != "" {
+				value = opts.InvocationRoleErrorValue
+			}
+			return nil, fmt.Errorf("%s %q", label, value)
+		}
+	}
+	if len(m.Servers) == 0 {
+		return nil, nil
+	}
+
+	requiresRole := false
+	for index, server := range m.Servers {
+		if err := validateMCPServerRoles(index, server.Roles, opts.ErrorPrefix); err != nil {
+			return nil, err
+		}
+		if len(server.Roles) > 0 {
+			requiresRole = true
+		}
+	}
+	if requiresRole && role == "" {
+		return nil, errors.New("invocation role is required when MCP servers declare role filters")
+	}
+
+	servers := make([]MCPServer, 0, len(m.Servers))
+	for index, server := range m.Servers {
+		if !mcpRoleAllowed(server.Roles, role) {
+			continue
+		}
+		if opts.ReadOnly && !server.ReadOnly && opts.ReadOnlyPolicy == MCPReadOnlyFilter {
+			continue
+		}
+		if err := validateMCPServer(index, server, opts.ErrorPrefix); err != nil {
+			return nil, err
+		}
+		if opts.ReadOnly && !server.ReadOnly {
+			return nil, fmt.Errorf("%smcp.servers[%d] %q is not locally classified read-only for a read-only invocation", opts.ErrorPrefix, index, server.Name)
+		}
+		servers = append(servers, copyMCPServer(server))
+	}
+	if len(servers) == 0 {
+		return nil, nil
+	}
+	return servers, nil
+}
+
+func validateMCPServerRoles(index int, roles []string, errorPrefix string) error {
+	for _, role := range roles {
+		normalized := normalizeMCPRole(role)
+		if !validMCPRole(normalized) {
+			return fmt.Errorf("%smcp.servers[%d].roles contains unknown role %q", errorPrefix, index, role)
+		}
+	}
+	return nil
+}
+
+func validateMCPServer(index int, server MCPServer, errorPrefix string) error {
+	if !validMCPServerName(server.Name) {
+		return fmt.Errorf("%smcp.servers[%d].name %q is not a safe provider MCP server name", errorPrefix, index, server.Name)
+	}
+
+	transport, err := MCPServerTransport(server)
+	if err != nil {
+		return fmt.Errorf("%smcp.servers[%d] %q: %w", errorPrefix, index, server.Name, err)
+	}
+	switch transport {
+	case "stdio":
+		if strings.TrimSpace(server.Command) == "" {
+			return fmt.Errorf("%smcp.servers[%d] %q stdio transport requires command", errorPrefix, index, server.Name)
+		}
+		if strings.TrimSpace(server.URL) != "" {
+			return fmt.Errorf("%smcp.servers[%d] %q stdio transport cannot include url", errorPrefix, index, server.Name)
+		}
+		if MCPAuthConfigured(server.Auth) {
+			return fmt.Errorf("%smcp.servers[%d] %q stdio transport cannot use HTTP auth", errorPrefix, index, server.Name)
+		}
+	case "http":
+		if strings.TrimSpace(server.URL) == "" {
+			return fmt.Errorf("%smcp.servers[%d] %q http transport requires url", errorPrefix, index, server.Name)
+		}
+		if strings.TrimSpace(server.Command) != "" || len(server.Args) > 0 {
+			return fmt.Errorf("%smcp.servers[%d] %q http transport cannot include command or args", errorPrefix, index, server.Name)
+		}
+		if !validMCPHTTPURL(server.URL) {
+			return fmt.Errorf("%smcp.servers[%d] %q http transport requires an http or https url", errorPrefix, index, server.Name)
+		}
+		if err := validateMCPAuth(index, server, errorPrefix); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%smcp.servers[%d] %q has unsupported transport %q", errorPrefix, index, server.Name, server.Transport)
+	}
+	return nil
+}
+
+func validateMCPAuth(index int, server MCPServer, errorPrefix string) error {
+	header := strings.TrimSpace(server.Auth.Header)
+	envName := strings.TrimSpace(server.Auth.Env)
+	if header == "" && envName == "" {
+		return nil
+	}
+	if header == "" || envName == "" {
+		return fmt.Errorf("%smcp.servers[%d] %q http auth requires both header and env", errorPrefix, index, server.Name)
+	}
+	if !validHTTPHeaderName(header) {
+		return fmt.Errorf("%smcp.servers[%d] %q http auth header %q is invalid", errorPrefix, index, server.Name, header)
+	}
+	if !validEnvName(envName) {
+		return fmt.Errorf("%smcp.servers[%d] %q http auth env %q is invalid", errorPrefix, index, server.Name, envName)
+	}
+	return nil
+}
+
+func MCPServerTransport(server MCPServer) (string, error) {
+	transport := strings.ToLower(strings.TrimSpace(server.Transport))
+	if transport == "" {
+		switch {
+		case strings.TrimSpace(server.URL) != "":
+			return "http", nil
+		case strings.TrimSpace(server.Command) != "":
+			return "stdio", nil
+		default:
+			return "", errors.New("transport is required")
+		}
+	}
+	switch transport {
+	case "stdio", "http":
+		return transport, nil
+	default:
+		return "", fmt.Errorf("unsupported transport %q", server.Transport)
+	}
+}
+
+func normalizeMCPRole(role string) string {
+	return strings.ToLower(strings.TrimSpace(role))
+}
+
+func validMCPRole(role string) bool {
+	switch role {
+	case "worker", "verifier":
+		return true
+	default:
+		return false
+	}
+}
+
+func mcpRoleAllowed(roles []string, role string) bool {
+	if len(roles) == 0 {
+		return true
+	}
+	for _, candidate := range roles {
+		if normalizeMCPRole(candidate) == role {
+			return true
+		}
+	}
+	return false
+}
+
+func mcpServerCanReachProvider(server MCPServer) bool {
+	if len(server.Roles) == 0 {
+		return true
+	}
+	for _, role := range server.Roles {
+		switch normalizeMCPRole(role) {
+		case "worker":
+			return true
+		case "verifier":
+			if server.ReadOnly {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validMCPServerName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validMCPHTTPURL(rawURL string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme == "https" || parsed.Scheme == "http"
+}
+
+func MCPAuthConfigured(auth MCPAuth) bool {
+	return strings.TrimSpace(auth.Header) != "" || strings.TrimSpace(auth.Env) != ""
+}
+
+func validHTTPHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '_':
+		case index > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func copyMCPServer(server MCPServer) MCPServer {
+	server.Args = append([]string(nil), server.Args...)
+	server.Roles = append([]string(nil), server.Roles...)
+	return server
 }
 
 func validateDomainCommands(domain Domain) error {
