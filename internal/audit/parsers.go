@@ -65,12 +65,8 @@ func parseGovulncheck(toolID, output string) ([]Finding, error) {
 	defs := map[string]osvDefinition{}
 	best := map[string]govulnFindingCandidate{}
 	linesSeen := 0
-	if err := scanJSONLines(output, func(line string) error {
+	if err := scanJSONObjects(output, func(envelope map[string]json.RawMessage) error {
 		linesSeen++
-		var envelope map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
-			return err
-		}
 		if raw, ok := envelope["osv"]; ok {
 			def := parseOSVDefinition(raw)
 			if def.ID != "" {
@@ -121,6 +117,29 @@ func parseGovulncheck(toolID, output string) ([]Finding, error) {
 		}))
 	}
 	return findings, nil
+}
+
+func scanJSONObjects(output string, fn func(map[string]json.RawMessage) error) error {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	for {
+		var envelope map[string]json.RawMessage
+		if err := decoder.Decode(&envelope); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if len(envelope) == 0 {
+			continue
+		}
+		if err := fn(envelope); err != nil {
+			return err
+		}
+	}
 }
 
 func parseOSVDefinition(raw json.RawMessage) osvDefinition {

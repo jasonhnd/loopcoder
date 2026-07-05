@@ -1,0 +1,430 @@
+# loopcoder self-audit baseline.
+#
+# Generated from the 0.5.3 C3 self-audit on 2026-07-05 after fixing the
+# worker prompt/recovery 0600 gap and updating golang.org/x/sys. Each waiver
+# is exact-fingerprint scoped and must be reviewed before 2027-07-05.
+waivers:
+  - id: lc-053-c3-001-g703-internal-statebranch-statebranch-go-674
+    rule: "G703"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:0f6f70600ac8507a744016fc9e8a67593b2da5630f42a2420074fc481e4dcf43"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-002-g703-internal-statebranch-statebranch-go-821
+    rule: "G703"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:85600b9304c77f1a4f3b251d4a46566e635a3c9d8d4211104f22b818d89e3e80"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-003-g703-internal-statebranch-statebranch-go-908
+    rule: "G703"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:16b8dc29df84ce886fbfe60fb8cd45437c5e76705af06e9a67041cec4f1c4fea"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-004-g122-internal-statebranch-statebranch-go-970
+    rule: "G122"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:936f9bbe70d6533aab5500583e1fa970462316ea52352fca197ad19790e90506"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-005-g122-internal-statebranch-statebranch-go-1361
+    rule: "G122"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:2fe0cde5c2463c70164520f3f4f45fd7afe5454e8602053d33cf8c4d6d833125"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-006-g703-internal-statebranch-statebranch-go-1368
+    rule: "G703"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:0b2413e0e9323e256dcba063ea511c812f9d63c78e4599cbdf1eed1d676e1582"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-007-g122-internal-statebranch-statebranch-go-1426
+    rule: "G122"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:658975951653a303d8451e61519d9be506956102ee65716a7a12282ddb37dd7e"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-008-g122-internal-statebranch-statebranch-go-1428
+    rule: "G122"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:5292cd9eb48542b7a1d1bfce706315227e1c939489d90c10883c039a69fcb065"
+    original_severity: high
+    justification: "State-branch copy and export paths are derived from loopcoder-owned run state under repo/worktree confinement; tracked for focused statebranch hardening review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-009-nativesecret-internal-statebranch-statebranch-test-go-34
+    rule: "native:secret"
+    file: "internal/statebranch/statebranch_test.go"
+    fingerprint: "sha256:3c90cce10077bcfe8576fb5b671977443e760c44dde54f5e51ccaae1a3cefb14"
+    original_severity: high
+    justification: "Synthetic token fixture validates recovery/state scrubbing and is not a live credential."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-010-g115-internal-supervisedexec-killgroup-window-58
+    rule: "G115"
+    file: "internal/supervisedexec/killgroup_windows.go"
+    fingerprint: "sha256:c31d545b07b5a16356d2616eb83ee454133beca5e298b5bdaf4151565a6b4a2e"
+    original_severity: high
+    justification: "Windows kill-group PID comes from os/exec after process start; range hardening is tracked for a focused Windows supervision review."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-011-nativesensitive-write-docs-specs-0518-loopcoder-audit-md-216
+    rule: "native:sensitive-write"
+    file: "docs/specs/0518-loopcoder-audit.md"
+    fingerprint: "sha256:51197e0b5f1acafdb2643bc96960231dcddd036bcfeae6ff5f2554832a248ff0"
+    original_severity: medium
+    justification: "Historical spec text contains a schema example, not executable sensitive-write code."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-012-g301-examples-docs-domain-tools-docs-domain-t-29
+    rule: "G301"
+    file: "examples/docs-domain/tools/docs_domain_tool.go"
+    fingerprint: "sha256:18b399d3537a83efdd3db2601d0f795abee40592e22452b5b75e9f23cc73ca07"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-013-g306-examples-docs-domain-tools-docs-domain-t-33
+    rule: "G306"
+    file: "examples/docs-domain/tools/docs_domain_tool.go"
+    fingerprint: "sha256:b35228fffe9b46ba45baa587f8a6498a4d8bcb3a94306432c5b8b1205646e12a"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-014-g302-internal-agent-supervision-go-85
+    rule: "G302"
+    file: "internal/agent/supervision.go"
+    fingerprint: "sha256:8d321986dba63751e17e381a84792f8e3f6b800085aea9a8c2f87108ed2abf19"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-015-nativesensitive-write-internal-agent-supervision-go-85
+    rule: "native:sensitive-write"
+    file: "internal/agent/supervision.go"
+    fingerprint: "sha256:58298f8cea17d78f981a49a62f1c34381e336e24c08977cd2c388d80eccaafeb"
+    original_severity: medium
+    justification: "Known local log write remains visible for follow-up permission hardening; C3 fixed the worker prompt and recovery brief gap."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-016-nativesensitive-write-internal-audit-audit-test-go-199
+    rule: "native:sensitive-write"
+    file: "internal/audit/audit_test.go"
+    fingerprint: "sha256:2a764c299a724f96b3d30ea1af02ec49271c47dd33e4be6000dc281e0c72e6db"
+    original_severity: medium
+    justification: "Audit test fixture intentionally contains an unsafe prompt write example so the native scanner stays covered."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-017-nativesensitive-write-internal-audit-audit-test-go-243
+    rule: "native:sensitive-write"
+    file: "internal/audit/audit_test.go"
+    fingerprint: "sha256:a69a65b2cb9128ff911353f77f978fb6e57bb19405ec251f320627330a884bdf"
+    original_severity: medium
+    justification: "Audit test fixture intentionally contains an unsafe prompt write example so the native scanner stays covered."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-018-g505-internal-compile-compile-go-7
+    rule: "G505"
+    file: "internal/compile/compile.go"
+    fingerprint: "sha256:593b6b9774d1d20f299a3fd2e8e198825b0aa65f7c0c09d384f518ea1caaf6d1"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-019-g401-internal-compile-compile-go-748
+    rule: "G401"
+    file: "internal/compile/compile.go"
+    fingerprint: "sha256:3d3573f0cdad67d9722ee57cec99669050e07aa1b7c00720c2e2b28a0b153512"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-020-g505-internal-compile-ordering-go-6
+    rule: "G505"
+    file: "internal/compile/ordering.go"
+    fingerprint: "sha256:1383cb43307ed2392ecfd965501ea99f58246ce8df617a534675942c723b2585"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-021-g401-internal-compile-ordering-go-436
+    rule: "G401"
+    file: "internal/compile/ordering.go"
+    fingerprint: "sha256:e52a046abc0ea37de3e0a13dd318d513fc43fcb083d5e8bfa89e49f4cf0d95db"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-022-g301-internal-conductorhooks-shared-go-189
+    rule: "G301"
+    file: "internal/conductorhooks/shared.go"
+    fingerprint: "sha256:e4befa1c11cf1a711d43ef5695151fab6726d139ad297913e93e2c5f53ddd8be"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-023-g301-internal-guardrails-budget-go-363
+    rule: "G301"
+    file: "internal/guardrails/budget.go"
+    fingerprint: "sha256:dcc9f27af3b609794388ba4ff78c73427a246df2622a0a18f418abb3bbac1f1b"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-024-g306-internal-guardrails-budget-go-390
+    rule: "G306"
+    file: "internal/guardrails/budget.go"
+    fingerprint: "sha256:eb4dfdf5fa92b5afba1b07b0e2ffd5ad22b2f7ed7cbb410007194193bb823483"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-025-g301-internal-lockfile-lockfile-go-39
+    rule: "G301"
+    file: "internal/lockfile/lockfile.go"
+    fingerprint: "sha256:056959f7e49ada4efeb68df545970336091feb59a467ca345ff23c14ab730fe6"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-026-g505-internal-perception-perception-go-7
+    rule: "G505"
+    file: "internal/perception/perception.go"
+    fingerprint: "sha256:ba8e4e7776572326fba99d842938067fdc0be438b8f35db3e2a9bd3750af6e31"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-027-g401-internal-perception-perception-go-317
+    rule: "G401"
+    file: "internal/perception/perception.go"
+    fingerprint: "sha256:7e186f4d98f0100aa3b114a12590ffac6d7a1f2f5a3349cd2a437e560dc37dbd"
+    original_severity: medium
+    justification: "SHA-1 use is for deterministic non-security identifiers, not password, signature, or integrity decisions."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-028-g301-internal-recovery-recovery-go-562
+    rule: "G301"
+    file: "internal/recovery/recovery.go"
+    fingerprint: "sha256:4701939b89db19566e2f9b632929b5f476c124a7f95a77d9bdd652785063e6fc"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-029-g302-internal-recovery-recovery-go-569
+    rule: "G302"
+    file: "internal/recovery/recovery.go"
+    fingerprint: "sha256:bccfeaf0fe4cb3ac6a8fff9b474d97e98ea36b8b05b4976cf7e5ae0da5621c90"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-030-g301-internal-relay-relay-go-51
+    rule: "G301"
+    file: "internal/relay/relay.go"
+    fingerprint: "sha256:bb1b9efd0819e20807071ebf0588b59facd296947e077ba696b0fd45246ed0e9"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-031-g301-internal-relaygate-relaygate-go-85
+    rule: "G301"
+    file: "internal/relaygate/relaygate.go"
+    fingerprint: "sha256:4694bf3480f2d8b6703946d65e85af8d1bca54ee398ccc1dc6b8ccc25569ed15"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-032-g301-internal-state-state-go-176
+    rule: "G301"
+    file: "internal/state/state.go"
+    fingerprint: "sha256:71374869153e21417a3beedd362b3b9d36ff03da7fa9d241ed6e2f4373dd3fd2"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-033-g306-internal-state-state-go-183
+    rule: "G306"
+    file: "internal/state/state.go"
+    fingerprint: "sha256:e6c4a4897ae9c3bac70712d30d36b5089971e1b140f73c2e0066fc22c92ade79"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-034-g301-internal-state-state-go-192
+    rule: "G301"
+    file: "internal/state/state.go"
+    fingerprint: "sha256:089d98cf0af154ffac7e8ad79a521f97c7edc6ce25a852378b3ad188ab406753"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-035-g302-internal-state-state-go-199
+    rule: "G302"
+    file: "internal/state/state.go"
+    fingerprint: "sha256:493bfcc201fc20a5950eb41daea12dfb2c4d9094d50a5e5772498710c41f3e90"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-036-g301-internal-statebranch-statebranch-go-664
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:8b22122d5848ac50fa48768c4758a652c29a17e12458ddf6711263c9fae37e51"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-037-g301-internal-statebranch-statebranch-go-671
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:fc0000523751100d508a22183662d0f2097a36c16d7e408e35bcbb994920e9fc"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-038-g306-internal-statebranch-statebranch-go-674
+    rule: "G306"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:26742b4e4542d005269443fce429f571b427e001f583054a0fc51933edc87993"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-039-g301-internal-statebranch-statebranch-go-818
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:6d1d1b13202a5e6820ff4fbaf74c6514a3fdd81fab8c5301a30c8bdb22f68d56"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-040-g306-internal-statebranch-statebranch-go-821
+    rule: "G306"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:cf5a43a623c07e8f8130edb781fdfa60acb394fcca6ccec940563417d068df10"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-041-g301-internal-statebranch-statebranch-go-884
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:a5701335cb21caf040284b0f18f16da3fdfc180d509e803c4795d9d4675e3278"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-042-g306-internal-statebranch-statebranch-go-923
+    rule: "G306"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:f76947def6cff96d7ae1449fab801e42ceacdf33915e92523ee5660f0cb6693b"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-043-g306-internal-statebranch-statebranch-go-1220
+    rule: "G306"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:b4a1ae601743b73e19074f815dcbee7afb03717f93a8b6c8273d235a31c6f74a"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-044-g301-internal-statebranch-statebranch-go-1225
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:7d233af4945a177b70d4394f3c50e7d47843290915e0be0b52b01ffe85add432"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-045-g302-internal-statebranch-statebranch-go-1232
+    rule: "G302"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:39c99e673d95d052a6c561288dc6a7fb8ffc42a908df25ff47edbe4d3ac8fd7d"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-046-g301-internal-statebranch-statebranch-go-1354
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:a6e3dd1262dd977e2329512ea24fb2dbc7a0556aced955e2b31305cb3f837d07"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-047-g301-internal-statebranch-statebranch-go-1365
+    rule: "G301"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:9ca2d244643961061c598940132679c3b92bcb3630fde8dfbe2ff1ff50bda52c"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-048-g306-internal-statebranch-statebranch-go-1368
+    rule: "G306"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:010843b05cbe014177e615992d71f6a38e7167bd857470b099acc762650fdfbb"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-049-g302-internal-statebranch-statebranch-go-1426
+    rule: "G302"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:8b4a87613c560e0f469d9246b9e1e94589e78e144c1e473b6568d1d05482879b"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-050-g302-internal-statebranch-statebranch-go-1428
+    rule: "G302"
+    file: "internal/statebranch/statebranch.go"
+    fingerprint: "sha256:7efef18d1928de3dd87488f44e634b796f4ee504daa6c6ae6ffdb15e58476c45"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-051-g302-internal-supervisedexec-supervisedexec-g-584
+    rule: "G302"
+    file: "internal/supervisedexec/supervisedexec.go"
+    fingerprint: "sha256:97bcc558af1b9039dcf7e757f15afcdda0d1cdba36cc9f295ea8b128d162f5d0"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-052-nativesensitive-write-internal-supervisedexec-supervisedexec-g-584
+    rule: "native:sensitive-write"
+    file: "internal/supervisedexec/supervisedexec.go"
+    fingerprint: "sha256:498a1e0ca6b795a5f570fd1fea99d62359146905a8014f9c7a57e061b1956213"
+    original_severity: medium
+    justification: "Known local log write remains visible for follow-up permission hardening; C3 fixed the worker prompt and recovery brief gap."
+    date_added: 2026-07-05
+    review_by: 2027-07-05
+  - id: lc-053-c3-053-g301-internal-worker-worker-go-1247
+    rule: "G301"
+    file: "internal/worker/worker.go"
+    fingerprint: "sha256:1c66733c07ba362dac7fd820995b4beebe73c195f85d830ce3ec8d4e5ec3d0cf"
+    original_severity: medium
+    justification: "Gosec file-mode rule is retained as an exact baseline while local state permission hardening is reviewed separately; C3 fixed the known worker prompt/recovery files."
+    date_added: 2026-07-05
+    review_by: 2027-07-05

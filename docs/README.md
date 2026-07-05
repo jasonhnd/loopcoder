@@ -18,6 +18,8 @@ Every document is exactly one of these types:
 - [`domains.md`](domains.md): domain profile guidance and docs-domain example.
 - [`learnings.md`](learnings.md): append-only operational learnings.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
+- [`reference/audit.md`](reference/audit.md): built-in security audit command,
+  CI usage, configuration, baselines, and local-only review behavior.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
 - [`reference/usage.md`](reference/usage.md): setup and end-to-end usage.

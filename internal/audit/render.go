@@ -42,7 +42,14 @@ func RenderText(w io.Writer, result Result) error {
 		if finding.Line > 0 {
 			location = fmt.Sprintf("%s:%d", location, finding.Line)
 		}
-		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message); err != nil {
+		waiver := ""
+		if finding.Waived {
+			waiver = " waived=true"
+			if strings.TrimSpace(finding.WaiverID) != "" {
+				waiver += " waiver_id=" + finding.WaiverID
+			}
+		}
+		if _, err := fmt.Fprintf(w, "- %s %s %s %s%s %s\n", finding.Severity, finding.Tool, finding.Rule, location, waiver, finding.Message); err != nil {
 			return err
 		}
 		if strings.TrimSpace(finding.Evidence) != "" {

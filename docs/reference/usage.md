@@ -413,6 +413,48 @@ probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
 does not invent provider-authentication status when the provider has no stable
 probe.
 
+## Built-In Audit
+
+`loopcoder audit` is a read-only security audit with two layers. The default
+`sast` layer runs deterministic command-line SAST plus native secret and
+sensitive-file scans. The optional `llm` layer runs an adversarial read-only
+verifier review with the built-in threat model and any configured rubric file.
+
+Common forms:
+
+```text
+loopcoder audit --repo .
+loopcoder audit --repo . --layer sast --format json
+loopcoder audit --repo . --layers all --pretty
+```
+
+Audit exit codes are `0` for clean, `1` for findings at or above the threshold,
+`2` for `needs-human`, `3` for command/runtime failure, and `4` for the existing
+relay hard gate before audit starts. The default threshold is `medium`; use
+`.delivery.yml audit.severity_threshold` or `--severity-threshold` to change it.
+
+For Go repositories without audit config, Layer 1 uses `govulncheck`,
+`staticcheck`, `gosec`, and the native scans. A repo can replace the command set
+with `audit.sast.commands`, disable native scans explicitly, add
+`audit.review.rubric_path`, and point `audit.baseline.path` at narrow waiver
+records. Waivers should record an id, rule, path scope, fingerprint, original
+severity, justification, date added, and review or expiry date. Expired,
+malformed, or broad waivers are reported by `doctor`; real findings should be
+fixed when the fix is small and safe.
+
+CI should run the deterministic floor only unless the repository explicitly
+opts into verifier credentials:
+
+```text
+loopcoder audit --repo . --layer sast --format text
+```
+
+Layer 2 attestation follows the same local-only rule as `loopreview`: pretty
+blocks, relay records, JSON output, and `.loopcoder/` state are local
+diagnostics, not PR bodies, comments, commits, merge artifacts, docs, examples,
+fixtures, or tracked files. Full audit reference:
+[`audit.md`](audit.md).
+
 ## Model And Speed
 
 By default, loopcoder passes no model or reasoning-effort flags to Codex. It
@@ -475,6 +517,10 @@ loopcoder --version
 loopcoder -v
 
 loopcoder doctor --repo .
+
+loopcoder audit --repo .
+loopcoder audit --repo . --layer sast --format json
+loopcoder audit --repo . --layers all --pretty
 
 loopcoder skill install --repo .
 
@@ -553,6 +599,8 @@ loopcoder lease release --repo . --run-id <run-id>
 - `loopcoder loopreview` exits `3` when the command itself fails before or after
   a clean verdict, such as invalid flags, repository/config/provider setup
   failure, or output/relay write failure.
+- `loopcoder audit` exits `0` for clean, `1` for threshold findings, `2` for
+  `needs-human`, and `3` for command/runtime failure.
 - Mechanical progress commands exit `4` when the relay hard gate finds pending
   local-only Worker/Verifier blocks. Run `loopcoder relay flush --repo <path>`
   to print and acknowledge them, or `loopcoder relay list --repo <path>` to

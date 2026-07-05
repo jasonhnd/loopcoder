@@ -61,6 +61,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		runLLMLayer(ctx, repoPath, cfg, plan, opts, deps, &result)
 	}
 
+	result = Finalize(result)
+	applyBaseline(repoPath, cfg.Audit.Baseline.Path, &result)
 	return Finalize(result), nil
 }
 
@@ -173,9 +175,33 @@ func runSASTCommand(ctx context.Context, repoPath string, command SASTCommand, r
 	}
 	toolResult.ParseStatus = "parsed"
 	result.ToolResults = append(result.ToolResults, toolResult)
+	relativizeFindingPaths(repoPath, findings)
 	result.Findings = append(result.Findings, findings...)
 	if run.ExitCode != 0 && len(findings) == 0 {
 		result.RuntimeFailures = append(result.RuntimeFailures, fmt.Sprintf("%s exited with code %d and no parseable findings", command.ID, run.ExitCode))
+	}
+}
+
+func relativizeFindingPaths(repoPath string, findings []Finding) {
+	repoAbs, err := filepath.Abs(repoPath)
+	if err != nil {
+		repoAbs = repoPath
+	}
+	repoAbs = filepath.Clean(repoAbs)
+	for index := range findings {
+		file := strings.TrimSpace(findings[index].File)
+		if file == "" {
+			continue
+		}
+		candidate := filepath.Clean(filepath.FromSlash(file))
+		if filepath.IsAbs(candidate) {
+			if rel, relErr := filepath.Rel(repoAbs, candidate); relErr == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+				file = rel
+			}
+		}
+		findings[index].File = normalizeRepoPath(file)
+		findings[index].Fingerprint = FindingFingerprint(findings[index])
+		findings[index].ID = findingID(findings[index])
 	}
 }
 

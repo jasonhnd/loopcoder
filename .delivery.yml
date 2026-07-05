@@ -41,7 +41,7 @@ verifier:
 #     Optional. Absent = 300; kill the verifier provider CLI after this many seconds with no log output or worktree file activity (stall).
 #     stall_timeout_seconds: 300
 ci:
-  checks: [verify, go, staticcheck, govulncheck]
+  checks: [verify, go, staticcheck, govulncheck, audit]
   # Optional. Absent = no local test command gate.
   # tests:
   #   - bun run test
@@ -67,3 +67,36 @@ ci:
 #       - "**/*.tsx"
 report:
   channel: chat
+audit:
+  severity_threshold: medium
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+        parser: govulncheck-json
+        timeout_seconds: 300
+      - id: staticcheck
+        argv: ["staticcheck", "-f", "json", "./..."]
+        parser: staticcheck-json
+        timeout_seconds: 300
+      - id: gosec
+        # loopcoder is an operator-trusted CLI. It intentionally runs trusted
+        # local tools from argv arrays and reads operator-selected repo paths;
+        # G204/G304 are design-shape noise under the 0518 threat model.
+        argv: ["gosec", "-fmt", "json", "-quiet", "-exclude=G204,G304", "./..."]
+        parser: gosec-json
+        timeout_seconds: 300
+    native:
+      secrets: true
+      file_permissions: true
+      include:
+        - "**/*"
+      exclude:
+        - ".git/**"
+        - "vendor/**"
+        - "dist/**"
+        - "node_modules/**"
+  review:
+    rubric_path: docs/security/audit-rubric.md
+  baseline:
+    path: docs/security/audit-baseline.yml

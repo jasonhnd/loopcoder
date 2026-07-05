@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
+	"github.com/jasonhnd/loopcoder/internal/audit"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -148,6 +150,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
+	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, Check{
@@ -586,6 +589,405 @@ func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
 	return Check{Name: "version compatibility", Status: status, Message: strings.Join(parts, "; ")}
 }
 
+func checkAuditReadiness(repoPath string, delivery deliveryState, deps Deps) []Check {
+	if !delivery.Valid {
+		return []Check{{
+			Name:    "audit config",
+			Status:  StatusFail,
+			Message: "cannot evaluate audit readiness because .delivery.yml is invalid",
+		}}
+	}
+
+	plan, err := audit.BuildPlan(repoPath, delivery.Config.Audit, audit.Options{Layers: []string{audit.LayerSAST}})
+	if err != nil {
+		return []Check{{
+			Name:    "audit config",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("audit configuration would fail: %v", err),
+		}}
+	}
+
+	checks := []Check{{
+		Name:    "audit config",
+		Status:  StatusOK,
+		Message: "parsed and deterministic SAST plan is valid",
+	}}
+	checks = append(checks, checkAuditThreshold(plan))
+	checks = append(checks, checkAuditSASTCommands(plan))
+	checks = append(checks, checkAuditTools(plan, deps))
+	checks = append(checks, checkAuditParsers(plan))
+	checks = append(checks, checkAuditRubric(repoPath, delivery.Config.Audit.Review.RubricPath, deps))
+	checks = append(checks, checkAuditBaseline(repoPath, delivery.Config.Audit.Baseline.Path, deps))
+	checks = append(checks, checkAuditCICheck(repoPath, delivery.Config.CI.Checks, deps))
+	checks = append(checks, checkAuditVerifier(delivery.Config, deps))
+	return checks
+}
+
+func checkAuditThreshold(plan audit.Plan) Check {
+	return Check{
+		Name:    "audit threshold",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("effective severity threshold is %s", plan.Threshold),
+	}
+}
+
+func checkAuditSASTCommands(plan audit.Plan) Check {
+	native := fmt.Sprintf("native secrets=%t file_permissions=%t", plan.Native.Secrets, plan.Native.FilePermissions)
+	if len(plan.Commands) == 0 {
+		return Check{
+			Name:    "audit SAST commands",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("no language SAST commands configured; %s will run", native),
+		}
+	}
+	return Check{
+		Name:    "audit SAST commands",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("commands: %s; %s", strings.Join(auditCommandIDs(plan.Commands), ", "), native),
+	}
+}
+
+func checkAuditTools(plan audit.Plan, deps Deps) Check {
+	tools := auditCommandExecutables(plan.Commands)
+	if len(tools) == 0 {
+		return Check{
+			Name:    "audit SAST tools",
+			Status:  StatusInfo,
+			Message: "no command-line SAST tools are required; native scans only",
+		}
+	}
+	missing := []string{}
+	found := []string{}
+	for _, tool := range tools {
+		path, err := deps.LookPath(tool)
+		if err != nil || strings.TrimSpace(path) == "" {
+			missing = append(missing, tool)
+			continue
+		}
+		found = append(found, fmt.Sprintf("%s=%s", tool, path))
+	}
+	if len(missing) > 0 {
+		return Check{
+			Name:    "audit SAST tools",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("missing tools on PATH: %s; found: %s", strings.Join(missing, ", "), strings.Join(found, ", ")),
+		}
+	}
+	return Check{
+		Name:    "audit SAST tools",
+		Status:  StatusOK,
+		Message: "found " + strings.Join(found, ", "),
+	}
+}
+
+func checkAuditParsers(plan audit.Plan) Check {
+	if len(plan.Commands) == 0 {
+		return Check{
+			Name:    "audit parsers",
+			Status:  StatusInfo,
+			Message: "no configured SAST command parsers",
+		}
+	}
+	parsers := make([]string, 0, len(plan.Commands))
+	for _, command := range plan.Commands {
+		parser := strings.TrimSpace(command.Parser)
+		if !audit.KnownParser(parser) {
+			return Check{
+				Name:    "audit parsers",
+				Status:  StatusFail,
+				Message: fmt.Sprintf("%s parser %q is not recognized", command.ID, parser),
+			}
+		}
+		parsers = append(parsers, command.ID+"="+parser)
+	}
+	return Check{
+		Name:    "audit parsers",
+		Status:  StatusOK,
+		Message: "recognized " + strings.Join(parsers, ", "),
+	}
+}
+
+func checkAuditRubric(repoPath, rawPath string, deps Deps) Check {
+	rawPath = strings.TrimSpace(rawPath)
+	if rawPath == "" {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusInfo,
+			Message: "no configured audit.review.rubric_path; built-in threat model applies",
+		}
+	}
+	path, err := safeDoctorRepoPath(rawPath)
+	if err != nil {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("audit.review.rubric_path is invalid: %v", err),
+		}
+	}
+	if _, err := deps.ReadFile(filepath.Join(repoPath, filepath.FromSlash(path))); err != nil {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured rubric %s is unreadable: %v", path, err),
+		}
+	}
+	return Check{
+		Name:    "audit rubric",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("configured rubric exists at %s", path),
+	}
+}
+
+type auditBaselineDocument struct {
+	Waivers []auditBaselineWaiver `yaml:"waivers"`
+}
+
+type auditBaselineWaiver struct {
+	ID               string `yaml:"id"`
+	Rule             string `yaml:"rule"`
+	File             string `yaml:"file"`
+	Path             string `yaml:"path"`
+	PathGlob         string `yaml:"path_glob"`
+	Fingerprint      string `yaml:"fingerprint"`
+	OriginalSeverity string `yaml:"original_severity"`
+	Justification    string `yaml:"justification"`
+	DateAdded        string `yaml:"date_added"`
+	ReviewBy         string `yaml:"review_by"`
+	ExpiresAt        string `yaml:"expires_at"`
+}
+
+func checkAuditBaseline(repoPath, rawPath string, deps Deps) Check {
+	rawPath = strings.TrimSpace(rawPath)
+	if rawPath == "" {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusInfo,
+			Message: "no configured audit.baseline.path",
+		}
+	}
+	path, err := safeDoctorRepoPath(rawPath)
+	if err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("audit.baseline.path is invalid: %v", err),
+		}
+	}
+	data, err := deps.ReadFile(filepath.Join(repoPath, filepath.FromSlash(path)))
+	if err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured baseline %s is unreadable: %v", path, err),
+		}
+	}
+	var baseline auditBaselineDocument
+	if err := yaml.Unmarshal(data, &baseline); err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured baseline %s is invalid YAML: %v", path, err),
+		}
+	}
+	problems := auditBaselineProblems(baseline, time.Now().UTC())
+	if len(problems) > 0 {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("%s has invalid or expired waiver entries: %s", path, strings.Join(problems, "; ")),
+		}
+	}
+	if len(baseline.Waivers) == 0 {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("%s parses and contains no active waivers", path),
+		}
+	}
+	return Check{
+		Name:    "audit baseline",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("%s parses with %d bounded waiver(s) and no expired entries", path, len(baseline.Waivers)),
+	}
+}
+
+func auditBaselineProblems(baseline auditBaselineDocument, now time.Time) []string {
+	problems := []string{}
+	for index, waiver := range baseline.Waivers {
+		label := strings.TrimSpace(waiver.ID)
+		if label == "" {
+			label = fmt.Sprintf("waivers[%d]", index)
+			problems = append(problems, label+" missing id")
+		}
+		if strings.TrimSpace(waiver.Rule) == "" {
+			problems = append(problems, label+" missing rule")
+		}
+		if strings.TrimSpace(waiver.File) == "" && strings.TrimSpace(waiver.Path) == "" && strings.TrimSpace(waiver.PathGlob) == "" {
+			problems = append(problems, label+" missing file/path/path_glob scope")
+		}
+		if strings.TrimSpace(waiver.Fingerprint) == "" {
+			problems = append(problems, label+" missing fingerprint")
+		}
+		if !audit.ValidSeverity(waiver.OriginalSeverity) {
+			problems = append(problems, label+" invalid original_severity")
+		}
+		if strings.TrimSpace(waiver.Justification) == "" {
+			problems = append(problems, label+" missing justification")
+		}
+		if _, ok := parseAuditDate(waiver.DateAdded); !ok {
+			problems = append(problems, label+" missing or invalid date_added")
+		}
+		deadlineRaw := firstNonEmpty(waiver.ReviewBy, waiver.ExpiresAt)
+		deadline, ok := parseAuditDate(deadlineRaw)
+		if !ok {
+			problems = append(problems, label+" missing or invalid review_by/expires_at")
+		} else if !deadline.After(now) {
+			problems = append(problems, label+" expired on "+deadline.Format("2006-01-02"))
+		}
+	}
+	return problems
+}
+
+func parseAuditDate(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse("2006-01-02", value)
+	return parsed, err == nil
+}
+
+func checkAuditCICheck(repoPath string, checks []string, deps Deps) Check {
+	required := containsString(checks, "audit")
+	workflowPath := filepath.Join(repoPath, ".github", "workflows", "ci.yml")
+	data, err := deps.ReadFile(workflowPath)
+	if err != nil {
+		status := StatusWarn
+		if required {
+			status = StatusFail
+		}
+		return Check{
+			Name:    "audit CI check",
+			Status:  status,
+			Message: fmt.Sprintf("could not inspect %s: %v", workflowPath, err),
+		}
+	}
+	hasJob, err := workflowHasJob(data, "audit")
+	if err != nil {
+		return Check{
+			Name:    "audit CI check",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("could not parse %s: %v", workflowPath, err),
+		}
+	}
+	switch {
+	case required && hasJob:
+		return Check{
+			Name:    "audit CI check",
+			Status:  StatusOK,
+			Message: ".delivery.yml ci.checks includes audit and .github/workflows/ci.yml defines job id audit",
+		}
+	case required:
+		return Check{
+			Name:    "audit CI check",
+			Status:  StatusFail,
+			Message: ".delivery.yml ci.checks includes audit but .github/workflows/ci.yml has no audit job",
+		}
+	case hasJob:
+		return Check{
+			Name:    "audit CI check",
+			Status:  StatusWarn,
+			Message: ".github/workflows/ci.yml defines audit but .delivery.yml ci.checks does not require it",
+		}
+	default:
+		return Check{
+			Name:    "audit CI check",
+			Status:  StatusWarn,
+			Message: "audit is not configured as a required CI check",
+		}
+	}
+}
+
+func checkAuditVerifier(cfg config.Config, deps Deps) Check {
+	provider := strings.TrimSpace(cfg.Adapters.Verifier)
+	if provider == "" {
+		provider = "claude"
+	}
+	path, err := deps.LookPath(provider)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return Check{
+			Name:    "audit LLM verifier",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("read-only Layer 2 verifier provider %q does not resolve on PATH", provider),
+		}
+	}
+	return Check{
+		Name:    "audit LLM verifier",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("read-only Layer 2 verifier provider %q resolves at %s; doctor does not run the LLM review", provider, path),
+	}
+}
+
+func auditCommandIDs(commands []audit.SASTCommand) []string {
+	ids := make([]string, 0, len(commands))
+	for _, command := range commands {
+		ids = append(ids, command.ID)
+	}
+	return ids
+}
+
+func auditCommandExecutables(commands []audit.SASTCommand) []string {
+	seen := map[string]bool{}
+	tools := []string{}
+	for _, command := range commands {
+		if len(command.Argv) == 0 {
+			continue
+		}
+		tool := strings.TrimSpace(command.Argv[0])
+		if tool == "" || seen[tool] {
+			continue
+		}
+		seen[tool] = true
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
+func safeDoctorRepoPath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("path is required")
+	}
+	if filepath.IsAbs(raw) {
+		return "", errors.New("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(filepath.FromSlash(raw))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("path must stay inside the repository")
+	}
+	return filepath.ToSlash(clean), nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func workflowHasJob(data []byte, jobID string) (bool, error) {
+	var workflow struct {
+		Jobs map[string]any `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		return false, err
+	}
+	_, ok := workflow.Jobs[jobID]
+	return ok, nil
+}
+
 func checkInstalledSkill(deps Deps) Check {
 	dir, err := defaultSkillDir(deps.UserHomeDir)
 	if err != nil {
@@ -771,6 +1173,15 @@ func firstNonEmptyLine(text string) string {
 	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
 		if trimmed := strings.TrimSpace(line); trimmed != "" {
 			return trimmed
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
 		}
 	}
 	return ""

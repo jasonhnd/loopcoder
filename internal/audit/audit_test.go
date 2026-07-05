@@ -114,6 +114,42 @@ func TestParseGovulncheckIgnoresDefinitionsAndDedupesTraceLevels(t *testing.T) {
 	}
 }
 
+func TestParseGovulncheckAcceptsMultilineJSONObjects(t *testing.T) {
+	output := `{
+  "config": {
+    "scanner_name": "govulncheck"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2026-0003",
+    "summary": "reachable issue"
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-0003",
+    "trace": [
+      {
+        "function": "Bad",
+        "position": {
+          "filename": "bad.go",
+          "line": 8
+        }
+      }
+    ]
+  }
+}`
+
+	findings, err := parseGovulncheck("govulncheck", output)
+	if err != nil {
+		t.Fatalf("parseGovulncheck returned error: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Rule != "GO-2026-0003" || findings[0].File != "bad.go" {
+		t.Fatalf("findings = %#v, want one multiline JSON finding", findings)
+	}
+}
+
 func TestParserAdaptersNormalizeFindings(t *testing.T) {
 	staticOutput := strings.Join([]string{
 		`{"code":"SA1000","severity":"error","location":{"file":"a.go","line":10,"column":3},"message":"bad regexp"}`,
@@ -190,6 +226,46 @@ func writePrompt(data []byte) error {
 		if finding.Rule == "native:file-permission" && finding.File == "CHANGELOG.md" {
 			t.Fatalf("CHANGELOG.md was incorrectly treated as sensitive: %#v", finding)
 		}
+	}
+}
+
+func TestApplyBaselineMarksMatchingFindingWaived(t *testing.T) {
+	repo := t.TempDir()
+	finding := makeFinding(Finding{
+		Layer:    LayerSAST,
+		Tool:     "native",
+		Severity: SeverityMedium,
+		File:     "internal/worker/worker.go",
+		Line:     12,
+		Rule:     "native:sensitive-write",
+		Category: "shared-host-disclosure",
+		Message:  "sensitive write",
+		Evidence: "os.WriteFile(prompt, 0o644)",
+	})
+	baseline := `waivers:
+  - id: lc-audit-test
+    rule: native:sensitive-write
+    file: internal/worker/worker.go
+    fingerprint: ` + finding.Fingerprint + `
+    original_severity: medium
+    justification: test waiver
+    date_added: 2026-01-01
+    review_by: 2099-01-01
+`
+	if err := os.MkdirAll(filepath.Join(repo, "docs", "security"), 0o700); err != nil {
+		t.Fatalf("mkdir baseline dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "security", "audit-baseline.yml"), []byte(baseline), 0o600); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	result := NewResult(repo, []string{LayerSAST}, SeverityMedium)
+	result.Findings = []Finding{finding}
+	result = Finalize(result)
+	applyBaseline(repo, "docs/security/audit-baseline.yml", &result)
+	result = Finalize(result)
+
+	if result.Verdict != VerdictClean || !result.Findings[0].Waived || result.Findings[0].WaiverID != "lc-audit-test" {
+		t.Fatalf("baseline result = %#v, want waived clean finding", result)
 	}
 }
 

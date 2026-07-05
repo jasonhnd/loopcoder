@@ -40,6 +40,15 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"default branch",
 		"loopcoder binary",
 		"version compatibility",
+		"audit config",
+		"audit threshold",
+		"audit SAST commands",
+		"audit SAST tools",
+		"audit parsers",
+		"audit rubric",
+		"audit baseline",
+		"audit CI check",
+		"audit LLM verifier",
 		"loopcoder skill",
 		"conductor hooks",
 		"conductor runtime",
@@ -54,6 +63,37 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+}
+
+func TestRunReportsAuditReadinessProblems(t *testing.T) {
+	env := healthyDoctorEnv()
+	delete(env.paths, "gosec")
+	env.extraFiles[filepath.Clean(filepath.Join("/repo", ".github", "workflows", "ci.yml"))] = []byte("jobs:\n  go:\n    runs-on: ubuntu-latest\n")
+	env.extraFiles[filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-baseline.yml"))] = []byte(`waivers:
+  - id: old-gosec
+    rule: G101
+    file: internal/example.go
+    fingerprint: sha256:abc123
+    original_severity: high
+    justification: historical test fixture
+    date_added: 2026-01-01
+    review_by: 2000-01-01
+`)
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	tools := requireCheck(t, report, "audit SAST tools")
+	if tools.Status != StatusWarn || !strings.Contains(tools.Message, "gosec") {
+		t.Fatalf("audit tools check = %#v, want missing gosec warning", tools)
+	}
+	baseline := requireCheck(t, report, "audit baseline")
+	if baseline.Status != StatusFail || !strings.Contains(baseline.Message, "expired") {
+		t.Fatalf("audit baseline check = %#v, want expired waiver failure", baseline)
+	}
+	ci := requireCheck(t, report, "audit CI check")
+	if ci.Status != StatusFail || !strings.Contains(ci.Message, "no audit job") {
+		t.Fatalf("audit CI check = %#v, want missing audit job failure", ci)
 	}
 }
 
@@ -584,11 +624,14 @@ func parseHelperInt(value string) int {
 func healthyDoctorEnv() *fakeDoctorEnv {
 	return &fakeDoctorEnv{
 		paths: map[string]string{
-			"git":       "/bin/git",
-			"gh":        "/bin/gh",
-			"codex":     "/bin/codex",
-			"claude":    "/bin/claude",
-			"loopcoder": "/bin/loopcoder",
+			"git":         "/bin/git",
+			"gh":          "/bin/gh",
+			"codex":       "/bin/codex",
+			"claude":      "/bin/claude",
+			"loopcoder":   "/bin/loopcoder",
+			"govulncheck": "/bin/govulncheck",
+			"staticcheck": "/bin/staticcheck",
+			"gosec":       "/bin/gosec",
 		},
 		commands: map[string]CommandResult{
 			cmdKey("gh", "auth", "status"): {
@@ -607,6 +650,40 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 				Worker:   "codex",
 				Verifier: "claude",
 			},
+			CI: config.CI{
+				Checks: []string{"verify", "go", "audit"},
+			},
+			Audit: config.Audit{
+				SeverityThreshold: "medium",
+				SAST: config.AuditSAST{
+					Commands: []config.AuditSASTCommand{
+						{
+							ID:             "govulncheck",
+							Argv:           []string{"govulncheck", "-json", "./..."},
+							Parser:         "govulncheck-json",
+							TimeoutSeconds: 300,
+						},
+						{
+							ID:             "staticcheck",
+							Argv:           []string{"staticcheck", "-f", "json", "./..."},
+							Parser:         "staticcheck-json",
+							TimeoutSeconds: 300,
+						},
+						{
+							ID:             "gosec",
+							Argv:           []string{"gosec", "-fmt", "json", "-quiet", "-exclude=G204,G304", "./..."},
+							Parser:         "gosec-json",
+							TimeoutSeconds: 300,
+						},
+					},
+				},
+				Review: config.AuditReview{
+					RubricPath: "docs/security/audit-rubric.md",
+				},
+				Baseline: config.AuditBaseline{
+					Path: "docs/security/audit-baseline.yml",
+				},
+			},
 		},
 		file:           []byte("version: 1\nmin_loopcoder_version: 0.3.0\n"),
 		settingsFile:   healthyClaudeSettings(),
@@ -615,6 +692,11 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 		skillFiles: map[string][]byte{
 			doctorSkillPath(filepath.Join("home", "user"), "SKILL.md"):  []byte("skill content\n"),
 			doctorSkillPath(filepath.Join("home", "user"), "AGENTS.md"): []byte("agents content\n"),
+		},
+		extraFiles: map[string][]byte{
+			filepath.Clean(filepath.Join("/repo", ".github", "workflows", "ci.yml")):         []byte("jobs:\n  audit:\n    runs-on: ubuntu-latest\n"),
+			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-rubric.md")):    []byte("# Audit rubric\n"),
+			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-baseline.yml")): []byte("waivers: []\n"),
 		},
 	}
 }
@@ -631,6 +713,7 @@ type fakeDoctorEnv struct {
 	executablePath string
 	userHome       string
 	skillFiles     map[string][]byte
+	extraFiles     map[string][]byte
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -690,6 +773,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 				return nil, os.ErrNotExist
 			}
 			return append([]byte(nil), f.settingsFile...), nil
+		}
+		if data, ok := f.extraFiles[clean]; ok {
+			return append([]byte(nil), data...), nil
 		}
 		if f.fileErr != nil {
 			return nil, f.fileErr

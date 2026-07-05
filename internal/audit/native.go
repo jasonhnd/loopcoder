@@ -152,6 +152,9 @@ func nativePermissionFinding(repoPath, file string) (Finding, bool) {
 	if !isSensitivePath(file) {
 		return Finding{}, false
 	}
+	if isTrackedSourceLikePath(file) {
+		return Finding{}, false
+	}
 	info, err := os.Stat(filepath.Join(repoPath, filepath.FromSlash(file)))
 	if err != nil || info.IsDir() {
 		return Finding{}, false
@@ -284,6 +287,19 @@ func isSensitivePath(file string) bool {
 		}
 	}
 	return strings.HasPrefix(base, "key.") || strings.HasSuffix(base, ".key") || strings.Contains(base, "_key.") || strings.Contains(base, "-key.")
+}
+
+func isTrackedSourceLikePath(file string) bool {
+	file = normalizeRepoPath(file)
+	if strings.HasPrefix(file, ".loopcoder/") {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(file)) {
+	case ".go", ".md", ".yml", ".yaml", ".json", ".toml":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSensitiveText(text string) bool {
