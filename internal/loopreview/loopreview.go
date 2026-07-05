@@ -29,6 +29,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -148,6 +149,7 @@ type Deps struct {
 
 type EvidenceProducerInvocation struct {
 	Command      string
+	Argv         []string
 	WorktreePath string
 	Timeout      time.Duration
 }
@@ -1106,7 +1108,7 @@ func configuredRenderedArtifacts(cfg config.Config) []renderedArtifactInput {
 }
 
 func evidenceProducerConfigured(producer config.DomainEvidenceProducer) bool {
-	return strings.TrimSpace(producer.Command) != ""
+	return strings.TrimSpace(producer.Command) != "" || len(producer.Argv) > 0
 }
 
 func producerIncludeInLoopreview(producer config.DomainEvidenceProducer) bool {
@@ -1119,7 +1121,7 @@ func producerIncludeInLoopreview(producer config.DomainEvidenceProducer) bool {
 func runConfiguredEvidenceProducer(ctx context.Context, deps Deps, worktreePath string, producer config.DomainEvidenceProducer, verifierTimeout time.Duration) ([]renderedArtifactInput, error) {
 	command := strings.TrimSpace(producer.Command)
 	source := "domain.evidence.producer"
-	if command == "" {
+	if command == "" && len(producer.Argv) == 0 {
 		return nil, nil
 	}
 	outputs := normalizeRenderedArtifactOutputs(producer.Outputs)
@@ -1133,6 +1135,7 @@ func runConfiguredEvidenceProducer(ctx context.Context, deps Deps, worktreePath 
 	defer cancel()
 	result := deps.RunEvidenceProducer(runCtx, EvidenceProducerInvocation{
 		Command:      command,
+		Argv:         append([]string(nil), producer.Argv...),
 		WorktreePath: worktreePath,
 		Timeout:      timeout,
 	})
@@ -1543,22 +1546,26 @@ func runEvidenceProducerCommand(ctx context.Context, invocation EvidenceProducer
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	file, args := shellCommand(invocation.Command)
-	cmd := exec.CommandContext(ctx, file, args...)
+	cmd, err := evidenceProducerCommand(invocation)
+	if err != nil {
+		return EvidenceProducerResult{
+			ExitCode: 127,
+			Err:      err,
+		}
+	}
 	cmd.Dir = invocation.WorktreePath
 
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
-	err := cmd.Run()
-	timedOut := ctx.Err() == context.DeadlineExceeded
-	exitCode := 0
-	if err != nil {
+	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{
+		HardCap: invocation.Timeout,
+		Role:    "evidence-producer",
+	})
+	timedOut := result.Outcome == supervisedexec.OutcomeDeadline || ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded)
+	exitCode := result.ExitCode
+	if err != nil && result.Outcome == supervisedexec.OutcomeCompleted {
 		exitCode = 127
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
 	}
 	return EvidenceProducerResult{
 		ExitCode: exitCode,
@@ -1566,6 +1573,23 @@ func runEvidenceProducerCommand(ctx context.Context, invocation EvidenceProducer
 		TimedOut: timedOut,
 		Err:      err,
 	}
+}
+
+func evidenceProducerCommand(invocation EvidenceProducerInvocation) (*exec.Cmd, error) {
+	if len(invocation.Argv) > 0 {
+		for index, arg := range invocation.Argv {
+			if strings.TrimSpace(arg) == "" {
+				return nil, fmt.Errorf("domain evidence producer argv[%d] is empty", index)
+			}
+		}
+		return exec.Command(invocation.Argv[0], invocation.Argv[1:]...), nil
+	}
+	command := strings.TrimSpace(invocation.Command)
+	if command == "" {
+		return nil, errors.New("domain evidence producer command is empty")
+	}
+	file, args := shellCommand(command)
+	return exec.Command(file, args...), nil
 }
 
 func shellCommand(command string) (string, []string) {

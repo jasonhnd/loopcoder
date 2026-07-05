@@ -14,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -634,6 +635,63 @@ domain:
 	}
 	if fakeAgent.invocation.LivenessCommand != "echo alive" {
 		t.Fatalf("LivenessCommand = %q, want echo alive", fakeAgent.invocation.LivenessCommand)
+	}
+}
+
+func TestDispatchPassesDomainCustomLivenessArgvToAgent(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`
+domain:
+  liveness:
+    mode: custom
+    argv: ["./tools/liveness", "--literal", "alive && exit 9"]
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented custom liveness argv.", 0),
+		log:       "codex ok\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 490,
+		IssueTitle:  "Domain liveness argv",
+		IssueBody:   "Body",
+		RunID:       "run-test",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/490"}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if fakeAgent.invocation.LivenessMode != "custom" {
+		t.Fatalf("LivenessMode = %q, want custom", fakeAgent.invocation.LivenessMode)
+	}
+	wantCommand := supervisedexec.EncodeLivenessArgv([]string{"./tools/liveness", "--literal", "alive && exit 9"})
+	if fakeAgent.invocation.LivenessCommand != wantCommand {
+		t.Fatalf("LivenessCommand = %q, want encoded argv command %q", fakeAgent.invocation.LivenessCommand, wantCommand)
 	}
 }
 

@@ -5,6 +5,8 @@ package supervisedexec
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +23,24 @@ import (
 const DefaultHardCap = 30 * time.Minute
 
 var defaultHardCap = DefaultHardCap
+var worktreeLivenessMaxFiles = 20000
+
+const livenessArgvCommandPrefix = "\x00loopcoder-liveness-argv:"
+
+var generatedWorktreeDirNames = map[string]bool{
+	".cache":        true,
+	".git":          true,
+	".loopcoder":    true,
+	".next":         true,
+	".parcel-cache": true,
+	".turbo":        true,
+	"build":         true,
+	"coverage":      true,
+	"dist":          true,
+	"node_modules":  true,
+	"target":        true,
+	"vendor":        true,
+}
 
 // LivenessMode selects the stall watchdog's progress signal.
 type LivenessMode string
@@ -84,6 +104,14 @@ type worktreeObservation struct {
 	exists        bool
 	latestModTime time.Time
 	rootErr       error
+	filesExamined int
+}
+
+// EncodeLivenessArgv encodes a no-shell custom liveness command for callers
+// constrained to the legacy string-only liveness command boundary.
+func EncodeLivenessArgv(argv []string) string {
+	data, _ := json.Marshal(argv)
+	return livenessArgvCommandPrefix + base64.StdEncoding.EncodeToString(data)
 }
 
 // Run starts cmd, supervises it, and waits until the process exits or is
@@ -177,7 +205,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			logProgress := currentLog.changedFrom(lastLog)
 			worktreeProgress := false
 			if opts.LivenessMode == LivenessModeWorktreeMTime && !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
-				currentWorktree = observeWorktree(opts.WorktreePath)
+				currentWorktree = observeWorktreeAfter(opts.WorktreePath, lastWorktree.latestModTime)
 				lastWorktreeWalk = now
 				if currentWorktree.rootErr != nil {
 					warnWorktreeUnavailable(opts.Stderr, opts.WorktreePath, currentWorktree.rootErr, &worktreeWarningEmitted)
@@ -240,6 +268,11 @@ func validateOptions(opts Options) error {
 	case LivenessModeCustom:
 		if strings.TrimSpace(opts.LivenessCommand) == "" {
 			return errors.New("supervisedexec: LivenessCommand is required when LivenessMode is custom")
+		}
+		if isEncodedLivenessArgv(opts.LivenessCommand) {
+			if _, err := decodeLivenessArgv(opts.LivenessCommand); err != nil {
+				return fmt.Errorf("supervisedexec: invalid LivenessCommand argv encoding: %w", err)
+			}
 		}
 		return nil
 	default:
@@ -347,6 +380,10 @@ func (o logObservation) changedFrom(prev logObservation) bool {
 }
 
 func observeWorktree(path string) worktreeObservation {
+	return observeWorktreeAfter(path, time.Time{})
+}
+
+func observeWorktreeAfter(path string, after time.Time) worktreeObservation {
 	if path == "" {
 		return worktreeObservation{}
 	}
@@ -356,17 +393,22 @@ func observeWorktree(path string) worktreeObservation {
 		if walkErr != nil {
 			if currentPath == path {
 				observation.rootErr = walkErr
-				return filepath.SkipDir
+				return filepath.SkipAll
 			}
 			return nil
 		}
-		if currentPath != path && entry.Name() == ".git" {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
+		if currentPath != path && entry.IsDir() && shouldSkipWorktreeDir(entry.Name()) {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() {
 			return nil
 		}
-		info, err := os.Stat(currentPath)
+		observation.filesExamined++
+		if worktreeLivenessMaxFiles > 0 && observation.filesExamined > worktreeLivenessMaxFiles {
+			observation.rootErr = fmt.Errorf("worktree liveness file cap exceeded after %d files", worktreeLivenessMaxFiles)
+			return filepath.SkipAll
+		}
+		info, err := entry.Info()
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -374,9 +416,16 @@ func observeWorktree(path string) worktreeObservation {
 		if info.ModTime().After(observation.latestModTime) {
 			observation.latestModTime = info.ModTime()
 		}
+		if !after.IsZero() && info.ModTime().After(after) {
+			return filepath.SkipAll
+		}
 		return nil
 	})
 	return observation
+}
+
+func shouldSkipWorktreeDir(name string) bool {
+	return generatedWorktreeDirNames[name]
 }
 
 func (o worktreeObservation) advancedFrom(prev worktreeObservation) bool {
@@ -417,7 +466,11 @@ func shouldWalkWorktree(current, last time.Time, interval time.Duration) bool {
 
 func runCustomLivenessProbe(ctx context.Context, opts Options, remainingHardCap time.Duration) bool {
 	var output bytes.Buffer
-	cmd := customLivenessShellCommand(opts.LivenessCommand, opts.WorktreePath)
+	cmd, displayCommand, buildErr := customLivenessCommand(opts.LivenessCommand, opts.WorktreePath)
+	if buildErr != nil {
+		appendCustomLivenessLog(opts.LogPath, opts.LivenessCommand, "", Result{}, buildErr, false)
+		return false
+	}
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 
@@ -427,8 +480,21 @@ func runCustomLivenessProbe(ctx context.Context, opts Options, remainingHardCap 
 		Role:    customLivenessRole(opts.Role),
 	})
 	success := err == nil && result.Outcome == OutcomeCompleted && result.ExitCode == 0
-	appendCustomLivenessLog(opts.LogPath, opts.LivenessCommand, output.String(), result, err, success)
+	appendCustomLivenessLog(opts.LogPath, displayCommand, output.String(), result, err, success)
 	return success
+}
+
+func customLivenessCommand(command, worktreePath string) (*exec.Cmd, string, error) {
+	if isEncodedLivenessArgv(command) {
+		argv, err := decodeLivenessArgv(command)
+		if err != nil {
+			return nil, "", err
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = worktreePath
+		return cmd, fmt.Sprintf("argv:%q", argv), nil
+	}
+	return customLivenessShellCommand(command, worktreePath), command, nil
 }
 
 func customLivenessShellCommand(command, worktreePath string) *exec.Cmd {
@@ -440,6 +506,31 @@ func customLivenessShellCommand(command, worktreePath string) *exec.Cmd {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = worktreePath
 	return cmd
+}
+
+func isEncodedLivenessArgv(command string) bool {
+	return strings.HasPrefix(command, livenessArgvCommandPrefix)
+}
+
+func decodeLivenessArgv(command string) ([]string, error) {
+	encoded := strings.TrimPrefix(command, livenessArgvCommandPrefix)
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	var argv []string
+	if err := json.Unmarshal(data, &argv); err != nil {
+		return nil, err
+	}
+	if len(argv) == 0 {
+		return nil, errors.New("argv is empty")
+	}
+	for index, arg := range argv {
+		if strings.TrimSpace(arg) == "" {
+			return nil, fmt.Errorf("argv[%d] is empty", index)
+		}
+	}
+	return argv, nil
 }
 
 func customLivenessHardCap(opts Options, remainingHardCap time.Duration) time.Duration {

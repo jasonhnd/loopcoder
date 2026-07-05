@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,56 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
+
+func TestEvidenceProducerHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_LOOPREVIEW_PRODUCER_HELPER") != "1" {
+		return
+	}
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		fmt.Fprintln(os.Stderr, "missing helper separator")
+		os.Exit(2)
+	}
+	mode := os.Args[separator+1]
+	args := os.Args[separator+2:]
+	switch mode {
+	case "write-output":
+		if len(args) != 2 {
+			fmt.Fprintf(os.Stderr, "write-output got %d args\n", len(args))
+			os.Exit(2)
+		}
+		if err := os.MkdirAll(filepath.Dir(args[0]), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "mkdir output: %v\n", err)
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[0], []byte("producer arg: "+args[1]+"\n"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write output: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "sleep":
+		if len(args) != 1 {
+			fmt.Fprintf(os.Stderr, "sleep got %d args\n", len(args))
+			os.Exit(2)
+		}
+		duration, err := time.ParseDuration(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parse sleep duration: %v\n", err)
+			os.Exit(2)
+		}
+		time.Sleep(duration)
+		os.Exit(0)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
+		os.Exit(2)
+	}
+}
 
 func TestVerifierWatchdogDefaultsAreRaised(t *testing.T) {
 	if DefaultVerifierTimeout != 15*time.Minute || VerifierStallTimeout != 5*time.Minute {
@@ -778,6 +830,138 @@ func TestRunExecutesDomainEvidenceProducerAndFeedsRenderedArtifact(t *testing.T)
 	artifact := result.Verdict.RenderedArtifacts[0]
 	if artifact.Source != "domain.evidence.producer" || artifact.Path != "out/report.md" || artifact.Kind != "markdown" || artifact.Status != "available" || artifact.SHA256 == "" {
 		t.Fatalf("artifact = %#v, want available markdown report with sha", artifact)
+	}
+}
+
+func TestRunExecutesDomainEvidenceProducerArgvAndFeedsRenderedArtifact(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`domain:
+  verification:
+    review_packet_order:
+      - rendered_artifact
+      - changed_files
+      - diff
+      - issue
+      - spec
+  evidence:
+    producer:
+      argv: ["producer-bin", "--literal", "value && exit 9"]
+      outputs:
+        - out/report.md
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "# Design\n",
+		},
+	}
+	fakeGitHub := loopreviewStandardFakeGitHub()
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"rendered artifact satisfies issue and spec","spec_conformance":"pass"}`,
+	}
+	var producerInvocation EvidenceProducerInvocation
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   152,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		RunEvidenceProducer: func(_ context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult {
+			producerInvocation = invocation
+			if !reflect.DeepEqual(invocation.Argv, []string{"producer-bin", "--literal", "value && exit 9"}) {
+				return EvidenceProducerResult{ExitCode: 7, Output: fmt.Sprintf("argv = %#v", invocation.Argv)}
+			}
+			outDir := filepath.Join(invocation.WorktreePath, "out")
+			if err := os.MkdirAll(outDir, 0o755); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			if err := os.WriteFile(filepath.Join(outDir, "report.md"), []byte("# Rendered report\nApproved.\n"), 0o644); err != nil {
+				return EvidenceProducerResult{ExitCode: 127, Err: err}
+			}
+			return EvidenceProducerResult{ExitCode: 0}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want pass exit 0", result)
+	}
+	if producerInvocation.Command != "" || !reflect.DeepEqual(producerInvocation.Argv, []string{"producer-bin", "--literal", "value && exit 9"}) {
+		t.Fatalf("producer invocation = %#v, want argv-only invocation", producerInvocation)
+	}
+	if !strings.Contains(fakeAgent.invocation.Prompt, "# Rendered artifacts") {
+		t.Fatalf("prompt missing rendered artifact:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestRunEvidenceProducerCommandArgvDoesNotUseShell(t *testing.T) {
+	t.Setenv("GO_WANT_LOOPREVIEW_PRODUCER_HELPER", "1")
+	worktreePath := t.TempDir()
+	literal := "value && exit 9"
+
+	result := runEvidenceProducerCommand(context.Background(), EvidenceProducerInvocation{
+		Argv: []string{
+			os.Args[0],
+			"-test.run=TestEvidenceProducerHelperProcess",
+			"--",
+			"write-output",
+			"out/report.md",
+			literal,
+		},
+		WorktreePath: worktreePath,
+		Timeout:      5 * time.Second,
+	})
+	if result.Err != nil {
+		t.Fatalf("runEvidenceProducerCommand Err = %v, output:\n%s", result.Err, result.Output)
+	}
+	if result.ExitCode != 0 || result.TimedOut {
+		t.Fatalf("result = %#v, want exit 0 without timeout", result)
+	}
+	data, err := os.ReadFile(filepath.Join(worktreePath, "out", "report.md"))
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if !strings.Contains(string(data), literal) {
+		t.Fatalf("report = %q, want literal shell metacharacters preserved", string(data))
+	}
+}
+
+func TestRunEvidenceProducerCommandHardTimeout(t *testing.T) {
+	t.Setenv("GO_WANT_LOOPREVIEW_PRODUCER_HELPER", "1")
+	result := runEvidenceProducerCommand(context.Background(), EvidenceProducerInvocation{
+		Argv: []string{
+			os.Args[0],
+			"-test.run=TestEvidenceProducerHelperProcess",
+			"--",
+			"sleep",
+			"10s",
+		},
+		WorktreePath: t.TempDir(),
+		Timeout:      100 * time.Millisecond,
+	})
+	if !result.TimedOut {
+		t.Fatalf("TimedOut = false, want true; result = %#v", result)
+	}
+	if result.Err != nil {
+		t.Fatalf("Err = %v, want nil timeout kill result", result.Err)
 	}
 }
 

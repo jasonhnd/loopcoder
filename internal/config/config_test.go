@@ -230,6 +230,8 @@ domain:
   evidence:
     producer:
       command: make render
+      outputs:
+        - out/report.md
 mcp:
   servers:
     - name: local-index
@@ -246,6 +248,9 @@ mcp:
 	if cfg.Domain.Evidence.Producer.Command != "make render" {
 		t.Fatalf("Domain.Evidence.Producer.Command = %q, want make render", cfg.Domain.Evidence.Producer.Command)
 	}
+	if !reflect.DeepEqual(cfg.Domain.Evidence.Producer.Outputs, []string{"out/report.md"}) {
+		t.Fatalf("Domain.Evidence.Producer.Outputs = %#v, want out/report.md", cfg.Domain.Evidence.Producer.Outputs)
+	}
 	if cfg.Domain.Evidence.Producer.IncludeInLoopreview != nil {
 		t.Fatalf("IncludeInLoopreview = %#v, want nil for absent optional bool", cfg.Domain.Evidence.Producer.IncludeInLoopreview)
 	}
@@ -257,6 +262,124 @@ mcp:
 	}
 	if cfg.MCP.Servers[0].Auth != (MCPAuth{}) || cfg.MCP.Servers[0].ReadOnly {
 		t.Fatalf("partial MCP server = %#v, want zero auth and read_only false", cfg.MCP.Servers[0])
+	}
+}
+
+func TestParseReadsDomainCommandArgvFields(t *testing.T) {
+	cfg, err := Parse([]byte(`
+domain:
+  evidence:
+    producer:
+      argv: ["make", "render-ir-pdf"]
+      outputs:
+        - out/report.pdf
+  liveness:
+    mode: custom
+    argv: ["./tools/liveness", "--worktree", "."]
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.Domain.Evidence.Producer.Argv, []string{"make", "render-ir-pdf"}) {
+		t.Fatalf("Producer.Argv = %#v, want make render-ir-pdf", cfg.Domain.Evidence.Producer.Argv)
+	}
+	if !reflect.DeepEqual(cfg.Domain.Liveness.Argv, []string{"./tools/liveness", "--worktree", "."}) {
+		t.Fatalf("Liveness.Argv = %#v, want no-shell liveness argv", cfg.Domain.Liveness.Argv)
+	}
+}
+
+func TestParseRejectsInvalidDomainCommandSpecs(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "producer command and argv",
+			body: `
+domain:
+  evidence:
+    producer:
+      command: make render
+      argv: ["make", "render"]
+      outputs: [out/report.md]
+`,
+			want: "domain.evidence.producer.command and domain.evidence.producer.argv are mutually exclusive",
+		},
+		{
+			name: "producer empty argv",
+			body: `
+domain:
+  evidence:
+    producer:
+      argv: []
+      outputs: [out/report.md]
+`,
+			want: "domain.evidence.producer.argv must be a non-empty array",
+		},
+		{
+			name: "producer empty argv element",
+			body: `
+domain:
+  evidence:
+    producer:
+      argv: ["make", ""]
+      outputs: [out/report.md]
+`,
+			want: "domain.evidence.producer.argv[1] must not be empty",
+		},
+		{
+			name: "producer missing outputs",
+			body: `
+domain:
+  evidence:
+    producer:
+      argv: ["make", "render"]
+`,
+			want: "domain.evidence.producer.outputs is required",
+		},
+		{
+			name: "liveness custom missing command",
+			body: `
+domain:
+  liveness:
+    mode: custom
+`,
+			want: "domain.liveness.mode custom requires exactly one",
+		},
+		{
+			name: "liveness command and argv",
+			body: `
+domain:
+  liveness:
+    mode: custom
+    command: echo alive
+    argv: ["echo", "alive"]
+`,
+			want: "domain.liveness.command and domain.liveness.argv are mutually exclusive",
+		},
+		{
+			name: "liveness command without custom mode",
+			body: `
+domain:
+  liveness:
+    mode: log-only
+    command: echo alive
+`,
+			want: "domain.liveness.command and domain.liveness.argv are only valid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil {
+				t.Fatal("Parse returned nil error, want invalid domain command spec")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -273,6 +396,8 @@ domain:
   evidence:
     producer:
       command: make render
+      outputs:
+        - out/report.md
       future_producer_field: ok
 mcp:
   future_mcp_field: ok
