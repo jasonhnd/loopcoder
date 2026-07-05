@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-05
+
+Behavior-preserving core refactor, per [`docs/specs/0507-core-refactor.md`](docs/specs/0507-core-refactor.md). This release has **zero observable behavior change**: it decomposes god-functions and centralizes scattered defaults for readability, testability, and reduced drift. Every slice proved behavior-preservation via golden/inventory tests and independent verifier path-tracing, and was gated by the full 0.5.1 CI suite (build/vet/test/`-race`/staticcheck/govulncheck). Built by loopcoder itself under the self-hosting guard.
+
+### Changed
+
+- **`worker.Dispatch` decomposed** into focused, independently-tested helpers (`prepareDispatch`/`prepareWorktree`/`buildInvocation`/`runAgent`/`handleHungOrPartialWork`/`commitAndOpenPR`/`writeRecovery`/`cleanup`) behind the unchanged `Dispatch` entrypoint and `worker.Result` contract.
+- **Orchestration state/render split** — `tick`, `promote`, and `dispatch-wave` keep state progression in report-returning functions, while text/JSON rendering moves to dedicated render files with byte-identical output (`RenderTickText`, `RenderPromoteText`, `RenderDispatchWaveText`, and the JSON marshallers are preserved).
+- **MCP validation consolidated** into a single shared parse-time validator reused by config parsing, the MCP bridge, and the provider layer; the accepted/rejected config set is unchanged and Codex/Claude/Gemini argv stays byte-identical, with the read-only verifier filter still fail-closed.
+- **Defaults/limits centralized** into a new `internal/defaults` leaf package (branch names, dispatch-wave throttle, hard caps, retry backoff, packet budgets, list limits, and other bounds), read from a single documented source with no value tuning and copy-returned mutable slices.
+
+### Notes
+
+- Zero behavior change: every value and rendered effect is identical, and the absent-config code profile is byte-for-byte unchanged. The 0161 F1–F5/M1–M4/E1 invariants, the 0.4.2 H5 exit-code contract, the `Invocation.ReadOnly` verifier boundary, the self-hosting guard, and the entire 0.5.1 security hardening are preserved. `internal/defaults` is a leaf package that imports only the standard library, so no import cycle is introduced.
+
 ## [0.5.1] - 2026-07-05
 
 Security and robustness hardening from an external security audit of the codebase, per [`docs/specs/0484-security-robustness-hardening.md`](docs/specs/0484-security-robustness-hardening.md). loopcoder is a local single-operator dev CLI, so most findings were Low–Medium hardening rather than active-exploit fixes, but every verified finding is closed. Built by loopcoder itself under the self-hosting guard (human merge gate): the spec merged first, then the fixes landed as file-disjoint slices gated through the read-only verifier and CI.
