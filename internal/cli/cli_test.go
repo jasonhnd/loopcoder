@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
@@ -144,6 +145,69 @@ func TestVersionDefaultsToDevBuildInfo(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("version output missing %q:\n%s", want, output)
 		}
+	}
+}
+
+func TestAuditCommandRunsInjectedAuditAndRendersJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"audit",
+		"--repo", repo,
+		"--format", "json",
+		"--layer", "sast",
+		"--threshold", "high",
+	}, &stdout, &stderr, Deps{
+		Audit: func(_ context.Context, opts audit.Options) (audit.Result, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if !reflect.DeepEqual(opts.Layers, []string{"sast"}) {
+				t.Fatalf("Layers = %#v, want sast", opts.Layers)
+			}
+			if opts.ThresholdOverride != "high" {
+				t.Fatalf("ThresholdOverride = %q, want high", opts.ThresholdOverride)
+			}
+			result := audit.NewResult(repo, []string{audit.LayerSAST}, audit.SeverityHigh)
+			result.Findings = []audit.Finding{{
+				ID:          "gosec:G101:a.go:1",
+				Layer:       audit.LayerSAST,
+				Tool:        "gosec",
+				Severity:    audit.SeverityHigh,
+				File:        "a.go",
+				Line:        1,
+				Rule:        "G101",
+				Category:    "security",
+				Message:     "hardcoded credential",
+				Evidence:    "[REDACTED]",
+				Fingerprint: "sha256:test",
+			}}
+			return audit.Finalize(result), nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{`"schema_version": 1`, `"verdict": "findings"`, `"threshold": "high"`} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("audit JSON missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestAuditCommandInvalidFormatUsesRuntimeFailureExit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"audit", "--format", "xml"}, &stdout, &stderr, Deps{})
+	if exitCode != auditCommandFailureExitCode {
+		t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, auditCommandFailureExitCode)
+	}
+	if !strings.Contains(stderr.String(), "invalid --format") {
+		t.Fatalf("stderr missing invalid format message: %q", stderr.String())
 	}
 }
 

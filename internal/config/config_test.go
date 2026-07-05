@@ -69,10 +69,164 @@ func TestDefaultMarshalOmitsAbsentDomainAndMCP(t *testing.T) {
 		t.Fatalf("yaml.Marshal(Default()) returned error: %v", err)
 	}
 	text := string(data)
-	for _, notWant := range []string{"domain:", "mcp:"} {
+	for _, notWant := range []string{"domain:", "mcp:", "audit:"} {
 		if strings.Contains(text, notWant) {
 			t.Fatalf("yaml.Marshal(Default()) contained %q:\n%s", notWant, text)
 		}
+	}
+}
+
+func TestParseReadsAuditSection(t *testing.T) {
+	data := []byte(`
+audit:
+  severity_threshold: high
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+        parser: govulncheck-json
+        timeout_seconds: 300
+    native:
+      secrets: false
+      file_permissions: true
+      include:
+        - "**/*.go"
+      exclude:
+        - vendor/**
+  review:
+    rubric_path: docs/security/audit-rubric.md
+  baseline:
+    path: docs/security/audit-baseline.yml
+`)
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Audit.SeverityThreshold != "high" {
+		t.Fatalf("Audit.SeverityThreshold = %q, want high", cfg.Audit.SeverityThreshold)
+	}
+	if len(cfg.Audit.SAST.Commands) != 1 {
+		t.Fatalf("Audit.SAST.Commands len = %d, want 1", len(cfg.Audit.SAST.Commands))
+	}
+	command := cfg.Audit.SAST.Commands[0]
+	if command.ID != "govulncheck" || command.Parser != "govulncheck-json" || command.TimeoutSeconds != 300 {
+		t.Fatalf("audit command = %#v, want govulncheck parser/timeout", command)
+	}
+	if !reflect.DeepEqual(command.Argv, []string{"govulncheck", "-json", "./..."}) {
+		t.Fatalf("audit command argv = %#v", command.Argv)
+	}
+	if cfg.Audit.SAST.Native.Secrets == nil || *cfg.Audit.SAST.Native.Secrets {
+		t.Fatalf("native secrets = %#v, want explicit false", cfg.Audit.SAST.Native.Secrets)
+	}
+	if cfg.Audit.SAST.Native.FilePermissions == nil || !*cfg.Audit.SAST.Native.FilePermissions {
+		t.Fatalf("native file_permissions = %#v, want explicit true", cfg.Audit.SAST.Native.FilePermissions)
+	}
+	if !reflect.DeepEqual(cfg.Audit.SAST.Native.Include, []string{"**/*.go"}) {
+		t.Fatalf("native include = %#v", cfg.Audit.SAST.Native.Include)
+	}
+	if !reflect.DeepEqual(cfg.Audit.SAST.Native.Exclude, []string{"vendor/**"}) {
+		t.Fatalf("native exclude = %#v", cfg.Audit.SAST.Native.Exclude)
+	}
+	if cfg.Audit.Review.RubricPath != "docs/security/audit-rubric.md" {
+		t.Fatalf("rubric_path = %q", cfg.Audit.Review.RubricPath)
+	}
+	if cfg.Audit.Baseline.Path != "docs/security/audit-baseline.yml" {
+		t.Fatalf("baseline path = %q", cfg.Audit.Baseline.Path)
+	}
+}
+
+func TestParseAuditToleratesUnknownFields(t *testing.T) {
+	data := []byte(`
+audit:
+  future: ok
+  severity_threshold: medium
+  sast:
+    future_sast: ok
+    commands:
+      - id: staticcheck
+        argv: ["staticcheck", "-f", "json", "./..."]
+        parser: staticcheck-json
+        future_command: ok
+    native:
+      secrets: true
+      future_native: ok
+  review:
+    rubric_path: docs/rubric.md
+    future_review: ok
+  baseline:
+    path: docs/baseline.yml
+    future_baseline: ok
+`)
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse returned error for unknown audit fields: %v", err)
+	}
+	if cfg.Audit.SAST.Commands[0].ID != "staticcheck" || cfg.Audit.Review.RubricPath != "docs/rubric.md" {
+		t.Fatalf("audit known fields not parsed: %#v", cfg.Audit)
+	}
+}
+
+func TestParseRejectsInvalidAuditCommandSpecs(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "bad threshold",
+			body: `audit:
+  severity_threshold: severe
+`,
+			want: "audit.severity_threshold",
+		},
+		{
+			name: "empty argv",
+			body: `audit:
+  sast:
+    commands:
+      - id: govulncheck
+        argv: []
+        parser: govulncheck-json
+`,
+			want: "audit.sast.commands[0].argv",
+		},
+		{
+			name: "missing parser",
+			body: `audit:
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+`,
+			want: "audit.sast.commands[0].parser is required",
+		},
+		{
+			name: "negative timeout",
+			body: `audit:
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+        parser: govulncheck-json
+        timeout_seconds: -1
+`,
+			want: "timeout_seconds must not be negative",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil {
+				t.Fatal("Parse returned nil error, want invalid audit config")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
 	}
 }
 
