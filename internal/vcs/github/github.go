@@ -19,6 +19,7 @@ import (
 )
 
 const ghHardCapDefault = 60 * time.Second
+const ghListLimit = 1000
 
 var ghHardCap = ghHardCapDefault
 
@@ -268,10 +269,16 @@ func (c *CLI) ListIssues(ctx context.Context, state string) ([]Issue, error) {
 	err := c.runJSON(ctx, []string{
 		"issue", "list",
 		"--state", state,
-		"--limit", "1000",
+		"--limit", fmt.Sprintf("%d", ghListLimit),
 		"--json", "number,title,body,labels,state,stateReason",
 	}, &issues)
-	return issues, err
+	if err != nil {
+		return issues, err
+	}
+	if len(issues) >= ghListLimit {
+		return issues, fmt.Errorf("gh issue list reached --limit %d; results may be truncated", ghListLimit)
+	}
+	return issues, nil
 }
 
 func (c *CLI) ViewIssue(ctx context.Context, number int) (Issue, error) {
@@ -288,10 +295,16 @@ func (c *CLI) ListOpenPRs(ctx context.Context) ([]PullRequest, error) {
 	err := c.runJSON(ctx, []string{
 		"pr", "list",
 		"--state", "open",
-		"--limit", "1000",
+		"--limit", fmt.Sprintf("%d", ghListLimit),
 		"--json", "number,title,url,headRefName,isDraft,labels,closingIssuesReferences",
 	}, &prs)
-	return prs, err
+	if err != nil {
+		return prs, err
+	}
+	if len(prs) >= ghListLimit {
+		return prs, fmt.Errorf("gh pr list reached --limit %d; results may be truncated", ghListLimit)
+	}
+	return prs, nil
 }
 
 func (c *CLI) ViewPR(ctx context.Context, number int) (PullRequest, error) {
@@ -573,7 +586,7 @@ func (c *CLI) PromotePreProdToMain(ctx context.Context, preProdBranch string) (M
 		SHA     string `json:"sha"`
 		HTMLURL string `json:"html_url"`
 	}
-	if err := c.runJSON(ctx, []string{
+	if err := c.runJSONAllowEmpty(ctx, []string{
 		"api",
 		"--method", "POST",
 		"repos/" + repo + "/merges",
@@ -940,7 +953,7 @@ func (c *CLI) CreateIssue(ctx context.Context, title, body string, labels []stri
 			Body:   body,
 			State:  "OPEN",
 			Labels: labelsFromNames(labels),
-		}, nil
+		}, fmt.Errorf("create issue #%d succeeded but readback failed: %w", number, viewErr)
 	}
 	return issue, nil
 }
@@ -970,7 +983,7 @@ func (c *CLI) UpdateIssue(ctx context.Context, number int, title, body string, a
 			Body:   body,
 			State:  "OPEN",
 			Labels: labelsFromNames(addLabels),
-		}, nil
+		}, fmt.Errorf("update issue #%d succeeded but readback failed: %w", number, err)
 	}
 	return issue, nil
 }
@@ -981,12 +994,23 @@ func (c *CLI) CloseIssue(ctx context.Context, number int) error {
 }
 
 func (c *CLI) runJSON(ctx context.Context, args []string, target any) error {
+	return c.runJSONWithOptions(ctx, args, target, false)
+}
+
+func (c *CLI) runJSONAllowEmpty(ctx context.Context, args []string, target any) error {
+	return c.runJSONWithOptions(ctx, args, target, true)
+}
+
+func (c *CLI) runJSONWithOptions(ctx context.Context, args []string, target any, allowEmpty bool) error {
 	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
 		return err
 	}
 	if len(bytes.TrimSpace(output)) == 0 {
-		return nil
+		if allowEmpty {
+			return nil
+		}
+		return fmt.Errorf("gh %s returned empty output where JSON was expected", strings.Join(args, " "))
 	}
 	return parseJSONOutput(output, target)
 }

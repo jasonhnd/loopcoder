@@ -39,6 +39,35 @@ func TestParseJSONOutputParsesObject(t *testing.T) {
 	}
 }
 
+func TestRunJSONRejectsEmptyOutput(t *testing.T) {
+	client := NewWithRunner("repo", &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "issue", "view", "7", "--json", "number"): []byte(" \n"),
+		},
+	})
+
+	var issue Issue
+	err := client.runJSON(context.Background(), []string{"issue", "view", "7", "--json", "number"}, &issue)
+	if err == nil || !strings.Contains(err.Error(), "empty output") || !strings.Contains(err.Error(), "JSON") {
+		t.Fatalf("runJSON error = %v, want empty JSON output error", err)
+	}
+}
+
+func TestRunJSONAllowEmptyOptIn(t *testing.T) {
+	client := NewWithRunner("repo", &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "api", "repos/owner/repo/merges"): nil,
+		},
+	})
+
+	var payload struct {
+		SHA string `json:"sha"`
+	}
+	if err := client.runJSONAllowEmpty(context.Background(), []string{"api", "repos/owner/repo/merges"}, &payload); err != nil {
+		t.Fatalf("runJSONAllowEmpty returned error: %v", err)
+	}
+}
+
 func TestParseGitHubRemote(t *testing.T) {
 	cases := map[string]string{
 		"git@github.com:owner/repo.git":      "owner/repo",
@@ -198,6 +227,40 @@ func TestListHeadPRsRunsGhPRList(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Number != 5 || got[0].URL != "https://github.com/owner/repo/pull/5" {
 		t.Fatalf("ListHeadPRs = %#v", got)
+	}
+}
+
+func TestListIssuesReturnsTruncationErrorAtLimit(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "issue", "list", "--state", "open", "--limit", fmt.Sprintf("%d", ghListLimit), "--json", "number,title,body,labels,state,stateReason"): githubIssuesJSON(ghListLimit),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.ListIssues(context.Background(), "")
+	if err == nil || !strings.Contains(err.Error(), "truncated") || !strings.Contains(err.Error(), "--limit 1000") {
+		t.Fatalf("ListIssues error = %v, want truncation error", err)
+	}
+	if len(got) != ghListLimit {
+		t.Fatalf("ListIssues returned %d issues, want capped partial list %d", len(got), ghListLimit)
+	}
+}
+
+func TestListOpenPRsReturnsTruncationErrorAtLimit(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "pr", "list", "--state", "open", "--limit", fmt.Sprintf("%d", ghListLimit), "--json", "number,title,url,headRefName,isDraft,labels,closingIssuesReferences"): githubPRsJSON(ghListLimit),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	got, err := client.ListOpenPRs(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "truncated") || !strings.Contains(err.Error(), "--limit 1000") {
+		t.Fatalf("ListOpenPRs error = %v, want truncation error", err)
+	}
+	if len(got) != ghListLimit {
+		t.Fatalf("ListOpenPRs returned %d PRs, want capped partial list %d", len(got), ghListLimit)
 	}
 }
 
@@ -768,6 +831,27 @@ func TestCreateIssueRunsGhIssueCreate(t *testing.T) {
 	}
 }
 
+func TestCreateIssueReturnsPartialAndErrorWhenReadbackFails(t *testing.T) {
+	viewKey := fakeCallKey("repo", "gh", "issue", "view", "7", "--json", "number,title,body,state,stateReason,labels,closedByPullRequestsReferences")
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "issue", "create", "--title", "Code: Add feature", "--body", "Body"): []byte("https://github.com/owner/repo/issues/7\n"),
+		},
+		errors: map[string]error{
+			viewKey: errors.New("view failed"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	created, err := client.CreateIssue(context.Background(), "Code: Add feature", "Body", nil)
+	if err == nil || !strings.Contains(err.Error(), "readback failed") || !strings.Contains(err.Error(), "view failed") {
+		t.Fatalf("CreateIssue error = %v, want readback failure", err)
+	}
+	if created.Number != 7 || created.Title != "Code: Add feature" || created.Body != "Body" || created.State != "OPEN" {
+		t.Fatalf("partial created issue = %#v", created)
+	}
+}
+
 func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
@@ -788,6 +872,27 @@ func TestUpdateIssueAndCloseIssueRunGhCommands(t *testing.T) {
 	}
 	if err := client.CloseIssue(context.Background(), 7); err != nil {
 		t.Fatalf("CloseIssue returned error: %v", err)
+	}
+}
+
+func TestUpdateIssueReturnsPartialAndErrorWhenReadbackFails(t *testing.T) {
+	viewKey := fakeCallKey("repo", "gh", "issue", "view", "7", "--json", "number,title,body,state,stateReason,labels,closedByPullRequestsReferences")
+	runner := &fakeRunner{
+		outputs: map[string][]byte{
+			fakeCallKey("repo", "gh", "issue", "edit", "7", "--title", "Epic: Add feature", "--body", "New body"): nil,
+		},
+		errors: map[string]error{
+			viewKey: errors.New("view failed"),
+		},
+	}
+	client := NewWithRunner("repo", runner)
+
+	updated, err := client.UpdateIssue(context.Background(), 7, "Epic: Add feature", "New body", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "readback failed") || !strings.Contains(err.Error(), "view failed") {
+		t.Fatalf("UpdateIssue error = %v, want readback failure", err)
+	}
+	if updated.Number != 7 || updated.Title != "Epic: Add feature" || updated.Body != "New body" || updated.State != "OPEN" {
+		t.Fatalf("partial updated issue = %#v", updated)
 	}
 }
 
@@ -846,6 +951,7 @@ func TestCreatePRPropagatesRunnerError(t *testing.T) {
 type fakeRunner struct {
 	calls   [][]string
 	outputs map[string][]byte
+	errors  map[string]error
 	err     error
 }
 
@@ -855,11 +961,47 @@ func (f *fakeRunner) Run(_ context.Context, dir, name string, args ...string) ([
 	if f.err != nil {
 		return nil, f.err
 	}
+	key := fakeCallKey(dir, name, args...)
+	if f.errors != nil {
+		if err, ok := f.errors[key]; ok {
+			return f.outputs[key], err
+		}
+	}
+	return f.outputs[key], nil
+}
+
+func fakeCallKey(dir, name string, args ...string) string {
 	key := dir + "\x00" + name
 	for _, arg := range args {
 		key += "\x00" + arg
 	}
-	return f.outputs[key], nil
+	return key
+}
+
+func githubIssuesJSON(count int) []byte {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 1; i <= count; i++ {
+		if i > 1 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"number":%d,"title":"Issue %d"}`, i, i)
+	}
+	b.WriteByte(']')
+	return []byte(b.String())
+}
+
+func githubPRsJSON(count int) []byte {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 1; i <= count; i++ {
+		if i > 1 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"number":%d,"title":"PR %d","url":"https://github.com/owner/repo/pull/%d"}`, i, i, i)
+	}
+	b.WriteByte(']')
+	return []byte(b.String())
 }
 
 type preProdRevertRunner struct {
