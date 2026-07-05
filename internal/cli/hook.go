@@ -8,6 +8,8 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/conductorhooks"
 )
 
+const maxHookInputBytes int64 = 1 << 20
+
 // runHook runs one embedded conductor hook by name. It is wired into a project's
 // Claude Code settings via `loopcoder hook <name>` and MUST fail open: any of our
 // own misconfiguration (missing or unknown hook name, nil stdin) returns exit 0,
@@ -45,14 +47,15 @@ func runHook(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return result.ExitCode
 }
 
-// readHookInput reads the entire hook payload from stdin. A nil reader (or any
-// read error) yields empty input so the hook still fails open.
+// readHookInput reads a bounded hook payload from stdin. A nil reader, read
+// error, or oversized payload yields empty input so the hook still fails open.
 func readHookInput(stdin io.Reader) []byte {
 	if stdin == nil {
 		return nil
 	}
-	data, err := io.ReadAll(stdin)
-	if err != nil {
+	limited := &io.LimitedReader{R: stdin, N: maxHookInputBytes + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil || int64(len(data)) > maxHookInputBytes {
 		return nil
 	}
 	return data

@@ -1,6 +1,7 @@
 package runstatus
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -102,6 +103,116 @@ func TestLoadWithoutRunSelectsLatestModifiedRun(t *testing.T) {
 	}
 }
 
+func TestLoadIgnoresArbitraryDeepJSONRecords(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-bounded"
+	writeAttempt(t, repo, runID, 301, 1, "job-301-1", workerAttestation(301, usageTotal(3010)))
+
+	deep := filepath.Join(state.RunPath(repo, runID), "scratch", "deep", "evil.json")
+	if err := os.MkdirAll(filepath.Dir(deep), 0o755); err != nil {
+		t.Fatalf("MkdirAll deep JSON: %v", err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"issue":       301,
+		"verdict":     "pass",
+		"attestation": verifierAttestation(999, usageSplit(1, 1, 2)),
+	})
+	if err != nil {
+		t.Fatalf("Marshal deep JSON: %v", err)
+	}
+	if err := os.WriteFile(deep, data, 0o644); err != nil {
+		t.Fatalf("WriteFile deep JSON: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if report.VerifierRecordCount != 0 {
+		t.Fatalf("VerifierRecordCount = %d, want 0 for arbitrary deep JSON", report.VerifierRecordCount)
+	}
+	if got := Render(report); !strings.Contains(got, "| #301 | job-301-1 | not reported |") {
+		t.Fatalf("rendered status missing unverified worker row:\n%s", got)
+	}
+}
+
+func TestLoadRejectsOversizedKnownRunRecords(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-oversized"
+	writeAttempt(t, repo, runID, 401, 1, "job-401-1", workerAttestation(401, usageTotal(4010)))
+
+	path := filepath.Join(state.RunPath(repo, runID), "verifiers", "pr-501.loopreview.json")
+	writeLargeFile(t, path, maxRunStatusRecordBytes+1)
+
+	_, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err == nil {
+		t.Fatal("Load returned nil error for oversized verifier record")
+	}
+	if text := err.Error(); !strings.Contains(text, "file is too large") || !strings.Contains(text, "verifiers/pr-501.loopreview.json") {
+		t.Fatalf("oversized error missing clear diagnostic: %v", err)
+	}
+}
+
+func TestLoadRejectsOversizedWorkerAttemptBeforeStateLoad(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-oversized-attempt"
+	path := filepath.Join(state.RunPath(repo, runID), "workers", "job-501-1.attempt.json")
+	writeLargeFile(t, path, maxRunStatusRecordBytes+1)
+
+	_, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err == nil {
+		t.Fatal("Load returned nil error for oversized worker attempt")
+	}
+	if text := err.Error(); !strings.Contains(text, "scan worker records") || !strings.Contains(text, "file is too large") {
+		t.Fatalf("oversized attempt error missing clear diagnostic: %v", err)
+	}
+}
+
+func TestLoadRejectsFutureDatedKnownRunRecord(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-future"
+	writeAttempt(t, repo, runID, 601, 1, "job-601-1", workerAttestation(601, usageTotal(6010)))
+	path := writeVerifierRecord(t, repo, runID, map[string]any{
+		"issue":       601,
+		"verdict":     "pass",
+		"attestation": verifierAttestation(601, usageSplit(1, 1, 2)),
+	})
+	future := time.Now().UTC().Add(maxRunStatusFutureSkew + time.Hour)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("Chtimes verifier: %v", err)
+	}
+
+	_, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err == nil {
+		t.Fatal("Load returned nil error for future-dated verifier record")
+	}
+	if text := err.Error(); !strings.Contains(text, "mtime") || !strings.Contains(text, "future skew") {
+		t.Fatalf("future mtime error missing clear diagnostic: %v", err)
+	}
+}
+
+func TestLoadRejectsNestedKnownRunRecordDirectory(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-nested"
+	writeAttempt(t, repo, runID, 701, 1, "job-701-1", workerAttestation(701, usageTotal(7010)))
+
+	nested := filepath.Join(state.RunPath(repo, runID), "verifiers", "nested", "pr-701.loopreview.json")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatalf("MkdirAll nested verifier: %v", err)
+	}
+	if err := os.WriteFile(nested, []byte(`{"issue":701,"verdict":"pass"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile nested verifier: %v", err)
+	}
+
+	_, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err == nil {
+		t.Fatal("Load returned nil error for nested verifier record directory")
+	}
+	if text := err.Error(); !strings.Contains(text, "depth limit") || !strings.Contains(text, "verifiers/nested") {
+		t.Fatalf("nested directory error missing clear diagnostic: %v", err)
+	}
+}
+
 func writeAttempt(t *testing.T, repo, runID string, issue, attempt int, jobID string, record attestation.AttestationRecord) {
 	t.Helper()
 	exitCode := 0
@@ -137,7 +248,7 @@ func writeEventLine(t *testing.T, repo, runID, line string) {
 	}
 }
 
-func writeVerifierRecord(t *testing.T, repo, runID string, record map[string]any) {
+func writeVerifierRecord(t *testing.T, repo, runID string, record map[string]any) string {
 	t.Helper()
 	path := filepath.Join(state.RunPath(repo, runID), "verifiers", "pr-501.loopreview.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -149,6 +260,17 @@ func writeVerifierRecord(t *testing.T, repo, runID string, record map[string]any
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("WriteFile verifier: %v", err)
+	}
+	return path
+}
+
+func writeLargeFile(t *testing.T, path string, size int64) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll large file: %v", err)
+	}
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), int(size)), 0o644); err != nil {
+		t.Fatalf("WriteFile large file: %v", err)
 	}
 }
 
