@@ -15,6 +15,40 @@ import (
 
 type ExecCodexRunner struct{}
 
+const sensitiveFileMode os.FileMode = 0o600
+
+func createSensitiveFile(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, sensitiveFileMode)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(sensitiveFileMode); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func writeSensitiveFile(path string, data []byte) error {
+	file, err := createSensitiveFile(path)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func ensureSensitiveFile(path string) error {
+	file, err := createSensitiveFile(path)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
 func BuildCodexArgs(inv Invocation) []string {
 	args := []string{
 		"exec",
@@ -54,12 +88,12 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 		return Result{ExitCode: -1}, fmt.Errorf("codex MCP configuration: %w", err)
 	}
 	if strings.TrimSpace(inv.OutputSchema) != "" {
-		if err := os.WriteFile(codexSchemaPath(inv.LogPath), []byte(inv.OutputSchema), 0o644); err != nil {
+		if err := writeSensitiveFile(codexSchemaPath(inv.LogPath), []byte(inv.OutputSchema)); err != nil {
 			return Result{ExitCode: -1}, fmt.Errorf("write output schema: %w", err)
 		}
 	}
 	promptPath := codexPromptPath(inv.LogPath)
-	if err := os.WriteFile(promptPath, []byte(inv.Prompt), 0o644); err != nil {
+	if err := writeSensitiveFile(promptPath, []byte(inv.Prompt)); err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("write prompt: %w", err)
 	}
 	prompt, err := os.Open(promptPath)
@@ -68,7 +102,11 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	}
 	defer prompt.Close()
 
-	logFile, err := os.Create(inv.LogPath)
+	if err := ensureSensitiveFile(codexSummaryPath(inv.LogPath)); err != nil {
+		return Result{ExitCode: -1}, fmt.Errorf("create summary: %w", err)
+	}
+
+	logFile, err := createSensitiveFile(inv.LogPath)
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("open codex log: %w", err)
 	}
@@ -83,12 +121,29 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	supervision, runErr := runProviderCommand(ctx, cmd, inv, "codex")
 	endedAt := time.Now()
 	_ = logFile.Sync()
-	logBytes, _ := os.ReadFile(inv.LogPath)
 	summary := readCodexSummary(inv.LogPath)
-	metadata := parseCodexInvocation(logBytes)
-	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
+	exitCode := supervisedExitCode(supervision, runErr)
+	logBytes, logErr := os.ReadFile(inv.LogPath)
+	metadata := invocationMetadata{}
+	var metadataErr error
+	if logErr == nil {
+		metadata = parseCodexInvocation(logBytes)
+		if runErr == nil && exitCode == 0 {
+			metadataErr = validateCodexSuccessMetadata(metadata)
+		}
+	}
+	result := resultWithSupervision(exitCode, summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
 	if runErr != nil {
+		if logErr != nil {
+			return result, errors.Join(runErr, fmt.Errorf("read codex log: %w", logErr))
+		}
 		return result, runErr
+	}
+	if logErr != nil {
+		return result, fmt.Errorf("read codex log: %w", logErr)
+	}
+	if metadataErr != nil {
+		return result, metadataErr
 	}
 	return result, nil
 }
@@ -416,6 +471,20 @@ func parseCodexInvocation(output []byte) invocationMetadata {
 		metadata.Usage.TotalTokens = &totalTokens
 	}
 	return metadata
+}
+
+func validateCodexSuccessMetadata(metadata invocationMetadata) error {
+	var missing []string
+	if strings.TrimSpace(metadata.Model) == "" {
+		missing = append(missing, "model")
+	}
+	if metadata.Usage.TotalTokens == nil && (metadata.Usage.InputTokens == nil || metadata.Usage.OutputTokens == nil) {
+		missing = append(missing, "token usage")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("codex metadata parse failed: missing %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func parseCodexHeaderValue(text, label string) string {

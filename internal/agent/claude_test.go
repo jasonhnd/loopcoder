@@ -1,12 +1,17 @@
 package agent
 
 import (
+	"context"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 func TestClaudeRegistration(t *testing.T) {
@@ -176,6 +181,37 @@ func TestWriteClaudeMCPConfigUsesEnvPlaceholders(t *testing.T) {
 	if strings.Contains(text, "secret") {
 		t.Fatalf("claude MCP config should not contain hardcoded secrets:\n%s", text)
 	}
+}
+
+func TestClaudeRunnerCreatesSensitiveFilesPrivate(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "claude.log")
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","result":"done","usage":{"total_tokens":42},"modelUsage":{"claude-sonnet":{"inputTokens":40,"outputTokens":2}}}`)
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := ClaudeRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do the work",
+		LogPath:      logPath,
+		Role:         "verifier",
+		MCPServers: []MCPServer{{
+			Name:      "shared-read",
+			Transport: "http",
+			URL:       "https://mcp.example.com/shared",
+			ReadOnly:  true,
+			Roles:     []string{"verifier"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+	assertPrivateFileMode(t, logPath)
+	assertPrivateFileMode(t, claudeMCPConfigPath(logPath))
 }
 
 func TestBuildClaudeReadOnlyVerifierArgs(t *testing.T) {

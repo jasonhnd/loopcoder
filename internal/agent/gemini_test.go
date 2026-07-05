@@ -1,10 +1,16 @@
 package agent
 
 import (
+	"context"
+	"io"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 func TestGeminiRegistration(t *testing.T) {
@@ -32,7 +38,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 				Prompt: "do the work",
 			},
 			want: []string{
-				"--prompt", "do the work",
+				"--prompt", "",
 				"--yolo",
 				"--output-format", "json",
 			},
@@ -44,7 +50,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 				Model:  "gemini-2.5-pro",
 			},
 			want: []string{
-				"--prompt", "do the work",
+				"--prompt", "",
 				"--yolo",
 				"-m", "gemini-2.5-pro",
 				"--output-format", "json",
@@ -57,7 +63,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 				Effort: "high",
 			},
 			want: []string{
-				"--prompt", "do the work",
+				"--prompt", "",
 				"--yolo",
 				"--output-format", "json",
 			},
@@ -70,7 +76,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 				ReadOnly: true,
 			},
 			want: []string{
-				"--prompt", "do the work",
+				"--prompt", "",
 				"--skip-trust",
 				"--extensions", "none",
 				"--output-format", "json",
@@ -83,7 +89,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 				OutputSchema: `{"type":"object"}`,
 			},
 			want: []string{
-				"--prompt", "do the work",
+				"--prompt", "",
 				"--yolo",
 				"--output-format", "json",
 			},
@@ -96,6 +102,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("BuildGeminiArgs() = %#v, want %#v", got, tt.want)
 			}
+			assertArgsDoNotContain(t, got, tt.inv.Prompt)
 		})
 	}
 }
@@ -122,7 +129,7 @@ func TestBuildGeminiArgsWithMCPServers(t *testing.T) {
 		},
 	})
 	want := []string{
-		"--prompt", "do the work",
+		"--prompt", "",
 		"--yolo",
 		"--allowed-mcp-server-names", "worker-index",
 		"--allowed-mcp-server-names", "shared-read",
@@ -131,6 +138,40 @@ func TestBuildGeminiArgsWithMCPServers(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("BuildGeminiArgs() = %#v, want %#v", got, want)
 	}
+	assertArgsDoNotContain(t, got, "do the work")
+}
+
+func TestGeminiRunnerFeedsPromptOnStdinAndCreatesSensitiveFilesPrivate(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "gemini.log")
+	prompt := "do the sensitive work"
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		stdin, err := io.ReadAll(cmd.Stdin)
+		if err != nil {
+			t.Fatalf("read stdin: %v", err)
+		}
+		if string(stdin) != prompt {
+			t.Fatalf("stdin = %q, want prompt %q", string(stdin), prompt)
+		}
+		assertArgsDoNotContain(t, cmd.Args, prompt)
+		_, _ = io.WriteString(cmd.Stdout, `{"response":"done","model":"gemini-2.5-pro","usage":{"totalTokens":42}}`)
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := GeminiRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       prompt,
+		LogPath:      logPath,
+		ReadOnly:     true,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+	assertPrivateFileMode(t, logPath)
+	assertPrivateFileMode(t, geminiReadOnlySettingsPath(logPath))
 }
 
 func TestGeminiSettingsJSONWithReadOnlyMCP(t *testing.T) {

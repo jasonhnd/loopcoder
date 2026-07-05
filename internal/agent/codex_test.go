@@ -1,8 +1,17 @@
 package agent
 
 import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 func TestBuildCodexArgs(t *testing.T) {
@@ -197,6 +206,122 @@ func TestBuildCodexReadOnlyVerifierArgs(t *testing.T) {
 		t.Fatalf("BuildCodexArgs() = %#v, want %#v", got, want)
 	}
 	assertArgsDoNotContain(t, got, "dangerously-bypass-approvals-and-sandbox", "approval", "plan")
+}
+
+func TestCodexRunnerCreatesSensitiveFilesPrivate(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "codex.log")
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		_, _ = io.WriteString(cmd.Stdout, "model: gpt-5\nreasoning effort: high\n\ntokens used\n42\n")
+		if err := os.WriteFile(codexSummaryPath(logPath), []byte("done\n"), 0o600); err != nil {
+			t.Fatalf("write summary: %v", err)
+		}
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := ExecCodexRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do the work",
+		LogPath:      logPath,
+		OutputSchema: `{"type":"object"}`,
+		Model:        "gpt-5",
+		Effort:       "high",
+		StallTimeout: 0,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+	for _, path := range []string{
+		logPath,
+		codexPromptPath(logPath),
+		codexSchemaPath(logPath),
+		codexSummaryPath(logPath),
+	} {
+		assertPrivateFileMode(t, path)
+	}
+}
+
+func TestCodexRunnerSurfacesLogReadError(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "codex.log")
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		if file, ok := cmd.Stdout.(*os.File); ok {
+			_ = file.Close()
+		}
+		if err := os.Remove(logPath); err != nil {
+			t.Fatalf("remove log: %v", err)
+		}
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	_, err := ExecCodexRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do the work",
+		LogPath:      logPath,
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want log read failure")
+	}
+	if !strings.Contains(err.Error(), "read codex log") {
+		t.Fatalf("Run error = %v, want read codex log", err)
+	}
+}
+
+func TestCodexRunnerDistinguishesMetadataParseFailureFromProviderFailure(t *testing.T) {
+	tests := []struct {
+		name          string
+		providerErr   error
+		exitCode      int
+		wantErr       string
+		wantProvider  bool
+		forbidErrText string
+	}{
+		{
+			name:     "successful provider with missing usage returns metadata parse failure",
+			exitCode: 0,
+			wantErr:  "codex metadata parse failed: missing token usage",
+		},
+		{
+			name:          "provider error remains provider failure",
+			providerErr:   errors.New("provider boom"),
+			exitCode:      1,
+			wantErr:       "provider boom",
+			wantProvider:  true,
+			forbidErrText: "metadata parse failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+				_, _ = io.WriteString(cmd.Stdout, "model: gpt-5\nreasoning effort: high\n")
+				return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: tt.exitCode}, tt.providerErr
+			})
+			defer restore()
+
+			_, err := ExecCodexRunner{}.Run(context.Background(), Invocation{
+				WorktreePath: t.TempDir(),
+				Prompt:       "do the work",
+				LogPath:      filepath.Join(t.TempDir(), "codex.log"),
+			})
+			if err == nil {
+				t.Fatal("Run returned nil error, want failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Run error = %v, want substring %q", err, tt.wantErr)
+			}
+			if tt.wantProvider && !errors.Is(err, tt.providerErr) {
+				t.Fatalf("Run error = %v, want provider error", err)
+			}
+			if tt.forbidErrText != "" && strings.Contains(err.Error(), tt.forbidErrText) {
+				t.Fatalf("Run error = %v, did not want %q", err, tt.forbidErrText)
+			}
+		})
+	}
 }
 
 func TestParseCodexInvocation(t *testing.T) {
