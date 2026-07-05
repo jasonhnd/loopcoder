@@ -26,7 +26,7 @@ func init() {
 func BuildGeminiArgs(inv Invocation) []string {
 	mcpServers := mcpServersForArgs(inv)
 	args := []string{
-		"--prompt", inv.Prompt,
+		"--prompt", "",
 	}
 	if inv.ReadOnly {
 		args = append(args, "--skip-trust", "--extensions", "none")
@@ -53,7 +53,7 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		return Result{ExitCode: -1}, fmt.Errorf("gemini MCP configuration: %w", err)
 	}
 
-	logFile, err := os.Create(inv.LogPath)
+	logFile, err := createSensitiveFile(inv.LogPath)
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("open gemini log: %w", err)
 	}
@@ -71,6 +71,7 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	var stdout bytes.Buffer
 	cmd := exec.CommandContext(ctx, "gemini", BuildGeminiArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
+	cmd.Stdin = strings.NewReader(inv.Prompt)
 	if inv.ReadOnly || len(mcpServers) > 0 {
 		cmd.Env = append(os.Environ(), "GEMINI_CLI_SYSTEM_SETTINGS_PATH="+geminiReadOnlySettingsPath(inv.LogPath))
 	}
@@ -281,7 +282,7 @@ func writeGeminiSettings(logPath string, readOnly bool, servers []MCPServer) err
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(geminiReadOnlySettingsPath(logPath), data, 0o600); err != nil {
+	if err := writeSensitiveFile(geminiReadOnlySettingsPath(logPath), data); err != nil {
 		return fmt.Errorf("write gemini settings: %w", err)
 	}
 	return nil

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -72,7 +71,7 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		}
 	}
 
-	logFile, err := os.Create(inv.LogPath)
+	logFile, err := createSensitiveFile(inv.LogPath)
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("open claude log: %w", err)
 	}
@@ -123,7 +122,7 @@ func writeClaudeMCPConfig(logPath string, servers []MCPServer) error {
 		return fmt.Errorf("render claude MCP config: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(claudeMCPConfigPath(logPath), data, 0o600); err != nil {
+	if err := writeSensitiveFile(claudeMCPConfigPath(logPath), data); err != nil {
 		return fmt.Errorf("write claude MCP config: %w", err)
 	}
 	return nil

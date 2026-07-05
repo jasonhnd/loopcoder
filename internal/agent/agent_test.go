@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -77,5 +79,22 @@ func assertArgsDoNotContain(t *testing.T, args []string, forbidden ...string) {
 				t.Fatalf("args %#v contain forbidden value %q in arg %q", args, value, arg)
 			}
 		}
+	}
+}
+
+func assertPrivateFileMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if info.IsDir() {
+		t.Fatalf("%s is a directory, want file", path)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("%s mode = %#o, want %#o", path, got, os.FileMode(0o600))
 	}
 }
