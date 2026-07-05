@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +22,14 @@ import (
 )
 
 const NotReported = "not reported"
+
+const (
+	maxRunStatusEventBytes       int64 = 64 << 20
+	maxRunStatusEventLineBytes   int   = 1 << 20
+	maxRunStatusRecordBytes      int64 = 4 << 20
+	maxRunStatusDirectoryEntries       = 4096
+	maxRunStatusFutureSkew             = 24 * time.Hour
+)
 
 type Options struct {
 	RepoPath string
@@ -118,16 +126,21 @@ func Load(opts Options) (Report, error) {
 		return Report{}, fmt.Errorf("run path is not a directory: %s", filepath.ToSlash(runPath))
 	}
 
+	now := time.Now().UTC()
+	if err := validateRunStatusAttemptRecords(runPath, now); err != nil {
+		return Report{}, err
+	}
+
 	attempts, err := state.LoadAttempts(repoPath, runID)
 	if err != nil {
 		return Report{}, err
 	}
 
-	eventMetadata, eventVerifiers, eventCount, err := loadEventRecords(repoPath, runID)
+	eventMetadata, eventVerifiers, eventCount, err := loadEventRecords(repoPath, runID, now)
 	if err != nil {
 		return Report{}, err
 	}
-	jsonMetadata, jsonVerifiers, err := scanRunJSONRecords(runPath)
+	jsonMetadata, jsonVerifiers, err := scanRunJSONRecords(runPath, now)
 	if err != nil {
 		return Report{}, err
 	}
@@ -318,12 +331,20 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 	return row
 }
 
-func loadEventRecords(repoPath, runID string) ([]metadataRecord, []verifierRecord, int, error) {
-	file, err := os.Open(state.EventsPath(repoPath, runID))
+func loadEventRecords(repoPath, runID string, now time.Time) ([]metadataRecord, []verifierRecord, int, error) {
+	path := state.EventsPath(repoPath, runID)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil, 0, nil
 		}
+		return nil, nil, 0, fmt.Errorf("read events file: %w", err)
+	}
+	if err := checkRunStatusFileBounds(path, info, maxRunStatusEventBytes, now); err != nil {
+		return nil, nil, 0, fmt.Errorf("read events file: %w", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
 		return nil, nil, 0, fmt.Errorf("read events file: %w", err)
 	}
 	defer file.Close()
@@ -331,51 +352,194 @@ func loadEventRecords(repoPath, runID string) ([]metadataRecord, []verifierRecor
 	var metadata []metadataRecord
 	var verifiers []verifierRecord
 	count := 0
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	limited := &io.LimitedReader{R: file, N: maxRunStatusEventBytes + 1}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 1024), maxRunStatusEventLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		count++
-		records, verifierRecords := collectRecords([]byte(line), state.EventsPath(repoPath, runID))
+		records, verifierRecords := collectRecords([]byte(line), path)
 		metadata = append(metadata, records...)
 		verifiers = append(verifiers, verifierRecords...)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, nil, 0, fmt.Errorf("read events file: %w", err)
 	}
+	if limited.N <= 0 {
+		return nil, nil, 0, fmt.Errorf("read events file: %s: file is too large while reading (%d byte limit)", filepath.ToSlash(path), maxRunStatusEventBytes)
+	}
 	return metadata, verifiers, count, nil
 }
 
-func scanRunJSONRecords(runPath string) ([]metadataRecord, []verifierRecord, error) {
+func validateRunStatusAttemptRecords(runPath string, now time.Time) error {
+	var diagnostics runStatusDiagnostics
+	scanRunStatusDir(runPath, "workers", isWorkerAttemptRecord, maxRunStatusRecordBytes, now, nil, &diagnostics)
+	if diagnostics.empty() {
+		return nil
+	}
+	return fmt.Errorf("scan worker records: %w", diagnostics)
+}
+
+func scanRunJSONRecords(runPath string, now time.Time) ([]metadataRecord, []verifierRecord, error) {
 	var metadata []metadataRecord
 	var verifiers []verifierRecord
-	err := filepath.WalkDir(runPath, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		name := entry.Name()
-		if name == "events.jsonl" || (!strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".attempt.json")) {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
+	var diagnostics runStatusDiagnostics
+	collect := func(data []byte, path string) {
 		records, verifierRecords := collectRecords(data, path)
 		metadata = append(metadata, records...)
 		verifiers = append(verifiers, verifierRecords...)
-		return nil
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("scan run records: %w", err)
+	}
+
+	scanRunStatusFile(runPath, "state.json", maxRunStatusRecordBytes, now, collect, &diagnostics)
+	scanRunStatusDir(runPath, "verifiers", isVerifierRunRecord, maxRunStatusRecordBytes, now, collect, &diagnostics)
+	scanRunStatusDir(runPath, "guardrails", isGuardrailRunRecord, maxRunStatusRecordBytes, now, collect, &diagnostics)
+
+	if !diagnostics.empty() {
+		return nil, nil, fmt.Errorf("scan run records: %w", diagnostics)
 	}
 	return metadata, verifiers, nil
+}
+
+type runStatusDiagnostics []string
+
+func (d runStatusDiagnostics) Error() string {
+	return "skipped unsafe local run status record(s): " + strings.Join(d, "; ")
+}
+
+func (d runStatusDiagnostics) empty() bool {
+	return len(d) == 0
+}
+
+func (d *runStatusDiagnostics) add(format string, args ...any) {
+	*d = append(*d, fmt.Sprintf(format, args...))
+}
+
+func scanRunStatusFile(runPath, rel string, maxBytes int64, now time.Time, collect func([]byte, string), diagnostics *runStatusDiagnostics) {
+	path := filepath.Join(runPath, filepath.FromSlash(rel))
+	info, err := os.Stat(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			diagnostics.add("%s: %v", filepath.ToSlash(path), err)
+		}
+		return
+	}
+	if err := checkRunStatusFileBounds(path, info, maxBytes, now); err != nil {
+		diagnostics.add("%v", err)
+		return
+	}
+	if collect == nil {
+		return
+	}
+	data, err := readBoundedRunStatusFile(path, maxBytes)
+	if err != nil {
+		diagnostics.add("%v", err)
+		return
+	}
+	collect(data, path)
+}
+
+func scanRunStatusDir(runPath, relDir string, match func(string) bool, maxBytes int64, now time.Time, collect func([]byte, string), diagnostics *runStatusDiagnostics) {
+	dirPath := filepath.Join(runPath, filepath.FromSlash(relDir))
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			diagnostics.add("%s: %v", filepath.ToSlash(dirPath), err)
+		}
+		return
+	}
+	defer dir.Close()
+
+	entries, err := dir.ReadDir(maxRunStatusDirectoryEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		diagnostics.add("%s: %v", filepath.ToSlash(dirPath), err)
+		return
+	}
+	if len(entries) > maxRunStatusDirectoryEntries {
+		diagnostics.add("%s: directory entry limit exceeded (%d > %d)", filepath.ToSlash(dirPath), len(entries), maxRunStatusDirectoryEntries)
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	for _, entry := range entries {
+		path := filepath.Join(dirPath, entry.Name())
+		if entry.IsDir() {
+			diagnostics.add("%s: depth limit exceeded under %s", filepath.ToSlash(path), filepath.ToSlash(dirPath))
+			continue
+		}
+		if !match(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			diagnostics.add("%s: %v", filepath.ToSlash(path), err)
+			continue
+		}
+		if err := checkRunStatusFileBounds(path, info, maxBytes, now); err != nil {
+			diagnostics.add("%v", err)
+			continue
+		}
+		if collect == nil {
+			continue
+		}
+		data, err := readBoundedRunStatusFile(path, maxBytes)
+		if err != nil {
+			diagnostics.add("%v", err)
+			continue
+		}
+		collect(data, path)
+	}
+}
+
+func checkRunStatusFileBounds(path string, info os.FileInfo, maxBytes int64, now time.Time) error {
+	slashPath := filepath.ToSlash(path)
+	if info.IsDir() {
+		return fmt.Errorf("%s: expected file, found directory", slashPath)
+	}
+	if info.Size() > maxBytes {
+		return fmt.Errorf("%s: file is too large (%d bytes > %d byte limit)", slashPath, info.Size(), maxBytes)
+	}
+	if info.ModTime().UTC().After(now.Add(maxRunStatusFutureSkew)) {
+		return fmt.Errorf("%s: file mtime %s exceeds future skew limit %s", slashPath, info.ModTime().UTC().Format(time.RFC3339), maxRunStatusFutureSkew)
+	}
+	return nil
+}
+
+func readBoundedRunStatusFile(path string, maxBytes int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.ToSlash(path), err)
+	}
+	defer file.Close()
+
+	limited := &io.LimitedReader{R: file, N: maxBytes + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.ToSlash(path), err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s: file is too large while reading (%d bytes > %d byte limit)", filepath.ToSlash(path), len(data), maxBytes)
+	}
+	return data, nil
+}
+
+func isWorkerAttemptRecord(name string) bool {
+	return strings.HasSuffix(name, ".attempt.json")
+}
+
+func isVerifierRunRecord(name string) bool {
+	return strings.HasSuffix(name, ".loopreview.json")
+}
+
+func isGuardrailRunRecord(name string) bool {
+	trimmed := strings.TrimSuffix(name, ".json")
+	if trimmed == name || trimmed == "" {
+		return false
+	}
+	issue, err := strconv.Atoi(trimmed)
+	return err == nil && issue > 0
 }
 
 func collectRecords(data []byte, path string) ([]metadataRecord, []verifierRecord) {
