@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 defaults:
   run:
@@ -119,9 +120,23 @@ jobs:
           sha256sum loopcoder_* > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Signing TODO
+      - uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Sign and verify checksums
         run: |
-          echo "TODO: Add cosign or minisign signing for SHA256SUMS in a follow-up release slice."
+          set -euo pipefail
+
+          cd dist
+          identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          issuer="https://token.actions.githubusercontent.com"
+
+          cosign sign-blob SHA256SUMS --bundle SHA256SUMS.sigstore --yes
+          cosign verify-blob SHA256SUMS \
+            --bundle SHA256SUMS.sigstore \
+            --certificate-identity "${identity}" \
+            --certificate-oidc-issuer "${issuer}"
+
+          printf 'Signed SHA256SUMS with Sigstore issuer %s and identity %s\n' "${issuer}" "${identity}"
 
       - name: Publish GitHub Release
         env:
@@ -131,13 +146,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          assets=(dist/loopcoder_* dist/SHA256SUMS)
+          assets=(dist/loopcoder_* dist/SHA256SUMS dist/SHA256SUMS.sigstore)
+          identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG_NAME}"
+          issuer="https://token.actions.githubusercontent.com"
+          notes="Automated release for ${TAG_NAME}. SHA256SUMS is signed with cosign keyless identity ${identity} and OIDC issuer ${issuer}."
 
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" --notes "${notes}"
             gh release upload "${TAG_NAME}" "${assets[@]}" --clobber
           else
             gh release create "${TAG_NAME}" "${assets[@]}" \
               --verify-tag \
               --title "${TAG_NAME}" \
-              --notes "Automated release for ${TAG_NAME}."
+              --notes "${notes}"
           fi

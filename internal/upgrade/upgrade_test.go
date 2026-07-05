@@ -206,15 +206,200 @@ func TestRunFailsWhenAssetMissing(t *testing.T) {
 	}
 }
 
+func TestRunFailsWhenChecksumSignatureMissing(t *testing.T) {
+	apiBase := "https://api.example.test"
+	repo := "owner/repo"
+	assetName := platformAssetName(t, "0.3.3")
+	releaseURL := apiBase + "/repos/" + repo + "/releases/latest"
+	calls := 0
+
+	_, err := Run(context.Background(), Options{
+		CurrentVersion: "v0.3.2",
+		RuntimeGOOS:    runtime.GOOS,
+		RuntimeGOARCH:  runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return apiBase
+			case EnvUpgradeRepo:
+				return repo
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("bin", wantBinaryFileName()), nil
+		},
+		HTTPGet: func(_ context.Context, rawURL string) ([]byte, error) {
+			calls++
+			if rawURL != releaseURL {
+				t.Fatalf("unexpected URL %q", rawURL)
+			}
+			return releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: "https://download.example.test/" + assetName},
+					{Name: checksumAssetName, BrowserDownloadURL: "https://download.example.test/SHA256SUMS"},
+				},
+			}), nil
+		},
+		VerifySignature: func(context.Context, []byte, []byte, string, string) error {
+			t.Fatal("VerifySignature should not run when the signature asset is missing")
+			return nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want missing signature asset")
+	}
+	if !strings.Contains(err.Error(), "missing release asset "+checksumSignatureAssetName) {
+		t.Fatalf("error = %v, want missing signature asset", err)
+	}
+	if calls != 1 {
+		t.Fatalf("HTTPGet calls = %d, want only release lookup", calls)
+	}
+}
+
+func TestRunFailsClosedWhenChecksumSignatureInvalid(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	assetName := platformAssetName(t, "0.3.3")
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	signatureBundle := []byte("bad sigstore bundle")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
+
+	_, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.3.3",
+		CurrentVersion:   "v0.3.2",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
+				},
+			}),
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
+		}),
+		VerifySignature: func(_ context.Context, artifact []byte, bundle []byte, identity string, issuer string) error {
+			if !reflect.DeepEqual(artifact, checksums) || !reflect.DeepEqual(bundle, signatureBundle) {
+				t.Fatalf("signature verifier inputs = %q/%q, want %q/%q", artifact, bundle, checksums, signatureBundle)
+			}
+			if identity != "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v0.3.3" {
+				t.Fatalf("identity = %q", identity)
+			}
+			if issuer != defaultCosignIssuer {
+				t.Fatalf("issuer = %q", issuer)
+			}
+			return errors.New("wrong identity")
+		},
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			t.Fatal("ExtractBinary should not run when signature verification fails")
+			return nil, nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want signature failure")
+	}
+	if !strings.Contains(err.Error(), "verify SHA256SUMS signature") || !strings.Contains(err.Error(), "wrong identity") {
+		t.Fatalf("error = %v, want signature failure with verifier detail", err)
+	}
+}
+
+func TestRunKeepsChecksumVerificationAfterValidSignature(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	assetName := platformAssetName(t, "0.3.3")
+	checksums := []byte(strings.Repeat("0", 64) + "  " + assetName + "\n")
+	signatureBundle := []byte("valid sigstore bundle")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
+
+	_, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.3.3",
+		CurrentVersion:   "v0.3.2",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.3.3",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
+				},
+			}),
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
+		}),
+		VerifySignature: verifySignatureFixture(t, checksums, signatureBundle),
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			t.Fatal("ExtractBinary should not run when checksum verification fails")
+			return nil, nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want checksum mismatch")
+	}
+	if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("error = %v, want checksum mismatch", err)
+	}
+}
+
 func TestRunInstallsStagedAtomic(t *testing.T) {
 	archiveBytes := []byte("archive bytes")
 	binaryBytes := []byte("new loopcoder binary")
 	assetName := platformAssetName(t, "0.3.3")
 	sum := sha256.Sum256(archiveBytes)
 	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	signatureBundle := []byte("valid sigstore bundle")
 	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
 	assetURL := "https://download.example.test/" + assetName
 	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
 	fsys := newFakeFS()
 	layout := home.New(filepath.Join("home", ".loopcoder"))
 	stablePath := layout.StableBinaryPath()
@@ -247,12 +432,15 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 				TagName: "v0.3.3",
 				Assets: []releaseAsset{
 					{Name: assetName, BrowserDownloadURL: assetURL},
-					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
 				},
 			}),
-			assetURL: archiveBytes,
-			sumsURL:  checksums,
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
 		}),
+		VerifySignature: verifySignatureFixture(t, checksums, signatureBundle),
 		ExtractBinary: func(gotArchiveName string, data []byte, binaryName string) ([]byte, error) {
 			if gotArchiveName != assetName {
 				t.Fatalf("archiveName = %q, want %q", gotArchiveName, assetName)
@@ -333,9 +521,11 @@ func TestRunReportsSkillRefreshFailureAsWarning(t *testing.T) {
 	assetName := platformAssetName(t, "0.3.3")
 	sum := sha256.Sum256(archiveBytes)
 	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	signatureBundle := []byte("valid sigstore bundle")
 	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
 	assetURL := "https://download.example.test/" + assetName
 	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
 	fsys := newFakeFS()
 	layout := home.New(filepath.Join("home", ".loopcoder"))
 
@@ -366,12 +556,15 @@ func TestRunReportsSkillRefreshFailureAsWarning(t *testing.T) {
 				TagName: "v0.3.3",
 				Assets: []releaseAsset{
 					{Name: assetName, BrowserDownloadURL: assetURL},
-					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
 				},
 			}),
-			assetURL: archiveBytes,
-			sumsURL:  checksums,
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
 		}),
+		VerifySignature: verifySignatureFixture(t, checksums, signatureBundle),
 		ExtractBinary: func(string, []byte, string) ([]byte, error) {
 			return binaryBytes, nil
 		},
@@ -411,9 +604,11 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 	assetName := platformAssetName(t, "0.3.3")
 	sum := sha256.Sum256(archiveBytes)
 	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	signatureBundle := []byte("valid sigstore bundle")
 	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.3.3"
 	assetURL := "https://download.example.test/" + assetName
 	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
 	loopcoderHome := filepath.Join(t.TempDir(), ".loopcoder")
 	layout := home.New(loopcoderHome)
 	userHome := t.TempDir()
@@ -459,12 +654,15 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 				TagName: "v0.3.3",
 				Assets: []releaseAsset{
 					{Name: assetName, BrowserDownloadURL: assetURL},
-					{Name: "SHA256SUMS", BrowserDownloadURL: sumsURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
 				},
 			}),
-			assetURL: archiveBytes,
-			sumsURL:  checksums,
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
 		}),
+		VerifySignature: verifySignatureFixture(t, checksums, signatureBundle),
 		ExtractBinary: func(string, []byte, string) ([]byte, error) {
 			return helperBytes, nil
 		},
@@ -709,6 +907,25 @@ func mapGetter(t *testing.T, responses map[string][]byte) func(context.Context, 
 			t.Fatalf("unexpected URL %q", rawURL)
 		}
 		return data, nil
+	}
+}
+
+func verifySignatureFixture(t *testing.T, wantArtifact []byte, wantBundle []byte) func(context.Context, []byte, []byte, string, string) error {
+	t.Helper()
+	return func(_ context.Context, artifact []byte, bundle []byte, identity string, issuer string) error {
+		if !reflect.DeepEqual(artifact, wantArtifact) {
+			t.Fatalf("signature artifact = %q, want %q", artifact, wantArtifact)
+		}
+		if !reflect.DeepEqual(bundle, wantBundle) {
+			t.Fatalf("signature bundle = %q, want %q", bundle, wantBundle)
+		}
+		if identity != "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v0.3.3" {
+			t.Fatalf("signature identity = %q, want owner/repo release workflow identity", identity)
+		}
+		if issuer != defaultCosignIssuer {
+			t.Fatalf("signature issuer = %q, want %q", issuer, defaultCosignIssuer)
+		}
+		return nil
 	}
 }
 

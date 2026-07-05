@@ -32,10 +32,16 @@ const (
 	DefaultAPIBaseURL = "https://api.github.com"
 	DefaultBaseURL    = "https://github.com"
 
-	EnvUpgradeRepo = "LOOPCODER_UPGRADE_REPO"
-	EnvInstallRepo = "LOOPCODER_INSTALL_REPO"
-	EnvAPIBaseURL  = "GITHUB_API_URL"
-	EnvBaseURL     = "GITHUB_BASE_URL"
+	EnvUpgradeRepo    = "LOOPCODER_UPGRADE_REPO"
+	EnvInstallRepo    = "LOOPCODER_INSTALL_REPO"
+	EnvAPIBaseURL     = "GITHUB_API_URL"
+	EnvBaseURL        = "GITHUB_BASE_URL"
+	EnvCosignIdentity = "LOOPCODER_COSIGN_IDENTITY"
+	EnvCosignIssuer   = "LOOPCODER_COSIGN_ISSUER"
+
+	checksumAssetName          = "SHA256SUMS"
+	checksumSignatureAssetName = "SHA256SUMS.sigstore"
+	defaultCosignIssuer        = "https://token.actions.githubusercontent.com"
 
 	commandHardCapDefault = 60 * time.Second
 )
@@ -89,6 +95,7 @@ type Deps struct {
 	HomeLayout      func() (home.Layout, error)
 	ExecutablePath  func() (string, error)
 	HTTPGet         func(context.Context, string) ([]byte, error)
+	VerifySignature func(ctx context.Context, artifact []byte, signatureBundle []byte, identity string, issuer string) error
 	ExtractBinary   func(archiveName string, data []byte, binaryName string) ([]byte, error)
 	MkdirAll        func(string, fs.FileMode) error
 	WriteFile       func(string, []byte, fs.FileMode) error
@@ -171,6 +178,7 @@ func DefaultDeps() Deps {
 			}
 			return data, nil
 		},
+		VerifySignature: verifySignatureWithCosign,
 		ExtractBinary:   ExtractBinary,
 		MkdirAll:        os.MkdirAll,
 		WriteFile:       os.WriteFile,
@@ -241,18 +249,31 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if !ok {
 		return result, fmt.Errorf("missing release asset %s for %s", assetName, result.Platform)
 	}
-	sums, ok := findAsset(rel, "SHA256SUMS")
+	sums, ok := findAsset(rel, checksumAssetName)
 	if !ok {
-		return result, errors.New("missing release asset SHA256SUMS")
+		return result, fmt.Errorf("missing release asset %s", checksumAssetName)
+	}
+	signature, ok := findAsset(rel, checksumSignatureAssetName)
+	if !ok {
+		return result, fmt.Errorf("missing release asset %s", checksumSignatureAssetName)
+	}
+
+	checksums, err := deps.HTTPGet(ctx, assetURL(sums, cfg, rel.TagName, checksumAssetName))
+	if err != nil {
+		return result, fmt.Errorf("download %s: %w", checksumAssetName, err)
+	}
+	signatureBundle, err := deps.HTTPGet(ctx, assetURL(signature, cfg, rel.TagName, checksumSignatureAssetName))
+	if err != nil {
+		return result, fmt.Errorf("download %s: %w", checksumSignatureAssetName, err)
+	}
+	identity, issuer := signatureTrust(deps, cfg, rel.TagName)
+	if err := deps.VerifySignature(ctx, checksums, signatureBundle, identity, issuer); err != nil {
+		return result, fmt.Errorf("verify %s signature: %w", checksumAssetName, err)
 	}
 
 	archiveBytes, err := deps.HTTPGet(ctx, assetURL(asset, cfg, rel.TagName, assetName))
 	if err != nil {
 		return result, fmt.Errorf("download %s: %w", assetName, err)
-	}
-	checksums, err := deps.HTTPGet(ctx, assetURL(sums, cfg, rel.TagName, "SHA256SUMS"))
-	if err != nil {
-		return result, fmt.Errorf("download SHA256SUMS: %w", err)
 	}
 	if err := VerifyChecksum(checksums, assetName, archiveBytes); err != nil {
 		return result, err
@@ -292,6 +313,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.HTTPGet == nil {
 		deps.HTTPGet = defaults.HTTPGet
+	}
+	if deps.VerifySignature == nil {
+		deps.VerifySignature = defaults.VerifySignature
 	}
 	if deps.ExtractBinary == nil {
 		deps.ExtractBinary = defaults.ExtractBinary
@@ -468,6 +492,68 @@ func assetURL(asset releaseAsset, cfg releaseConfig, tag string, name string) st
 		return asset.BrowserDownloadURL
 	}
 	return fmt.Sprintf("%s/%s/releases/download/%s/%s", cfg.BaseURL, cfg.Repo, url.PathEscape(tag), url.PathEscape(name))
+}
+
+func signatureTrust(deps Deps, cfg releaseConfig, tag string) (string, string) {
+	identity := strings.TrimSpace(deps.Getenv(EnvCosignIdentity))
+	if identity == "" {
+		identity = fmt.Sprintf("%s/%s/.github/workflows/release.yml@refs/tags/%s", cfg.BaseURL, cfg.Repo, tag)
+	}
+	issuer := strings.TrimSpace(deps.Getenv(EnvCosignIssuer))
+	if issuer == "" {
+		issuer = defaultCosignIssuer
+	}
+	return identity, issuer
+}
+
+func verifySignatureWithCosign(ctx context.Context, artifact []byte, signatureBundle []byte, identity string, issuer string) error {
+	if strings.TrimSpace(identity) == "" {
+		return errors.New("cosign certificate identity is empty")
+	}
+	if strings.TrimSpace(issuer) == "" {
+		return errors.New("cosign OIDC issuer is empty")
+	}
+
+	dir, err := os.MkdirTemp("", "loopcoder-upgrade-signature-*")
+	if err != nil {
+		return fmt.Errorf("create signature verification temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	artifactPath := filepath.Join(dir, checksumAssetName)
+	signaturePath := filepath.Join(dir, checksumSignatureAssetName)
+	if err := os.WriteFile(artifactPath, artifact, 0o600); err != nil {
+		return fmt.Errorf("write %s for signature verification: %w", checksumAssetName, err)
+	}
+	if err := os.WriteFile(signaturePath, signatureBundle, 0o600); err != nil {
+		return fmt.Errorf("write %s for signature verification: %w", checksumSignatureAssetName, err)
+	}
+
+	result, err := execRunCommand(ctx, "cosign", "verify-blob", artifactPath,
+		"--bundle", signaturePath,
+		"--certificate-identity", identity,
+		"--certificate-oidc-issuer", issuer)
+	if err != nil {
+		return fmt.Errorf("run cosign verify-blob: %w", err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("cosign verify-blob failed for identity %q and issuer %q: %s", identity, issuer, commandDetail(result))
+	}
+	return nil
+}
+
+func commandDetail(result CommandResult) string {
+	detail := strings.TrimSpace(result.Stderr)
+	if detail == "" {
+		detail = strings.TrimSpace(result.Stdout)
+	}
+	if detail == "" {
+		detail = fmt.Sprintf("exit code %d", result.ExitCode)
+	}
+	if len(detail) > 240 {
+		detail = detail[:240]
+	}
+	return detail
 }
 
 // VerifyChecksum verifies archive against its SHA256SUMS entry.
