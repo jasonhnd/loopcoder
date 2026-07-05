@@ -23,14 +23,19 @@ func LoadPlan(ctx context.Context, repoPath string, opts Options) (Plan, error) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
-		BaseBranch:     opts.BaseBranch,
-		ConfigFromBase: opts.ConfigFromBase,
-	})
+	cfg, err := loadAuditConfig(ctx, repoPath, opts)
 	if err != nil {
 		return Plan{}, err
 	}
 	return BuildPlan(repoPath, cfg.Audit, opts)
+}
+
+func loadAuditConfig(ctx context.Context, repoPath string, opts Options) (config.Config, error) {
+	return config.LoadForRepo(ctx, repoPath, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       opts.Stderr,
+	})
 }
 
 func BuildPlan(repoPath string, cfg config.Audit, opts Options) (Plan, error) {
@@ -62,6 +67,9 @@ func BuildPlan(repoPath string, cfg config.Audit, opts Options) (Plan, error) {
 		Layers:    layers,
 		Commands:  commands,
 		Native:    native,
+		Review: ReviewConfig{
+			RubricPath: strings.TrimSpace(cfg.Review.RubricPath),
+		},
 	}, nil
 }
 
@@ -78,16 +86,20 @@ func NormalizeLayers(values []string) ([]string, error) {
 				continue
 			}
 			if layer == "all" {
-				layer = LayerSAST
+				for _, expanded := range []string{LayerSAST, LayerLLM} {
+					if !seen[expanded] {
+						seen[expanded] = true
+						out = append(out, expanded)
+					}
+				}
+				continue
 			}
 			switch layer {
-			case LayerSAST:
+			case LayerSAST, LayerLLM:
 				if !seen[layer] {
 					seen[layer] = true
 					out = append(out, layer)
 				}
-			case LayerLLM:
-				return nil, errors.New("llm audit layer is not implemented in this slice")
 			default:
 				return nil, fmt.Errorf("unknown audit layer %q", part)
 			}
