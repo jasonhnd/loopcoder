@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/attestation"
 )
 
 const (
@@ -34,18 +37,24 @@ type Options struct {
 	ThresholdOverride string
 	BaseBranch        string
 	ConfigFromBase    bool
+	Provider          string
+	Model             string
+	Effort            string
+	Timeout           time.Duration
+	Stderr            io.Writer
 }
 
 type Result struct {
-	SchemaVersion   int          `json:"schema_version"`
-	Repo            string       `json:"repo"`
-	Layers          []string     `json:"layers"`
-	Threshold       string       `json:"threshold"`
-	Verdict         string       `json:"verdict"`
-	Findings        []Finding    `json:"findings"`
-	ToolResults     []ToolResult `json:"tool_results"`
-	NeedsHuman      []NeedsHuman `json:"needs_human"`
-	RuntimeFailures []string     `json:"runtime_failures,omitempty"`
+	SchemaVersion   int                            `json:"schema_version"`
+	Repo            string                         `json:"repo"`
+	Layers          []string                       `json:"layers"`
+	Threshold       string                         `json:"threshold"`
+	Verdict         string                         `json:"verdict"`
+	Findings        []Finding                      `json:"findings"`
+	ToolResults     []ToolResult                   `json:"tool_results"`
+	NeedsHuman      []NeedsHuman                   `json:"needs_human"`
+	Attestation     *attestation.AttestationRecord `json:"-"`
+	RuntimeFailures []string                       `json:"runtime_failures,omitempty"`
 }
 
 type Finding struct {
@@ -100,6 +109,11 @@ type Plan struct {
 	Layers    []string
 	Commands  []SASTCommand
 	Native    NativeConfig
+	Review    ReviewConfig
+}
+
+type ReviewConfig struct {
+	RubricPath string
 }
 
 type CommandInvocation struct {

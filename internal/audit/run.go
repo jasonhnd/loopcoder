@@ -11,18 +11,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 type Deps struct {
-	Runner CommandRunner
+	Runner      CommandRunner
+	AgentLookup func(provider string) (agent.Runner, error)
 }
 
 type ExecRunner struct{}
 
 func DefaultDeps() Deps {
-	return Deps{Runner: ExecRunner{}}
+	return Deps{
+		Runner:      ExecRunner{},
+		AgentLookup: agent.Lookup,
+	}
 }
 
 func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
@@ -34,7 +40,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	plan, err := LoadPlan(ctx, repoPath, opts)
+	cfg, err := loadAuditConfig(ctx, repoPath, opts)
+	if err != nil {
+		result := NewResult(repoPath, []string{LayerSAST}, SeverityMedium)
+		result.RuntimeFailures = append(result.RuntimeFailures, err.Error())
+		return Finalize(result), nil
+	}
+	plan, err := BuildPlan(repoPath, cfg.Audit, opts)
 	if err != nil {
 		result := NewResult(repoPath, []string{LayerSAST}, SeverityMedium)
 		result.RuntimeFailures = append(result.RuntimeFailures, err.Error())
@@ -45,6 +57,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if containsLayer(plan.Layers, LayerSAST) {
 		runSASTLayer(ctx, repoPath, plan, deps, &result)
 	}
+	if containsLayer(plan.Layers, LayerLLM) {
+		runLLMLayer(ctx, repoPath, cfg, plan, opts, deps, &result)
+	}
 
 	return Finalize(result), nil
 }
@@ -54,7 +69,30 @@ func withDefaults(deps Deps) Deps {
 	if deps.Runner == nil {
 		deps.Runner = defaults.Runner
 	}
+	if deps.AgentLookup == nil {
+		deps.AgentLookup = defaults.AgentLookup
+	}
 	return deps
+}
+
+func reviewProviderOptions(cfg config.Config, opts Options) (provider, model, effort string, timeout time.Duration) {
+	provider = strings.TrimSpace(opts.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(cfg.Adapters.Verifier)
+	}
+	model = strings.TrimSpace(opts.Model)
+	if model == "" {
+		model = strings.TrimSpace(cfg.Verifier.Model)
+	}
+	effort = strings.TrimSpace(opts.Effort)
+	if effort == "" {
+		effort = strings.TrimSpace(cfg.Verifier.ReasoningEffort)
+	}
+	timeout = opts.Timeout
+	if timeout <= 0 {
+		timeout = config.DurationSeconds(cfg.Resilience.Verifier.HardCapSeconds, lcdefaults.VerifierTimeout)
+	}
+	return provider, model, effort, timeout
 }
 
 func runSASTLayer(ctx context.Context, repoPath string, plan Plan, deps Deps, result *Result) {
