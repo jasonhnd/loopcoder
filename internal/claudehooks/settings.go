@@ -231,7 +231,7 @@ func decodeSettings(data []byte) (map[string]any, error) {
 		return nil, fmt.Errorf("parse Claude Code settings JSON: %w", err)
 	}
 	if settings == nil {
-		return nil, errors.New("Claude Code settings must be a JSON object")
+		return nil, errors.New("claude Code settings must be a JSON object")
 	}
 	return settings, nil
 }
@@ -243,7 +243,7 @@ func objectField(parent map[string]any, name string) (map[string]any, bool, erro
 	}
 	object, ok := value.(map[string]any)
 	if !ok {
-		return nil, false, fmt.Errorf("Claude Code settings field %q must be an object", name)
+		return nil, false, fmt.Errorf("claude Code settings field %q must be an object", name)
 	}
 	return object, true, nil
 }
@@ -260,7 +260,7 @@ func ensurePostToolUse(hooks map[string]any, required RequiredHook) (bool, error
 	for index := range entries {
 		entry, ok := entries[index].(map[string]any)
 		if !ok {
-			return false, fmt.Errorf("Claude Code hook event %q entry %d must be an object", required.Event, index)
+			return false, fmt.Errorf("claude Code hook event %q entry %d must be an object", required.Event, index)
 		}
 		if matcher, _ := entry["matcher"].(string); matcher != required.Matcher {
 			continue
@@ -308,7 +308,7 @@ func ensureStop(hooks map[string]any, required RequiredHook) (bool, error) {
 	for index := range entries {
 		entry, ok := entries[index].(map[string]any)
 		if !ok {
-			return false, fmt.Errorf("Claude Code hook event %q entry %d must be an object", required.Event, index)
+			return false, fmt.Errorf("claude Code hook event %q entry %d must be an object", required.Event, index)
 		}
 		if target < 0 {
 			target = index
@@ -347,7 +347,7 @@ func eventEntries(hooks map[string]any, event string) ([]any, bool, error) {
 	}
 	entries, ok := value.([]any)
 	if !ok {
-		return nil, false, fmt.Errorf("Claude Code hooks.%s must be an array", event)
+		return nil, false, fmt.Errorf("claude Code hooks.%s must be an array", event)
 	}
 	return entries, true, nil
 }
@@ -363,14 +363,14 @@ func ensureCommandHook(entry map[string]any, command string, appendIfMissing boo
 	}
 	hooks, ok := hooksValue.([]any)
 	if !ok {
-		return false, false, errors.New("Claude Code hook entry field \"hooks\" must be an array")
+		return false, false, errors.New("claude Code hook entry field \"hooks\" must be an array")
 	}
 
 	changed := false
 	for index := range hooks {
 		hook, ok := hooks[index].(map[string]any)
 		if !ok {
-			return false, false, fmt.Errorf("Claude Code command hook %d must be an object", index)
+			return false, false, fmt.Errorf("claude Code command hook %d must be an object", index)
 		}
 		if hookCommand, _ := hook["command"].(string); hookCommand != command {
 			continue
@@ -396,7 +396,7 @@ func hasRequiredHook(hooks map[string]any, required RequiredHook) (bool, error) 
 	for index := range entries {
 		entry, ok := entries[index].(map[string]any)
 		if !ok {
-			return false, fmt.Errorf("Claude Code hook event %q entry %d must be an object", required.Event, index)
+			return false, fmt.Errorf("claude Code hook event %q entry %d must be an object", required.Event, index)
 		}
 		if required.Matcher != "" {
 			matcher, _ := entry["matcher"].(string)
@@ -422,12 +422,12 @@ func hasCommandHook(entry map[string]any, command string) (bool, error) {
 	}
 	hooks, ok := hooksValue.([]any)
 	if !ok {
-		return false, errors.New("Claude Code hook entry field \"hooks\" must be an array")
+		return false, errors.New("claude Code hook entry field \"hooks\" must be an array")
 	}
 	for index := range hooks {
 		hook, ok := hooks[index].(map[string]any)
 		if !ok {
-			return false, fmt.Errorf("Claude Code command hook %d must be an object", index)
+			return false, fmt.Errorf("claude Code command hook %d must be an object", index)
 		}
 		if hookCommand, _ := hook["command"].(string); hookCommand != command {
 			continue

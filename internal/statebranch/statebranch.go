@@ -926,17 +926,6 @@ func writeLogArtifacts(sourceRun, destRun, runID string, written map[string]bool
 	return nil
 }
 
-func discoverLogSources(sourceRun string) []string {
-	sources := discoverLogSourceResults(sourceRun)
-	out := make([]string, 0, len(sources))
-	for _, source := range sources {
-		if source.Error == "" {
-			out = append(out, source.ReadPath)
-		}
-	}
-	return out
-}
-
 func discoverLogSourceResults(sourceRun string) []logSource {
 	candidates := []string{}
 	seenCandidates := map[string]bool{}
