@@ -39,7 +39,7 @@ func newKillGroup(runID string) killGroup {
 	if _, err := windows.SetInformationJobObject(
 		job,
 		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)),
+		uintptr(unsafe.Pointer(&info)), // #nosec G103 -- documented Windows syscall interop: JOBOBJECT_EXTENDED_LIMIT_INFORMATION is passed only for this immediate call.
 		uint32(unsafe.Sizeof(info)),
 	); err != nil {
 		windows.CloseHandle(job)
@@ -55,7 +55,7 @@ func (g *windowsKillGroup) adopt(cmd *exec.Cmd) error {
 	if g.job == 0 || cmd.Process == nil {
 		return nil
 	}
-	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.PROCESS_SET_QUOTA, false, uint32(cmd.Process.Pid))
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.PROCESS_SET_QUOTA, false, uint32(cmd.Process.Pid)) // #nosec G115 -- Windows OpenProcess takes a DWORD PID; cmd.Process.Pid comes from operator-trusted process control.
 	if err != nil {
 		return err
 	}

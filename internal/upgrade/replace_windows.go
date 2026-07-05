@@ -25,8 +25,8 @@ func scheduleReplace(source string, target string) error {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	moveFileExW := kernel32.NewProc("MoveFileExW")
 	ret, _, callErr := moveFileExW.Call(
-		uintptr(unsafe.Pointer(sourcePtr)),
-		uintptr(unsafe.Pointer(targetPtr)),
+		uintptr(unsafe.Pointer(sourcePtr)), // #nosec G103 -- documented Windows syscall interop: UTF-16 pointer is converted only for this immediate Call.
+		uintptr(unsafe.Pointer(targetPtr)), // #nosec G103 -- documented Windows syscall interop: UTF-16 pointer is converted only for this immediate Call.
 		uintptr(movefileReplaceExisting|movefileDelayUntilReboot),
 	)
 	if ret == 0 {
