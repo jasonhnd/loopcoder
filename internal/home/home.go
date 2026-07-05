@@ -188,9 +188,7 @@ func compareInstalledVersion(a, b string) int {
 }
 
 func parseInstalledSemver(version string) (installedSemver, bool) {
-	if strings.HasPrefix(version, "v") {
-		version = strings.TrimPrefix(version, "v")
-	}
+	version = strings.TrimPrefix(version, "v")
 
 	parts := strings.Split(version, ".")
 	if len(parts) != 3 {

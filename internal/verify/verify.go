@@ -357,9 +357,7 @@ func checkoutIsolated(ctx context.Context, deps Deps, repoPath, worktreePath str
 	}
 
 	remoteBranch := opts.Branch
-	if strings.HasPrefix(remoteBranch, "origin/") {
-		remoteBranch = strings.TrimPrefix(remoteBranch, "origin/")
-	}
+	remoteBranch = strings.TrimPrefix(remoteBranch, "origin/")
 	if err := deps.Git.FetchOriginBranch(ctx, worktreePath, remoteBranch); err == nil {
 		if err := deps.Git.CheckoutDetached(ctx, worktreePath, "FETCH_HEAD"); err != nil {
 			return fmt.Errorf("could not check out fetched branch %q: %w", opts.Branch, err)
