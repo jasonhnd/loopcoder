@@ -30,6 +30,7 @@ type Config struct {
 	Evidence     Evidence     `yaml:"evidence"`
 	Domain       Domain       `yaml:"domain,omitempty"`
 	MCP          MCP          `yaml:"mcp,omitempty"`
+	Audit        Audit        `yaml:"audit,omitempty"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -234,6 +235,42 @@ type MCPAuth struct {
 	Env    string `yaml:"env,omitempty"`
 }
 
+// Audit is the optional 0.5.3 audit command configuration surface. It is
+// additive: absent fields preserve built-in audit defaults.
+type Audit struct {
+	SeverityThreshold string        `yaml:"severity_threshold,omitempty"`
+	SAST              AuditSAST     `yaml:"sast,omitempty"`
+	Review            AuditReview   `yaml:"review,omitempty"`
+	Baseline          AuditBaseline `yaml:"baseline,omitempty"`
+}
+
+type AuditSAST struct {
+	Commands []AuditSASTCommand `yaml:"commands,omitempty"`
+	Native   AuditSASTNative    `yaml:"native,omitempty"`
+}
+
+type AuditSASTCommand struct {
+	ID             string   `yaml:"id,omitempty"`
+	Argv           []string `yaml:"argv,omitempty"`
+	Parser         string   `yaml:"parser,omitempty"`
+	TimeoutSeconds int      `yaml:"timeout_seconds,omitempty"`
+}
+
+type AuditSASTNative struct {
+	Secrets         *bool    `yaml:"secrets,omitempty"`
+	FilePermissions *bool    `yaml:"file_permissions,omitempty"`
+	Include         []string `yaml:"include,omitempty"`
+	Exclude         []string `yaml:"exclude,omitempty"`
+}
+
+type AuditReview struct {
+	RubricPath string `yaml:"rubric_path,omitempty"`
+}
+
+type AuditBaseline struct {
+	Path string `yaml:"path,omitempty"`
+}
+
 type MCPReadOnlyPolicy int
 
 const (
@@ -367,6 +404,9 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateDomainCommands(cfg.Domain); err != nil {
+		return Config{}, err
+	}
+	if err := validateAudit(cfg.Audit); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -748,6 +788,43 @@ func validateDomainCommands(domain Domain) error {
 		return nil
 	}
 	return nil
+}
+
+func validateAudit(a Audit) error {
+	threshold := strings.ToLower(strings.TrimSpace(a.SeverityThreshold))
+	if threshold != "" && !validAuditSeverity(threshold) {
+		return fmt.Errorf("invalid delivery config: audit.severity_threshold %q is not one of critical, high, medium, low, info", a.SeverityThreshold)
+	}
+	for index, command := range a.SAST.Commands {
+		path := fmt.Sprintf("audit.sast.commands[%d]", index)
+		if strings.TrimSpace(command.ID) == "" {
+			return fmt.Errorf("invalid delivery config: %s.id is required", path)
+		}
+		if len(command.Argv) == 0 {
+			return fmt.Errorf("invalid delivery config: %s.argv must be a non-empty array of non-empty strings", path)
+		}
+		for argIndex, arg := range command.Argv {
+			if strings.TrimSpace(arg) == "" {
+				return fmt.Errorf("invalid delivery config: %s.argv[%d] must not be empty", path, argIndex)
+			}
+		}
+		if strings.TrimSpace(command.Parser) == "" {
+			return fmt.Errorf("invalid delivery config: %s.parser is required", path)
+		}
+		if command.TimeoutSeconds < 0 {
+			return fmt.Errorf("invalid delivery config: %s.timeout_seconds must not be negative", path)
+		}
+	}
+	return nil
+}
+
+func validAuditSeverity(severity string) bool {
+	switch severity {
+	case "critical", "high", "medium", "low", "info":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateCommandSpec(path, command string, argv []string) (bool, error) {

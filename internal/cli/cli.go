@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -68,6 +69,7 @@ type Deps struct {
 	Promote          func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
 	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
 	Verify           func(ctx context.Context, opts verify.Options) verify.Result
+	Audit            func(ctx context.Context, opts audit.Options) (audit.Result, error)
 	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
 	Init             func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	Upgrade          func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
@@ -81,6 +83,7 @@ type Deps struct {
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "version", Summary: "print version and build information"},
+	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
@@ -172,6 +175,9 @@ func DefaultDeps() Deps {
 		Verify: func(ctx context.Context, opts verify.Options) verify.Result {
 			return verify.Run(ctx, opts, verify.DefaultDeps())
 		},
+		Audit: func(ctx context.Context, opts audit.Options) (audit.Result, error) {
+			return audit.Run(ctx, opts, audit.DefaultDeps())
+		},
 		Doctor: func(ctx context.Context, opts doctor.Options) doctor.Report {
 			return doctor.Run(ctx, opts, doctor.DefaultDeps())
 		},
@@ -238,6 +244,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "version" {
 		return runVersion(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "audit" {
+		return runAudit(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "doctor" {
 		return runDoctor(args[1:], stdout, stderr, deps)
@@ -386,6 +395,23 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
+	}
+	if command.Name == "audit" {
+		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
+		fmt.Fprintln(w, "  --format string               output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --layer string                audit layer to run; repeatable or comma-separated (default \"sast\")")
+		fmt.Fprintln(w, "  --layers string               alias for --layer")
+		fmt.Fprintln(w, "  --severity-threshold string   one-run severity threshold override")
+		fmt.Fprintln(w, "  --threshold string            alias for --severity-threshold")
+		fmt.Fprintf(w, "  --base-branch string          base branch for config lookup (default %q)\n", lcdefaults.BaseBranch)
+		fmt.Fprintln(w, "  --config-from-base            read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Exit codes:")
+		fmt.Fprintln(w, "  0   clean audit verdict")
+		fmt.Fprintln(w, "  1   findings at or above the configured threshold")
+		fmt.Fprintln(w, "  2   needs-human audit verdict")
+		fmt.Fprintln(w, "  3   command/runtime failure")
+		fmt.Fprintln(w, "  4   pending local relay block; run `loopcoder relay flush` before mechanical progress")
 	}
 	if command.Name == "init" {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
