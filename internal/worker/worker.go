@@ -22,7 +22,6 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -301,7 +300,7 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		return Result{}, err
 	}
 	resilience := cfg.Resilience
-	domainPolicy, err := resolveDomainWorkerPolicy(ctx, repoPath, opts.BaseBranch, opts.ConfigFromBase, cfg)
+	domainPolicy, err := resolveDomainWorkerPolicy(cfg)
 	if err != nil {
 		return Result{}, err
 	}
@@ -855,7 +854,7 @@ func (p domainWorkerPolicy) AgentLivenessMode() string {
 	return string(p.LivenessMode)
 }
 
-func resolveDomainWorkerPolicy(ctx context.Context, repoPath, baseBranch string, configFromBase bool, cfg config.Config) (domainWorkerPolicy, error) {
+func resolveDomainWorkerPolicy(cfg config.Config) (domainWorkerPolicy, error) {
 	policy := domainWorkerPolicy{
 		PartialWorkMode: partialWorkModeHarvestNeedsHuman,
 		LivenessMode:    supervisedexec.LivenessModeWorktreeMTime,
@@ -872,19 +871,31 @@ func resolveDomainWorkerPolicy(ctx context.Context, repoPath, baseBranch string,
 
 	switch mode := strings.ToLower(strings.TrimSpace(cfg.Domain.Liveness.Mode)); mode {
 	case "", string(supervisedexec.LivenessModeWorktreeMTime):
+		if domainLivenessCommandConfigured(cfg.Domain.Liveness) {
+			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.command and domain.liveness.argv are only valid when domain.liveness.mode is \"custom\"")
+		}
 		policy.LivenessMode = supervisedexec.LivenessModeWorktreeMTime
 	case string(supervisedexec.LivenessModeLogOnly):
+		if domainLivenessCommandConfigured(cfg.Domain.Liveness) {
+			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.command and domain.liveness.argv are only valid when domain.liveness.mode is \"custom\"")
+		}
 		policy.LivenessMode = supervisedexec.LivenessModeLogOnly
 	case string(supervisedexec.LivenessModeCustom):
-		command, err := readDomainLivenessCommand(ctx, repoPath, baseBranch, configFromBase)
-		if err != nil {
-			return domainWorkerPolicy{}, err
+		command := strings.TrimSpace(cfg.Domain.Liveness.Command)
+		hasCommand := command != ""
+		hasArgv := len(cfg.Domain.Liveness.Argv) > 0
+		if hasCommand && hasArgv {
+			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.command and domain.liveness.argv are mutually exclusive")
 		}
-		if strings.TrimSpace(command) == "" {
-			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.command is required when domain.liveness.mode is custom")
+		if !hasCommand && !hasArgv {
+			return domainWorkerPolicy{}, errors.New("invalid delivery config: domain.liveness.mode custom requires exactly one of domain.liveness.command or domain.liveness.argv")
 		}
 		policy.LivenessMode = supervisedexec.LivenessModeCustom
-		policy.LivenessCommand = strings.TrimSpace(command)
+		if hasArgv {
+			policy.LivenessCommand = supervisedexec.EncodeLivenessArgv(cfg.Domain.Liveness.Argv)
+		} else {
+			policy.LivenessCommand = command
+		}
 	default:
 		return domainWorkerPolicy{}, fmt.Errorf("invalid delivery config: domain.liveness.mode must be %q, %q, or %q, got %q", supervisedexec.LivenessModeWorktreeMTime, supervisedexec.LivenessModeLogOnly, supervisedexec.LivenessModeCustom, cfg.Domain.Liveness.Mode)
 	}
@@ -892,54 +903,8 @@ func resolveDomainWorkerPolicy(ctx context.Context, repoPath, baseBranch string,
 	return policy, nil
 }
 
-func readDomainLivenessCommand(ctx context.Context, repoPath, baseBranch string, configFromBase bool) (string, error) {
-	data, err := readDeliveryConfigForDomainPolicy(ctx, repoPath, baseBranch, configFromBase)
-	if err != nil {
-		return "", err
-	}
-	if len(data) == 0 {
-		return "", nil
-	}
-	var raw struct {
-		Domain struct {
-			Liveness struct {
-				Command string `yaml:"command"`
-			} `yaml:"liveness"`
-		} `yaml:"domain"`
-	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("parse domain.liveness.command: %w", err)
-	}
-	return strings.TrimSpace(raw.Domain.Liveness.Command), nil
-}
-
-func readDeliveryConfigForDomainPolicy(ctx context.Context, repoPath, baseBranch string, configFromBase bool) ([]byte, error) {
-	data, err := os.ReadFile(filepath.Join(repoPath, ".delivery.yml"))
-	if err == nil {
-		return data, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read delivery config for domain policy: %w", err)
-	}
-	if !configFromBase {
-		return nil, nil
-	}
-	content, err := gitutil.New().Show(ctx, repoPath, normalizeDomainPolicyBaseBranch(baseBranch)+":.delivery.yml")
-	if err != nil {
-		if gitutil.IsPathAbsentOnRef(err, ".delivery.yml") {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read base delivery config for domain policy: %w", err)
-	}
-	return []byte(content), nil
-}
-
-func normalizeDomainPolicyBaseBranch(baseBranch string) string {
-	baseBranch = strings.TrimSpace(baseBranch)
-	if baseBranch == "" {
-		return "main"
-	}
-	return baseBranch
+func domainLivenessCommandConfigured(liveness config.DomainLiveness) bool {
+	return strings.TrimSpace(liveness.Command) != "" || len(liveness.Argv) > 0
 }
 
 func MarshalResult(result Result) ([]byte, error) {

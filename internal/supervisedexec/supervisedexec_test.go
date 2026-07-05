@@ -239,6 +239,37 @@ func TestRunCustomLivenessExtendsStallWindow(t *testing.T) {
 	}
 }
 
+func TestRunCustomLivenessArgvDoesNotUseShell(t *testing.T) {
+	t.Setenv("GO_WANT_SUPERVISEDEXEC_HELPER", "1")
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "write-then-sleep", logPath, "1200ms")
+	literal := "alive && exit 9"
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:                10 * time.Second,
+		StallTimeout:           800 * time.Millisecond,
+		LogPath:                logPath,
+		LivenessMode:           LivenessModeCustom,
+		LivenessCommand:        EncodeLivenessArgv([]string{os.Args[0], "-test.run=TestHelperProcess", "--", "assert-arg", literal}),
+		LivenessCommandHardCap: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v because argv liveness reports progress", result.Outcome, OutcomeCompleted)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile log: %v", err)
+	}
+	for _, want := range []string{"custom liveness ok", literal} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("custom liveness argv log missing %q:\n%s", want, string(data))
+		}
+	}
+}
+
 func TestRunCustomLivenessFailureDoesNotSelfSignal(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
 	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
@@ -335,6 +366,68 @@ func TestObserveWorktreeRootErrorWarnsAndReturnsZeroObservation(t *testing.T) {
 		if !strings.Contains(warnings.String(), want) {
 			t.Fatalf("warning missing %q:\n%s", want, warnings.String())
 		}
+	}
+}
+
+func TestObserveWorktreeSkipsGeneratedDirsAndEarlyExitsOnProgress(t *testing.T) {
+	oldLimit := worktreeLivenessMaxFiles
+	worktreeLivenessMaxFiles = 1
+	t.Cleanup(func() {
+		worktreeLivenessMaxFiles = oldLimit
+	})
+
+	root := t.TempDir()
+	base := time.Now().Add(-time.Hour)
+	if err := writeFileWithMTime(filepath.Join(root, "a-new.txt"), "new", base.Add(time.Minute)); err != nil {
+		t.Fatalf("write new file: %v", err)
+	}
+	if err := writeFileWithMTime(filepath.Join(root, "b-old.txt"), "old", base); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	if err := writeFileWithMTime(filepath.Join(root, ".git", "index"), "ignored", base.Add(2*time.Minute)); err != nil {
+		t.Fatalf("write git file: %v", err)
+	}
+	if err := writeFileWithMTime(filepath.Join(root, "node_modules", "pkg", "index.js"), "ignored", base.Add(3*time.Minute)); err != nil {
+		t.Fatalf("write generated file: %v", err)
+	}
+
+	observation := observeWorktreeAfter(root, base)
+	if observation.rootErr != nil {
+		t.Fatalf("rootErr = %v, want nil because first newer tracked file should early-exit before cap", observation.rootErr)
+	}
+	if observation.filesExamined != 1 {
+		t.Fatalf("filesExamined = %d, want early exit after first file", observation.filesExamined)
+	}
+	if !observation.latestModTime.After(base) {
+		t.Fatalf("latestModTime = %s, want newer than baseline", observation.latestModTime)
+	}
+}
+
+func TestObserveWorktreeCapsWalkWithDiagnosticFallback(t *testing.T) {
+	oldLimit := worktreeLivenessMaxFiles
+	worktreeLivenessMaxFiles = 1
+	t.Cleanup(func() {
+		worktreeLivenessMaxFiles = oldLimit
+	})
+
+	root := t.TempDir()
+	base := time.Now().Add(-time.Hour)
+	if err := writeFileWithMTime(filepath.Join(root, "a-old.txt"), "old", base); err != nil {
+		t.Fatalf("write first file: %v", err)
+	}
+	if err := writeFileWithMTime(filepath.Join(root, "b-old.txt"), "old", base); err != nil {
+		t.Fatalf("write second file: %v", err)
+	}
+	if err := writeFileWithMTime(filepath.Join(root, ".git", "index"), "ignored", base.Add(time.Hour)); err != nil {
+		t.Fatalf("write git file: %v", err)
+	}
+
+	observation := observeWorktreeAfter(root, base.Add(time.Minute))
+	if observation.rootErr == nil {
+		t.Fatal("rootErr = nil, want file cap diagnostic")
+	}
+	if !strings.Contains(observation.rootErr.Error(), "worktree liveness file cap exceeded after 1 files") {
+		t.Fatalf("rootErr = %v, want file cap diagnostic", observation.rootErr)
 	}
 }
 
@@ -500,6 +593,13 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "assert-arg":
+		if len(args) != 1 {
+			fmt.Fprintf(os.Stderr, "assert-arg got %d args\n", len(args))
+			os.Exit(2)
+		}
+		fmt.Println(args[0])
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
@@ -567,6 +667,16 @@ func appendLog(path, line string) {
 		fmt.Fprintf(os.Stderr, "close log: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func writeFileWithMTime(path, content string, mtime time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+	return os.Chtimes(path, mtime, mtime)
 }
 
 func updateWorktreeActivity(worktreePath string, index int) {

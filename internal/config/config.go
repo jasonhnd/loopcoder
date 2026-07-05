@@ -188,6 +188,7 @@ type DomainEvidence struct {
 
 type DomainEvidenceProducer struct {
 	Command             string   `yaml:"command,omitempty"`
+	Argv                []string `yaml:"argv,omitempty"`
 	Outputs             []string `yaml:"outputs,omitempty"`
 	TimeoutSeconds      int      `yaml:"timeout_seconds,omitempty"`
 	IncludeInLoopreview *bool    `yaml:"include_in_loopreview,omitempty"`
@@ -204,7 +205,9 @@ type DomainPartialWork struct {
 }
 
 type DomainLiveness struct {
-	Mode string `yaml:"mode,omitempty"`
+	Mode    string   `yaml:"mode,omitempty"`
+	Command string   `yaml:"command,omitempty"`
+	Argv    []string `yaml:"argv,omitempty"`
 }
 
 // MCP is the optional 0.5.0 MCP server schema. Provider wiring lands in later
@@ -344,6 +347,9 @@ func Parse(data []byte) (Config, error) {
 	if err := validateMCP(cfg.MCP); err != nil {
 		return Config{}, err
 	}
+	if err := validateDomainCommands(cfg.Domain); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -431,6 +437,68 @@ func validateMCP(m MCP) error {
 		}
 	}
 	return nil
+}
+
+func validateDomainCommands(domain Domain) error {
+	producerConfigured, err := validateCommandSpec("domain.evidence.producer", domain.Evidence.Producer.Command, domain.Evidence.Producer.Argv)
+	if err != nil {
+		return err
+	}
+	if producerConfigured && len(normalizeNonEmptyStrings(domain.Evidence.Producer.Outputs)) == 0 {
+		return errors.New("invalid delivery config: domain.evidence.producer.outputs is required when domain.evidence.producer.command or domain.evidence.producer.argv is configured")
+	}
+
+	livenessConfigured, err := validateCommandSpec("domain.liveness", domain.Liveness.Command, domain.Liveness.Argv)
+	if err != nil {
+		return err
+	}
+	switch mode := strings.ToLower(strings.TrimSpace(domain.Liveness.Mode)); mode {
+	case "":
+		if livenessConfigured {
+			return errors.New("invalid delivery config: domain.liveness.mode must be \"custom\" when domain.liveness.command or domain.liveness.argv is configured")
+		}
+	case "worktree-mtime", "log-only":
+		if livenessConfigured {
+			return fmt.Errorf("invalid delivery config: domain.liveness.command and domain.liveness.argv are only valid when domain.liveness.mode is %q", "custom")
+		}
+	case "custom":
+		if !livenessConfigured {
+			return errors.New("invalid delivery config: domain.liveness.mode custom requires exactly one of domain.liveness.command or domain.liveness.argv")
+		}
+	default:
+		return nil
+	}
+	return nil
+}
+
+func validateCommandSpec(path, command string, argv []string) (bool, error) {
+	hasCommand := strings.TrimSpace(command) != ""
+	hasArgv := argv != nil
+	if hasCommand && hasArgv {
+		return false, fmt.Errorf("invalid delivery config: %s.command and %s.argv are mutually exclusive", path, path)
+	}
+	if !hasArgv {
+		return hasCommand, nil
+	}
+	if len(argv) == 0 {
+		return false, fmt.Errorf("invalid delivery config: %s.argv must be a non-empty array of non-empty strings", path)
+	}
+	for index, arg := range argv {
+		if strings.TrimSpace(arg) == "" {
+			return false, fmt.Errorf("invalid delivery config: %s.argv[%d] must not be empty", path, index)
+		}
+	}
+	return true, nil
+}
+
+func normalizeNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func showBaseConfig(ctx context.Context, repoPath, baseBranch string, show ShowBaseConfigFunc) ([]byte, bool, error) {
