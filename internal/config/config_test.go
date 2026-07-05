@@ -235,6 +235,7 @@ domain:
 mcp:
   servers:
     - name: local-index
+      command: ./tools/local-index
 `)
 
 	cfg, err := Parse(data)
@@ -403,10 +404,12 @@ mcp:
   future_mcp_field: ok
   servers:
     - name: governance-index
-      transport: stdio
+      transport: http
+      url: https://mcp.example.com/governance
       future_server_field: ok
       auth:
         header: Authorization
+        env: GOVERNANCE_MCP_TOKEN
         future_auth_field: ok
 `)
 

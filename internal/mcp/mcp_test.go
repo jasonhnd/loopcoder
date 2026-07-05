@@ -96,6 +96,27 @@ func TestServersForInvocationAllowsUnrestrictedRoles(t *testing.T) {
 	}
 }
 
+func TestServersForInvocationFiltersVerifierWriteServerBeforeDeclarationValidation(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+mcp:
+  servers:
+    - name: bad/name
+      transport: websocket
+      roles: [verifier]
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error for verifier write-capable MCP server filtered from read-only invocation: %v", err)
+	}
+
+	servers, err := ServersForInvocation(cfg.MCP, RoleVerifier, true)
+	if err != nil {
+		t.Fatalf("ServersForInvocation returned error for filtered verifier write server: %v", err)
+	}
+	if len(servers) != 0 {
+		t.Fatalf("servers = %#v, want filtered write-capable verifier server", servers)
+	}
+}
+
 func TestServersForInvocationRejectsUnknownRoles(t *testing.T) {
 	cfg := config.MCP{
 		Servers: []config.MCPServer{{
