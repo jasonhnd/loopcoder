@@ -69,7 +69,7 @@ func TestDefaultMarshalOmitsAbsentDomainAndMCP(t *testing.T) {
 		t.Fatalf("yaml.Marshal(Default()) returned error: %v", err)
 	}
 	text := string(data)
-	for _, notWant := range []string{"domain:", "mcp:"} {
+	for _, notWant := range []string{"domain:", "mcp:", "audit:"} {
 		if strings.Contains(text, notWant) {
 			t.Fatalf("yaml.Marshal(Default()) contained %q:\n%s", notWant, text)
 		}
@@ -263,6 +263,136 @@ mcp:
 	}
 	if cfg.MCP.Servers[0].Auth != (MCPAuth{}) || cfg.MCP.Servers[0].ReadOnly {
 		t.Fatalf("partial MCP server = %#v, want zero auth and read_only false", cfg.MCP.Servers[0])
+	}
+}
+
+func TestParseReadsAuditSection(t *testing.T) {
+	cfg, err := Parse([]byte(`
+audit:
+  severity_threshold: high
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+        parser: govulncheck-json
+        timeout_seconds: 120
+    native:
+      secrets: false
+      file_permissions: true
+      include:
+        - "**/*.go"
+      exclude:
+        - "vendor/**"
+  review:
+    rubric_path: docs/security/audit-rubric.md
+  baseline:
+    path: docs/security/audit-baseline.yml
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Audit.SeverityThreshold != "high" {
+		t.Fatalf("SeverityThreshold = %q, want high", cfg.Audit.SeverityThreshold)
+	}
+	if len(cfg.Audit.SAST.Commands) != 1 {
+		t.Fatalf("Commands = %#v, want one", cfg.Audit.SAST.Commands)
+	}
+	command := cfg.Audit.SAST.Commands[0]
+	if command.ID != "govulncheck" || command.Parser != "govulncheck-json" || command.TimeoutSeconds != 120 {
+		t.Fatalf("command = %#v", command)
+	}
+	if !reflect.DeepEqual(command.Argv, []string{"govulncheck", "-json", "./..."}) {
+		t.Fatalf("Argv = %#v", command.Argv)
+	}
+	if cfg.Audit.SAST.Native.Secrets == nil || *cfg.Audit.SAST.Native.Secrets {
+		t.Fatalf("Native.Secrets = %#v, want false pointer", cfg.Audit.SAST.Native.Secrets)
+	}
+	if cfg.Audit.SAST.Native.FilePermissions == nil || !*cfg.Audit.SAST.Native.FilePermissions {
+		t.Fatalf("Native.FilePermissions = %#v, want true pointer", cfg.Audit.SAST.Native.FilePermissions)
+	}
+	if cfg.Audit.Review.RubricPath != "docs/security/audit-rubric.md" {
+		t.Fatalf("RubricPath = %q", cfg.Audit.Review.RubricPath)
+	}
+	if cfg.Audit.Baseline.Path != "docs/security/audit-baseline.yml" {
+		t.Fatalf("Baseline.Path = %q", cfg.Audit.Baseline.Path)
+	}
+}
+
+func TestParseRejectsInvalidAuditConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "bad severity threshold",
+			body: `audit:
+  severity_threshold: urgent
+`,
+			want: "audit.severity_threshold",
+		},
+		{
+			name: "missing argv",
+			body: `audit:
+  sast:
+    commands:
+      - id: bad
+        parser: generic-line
+`,
+			want: "audit.sast.commands[0].argv",
+		},
+		{
+			name: "empty argv element",
+			body: `audit:
+  sast:
+    commands:
+      - argv: ["tool", ""]
+        parser: generic-line
+`,
+			want: "audit.sast.commands[0].argv[1]",
+		},
+		{
+			name: "missing parser",
+			body: `audit:
+  sast:
+    commands:
+      - argv: ["tool"]
+`,
+			want: "audit.sast.commands[0].parser is required",
+		},
+		{
+			name: "unknown parser",
+			body: `audit:
+  sast:
+    commands:
+      - argv: ["tool"]
+        parser: mystery-json
+`,
+			want: "parser",
+		},
+		{
+			name: "negative timeout",
+			body: `audit:
+  sast:
+    commands:
+      - argv: ["tool"]
+        parser: generic-line
+        timeout_seconds: -1
+`,
+			want: "timeout_seconds",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil {
+				t.Fatal("Parse returned nil error, want invalid audit config")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
 	}
 }
 

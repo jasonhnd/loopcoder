@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
@@ -144,6 +145,124 @@ func TestVersionDefaultsToDevBuildInfo(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("version output missing %q:\n%s", want, output)
 		}
+	}
+}
+
+func TestAuditRunsWithInjectedAuditAndRendersJSON(t *testing.T) {
+	repo := t.TempDir()
+	called := false
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{
+		"audit",
+		"--repo", repo,
+		"--format", "json",
+		"--layer", "sast",
+		"--threshold", "low",
+		"--base-branch", "trunk",
+		"--config-from-base",
+	}, &stdout, &stderr, Deps{
+		Audit: func(_ context.Context, opts audit.Options) (audit.Result, error) {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if !reflect.DeepEqual(opts.Layers, []string{"sast"}) {
+				t.Fatalf("Layers = %#v, want [sast]", opts.Layers)
+			}
+			if opts.Threshold != "low" || opts.BaseBranch != "trunk" || !opts.ConfigFromBase {
+				t.Fatalf("audit opts = %#v", opts)
+			}
+			return audit.Result{
+				SchemaVersion: 1,
+				Repo:          opts.RepoPath,
+				Layers:        []string{"sast"},
+				Threshold:     "low",
+				Verdict:       audit.VerdictClean,
+				Findings:      []audit.Finding{},
+				ToolResults:   []audit.ToolResult{},
+				NeedsHuman:    []audit.NeedHuman{},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if !called {
+		t.Fatal("Audit dependency was not called")
+	}
+	var result audit.Result
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout did not contain JSON result: %v\n%s", err, stdout.String())
+	}
+	if result.Verdict != audit.VerdictClean || result.Threshold != "low" {
+		t.Fatalf("audit JSON = %#v", result)
+	}
+}
+
+func TestAuditExitCodeMappingFromInjectedResult(t *testing.T) {
+	tests := []struct {
+		name   string
+		result audit.Result
+		want   int
+	}{
+		{
+			name: "findings",
+			result: audit.Result{
+				SchemaVersion: 1,
+				Layers:        []string{"sast"},
+				Threshold:     "medium",
+				Verdict:       audit.VerdictFindings,
+				Findings:      []audit.Finding{},
+				ToolResults:   []audit.ToolResult{},
+				NeedsHuman:    []audit.NeedHuman{},
+			},
+			want: 1,
+		},
+		{
+			name: "needs human",
+			result: audit.Result{
+				SchemaVersion: 1,
+				Layers:        []string{"llm"},
+				Threshold:     "medium",
+				Verdict:       audit.VerdictNeedsHuman,
+				Findings:      []audit.Finding{},
+				ToolResults:   []audit.ToolResult{},
+				NeedsHuman:    []audit.NeedHuman{{Layer: "llm", Reason: "timeout", Message: "provider timeout"}},
+			},
+			want: 2,
+		},
+		{
+			name: "runtime failure",
+			result: audit.Result{
+				SchemaVersion:   1,
+				Layers:          []string{"sast"},
+				Threshold:       "medium",
+				Verdict:         audit.VerdictNeedsHuman,
+				Findings:        []audit.Finding{},
+				ToolResults:     []audit.ToolResult{},
+				NeedsHuman:      []audit.NeedHuman{{Layer: "sast", Reason: "missing-tool", Message: "missing tool"}},
+				RuntimeFailures: []string{"missing tool"},
+			},
+			want: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps([]string{"audit", "--repo", t.TempDir()}, &stdout, &stderr, Deps{
+				Audit: func(context.Context, audit.Options) (audit.Result, error) {
+					return tt.result, nil
+				},
+			})
+			if exitCode != tt.want {
+				t.Fatalf("RunWithDeps returned exit code %d, want %d; stdout=%q stderr=%q", exitCode, tt.want, stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 
