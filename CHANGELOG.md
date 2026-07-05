@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-05
+
+Security and robustness hardening from an external security audit of the codebase, per [`docs/specs/0484-security-robustness-hardening.md`](docs/specs/0484-security-robustness-hardening.md). loopcoder is a local single-operator dev CLI, so most findings were Low–Medium hardening rather than active-exploit fixes, but every verified finding is closed. Built by loopcoder itself under the self-hosting guard (human merge gate): the spec merged first, then the fixes landed as file-disjoint slices gated through the read-only verifier and CI.
+
+### Security
+
+- **Supply-chain integrity** — release `SHA256SUMS` is now signed with cosign (keyless/OIDC). The shell installer, PowerShell installer, and `loopcoder upgrade` verify the signature before trusting the checksum and fail closed when it is missing, malformed, or wrong-identity. CI adds `govulncheck` and `staticcheck` as required checks, and all GitHub Actions in CI and release workflows are pinned to full commit SHAs with Dependabot keeping the pins and Go modules current.
+- **Shared-host disclosure** — provider prompt/schema/summary/settings/log files and statebranch log tails are written `0o600`; the Gemini prompt is passed via stdin instead of argv, so it is no longer visible in the process list on a shared host.
+- **Statebranch path confinement** — `discoverLogSources` confines log sources to the run directory and configured scratch roots, rejecting absolute, `..`-escaping, and symlink sources outside allowed roots with a diagnosable manifest entry.
+- **Config-command hardening** — the domain evidence producer and custom liveness command accept an additive, no-shell `argv` array form (the legacy shell `command` string remains supported for backward compatibility); the evidence producer now runs under the process-group + hard-timeout supervisor.
+
+### Fixed
+
+- **Honest failure reporting** — `runJSON` treats empty-where-JSON-expected output as an error, with an explicit allow-empty opt-in for the idempotent GitHub merge API (both merge call sites); `CreateIssue`/`UpdateIssue` return the partial object plus an error when a mutation succeeds but its read-back fails; issue and PR list calls report truncation at the API limit instead of silently dropping data; Codex log-read errors are surfaced, and metadata-parse failure is distinguished from provider exec failure so attestation never silently reports zero usage.
+- **Bounded local I/O** — hook stdin is capped with `io.LimitedReader`; `loopcoder status` scans only known run-record filenames bounded by size/mtime/depth and reports diagnosable errors on corrupt or oversized state; worktree-liveness directory walks skip `.git`/ignored directories, early-exit on the first newer mtime, and cap the number of files examined.
+
+### Notes
+
+- No behavior change to the code profile: absent config and absent release-signature assets behave exactly as before. The 0.4.2 H5 loopreview exit-code contract, the `Invocation.ReadOnly` verifier boundary, and the self-hosting guard are preserved. The audit's two "Critical" labels were, on inspection of the real code, overstated (the installer is checksum-gated with isolated extraction and copies only the top-level binary; statebranch log tails are scrubbed and sourced from loopcoder-authored run records), and real severities were set accordingly. New installs and `loopcoder upgrade` now require `cosign` on `PATH` to verify the release signature.
+
 ## [0.5.0] - 2026-07-04
 
 Generalize loopcoder from a code-delivery loop into a general autonomous-delivery engine for any verifiable, repo-based, AI-doable work -- documents, content, data, governance packets, reports, and code -- via configurable **domain profiles**, per [`docs/specs/0459-domain-profiles.md`](docs/specs/0459-domain-profiles.md). Code becomes the first domain profile, not the definition of the engine. The core loop (`tick`, `compile`, `dispatch`, `dispatch-wave`, `loopreview`, `risk-gate`, `promote`, guardrails, watchdog, relay, recovery) keeps its ordering and authority unchanged; 0.5.0 only adds optional plug points those existing stages consume. An absent or empty `domain` section behaves exactly like the 0.4.x code profile.
