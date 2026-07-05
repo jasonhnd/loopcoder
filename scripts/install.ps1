@@ -11,6 +11,8 @@ $Repo = if ($env:LOOPCODER_INSTALL_REPO) { $env:LOOPCODER_INSTALL_REPO } else { 
 $GitHubBaseUrl = if ($env:GITHUB_BASE_URL) { $env:GITHUB_BASE_URL.TrimEnd("/") } else { "https://github.com" }
 $GitHubApiUrl = if ($env:GITHUB_API_URL) { $env:GITHUB_API_URL.TrimEnd("/") } else { "https://api.github.com" }
 $BinDir = if ($env:LOOPCODER_INSTALL_DIR) { $env:LOOPCODER_INSTALL_DIR } else { Join-Path $HOME ".loopcoder\bin" }
+$ChecksumSignatureAsset = "SHA256SUMS.sigstore"
+$CosignIssuer = if ($env:LOOPCODER_COSIGN_ISSUER) { $env:LOOPCODER_COSIGN_ISSUER } else { "https://token.actions.githubusercontent.com" }
 $Headers = @{
     "Accept" = "application/vnd.github+json"
     "User-Agent" = "loopcoder-install"
@@ -19,6 +21,14 @@ $Headers = @{
 function Fail {
     param([string]$Message)
     throw "loopcoder install: $Message"
+}
+
+function Require-Command {
+    param([string]$Name)
+
+    if ($null -eq (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        Fail "$Name is required to verify the SHA256SUMS signature"
+    }
 }
 
 function Resolve-LoopcoderTag {
@@ -99,6 +109,24 @@ function Get-ExpectedHash {
     Fail "SHA256SUMS does not contain $ArchiveName; release may be incomplete"
 }
 
+function Verify-ChecksumsSignature {
+    param(
+        [string]$SumsPath,
+        [string]$SignaturePath,
+        [string]$Identity,
+        [string]$Issuer
+    )
+
+    $output = & cosign verify-blob $SumsPath --bundle $SignaturePath --certificate-identity $Identity --certificate-oidc-issuer $Issuer 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $detail = ($output | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            Fail "failed to verify SHA256SUMS signature with cosign identity $Identity and issuer $Issuer"
+        }
+        Fail "failed to verify SHA256SUMS signature with cosign identity $Identity and issuer $Issuer. $detail"
+    }
+}
+
 function Test-PathListContains {
     param(
         [AllowNull()][string]$PathValue,
@@ -161,6 +189,7 @@ function Ensure-UserPath {
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     Fail "install.ps1 supports Windows only; use scripts/install.sh on Unix-like systems"
 }
+Require-Command "cosign"
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -177,6 +206,7 @@ if ([string]::IsNullOrWhiteSpace($AssetVersion)) {
 
 $ArchiveName = "loopcoder_$($AssetVersion)_$($Os)_$($Arch).zip"
 $ReleaseUrl = "$GitHubBaseUrl/$Repo/releases/download/$Tag"
+$CosignIdentity = if ($env:LOOPCODER_COSIGN_IDENTITY) { $env:LOOPCODER_COSIGN_IDENTITY } else { "$GitHubBaseUrl/$Repo/.github/workflows/release.yml@refs/tags/$Tag" }
 $BinDir = [System.IO.Path]::GetFullPath($BinDir)
 $InstallPath = Join-Path $BinDir "loopcoder.exe"
 
@@ -186,12 +216,15 @@ New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 try {
     $ArchivePath = Join-Path $TempDir $ArchiveName
     $SumsPath = Join-Path $TempDir "SHA256SUMS"
+    $SignaturePath = Join-Path $TempDir $ChecksumSignatureAsset
     $ExtractDir = Join-Path $TempDir "extract"
     New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
 
     Write-Host "Installing loopcoder $AssetVersion for $Os/$Arch..."
-    Download-File -Uri "$ReleaseUrl/$ArchiveName" -OutFile $ArchivePath -Label $ArchiveName
     Download-File -Uri "$ReleaseUrl/SHA256SUMS" -OutFile $SumsPath -Label "SHA256SUMS"
+    Download-File -Uri "$ReleaseUrl/$ChecksumSignatureAsset" -OutFile $SignaturePath -Label $ChecksumSignatureAsset
+    Verify-ChecksumsSignature -SumsPath $SumsPath -SignaturePath $SignaturePath -Identity $CosignIdentity -Issuer $CosignIssuer
+    Download-File -Uri "$ReleaseUrl/$ArchiveName" -OutFile $ArchivePath -Label $ArchiveName
 
     $expectedHash = Get-ExpectedHash -SumsPath $SumsPath -ArchiveName $ArchiveName
     $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ArchivePath).Hash.ToLowerInvariant()

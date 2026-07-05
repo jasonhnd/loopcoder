@@ -6,6 +6,8 @@ GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
 BIN_DIR="${LOOPCODER_INSTALL_DIR:-$HOME/.loopcoder/bin}"
 REQUESTED_VERSION="${LOOPCODER_VERSION:-}"
+COSIGN_ISSUER="${LOOPCODER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
+CHECKSUM_SIGNATURE_ASSET="SHA256SUMS.sigstore"
 
 usage() {
 	printf '%s\n' \
@@ -61,6 +63,7 @@ need_cmd uname
 need_cmd tar
 need_cmd awk
 need_cmd sed
+need_cmd cosign
 
 if command -v sha256sum >/dev/null 2>&1; then
 	sha256_file() {
@@ -143,6 +146,20 @@ extract_expected_hash() {
 	' "$sums_file"
 }
 
+verify_checksums_signature() {
+	sums_file="$1"
+	signature_bundle="$2"
+	identity="$3"
+	issuer="$4"
+
+	if ! cosign verify-blob "$sums_file" \
+		--bundle "$signature_bundle" \
+		--certificate-identity "$identity" \
+		--certificate-oidc-issuer "$issuer"; then
+		fail "failed to verify SHA256SUMS signature with cosign identity $identity and issuer $issuer"
+	fi
+}
+
 print_path_instructions() {
 	profile_label="$1"
 	reload_command="$2"
@@ -216,6 +233,7 @@ ASSET_VERSION="${TAG#v}"
 
 ARCHIVE="loopcoder_${ASSET_VERSION}_${OS}_${ARCH}.tar.gz"
 RELEASE_URL="$GITHUB_BASE_URL/$REPO/releases/download/$TAG"
+COSIGN_IDENTITY="${LOOPCODER_COSIGN_IDENTITY:-${GITHUB_BASE_URL%/}/$REPO/.github/workflows/release.yml@refs/tags/$TAG}"
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/loopcoder-install.XXXXXX") || fail "failed to create temporary directory"
 cleanup() {
@@ -225,13 +243,16 @@ trap cleanup EXIT HUP INT TERM
 
 archive_path="$tmp_dir/$ARCHIVE"
 sums_path="$tmp_dir/SHA256SUMS"
+signature_path="$tmp_dir/$CHECKSUM_SIGNATURE_ASSET"
 extract_dir="$tmp_dir/extract"
 
 mkdir -p "$extract_dir"
 
 printf 'Installing loopcoder %s for %s/%s...\n' "$ASSET_VERSION" "$OS" "$ARCH"
-download "$RELEASE_URL/$ARCHIVE" "$archive_path" "$ARCHIVE"
 download "$RELEASE_URL/SHA256SUMS" "$sums_path" "SHA256SUMS"
+download "$RELEASE_URL/$CHECKSUM_SIGNATURE_ASSET" "$signature_path" "$CHECKSUM_SIGNATURE_ASSET"
+verify_checksums_signature "$sums_path" "$signature_path" "$COSIGN_IDENTITY" "$COSIGN_ISSUER"
+download "$RELEASE_URL/$ARCHIVE" "$archive_path" "$ARCHIVE"
 
 expected_hash=$(extract_expected_hash "$sums_path" "$ARCHIVE")
 [ -n "$expected_hash" ] || fail "SHA256SUMS does not contain $ARCHIVE; release may be incomplete"
