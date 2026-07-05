@@ -30,7 +30,10 @@ const (
 	logTailLines = 50
 )
 
-var logPathLinePattern = regexp.MustCompile(`(?m)^\s*-\s*Log path:\s*(.+?)\s*$`)
+var (
+	logPathLinePattern      = regexp.MustCompile(`(?m)^\s*-\s*Log path:\s*(.+?)\s*$`)
+	worktreePathLinePattern = regexp.MustCompile(`(?m)^\s*-\s*Worktree path:\s*(.+?)\s*$`)
+)
 
 // Deps is the injectable surface for deterministic tests.
 type Deps struct {
@@ -129,6 +132,17 @@ type logManifestEntry struct {
 	SHA256     string `json:"sha256,omitempty"`
 	TailPath   string `json:"tail_path,omitempty"`
 	Error      string `json:"error,omitempty"`
+}
+
+type logSource struct {
+	SourcePath string
+	ReadPath   string
+	Error      string
+}
+
+type logRoot struct {
+	Path string
+	Real string
 }
 
 type leaseEvent struct {
@@ -861,7 +875,7 @@ func scrubJSONValue(value any) any {
 }
 
 func writeLogArtifacts(sourceRun, destRun, runID string, written map[string]bool) error {
-	sources := discoverLogSources(sourceRun)
+	sources := discoverLogSourceResults(sourceRun)
 	if len(sources) == 0 {
 		return nil
 	}
@@ -871,19 +885,26 @@ func writeLogArtifacts(sourceRun, destRun, runID string, written map[string]bool
 	}
 
 	manifest := make([]logManifestEntry, 0, len(sources))
-	for i, source := range sources {
-		entry := logManifestEntry{SourcePath: recovery.Scrub(source)}
-		data, err := os.ReadFile(source)
+	tailIndex := 0
+	for _, source := range sources {
+		entry := logManifestEntry{SourcePath: recovery.Scrub(source.SourcePath)}
+		if source.Error != "" {
+			entry.Error = recovery.Scrub(source.Error)
+			manifest = append(manifest, entry)
+			continue
+		}
+		data, err := os.ReadFile(source.ReadPath)
 		if err != nil {
 			entry.Error = recovery.Scrub(err.Error())
 			manifest = append(manifest, entry)
 			continue
 		}
 		sum := sha256.Sum256(data)
-		tailName := fmt.Sprintf("log-%02d-%s.tail.txt", i+1, shortHash(source))
+		tailIndex++
+		tailName := fmt.Sprintf("log-%02d-%s.tail.txt", tailIndex, shortHash(source.SourcePath))
 		tailRel := filepath.ToSlash(filepath.Join("logs", tailName))
 		tail := recovery.Scrub(lastLines(string(data), logTailLines))
-		if err := os.WriteFile(filepath.Join(logsDir, tailName), []byte(tail), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(logsDir, tailName), []byte(tail), 0o600); err != nil {
 			return fmt.Errorf("write scrubbed log tail: %w", err)
 		}
 		entry.Bytes = int64(len(data))
@@ -906,20 +927,44 @@ func writeLogArtifacts(sourceRun, destRun, runID string, written map[string]bool
 }
 
 func discoverLogSources(sourceRun string) []string {
-	seen := map[string]bool{}
-	add := func(path string) {
-		path = strings.Trim(strings.TrimSpace(path), `"`)
+	sources := discoverLogSourceResults(sourceRun)
+	out := make([]string, 0, len(sources))
+	for _, source := range sources {
+		if source.Error == "" {
+			out = append(out, source.ReadPath)
+		}
+	}
+	return out
+}
+
+func discoverLogSourceResults(sourceRun string) []logSource {
+	candidates := []string{}
+	seenCandidates := map[string]bool{}
+	addCandidate := func(path string) {
+		path = cleanDiscoveredPath(path)
 		if path == "" {
 			return
 		}
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(sourceRun, path)
-		}
-		cleaned := filepath.Clean(path)
-		if seen[cleaned] {
+		if seenCandidates[path] {
 			return
 		}
-		seen[cleaned] = true
+		seenCandidates[path] = true
+		candidates = append(candidates, path)
+	}
+
+	scratchRoots := []string{}
+	seenScratchRoots := map[string]bool{}
+	addScratchRoot := func(path string) {
+		path = cleanDiscoveredPath(path)
+		if path == "" || !filepath.IsAbs(path) {
+			return
+		}
+		root := filepath.Clean(filepath.Dir(path))
+		if seenScratchRoots[root] {
+			return
+		}
+		seenScratchRoots[root] = true
+		scratchRoots = append(scratchRoots, root)
 	}
 
 	_ = filepath.WalkDir(sourceRun, func(path string, d fs.DirEntry, err error) error {
@@ -928,15 +973,21 @@ func discoverLogSources(sourceRun string) []string {
 		}
 		rel, relErr := filepath.Rel(sourceRun, path)
 		if relErr == nil && isRawLogFile(rel) {
-			add(path)
+			addCandidate(path)
 			return nil
 		}
 		if strings.HasSuffix(strings.ToLower(d.Name()), ".md") || strings.HasSuffix(strings.ToLower(d.Name()), ".txt") {
 			data, readErr := os.ReadFile(path)
 			if readErr == nil {
-				for _, match := range logPathLinePattern.FindAllStringSubmatch(string(data), -1) {
+				text := string(data)
+				for _, match := range worktreePathLinePattern.FindAllStringSubmatch(text, -1) {
 					if len(match) > 1 {
-						add(match[1])
+						addScratchRoot(match[1])
+					}
+				}
+				for _, match := range logPathLinePattern.FindAllStringSubmatch(text, -1) {
+					if len(match) > 1 {
+						addCandidate(match[1])
 					}
 				}
 			}
@@ -944,12 +995,136 @@ func discoverLogSources(sourceRun string) []string {
 		return nil
 	})
 
-	out := make([]string, 0, len(seen))
-	for path := range seen {
-		out = append(out, path)
+	roots := allowedLogRoots(append([]string{sourceRun}, scratchRoots...))
+	out := make([]logSource, 0, len(candidates))
+	seenSources := map[string]bool{}
+	for _, candidate := range candidates {
+		source := confineLogSource(sourceRun, candidate, roots)
+		key := source.SourcePath + "\x00" + source.Error
+		if seenSources[key] {
+			continue
+		}
+		seenSources[key] = true
+		out = append(out, source)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SourcePath != out[j].SourcePath {
+			return out[i].SourcePath < out[j].SourcePath
+		}
+		return out[i].Error < out[j].Error
+	})
 	return out
+}
+
+func cleanDiscoveredPath(path string) string {
+	return strings.Trim(strings.TrimSpace(path), `"`)
+}
+
+func allowedLogRoots(paths []string) []logRoot {
+	roots := make([]logRoot, 0, len(paths))
+	seen := map[string]bool{}
+	for _, path := range paths {
+		path = cleanDiscoveredPath(path)
+		if path == "" {
+			continue
+		}
+		abs, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			continue
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		root := logRoot{Path: abs, Real: abs}
+		if real, err := filepath.EvalSymlinks(abs); err == nil {
+			if realAbs, absErr := filepath.Abs(real); absErr == nil {
+				root.Real = filepath.Clean(realAbs)
+			}
+		}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+func confineLogSource(sourceRun, candidate string, roots []logRoot) logSource {
+	candidate = cleanDiscoveredPath(candidate)
+	sourcePath := candidate
+	if !filepath.IsAbs(candidate) {
+		rel := filepath.Clean(candidate)
+		if pathEscapesRoot(rel) {
+			return logSource{
+				SourcePath: recovery.Scrub(filepath.Clean(filepath.Join(sourceRun, rel))),
+				Error:      "rejected log source outside allowed roots: relative path escapes run directory",
+			}
+		}
+		sourcePath = filepath.Join(sourceRun, rel)
+	}
+
+	absPath, err := filepath.Abs(filepath.Clean(sourcePath))
+	if err != nil {
+		return logSource{
+			SourcePath: recovery.Scrub(sourcePath),
+			Error:      "rejected log source: " + err.Error(),
+		}
+	}
+	if !pathUnderAnyRoot(absPath, roots, false) {
+		return logSource{
+			SourcePath: recovery.Scrub(absPath),
+			Error:      "rejected log source outside allowed roots",
+		}
+	}
+
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return logSource{
+			SourcePath: absPath,
+			ReadPath:   absPath,
+		}
+	}
+	realAbs, err := filepath.Abs(realPath)
+	if err != nil {
+		return logSource{
+			SourcePath: recovery.Scrub(absPath),
+			Error:      "rejected log source: " + err.Error(),
+		}
+	}
+	realAbs = filepath.Clean(realAbs)
+	if !pathUnderAnyRoot(realAbs, roots, true) {
+		return logSource{
+			SourcePath: recovery.Scrub(absPath),
+			Error:      "rejected log source outside allowed roots: symlink resolves outside allowed roots",
+		}
+	}
+	return logSource{
+		SourcePath: absPath,
+		ReadPath:   absPath,
+	}
+}
+
+func pathUnderAnyRoot(path string, roots []logRoot, real bool) bool {
+	for _, root := range roots {
+		rootPath := root.Path
+		if real {
+			rootPath = root.Real
+		}
+		if pathWithinRoot(path, rootPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathEscapesRoot(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel)
+}
+
+func pathWithinRoot(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." && !filepath.IsAbs(rel))
 }
 
 func isRawLogFile(path string) bool {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -85,9 +86,94 @@ func TestPushScrubsStateBeforeCommitAndKeepsRawLogsOut(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(worktree, "runs", runID, "logs", "log_manifest.json")); err != nil {
 		t.Fatalf("log manifest missing: %v", err)
 	}
+	tails, err := filepath.Glob(filepath.Join(worktree, "runs", runID, "logs", "*.tail.txt"))
+	if err != nil {
+		t.Fatalf("Glob log tails: %v", err)
+	}
+	if len(tails) == 0 {
+		t.Fatalf("no log tails written")
+	}
+	for _, tail := range tails {
+		info, err := os.Stat(tail)
+		if err != nil {
+			t.Fatalf("Stat log tail %s: %v", tail, err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Fatalf("log tail %s mode = %v, want 0600", tail, info.Mode().Perm())
+		}
+	}
 	if !strings.Contains(all, "sha256:") || !strings.Contains(all, ".tail.txt") {
 		t.Fatalf("log manifest missing hash or tail path:\n%s", all)
 	}
+	if !strings.Contains(all, "rejected log source outside allowed roots") {
+		t.Fatalf("log manifest missing rejected external source diagnostic:\n%s", all)
+	}
+}
+
+func TestDiscoverLogSourcesConfinesToRunAndConfiguredScratchRoots(t *testing.T) {
+	sourceRun := filepath.Join(t.TempDir(), ".loopcoder", "runs", "run-test")
+	if err := os.MkdirAll(filepath.Join(sourceRun, "recovery"), 0o755); err != nil {
+		t.Fatalf("MkdirAll recovery: %v", err)
+	}
+
+	runLog := filepath.Join(sourceRun, "codex.log")
+	if err := os.WriteFile(runLog, []byte("run log\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile run log: %v", err)
+	}
+
+	scratchRoot, err := os.MkdirTemp("", "loopcoder-statebranch-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp scratch root: %v", err)
+	}
+	defer os.RemoveAll(scratchRoot)
+	worktreePath := filepath.Join(scratchRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll scratch worktree: %v", err)
+	}
+	scratchLog := filepath.Join(scratchRoot, "codex.log")
+	if err := os.WriteFile(scratchLog, []byte("scratch log\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile scratch log: %v", err)
+	}
+
+	outsideLog := filepath.Join(t.TempDir(), "codex.log")
+	if err := os.WriteFile(outsideLog, []byte("outside log\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile outside log: %v", err)
+	}
+
+	brief := strings.Join([]string{
+		"- Worktree path: " + worktreePath,
+		"- Log path: " + scratchLog,
+		"- Log path: " + outsideLog,
+		"- Log path: ../escape.log",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(sourceRun, "recovery", "job-1-context.md"), []byte(brief), 0o644); err != nil {
+		t.Fatalf("WriteFile recovery brief: %v", err)
+	}
+
+	sources := discoverLogSourceResults(sourceRun)
+	assertAcceptedLogSource(t, sources, runLog)
+	assertAcceptedLogSource(t, sources, scratchLog)
+	assertRejectedLogSource(t, sources, outsideLog, "outside allowed roots")
+	assertRejectedLogSource(t, sources, filepath.Clean(filepath.Join(sourceRun, "..", "escape.log")), "relative path escapes run directory")
+}
+
+func TestDiscoverLogSourcesRejectsSymlinkEscape(t *testing.T) {
+	sourceRun := filepath.Join(t.TempDir(), ".loopcoder", "runs", "run-test")
+	if err := os.MkdirAll(sourceRun, 0o755); err != nil {
+		t.Fatalf("MkdirAll source run: %v", err)
+	}
+	outsideLog := filepath.Join(t.TempDir(), "codex.log")
+	if err := os.WriteFile(outsideLog, []byte("outside log\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile outside log: %v", err)
+	}
+	symlinkLog := filepath.Join(sourceRun, "linked.log")
+	if err := os.Symlink(outsideLog, symlinkLog); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+
+	sources := discoverLogSourceResults(sourceRun)
+	assertRejectedLogSource(t, sources, symlinkLog, "symlink resolves outside allowed roots")
 }
 
 func TestLeaseAcquireRenewObserveTakeoverAndRelease(t *testing.T) {
@@ -425,6 +511,37 @@ func readAllTestFiles(t *testing.T, root string) string {
 		t.Fatalf("WalkDir %s: %v", root, err)
 	}
 	return out.String()
+}
+
+func assertAcceptedLogSource(t *testing.T, sources []logSource, path string) {
+	t.Helper()
+	path = filepath.Clean(path)
+	for _, source := range sources {
+		if filepath.Clean(source.SourcePath) == path && source.Error == "" {
+			if filepath.Clean(source.ReadPath) != path {
+				t.Fatalf("accepted source %s read path = %s", path, source.ReadPath)
+			}
+			return
+		}
+	}
+	t.Fatalf("accepted source %s not found in %#v", path, sources)
+}
+
+func assertRejectedLogSource(t *testing.T, sources []logSource, path, wantError string) {
+	t.Helper()
+	path = filepath.Clean(path)
+	for _, source := range sources {
+		if filepath.Clean(source.SourcePath) == path && source.Error != "" {
+			if !strings.Contains(source.Error, wantError) {
+				t.Fatalf("rejected source %s error = %q, want containing %q", path, source.Error, wantError)
+			}
+			if source.ReadPath != "" {
+				t.Fatalf("rejected source %s read path = %s, want empty", path, source.ReadPath)
+			}
+			return
+		}
+	}
+	t.Fatalf("rejected source %s not found in %#v", path, sources)
 }
 
 func replaceTreeTest(dest, source string) error {
