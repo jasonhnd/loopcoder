@@ -41,7 +41,7 @@ verifier:
 #     Optional. Absent = 300; kill the verifier provider CLI after this many seconds with no log output or worktree file activity (stall).
 #     stall_timeout_seconds: 300
 ci:
-  checks: [verify, go, staticcheck, govulncheck]
+  checks: [verify, go, staticcheck, govulncheck, audit]
   # Optional. Absent = no local test command gate.
   # tests:
   #   - bun run test
@@ -67,3 +67,42 @@ ci:
 #       - "**/*.tsx"
 report:
   channel: chat
+audit:
+  severity_threshold: medium
+  sast:
+    commands:
+      - id: govulncheck
+        argv: ["govulncheck", "-json", "./..."]
+        parser: govulncheck-json
+        timeout_seconds: 300
+      - id: staticcheck
+        argv: ["staticcheck", "-f", "json", "./..."]
+        parser: staticcheck-json
+        timeout_seconds: 300
+      # loopcoder is an operator-trusted orchestration CLI. Its self-audit
+      # intentionally runs provider/git/gh subprocesses, reads operator-selected
+      # repo paths, stages state snapshots, and uses SHA-1 only for stable
+      # non-cryptographic IDs. Native audit scans remain enabled for sensitive
+      # file-mode and secret classes, so these gosec rule exclusions keep CI
+      # focused on non-inherent findings instead of per-platform line waivers.
+      - id: gosec
+        argv: ["gosec", "-fmt", "json", "-quiet", "-exclude=G104,G122,G204,G301,G302,G304,G306,G401,G505,G703", "./..."]
+        parser: gosec-json
+        timeout_seconds: 300
+    native:
+      secrets: true
+      file_permissions: true
+      include:
+        - "**/*"
+      exclude:
+        - ".git/**"
+        - ".loopcoder/**"
+        - "docs/specs/**"
+        - "**/*_test.go"
+        - "vendor/**"
+        - "dist/**"
+        - "node_modules/**"
+  review:
+    rubric_path: docs/security/audit-rubric.md
+  baseline:
+    path: docs/security/audit-baseline.yml

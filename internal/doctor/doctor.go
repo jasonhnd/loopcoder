@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	loopcoder "github.com/jasonhnd/loopcoder"
+	"github.com/jasonhnd/loopcoder/internal/audit"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -148,6 +150,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
+	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, Check{
@@ -586,6 +589,336 @@ func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
 	return Check{Name: "version compatibility", Status: status, Message: strings.Join(parts, "; ")}
 }
 
+func checkAuditReadiness(repoPath string, delivery deliveryState, deps Deps) []Check {
+	if !delivery.Valid {
+		return []Check{{
+			Name:    "audit config",
+			Status:  StatusFail,
+			Message: "cannot evaluate audit readiness because .delivery.yml is invalid",
+		}}
+	}
+	plan, err := audit.BuildPlan(repoPath, delivery.Config.Audit, audit.Options{})
+	if err != nil {
+		return []Check{{
+			Name:    "audit config",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("invalid audit config: %v", err),
+		}}
+	}
+	checks := []Check{
+		checkAuditConfig(plan),
+		checkAuditTools(plan, deps),
+		checkAuditParsers(plan),
+		checkAuditRubric(repoPath, delivery.Config.Audit.Review.RubricPath, deps),
+		checkAuditBaseline(repoPath, delivery.Config.Audit.Baseline.Path, deps),
+		checkAuditCICheck(repoPath, delivery.Config, deps),
+		checkAuditLLMProvider(delivery.Config, deps),
+	}
+	return checks
+}
+
+func checkAuditConfig(plan audit.Plan) Check {
+	native := []string{}
+	if plan.Native.Secrets {
+		native = append(native, "secrets")
+	}
+	if plan.Native.FilePermissions {
+		native = append(native, "file_permissions")
+	}
+	if len(native) == 0 {
+		native = append(native, "disabled")
+	}
+	commandIDs := make([]string, 0, len(plan.Commands))
+	for _, command := range plan.Commands {
+		commandIDs = append(commandIDs, command.ID)
+	}
+	commandText := strings.Join(commandIDs, ", ")
+	if commandText == "" {
+		commandText = "none"
+	}
+	return Check{
+		Name:    "audit config",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("threshold=%s; sast_commands=%s; native=%s", plan.Threshold, commandText, strings.Join(native, ",")),
+	}
+}
+
+func checkAuditTools(plan audit.Plan, deps Deps) Check {
+	if len(plan.Commands) == 0 {
+		return Check{
+			Name:    "audit tools",
+			Status:  StatusInfo,
+			Message: "no language SAST commands configured; native audit scans still run when enabled",
+		}
+	}
+	missing := []string{}
+	found := []string{}
+	for _, command := range plan.Commands {
+		if len(command.Argv) == 0 {
+			missing = append(missing, command.ID+"=(empty argv)")
+			continue
+		}
+		path, err := deps.LookPath(command.Argv[0])
+		if err != nil || strings.TrimSpace(path) == "" {
+			missing = append(missing, command.ID+"="+command.Argv[0])
+			continue
+		}
+		found = append(found, command.ID+"="+path)
+	}
+	if len(missing) > 0 {
+		return Check{
+			Name:    "audit tools",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("missing required SAST tools on PATH: %s; found: %s", strings.Join(missing, ", "), firstNonEmpty(strings.Join(found, ", "), "none")),
+		}
+	}
+	return Check{
+		Name:    "audit tools",
+		Status:  StatusOK,
+		Message: "required SAST tools found on PATH: " + strings.Join(found, ", "),
+	}
+}
+
+func checkAuditParsers(plan audit.Plan) Check {
+	if len(plan.Commands) == 0 {
+		return Check{
+			Name:    "audit parsers",
+			Status:  StatusInfo,
+			Message: "no configured SAST command parsers to check",
+		}
+	}
+	recognized := []string{}
+	unrecognized := []string{}
+	for _, command := range plan.Commands {
+		if audit.KnownParser(command.Parser) {
+			recognized = append(recognized, command.ID+"="+command.Parser)
+		} else {
+			unrecognized = append(unrecognized, command.ID+"="+command.Parser)
+		}
+	}
+	if len(unrecognized) > 0 {
+		return Check{
+			Name:    "audit parsers",
+			Status:  StatusFail,
+			Message: "unrecognized parser(s): " + strings.Join(unrecognized, ", "),
+		}
+	}
+	return Check{
+		Name:    "audit parsers",
+		Status:  StatusOK,
+		Message: "recognized parser(s): " + strings.Join(recognized, ", "),
+	}
+}
+
+func checkAuditRubric(repoPath, rawPath string, deps Deps) Check {
+	if strings.TrimSpace(rawPath) == "" {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusInfo,
+			Message: "no configured rubric path; Layer 2 uses the built-in threat model only",
+		}
+	}
+	clean, err := safeRepoRelativePath(rawPath)
+	if err != nil {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured rubric path is invalid: %v", err),
+		}
+	}
+	data, err := deps.ReadFile(filepath.Join(repoPath, filepath.FromSlash(clean)))
+	if err != nil {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured rubric %s is not readable: %v", clean, err),
+		}
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return Check{
+			Name:    "audit rubric",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured rubric %s is empty", clean),
+		}
+	}
+	return Check{
+		Name:    "audit rubric",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("configured rubric exists at %s", clean),
+	}
+}
+
+func checkAuditBaseline(repoPath, rawPath string, deps Deps) Check {
+	if strings.TrimSpace(rawPath) == "" {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusInfo,
+			Message: "no audit baseline configured",
+		}
+	}
+	clean, err := safeRepoRelativePath(rawPath)
+	if err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured baseline path is invalid: %v", err),
+		}
+	}
+	data, err := deps.ReadFile(filepath.Join(repoPath, filepath.FromSlash(clean)))
+	if err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured baseline %s is not readable: %v", clean, err),
+		}
+	}
+	var baseline audit.BaselineFile
+	if err := yaml.Unmarshal(data, &baseline); err != nil {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("parse audit baseline %s: %v", clean, err),
+		}
+	}
+	validation := audit.ValidateBaseline(baseline, time.Now())
+	if len(validation.Errors) > 0 {
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: "invalid baseline waiver(s): " + strings.Join(validation.Errors, "; "),
+		}
+	}
+	if len(validation.Expired) > 0 {
+		ids := make([]string, 0, len(validation.Expired))
+		for _, waiver := range validation.Expired {
+			ids = append(ids, waiver.ID)
+		}
+		return Check{
+			Name:    "audit baseline",
+			Status:  StatusFail,
+			Message: "expired baseline waiver(s): " + strings.Join(ids, ", "),
+		}
+	}
+	return Check{
+		Name:    "audit baseline",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("baseline parsed with %d waiver(s); no expired or broad waivers", len(baseline.Waivers)),
+	}
+}
+
+func checkAuditCICheck(repoPath string, cfg config.Config, deps Deps) Check {
+	inDelivery := false
+	for _, check := range cfg.CI.Checks {
+		if strings.TrimSpace(check) == "audit" {
+			inDelivery = true
+			break
+		}
+	}
+	workflowHasJob, workflowErr := workflowHasAuditJob(repoPath, deps)
+	switch {
+	case inDelivery && workflowHasJob:
+		return Check{
+			Name:    "audit ci check",
+			Status:  StatusOK,
+			Message: "ci.checks includes audit and workflow job audit exists",
+		}
+	case !inDelivery && workflowHasJob:
+		return Check{
+			Name:    "audit ci check",
+			Status:  StatusFail,
+			Message: "workflow job audit exists but .delivery.yml ci.checks does not include audit",
+		}
+	case inDelivery && workflowErr != nil:
+		return Check{
+			Name:    "audit ci check",
+			Status:  StatusFail,
+			Message: fmt.Sprintf(".delivery.yml ci.checks includes audit but workflow job could not be verified: %v", workflowErr),
+		}
+	case inDelivery:
+		return Check{
+			Name:    "audit ci check",
+			Status:  StatusFail,
+			Message: ".delivery.yml ci.checks includes audit but no workflow job named audit was found",
+		}
+	default:
+		if workflowErr != nil {
+			return Check{
+				Name:    "audit ci check",
+				Status:  StatusInfo,
+				Message: fmt.Sprintf("audit is not required in ci.checks; workflow job lookup skipped after error: %v", workflowErr),
+			}
+		}
+		return Check{
+			Name:    "audit ci check",
+			Status:  StatusInfo,
+			Message: "audit is not required in ci.checks",
+		}
+	}
+}
+
+func workflowHasAuditJob(repoPath string, deps Deps) (bool, error) {
+	data, err := deps.ReadFile(filepath.Join(repoPath, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		return false, err
+	}
+	var workflow struct {
+		Jobs map[string]any `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		return false, err
+	}
+	_, ok := workflow.Jobs["audit"]
+	return ok, nil
+}
+
+func checkAuditLLMProvider(cfg config.Config, deps Deps) Check {
+	provider := strings.TrimSpace(cfg.Adapters.Verifier)
+	if provider == "" {
+		provider = "claude"
+	}
+	if _, err := config.MCPServersForInvocation(cfg.MCP, config.MCPInvocationOptions{
+		Role:           "verifier",
+		ReadOnly:       true,
+		ReadOnlyPolicy: config.MCPReadOnlyFilter,
+		RequireRole:    true,
+		ErrorPrefix:    "invalid delivery config: ",
+	}); err != nil {
+		return Check{
+			Name:    "audit llm provider",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("read-only verifier MCP selection failed for Layer 2: %v", err),
+		}
+	}
+	path, err := deps.LookPath(provider)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return Check{
+			Name:    "audit llm provider",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("Layer 2 verifier provider %q could not be resolved on PATH", provider),
+		}
+	}
+	return Check{
+		Name:    "audit llm provider",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("Layer 2 read-only verifier provider %q resolves at %s", provider, path),
+	}
+}
+
+func safeRepoRelativePath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("path is required")
+	}
+	if filepath.IsAbs(raw) {
+		return "", errors.New("absolute paths are not allowed")
+	}
+	clean := filepath.Clean(filepath.FromSlash(raw))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("path must stay inside the repository")
+	}
+	return strings.ReplaceAll(clean, string(filepath.Separator), "/"), nil
+}
+
 func checkInstalledSkill(deps Deps) Check {
 	dir, err := defaultSkillDir(deps.UserHomeDir)
 	if err != nil {
@@ -765,6 +1098,15 @@ func commandDetail(result CommandResult) string {
 
 func isNotExist(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func firstNonEmptyLine(text string) string {

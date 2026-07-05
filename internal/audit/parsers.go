@@ -64,40 +64,41 @@ type govulnFrame struct {
 func parseGovulncheck(toolID, output string) ([]Finding, error) {
 	defs := map[string]osvDefinition{}
 	best := map[string]govulnFindingCandidate{}
-	linesSeen := 0
-	if err := scanJSONLines(output, func(line string) error {
-		linesSeen++
+	messagesSeen := 0
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(output)))
+	for {
 		var envelope map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
-			return err
+		if err := decoder.Decode(&envelope); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("parse govulncheck JSON: %w", err)
 		}
+		messagesSeen++
 		if raw, ok := envelope["osv"]; ok {
 			def := parseOSVDefinition(raw)
 			if def.ID != "" {
 				defs[def.ID] = def
 			}
-			return nil
+			continue
 		}
 		raw, ok := envelope["finding"]
 		if !ok {
-			return nil
+			continue
 		}
 		candidate, err := parseGovulnFinding(raw)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("parse govulncheck JSON: %w", err)
 		}
 		if candidate.OSV == "" {
-			return errors.New("govulncheck finding missing osv id")
+			return nil, errors.New("parse govulncheck JSON: govulncheck finding missing osv id")
 		}
 		current, exists := best[candidate.OSV]
 		if !exists || govulnSpecificity(candidate) > govulnSpecificity(current) {
 			best[candidate.OSV] = candidate
 		}
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("parse govulncheck JSON: %w", err)
 	}
-	if strings.TrimSpace(output) != "" && linesSeen == 0 {
+	if strings.TrimSpace(output) != "" && messagesSeen == 0 {
 		return nil, errors.New("parse govulncheck JSON: no JSON messages found")
 	}
 

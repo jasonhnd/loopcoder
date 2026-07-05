@@ -60,6 +60,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if containsLayer(plan.Layers, LayerLLM) {
 		runLLMLayer(ctx, repoPath, cfg, plan, opts, deps, &result)
 	}
+	applyBaseline(repoPath, plan.Baseline, &result, time.Now())
 
 	return Finalize(result), nil
 }

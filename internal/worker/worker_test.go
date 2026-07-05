@@ -1531,8 +1531,8 @@ func TestDispatchHelperSeamsSuccessPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat prompt: %v", err)
 	}
-	if runtime.GOOS != "windows" && promptInfo.Mode().Perm() != 0o644 {
-		t.Fatalf("prompt mode = %#o, want 0644", promptInfo.Mode().Perm())
+	if runtime.GOOS != "windows" && promptInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("prompt mode = %#o, want 0600", promptInfo.Mode().Perm())
 	}
 
 	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
@@ -1639,6 +1639,13 @@ func TestHandleHungReportOnlyAndWriteRecoveryHelpers(t *testing.T) {
 	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-hung", "job-509-1357"))
 	if err != nil {
 		t.Fatalf("read recovery brief: %v", err)
+	}
+	briefInfo, err := os.Stat(state.RecoveryBriefPath(repo, "run-hung", "job-509-1357"))
+	if err != nil {
+		t.Fatalf("stat recovery brief: %v", err)
+	}
+	if runtime.GOOS != "windows" && briefInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("recovery brief mode = %#o, want 0600", briefInfo.Mode().Perm())
 	}
 	for _, want := range []string{"- Status: hung", "- Last phase: worktree_created", " M partial.go", "last useful line"} {
 		if !strings.Contains(string(brief), want) {

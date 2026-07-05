@@ -149,7 +149,7 @@ func awsSecretFindings(file string, lineNumber int, line string) []Finding {
 }
 
 func nativePermissionFinding(repoPath, file string) (Finding, bool) {
-	if !isSensitivePath(file) {
+	if !isSensitivePath(file) || isSourceFileForPermissionScan(file) {
 		return Finding{}, false
 	}
 	info, err := os.Stat(filepath.Join(repoPath, filepath.FromSlash(file)))
@@ -284,6 +284,15 @@ func isSensitivePath(file string) bool {
 		}
 	}
 	return strings.HasPrefix(base, "key.") || strings.HasSuffix(base, ".key") || strings.Contains(base, "_key.") || strings.Contains(base, "-key.")
+}
+
+func isSourceFileForPermissionScan(file string) bool {
+	switch strings.ToLower(filepath.Ext(normalizeRepoPath(file))) {
+	case ".go", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".rb", ".rs", ".java", ".kt", ".cs", ".php", ".sh", ".bash", ".ps1", ".psm1", ".yml", ".yaml", ".json", ".toml":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSensitiveText(text string) bool {

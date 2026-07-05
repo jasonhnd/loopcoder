@@ -402,6 +402,10 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   development track;
 - `.delivery.yml` schema version and `min_loopcoder_version` compatibility when
   declared;
+- audit readiness: config parse result, effective threshold, configured SAST
+  commands, required tool availability, parser recognition, rubric and
+  baseline files, required `audit` CI check wiring, and Layer 2 verifier
+  provider resolution;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-attest` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -412,6 +416,30 @@ Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
 does not invent provider-authentication status when the provider has no stable
 probe.
+
+## Security Audit
+
+`loopcoder audit` runs a read-only security audit. The deterministic layer
+(`--layer sast`) runs configured SAST tools plus native secret and sensitive
+file-mode scans and is suitable for required CI. The LLM layer (`--layer llm`
+or `--layer all`) uses the configured verifier provider in read-only mode with
+the built-in threat model plus any configured rubric.
+
+```text
+loopcoder audit --repo . --layer sast
+loopcoder audit --repo . --layer all --provider claude --pretty
+```
+
+The exit codes are `0` clean, `1` threshold findings, `2` needs-human, `3`
+command/runtime failure, and `4` relay gate. Configure thresholds, SAST argv
+arrays, rubrics, and baselines under `.delivery.yml audit`. Baseline waivers
+must record a justification, date, review/expiry date, and either a
+`fingerprint` or `normalized_evidence`; stale waivers are reported without
+gating, while expired or malformed waivers require human judgment.
+
+Layer 2 attestation is local-only, like `loopreview`: pretty blocks, canonical
+JSON, relay records, and logs must not be copied into repository-visible
+artifacts. See [`audit.md`](audit.md) for the full command reference.
 
 ## Model And Speed
 
@@ -475,6 +503,9 @@ loopcoder --version
 loopcoder -v
 
 loopcoder doctor --repo .
+
+loopcoder audit --repo . --layer sast
+loopcoder audit --repo . --layer all --provider claude
 
 loopcoder skill install --repo .
 
@@ -553,6 +584,9 @@ loopcoder lease release --repo . --run-id <run-id>
 - `loopcoder loopreview` exits `3` when the command itself fails before or after
   a clean verdict, such as invalid flags, repository/config/provider setup
   failure, or output/relay write failure.
+- `loopcoder audit` reserves `0`, `1`, and `2` for clean audit verdicts:
+  `clean`, `findings`, and `needs-human`; it exits `3` for command/runtime
+  failures.
 - Mechanical progress commands exit `4` when the relay hard gate finds pending
   local-only Worker/Verifier blocks. Run `loopcoder relay flush --repo <path>`
   to print and acknowledge them, or `loopcoder relay list --repo <path>` to

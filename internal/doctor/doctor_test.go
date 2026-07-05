@@ -40,6 +40,13 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"default branch",
 		"loopcoder binary",
 		"version compatibility",
+		"audit config",
+		"audit tools",
+		"audit parsers",
+		"audit rubric",
+		"audit baseline",
+		"audit ci check",
+		"audit llm provider",
 		"loopcoder skill",
 		"conductor hooks",
 		"conductor runtime",
@@ -290,6 +297,32 @@ func TestRunWarnsWhenProviderCLIMissing(t *testing.T) {
 	}
 	if !strings.Contains(check.Message, "not found on PATH") {
 		t.Fatalf("provider codex message = %q", check.Message)
+	}
+}
+
+func TestRunAuditBaselineAcceptsNormalizedEvidenceWithoutFingerprint(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.files[filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-baseline.yml"))] = []byte(`
+version: 1
+waivers:
+  - id: normalized-evidence-waiver
+    rule: G204
+    path: internal/audit/run.go
+    normalized_evidence: exec.Command(invocation.Argv[0], invocation.Argv[1:]...)
+    original_severity: medium
+    justification: Operator-trusted command argv self-audit waiver fixture.
+    date_added: 2026-07-05
+    review_by: 2099-01-01
+`)
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "audit baseline")
+	if check.Status != StatusOK {
+		t.Fatalf("audit baseline status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if !strings.Contains(check.Message, "1 waiver") {
+		t.Fatalf("audit baseline message = %q, want waiver count", check.Message)
 	}
 }
 
@@ -584,11 +617,14 @@ func parseHelperInt(value string) int {
 func healthyDoctorEnv() *fakeDoctorEnv {
 	return &fakeDoctorEnv{
 		paths: map[string]string{
-			"git":       "/bin/git",
-			"gh":        "/bin/gh",
-			"codex":     "/bin/codex",
-			"claude":    "/bin/claude",
-			"loopcoder": "/bin/loopcoder",
+			"git":         "/bin/git",
+			"gh":          "/bin/gh",
+			"codex":       "/bin/codex",
+			"claude":      "/bin/claude",
+			"loopcoder":   "/bin/loopcoder",
+			"govulncheck": "/bin/govulncheck",
+			"staticcheck": "/bin/staticcheck",
+			"gosec":       "/bin/gosec",
 		},
 		commands: map[string]CommandResult{
 			cmdKey("gh", "auth", "status"): {
@@ -607,6 +643,25 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 				Worker:   "codex",
 				Verifier: "claude",
 			},
+			CI: config.CI{
+				Checks: []string{"verify", "go", "staticcheck", "govulncheck", "audit"},
+			},
+			Audit: config.Audit{
+				SeverityThreshold: "medium",
+				SAST: config.AuditSAST{
+					Commands: []config.AuditSASTCommand{
+						{ID: "govulncheck", Argv: []string{"govulncheck", "-json", "./..."}, Parser: "govulncheck-json"},
+						{ID: "staticcheck", Argv: []string{"staticcheck", "-f", "json", "./..."}, Parser: "staticcheck-json"},
+						{ID: "gosec", Argv: []string{"gosec", "-fmt", "json", "-quiet", "./..."}, Parser: "gosec-json"},
+					},
+				},
+				Review: config.AuditReview{
+					RubricPath: "docs/security/audit-rubric.md",
+				},
+				Baseline: config.AuditBaseline{
+					Path: "docs/security/audit-baseline.yml",
+				},
+			},
 		},
 		file:           []byte("version: 1\nmin_loopcoder_version: 0.3.0\n"),
 		settingsFile:   healthyClaudeSettings(),
@@ -615,6 +670,11 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 		skillFiles: map[string][]byte{
 			doctorSkillPath(filepath.Join("home", "user"), "SKILL.md"):  []byte("skill content\n"),
 			doctorSkillPath(filepath.Join("home", "user"), "AGENTS.md"): []byte("agents content\n"),
+		},
+		files: map[string][]byte{
+			filepath.Clean(filepath.Join("/repo", ".github", "workflows", "ci.yml")):         []byte("jobs:\n  audit:\n    runs-on: ubuntu-latest\n"),
+			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-rubric.md")):    []byte("# Audit Rubric\n"),
+			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-baseline.yml")): []byte("version: 1\nwaivers: []\n"),
 		},
 	}
 }
@@ -631,6 +691,7 @@ type fakeDoctorEnv struct {
 	executablePath string
 	userHome       string
 	skillFiles     map[string][]byte
+	files          map[string][]byte
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -690,6 +751,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 				return nil, os.ErrNotExist
 			}
 			return append([]byte(nil), f.settingsFile...), nil
+		}
+		if data, ok := f.files[clean]; ok {
+			return append([]byte(nil), data...), nil
 		}
 		if f.fileErr != nil {
 			return nil, f.fileErr
