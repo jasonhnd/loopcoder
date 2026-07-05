@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -279,10 +280,10 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		opts.RunID = state.RunIDForWave(started)
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if strings.TrimSpace(opts.PreProdBranch) == "" {
-		opts.PreProdBranch = "pre-prod"
+		opts.PreProdBranch = lcdefaults.PreProdBranch
 	}
 
 	tickReport := TickReport{
@@ -601,7 +602,7 @@ func withTickDefaults(opts TickOptions) TickOptions {
 		opts.LoadAttempts = state.LoadAttempts
 	}
 	if opts.ThrottleLimit <= 0 {
-		opts.ThrottleLimit = 4
+		opts.ThrottleLimit = lcdefaults.DispatchWaveThrottleLimit
 	}
 	return opts
 }

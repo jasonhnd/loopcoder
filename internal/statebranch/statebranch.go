@@ -17,17 +17,18 @@ import (
 	"strings"
 	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
 const (
-	DefaultBranch     = "loopcoder/state"
-	DefaultRemote     = "origin"
-	DefaultTTLSeconds = 600
+	DefaultBranch     = lcdefaults.StateBranchDefaultBranch
+	DefaultRemote     = lcdefaults.StateBranchDefaultRemote
+	DefaultTTLSeconds = lcdefaults.StateBranchDefaultTTLSeconds
 
-	logTailLines = 50
+	logTailLines = lcdefaults.StateBranchLogTailLines
 )
 
 var (

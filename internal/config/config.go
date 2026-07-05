@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"gopkg.in/yaml.v3"
 )
@@ -315,28 +316,28 @@ func Default() Config {
 	return Config{
 		Verification: Verification{
 			SpecRequired: true,
-			MaxFixPasses: 3,
+			MaxFixPasses: lcdefaults.VerificationMaxFixPasses,
 			Browser: Browser{
-				Enabled: "auto",
+				Enabled: lcdefaults.VerificationBrowserMode,
 			},
 		},
 		Resilience: Resilience{
 			Worker: ResilienceWorker{
-				HeartbeatIntervalSeconds: 15,
-				StaleAfterSeconds:        120,
-				HungAfterSeconds:         300,
-				MaxAttempts:              3,
-				RetryBackoffSeconds:      []int{10, 30, 120},
-				HardCapSeconds:           2700,
-				StallTimeoutSeconds:      300,
+				HeartbeatIntervalSeconds: lcdefaults.WorkerHeartbeatIntervalSeconds,
+				StaleAfterSeconds:        lcdefaults.WorkerStaleAfterSeconds,
+				HungAfterSeconds:         lcdefaults.WorkerHungAfterSeconds,
+				MaxAttempts:              lcdefaults.WorkerMaxAttempts,
+				RetryBackoffSeconds:      lcdefaults.WorkerRetryBackoffSeconds(),
+				HardCapSeconds:           lcdefaults.WorkerHardCapSeconds,
+				StallTimeoutSeconds:      lcdefaults.WorkerStallTimeoutSeconds,
 			},
 			Verifier: ResilienceVerifier{
-				HardCapSeconds:      900,
-				StallTimeoutSeconds: 300,
+				HardCapSeconds:      lcdefaults.VerifierHardCapSeconds,
+				StallTimeoutSeconds: lcdefaults.VerifierStallTimeoutSeconds,
 			},
 		},
 		Environment: Environment{
-			PreProdBranch: "pre-prod",
+			PreProdBranch: lcdefaults.PreProdBranch,
 		},
 	}
 }
@@ -807,7 +808,7 @@ func defaultShowBaseConfig(ctx context.Context, repoPath, baseBranch string) ([]
 func normalizeBaseBranch(baseBranch string) string {
 	baseBranch = strings.TrimSpace(baseBranch)
 	if baseBranch == "" {
-		return "main"
+		return lcdefaults.BaseBranch
 	}
 	return baseBranch
 }

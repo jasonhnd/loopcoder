@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
 type PendingPromotionLedgerLoader func(repoPath, preProdBranch string) []TickPendingPromotion
@@ -29,7 +30,7 @@ func ResolvePromoteAutoGate(ctx context.Context, opts AutoGateResolverOptions) (
 
 	inputs := &AutoGateInputs{}
 
-	if files, diff, err := opts.Writer.CompareBranches(ctx, "main", opts.PreProdBranch); err == nil {
+	if files, diff, err := opts.Writer.CompareBranches(ctx, lcdefaults.BaseBranch, opts.PreProdBranch); err == nil {
 		inputs.RedLineClean = promoteBoolPtr(PromotionRedLinesClean(files, diff))
 	}
 

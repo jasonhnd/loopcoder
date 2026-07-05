@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -23,7 +23,7 @@ const (
 	DeliveryFilename = ".delivery.yml"
 	RoadmapFilename  = "ROADMAP.md"
 
-	ghHardCapDefault = 60 * time.Second
+	ghHardCapDefault = lcdefaults.ScaffoldGitHubCommandCap
 )
 
 var (
@@ -200,10 +200,10 @@ func DeliveryTemplate(opts Options) string {
 	writeOptionalScalar(&b, "  ", "model", workerModel)
 	b.WriteString("  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.\n")
 	writeOptionalScalar(&b, "  ", "reasoning_effort", workerEffort)
-	b.WriteString("  base_branch: main\n")
+	fmt.Fprintf(&b, "  base_branch: %s\n", lcdefaults.BaseBranch)
 	b.WriteString("  command_hint: \"implement the issue, run relevant checks, commit\"\n")
 	b.WriteString("environment:\n")
-	b.WriteString("  pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; promote is the separate production step.\n")
+	fmt.Fprintf(&b, "  pre_prod_branch: %s # Tick auto-merges clean PRs here only; promote is the separate production step.\n", lcdefaults.PreProdBranch)
 	b.WriteString("# evidence:\n")
 	b.WriteString("#   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.\n")
 	b.WriteString("#   website:\n")
@@ -300,16 +300,16 @@ func DeliveryTemplate(opts Options) string {
 	}
 	b.WriteString("# resilience:\n")
 	b.WriteString("#   worker:\n")
-	b.WriteString("#     # Optional. Absent = 15; expected worker heartbeat cadence in seconds.\n")
-	b.WriteString("#     heartbeat_interval_seconds: 15\n")
-	b.WriteString("#     # Optional. Absent = 120; mark progress stale after this many seconds without phase or log growth.\n")
-	b.WriteString("#     stale_after_seconds: 120\n")
-	b.WriteString("#     # Optional. Absent = 300; classify hung after stale progress or stale sidecar with no live process.\n")
-	b.WriteString("#     hung_after_seconds: 300\n")
-	b.WriteString("#     # Optional. Absent = 3; maximum attempts before blocking for a human decision.\n")
-	b.WriteString("#     max_attempts: 3\n")
-	b.WriteString("#     # Optional. Absent = [10, 30, 120]; retry backoff schedule between attempts.\n")
-	b.WriteString("#     retry_backoff_seconds: [10, 30, 120]\n")
+	fmt.Fprintf(&b, "#     # Optional. Absent = %d; expected worker heartbeat cadence in seconds.\n", lcdefaults.WorkerHeartbeatIntervalSeconds)
+	fmt.Fprintf(&b, "#     heartbeat_interval_seconds: %d\n", lcdefaults.WorkerHeartbeatIntervalSeconds)
+	fmt.Fprintf(&b, "#     # Optional. Absent = %d; mark progress stale after this many seconds without phase or log growth.\n", lcdefaults.WorkerStaleAfterSeconds)
+	fmt.Fprintf(&b, "#     stale_after_seconds: %d\n", lcdefaults.WorkerStaleAfterSeconds)
+	fmt.Fprintf(&b, "#     # Optional. Absent = %d; classify hung after stale progress or stale sidecar with no live process.\n", lcdefaults.WorkerHungAfterSeconds)
+	fmt.Fprintf(&b, "#     hung_after_seconds: %d\n", lcdefaults.WorkerHungAfterSeconds)
+	fmt.Fprintf(&b, "#     # Optional. Absent = %d; maximum attempts before blocking for a human decision.\n", lcdefaults.WorkerMaxAttempts)
+	fmt.Fprintf(&b, "#     max_attempts: %d\n", lcdefaults.WorkerMaxAttempts)
+	fmt.Fprintf(&b, "#     # Optional. Absent = %s; retry backoff schedule between attempts.\n", formatInlineInts(lcdefaults.WorkerRetryBackoffSeconds()))
+	fmt.Fprintf(&b, "#     retry_backoff_seconds: %s\n", formatInlineInts(lcdefaults.WorkerRetryBackoffSeconds()))
 	b.WriteString("ci:\n")
 	b.WriteString("  checks: []\n")
 	b.WriteString("  # Optional. Absent = no local test command gate.\n")
@@ -324,11 +324,11 @@ func DeliveryTemplate(opts Options) string {
 	b.WriteString("# verification:\n")
 	b.WriteString("#   # Optional. Absent = true for loopcoder code PRs.\n")
 	b.WriteString("#   spec_required: true\n")
-	b.WriteString("#   # Optional. Absent = 3.\n")
-	b.WriteString("#   max_fix_passes: 3\n")
+	fmt.Fprintf(&b, "#   # Optional. Absent = %d.\n", lcdefaults.VerificationMaxFixPasses)
+	fmt.Fprintf(&b, "#   max_fix_passes: %d\n", lcdefaults.VerificationMaxFixPasses)
 	b.WriteString("#   browser:\n")
-	b.WriteString("#     # Optional. auto|always|never; absent = auto.\n")
-	b.WriteString("#     enabled: auto\n")
+	fmt.Fprintf(&b, "#     # Optional. auto|always|never; absent = %s.\n", lcdefaults.VerificationBrowserMode)
+	fmt.Fprintf(&b, "#     enabled: %s\n", lcdefaults.VerificationBrowserMode)
 	b.WriteString("#     # Optional. Changed-path patterns that trigger browser verification in auto mode.\n")
 	b.WriteString("#     globs:\n")
 	b.WriteString("#       - web/**\n")
@@ -338,6 +338,14 @@ func DeliveryTemplate(opts Options) string {
 	b.WriteString("report:\n")
 	b.WriteString("  channel: chat\n")
 	return b.String()
+}
+
+func formatInlineInts(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func writeOptionalScalar(b *strings.Builder, indent, key, value string) {
@@ -382,7 +390,7 @@ Describe one large task here. compile will emit an epic slice DAG.
 `
 
 func ensureLabels(ctx context.Context, repoPath string, runner GitHubRunner) ([]LabelResult, []string) {
-	output, err := runner.Run(ctx, repoPath, "label", "list", "--limit", "1000", "--json", "name")
+	output, err := runner.Run(ctx, repoPath, "label", "list", "--limit", strconv.Itoa(lcdefaults.GitHubListLimit), "--json", "name")
 	if err != nil {
 		return nil, []string{"gh label setup skipped: " + commandError(err, output)}
 	}

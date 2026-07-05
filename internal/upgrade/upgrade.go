@@ -21,8 +21,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -43,7 +43,7 @@ const (
 	checksumSignatureAssetName = "SHA256SUMS.sigstore"
 	defaultCosignIssuer        = "https://token.actions.githubusercontent.com"
 
-	commandHardCapDefault = 60 * time.Second
+	commandHardCapDefault = lcdefaults.UpgradeCommandHardCap
 )
 
 var commandHardCap = commandHardCapDefault
@@ -141,7 +141,7 @@ type installResult struct {
 
 // DefaultDeps returns production dependencies for upgrade.
 func DefaultDeps() Deps {
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: lcdefaults.UpgradeHTTPTimeout}
 	return Deps{
 		Getenv: os.Getenv,
 		HomeLayout: func() (home.Layout, error) {

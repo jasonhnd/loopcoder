@@ -8,13 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-const gitHardCapDefault = 60 * time.Second
+const gitHardCapDefault = lcdefaults.GitCommandHardCap
 
 var (
 	gitCommand   = "git"

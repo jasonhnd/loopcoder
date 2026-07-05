@@ -18,17 +18,18 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/attestation"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
 const NotReported = "not reported"
 
 const (
-	maxRunStatusEventBytes       int64 = 64 << 20
-	maxRunStatusEventLineBytes   int   = 1 << 20
-	maxRunStatusRecordBytes      int64 = 4 << 20
-	maxRunStatusDirectoryEntries       = 4096
-	maxRunStatusFutureSkew             = 24 * time.Hour
+	maxRunStatusEventBytes       int64 = lcdefaults.RunStatusMaxEventBytes
+	maxRunStatusEventLineBytes   int   = lcdefaults.RunStatusMaxEventLineBytes
+	maxRunStatusRecordBytes      int64 = lcdefaults.RunStatusMaxRecordBytes
+	maxRunStatusDirectoryEntries       = lcdefaults.RunStatusMaxDirectoryEntries
+	maxRunStatusFutureSkew             = lcdefaults.RunStatusMaxFutureSkew
 )
 
 type Options struct {

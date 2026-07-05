@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -42,7 +43,7 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 		return report.ResumeReport{}, fmt.Errorf("github reader is required")
 	}
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if opts.Now.IsZero() {
 		opts.Now = time.Now().UTC()

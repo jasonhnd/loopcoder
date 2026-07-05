@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
 const (
 	SettingsRelPath = ".claude/settings.json"
 
-	hookTimeout             = 10
+	hookTimeout             = lcdefaults.ClaudeHookTimeoutSeconds
 	postToolUseShellMatcher = "Bash|PowerShell|pwsh"
 )
 

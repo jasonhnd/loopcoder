@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -26,7 +27,7 @@ const (
 	StatusFail       = "fail"
 	StatusNeedsHuman = "needs-human"
 
-	commandHardCapDefault = 15 * time.Minute
+	commandHardCapDefault = lcdefaults.VerifyCommandHardCap
 )
 
 var commandHardCap = commandHardCapDefault
@@ -124,7 +125,7 @@ func DefaultDeps() Deps {
 func Run(ctx context.Context, opts Options, deps Deps) Result {
 	deps = withDefaults(deps)
 	if strings.TrimSpace(opts.BaseBranch) == "" {
-		opts.BaseBranch = "main"
+		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 
 	summary := Summary{
