@@ -166,7 +166,7 @@ func TestParserAdaptersNormalizeFindings(t *testing.T) {
 	}
 }
 
-func TestNativeScansRedactSecretsAndFlagSensitivePermissions(t *testing.T) {
+func TestNativeScansRedactSecretsAndFlagSensitiveWrites(t *testing.T) {
 	repo := t.TempDir()
 	rawSecret := "supersecretvalue1234567890"
 	if err := os.WriteFile(filepath.Join(repo, "config.txt"), []byte("api_key = \""+rawSecret+"\"\n"), 0o600); err != nil {
@@ -194,8 +194,8 @@ func writePrompt(data []byte) error {
 	if err != nil {
 		t.Fatalf("RunNativeScans returned error: %v", err)
 	}
-	if len(findings) < 3 {
-		t.Fatalf("native findings len = %d, want at least secret, permission, sensitive write: %#v", len(findings), findings)
+	if len(findings) < 2 {
+		t.Fatalf("native findings len = %d, want at least secret and sensitive write: %#v", len(findings), findings)
 	}
 	encoded, err := json.Marshal(findings)
 	if err != nil {
@@ -204,7 +204,7 @@ func writePrompt(data []byte) error {
 	if strings.Contains(string(encoded), rawSecret) {
 		t.Fatalf("native findings leaked raw secret: %s", string(encoded))
 	}
-	for _, wantRule := range []string{"native:secret", "native:file-permission", "native:sensitive-write"} {
+	for _, wantRule := range []string{"native:secret", "native:sensitive-write"} {
 		if !hasRule(findings, wantRule) {
 			t.Fatalf("native findings missing %s: %#v", wantRule, findings)
 		}

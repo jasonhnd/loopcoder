@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -332,6 +333,9 @@ func isGenericSecretSuppressedPath(file string) bool {
 }
 
 func nativePermissionFinding(repoPath, file string) (Finding, bool) {
+	if !nativeModeBitPermissionChecksEnabled() {
+		return Finding{}, false
+	}
 	if !isSensitivePath(file) || isSourceFileForPermissionScan(file) {
 		return Finding{}, false
 	}
@@ -353,6 +357,11 @@ func nativePermissionFinding(repoPath, file string) (Finding, bool) {
 		Message:  "Sensitive file is readable or writable beyond owner-only permissions.",
 		Evidence: fmt.Sprintf("%s mode %04o is broader than 0600", file, mode),
 	}), true
+}
+
+func nativeModeBitPermissionChecksEnabled() bool {
+	// Windows reports synthesized Unix mode bits; skip until a real ACL signal is implemented.
+	return runtime.GOOS != "windows"
 }
 
 func nativeSensitiveWriteFindings(file, text string) []Finding {
