@@ -104,13 +104,32 @@ func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]by
 
 // FetchOriginBase runs git fetch origin <baseBranch>.
 func (c *Client) FetchOriginBase(ctx context.Context, repoPath, baseBranch string) error {
-	_, err := c.run(ctx, repoPath, "fetch", "origin", baseBranch)
+	baseBranch = strings.TrimSpace(baseBranch)
+	if baseBranch == "" {
+		return fmt.Errorf("base branch is required")
+	}
+	refspec := "+refs/heads/" + baseBranch + ":refs/remotes/origin/" + baseBranch
+	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", refspec)
 	return err
 }
 
 // FetchPRHead fetches a pull request head into FETCH_HEAD.
 func (c *Client) FetchPRHead(ctx context.Context, repoPath string, prNumber int) error {
 	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", fmt.Sprintf("pull/%d/head", prNumber))
+	return err
+}
+
+// FetchPRHeadRef fetches a pull request head into destRef.
+func (c *Client) FetchPRHeadRef(ctx context.Context, repoPath string, prNumber int, destRef string) error {
+	destRef = strings.TrimSpace(destRef)
+	if prNumber <= 0 {
+		return fmt.Errorf("pull request number is required")
+	}
+	if destRef == "" {
+		return fmt.Errorf("destination ref is required")
+	}
+	refspec := fmt.Sprintf("+refs/pull/%d/head:%s", prNumber, destRef)
+	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", refspec)
 	return err
 }
 

@@ -115,8 +115,10 @@ type Finding struct {
 type GitClient interface {
 	FetchOriginBase(ctx context.Context, repoPath, baseBranch string) error
 	FetchPRHead(ctx context.Context, repoPath string, prNumber int) error
+	FetchPRHeadRef(ctx context.Context, repoPath string, prNumber int, destRef string) error
 	WorktreeAddDetachedAt(ctx context.Context, repoPath, worktreePath, rev string) error
 	WorktreeRemove(ctx context.Context, repoPath, worktreePath string) error
+	RevParse(ctx context.Context, repoPath, rev string) (string, error)
 	Show(ctx context.Context, repoPath, revPath string) (string, error)
 }
 
@@ -174,6 +176,7 @@ type ReviewPacketLimits struct {
 
 type reviewInputs struct {
 	PR                      gh.PullRequest
+	Refs                    reviewRefs
 	Issue                   gh.Issue
 	IssuePresent            bool
 	Diff                    string
@@ -183,6 +186,28 @@ type reviewInputs struct {
 	Rubric                  rubricInput
 	RenderedArtifacts       []renderedArtifactInput
 	ReviewPacketOrder       []string
+}
+
+type reviewRefs struct {
+	PRNumber           int
+	BaseBranch         string
+	BaseSHA            string
+	HeadBranch         string
+	HeadSHA            string
+	PRHeadFileSource   prHeadFileSource
+	VerificationReason string
+}
+
+type prHeadFileSource struct {
+	Ref      string
+	Verified bool
+	Reason   string
+}
+
+type prHeadFileContent struct {
+	Path      string
+	SourceRef string
+	Content   string
 }
 
 type specInput struct {
@@ -244,6 +269,21 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	github := deps.GitHub(repoPath)
+	if github == nil {
+		return Result{}, errors.New("github client is not configured")
+	}
+	pr, err := github.ViewPR(ctx, opts.PRNumber)
+	if err != nil {
+		return Result{}, fmt.Errorf("gh pr view %d: %w", opts.PRNumber, err)
+	}
+	refs := reviewRefsFromPR(opts.PRNumber, opts.BaseBranch, pr)
+	opts.BaseBranch = refs.BaseBranch
+	refs, err = prepareReviewRefs(ctx, deps, repoPath, refs)
+	if err != nil {
+		verdict := needsHumanVerdict("warning", "", "review refs unavailable: "+err.Error())
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+	}
 	cfg, err := config.LoadForRepo(ctx, repoPath, config.LoadOptions{
 		BaseBranch:     opts.BaseBranch,
 		ConfigFromBase: opts.ConfigFromBase,
@@ -263,10 +303,6 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if runner == nil {
 		return Result{}, fmt.Errorf("provider %q resolved to nil runner", opts.Provider)
 	}
-	github := deps.GitHub(repoPath)
-	if github == nil {
-		return Result{}, errors.New("github client is not configured")
-	}
 
 	scratchPath, err := deps.MkdirTemp("", "loopcoder-loopreview-*")
 	if err != nil {
@@ -276,10 +312,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	logPath := filepath.Join(scratchPath, "loopreview.log")
 	defer cleanup(deps, warnings, repoPath, worktreePath, scratchPath)
 
-	if err := deps.Git.FetchOriginBase(ctx, repoPath, opts.BaseBranch); err != nil {
-		return Result{}, fmt.Errorf("git fetch origin %s: %w", opts.BaseBranch, err)
-	}
-	inputs, err := gatherInputs(ctx, deps, github, repoPath, opts)
+	inputs, err := gatherInputs(ctx, deps, github, repoPath, opts, pr, refs)
 	if err != nil {
 		return Result{}, err
 	}
@@ -288,7 +321,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	inputs.ReviewPacketOrder = cfg.Domain.Verification.ReviewPacketOrder
 	producer := cfg.Domain.Evidence.Producer
 	if evidenceProducerConfigured(producer) {
-		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
+		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, refs.PRHeadFileSource); err != nil {
 			return Result{}, err
 		}
 		produced, producerErr := runConfiguredEvidenceProducer(ctx, deps, worktreePath, producer, opts.Timeout)
@@ -307,7 +340,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
 	}
 	if !evidenceProducerConfigured(producer) {
-		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, opts.PRNumber); err != nil {
+		if err := checkoutPRWorktree(ctx, deps, repoPath, worktreePath, refs.PRHeadFileSource); err != nil {
 			return Result{}, err
 		}
 	}
@@ -438,6 +471,123 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func reviewRefsFromPR(prNumber int, fallbackBase string, pr gh.PullRequest) reviewRefs {
+	baseBranch := strings.TrimSpace(pr.BaseRefName)
+	if baseBranch == "" {
+		baseBranch = strings.TrimSpace(fallbackBase)
+	}
+	if baseBranch == "" {
+		baseBranch = lcdefaults.BaseBranch
+	}
+	headBranch := strings.TrimSpace(pr.HeadRefName)
+	return reviewRefs{
+		PRNumber:   prNumber,
+		BaseBranch: baseBranch,
+		BaseSHA:    strings.TrimSpace(pr.BaseRefOID),
+		HeadBranch: headBranch,
+		HeadSHA:    strings.TrimSpace(pr.HeadRefOID),
+		PRHeadFileSource: prHeadFileSource{
+			Ref: prHeadLocalRef(prNumber),
+		},
+	}
+}
+
+func prepareReviewRefs(ctx context.Context, deps Deps, repoPath string, refs reviewRefs) (reviewRefs, error) {
+	if strings.TrimSpace(refs.BaseBranch) == "" {
+		refs.BaseBranch = lcdefaults.BaseBranch
+	}
+	if strings.TrimSpace(refs.PRHeadFileSource.Ref) == "" {
+		refs.PRHeadFileSource.Ref = prHeadLocalRef(refs.PRNumber)
+	}
+	lock, err := deps.AcquireLock(repoPath, 60*time.Second)
+	if err != nil {
+		return refs, err
+	}
+	if lock == nil {
+		return refs, errors.New("lock acquisition returned nil lock")
+	}
+	release := true
+	defer func() {
+		if release {
+			_ = lock.Release()
+		}
+	}()
+
+	if err := deps.Git.FetchOriginBase(ctx, repoPath, refs.BaseBranch); err != nil {
+		return refs, fmt.Errorf("git fetch PR base %s: %w", refs.BaseBranch, err)
+	}
+	fetchedBase, err := deps.Git.RevParse(ctx, repoPath, "origin/"+refs.BaseBranch+"^{commit}")
+	if err != nil {
+		return refs, fmt.Errorf("verify PR base %s: %w", refs.BaseBranch, err)
+	}
+	if refs.BaseSHA != "" {
+		if !sameCommit(fetchedBase, refs.BaseSHA) {
+			return refs, fmt.Errorf("verify PR base %s: fetched origin/%s at %s, GitHub reports %s", refs.BaseBranch, refs.BaseBranch, fetchedBase, refs.BaseSHA)
+		}
+	} else {
+		refs.BaseSHA = fetchedBase
+	}
+	if err := deps.Git.FetchPRHeadRef(ctx, repoPath, refs.PRNumber, refs.PRHeadFileSource.Ref); err != nil {
+		return refs, fmt.Errorf("git fetch PR #%d head into %s: %w", refs.PRNumber, refs.PRHeadFileSource.Ref, err)
+	}
+	fetchedHead, err := deps.Git.RevParse(ctx, repoPath, refs.PRHeadFileSource.Ref+"^{commit}")
+	if err != nil {
+		return refs, fmt.Errorf("verify PR #%d head ref %s: %w", refs.PRNumber, refs.PRHeadFileSource.Ref, err)
+	}
+	if refs.HeadSHA != "" && !sameCommit(fetchedHead, refs.HeadSHA) {
+		return refs, fmt.Errorf("verify PR #%d head: fetched %s at %s, GitHub reports %s", refs.PRNumber, refs.PRHeadFileSource.Ref, fetchedHead, refs.HeadSHA)
+	}
+	refs.PRHeadFileSource.Verified = true
+	refs.PRHeadFileSource.Reason = "fetched from GitHub PR head ref"
+	if refs.HeadSHA == "" {
+		refs.HeadSHA = fetchedHead
+	}
+	refs.VerificationReason = "base and PR head refs fetched before packet construction"
+
+	releaseErr := lock.Release()
+	release = false
+	if releaseErr != nil {
+		return refs, releaseErr
+	}
+	return refs, nil
+}
+
+func sameCommit(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	return strings.EqualFold(left, right)
+}
+
+func prHeadLocalRef(prNumber int) string {
+	return fmt.Sprintf("refs/loopcoder/loopreview/pr-%d-head", prNumber)
+}
+
+func readPRHeadFile(ctx context.Context, git GitClient, repoPath string, source prHeadFileSource, rawPath string) (prHeadFileContent, error) {
+	if !source.Verified {
+		return prHeadFileContent{}, errors.New("PR-head file source ref is not verified")
+	}
+	sourceRef := strings.TrimSpace(source.Ref)
+	if sourceRef == "" {
+		return prHeadFileContent{}, errors.New("PR-head file source ref is unavailable")
+	}
+	cleanPath, err := cleanRepoRelativePath(rawPath)
+	if err != nil {
+		return prHeadFileContent{}, err
+	}
+	content, err := git.Show(ctx, repoPath, sourceRef+":"+cleanPath)
+	if err != nil {
+		return prHeadFileContent{}, err
+	}
+	return prHeadFileContent{
+		Path:      cleanPath,
+		SourceRef: sourceRef,
+		Content:   content,
+	}, nil
+}
+
 func Render(w io.Writer, result Result) error {
 	data, err := json.Marshal(result.Verdict)
 	if err != nil {
@@ -515,7 +665,12 @@ type reviewPacket struct {
 	PRNumber                 int
 	PRTitle                  string
 	HeadRef                  string
+	HeadSHA                  string
 	BaseBranch               string
+	BaseSHA                  string
+	PRHeadFileSourceRef      string
+	PRHeadFileSourceVerified bool
+	PRHeadFileSourceReason   string
 	IssueNumber              string
 	IssueTitle               string
 	IssueBody                packetSection
@@ -610,10 +765,11 @@ func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacke
 }
 
 func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLimits) reviewPacket {
-	baseBranch := opts.BaseBranch
-	if strings.TrimSpace(baseBranch) == "" {
-		baseBranch = lcdefaults.BaseBranch
+	refs := inputs.Refs
+	if refs.PRNumber == 0 {
+		refs = reviewRefsFromPR(opts.PRNumber, opts.BaseBranch, inputs.PR)
 	}
+	baseBranch := refs.BaseBranch
 
 	issueTitle := "(issue unavailable)"
 	issueBody := "(issue body unavailable)"
@@ -640,28 +796,33 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 	specPathAdded := diffAddsPath(inputs.Diff, inputs.Spec.Path)
 
 	return reviewPacket{
-		PRNumber:           opts.PRNumber,
-		PRTitle:            inputs.PR.Title,
-		HeadRef:            inputs.PR.HeadRefName,
-		BaseBranch:         baseBranch,
-		IssueNumber:        issueNumber,
-		IssueTitle:         issueTitle,
-		IssueBody:          truncatePacketSection(issueBody, limits.IssueBytes),
-		SpecPath:           specPath,
-		SpecAvailable:      inputs.Spec.Available,
-		SpecReason:         specReason,
-		SpecExpectedAbsent: inputs.Spec.ExpectedAbsent,
-		SpecExpectedReason: inputs.Spec.ExpectedReason,
-		DocumentationOnly:  documentationOnly,
-		SpecPathChanged:    specPathChanged,
-		SpecPathAdded:      specPathAdded,
-		SpecContent:        truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
-		Rubric:             buildRubricSection(inputs.Rubric, limits.RubricBytes),
-		RenderedArtifacts:  buildRenderedArtifactsSection(inputs.RenderedArtifacts, limits.RenderedArtifactBytes),
-		ChangedFiles:       buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
-		Diff:               buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
-		ReviewPacketOrder:  append([]string(nil), inputs.ReviewPacketOrder...),
-		Limits:             limits,
+		PRNumber:                 opts.PRNumber,
+		PRTitle:                  inputs.PR.Title,
+		HeadRef:                  refs.HeadBranch,
+		HeadSHA:                  refs.HeadSHA,
+		BaseBranch:               baseBranch,
+		BaseSHA:                  refs.BaseSHA,
+		PRHeadFileSourceRef:      refs.PRHeadFileSource.Ref,
+		PRHeadFileSourceVerified: refs.PRHeadFileSource.Verified,
+		PRHeadFileSourceReason:   refs.PRHeadFileSource.Reason,
+		IssueNumber:              issueNumber,
+		IssueTitle:               issueTitle,
+		IssueBody:                truncatePacketSection(issueBody, limits.IssueBytes),
+		SpecPath:                 specPath,
+		SpecAvailable:            inputs.Spec.Available,
+		SpecReason:               specReason,
+		SpecExpectedAbsent:       inputs.Spec.ExpectedAbsent,
+		SpecExpectedReason:       inputs.Spec.ExpectedReason,
+		DocumentationOnly:        documentationOnly,
+		SpecPathChanged:          specPathChanged,
+		SpecPathAdded:            specPathAdded,
+		SpecContent:              truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
+		Rubric:                   buildRubricSection(inputs.Rubric, limits.RubricBytes),
+		RenderedArtifacts:        buildRenderedArtifactsSection(inputs.RenderedArtifacts, limits.RenderedArtifactBytes),
+		ChangedFiles:             buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
+		Diff:                     buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
+		ReviewPacketOrder:        append([]string(nil), inputs.ReviewPacketOrder...),
+		Limits:                   limits,
 	}
 }
 
@@ -791,7 +952,15 @@ func formatReviewPacket(packet reviewPacket) string {
 	fmt.Fprintf(&out, "Number: #%d\n", packet.PRNumber)
 	fmt.Fprintf(&out, "Title: %s\n", packet.PRTitle)
 	fmt.Fprintf(&out, "Head: %s\n", packet.HeadRef)
-	fmt.Fprintf(&out, "Base: %s\n\n", packet.BaseBranch)
+	fmt.Fprintf(&out, "Head SHA: %s\n", firstNonEmpty(packet.HeadSHA, "(unavailable)"))
+	fmt.Fprintf(&out, "Base: %s\n", packet.BaseBranch)
+	fmt.Fprintf(&out, "Base SHA: %s\n", firstNonEmpty(packet.BaseSHA, "(unavailable)"))
+	fmt.Fprintf(&out, "PR-head file source ref: %s\n", firstNonEmpty(packet.PRHeadFileSourceRef, "(unavailable)"))
+	fmt.Fprintf(&out, "PR-head file source verified: %s\n", yesNo(packet.PRHeadFileSourceVerified))
+	if strings.TrimSpace(packet.PRHeadFileSourceReason) != "" {
+		fmt.Fprintf(&out, "PR-head file source note: %s\n", packet.PRHeadFileSourceReason)
+	}
+	fmt.Fprintf(&out, "\n")
 
 	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured, packet.RenderedArtifacts.Configured) {
 		switch section {
@@ -2035,11 +2204,7 @@ func countOmittedLines(text string) int {
 	return countLines(text)
 }
 
-func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath string, opts Options) (reviewInputs, error) {
-	pr, err := github.ViewPR(ctx, opts.PRNumber)
-	if err != nil {
-		return reviewInputs{}, fmt.Errorf("gh pr view %d: %w", opts.PRNumber, err)
-	}
+func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath string, opts Options, pr gh.PullRequest, refs reviewRefs) (reviewInputs, error) {
 	diff, err := github.PRDiff(ctx, opts.PRNumber)
 	if err != nil {
 		return reviewInputs{}, fmt.Errorf("gh pr diff %d: %w", opts.PRNumber, err)
@@ -2051,15 +2216,16 @@ func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath 
 
 	inputs := reviewInputs{
 		PR:           pr,
+		Refs:         refs,
 		Diff:         diff,
 		ChangedFiles: changedFiles,
 	}
 	issue, present := loadIssue(ctx, github, pr)
 	inputs.Issue = issue
 	inputs.IssuePresent = present
-	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, opts.BaseBranch, opts.Stderr)
-	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, opts.BaseBranch, specSearchTexts(issue, present, pr))
-	inputs.Spec = classifySpecAbsence(inputs.Spec, opts.BaseBranch, changedFiles, diff)
+	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, refs.BaseBranch, opts.Stderr)
+	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, refs.BaseBranch, specSearchTexts(issue, present, pr))
+	inputs.Spec = classifySpecAbsence(inputs.Spec, refs.BaseBranch, changedFiles, diff)
 	return inputs, nil
 }
 
@@ -2426,20 +2592,23 @@ func repoPathBase(path string) string {
 	return path[index+1:]
 }
 
-func checkoutPRWorktree(ctx context.Context, deps Deps, repoPath, worktreePath string, prNumber int) error {
+func checkoutPRWorktree(ctx context.Context, deps Deps, repoPath, worktreePath string, source prHeadFileSource) error {
+	if !source.Verified {
+		return errors.New("PR-head worktree source ref is not verified")
+	}
+	sourceRef := strings.TrimSpace(source.Ref)
+	if sourceRef == "" {
+		return errors.New("PR-head worktree source ref is unavailable")
+	}
 	lock, err := deps.AcquireLock(repoPath, 60*time.Second)
 	if err != nil {
 		return err
 	}
-	fetchErr := deps.Git.FetchPRHead(ctx, repoPath, prNumber)
-	var addErr error
-	if fetchErr == nil {
-		addErr = deps.Git.WorktreeAddDetachedAt(ctx, repoPath, worktreePath, "FETCH_HEAD")
+	if lock == nil {
+		return errors.New("lock acquisition returned nil lock")
 	}
+	addErr := deps.Git.WorktreeAddDetachedAt(ctx, repoPath, worktreePath, sourceRef)
 	releaseErr := lock.Release()
-	if fetchErr != nil {
-		return fmt.Errorf("git fetch PR head: %w", fetchErr)
-	}
 	if addErr != nil {
 		return fmt.Errorf("git worktree add: %w", addErr)
 	}

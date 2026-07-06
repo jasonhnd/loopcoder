@@ -107,7 +107,10 @@ type PullRequest struct {
 	Title                   string           `json:"title"`
 	Body                    string           `json:"body"`
 	URL                     string           `json:"url"`
+	BaseRefName             string           `json:"baseRefName"`
+	BaseRefOID              string           `json:"baseRefOid"`
 	HeadRefName             string           `json:"headRefName"`
+	HeadRefOID              string           `json:"headRefOid"`
 	IsDraft                 bool             `json:"isDraft"`
 	Labels                  []Label          `json:"labels"`
 	ClosingIssuesReferences []IssueReference `json:"closingIssuesReferences"`
@@ -309,7 +312,7 @@ func (c *CLI) ViewPR(ctx context.Context, number int) (PullRequest, error) {
 	var pr PullRequest
 	err := c.runJSON(ctx, []string{
 		"pr", "view", fmt.Sprintf("%d", number),
-		"--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences",
+		"--json", "number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences",
 	}, &pr)
 	return pr, err
 }
