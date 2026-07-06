@@ -566,6 +566,88 @@ func TestBuildReviewPacketTruncatesPerFileDiffBudget(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPacketIncludesCompletePRHeadBodyForLargeDocSpec(t *testing.T) {
+	specPath := "docs/specs/0535-loopreview-packet-truncation-reliability.md"
+	sourceRef := prHeadLocalRef(547)
+	body := loopreviewLargeSpecBody()
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{specPath}
+	inputs.Diff = loopreviewNewFileDiff(specPath, loopreviewAddedDiffBody(body))
+	inputs.Refs = reviewRefs{
+		PRNumber: 547,
+		PRHeadFileSource: prHeadFileSource{
+			Ref:      sourceRef,
+			Verified: true,
+		},
+	}
+	inputs.PRHeadFileBodies = []prHeadFileBodyInput{{
+		Path:      specPath,
+		SourceRef: sourceRef,
+		Content:   body,
+		Available: true,
+	}}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DiffFileBytes:              1200,
+		DocumentationBodyFileBytes: len(body) + 256,
+		DocumentationBodyBytes:     len(body) + 2048,
+		DocumentationBodyMaxFiles:  1,
+	})
+	if !packet.Diff.Truncated {
+		t.Fatal("diff was not truncated")
+	}
+	if packet.PRHeadFileBodies.IncludedCount != 1 {
+		t.Fatalf("included PR-head bodies = %d, want 1; skipped=%#v", packet.PRHeadFileBodies.IncludedCount, packet.PRHeadFileBodies.Skipped)
+	}
+	bodySection := strings.Index(prompt, "# PR-head file content")
+	if bodySection < 0 {
+		t.Fatalf("prompt missing PR-head file content section:\n%s", prompt)
+	}
+	if strings.Contains(prompt[:bodySection], "Relationship to existing specs") || strings.Contains(prompt[:bodySection], "Non-goals") {
+		t.Fatalf("generic diff excerpt unexpectedly contains tail sections before PR-head body:\n%s", prompt[:bodySection])
+	}
+	for _, want := range []string{
+		"Source: " + sourceRef + ":" + specPath,
+		"Completeness: complete",
+		"## Relationship to existing specs",
+		"## Non-goals",
+		"Line 600: final acceptance-criteria-relevant documentation detail.",
+	} {
+		if !strings.Contains(prompt[bodySection:], want) {
+			t.Fatalf("PR-head body section missing %q:\n%s", want, prompt[bodySection:])
+		}
+	}
+}
+
+func TestBuildReviewPacketSkipsPRHeadBodyWhenBodyBudgetExceeded(t *testing.T) {
+	specPath := "docs/specs/large.md"
+	body := "kept heading\n" + strings.Repeat("required body line\n", 50)
+	inputs := loopreviewPromptTestInputs()
+	inputs.ChangedFiles = []string{specPath}
+	inputs.Diff = loopreviewNewFileDiff(specPath, "+kept heading\n")
+	inputs.PRHeadFileBodies = []prHeadFileBodyInput{{
+		Path:      specPath,
+		SourceRef: prHeadLocalRef(548),
+		Content:   body,
+		Available: true,
+	}}
+
+	prompt, packet := buildPromptWithLimits(loopreviewPromptTestOptions(), inputs, ReviewPacketLimits{
+		DocumentationBodyFileBytes: 64,
+		DocumentationBodyBytes:     4096,
+		DocumentationBodyMaxFiles:  1,
+	})
+	if packet.PRHeadFileBodies.IncludedCount != 0 {
+		t.Fatalf("included PR-head bodies = %d, want 0", packet.PRHeadFileBodies.IncludedCount)
+	}
+	if strings.Contains(prompt, "required body line") {
+		t.Fatalf("oversized PR-head body was included:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "exceeding per-file body budget 64 bytes") {
+		t.Fatalf("prompt missing budget skip reason:\n%s", prompt)
+	}
+}
+
 func TestBuildReviewPacketTruncatesTotalDiffBudget(t *testing.T) {
 	inputs := loopreviewPromptTestInputs()
 	inputs.Diff = loopreviewDiffPatch("internal/loopreview/a.go", "+ kept\n") +
@@ -2017,6 +2099,90 @@ func TestRunDocFirstNewSpecCanPassWithoutMergedSpec(t *testing.T) {
 	}
 }
 
+func TestRunIncludesCompletePRHeadBodyForLargeAddedDocSpec(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	specPath := "docs/specs/0535-loopreview-packet-truncation-reliability.md"
+	sourceRef := prHeadLocalRef(547)
+	body := loopreviewLargeSpecBody()
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			sourceRef + ":" + specPath: body,
+		},
+		showErrs: map[string]error{
+			"origin/main:" + specPath: errors.New("path does not exist in origin/main"),
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      547,
+			Title:       "Add large spec",
+			HeadRefName: "loop/issue-547",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 547,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 547,
+			Title:  "Add large spec",
+			Body:   "Add the doc-first design in " + specPath + ".",
+		},
+		diff:  loopreviewNewFileDiff(specPath, loopreviewAddedDiffBody(body)),
+		files: []string{specPath},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"complete PR-head body includes required tail sections","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   547,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+		ReviewPacketLimits: ReviewPacketLimits{
+			DiffFileBytes:              1200,
+			DocumentationBodyFileBytes: len(body) + 256,
+			DocumentationBodyBytes:     len(body) + 2048,
+			DocumentationBodyMaxFiles:  1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass {
+		t.Fatalf("verdict = %q, want pass", result.Verdict.Verdict)
+	}
+	if !containsString(fakeGit.showCalls, sourceRef+":"+specPath) {
+		t.Fatalf("show calls = %#v, want PR-head file read", fakeGit.showCalls)
+	}
+	for _, want := range []string{
+		"# PR-head file content",
+		"Source: " + sourceRef + ":" + specPath,
+		"Completeness: complete",
+		"## Relationship to existing specs",
+		"## Non-goals",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+}
+
 func TestRunUsesGitHubPRBaseAndVerifiedHeadRef(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
@@ -2421,6 +2587,38 @@ func loopreviewNewFileDiff(path, body string) string {
 		body
 }
 
+func loopreviewAddedDiffBody(body string) string {
+	var out strings.Builder
+	for _, line := range strings.SplitAfter(body, "\n") {
+		if line == "" {
+			continue
+		}
+		out.WriteString("+")
+		out.WriteString(line)
+	}
+	return out.String()
+}
+
+func loopreviewLargeSpecBody() string {
+	var out strings.Builder
+	out.WriteString("# Packet truncation reliability\n\n")
+	for i := 1; i <= 600; i++ {
+		switch i {
+		case 560:
+			out.WriteString("## Relationship to existing specs\n")
+			out.WriteString("This section is intentionally near the tail so the generic per-file diff cap omits it.\n\n")
+		case 590:
+			out.WriteString("## Non-goals\n")
+			out.WriteString("This section is also intentionally near the tail and must remain reviewable from PR-head content.\n\n")
+		case 600:
+			out.WriteString("Line 600: final acceptance-criteria-relevant documentation detail.\n")
+		default:
+			fmt.Fprintf(&out, "Line %03d: bounded review packet documentation filler.\n", i)
+		}
+	}
+	return out.String()
+}
+
 func assertPromptOrder(t *testing.T, prompt string, labels ...string) {
 	t.Helper()
 	previous := -1
@@ -2529,6 +2727,15 @@ func assertViewedIssues(t *testing.T, fakeGitHub *loopreviewFakeGitHub, want ...
 			t.Fatalf("viewed issues = %#v, want %#v", fakeGitHub.viewedIssues, want)
 		}
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func loopreviewStandardFakeGitHub() *loopreviewFakeGitHub {

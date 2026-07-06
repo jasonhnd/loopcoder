@@ -48,6 +48,9 @@ func TestCurrentInventory(t *testing.T) {
 		t.Fatalf("command hard caps = %#v", got)
 	}
 	if got.ReviewPacketDiffBudgetBytes != 80*1024 ||
+		got.ReviewPacketDocumentationBodyFileBytes != 64*1024 ||
+		got.ReviewPacketDocumentationBodyTotalBytes != 96*1024 ||
+		got.ReviewPacketDocumentationBodyMaxFiles != 3 ||
 		got.ReviewPacketTotalPromptBudgetBytes != 160*1024 ||
 		got.RenderedArtifactFileBudgetBytes != 8*1024 ||
 		got.RenderedArtifactMaxDirectoryFiles != 32 ||

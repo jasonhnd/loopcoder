@@ -49,6 +49,9 @@ const (
 	ReviewPacketChangedFilesBudgetBytes     = 8 * 1024
 	ReviewPacketDiffBudgetBytes             = 80 * 1024
 	ReviewPacketDiffFileBudgetBytes         = 24 * 1024
+	ReviewPacketDocumentationBodyFileBytes  = 64 * 1024
+	ReviewPacketDocumentationBodyTotalBytes = 96 * 1024
+	ReviewPacketDocumentationBodyMaxFiles   = 3
 	ReviewPacketGeneratedDiffFileBytes      = 2 * 1024
 	ReviewPacketGeneratedSizeBytes          = 128 * 1024
 	ReviewPacketIssueBudgetBytes            = 12 * 1024
@@ -135,6 +138,9 @@ type Values struct {
 	ReviewPacketChangedFilesBudgetBytes     int
 	ReviewPacketDiffBudgetBytes             int
 	ReviewPacketDiffFileBudgetBytes         int
+	ReviewPacketDocumentationBodyFileBytes  int
+	ReviewPacketDocumentationBodyTotalBytes int
+	ReviewPacketDocumentationBodyMaxFiles   int
 	ReviewPacketGeneratedDiffFileBytes      int
 	ReviewPacketGeneratedSizeBytes          int
 	ReviewPacketGeneratedPatterns           []string
@@ -206,6 +212,9 @@ func Current() Values {
 		ReviewPacketChangedFilesBudgetBytes:     ReviewPacketChangedFilesBudgetBytes,
 		ReviewPacketDiffBudgetBytes:             ReviewPacketDiffBudgetBytes,
 		ReviewPacketDiffFileBudgetBytes:         ReviewPacketDiffFileBudgetBytes,
+		ReviewPacketDocumentationBodyFileBytes:  ReviewPacketDocumentationBodyFileBytes,
+		ReviewPacketDocumentationBodyTotalBytes: ReviewPacketDocumentationBodyTotalBytes,
+		ReviewPacketDocumentationBodyMaxFiles:   ReviewPacketDocumentationBodyMaxFiles,
 		ReviewPacketGeneratedDiffFileBytes:      ReviewPacketGeneratedDiffFileBytes,
 		ReviewPacketGeneratedSizeBytes:          ReviewPacketGeneratedSizeBytes,
 		ReviewPacketGeneratedPatterns:           ReviewPacketGeneratedPatterns(),
