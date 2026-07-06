@@ -149,3 +149,39 @@ higher-authority source and report the conflict.
 - Candidate improvement: Partially mitigated -- `release.yml` now smokes the native linux/amd64 build's `--version` and fails on `version=dev`. A follow-up could add a post-publish download-and-verify step (checksum + `--version`) to the release workflow.
 - Confidence: high
 - Supersedes: none
+
+### 2026-07-06 - run 2026-07-06-v0.5.4 - Flush leftover relay from the previous session before the first dispatch
+
+- Scope: dispatch of issue #550 (0.5.4 C4); the initial dispatch failed with reserved exit code 4
+- Role: conductor
+- Observed: The first `loopcoder dispatch` of a fresh conductor session refused to run and exited 4, because a Verifier attestation block from the *previous* session's `loopreview` of PR #549 was still pending and unacknowledged in local relay state. Dispatch printed the pending block plus recovery instructions instead of proceeding.
+- Evidence: dispatch stdout "loopcoder relay gate: pending local-only Worker/Verifier attestation block(s) must be relayed before this command can run"; `loopcoder relay flush --repo .` then surfaced the pending PR #549 verifier block (verifier claude opus-4.8-1m, exit 0, 6m36s) and cleared the gate; the re-dispatch of #550 then succeeded.
+- Learning: The relay hard gate (spec 0447) persists across sessions via gitignored local state, so a leftover block from a prior session blocks the first mechanical command of the next one. A new conductor session resuming loopcoder self-work should run `loopcoder relay list --repo .` up front and `loopcoder relay flush --repo .` to surface any leftover Worker/Verifier block *before* the first dispatch, rather than discovering it as an exit-4.
+- Applies to: SKILL.md (conductor procedure, resume/intake path)
+- Candidate improvement: Add a "flush any leftover relay at session start" step to the resume/intake section of SKILL.md.
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-06 - run 2026-07-06-v0.5.4 - dispatch --run-id is overridden by a worker-generated run id
+
+- Scope: `loopcoder dispatch --run-id 0550-c4 ...` for issue #550
+- Role: conductor
+- Observed: Dispatch was invoked with `--run-id 0550-c4`, but the attempt was recorded under `.loopcoder/runs/run-20260706T125951Z-issue-550/`, and `loopcoder status --repo . --run 0550-c4` reported `run "0550-c4" not found`. The worker branch (`loop/issue-550`) was correct.
+- Evidence: dispatch result JSON `"run_id":"run-20260706T125951Z-issue-550"` and `attempt_path` under that directory despite the `--run-id 0550-c4` flag; `status --run 0550-c4` exited 1 not-found.
+- Learning: `dispatch`'s `--run-id` does not control the on-disk run directory (an internal run id is generated), so `status --run <flag value>` will not find it. This is a sibling to the known ignored `--branch` flag. Until reconciled, read the effective run id back from the dispatch result JSON rather than assuming the flag value.
+- Applies to: dispatch code, docs, conductor
+- Candidate improvement: "dispatch: honor --run-id for the run directory, or document it as advisory and echo the effective run id".
+- Confidence: medium
+- Supersedes: none
+
+### 2026-07-06 - run 2026-07-06-v0.5.4 - Read the referenced spec from the base branch when the conductor checkout lags main
+
+- Scope: spec-conformance review of PR #551 (C4) against docs/specs/0533; conductor checkout was on a stale branch
+- Role: conductor
+- Observed: The conductor session working tree was on `roadmap/0.6.0`, 7 commits behind `main`. The merged C4 design spec `docs/specs/0533-audit-consumer-repo-usability.md` did not exist in the working tree, so Grep/Glob for it returned nothing -- even though the worker's worktree (branched from main) saw it fine.
+- Evidence: Grep/Glob for `docs/specs/0533-*.md` returned "No files found" / "Path does not exist" on the roadmap/0.6.0 checkout; the file was present via `git show main:docs/specs/0533-...`.
+- Learning: The conductor must not assume its working tree contains merged docs. The playbook already says to read the referenced design doc from the base branch (`git show origin/main:docs/<doc>.md`); this is essential, not optional, whenever the conductor checkout lags main. Never conclude "spec missing" from a stale working tree.
+- Applies to: SKILL.md (verification gate)
+- Candidate improvement: none (playbook already prescribes reading from the base branch; this reinforces it)
+- Confidence: medium
+- Supersedes: none
