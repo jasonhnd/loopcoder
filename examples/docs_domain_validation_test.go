@@ -320,12 +320,20 @@ func (g *docsDomainFakeGit) FetchPRHead(context.Context, string, int) error {
 	return nil
 }
 
+func (g *docsDomainFakeGit) FetchPRHeadRef(context.Context, string, int, string) error {
+	return nil
+}
+
 func (g *docsDomainFakeGit) WorktreeAddDetachedAt(_ context.Context, _ string, worktreePath, _ string) error {
 	return copyDir(g.source, worktreePath)
 }
 
 func (g *docsDomainFakeGit) WorktreeRemove(context.Context, string, string) error {
 	return nil
+}
+
+func (g *docsDomainFakeGit) RevParse(context.Context, string, string) (string, error) {
+	return "docs-domain-fake-sha", nil
 }
 
 func (g *docsDomainFakeGit) Show(_ context.Context, _ string, revPath string) (string, error) {
