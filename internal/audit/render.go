@@ -34,6 +34,18 @@ func RenderText(w io.Writer, result Result) error {
 	if _, err := fmt.Fprintf(w, "findings: %d\n", len(result.Findings)); err != nil {
 		return err
 	}
+	if _, err := fmt.Fprintf(w, "gate_findings: %d\n", result.Summary.GateFindings); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "warnings: %d\n", result.Summary.Warnings); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "waived_findings: %d\n", result.Summary.WaivedFindings); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "needs_human_count: %d\n", result.Summary.NeedsHuman); err != nil {
+		return err
+	}
 	for _, finding := range result.Findings {
 		location := finding.File
 		if location == "" {
@@ -44,7 +56,7 @@ func RenderText(w io.Writer, result Result) error {
 		}
 		waiver := ""
 		if finding.Waived {
-			waiver = fmt.Sprintf(" waived=%s", finding.WaiverID)
+			waiver = fmt.Sprintf(" waived=true waiver_id=%s", finding.WaiverID)
 		}
 		metadata := findingMetadataText(finding)
 		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s%s%s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message, metadata, waiver); err != nil {

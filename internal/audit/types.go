@@ -56,12 +56,20 @@ type Result struct {
 	Layers          []string                       `json:"layers"`
 	Threshold       string                         `json:"threshold"`
 	Verdict         string                         `json:"verdict"`
+	Summary         ResultSummary                  `json:"summary"`
 	Findings        []Finding                      `json:"findings"`
 	ToolResults     []ToolResult                   `json:"tool_results"`
 	NeedsHuman      []NeedsHuman                   `json:"needs_human"`
 	BaselineNotices []BaselineNotice               `json:"baseline_notices,omitempty"`
 	Attestation     *attestation.AttestationRecord `json:"-"`
 	RuntimeFailures []string                       `json:"runtime_failures,omitempty"`
+}
+
+type ResultSummary struct {
+	GateFindings   int `json:"gate_findings"`
+	Warnings       int `json:"warnings"`
+	WaivedFindings int `json:"waived_findings"`
+	NeedsHuman     int `json:"needs_human"`
 }
 
 type Finding struct {
@@ -191,6 +199,7 @@ func Finalize(result Result) Result {
 		result.Findings[index].File = normalizeRepoPath(result.Findings[index].File)
 		result.Findings[index].Tier = normalizeFindingMetadata(result.Findings[index].Tier)
 		result.Findings[index].Gate = normalizeFindingMetadata(result.Findings[index].Gate)
+		result.Findings[index].Gate = effectiveFindingGate(result.Findings[index], result.Threshold)
 		if strings.TrimSpace(result.Findings[index].Fingerprint) == "" {
 			result.Findings[index].Fingerprint = FindingFingerprint(result.Findings[index])
 		}
@@ -199,6 +208,7 @@ func Finalize(result Result) Result {
 		}
 	}
 	SortFindings(result.Findings)
+	result.Summary = summarizeResult(result)
 	result.Verdict = VerdictFor(result)
 	return result
 }
@@ -215,11 +225,52 @@ func VerdictFor(result Result) string {
 		if finding.Waived {
 			continue
 		}
-		if SeverityAtOrAbove(finding.Severity, threshold) {
+		if findingFailsGate(finding, threshold) {
 			return VerdictFindings
 		}
 	}
 	return VerdictClean
+}
+
+func summarizeResult(result Result) ResultSummary {
+	threshold := NormalizeSeverity(result.Threshold)
+	if threshold == "" {
+		threshold = SeverityMedium
+	}
+	summary := ResultSummary{NeedsHuman: len(result.NeedsHuman)}
+	for _, finding := range result.Findings {
+		if finding.Waived {
+			summary.WaivedFindings++
+			continue
+		}
+		if findingFailsGate(finding, threshold) {
+			summary.GateFindings++
+			continue
+		}
+		summary.Warnings++
+	}
+	return summary
+}
+
+func findingFailsGate(finding Finding, threshold string) bool {
+	return effectiveFindingGate(finding, threshold) == FindingGateGate
+}
+
+func effectiveFindingGate(finding Finding, threshold string) string {
+	switch normalizeFindingMetadata(finding.Tier) {
+	case FindingTierEntropy:
+		return FindingGateWarning
+	case FindingTierSignature:
+		return FindingGateGate
+	}
+	threshold = NormalizeSeverity(threshold)
+	if threshold == "" {
+		threshold = SeverityMedium
+	}
+	if SeverityAtOrAbove(finding.Severity, threshold) {
+		return FindingGateGate
+	}
+	return FindingGateWarning
 }
 
 func ExitCode(result Result) int {

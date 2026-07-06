@@ -49,11 +49,14 @@ func TestNativeSecretGenericWarningsDoNotGateDefaultThreshold(t *testing.T) {
 		t.Fatalf("generic finding classification = tier %q gate %q severity %q, want entropy/warning/low: %#v", generic.Tier, generic.Gate, generic.Severity, generic)
 	}
 
-	warningOnly := NewResult("repo", []string{LayerSAST}, SeverityMedium)
+	warningOnly := NewResult("repo", []string{LayerSAST}, SeverityLow)
 	warningOnly.Findings = genericFindings
 	warningOnly = Finalize(warningOnly)
 	if warningOnly.Verdict != VerdictClean || ExitCode(warningOnly) != 0 {
 		t.Fatalf("generic warning verdict/exit = %s/%d, want clean/0", warningOnly.Verdict, ExitCode(warningOnly))
+	}
+	if warningOnly.Summary.GateFindings != 0 || warningOnly.Summary.Warnings != 1 {
+		t.Fatalf("generic warning summary = %#v, want 0 gate findings and 1 warning", warningOnly.Summary)
 	}
 
 	signatureGate := NewResult("repo", []string{LayerSAST}, SeverityMedium)

@@ -423,6 +423,60 @@ audit:
 	if len(result.NeedsHuman) != 0 {
 		t.Fatalf("stale waiver should not gate as needs-human: %#v", result.NeedsHuman)
 	}
+	if result.Summary.GateFindings != 0 || result.Summary.WaivedFindings != 1 {
+		t.Fatalf("summary = %#v, want clean baseline diff with one waived finding", result.Summary)
+	}
+}
+
+func TestRunBaselineDiffFailsOnlyNetNewSignatureGateFindings(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "docs", "security"), 0o755); err != nil {
+		t.Fatalf("create security docs dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "security", "audit-baseline.yml"), []byte(`
+version: 1
+waivers:
+  - id: existing-stripe-secret
+    rule: native:secret
+    path: secrets.txt
+    normalized_evidence: Stripe live key redacted
+    original_severity: high
+    justification: Existing test fixture for baseline-diff gating.
+    date_added: 2026-07-05
+    review_by: 2099-01-01
+`), 0o600); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+	writeAuditConfig(t, repo, `
+audit:
+  baseline:
+    path: docs/security/audit-baseline.yml
+  sast:
+    native:
+      secrets: true
+      file_permissions: false
+`)
+	writeNativeAuditFile(t, repo, "secrets.txt", strings.Join([]string{
+		"stripe=" + stripeLiveKeyForTest(),
+		"github=" + githubClassicTokenForTest(),
+	}, "\n"))
+
+	result, err := Run(context.Background(), Options{RepoPath: repo}, Deps{})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict != VerdictFindings || ExitCode(result) != 1 {
+		t.Fatalf("result verdict/exit = %s/%d, want findings/1; result=%#v", result.Verdict, ExitCode(result), result)
+	}
+	if len(result.Findings) != 2 {
+		t.Fatalf("findings len = %d, want waived existing plus net-new signature: %#v", len(result.Findings), result.Findings)
+	}
+	if !hasWaivedFinding(result.Findings, "existing-stripe-secret") {
+		t.Fatalf("baseline did not keep waived finding visible: %#v", result.Findings)
+	}
+	if result.Summary.GateFindings != 1 || result.Summary.WaivedFindings != 1 || result.Summary.Warnings != 0 {
+		t.Fatalf("summary = %#v, want one net-new gate finding and one waived finding", result.Summary)
+	}
 }
 
 func TestExpiredBaselineWaiverNeedsHumanWithoutStaleDoubleEmit(t *testing.T) {
@@ -479,6 +533,98 @@ audit:
 	}
 	if len(result.BaselineNotices) != 0 {
 		t.Fatalf("expired waiver should not also be reported stale: %#v", result.BaselineNotices)
+	}
+}
+
+func TestRenderClassifiesGateWarningsWaivedAndNeedsHuman(t *testing.T) {
+	result := NewResult("repo", []string{LayerSAST}, SeverityLow)
+	waived := makeFinding(Finding{
+		Layer:    LayerSAST,
+		Tool:     "native",
+		Severity: SeverityHigh,
+		File:     "existing.txt",
+		Rule:     "native:secret",
+		Category: "secret-disclosure",
+		Message:  "Existing secret signature detected.",
+		Evidence: "Stripe live key redacted",
+		Tier:     FindingTierSignature,
+		Gate:     FindingGateGate,
+	})
+	waived.Waived = true
+	waived.WaiverID = "existing-secret"
+	result.Findings = []Finding{
+		waived,
+		makeFinding(Finding{
+			Layer:    LayerSAST,
+			Tool:     "native",
+			Severity: SeverityHigh,
+			File:     "new.txt",
+			Rule:     "native:secret",
+			Category: "secret-disclosure",
+			Message:  "New secret signature detected.",
+			Evidence: "GitHub classic token redacted",
+			Tier:     FindingTierSignature,
+			Gate:     FindingGateGate,
+		}),
+		makeFinding(Finding{
+			Layer:    LayerSAST,
+			Tool:     "native",
+			Severity: SeverityLow,
+			File:     "maybe.txt",
+			Rule:     "native:secret",
+			Category: "secret-disclosure",
+			Message:  "Potential high-entropy secret assignment detected.",
+			Evidence: "keyword api_key assignment redacted; entropy=4.20",
+			Tier:     FindingTierEntropy,
+			Gate:     FindingGateWarning,
+		}),
+	}
+	result.NeedsHuman = []NeedsHuman{{Layer: LayerSAST, Reason: "baseline waiver expired"}}
+	result = Finalize(result)
+
+	if result.Summary.GateFindings != 1 || result.Summary.Warnings != 1 || result.Summary.WaivedFindings != 1 || result.Summary.NeedsHuman != 1 {
+		t.Fatalf("summary = %#v, want gate/warning/waived/needs-human split", result.Summary)
+	}
+
+	var text bytes.Buffer
+	if err := RenderText(&text, result); err != nil {
+		t.Fatalf("RenderText returned error: %v", err)
+	}
+	for _, want := range []string{
+		"gate_findings: 1",
+		"warnings: 1",
+		"waived_findings: 1",
+		"needs_human_count: 1",
+		"gate=gate",
+		"gate=warning",
+		"waived=true waiver_id=existing-secret",
+		"needs_human:",
+	} {
+		if !strings.Contains(text.String(), want) {
+			t.Fatalf("text output missing %q:\n%s", want, text.String())
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := RenderJSON(&jsonOut, result); err != nil {
+		t.Fatalf("RenderJSON returned error: %v", err)
+	}
+	var payload struct {
+		Summary    ResultSummary `json:"summary"`
+		Findings   []Finding     `json:"findings"`
+		NeedsHuman []NeedsHuman  `json:"needs_human"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal rendered JSON: %v\n%s", err, jsonOut.String())
+	}
+	if payload.Summary != result.Summary {
+		t.Fatalf("JSON summary = %#v, want %#v", payload.Summary, result.Summary)
+	}
+	if !hasGateFinding(payload.Findings, FindingGateGate) || !hasGateFinding(payload.Findings, FindingGateWarning) || !hasWaivedFinding(payload.Findings, "existing-secret") {
+		t.Fatalf("JSON findings did not preserve gate/warning/waived classifications: %#v", payload.Findings)
+	}
+	if len(payload.NeedsHuman) != 1 {
+		t.Fatalf("JSON needs_human len = %d, want 1", len(payload.NeedsHuman))
 	}
 }
 
@@ -596,6 +742,24 @@ func containsString(values []string, want string) bool {
 func hasFindingFile(findings []Finding, file string) bool {
 	for _, finding := range findings {
 		if finding.File == file {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWaivedFinding(findings []Finding, waiverID string) bool {
+	for _, finding := range findings {
+		if finding.Waived && finding.WaiverID == waiverID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGateFinding(findings []Finding, gate string) bool {
+	for _, finding := range findings {
+		if finding.Gate == gate {
 			return true
 		}
 	}
