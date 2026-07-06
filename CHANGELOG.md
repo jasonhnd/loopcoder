@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-07-06
+
+Two reliability lines: make the 0.5.3 `loopcoder audit` usable in real consumer repositories, and harden the `loopreview` verifier against false `needs-human` verdicts on large PRs. Per [`docs/specs/0533-audit-consumer-repo-usability.md`](docs/specs/0533-audit-consumer-repo-usability.md), [`docs/specs/0535-loopreview-packet-truncation-reliability.md`](docs/specs/0535-loopreview-packet-truncation-reliability.md), and [`docs/specs/0539-loopreview-cited-spec-not-conformance-target.md`](docs/specs/0539-loopreview-cited-spec-not-conformance-target.md). Built by loopcoder itself under the self-hosting guard (human merge gate).
+
+### Changed
+
+- **Audit scans default to git-tracked files** — native secret and file-permission scans scope to git-tracked files by default, with a non-Git fallback and configurable default excludes, so `.gitignore`d paths such as loopcoder's own `.loopcoder/` are no longer walked. (per spec 0533)
+- **Secret detection is signature-first with an entropy floor** — findings are split into a high-confidence signature tier (known key/token formats) and a lower-confidence entropy/keyword tier, cutting the `process.env`-style false positives that made the audit unusable on real trees. (per spec 0533)
+- **Audit gate posture is net-new only** — the default CI gate fails only on net-new signature-tier findings via baseline diff; entropy/keyword-tier findings warn without failing the gate, baselined findings remain visible as `waived: true`, and both human text and JSON output distinguish gate findings, warnings, waived findings, and needs-human items. Exit-code precedence (runtime > needs-human > findings > clean) is preserved. (per spec 0533)
+- **loopreview review packets stay bounded and fresh** — the verifier fetches fresh PR refs and reads PR-head files through a read-only helper, and documentation/added-file bodies are emitted as a bounded PR-head body packet, so large valid PRs no longer truncate into a spurious `needs-human`. (per spec 0535)
+- **loopreview does not fail closed on a body-cited unmerged sibling spec** — a design doc merely referenced in a PR body is distinguished from the conformance target, so citing an unmerged sibling spec no longer forces `needs-human`. (per spec 0539)
+
+### Fixed
+
+- **Windows file-permission false positives** — native file-permission scanning skips synthesized Unix mode-bit findings on Windows, where they carry no meaning. (per spec 0533)
+- **Audit self-scan noise closed ([#532](https://github.com/jasonhnd/loopcoder/issues/532))** — git-tracked default selection, signature-first precision, and warn-only entropy tiers together close the 492-findings / 0-true-positives CI-gating problem the audit exhibited on loopcoder's own tree.
+- **`sigstore/cosign-installer` bumped 4.0.0 → 4.1.2** via Dependabot, keeping the release-signing action current.
+
+### Notes
+
+- All 0.5.3 audit invariants (the 0518 read-only Layer-2 boundary, H5 exit-code discipline, secret redaction, deterministic fingerprints), the 0.5.1 hardening, and the 0.5.2 behavior-preservation are preserved; loopcoder's own self-audit stays green in CI. Every slice was gated through the independent read-only verifier and the full CI suite (verify/go/staticcheck/govulncheck/audit) under the human merge gate.
+
 ## [0.5.3] - 2026-07-06
 
 Add `loopcoder audit`, a read-only built-in security audit, per [`docs/specs/0518-loopcoder-audit.md`](docs/specs/0518-loopcoder-audit.md). It institutionalizes catching the class of issue that led to the 0.5.1 hardening — on demand and in CI — with two layers: a deterministic SAST floor (CI-gateable) and an adversarial LLM security-review lens. Built by loopcoder itself under the self-hosting guard.
