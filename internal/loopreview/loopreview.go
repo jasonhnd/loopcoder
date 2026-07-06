@@ -49,6 +49,9 @@ const (
 	reviewPacketChangedFilesBudgetBytes = lcdefaults.ReviewPacketChangedFilesBudgetBytes
 	reviewPacketDiffBudgetBytes         = lcdefaults.ReviewPacketDiffBudgetBytes
 	reviewPacketDiffFileBudgetBytes     = lcdefaults.ReviewPacketDiffFileBudgetBytes
+	reviewPacketDocBodyFileBytes        = lcdefaults.ReviewPacketDocumentationBodyFileBytes
+	reviewPacketDocBodyTotalBytes       = lcdefaults.ReviewPacketDocumentationBodyTotalBytes
+	reviewPacketDocBodyMaxFiles         = lcdefaults.ReviewPacketDocumentationBodyMaxFiles
 	reviewPacketGeneratedDiffFileBytes  = lcdefaults.ReviewPacketGeneratedDiffFileBytes
 	reviewPacketGeneratedSizeBytes      = lcdefaults.ReviewPacketGeneratedSizeBytes
 	reviewPacketIssueBudgetBytes        = lcdefaults.ReviewPacketIssueBudgetBytes
@@ -161,17 +164,20 @@ type EvidenceProducerResult struct {
 type EvidenceProducerRunner func(ctx context.Context, invocation EvidenceProducerInvocation) EvidenceProducerResult
 
 type ReviewPacketLimits struct {
-	ChangedFilesBytes      int
-	DiffBytes              int
-	DiffFileBytes          int
-	GeneratedDiffFileBytes int
-	GeneratedSizeBytes     int
-	GeneratedPatterns      []string
-	IssueBytes             int
-	RenderedArtifactBytes  int
-	RubricBytes            int
-	SpecBytes              int
-	TotalPromptBytes       int
+	ChangedFilesBytes          int
+	DiffBytes                  int
+	DiffFileBytes              int
+	DocumentationBodyFileBytes int
+	DocumentationBodyMaxFiles  int
+	DocumentationBodyBytes     int
+	GeneratedDiffFileBytes     int
+	GeneratedSizeBytes         int
+	GeneratedPatterns          []string
+	IssueBytes                 int
+	RenderedArtifactBytes      int
+	RubricBytes                int
+	SpecBytes                  int
+	TotalPromptBytes           int
 }
 
 type reviewInputs struct {
@@ -182,6 +188,7 @@ type reviewInputs struct {
 	Diff                    string
 	ChangedFiles            []string
 	GeneratedAttributeRules []generatedAttributeRule
+	PRHeadFileBodies        []prHeadFileBodyInput
 	Spec                    specInput
 	Rubric                  rubricInput
 	RenderedArtifacts       []renderedArtifactInput
@@ -208,6 +215,14 @@ type prHeadFileContent struct {
 	Path      string
 	SourceRef string
 	Content   string
+}
+
+type prHeadFileBodyInput struct {
+	Path      string
+	SourceRef string
+	Content   string
+	Available bool
+	Reason    string
 }
 
 type specInput struct {
@@ -588,6 +603,109 @@ func readPRHeadFile(ctx context.Context, git GitClient, repoPath string, source 
 	}, nil
 }
 
+func loadPRHeadFileBodies(ctx context.Context, git GitClient, repoPath string, refs reviewRefs, changedFiles []string, diff string, limits ReviewPacketLimits) []prHeadFileBodyInput {
+	candidates := prHeadFileBodyCandidatePaths(changedFiles, diff)
+	if len(candidates) == 0 {
+		return nil
+	}
+	out := make([]prHeadFileBodyInput, 0, len(candidates))
+	maxFiles := limits.DocumentationBodyMaxFiles
+	for index, candidate := range candidates {
+		if maxFiles > 0 && index >= maxFiles {
+			out = append(out, prHeadFileBodyInput{
+				Path:      candidate,
+				Available: false,
+				Reason:    fmt.Sprintf("maximum PR-head file body count exceeded before read (limit %d)", maxFiles),
+			})
+			continue
+		}
+		content, err := readPRHeadFile(ctx, git, repoPath, refs.PRHeadFileSource, candidate)
+		if err != nil {
+			out = append(out, prHeadFileBodyInput{
+				Path:      candidate,
+				Available: false,
+				Reason:    err.Error(),
+			})
+			continue
+		}
+		if !textualPRHeadBody(content.Content) {
+			out = append(out, prHeadFileBodyInput{
+				Path:      content.Path,
+				SourceRef: content.SourceRef,
+				Available: false,
+				Reason:    "PR-head file content is not textual UTF-8",
+			})
+			continue
+		}
+		out = append(out, prHeadFileBodyInput{
+			Path:      content.Path,
+			SourceRef: content.SourceRef,
+			Content:   content.Content,
+			Available: true,
+		})
+	}
+	return out
+}
+
+func prHeadFileBodyCandidatePaths(changedFiles []string, diff string) []string {
+	documentationOnly := docsOnlyChangedFiles(changedFiles)
+	seen := map[string]bool{}
+	paths := []string{}
+	for _, rawPath := range changedFiles {
+		cleanPath, err := cleanRepoRelativePath(rawPath)
+		if err != nil {
+			continue
+		}
+		if seen[cleanPath] || !prHeadFileBodyCandidate(cleanPath, diff, documentationOnly) {
+			continue
+		}
+		seen[cleanPath] = true
+		paths = append(paths, cleanPath)
+	}
+	return paths
+}
+
+func prHeadFileBodyCandidate(repoPath string, diff string, documentationOnly bool) bool {
+	if documentationOnly {
+		return documentationBodyTextPath(repoPath)
+	}
+	return diffAddsPath(diff, repoPath) && documentationDeliverablePath(repoPath)
+}
+
+func documentationBodyTextPath(repoPath string) bool {
+	repoPath = normalizeRepoPath(repoPath)
+	if strings.HasPrefix(repoPath, "docs/") {
+		return knownTextBodyExtension(repoPath)
+	}
+	return documentationDeliverablePath(repoPath)
+}
+
+func documentationDeliverablePath(repoPath string) bool {
+	switch strings.ToLower(path.Ext(repoPath)) {
+	case ".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".adoc", ".asciidoc":
+		return true
+	}
+	switch strings.ToLower(repoPathBase(repoPath)) {
+	case "readme", "changelog", "license", "notice", "security", "contributing", "code_of_conduct":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownTextBodyExtension(repoPath string) bool {
+	switch strings.ToLower(path.Ext(repoPath)) {
+	case ".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".adoc", ".asciidoc", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".csv", ".tsv":
+		return true
+	default:
+		return false
+	}
+}
+
+func textualPRHeadBody(content string) bool {
+	return utf8.ValidString(content) && !strings.ContainsRune(content, 0)
+}
+
 func Render(w io.Writer, result Result) error {
 	data, err := json.Marshal(result.Verdict)
 	if err != nil {
@@ -685,6 +803,7 @@ type reviewPacket struct {
 	SpecContent              packetSection
 	Rubric                   rubricSection
 	RenderedArtifacts        renderedArtifactsSection
+	PRHeadFileBodies         prHeadFileBodiesSection
 	ChangedFiles             changedFilesSection
 	Diff                     packetSection
 	ReviewPacketOrder        []string
@@ -736,6 +855,18 @@ type renderedArtifactsSection struct {
 	Configured bool
 	Artifacts  []renderedArtifactInput
 	Content    packetSection
+}
+
+type prHeadFileBodiesSection struct {
+	CandidateCount int
+	IncludedCount  int
+	Skipped        []prHeadFileBodySkip
+	Content        packetSection
+}
+
+type prHeadFileBodySkip struct {
+	Path   string
+	Reason string
 }
 
 func buildPromptWithLimits(opts Options, inputs reviewInputs, limits ReviewPacketLimits) (string, reviewPacket) {
@@ -819,6 +950,7 @@ func buildReviewPacket(opts Options, inputs reviewInputs, limits ReviewPacketLim
 		SpecContent:              truncatePacketSection(inputs.Spec.Content, limits.SpecBytes),
 		Rubric:                   buildRubricSection(inputs.Rubric, limits.RubricBytes),
 		RenderedArtifacts:        buildRenderedArtifactsSection(inputs.RenderedArtifacts, limits.RenderedArtifactBytes),
+		PRHeadFileBodies:         buildPRHeadFileBodiesSection(inputs.PRHeadFileBodies, limits),
 		ChangedFiles:             buildChangedFilesSection(inputs.ChangedFiles, limits.ChangedFilesBytes),
 		Diff:                     buildDiffSection(inputs.Diff, limits, inputs.GeneratedAttributeRules),
 		ReviewPacketOrder:        append([]string(nil), inputs.ReviewPacketOrder...),
@@ -837,7 +969,8 @@ Return only JSON matching this schema:
 
 # Review contract
 - Use the bounded review packet below as the primary evidence.
-- Compare the bounded diff excerpts against the GitHub issue, acceptance criteria, merged design/spec, and any configured domain rubric.
+- Compare the bounded diff excerpts and PR-head file content against the GitHub issue, acceptance criteria, merged design/spec, and any configured domain rubric.
+- Treat complete PR-head file content as authoritative fallback evidence for that changed file; a TRUNCATED diff marker for the same path is not missing evidence by itself when the complete PR-head body answers the criterion.
 - When a Rubric section is configured, apply it as required review criteria.
 - When a Rendered artifacts section is configured, treat it as required product evidence for the changed output.
 - For complete packets with no relevant TRUNCATED markers, decide from the packet instead of exploring the repository.
@@ -863,17 +996,20 @@ const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"requir
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{
-		ChangedFilesBytes:      reviewPacketChangedFilesBudgetBytes,
-		DiffBytes:              reviewPacketDiffBudgetBytes,
-		DiffFileBytes:          reviewPacketDiffFileBudgetBytes,
-		GeneratedDiffFileBytes: reviewPacketGeneratedDiffFileBytes,
-		GeneratedSizeBytes:     reviewPacketGeneratedSizeBytes,
-		GeneratedPatterns:      defaultGeneratedPatterns,
-		IssueBytes:             reviewPacketIssueBudgetBytes,
-		RenderedArtifactBytes:  reviewPacketRenderedArtifactBytes,
-		RubricBytes:            reviewPacketRubricBudgetBytes,
-		SpecBytes:              reviewPacketSpecBudgetBytes,
-		TotalPromptBytes:       reviewPacketTotalPromptBudgetBytes,
+		ChangedFilesBytes:          reviewPacketChangedFilesBudgetBytes,
+		DiffBytes:                  reviewPacketDiffBudgetBytes,
+		DiffFileBytes:              reviewPacketDiffFileBudgetBytes,
+		DocumentationBodyFileBytes: reviewPacketDocBodyFileBytes,
+		DocumentationBodyMaxFiles:  reviewPacketDocBodyMaxFiles,
+		DocumentationBodyBytes:     reviewPacketDocBodyTotalBytes,
+		GeneratedDiffFileBytes:     reviewPacketGeneratedDiffFileBytes,
+		GeneratedSizeBytes:         reviewPacketGeneratedSizeBytes,
+		GeneratedPatterns:          defaultGeneratedPatterns,
+		IssueBytes:                 reviewPacketIssueBudgetBytes,
+		RenderedArtifactBytes:      reviewPacketRenderedArtifactBytes,
+		RubricBytes:                reviewPacketRubricBudgetBytes,
+		SpecBytes:                  reviewPacketSpecBudgetBytes,
+		TotalPromptBytes:           reviewPacketTotalPromptBudgetBytes,
 	}
 	if limits.ChangedFilesBytes <= 0 {
 		limits.ChangedFilesBytes = defaults.ChangedFilesBytes
@@ -883,6 +1019,15 @@ func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	}
 	if limits.DiffFileBytes <= 0 {
 		limits.DiffFileBytes = defaults.DiffFileBytes
+	}
+	if limits.DocumentationBodyFileBytes <= 0 {
+		limits.DocumentationBodyFileBytes = defaults.DocumentationBodyFileBytes
+	}
+	if limits.DocumentationBodyMaxFiles <= 0 {
+		limits.DocumentationBodyMaxFiles = defaults.DocumentationBodyMaxFiles
+	}
+	if limits.DocumentationBodyBytes <= 0 {
+		limits.DocumentationBodyBytes = defaults.DocumentationBodyBytes
 	}
 	if limits.GeneratedDiffFileBytes <= 0 {
 		limits.GeneratedDiffFileBytes = defaults.GeneratedDiffFileBytes
@@ -918,13 +1063,15 @@ func reduceReviewPacketBudgets(limits *ReviewPacketLimits, bytesToRemove int) bo
 	reduced := false
 	for _, budget := range []*int{
 		&limits.DiffBytes,
+		&limits.DiffFileBytes,
+		&limits.GeneratedDiffFileBytes,
 		&limits.SpecBytes,
 		&limits.RenderedArtifactBytes,
 		&limits.RubricBytes,
 		&limits.IssueBytes,
 		&limits.ChangedFilesBytes,
-		&limits.DiffFileBytes,
-		&limits.GeneratedDiffFileBytes,
+		&limits.DocumentationBodyBytes,
+		&limits.DocumentationBodyFileBytes,
 	} {
 		if bytesToRemove <= 0 {
 			break
@@ -962,12 +1109,14 @@ func formatReviewPacket(packet reviewPacket) string {
 	}
 	fmt.Fprintf(&out, "\n")
 
-	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured, packet.RenderedArtifacts.Configured) {
+	for _, section := range reviewPacketSections(packet.ReviewPacketOrder, packet.Rubric.Configured, packet.RenderedArtifacts.Configured, packet.PRHeadFileBodies.CandidateCount > 0) {
 		switch section {
 		case reviewPacketSectionChangedFiles:
 			formatChangedFilesPacketSection(&out, packet)
 		case reviewPacketSectionDiff:
 			formatDiffPacketSection(&out, packet)
+		case reviewPacketSectionPRHeadFileContent:
+			formatPRHeadFileBodiesPacketSection(&out, packet)
 		case reviewPacketSectionIssue:
 			formatIssuePacketSection(&out, packet)
 		case reviewPacketSectionSpec:
@@ -982,29 +1131,32 @@ func formatReviewPacket(packet reviewPacket) string {
 }
 
 const (
-	reviewPacketSectionChangedFiles     = "changed_files"
-	reviewPacketSectionDiff             = "diff"
-	reviewPacketSectionIssue            = "issue"
-	reviewPacketSectionSpec             = "spec"
-	reviewPacketSectionRubric           = "rubric"
-	reviewPacketSectionRenderedArtifact = "rendered_artifact"
+	reviewPacketSectionChangedFiles      = "changed_files"
+	reviewPacketSectionDiff              = "diff"
+	reviewPacketSectionPRHeadFileContent = "pr_head_file_content"
+	reviewPacketSectionIssue             = "issue"
+	reviewPacketSectionSpec              = "spec"
+	reviewPacketSectionRubric            = "rubric"
+	reviewPacketSectionRenderedArtifact  = "rendered_artifact"
 )
 
 var defaultReviewPacketSections = []string{
 	reviewPacketSectionChangedFiles,
 	reviewPacketSectionDiff,
+	reviewPacketSectionPRHeadFileContent,
 	reviewPacketSectionIssue,
 	reviewPacketSectionSpec,
 }
 
-func reviewPacketSections(configured []string, includeRubric bool, includeRenderedArtifacts bool) []string {
+func reviewPacketSections(configured []string, includeRubric bool, includeRenderedArtifacts bool, includePRHeadFileContent bool) []string {
 	known := map[string]bool{
-		reviewPacketSectionChangedFiles:     true,
-		reviewPacketSectionDiff:             true,
-		reviewPacketSectionIssue:            true,
-		reviewPacketSectionSpec:             true,
-		reviewPacketSectionRubric:           includeRubric,
-		reviewPacketSectionRenderedArtifact: includeRenderedArtifacts,
+		reviewPacketSectionChangedFiles:      true,
+		reviewPacketSectionDiff:              true,
+		reviewPacketSectionPRHeadFileContent: includePRHeadFileContent,
+		reviewPacketSectionIssue:             true,
+		reviewPacketSectionSpec:              true,
+		reviewPacketSectionRubric:            includeRubric,
+		reviewPacketSectionRenderedArtifact:  includeRenderedArtifacts,
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(defaultReviewPacketSections)+1)
@@ -1017,7 +1169,7 @@ func reviewPacketSections(configured []string, includeRubric bool, includeRender
 		out = append(out, section)
 	}
 	for _, section := range defaultReviewPacketSections {
-		if seen[section] {
+		if !known[section] || seen[section] {
 			continue
 		}
 		seen[section] = true
@@ -1051,6 +1203,30 @@ func formatDiffPacketSection(out *strings.Builder, packet reviewPacket) {
 	fmt.Fprintf(out, "Total diff budget: %d bytes\n", packet.Limits.DiffBytes)
 	fmt.Fprintf(out, "Per-file diff budget: %d bytes\n", packet.Limits.DiffFileBytes)
 	fmt.Fprintf(out, "%s\n\n", formatPacketSection("diff", packet.Diff))
+}
+
+func formatPRHeadFileBodiesPacketSection(out *strings.Builder, packet reviewPacket) {
+	if packet.PRHeadFileBodies.CandidateCount == 0 {
+		return
+	}
+	fmt.Fprintf(out, "# PR-head file content\n")
+	fmt.Fprintf(out, "Use: complete PR-head file bodies are authoritative fallback evidence for their paths.\n")
+	fmt.Fprintf(out, "Candidate bodies: %d\n", packet.PRHeadFileBodies.CandidateCount)
+	fmt.Fprintf(out, "Included complete bodies: %d\n", packet.PRHeadFileBodies.IncludedCount)
+	fmt.Fprintf(out, "Maximum complete bodies: %d\n", packet.Limits.DocumentationBodyMaxFiles)
+	fmt.Fprintf(out, "Per-file body budget: %d bytes\n", packet.Limits.DocumentationBodyFileBytes)
+	fmt.Fprintf(out, "Aggregate body budget: %d bytes\n", packet.Limits.DocumentationBodyBytes)
+	text := strings.TrimRight(packet.PRHeadFileBodies.Content.Text, "\n")
+	if strings.TrimSpace(text) != "" {
+		fmt.Fprintf(out, "%s\n", text)
+	}
+	if len(packet.PRHeadFileBodies.Skipped) > 0 {
+		fmt.Fprintf(out, "Skipped PR-head file bodies:\n")
+		for _, skipped := range packet.PRHeadFileBodies.Skipped {
+			fmt.Fprintf(out, "- %s: %s\n", skipped.Path, skipped.Reason)
+		}
+	}
+	fmt.Fprintf(out, "\n")
 }
 
 func formatIssuePacketSection(out *strings.Builder, packet reviewPacket) {
@@ -1216,6 +1392,98 @@ func buildRenderedArtifactsSection(inputs []renderedArtifactInput, byteBudget in
 	}
 	section.Content = truncatePacketSection(out.String(), byteBudget)
 	return section
+}
+
+func buildPRHeadFileBodiesSection(inputs []prHeadFileBodyInput, limits ReviewPacketLimits) prHeadFileBodiesSection {
+	section := prHeadFileBodiesSection{CandidateCount: len(inputs)}
+	if len(inputs) == 0 {
+		return section
+	}
+	maxFiles := limits.DocumentationBodyMaxFiles
+	perFileBudget := limits.DocumentationBodyFileBytes
+	aggregateBudget := limits.DocumentationBodyBytes
+	var out strings.Builder
+	usedBytes := 0
+	originalBytes := 0
+	originalLines := 0
+	omittedBytes := 0
+	omittedLines := 0
+	for _, input := range inputs {
+		label := firstNonEmpty(input.Path, "(unknown)")
+		if !input.Available {
+			section.Skipped = append(section.Skipped, prHeadFileBodySkip{
+				Path:   label,
+				Reason: firstNonEmpty(input.Reason, "unavailable"),
+			})
+			continue
+		}
+		originalBytes += len(input.Content)
+		originalLines += countLines(input.Content)
+		if section.IncludedCount >= maxFiles {
+			omittedBytes += len(input.Content)
+			omittedLines += countLines(input.Content)
+			section.Skipped = append(section.Skipped, prHeadFileBodySkip{
+				Path:   label,
+				Reason: fmt.Sprintf("maximum complete body count exceeded (limit %d)", maxFiles),
+			})
+			continue
+		}
+		if len(input.Content) > perFileBudget {
+			omittedBytes += len(input.Content)
+			omittedLines += countLines(input.Content)
+			section.Skipped = append(section.Skipped, prHeadFileBodySkip{
+				Path:   label,
+				Reason: fmt.Sprintf("body is %d bytes, exceeding per-file body budget %d bytes", len(input.Content), perFileBudget),
+			})
+			continue
+		}
+		block := formatPRHeadFileBodyBlock(input)
+		if usedBytes+len(block) > aggregateBudget {
+			omittedBytes += len(input.Content)
+			omittedLines += countLines(input.Content)
+			section.Skipped = append(section.Skipped, prHeadFileBodySkip{
+				Path:   label,
+				Reason: fmt.Sprintf("body would exceed aggregate body budget %d bytes", aggregateBudget),
+			})
+			continue
+		}
+		if out.Len() > 0 {
+			out.WriteString("\n")
+		}
+		out.WriteString(block)
+		usedBytes += len(block)
+		section.IncludedCount++
+	}
+	section.Content = packetSection{
+		Text:          out.String(),
+		OriginalBytes: originalBytes,
+		OriginalLines: originalLines,
+		OmittedBytes:  omittedBytes,
+		OmittedLines:  omittedLines,
+		Truncated:     omittedBytes > 0 || omittedLines > 0,
+	}
+	return section
+}
+
+func formatPRHeadFileBodyBlock(input prHeadFileBodyInput) string {
+	var out strings.Builder
+	path := firstNonEmpty(input.Path, "(unknown)")
+	fmt.Fprintf(&out, "## %s\n", path)
+	fmt.Fprintf(&out, "Source: %s:%s\n", firstNonEmpty(input.SourceRef, "(unavailable)"), path)
+	fmt.Fprintf(&out, "Completeness: complete\n")
+	fmt.Fprintf(&out, "Bytes: %d\n", len(input.Content))
+	fmt.Fprintf(&out, "Lines: %d\n", countLines(input.Content))
+	fmt.Fprintf(&out, "\n```%s\n%s\n```\n", prHeadFileBodyFenceLanguage(path), strings.TrimRight(input.Content, "\n"))
+	return out.String()
+}
+
+func prHeadFileBodyFenceLanguage(repoPath string) string {
+	switch strings.ToLower(path.Ext(repoPath)) {
+	case ".md", ".markdown", ".mdx":
+		return "markdown"
+	default:
+		return "text"
+	}
 }
 
 func artifactFenceLanguage(artifact RenderedArtifact) string {
@@ -2226,6 +2494,7 @@ func gatherInputs(ctx context.Context, deps Deps, github GitHubClient, repoPath 
 	inputs.GeneratedAttributeRules = loadGeneratedAttributeRules(ctx, deps.Git, repoPath, refs.BaseBranch, opts.Stderr)
 	inputs.Spec = loadSpec(ctx, deps.Git, repoPath, refs.BaseBranch, specSearchTexts(issue, present, pr))
 	inputs.Spec = classifySpecAbsence(inputs.Spec, refs.BaseBranch, changedFiles, diff)
+	inputs.PRHeadFileBodies = loadPRHeadFileBodies(ctx, deps.Git, repoPath, refs, changedFiles, diff, deps.ReviewPacketLimits.withDefaults())
 	return inputs, nil
 }
 
