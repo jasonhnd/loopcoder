@@ -29,6 +29,12 @@ const (
 	SeverityMedium   = "medium"
 	SeverityLow      = "low"
 	SeverityInfo     = "info"
+
+	FindingTierSignature = "signature"
+	FindingTierEntropy   = "entropy"
+
+	FindingGateGate    = "gate"
+	FindingGateWarning = "warning"
 )
 
 type Options struct {
@@ -70,6 +76,8 @@ type Finding struct {
 	Category    string `json:"category"`
 	Message     string `json:"message"`
 	Evidence    string `json:"evidence"`
+	Tier        string `json:"tier,omitempty"`
+	Gate        string `json:"gate,omitempty"`
 	Fingerprint string `json:"fingerprint"`
 	Waived      bool   `json:"waived"`
 	WaiverID    string `json:"waiver_id,omitempty"`
@@ -181,6 +189,8 @@ func Finalize(result Result) Result {
 		result.Findings[index].Severity = NormalizeSeverity(result.Findings[index].Severity)
 		result.Findings[index].Layer = normalizeLayer(result.Findings[index].Layer)
 		result.Findings[index].File = normalizeRepoPath(result.Findings[index].File)
+		result.Findings[index].Tier = normalizeFindingMetadata(result.Findings[index].Tier)
+		result.Findings[index].Gate = normalizeFindingMetadata(result.Findings[index].Gate)
 		if strings.TrimSpace(result.Findings[index].Fingerprint) == "" {
 			result.Findings[index].Fingerprint = FindingFingerprint(result.Findings[index])
 		}
@@ -329,6 +339,10 @@ func normalizeLayer(layer string) string {
 	default:
 		return LayerSAST
 	}
+}
+
+func normalizeFindingMetadata(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func normalizeEvidence(evidence string) string {

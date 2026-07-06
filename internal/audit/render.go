@@ -46,7 +46,8 @@ func RenderText(w io.Writer, result Result) error {
 		if finding.Waived {
 			waiver = fmt.Sprintf(" waived=%s", finding.WaiverID)
 		}
-		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s%s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message, waiver); err != nil {
+		metadata := findingMetadataText(finding)
+		if _, err := fmt.Fprintf(w, "- %s %s %s %s %s%s%s\n", finding.Severity, finding.Tool, finding.Rule, location, finding.Message, metadata, waiver); err != nil {
 			return err
 		}
 		if strings.TrimSpace(finding.Evidence) != "" {
@@ -105,4 +106,18 @@ func RenderText(w io.Writer, result Result) error {
 		}
 	}
 	return nil
+}
+
+func findingMetadataText(finding Finding) string {
+	parts := []string{}
+	if strings.TrimSpace(finding.Tier) != "" {
+		parts = append(parts, "tier="+finding.Tier)
+	}
+	if strings.TrimSpace(finding.Gate) != "" {
+		parts = append(parts, "gate="+finding.Gate)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, " ") + ")"
 }
