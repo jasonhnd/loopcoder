@@ -36,6 +36,9 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	if err := client.FetchPRHead(ctx, "repo", 152); err != nil {
 		t.Fatalf("FetchPRHead returned error: %v", err)
 	}
+	if err := client.FetchPRHeadRef(ctx, "repo", 152, "refs/loopcoder/loopreview/pr-152/head"); err != nil {
+		t.Fatalf("FetchPRHeadRef returned error: %v", err)
+	}
 	if err := client.WorktreeAddDetachedAt(ctx, "repo", "review-wt", "FETCH_HEAD"); err != nil {
 		t.Fatalf("WorktreeAddDetachedAt returned error: %v", err)
 	}
@@ -86,10 +89,11 @@ func TestClientRunsExpectedGitCommands(t *testing.T) {
 	}
 
 	want := [][]string{
-		{"repo", "fetch", "origin", "main"},
+		{"repo", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"},
 		{"repo", "worktree", "add", "-b", "loop/issue-101", "wt", "origin/main"},
 		{"repo", "worktree", "add", "--detach", "verify-wt", "origin/main"},
 		{"repo", "fetch", "-q", "origin", "pull/152/head"},
+		{"repo", "fetch", "-q", "origin", "+refs/pull/152/head:refs/loopcoder/loopreview/pr-152/head"},
 		{"repo", "worktree", "add", "--detach", "review-wt", "FETCH_HEAD"},
 		{"verify-wt", "fetch", "-q", "origin", "loop/issue-101"},
 		{"verify-wt", "checkout", "--detach", "FETCH_HEAD"},

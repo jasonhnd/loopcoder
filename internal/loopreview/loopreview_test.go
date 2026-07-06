@@ -287,6 +287,33 @@ func TestBuildPromptUsesBoundedReviewPacketContract(t *testing.T) {
 	}
 }
 
+func TestBuildPromptRecordsPRRefMetadata(t *testing.T) {
+	inputs := loopreviewPromptTestInputs()
+	inputs.Refs = prRefMetadata{
+		PRNumber:      199,
+		BaseBranch:    "release",
+		BaseSHA:       "base-sha",
+		HeadBranch:    "loop/issue-199",
+		HeadSHA:       "head-sha",
+		HeadSourceRef: loopreviewPRHeadSourceRef(199),
+	}
+
+	prompt, _ := buildPromptWithLimits(Options{PRNumber: 199, BaseBranch: "main"}, inputs, ReviewPacketLimits{})
+	for _, want := range []string{
+		"Number: #199",
+		"Head branch: loop/issue-199",
+		"Head SHA: head-sha",
+		"PR-head source ref: refs/loopcoder/loopreview/pr-199/head",
+		"Base branch: release",
+		"Base SHA: base-sha",
+		"# Merged design/spec from origin/release",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildPromptMarksDocFirstSpecAbsenceExpected(t *testing.T) {
 	specPath := "docs/specs/0220-loopreview-new-spec-not-a-blocker.md"
 	inputs := loopreviewPromptTestInputs()
@@ -1367,7 +1394,7 @@ func TestGatherInputsParsesGeneratedAttributes(t *testing.T) {
 	inputs, err := gatherInputs(context.Background(), Deps{Git: fakeGit}, fakeGitHub, t.TempDir(), Options{
 		PRNumber:   152,
 		BaseBranch: "main",
-	})
+	}, fakeGitHub.pr, prRefsFromMetadata(Options{PRNumber: 152, BaseBranch: "main"}, fakeGitHub.pr))
 	if err != nil {
 		t.Fatalf("gatherInputs returned error: %v", err)
 	}
@@ -1414,7 +1441,7 @@ func TestGatherInputsWarnsWhenGeneratedAttributesGitShowFails(t *testing.T) {
 		PRNumber:   152,
 		BaseBranch: "main",
 		Stderr:     &stderr,
-	})
+	}, fakeGitHub.pr, prRefsFromMetadata(Options{PRNumber: 152, BaseBranch: "main"}, fakeGitHub.pr))
 	if err != nil {
 		t.Fatalf("gatherInputs returned error: %v", err)
 	}
@@ -1638,8 +1665,144 @@ func TestRunInsufficientReviewPacketReturnsNeedsHumanWithoutAgent(t *testing.T) 
 	if fakeAgent.calls != 0 {
 		t.Fatalf("agent calls = %d, want 0", fakeAgent.calls)
 	}
-	if fakeGit.fetchPR != 0 || fakeGit.addRev != "" {
+	if fakeGit.addRev != "" {
 		t.Fatalf("worktree checkout should not run for insufficient packet: %#v", fakeGit)
+	}
+}
+
+func TestRunUsesTruePRBaseAndVerifiedHeadRef(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/release:docs/specs/design.md": "# Design from true base\n",
+		},
+		revParse: map[string]string{
+			"origin/release^{commit}":                    "base-sha",
+			loopreviewPRHeadSourceRef(538) + "^{commit}": "head-sha",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      538,
+			Title:       "Fresh refs",
+			BaseRefName: "release",
+			BaseRefOid:  "base-sha",
+			HeadRefName: "loop/issue-538",
+			HeadRefOid:  "head-sha",
+			ClosingIssuesReferences: []gh.IssueReference{{
+				Number: 538,
+			}},
+		},
+		issue: gh.Issue{
+			Number: 538,
+			Title:  "Fresh refs",
+			Body:   "Implement per docs/specs/design.md.",
+		},
+		diff:  loopreviewDiffPatch("internal/loopreview/loopreview.go", "+ fresh refs\n"),
+		files: []string{"internal/loopreview/loopreview.go"},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies true-base packet","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:   repo,
+		PRNumber:   538,
+		Provider:   "codex",
+		BaseBranch: "main",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &loopreviewFakeLock{}, nil
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictPass {
+		t.Fatalf("verdict = %q, want pass", result.Verdict.Verdict)
+	}
+	if fakeGit.fetchBase != "release" {
+		t.Fatalf("fetchBase = %q, want release", fakeGit.fetchBase)
+	}
+	if fakeGit.fetchPRRef != 538 || fakeGit.fetchTarget != loopreviewPRHeadSourceRef(538) {
+		t.Fatalf("PR head fetch = #%d %q, want verified PR-head ref", fakeGit.fetchPRRef, fakeGit.fetchTarget)
+	}
+	if fakeGit.addRev != loopreviewPRHeadSourceRef(538) {
+		t.Fatalf("worktree add rev = %q, want PR-head source ref", fakeGit.addRev)
+	}
+	for _, want := range []string{
+		"Head branch: loop/issue-538",
+		"Head SHA: head-sha",
+		"PR-head source ref: refs/loopcoder/loopreview/pr-538/head",
+		"Base branch: release",
+		"Base SHA: base-sha",
+		"# Merged design/spec from origin/release",
+		"# Design from true base",
+	} {
+		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
+		}
+	}
+}
+
+func TestRunRefVerificationFailureReturnsNeedsHumanWithoutAgent(t *testing.T) {
+	repo := t.TempDir()
+	fakeGit := &loopreviewFakeGit{
+		revParse: map[string]string{
+			"origin/main^{commit}":                       "base-sha",
+			loopreviewPRHeadSourceRef(538) + "^{commit}": "stale-head-sha",
+		},
+	}
+	fakeGitHub := &loopreviewFakeGitHub{
+		pr: gh.PullRequest{
+			Number:      538,
+			Title:       "Fresh refs",
+			BaseRefName: "main",
+			BaseRefOid:  "base-sha",
+			HeadRefName: "loop/issue-538",
+			HeadRefOid:  "head-sha",
+		},
+	}
+	fakeAgent := &loopreviewFakeAgent{
+		summary: `{"verdict":"pass","findings":[],"evidence":"unused","spec_conformance":"pass"}`,
+	}
+
+	result, err := Run(context.Background(), Options{
+		RepoPath: repo,
+		PRNumber: 538,
+		Provider: "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Verdict.Verdict != VerdictNeedsHuman || result.ExitCode != 2 {
+		t.Fatalf("result = %#v, want needs-human exit 2", result)
+	}
+	if !strings.Contains(result.Verdict.Evidence, "PR ref verification unavailable") || !strings.Contains(result.Verdict.Evidence, "expected head-sha") {
+		t.Fatalf("evidence = %q, want PR ref verification mismatch", result.Verdict.Evidence)
+	}
+	if fakeAgent.calls != 0 {
+		t.Fatalf("agent calls = %d, want 0", fakeAgent.calls)
 	}
 }
 
@@ -1717,7 +1880,7 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	if result.Verdict.Attestation == nil {
 		t.Fatal("verdict missing attestation")
 	}
-	if fakeGit.fetchBase != "main" || fakeGit.fetchPR != 152 || fakeGit.addRev != "FETCH_HEAD" {
+	if fakeGit.fetchBase != "main" || fakeGit.fetchPRRef != 152 || fakeGit.fetchTarget != loopreviewPRHeadSourceRef(152) || fakeGit.addRev != loopreviewPRHeadSourceRef(152) {
 		t.Fatalf("git checkout calls not recorded correctly: %#v", fakeGit)
 	}
 	if !fakeGit.removed {
@@ -1916,6 +2079,56 @@ func TestRunDocFirstNewSpecCanPassWithoutMergedSpec(t *testing.T) {
 		if !strings.Contains(fakeAgent.invocation.Prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, fakeAgent.invocation.Prompt)
 		}
+	}
+}
+
+func TestReadPRHeadFileReadsVerifiedHeadRefNotWorktreeOrBase(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "docs", "specs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs/specs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "specs", "design.md"), []byte("conductor worktree content\n"), 0o644); err != nil {
+		t.Fatalf("write worktree file: %v", err)
+	}
+	sourceRef := loopreviewPRHeadSourceRef(538)
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md":  "stale base content\n",
+			sourceRef + ":docs/specs/design.md": "fresh PR head content\n",
+		},
+	}
+
+	got, err := readPRHeadFile(context.Background(), fakeGit, repo, prRefMetadata{
+		PRNumber:      538,
+		HeadSourceRef: sourceRef,
+	}, "docs/specs/design.md")
+	if err != nil {
+		t.Fatalf("readPRHeadFile returned error: %v", err)
+	}
+	if got.Path != "docs/specs/design.md" || got.SourceRef != sourceRef || got.Content != "fresh PR head content\n" {
+		t.Fatalf("PR-head content = %#v, want fresh content from source ref", got)
+	}
+	if !reflect.DeepEqual(fakeGit.showCalls, []string{sourceRef + ":docs/specs/design.md"}) {
+		t.Fatalf("git show calls = %#v, want only PR-head source ref", fakeGit.showCalls)
+	}
+}
+
+func TestReadPRHeadFileRejectsUnverifiedSourceRef(t *testing.T) {
+	fakeGit := &loopreviewFakeGit{
+		show: map[string]string{
+			"origin/main:docs/specs/design.md": "stale base content\n",
+		},
+	}
+
+	_, err := readPRHeadFile(context.Background(), fakeGit, t.TempDir(), prRefMetadata{
+		PRNumber:      538,
+		HeadSourceRef: "origin/main",
+	}, "docs/specs/design.md")
+	if err == nil {
+		t.Fatal("readPRHeadFile returned nil error for unverified source ref")
+	}
+	if len(fakeGit.showCalls) != 0 {
+		t.Fatalf("git show calls = %#v, want none for unverified ref", fakeGit.showCalls)
 	}
 }
 
@@ -2304,13 +2517,18 @@ func loopreviewStandardFakeGitHub() *loopreviewFakeGitHub {
 }
 
 type loopreviewFakeGit struct {
-	fetchBase string
-	fetchPR   int
-	addRev    string
-	removed   bool
-	show      map[string]string
-	showErr   error
-	showErrs  map[string]error
+	fetchBase    string
+	fetchPR      int
+	fetchPRRef   int
+	fetchTarget  string
+	addRev       string
+	removed      bool
+	show         map[string]string
+	showErr      error
+	showErrs     map[string]error
+	showCalls    []string
+	revParse     map[string]string
+	revParseErrs map[string]error
 }
 
 func (f *loopreviewFakeGit) FetchOriginBase(_ context.Context, _ string, baseBranch string) error {
@@ -2320,6 +2538,12 @@ func (f *loopreviewFakeGit) FetchOriginBase(_ context.Context, _ string, baseBra
 
 func (f *loopreviewFakeGit) FetchPRHead(_ context.Context, _ string, prNumber int) error {
 	f.fetchPR = prNumber
+	return nil
+}
+
+func (f *loopreviewFakeGit) FetchPRHeadRef(_ context.Context, _ string, prNumber int, targetRef string) error {
+	f.fetchPRRef = prNumber
+	f.fetchTarget = targetRef
 	return nil
 }
 
@@ -2333,7 +2557,20 @@ func (f *loopreviewFakeGit) WorktreeRemove(context.Context, string, string) erro
 	return nil
 }
 
+func (f *loopreviewFakeGit) RevParse(_ context.Context, _ string, rev string) (string, error) {
+	if err := f.revParseErrs[rev]; err != nil {
+		return "", err
+	}
+	if f.revParse != nil {
+		if value, ok := f.revParse[rev]; ok {
+			return value, nil
+		}
+	}
+	return rev + "-sha", nil
+}
+
 func (f *loopreviewFakeGit) Show(_ context.Context, _ string, revPath string) (string, error) {
+	f.showCalls = append(f.showCalls, revPath)
 	if err := f.showErrs[revPath]; err != nil {
 		return "", err
 	}

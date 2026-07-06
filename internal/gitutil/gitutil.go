@@ -102,15 +102,23 @@ func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]by
 	return c.runner.RunGit(ctx, repoPath, args...)
 }
 
-// FetchOriginBase runs git fetch origin <baseBranch>.
+// FetchOriginBase refreshes origin/<baseBranch>.
 func (c *Client) FetchOriginBase(ctx context.Context, repoPath, baseBranch string) error {
-	_, err := c.run(ctx, repoPath, "fetch", "origin", baseBranch)
+	refspec := "+refs/heads/" + strings.TrimSpace(baseBranch) + ":refs/remotes/origin/" + strings.TrimSpace(baseBranch)
+	_, err := c.run(ctx, repoPath, "fetch", "origin", refspec)
 	return err
 }
 
 // FetchPRHead fetches a pull request head into FETCH_HEAD.
 func (c *Client) FetchPRHead(ctx context.Context, repoPath string, prNumber int) error {
 	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", fmt.Sprintf("pull/%d/head", prNumber))
+	return err
+}
+
+// FetchPRHeadRef fetches a pull request head into a caller-owned local ref.
+func (c *Client) FetchPRHeadRef(ctx context.Context, repoPath string, prNumber int, targetRef string) error {
+	refspec := fmt.Sprintf("+refs/pull/%d/head:%s", prNumber, strings.TrimSpace(targetRef))
+	_, err := c.run(ctx, repoPath, "fetch", "-q", "origin", refspec)
 	return err
 }
 

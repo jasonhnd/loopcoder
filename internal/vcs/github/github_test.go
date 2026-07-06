@@ -278,8 +278,8 @@ func TestListHeadPRsRunsGhPRList(t *testing.T) {
 func TestMergeToPreProdRunsGitHubMergeAPI(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences":                                                                []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
-			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner":                                                                                                                         []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences": []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner": []byte(`{"nameWithOwner":"owner/repo"}`),
 			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=pre-prod\x00-f\x00head=loop/issue-101\x00-f\x00commit_message=loopcoder pre-prod merge PR #101": []byte(`{"sha":"abc123","html_url":"https://github.com/owner/repo/commit/abc123"}`),
 		},
 	}
@@ -294,7 +294,7 @@ func TestMergeToPreProdRunsGitHubMergeAPI(t *testing.T) {
 	}
 
 	want := [][]string{
-		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences"},
 		{"repo", "gh", "repo", "view", "--json", "nameWithOwner"},
 		{"repo", "gh", "api", "--method", "POST", "repos/owner/repo/merges", "-f", "base=pre-prod", "-f", "head=loop/issue-101", "-f", "commit_message=loopcoder pre-prod merge PR #101"},
 	}
@@ -306,8 +306,8 @@ func TestMergeToPreProdRunsGitHubMergeAPI(t *testing.T) {
 func TestMergeToPreProdEmptyMergeResponseIsAlreadyUpToDate(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences":                                                                []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
-			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner":                                                                                                                         []byte(`{"nameWithOwner":"owner/repo"}`),
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences": []byte(`{"number":101,"headRefName":"loop/issue-101","url":"https://github.com/owner/repo/pull/101"}`),
+			"repo\x00gh\x00repo\x00view\x00--json\x00nameWithOwner": []byte(`{"nameWithOwner":"owner/repo"}`),
 			"repo\x00gh\x00api\x00--method\x00POST\x00repos/owner/repo/merges\x00-f\x00base=pre-prod\x00-f\x00head=loop/issue-101\x00-f\x00commit_message=loopcoder pre-prod merge PR #101": nil,
 		},
 	}
@@ -753,9 +753,9 @@ func TestResolvePreProdKickBackCommitAcceptsSHAWithoutLogLookup(t *testing.T) {
 func TestRouteKickBackToNeedsHumanLabelsLinkedIssues(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"loop/issue-35","closingIssuesReferences":[{"number":35}]}`),
-			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":  nil,
-			"repo\x00gh\x00issue\x00edit\x0035\x00--add-label\x00needs-human":                                                nil,
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"loop/issue-35","closingIssuesReferences":[{"number":35}]}`),
+			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":                                    nil,
+			"repo\x00gh\x00issue\x00edit\x0035\x00--add-label\x00needs-human":                                                                                  nil,
 		},
 	}
 	client := NewWithRunner("repo", runner)
@@ -769,7 +769,7 @@ func TestRouteKickBackToNeedsHumanLabelsLinkedIssues(t *testing.T) {
 	}
 
 	want := [][]string{
-		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "pr", "view", "101", "--json", "number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences"},
 		{"repo", "gh", "label", "create", "needs-human", "--color", "b60205", "--description", "human decision required"},
 		{"repo", "gh", "issue", "edit", "35", "--add-label", "needs-human"},
 	}
@@ -781,9 +781,9 @@ func TestRouteKickBackToNeedsHumanLabelsLinkedIssues(t *testing.T) {
 func TestRouteKickBackToNeedsHumanLabelsPRWhenNoLinkedIssue(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"feature"}`),
-			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":  nil,
-			"repo\x00gh\x00pr\x00edit\x00101\x00--add-label\x00needs-human":                                                  nil,
+			"repo\x00gh\x00pr\x00view\x00101\x00--json\x00number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences": []byte(`{"number":101,"title":"Kick back item","headRefName":"feature"}`),
+			"repo\x00gh\x00label\x00create\x00needs-human\x00--color\x00b60205\x00--description\x00human decision required":                                    nil,
+			"repo\x00gh\x00pr\x00edit\x00101\x00--add-label\x00needs-human":                                                                                    nil,
 		},
 	}
 	client := NewWithRunner("repo", runner)
@@ -930,7 +930,7 @@ func TestUpdateIssueReturnsPartialIssueAndReadbackError(t *testing.T) {
 func TestViewPRAndDiffRunGhCommands(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string][]byte{
-			"repo\x00gh\x00pr\x00view\x00152\x00--json\x00number,title,body,url,headRefName,isDraft,closingIssuesReferences": []byte(`{"number":152,"title":"PR","body":"Body","url":"https://github.com/owner/repo/pull/152","headRefName":"loop/issue-152","closingIssuesReferences":[{"number":152}]}`),
+			"repo\x00gh\x00pr\x00view\x00152\x00--json\x00number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences": []byte(`{"number":152,"title":"PR","body":"Body","url":"https://github.com/owner/repo/pull/152","baseRefName":"main","baseRefOid":"base-sha","headRefName":"loop/issue-152","headRefOid":"head-sha","closingIssuesReferences":[{"number":152}]}`),
 			"repo\x00gh\x00pr\x00diff\x00152":                []byte("diff --git a/a.go b/a.go\n"),
 			"repo\x00gh\x00pr\x00diff\x00152\x00--name-only": []byte("a.go\r\nb.go\n"),
 		},
@@ -941,7 +941,7 @@ func TestViewPRAndDiffRunGhCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPR returned error: %v", err)
 	}
-	if pr.Number != 152 || pr.Title != "PR" || pr.Body != "Body" || pr.HeadRefName != "loop/issue-152" || len(pr.ClosingIssuesReferences) != 1 {
+	if pr.Number != 152 || pr.Title != "PR" || pr.Body != "Body" || pr.BaseRefName != "main" || pr.BaseRefOid != "base-sha" || pr.HeadRefName != "loop/issue-152" || pr.HeadRefOid != "head-sha" || len(pr.ClosingIssuesReferences) != 1 {
 		t.Fatalf("ViewPR parsed incorrectly: %#v", pr)
 	}
 	diff, err := client.PRDiff(context.Background(), 152)
@@ -960,7 +960,7 @@ func TestViewPRAndDiffRunGhCommands(t *testing.T) {
 	}
 
 	want := [][]string{
-		{"repo", "gh", "pr", "view", "152", "--json", "number,title,body,url,headRefName,isDraft,closingIssuesReferences"},
+		{"repo", "gh", "pr", "view", "152", "--json", "number,title,body,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,closingIssuesReferences"},
 		{"repo", "gh", "pr", "diff", "152"},
 		{"repo", "gh", "pr", "diff", "152", "--name-only"},
 	}
