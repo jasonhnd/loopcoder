@@ -42,6 +42,29 @@ func TestBuildPlanUsesGoDefaultsWhenAuditConfigAbsent(t *testing.T) {
 	}
 }
 
+func TestBuildPlanNativeDefaultExcludesCoverGeneratedAndLoopcoderDirs(t *testing.T) {
+	plan, err := BuildPlan(t.TempDir(), config.Audit{}, Options{})
+	if err != nil {
+		t.Fatalf("BuildPlan returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		".git/**",
+		".loopcoder/**",
+		"node_modules/**",
+		"vendor/**",
+		"dist/**",
+		"build/**",
+		"coverage/**",
+		".next/**",
+		"out/**",
+	} {
+		if !containsString(plan.Native.Exclude, want) {
+			t.Fatalf("native default excludes = %#v, missing %q", plan.Native.Exclude, want)
+		}
+	}
+}
+
 func TestThresholdVerdictAndExitCodePrecedence(t *testing.T) {
 	lowOnly := NewResult("repo", []string{LayerSAST}, SeverityMedium)
 	lowOnly.Findings = []Finding{makeFinding(Finding{
@@ -190,6 +213,118 @@ func writePrompt(data []byte) error {
 		if finding.Rule == "native:file-permission" && finding.File == "CHANGELOG.md" {
 			t.Fatalf("CHANGELOG.md was incorrectly treated as sensitive: %#v", finding)
 		}
+	}
+}
+
+func TestNativeScansUseGitTrackedFilesAndDefaultExcludes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runAuditTestGit(t, repo, "init", "-b", "main")
+	writeNativeAuditFile(t, repo, ".gitignore", "node_modules/\nbuild/\n.loopcoder/\n")
+	writeNativeAuditFile(t, repo, "tracked.txt", `api_key = "trackedsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "untracked.txt", `api_key = "untrackedsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "node_modules/pkg/leak.txt", `api_key = "nodemodulessecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "build/out/leak.txt", `api_key = "buildsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, ".loopcoder/leak.txt", `api_key = "loopcodersecretvalue1234567890"`+"\n")
+	runAuditTestGit(t, repo, "add", ".gitignore", "tracked.txt")
+	runAuditTestGit(t, repo, "add", "-f", "node_modules/pkg/leak.txt", "build/out/leak.txt", ".loopcoder/leak.txt")
+
+	findings, err := RunNativeScans(repo, NativeConfig{
+		Secrets: true,
+		Include: []string{"**/*"},
+		Exclude: []string{"custom-ignore/**"},
+	})
+	if err != nil {
+		t.Fatalf("RunNativeScans returned error: %v", err)
+	}
+	if len(findings) != 1 || findings[0].File != "tracked.txt" {
+		t.Fatalf("native findings = %#v, want only tracked.txt", findings)
+	}
+	for _, notWant := range []string{"untracked.txt", "node_modules/pkg/leak.txt", "build/out/leak.txt", ".loopcoder/leak.txt"} {
+		if hasFindingFile(findings, notWant) {
+			t.Fatalf("native scan included excluded or untracked file %s: %#v", notWant, findings)
+		}
+	}
+}
+
+func TestNativeScansApplyUserFiltersAfterGitSourceSelection(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runAuditTestGit(t, repo, "init", "-b", "main")
+	writeNativeAuditFile(t, repo, "src/keep.txt", `api_key = "keepsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "src/drop.txt", `api_key = "dropsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "src/untracked.txt", `api_key = "untrackedsecretvalue1234567890"`+"\n")
+	writeNativeAuditFile(t, repo, "docs/drop.txt", `api_key = "docssecretvalue1234567890"`+"\n")
+	runAuditTestGit(t, repo, "add", "src/keep.txt", "src/drop.txt", "docs/drop.txt")
+
+	findings, err := RunNativeScans(repo, NativeConfig{
+		Secrets: true,
+		Include: []string{
+			"src/**",
+		},
+		Exclude: []string{
+			"src/drop.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunNativeScans returned error: %v", err)
+	}
+	if len(findings) != 1 || findings[0].File != "src/keep.txt" {
+		t.Fatalf("native findings = %#v, want only src/keep.txt", findings)
+	}
+}
+
+func TestNativeScansNonGitFallbackUsesDefaultExcludes(t *testing.T) {
+	repo := t.TempDir()
+	writeNativeAuditFile(t, repo, "keep.txt", `api_key = "keepsecretvalue1234567890"`+"\n")
+	for _, path := range []string{
+		".loopcoder/leak.txt",
+		"node_modules/pkg/leak.txt",
+		"vendor/pkg/leak.txt",
+		"dist/leak.txt",
+		"build/leak.txt",
+		"coverage/leak.txt",
+		".next/leak.txt",
+		"out/leak.txt",
+	} {
+		writeNativeAuditFile(t, repo, path, `api_key = "excludedsecretvalue1234567890"`+"\n")
+	}
+
+	findings, err := RunNativeScans(repo, NativeConfig{Secrets: true, Include: []string{"**/*"}})
+	if err != nil {
+		t.Fatalf("RunNativeScans returned error: %v", err)
+	}
+	if len(findings) != 1 || findings[0].File != "keep.txt" {
+		t.Fatalf("native findings = %#v, want only keep.txt", findings)
+	}
+}
+
+func TestRunReportsNativeGitListFailureAsRuntimeFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".git"), []byte("gitdir: missing\n"), 0o600); err != nil {
+		t.Fatalf("write invalid .git file: %v", err)
+	}
+	writeNativeAuditFile(t, repo, "leak.txt", `api_key = "fallbackmustnotscan1234567890"`+"\n")
+
+	result, err := Run(context.Background(), Options{RepoPath: repo}, Deps{})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if ExitCode(result) != 3 {
+		t.Fatalf("ExitCode = %d, want 3; result=%#v", ExitCode(result), result)
+	}
+	if !containsText(result.RuntimeFailures, "native audit git ls-files") {
+		t.Fatalf("runtime failures = %#v, want git ls-files failure", result.RuntimeFailures)
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("native scan fell back to filesystem walk and found: %#v", result.Findings)
 	}
 }
 
@@ -449,10 +584,39 @@ func containsText(values []string, want string) bool {
 	return false
 }
 
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFindingFile(findings []Finding, file string) bool {
+	for _, finding := range findings {
+		if finding.File == file {
+			return true
+		}
+	}
+	return false
+}
+
 func writeAuditConfig(t *testing.T, repo, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(body), 0o600); err != nil {
 		t.Fatalf("write .delivery.yml: %v", err)
+	}
+}
+
+func writeNativeAuditFile(t *testing.T, repo, rel, content string) {
+	t.Helper()
+	path := filepath.Join(repo, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
 	}
 }
 

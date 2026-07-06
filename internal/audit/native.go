@@ -1,11 +1,13 @@
 package audit
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -52,9 +54,23 @@ func RunNativeScans(repoPath string, cfg NativeConfig) ([]Finding, error) {
 }
 
 func auditFiles(repoPath string, include, exclude []string) ([]string, error) {
-	if len(include) == 0 {
-		include = []string{"**/*"}
+	var files []string
+	var err error
+	if repoLooksLikeGit(repoPath) {
+		files, err = gitTrackedFiles(context.Background(), repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("native audit git ls-files: %w", err)
+		}
+	} else {
+		files, err = walkNativeAuditFiles(repoPath)
+		if err != nil {
+			return nil, err
+		}
 	}
+	return filterNativeAuditFiles(files, include, exclude), nil
+}
+
+func walkNativeAuditFiles(repoPath string) ([]string, error) {
 	files := []string{}
 	err := filepath.WalkDir(repoPath, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -72,15 +88,9 @@ func auditFiles(repoPath string, include, exclude []string) ([]string, error) {
 		}
 		rel = normalizeRepoPath(rel)
 		if entry.IsDir() {
-			if matchesAnyRepoGlob(rel+"/", exclude) || matchesAnyRepoGlob(rel+"/**", exclude) {
+			if matchesAnyRepoGlob(rel+"/", defaultNativeExclude) || matchesAnyRepoGlob(rel+"/**", defaultNativeExclude) {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-		if !matchesAnyRepoGlob(rel, include) {
-			return nil
-		}
-		if matchesAnyRepoGlob(rel, exclude) {
 			return nil
 		}
 		files = append(files, rel)
@@ -89,7 +99,47 @@ func auditFiles(repoPath string, include, exclude []string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("native audit scan: %w", err)
 	}
+	sort.Strings(files)
 	return files, nil
+}
+
+func filterNativeAuditFiles(files, include, exclude []string) []string {
+	if len(include) == 0 {
+		include = []string{"**/*"}
+	}
+	exclude = mergeRepoGlobs(defaultNativeExclude, exclude)
+	out := []string{}
+	for _, file := range files {
+		file = normalizeRepoPath(file)
+		if file == "" {
+			continue
+		}
+		if !matchesAnyRepoGlob(file, include) {
+			continue
+		}
+		if matchesAnyRepoGlob(file, exclude) {
+			continue
+		}
+		out = append(out, file)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func mergeRepoGlobs(lists ...[]string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, pattern := range list {
+			pattern = normalizeRepoPath(pattern)
+			if pattern == "" || seen[pattern] {
+				continue
+			}
+			seen[pattern] = true
+			out = append(out, pattern)
+		}
+	}
+	return out
 }
 
 func nativeSecretFindings(file, text string) []Finding {

@@ -14,9 +14,14 @@ import (
 
 var defaultNativeExclude = []string{
 	".git/**",
+	".loopcoder/**",
+	"node_modules/**",
 	"vendor/**",
 	"dist/**",
-	"node_modules/**",
+	"build/**",
+	"coverage/**",
+	".next/**",
+	"out/**",
 }
 
 func LoadPlan(ctx context.Context, repoPath string, opts Options) (Plan, error) {
