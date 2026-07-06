@@ -12,12 +12,26 @@ Format for loopcoder work units:
 ## 0.6.0 — Model & depth selection: discovery, validation, defaults (+ agy provider)
 
 Planned. Make models and their depth tiers discoverable, validated, and defaulted so operators
-choose across providers without guessing; land the Antigravity (`agy`) provider as the largest
-new model source. Depth is modeled as a **per-model list of valid tokens that may be empty** — not a
-cross-provider scale: codex `reasoning_effort` [low..xhigh]; agy = whatever `agy models` lists
-per model (`Gemini 3.1 Pro`→[Low,High], `Opus 4.6`→[Thinking], `GPT-OSS 120B`→[Medium]);
-gemini/claude empty today (gemini ignores effort; claude takes `--model` only). Validation
-checks membership per model; a configured effort against an empty list is a warning.
+choose without guessing. Target models: **claude, gpt (codex), gemini** — gemini reached **via
+the Antigravity (`agy`) provider**, since the direct gemini CLI is dead for personal accounts
+(Google `IneligibleTier`). Depth is a **per-model list of valid tokens that may be empty** (not a
+cross-provider scale), wired per provider: claude `--effort`, codex `reasoning_effort`
+[low..xhigh], agy = whatever `agy models` lists per model (`Gemini 3.1 Pro`→[Low,High],
+`Opus 4.6`→[Thinking], `GPT-OSS 120B`→[Medium]). All three target models thus have depth —
+gemini's comes from agy's tiers. Validation checks membership per model; effort against an empty
+list is a warning.
+
+Selection is **per-role**: worker and verifier each choose their own model+depth (config;
+per-role override already shipped in spec 0215) and both are validated against the registry. The
+conductor is the host session driving loopcoder, not a dispatched subprocess — its model is the
+operator's host choice, so loopcoder does not switch it.
+
+Dispatch is **natural-language**: the operator tells the conductor "use gemini, deeper" and the
+conductor translates it to `--provider/--model/--effort`. The registry is the conductor's
+ground-truth for valid model+depth (translation targets real options) and validation rejects
+invalid names; the reporter's recorded model+depth per work-ID is the operator's confirmation
+that the translation matched intent — validation catches *invalid* picks, the reporter catches
+*wrong-but-valid* ones.
 
 - doc: spec — static model registry (per provider: models × depth tiers + defaults);
   `loopcoder models [--provider]`; parse-time validation (warn default, `--strict` rejects);
@@ -31,8 +45,10 @@ checks membership per model; a configured effort against an empty list is a warn
   by default; `.delivery.yml`/CLI `--strict` escalates to reject).
 - code: `internal/agent/antigravity.go` agy runner (close stdin, `-p`, plain-text summary,
   self-reported model, vendor "Google Antigravity"); register `antigravity`; depth via
-  `model`+`reasoning_effort` → `"<model> (<Depth>)"`; `loopcoder doctor` checks agy OAuth login
-  so a missing login fails clearly.
+  `model`+`reasoning_effort` → `"<model> (<Depth>)"`; **MUST pin the worktree as agy's workspace
+  via `--add-dir <worktree>` (verified fix) — agy otherwise ignores process CWD and writes to its
+  own `~/.gemini/antigravity-cli/scratch` (silent wrong-directory writes, exit 0)**; `loopcoder
+  doctor` checks agy OAuth login so a missing login fails clearly.
 - code: docs/reference — `loopcoder models` usage, model/depth config, agy setup + login.
 
 ## 0.6.0 — reporter (attestation → reporter rename + light strengthening)
@@ -43,13 +59,16 @@ emitted header, and all human prose. The hard part is the relay hard-gate: the t
 matched (`relay_guard.go`), and instructed for verbatim relay (SKILL.md, host-hook templates,
 GEMINI.md/AGENTS.md); a naive swap risks relay lock-out / fail-open on upgrade-lag between
 binary, skill manual, and host hooks. So it ships with a transition window, not a raw swap.
+Sequence: land Unit A (incl. `antigravity.go`) before this rename sweep, so the sweep renames
+the new agy file in one pass instead of colliding with it.
 
 - doc: spec — rename map + **full consumer inventory** (grep: ~1068 refs / 60 files across
   emit + match + manual: cli.go, worker.go, audit/*, agent/* providers, claudehooks,
   cli/hook.go, cli/pretty.go, doctor, guardrails, loopreview, conductor hooks, `relay_guard.go`,
-  SKILL.md, GEMINI.md, AGENTS.md, hooks/*); **freeze CHANGELOG + shipped `docs/specs/*`
-  history**; CanonicalJSON field names already generic → keep stable; invariant: `Validate()`
-  keeps accepting agy self-reported model + absent tokens.
+  SKILL.md, GEMINI.md, AGENTS.md, hooks/*); **freeze CHANGELOG + shipped `docs/specs/*` history,
+  CanonicalJSON field names, and the `.attest` ledger extension** (invisible machinery — same
+  rationale as freezing schema fields: changing them adds transition risk for zero operator-
+  visible gain); invariant: `Validate()` keeps accepting agy self-reported model + absent tokens.
 - code: emit `[reporter]`; rename `internal/attestation`→`internal/reporter`,
   `AttestationRecord`→`Report`, all Go identifiers + pretty wording + current `docs/reference/*`;
   sweep every emit + match + manual site in lockstep; update golden/inventory tests.
@@ -57,12 +76,43 @@ binary, skill manual, and host hooks. So it ships with a transition window, not 
   for this release so upgrade-lag (binary vs propagated skill manual vs host-side hooks) can
   neither lock out nor fail open; drop `[attestation]` acceptance one version later. (relay
   hard-gate spec 0447 + the "blocking gate must not lock out" rule)
-- code: strengthen — model+depth display (`Gemini 3.1 Pro (High)`); add `issue`/`branch`/
-  `worktree`/`round` context fields (dispatch/tick-filled, optional); pretty grouping
+- code: strengthen — model+depth display (`Gemini 3.1 Pro (High)`); **work-ID per dispatch =
+  reuse existing `RunID` (spec 0390), surfaced in every report**; add `issue`/`branch`/
+  `worktree`/`round` context fields (dispatch/tick-filled, optional); **prefer loopcoder-observed
+  ground-truth** (dispatched model+depth, process timing, parsed tokens) over agent self-report,
+  marking `self-reported` only where unobservable (e.g. agy); pretty grouping
   (who·what·result·cost); must not re-tighten validation against agy. (needs: 0.6.0 models
   registry for depth display)
+- code: `loopcoder report` — on-demand, read-only command to list/query recent per-work reports
+  (work-ID, role, model+depth, start/end, tokens) from the persisted log; this is how the
+  reporter subsystem "reports at any time".
 - code: docs/reference — reporter concept + attestation→reporter prose in usage.md/worker.md
   (CHANGELOG + shipped specs frozen).
+
+## 0.6.0 — Upgrade, migration & operational health (doctor)
+
+Planned. 0.6.0 is the first BREAKING release (reporter rename), so it must ship a clean upgrade
+from 0.5.x and a defined self-check. Everything we froze (`.attest` ledgers, CanonicalJSON field
+names) migrates as a no-op; only renamed config keys and stale logs need real handling.
+
+- doc: spec — upgrade/migration plan (old-version detection, config-key migration map, log
+  retention policy) + `loopcoder doctor` definition (who runs it, what it checks, which roles).
+- code: `loopcoder upgrade` 0.5.x→0.6.0 — detect old version; migrate any renamed config keys
+  (from the reporter rename); keep frozen machinery intact; idempotent, no data loss; the relay
+  dual-token window (Unit B) must stay valid across the version boundary.
+- code: old-file handling — config-key migration; **bounded cleanup of stale logs** (run logs,
+  worktree-liveness, relay state) under a retention policy; leave `.attest` ledgers + schema
+  untouched.
+- code: `loopcoder doctor` — **operator-run; default diagnoses only (read-only, safe anytime)**:
+  git + provider CLIs present; **per-provider auth/reachability** (codex, claude, agy OAuth
+  login); config validity (worker/verifier model+depth vs registry); reporter/relay wiring sane;
+  version + upgrade status — reports each problem + its fix command, changing nothing. **`--fix`
+  (explicit opt-in) performs the mutations** (upgrade, stale-log cleanup, config-key migration);
+  doctor is the operational-health entry point but never changes state by default. (Doctor is
+  not a role — it verifies readiness FOR worker/verifier dispatch and conductor/relay wiring.)
+- code+docs: **0.6.0 CHANGELOG + Release Note + README** — detailed feature + how-to-use docs;
+  and establish a standing per-release rule in `docs/reference/releasing.md`: every version bump
+  rewrites all three (changelog / release note / README), as complete and detailed as possible.
 
 ## 0.5.3 — loopcoder audit (built-in security audit) — ✅ shipped v0.5.3 (2026-07-06)
 
