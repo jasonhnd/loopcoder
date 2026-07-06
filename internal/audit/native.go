@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,10 +15,29 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 )
 
+const genericSecretEntropyFloor = 3.5
+
+type nativeSecretSignature struct {
+	family  string
+	pattern *regexp.Regexp
+}
+
+type nativeSecretRange struct {
+	start int
+	end   int
+}
+
 var (
 	secretAssignmentPattern = regexp.MustCompile(`(?i)\b(api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*["']?([A-Za-z0-9][A-Za-z0-9_./+=-]{15,})["']?`)
-	awsAccessKeyPattern     = regexp.MustCompile(`\b(AKIA[0-9A-Z]{16})\b`)
-	sensitiveModePattern    = regexp.MustCompile(`(?i)\b(?:os\.)?(?:WriteFile|OpenFile|Chmod)\s*\([^)]*(0o[0-7]{3,4}|0[0-7]{3,4})`)
+	secretSignaturePatterns = []nativeSecretSignature{
+		{family: "GitHub classic token", pattern: regexp.MustCompile(`\b(ghp_[A-Za-z0-9_]{36,})\b`)},
+		{family: "GitHub fine-grained token", pattern: regexp.MustCompile(`\b(github_pat_[A-Za-z0-9_]{36,})\b`)},
+		{family: "Stripe live key", pattern: regexp.MustCompile(`\b(sk_live_[A-Za-z0-9]{16,})\b`)},
+		{family: "AWS access key", pattern: regexp.MustCompile(`\b(AKIA[0-9A-Z]{16})\b`)},
+		{family: "PEM private key block", pattern: regexp.MustCompile(`(?i)(-{5}BEGIN [A-Z0-9 ]*PRIVATE KEY-{5})`)},
+		{family: "JWT-looking value", pattern: regexp.MustCompile(`\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b`)},
+	}
+	sensitiveModePattern = regexp.MustCompile(`(?i)\b(?:os\.)?(?:WriteFile|OpenFile|Chmod)\s*\([^)]*(0o[0-7]{3,4}|0[0-7]{3,4})`)
 )
 
 func RunNativeScans(repoPath string, cfg NativeConfig) ([]Finding, error) {
@@ -146,56 +166,169 @@ func nativeSecretFindings(file, text string) []Finding {
 	findings := []Finding{}
 	for index, line := range splitLines(text) {
 		lineNumber := index + 1
-		findings = append(findings, secretAssignmentFindings(file, lineNumber, line)...)
-		findings = append(findings, awsSecretFindings(file, lineNumber, line)...)
+		signatureFindings, signatureRanges := secretSignatureFindings(file, lineNumber, line)
+		findings = append(findings, signatureFindings...)
+		findings = append(findings, secretAssignmentFindings(file, lineNumber, line, signatureRanges)...)
 	}
 	return findings
 }
 
-func secretAssignmentFindings(file string, lineNumber int, line string) []Finding {
+func secretSignatureFindings(file string, lineNumber int, line string) ([]Finding, []nativeSecretRange) {
+	findings := []Finding{}
+	ranges := []nativeSecretRange{}
+	for _, signature := range secretSignaturePatterns {
+		matches := signature.pattern.FindAllStringSubmatchIndex(line, -1)
+		for _, match := range matches {
+			if len(match) < 4 {
+				continue
+			}
+			start, end := match[2], match[3]
+			if start < 0 || end < start {
+				start, end = match[0], match[1]
+			}
+			if start < 0 || end < start {
+				continue
+			}
+			ranges = append(ranges, nativeSecretRange{start: start, end: end})
+			findings = append(findings, makeFinding(Finding{
+				Layer:    LayerSAST,
+				Tool:     "native",
+				Severity: SeverityHigh,
+				File:     file,
+				Line:     lineNumber,
+				Column:   start + 1,
+				Rule:     "native:secret",
+				Category: "secret-disclosure",
+				Message:  "High-confidence secret signature detected.",
+				Evidence: boundedEvidence(signature.family + " redacted"),
+				Tier:     FindingTierSignature,
+				Gate:     FindingGateGate,
+			}))
+		}
+	}
+	return findings, ranges
+}
+
+func secretAssignmentFindings(file string, lineNumber int, line string, signatureRanges []nativeSecretRange) []Finding {
+	if isGenericSecretSuppressedPath(file) {
+		return nil
+	}
 	matches := secretAssignmentPattern.FindAllStringSubmatchIndex(line, -1)
 	findings := make([]Finding, 0, len(matches))
 	for _, match := range matches {
 		if len(match) < 6 {
 			continue
 		}
-		redacted := redactCapture(line, match[4], match[5])
+		valueStart, valueEnd := match[4], match[5]
+		if valueStart < 0 || valueEnd < valueStart || valueEnd > len(line) {
+			continue
+		}
+		if overlapsAnyRange(valueStart, valueEnd, signatureRanges) {
+			continue
+		}
+		value := line[valueStart:valueEnd]
+		if shouldDropGenericSecret(line, value) {
+			continue
+		}
+		entropy := shannonEntropy(value)
+		if entropy < genericSecretEntropyFloor {
+			continue
+		}
+		keyword := strings.ToLower(line[match[2]:match[3]])
 		findings = append(findings, makeFinding(Finding{
 			Layer:    LayerSAST,
 			Tool:     "native",
-			Severity: SeverityHigh,
+			Severity: SeverityLow,
 			File:     file,
 			Line:     lineNumber,
+			Column:   valueStart + 1,
 			Rule:     "native:secret",
 			Category: "secret-disclosure",
-			Message:  "Potential hardcoded secret detected.",
-			Evidence: boundedEvidence(redacted),
+			Message:  "Potential high-entropy secret assignment detected.",
+			Evidence: boundedEvidence(fmt.Sprintf("keyword %s assignment redacted; entropy=%.2f", keyword, entropy)),
+			Tier:     FindingTierEntropy,
+			Gate:     FindingGateWarning,
 		}))
 	}
 	return findings
 }
 
-func awsSecretFindings(file string, lineNumber int, line string) []Finding {
-	matches := awsAccessKeyPattern.FindAllStringSubmatchIndex(line, -1)
-	findings := make([]Finding, 0, len(matches))
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
-		}
-		redacted := redactCapture(line, match[2], match[3])
-		findings = append(findings, makeFinding(Finding{
-			Layer:    LayerSAST,
-			Tool:     "native",
-			Severity: SeverityHigh,
-			File:     file,
-			Line:     lineNumber,
-			Rule:     "native:secret",
-			Category: "secret-disclosure",
-			Message:  "Potential AWS access key detected.",
-			Evidence: boundedEvidence(redacted),
-		}))
+func shouldDropGenericSecret(line, value string) bool {
+	if containsEnvRead(line) || containsEnvRead(value) {
+		return true
 	}
-	return findings
+	return isPlaceholderValue(strings.TrimSpace(value))
+}
+
+func containsEnvRead(text string) bool {
+	lower := strings.ToLower(text)
+	for _, signal := range []string{
+		"process.env",
+		"os.getenv",
+		"os.environ",
+		"system.getenv",
+	} {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPlaceholderValue(value string) bool {
+	value = strings.Trim(value, `"'`)
+	return placeholderWrapped(value, "${", "}") || placeholderWrapped(value, "{{", "}}") || placeholderWrapped(value, "<", ">")
+}
+
+func placeholderWrapped(value, prefix, suffix string) bool {
+	return strings.HasPrefix(value, prefix) && strings.HasSuffix(value, suffix) && len(value) > len(prefix)+len(suffix)
+}
+
+func overlapsAnyRange(start, end int, ranges []nativeSecretRange) bool {
+	for _, candidate := range ranges {
+		if start < candidate.end && end > candidate.start {
+			return true
+		}
+	}
+	return false
+}
+
+func shannonEntropy(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	counts := map[rune]int{}
+	total := 0
+	for _, r := range value {
+		counts[r]++
+		total++
+	}
+	if total == 0 {
+		return 0
+	}
+	entropy := 0.0
+	for _, count := range counts {
+		probability := float64(count) / float64(total)
+		entropy -= probability * math.Log2(probability)
+	}
+	return entropy
+}
+
+func isGenericSecretSuppressedPath(file string) bool {
+	lower := strings.ToLower(normalizeRepoPath(file))
+	base := pathBase(lower)
+	for _, suffix := range []string{".example", ".sample", ".template"} {
+		if strings.HasSuffix(base, suffix) || strings.Contains(base, suffix+".") {
+			return true
+		}
+	}
+	for _, component := range strings.Split(lower, "/") {
+		switch component {
+		case "fixture", "fixtures", "__fixtures__", "testdata", "test-fixtures", "test_fixtures":
+			return true
+		}
+	}
+	return false
 }
 
 func nativePermissionFinding(repoPath, file string) (Finding, bool) {
@@ -286,13 +419,6 @@ func splitLines(text string) []string {
 		return nil
 	}
 	return strings.Split(text, "\n")
-}
-
-func redactCapture(line string, start, end int) string {
-	if start < 0 || end < start || end > len(line) {
-		return boundedEvidence(line)
-	}
-	return strings.TrimSpace(line[:start] + "[REDACTED]" + line[end:])
 }
 
 func boundedEvidence(text string) string {
