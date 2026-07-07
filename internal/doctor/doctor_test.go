@@ -50,6 +50,8 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"audit llm provider",
 		"loopcoder skill",
 		"conductor hooks",
+		"migration status",
+		"stale local state",
 		"conductor runtime",
 	} {
 		check := requireCheck(t, report, name)

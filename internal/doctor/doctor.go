@@ -19,8 +19,10 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	"gopkg.in/yaml.v3"
 )
 
@@ -155,6 +157,8 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
+	checks = append(checks, checkMigrationStatus(repoPath, deps))
+	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
 		Status:  StatusOK,
@@ -1360,4 +1364,54 @@ func compareSemver(a, b semver) int {
 		return -1
 	}
 	return strings.Compare(a.prerelease, b.prerelease)
+}
+
+func checkMigrationStatus(repoPath string, deps Deps) Check {
+	udeps := upgrade.DefaultDeps()
+	udeps.Getwd = func() (string, error) { return repoPath, nil }
+	udeps.ReadFile = deps.ReadFile
+	
+	status := upgrade.ScanMigrationStatus(udeps)
+	
+	legacyCount := len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
+	
+	if legacyCount > 0 {
+		return Check{
+			Name: "migration status",
+			Status: StatusWarn,
+			Message: fmt.Sprintf("found %d legacy surface(s) requiring migration; run: loopcoder doctor --repo . --fix", legacyCount),
+		}
+	}
+	return Check{
+		Name: "migration status",
+		Status: StatusOK,
+		Message: "no legacy surfaces found",
+	}
+}
+
+func checkStaleState(repoPath string, deps Deps) Check {
+	opts := localcleanup.Options{
+		RepoPath: repoPath,
+	}
+	result, err := localcleanup.Plan(opts)
+	if err != nil {
+		return Check{
+			Name: "stale local state",
+			Status: StatusWarn,
+			Message: fmt.Sprintf("could not scan local state: %v", err),
+		}
+	}
+	
+	if len(result.Planned) > 0 {
+		return Check{
+			Name: "stale local state",
+			Status: StatusWarn,
+			Message: fmt.Sprintf("found %d cleanup-eligible item(s); run: loopcoder doctor --repo . --fix", len(result.Planned)),
+		}
+	}
+	return Check{
+		Name: "stale local state",
+		Status: StatusOK,
+		Message: "no cleanup-eligible items found",
+	}
 }

@@ -292,12 +292,12 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return result, errors.New("release response did not include tag_name")
 	}
 	result.TargetVersion = rel.TagName
-	result.VersionStatus = classifyVersionStatus(currentVersion, rel.TagName)
+	result.VersionStatus = ClassifyVersionStatus(currentVersion, rel.TagName)
 
 	if sameReleaseVersion(currentVersion, rel.TagName) {
 		result.AlreadyLatest = true
 		if shouldReportMigrationStatus(result.VersionStatus) {
-			result.MigrationStatus = scanMigrationStatus(deps)
+			result.MigrationStatus = ScanMigrationStatus(deps)
 		}
 		return result, nil
 	}
@@ -362,7 +362,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	result.PendingPath = installed.PendingPath
 	result.SkillRefresh = refreshSkill(ctx, deps, skillRefreshBinaryPath(installed))
 	if shouldReportMigrationStatus(result.VersionStatus) {
-		result.MigrationStatus = scanMigrationStatus(deps)
+		result.MigrationStatus = ScanMigrationStatus(deps)
 	}
 	return result, nil
 }
@@ -435,7 +435,7 @@ type semver struct {
 	patch int
 }
 
-func classifyVersionStatus(current string, target string) VersionStatus {
+func ClassifyVersionStatus(current string, target string) VersionStatus {
 	currentClass := classifyVersion(current)
 	targetClass := classifyVersion(target)
 	return VersionStatus{
@@ -528,7 +528,7 @@ func shouldReportMigrationStatus(status VersionStatus) bool {
 	return status.TargetClassification == VersionBreakingTransition
 }
 
-func scanMigrationStatus(deps Deps) MigrationStatus {
+func ScanMigrationStatus(deps Deps) MigrationStatus {
 	deps = normalizeDeps(deps)
 	status := MigrationStatus{
 		EnvDiagnostics: migration.ReporterEnvDiagnostics(deps.Getenv),
