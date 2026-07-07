@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 func TestResolveReleaseLatestAndPinned(t *testing.T) {
@@ -722,6 +723,142 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 	}
 }
 
+func TestRunReports060MigrationStatusAfterUpgrade(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	binaryBytes := []byte("new loopcoder binary")
+	assetName := platformAssetName(t, "0.6.0")
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n")
+	signatureBundle := []byte("valid sigstore bundle")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.6.0"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
+	fsys := newFakeFS()
+	layout := home.New(filepath.Join("home", ".loopcoder"))
+	repo := t.TempDir()
+	deliveryBody := "version: 1\nmin_loopcoder_version: 0.5.0\n" + migration.LegacyReportConfigRoot + ":\n  channel: chat\n"
+	settingsBody := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"` + migration.LegacyReporterHookCommand + `","timeout":10}]}]}}`
+	attemptBody := `{"issue":589,"attempt":1,"` + migration.LegacyReportStateKey + `":{"role":"worker","provider":"codex","model":"gpt-5"}}`
+	writeTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeTextFile(t, filepath.Join(repo, ".delivery.yml"), deliveryBody)
+	writeTextFile(t, filepath.Join(repo, ".claude", "settings.json"), settingsBody)
+	writeTextFile(t, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName), "{}\n")
+	writeTextFile(t, filepath.Join(repo, ".loopcoder", "runs", "run-20260708T000000Z-issue-589", "workers", "job.attempt.json"), attemptBody)
+
+	result, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.6.0",
+		CurrentVersion:   "v0.5.4",
+		RuntimeGOOS:      runtime.GOOS,
+		RuntimeGOARCH:    runtime.GOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			case migration.LegacyReporterScopeEnv:
+				return "auto"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", wantBinaryFileName()), nil
+		},
+		Getwd: func() (string, error) {
+			return repo, nil
+		},
+		HomeLayout: func() (home.Layout, error) {
+			return layout, nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.6.0",
+				Assets: []releaseAsset{
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
+				},
+			}),
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
+		}),
+		VerifySignature: func(_ context.Context, artifact []byte, bundle []byte, identity string, issuer string) error {
+			if !reflect.DeepEqual(artifact, checksums) || !reflect.DeepEqual(bundle, signatureBundle) {
+				t.Fatalf("signature verifier inputs = %q/%q, want %q/%q", artifact, bundle, checksums, signatureBundle)
+			}
+			if identity != "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v0.6.0" {
+				t.Fatalf("identity = %q, want v0.6.0 release workflow identity", identity)
+			}
+			if issuer != defaultCosignIssuer {
+				t.Fatalf("issuer = %q, want %q", issuer, defaultCosignIssuer)
+			}
+			return nil
+		},
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			return binaryBytes, nil
+		},
+		MkdirAll:  fsys.MkdirAll,
+		WriteFile: fsys.WriteFile,
+		Chmod:     fsys.Chmod,
+		Rename:    fsys.Rename,
+		Remove:    fsys.Remove,
+		RunCommand: func(_ context.Context, name string, args ...string) (CommandResult, error) {
+			return CommandResult{
+				Stdout: "loopcoder skill install complete\n" +
+					"  directory " + filepath.Join("home", ".claude", "skills", "loopcoder") + "\n" +
+					"  updated " + filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md") + "\n" +
+					"  updated " + filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md") + "\n",
+			}, nil
+		},
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !result.VersionStatus.BreakingBoundary {
+		t.Fatalf("BreakingBoundary = false, status = %#v", result.VersionStatus)
+	}
+	if !result.VersionStatus.CompatibilityAliasesActive {
+		t.Fatalf("CompatibilityAliasesActive = false")
+	}
+	status := result.MigrationStatus
+	if !status.RepoAvailable || status.RepoPath != repo {
+		t.Fatalf("repo status = %#v, want available repo %s", status, repo)
+	}
+	if len(status.ConfigDiagnostics) != 2 {
+		t.Fatalf("ConfigDiagnostics = %#v, want root and channel diagnostics", status.ConfigDiagnostics)
+	}
+	if len(status.EnvDiagnostics) != 1 {
+		t.Fatalf("EnvDiagnostics = %#v, want legacy env diagnostic", status.EnvDiagnostics)
+	}
+	if len(status.HookDiagnostics) != 1 {
+		t.Fatalf("HookDiagnostics = %#v, want legacy hook command diagnostic", status.HookDiagnostics)
+	}
+	if len(status.OldSurfaceDiagnostics) != 2 {
+		t.Fatalf("OldSurfaceDiagnostics = %#v, want hook-state and state-key diagnostics", status.OldSurfaceDiagnostics)
+	}
+	if missing := missingManagedSkillFiles(result.SkillRefresh.Files); len(missing) > 0 {
+		t.Fatalf("skill refresh missing managed files: %v", missing)
+	}
+}
+
+func TestParseSkillInstallOutputRequiresBothManagedFiles(t *testing.T) {
+	_, _, err := parseSkillInstallOutput("loopcoder skill install complete\n" +
+		"  directory /home/.claude/skills/loopcoder\n" +
+		"  updated /home/.claude/skills/loopcoder/SKILL.md\n")
+	if err == nil {
+		t.Fatal("parseSkillInstallOutput returned nil error, want missing AGENTS.md")
+	}
+	if !strings.Contains(err.Error(), "AGENTS.md") {
+		t.Fatalf("error = %v, want missing AGENTS.md", err)
+	}
+}
+
 func TestExecRunCommandCapturesOutputAndNonZeroExit(t *testing.T) {
 	withTestCommandCap(t, 2*time.Second)
 
@@ -969,6 +1106,16 @@ func readFileString(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func writeTextFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 func buildSkillInstallHelper(t *testing.T) string {

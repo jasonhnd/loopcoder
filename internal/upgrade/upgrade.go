@@ -22,9 +22,12 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -51,6 +54,8 @@ var commandHardCap = commandHardCapDefault
 type Options struct {
 	RequestedVersion string
 	CurrentVersion   string
+	CurrentCommit    string
+	CurrentDate      string
 	RuntimeGOOS      string
 	RuntimeGOARCH    string
 }
@@ -58,6 +63,9 @@ type Options struct {
 type Result struct {
 	CurrentPath       string
 	CurrentVersion    string
+	CurrentCommit     string
+	CurrentDate       string
+	RequestedVersion  string
 	TargetVersion     string
 	Platform          string
 	AssetName         string
@@ -67,6 +75,47 @@ type Result struct {
 	Deferred          bool
 	PendingPath       string
 	SkillRefresh      SkillRefreshResult
+	VersionStatus     VersionStatus
+	MigrationStatus   MigrationStatus
+}
+
+type VersionClassification string
+
+const (
+	VersionUnknown            VersionClassification = "unknown"
+	VersionPreBreaking        VersionClassification = "pre-breaking"
+	VersionBreakingTransition VersionClassification = "breaking transition"
+	VersionPostTransition     VersionClassification = "post-transition"
+)
+
+type VersionStatus struct {
+	CurrentClassification      VersionClassification
+	TargetClassification       VersionClassification
+	BreakingBoundary           bool
+	CompatibilityAliasesActive bool
+}
+
+type MigrationStatus struct {
+	RepoPath              string
+	RepoAvailable         bool
+	ConfigPresent         bool
+	ConfigError           string
+	DeliveryVersion       string
+	MinLoopcoderVersion   string
+	ConfigDiagnostics     []migration.Diagnostic
+	EnvDiagnostics        []migration.Diagnostic
+	HookDiagnostics       []migration.Diagnostic
+	OldSurfaceDiagnostics []OldSurfaceDiagnostic
+	ScanWarning           string
+}
+
+type OldSurfaceDiagnostic struct {
+	Surface    string
+	Legacy     string
+	Current    string
+	Location   string
+	FixCommand string
+	Detail     string
 }
 
 type SkillRefreshFileStatus string
@@ -94,6 +143,10 @@ type Deps struct {
 	Getenv          func(string) string
 	HomeLayout      func() (home.Layout, error)
 	ExecutablePath  func() (string, error)
+	Getwd           func() (string, error)
+	Stat            func(string) (fs.FileInfo, error)
+	ReadFile        func(string) ([]byte, error)
+	ReadDir         func(string) ([]fs.DirEntry, error)
 	HTTPGet         func(context.Context, string) ([]byte, error)
 	VerifySignature func(ctx context.Context, artifact []byte, signatureBundle []byte, identity string, issuer string) error
 	ExtractBinary   func(archiveName string, data []byte, binaryName string) ([]byte, error)
@@ -148,6 +201,10 @@ func DefaultDeps() Deps {
 			return home.Resolve(home.DefaultDeps())
 		},
 		ExecutablePath: os.Executable,
+		Getwd:          os.Getwd,
+		Stat:           os.Stat,
+		ReadFile:       os.ReadFile,
+		ReadDir:        os.ReadDir,
 		HTTPGet: func(ctx context.Context, rawURL string) ([]byte, error) {
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 			if err != nil {
@@ -208,8 +265,11 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		currentVersion = "unknown"
 	}
 	result := Result{
-		CurrentPath:    currentPath,
-		CurrentVersion: currentVersion,
+		CurrentPath:      currentPath,
+		CurrentVersion:   currentVersion,
+		CurrentCommit:    strings.TrimSpace(opts.CurrentCommit),
+		CurrentDate:      strings.TrimSpace(opts.CurrentDate),
+		RequestedVersion: strings.TrimSpace(opts.RequestedVersion),
 	}
 
 	goos := firstNonEmpty(opts.RuntimeGOOS, deps.RuntimeGOOS)
@@ -232,9 +292,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return result, errors.New("release response did not include tag_name")
 	}
 	result.TargetVersion = rel.TagName
+	result.VersionStatus = classifyVersionStatus(currentVersion, rel.TagName)
 
 	if sameReleaseVersion(currentVersion, rel.TagName) {
 		result.AlreadyLatest = true
+		if shouldReportMigrationStatus(result.VersionStatus) {
+			result.MigrationStatus = scanMigrationStatus(deps)
+		}
 		return result, nil
 	}
 
@@ -297,6 +361,9 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	result.Deferred = installed.Deferred
 	result.PendingPath = installed.PendingPath
 	result.SkillRefresh = refreshSkill(ctx, deps, skillRefreshBinaryPath(installed))
+	if shouldReportMigrationStatus(result.VersionStatus) {
+		result.MigrationStatus = scanMigrationStatus(deps)
+	}
 	return result, nil
 }
 
@@ -310,6 +377,18 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ExecutablePath == nil {
 		deps.ExecutablePath = defaults.ExecutablePath
+	}
+	if deps.Getwd == nil {
+		deps.Getwd = defaults.Getwd
+	}
+	if deps.Stat == nil {
+		deps.Stat = defaults.Stat
+	}
+	if deps.ReadFile == nil {
+		deps.ReadFile = defaults.ReadFile
+	}
+	if deps.ReadDir == nil {
+		deps.ReadDir = defaults.ReadDir
 	}
 	if deps.HTTPGet == nil {
 		deps.HTTPGet = defaults.HTTPGet
@@ -348,6 +427,305 @@ func normalizeDeps(deps Deps) Deps {
 		deps.RuntimeGOARCH = defaults.RuntimeGOARCH
 	}
 	return deps
+}
+
+type semver struct {
+	major int
+	minor int
+	patch int
+}
+
+func classifyVersionStatus(current string, target string) VersionStatus {
+	currentClass := classifyVersion(current)
+	targetClass := classifyVersion(target)
+	return VersionStatus{
+		CurrentClassification:      currentClass,
+		TargetClassification:       targetClass,
+		BreakingBoundary:           currentClass == VersionPreBreaking && targetClass == VersionBreakingTransition,
+		CompatibilityAliasesActive: targetClass == VersionBreakingTransition,
+	}
+}
+
+func classifyVersion(version string) VersionClassification {
+	parsed, ok := parseSemver(version)
+	if !ok {
+		return VersionUnknown
+	}
+	switch {
+	case parsed.major == 0 && parsed.minor == 5:
+		return VersionPreBreaking
+	case parsed.major == 0 && parsed.minor == 6 && parsed.patch == 0:
+		return VersionBreakingTransition
+	case compareSemver(parsed, semver{major: 0, minor: 6, patch: 0}) > 0:
+		return VersionPostTransition
+	default:
+		return VersionUnknown
+	}
+}
+
+func parseSemver(version string) (semver, bool) {
+	trimmed := strings.TrimSpace(version)
+	trimmed = strings.TrimPrefix(strings.TrimPrefix(trimmed, "v"), "V")
+	if trimmed == "" {
+		return semver{}, false
+	}
+	if index := strings.Index(trimmed, "+"); index >= 0 {
+		trimmed = trimmed[:index]
+	}
+	if index := strings.Index(trimmed, "-"); index >= 0 {
+		trimmed = trimmed[:index]
+	}
+	parts := strings.Split(trimmed, ".")
+	if len(parts) != 3 {
+		return semver{}, false
+	}
+	major, ok := parseSemverPart(parts[0])
+	if !ok {
+		return semver{}, false
+	}
+	minor, ok := parseSemverPart(parts[1])
+	if !ok {
+		return semver{}, false
+	}
+	patch, ok := parseSemverPart(parts[2])
+	if !ok {
+		return semver{}, false
+	}
+	return semver{major: major, minor: minor, patch: patch}, true
+}
+
+func parseSemverPart(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	var parsed int
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		parsed = parsed*10 + int(r-'0')
+	}
+	return parsed, true
+}
+
+func compareSemver(a, b semver) int {
+	for _, pair := range [][2]int{
+		{a.major, b.major},
+		{a.minor, b.minor},
+		{a.patch, b.patch},
+	} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func shouldReportMigrationStatus(status VersionStatus) bool {
+	return status.TargetClassification == VersionBreakingTransition
+}
+
+func scanMigrationStatus(deps Deps) MigrationStatus {
+	deps = normalizeDeps(deps)
+	status := MigrationStatus{
+		EnvDiagnostics: migration.ReporterEnvDiagnostics(deps.Getenv),
+	}
+
+	repoPath, err := deps.Getwd()
+	if err != nil || strings.TrimSpace(repoPath) == "" {
+		status.ScanWarning = fmt.Sprintf("could not resolve current directory: %v", err)
+		return status
+	}
+	repoPath = filepath.Clean(repoPath)
+	status.RepoPath = repoPath
+	if !repoLooksAvailable(repoPath, deps) {
+		return status
+	}
+	status.RepoAvailable = true
+
+	scanDeliveryConfig(repoPath, deps, &status)
+	status.HookDiagnostics = scanLegacyHookDiagnostics(repoPath, deps)
+	status.OldSurfaceDiagnostics = append(status.OldSurfaceDiagnostics, scanLegacyHookStateDiagnostics(repoPath, deps)...)
+	oldState, warning := scanLegacyStateDiagnostics(repoPath, deps)
+	status.OldSurfaceDiagnostics = append(status.OldSurfaceDiagnostics, oldState...)
+	if warning != "" {
+		status.ScanWarning = warning
+	}
+	return status
+}
+
+func repoLooksAvailable(repoPath string, deps Deps) bool {
+	for _, rel := range []string{".git", ".delivery.yml", ".loopcoder", ".claude"} {
+		if _, err := deps.Stat(filepath.Join(repoPath, rel)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+type deliveryMetadata struct {
+	Version             *int   `yaml:"version"`
+	MinLoopcoderVersion string `yaml:"min_loopcoder_version"`
+}
+
+func scanDeliveryConfig(repoPath string, deps Deps, status *MigrationStatus) {
+	path := filepath.Join(repoPath, ".delivery.yml")
+	_, diagnostics, err := config.LoadWithDiagnostics(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		status.ConfigPresent = true
+		status.ConfigError = err.Error()
+		return
+	}
+	status.ConfigPresent = true
+	status.ConfigDiagnostics = diagnostics
+
+	data, err := deps.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var meta deliveryMetadata
+	if err := yaml.Unmarshal(data, &meta); err != nil {
+		return
+	}
+	if meta.Version != nil {
+		status.DeliveryVersion = fmt.Sprintf("%d", *meta.Version)
+	}
+	status.MinLoopcoderVersion = strings.TrimSpace(meta.MinLoopcoderVersion)
+}
+
+func scanLegacyHookDiagnostics(repoPath string, deps Deps) []migration.Diagnostic {
+	data, err := deps.ReadFile(filepath.Join(repoPath, ".claude", "settings.json"))
+	if err != nil || !bytes.Contains(data, []byte(migration.LegacyReporterHookCommand)) {
+		return nil
+	}
+	entry, ok := migration.ReporterRenameEntry(migration.LegacyReporterHookCommand)
+	if !ok {
+		return nil
+	}
+	return []migration.Diagnostic{
+		migration.NewDiagnostic(entry, false, "found in .claude/settings.json"),
+	}
+}
+
+func scanLegacyHookStateDiagnostics(repoPath string, deps Deps) []OldSurfaceDiagnostic {
+	location := filepath.Join(repoPath, ".loopcoder", "hooks", migration.LegacyReporterHookName)
+	if _, err := deps.Stat(location); err != nil {
+		return nil
+	}
+	return []OldSurfaceDiagnostic{{
+		Surface:    "hook-state",
+		Legacy:     migration.LegacyReporterHookName,
+		Current:    migration.ReporterHookName,
+		Location:   location,
+		FixCommand: "loopcoder doctor --repo . --fix",
+		Detail:     "legacy hook state label is still present",
+	}}
+}
+
+const (
+	maxMigrationStatusEntries   = 2000
+	maxMigrationStatusFileBytes = 4 * 1024 * 1024
+	maxMigrationStatusFindings  = 20
+)
+
+func scanLegacyStateDiagnostics(repoPath string, deps Deps) ([]OldSurfaceDiagnostic, string) {
+	var diagnostics []OldSurfaceDiagnostic
+	var seen int
+	var skipped []string
+	roots := []string{
+		filepath.Join(repoPath, ".loopcoder", "runs"),
+		filepath.Join(repoPath, ".loopcoder", "relay", "pending"),
+	}
+	for _, root := range roots {
+		found, rootSeen, rootSkipped := scanLegacyStateRoot(root, deps)
+		diagnostics = append(diagnostics, found...)
+		seen += rootSeen
+		skipped = append(skipped, rootSkipped...)
+		if len(diagnostics) >= maxMigrationStatusFindings {
+			break
+		}
+	}
+	if len(diagnostics) > maxMigrationStatusFindings {
+		diagnostics = diagnostics[:maxMigrationStatusFindings]
+	}
+	if len(skipped) > 0 {
+		return diagnostics, "skipped some local state while scanning old reporter surfaces: " + strings.Join(skipped, "; ")
+	}
+	if seen > maxMigrationStatusEntries {
+		return diagnostics, fmt.Sprintf("stopped local state migration scan after %d entries", maxMigrationStatusEntries)
+	}
+	return diagnostics, ""
+}
+
+func scanLegacyStateRoot(root string, deps Deps) ([]OldSurfaceDiagnostic, int, []string) {
+	if _, err := deps.Stat(root); err != nil {
+		return nil, 0, nil
+	}
+	var diagnostics []OldSurfaceDiagnostic
+	var skipped []string
+	seen := 0
+	var walk func(string)
+	walk = func(dir string) {
+		if seen > maxMigrationStatusEntries || len(diagnostics) >= maxMigrationStatusFindings {
+			return
+		}
+		entries, err := deps.ReadDir(dir)
+		if err != nil {
+			skipped = append(skipped, filepath.ToSlash(dir)+": "+err.Error())
+			return
+		}
+		for _, entry := range entries {
+			if seen > maxMigrationStatusEntries || len(diagnostics) >= maxMigrationStatusFindings {
+				return
+			}
+			seen++
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				walk(path)
+				continue
+			}
+			if entry.Type()&fs.ModeSymlink != 0 || !isMigrationStatusJSONFile(entry.Name()) {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				skipped = append(skipped, filepath.ToSlash(path)+": "+err.Error())
+				continue
+			}
+			if info.Size() > maxMigrationStatusFileBytes {
+				skipped = append(skipped, fmt.Sprintf("%s: file too large", filepath.ToSlash(path)))
+				continue
+			}
+			data, err := deps.ReadFile(path)
+			if err != nil {
+				skipped = append(skipped, filepath.ToSlash(path)+": "+err.Error())
+				continue
+			}
+			if !bytes.Contains(data, []byte(`"` + migration.LegacyReportStateKey + `"`)) {
+				continue
+			}
+			diagnostics = append(diagnostics, OldSurfaceDiagnostic{
+				Surface:    "state-key",
+				Legacy:     migration.LegacyReportStateKey,
+				Current:    migration.ReportStateKey,
+				Location:   path,
+				FixCommand: "loopcoder doctor --repo . --fix",
+				Detail:     "legacy report result key is still present",
+			})
+		}
+	}
+	walk(root)
+	return diagnostics, seen, skipped
+}
+
+func isMigrationStatusJSONFile(name string) bool {
+	return strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".jsonl")
 }
 
 func execRunCommand(ctx context.Context, name string, args ...string) (CommandResult, error) {
@@ -780,7 +1158,24 @@ func parseSkillInstallOutput(output string) (string, []SkillRefreshFileResult, e
 	if len(files) == 0 {
 		return "", nil, errors.New("missing managed file status lines")
 	}
+	if missing := missingManagedSkillFiles(files); len(missing) > 0 {
+		return "", nil, fmt.Errorf("missing managed file status lines for %s", strings.Join(missing, ", "))
+	}
 	return dir, files, nil
+}
+
+func missingManagedSkillFiles(files []SkillRefreshFileResult) []string {
+	seen := map[string]bool{}
+	for _, file := range files {
+		seen[filepath.Base(filepath.Clean(file.Path))] = true
+	}
+	var missing []string
+	for _, name := range []string{"SKILL.md", "AGENTS.md"} {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 func replaceStableBinary(deps Deps, tmpPath string, stablePath string) (bool, string, error) {

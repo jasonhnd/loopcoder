@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
@@ -128,7 +129,7 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
 	}
-	if strings.Contains(stdout.String(), `"attestation"`) {
+	if strings.Contains(stdout.String(), `"` + migration.LegacyReportStateKey + `"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
@@ -1287,6 +1288,109 @@ func TestUpgradeRendersSkillRefreshWarning(t *testing.T) {
 	for _, want := range []string{"[loopcoder] warning: skill refresh failed after upgrade", "permission denied", "run: loopcoder skill install"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestUpgradeRenders060MigrationStatus(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	configEntry, ok := migration.ReporterRenameEntry(migration.LegacyReportConfigRoot)
+	if !ok {
+		t.Fatal("missing config migration entry")
+	}
+	envEntry, ok := migration.ReporterRenameEntry(migration.LegacyReporterScopeEnv)
+	if !ok {
+		t.Fatal("missing env migration entry")
+	}
+	hookEntry, ok := migration.ReporterRenameEntry(migration.LegacyReporterHookCommand)
+	if !ok {
+		t.Fatal("missing hook migration entry")
+	}
+
+	exitCode := RunWithDeps([]string{"upgrade", "--version", "v0.6.0"}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "v0.5.4",
+			Commit:  "abc123",
+			Date:    "2026-07-08T00:00:00Z",
+		},
+		Upgrade: func(_ context.Context, opts upgrade.Options) (upgrade.Result, error) {
+			return upgrade.Result{
+				CurrentPath:       "/old/loopcoder",
+				CurrentVersion:    opts.CurrentVersion,
+				CurrentCommit:     opts.CurrentCommit,
+				CurrentDate:       opts.CurrentDate,
+				RequestedVersion:  opts.RequestedVersion,
+				TargetVersion:     "v0.6.0",
+				Platform:          "linux/amd64",
+				AssetName:         "loopcoder_0.6.0_linux_amd64.tar.gz",
+				VersionBinaryPath: "/home/.loopcoder/versions/v0.6.0/loopcoder",
+				StableBinaryPath:  "/home/.loopcoder/bin/loopcoder",
+				VersionStatus: upgrade.VersionStatus{
+					CurrentClassification:      upgrade.VersionPreBreaking,
+					TargetClassification:       upgrade.VersionBreakingTransition,
+					BreakingBoundary:           true,
+					CompatibilityAliasesActive: true,
+				},
+				SkillRefresh: upgrade.SkillRefreshResult{
+					BinaryPath: "/home/.loopcoder/bin/loopcoder",
+					Dir:        "/home/.claude/skills/loopcoder",
+					Files: []upgrade.SkillRefreshFileResult{
+						{Path: "/home/.claude/skills/loopcoder/SKILL.md", Status: upgrade.SkillRefreshFileUpdated},
+						{Path: "/home/.claude/skills/loopcoder/AGENTS.md", Status: upgrade.SkillRefreshFileUpdated},
+					},
+				},
+				MigrationStatus: upgrade.MigrationStatus{
+					RepoPath:            "/repo",
+					RepoAvailable:       true,
+					ConfigPresent:       true,
+					DeliveryVersion:     "1",
+					MinLoopcoderVersion: "0.5.0",
+					ConfigDiagnostics: []migration.Diagnostic{
+						migration.NewDiagnostic(configEntry, false, ""),
+					},
+					EnvDiagnostics: []migration.Diagnostic{
+						migration.NewDiagnostic(envEntry, false, ""),
+					},
+					HookDiagnostics: []migration.Diagnostic{
+						migration.NewDiagnostic(hookEntry, false, "found in .claude/settings.json"),
+					},
+					OldSurfaceDiagnostics: []upgrade.OldSurfaceDiagnostic{
+						{
+							Surface:    "state-key",
+							Legacy:     migration.LegacyReportStateKey,
+							Current:    migration.ReportStateKey,
+							Location:   "/repo/.loopcoder/runs/run/workers/job.attempt.json",
+							FixCommand: "loopcoder doctor --repo . --fix",
+							Detail:     "legacy report result key is still present",
+						},
+					},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, want := range []string{
+		"Current selected binary: path=/old/loopcoder version=v0.5.4 commit=abc123 date=2026-07-08T00:00:00Z",
+		"Requested target: v0.6.0",
+		"Upgrade version status: current=v0.5.4 (pre-breaking) target=v0.6.0 (breaking transition)",
+		"0.5.x -> 0.6.0 boundary detected",
+		"verified managed files: SKILL.md, AGENTS.md",
+		"Migration status:",
+		"delivery version: schema=1 min_loopcoder_version=0.5.0",
+		"config: legacy config-key \"" + migration.LegacyReportConfigRoot + "\" accepted as \"" + migration.ReportConfigRoot + "\"",
+		"env: legacy env \"" + migration.LegacyReporterScopeEnv + "\" accepted as \"" + migration.ReporterScopeEnv + "\"",
+		"hook: legacy hook-command \"" + migration.LegacyReporterHookCommand + "\" accepted as \"" + migration.ReporterHookCommand + "\"",
+		"old local state: legacy state-key \"" + migration.LegacyReportStateKey + "\" accepted as \"" + migration.ReportStateKey + "\"",
+		"fix: loopcoder doctor --repo . --fix",
+		"Run: loopcoder doctor --repo .",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
 		}
 	}
 }

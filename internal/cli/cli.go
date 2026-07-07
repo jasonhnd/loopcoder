@@ -21,6 +21,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
@@ -2027,7 +2028,10 @@ func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
 	result, err := deps.Upgrade(context.Background(), upgrade.Options{
 		RequestedVersion: requestedVersion,
 		CurrentVersion:   build.Version,
+		CurrentCommit:    build.Commit,
+		CurrentDate:      build.Date,
 	})
+	result = fillUpgradeRenderDefaults(result, requestedVersion, build)
 	if result.CurrentPath != "" || result.CurrentVersion != "" {
 		renderUpgradeCurrent(stdout, result)
 	}
@@ -2042,14 +2046,44 @@ func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
+func fillUpgradeRenderDefaults(result upgrade.Result, requestedVersion string, build BuildInfo) upgrade.Result {
+	if strings.TrimSpace(result.CurrentVersion) == "" {
+		result.CurrentVersion = build.Version
+	}
+	if strings.TrimSpace(result.CurrentCommit) == "" {
+		result.CurrentCommit = build.Commit
+	}
+	if strings.TrimSpace(result.CurrentDate) == "" {
+		result.CurrentDate = build.Date
+	}
+	if strings.TrimSpace(result.RequestedVersion) == "" {
+		result.RequestedVersion = requestedVersion
+	}
+	return result
+}
+
 func renderUpgradeCurrent(w io.Writer, result upgrade.Result) {
-	fmt.Fprintf(w, "Current selected binary: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
+	line := fmt.Sprintf("Current selected binary: path=%s version=%s", result.CurrentPath, result.CurrentVersion)
+	if strings.TrimSpace(result.CurrentCommit) != "" {
+		line += " commit=" + result.CurrentCommit
+	}
+	if strings.TrimSpace(result.CurrentDate) != "" {
+		line += " date=" + result.CurrentDate
+	}
+	fmt.Fprintln(w, line)
+	requested := strings.TrimSpace(result.RequestedVersion)
+	if requested == "" {
+		requested = "latest stable"
+	}
+	fmt.Fprintf(w, "Requested target: %s\n", requested)
 }
 
 func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
 	fmt.Fprintf(w, "Resolved target version: %s\n", result.TargetVersion)
 	if result.AlreadyLatest {
 		fmt.Fprintln(w, "Already latest; no download needed.")
+		renderUpgradeVersionStatus(w, result)
+		renderUpgradeMigrationStatus(w, result.MigrationStatus)
 		return
 	}
 	fmt.Fprintf(w, "Platform asset: %s (%s)\n", result.AssetName, result.Platform)
@@ -2061,8 +2095,31 @@ func renderUpgradeSuccess(w io.Writer, result upgrade.Result) {
 	}
 	fmt.Fprintf(w, "Before: path=%s version=%s\n", result.CurrentPath, result.CurrentVersion)
 	fmt.Fprintf(w, "After: path=%s version=%s\n", result.StableBinaryPath, result.TargetVersion)
+	renderUpgradeVersionStatus(w, result)
 	renderUpgradeSkillRefresh(w, result.SkillRefresh)
-	fmt.Fprintln(w, "Run: loopcoder doctor")
+	renderUpgradeMigrationStatus(w, result.MigrationStatus)
+	fmt.Fprintln(w, "Run: loopcoder doctor --repo .")
+}
+
+func renderUpgradeVersionStatus(w io.Writer, result upgrade.Result) {
+	status := result.VersionStatus
+	if status.CurrentClassification == "" && status.TargetClassification == "" {
+		return
+	}
+	if status.CurrentClassification == upgrade.VersionUnknown && status.TargetClassification != upgrade.VersionBreakingTransition {
+		return
+	}
+	fmt.Fprintf(w, "Upgrade version status: current=%s (%s) target=%s (%s)\n",
+		result.CurrentVersion,
+		status.CurrentClassification,
+		result.TargetVersion,
+		status.TargetClassification,
+	)
+	if status.BreakingBoundary {
+		fmt.Fprintln(w, "0.5.x -> 0.6.0 boundary detected; compatibility aliases are active for this transition and new output uses report/reporter names.")
+	} else if status.CompatibilityAliasesActive {
+		fmt.Fprintln(w, "0.6.0 transition selected; compatibility aliases are active and old reporter names remain accepted for this release.")
+	}
 }
 
 func renderUpgradeSkillRefresh(w io.Writer, result upgrade.SkillRefreshResult) {
@@ -2079,6 +2136,94 @@ func renderUpgradeSkillRefresh(w io.Writer, result upgrade.SkillRefreshResult) {
 	for _, file := range result.Files {
 		fmt.Fprintf(w, "  %s %s\n", file.Status, file.Path)
 	}
+	if len(result.Files) > 0 {
+		fmt.Fprintln(w, "  verified managed files: SKILL.md, AGENTS.md")
+	}
+}
+
+func renderUpgradeMigrationStatus(w io.Writer, status upgrade.MigrationStatus) {
+	if status.RepoPath == "" && !status.RepoAvailable && len(status.EnvDiagnostics) == 0 && status.ScanWarning == "" {
+		return
+	}
+	fmt.Fprintln(w, "Migration status:")
+	if status.RepoPath == "" {
+		fmt.Fprintln(w, "  repo: unavailable; repo migration scan deferred to loopcoder doctor --repo <repo>")
+	} else if !status.RepoAvailable {
+		fmt.Fprintf(w, "  repo: %s is not a detected loopcoder repository; repo migration scan deferred to loopcoder doctor --repo <repo>\n", status.RepoPath)
+	} else {
+		fmt.Fprintf(w, "  repo: %s\n", status.RepoPath)
+		if status.DeliveryVersion != "" || status.MinLoopcoderVersion != "" {
+			fmt.Fprintf(w, "  delivery version: schema=%s min_loopcoder_version=%s\n", displayUpgradeValue(status.DeliveryVersion), displayUpgradeValue(status.MinLoopcoderVersion))
+		}
+		renderMigrationDiagnostics(w, "config", status.ConfigPresent, status.ConfigError, status.ConfigDiagnostics)
+		renderMigrationDiagnosticList(w, "env", status.EnvDiagnostics)
+		renderMigrationDiagnosticList(w, "hook", status.HookDiagnostics)
+		renderOldSurfaceDiagnostics(w, status.OldSurfaceDiagnostics)
+	}
+	if !status.RepoAvailable {
+		renderMigrationDiagnosticList(w, "env", status.EnvDiagnostics)
+	}
+	if status.RepoAvailable {
+		if len(status.EnvDiagnostics) == 0 {
+			fmt.Fprintln(w, "  env: ok (no legacy reporter env vars found)")
+		}
+		if len(status.HookDiagnostics) == 0 {
+			fmt.Fprintln(w, "  hook: ok (no legacy conductor-attest hook command found)")
+		}
+		if len(status.OldSurfaceDiagnostics) == 0 {
+			fmt.Fprintln(w, "  old local state: ok (no legacy report state keys or hook-state labels found)")
+		}
+	}
+	if status.ScanWarning != "" {
+		fmt.Fprintf(w, "  warning: %s\n", status.ScanWarning)
+	}
+}
+
+func renderMigrationDiagnostics(w io.Writer, label string, present bool, configError string, diagnostics []migration.Diagnostic) {
+	if configError != "" {
+		fmt.Fprintf(w, "  %s: warning: %s; run: loopcoder doctor --repo .\n", label, configError)
+		return
+	}
+	if !present {
+		fmt.Fprintf(w, "  %s: .delivery.yml not found; repo config migration deferred to loopcoder doctor --repo <repo>\n", label)
+		return
+	}
+	if len(diagnostics) == 0 {
+		fmt.Fprintf(w, "  %s: ok (no legacy reporter config keys found)\n", label)
+		return
+	}
+	renderMigrationDiagnosticList(w, label, diagnostics)
+}
+
+func renderMigrationDiagnosticList(w io.Writer, label string, diagnostics []migration.Diagnostic) {
+	for _, diagnostic := range diagnostics {
+		fmt.Fprintf(w, "  %s: %s\n", label, diagnostic.String())
+	}
+}
+
+func renderOldSurfaceDiagnostics(w io.Writer, diagnostics []upgrade.OldSurfaceDiagnostic) {
+	for _, diagnostic := range diagnostics {
+		detail := strings.TrimSpace(diagnostic.Detail)
+		if detail != "" {
+			detail += "; "
+		}
+		fmt.Fprintf(w, "  old local state: legacy %s %q accepted as %q; %slocation: %s; fix: %s\n",
+			diagnostic.Surface,
+			diagnostic.Legacy,
+			diagnostic.Current,
+			detail,
+			diagnostic.Location,
+			diagnostic.FixCommand,
+		)
+	}
+}
+
+func displayUpgradeValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "(none)"
+	}
+	return value
 }
 
 func normalizeBuildInfo(build BuildInfo) BuildInfo {
