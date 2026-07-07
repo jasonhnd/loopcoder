@@ -41,6 +41,9 @@ func TestParseAppliesDefaultsWhenOptionalSectionsAreAbsent(t *testing.T) {
 	if cfg.Verifier.Model != "" || cfg.Verifier.ReasoningEffort != "" {
 		t.Fatalf("Verifier = %#v, want inherited empty config", cfg.Verifier)
 	}
+	if cfg.Models.Strict {
+		t.Fatal("Models.Strict = true, want false")
+	}
 	if cfg.Environment.PreProdBranch != "pre-prod" {
 		t.Fatalf("Environment.PreProdBranch = %q, want pre-prod", cfg.Environment.PreProdBranch)
 	}
@@ -616,6 +619,8 @@ worker:
 verifier:
   model: claude-test
   reasoning_effort: xhigh
+models:
+  strict: true
 ci:
   checks: [verify, go]
   tests:
@@ -689,6 +694,9 @@ guardrails:
 	}
 	if cfg.Verifier.Model != "claude-test" || cfg.Verifier.ReasoningEffort != "xhigh" {
 		t.Fatalf("Verifier parsed incorrectly: %#v", cfg.Verifier)
+	}
+	if !cfg.Models.Strict {
+		t.Fatalf("Models parsed incorrectly: %#v", cfg.Models)
 	}
 	if !reflect.DeepEqual(cfg.CI.Checks, []string{"verify", "go"}) {
 		t.Fatalf("CI.Checks = %v, want [verify go]", cfg.CI.Checks)

@@ -298,6 +298,40 @@ func TestAuditCommandInvalidFormatUsesRuntimeFailureExit(t *testing.T) {
 	}
 }
 
+func TestAuditLLMStrictRejectsInvalidVerifierSelection(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+models:
+  strict: true
+verifier:
+  model: custom-review-model
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{
+		"audit",
+		"--repo", repo,
+		"--layer", audit.LayerLLM,
+	}, &stdout, &stderr, Deps{
+		Audit: func(context.Context, audit.Options) (audit.Result, error) {
+			called = true
+			return audit.Result{}, nil
+		},
+	})
+	if exitCode != auditCommandFailureExitCode {
+		t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, auditCommandFailureExitCode)
+	}
+	if called {
+		t.Fatal("Audit dependency was called despite strict model rejection")
+	}
+	if !strings.Contains(stderr.String(), "reject") || !strings.Contains(stderr.String(), `model "custom-review-model"`) {
+		t.Fatalf("stderr missing strict rejection:\n%s", stderr.String())
+	}
+}
+
 func TestRelayGateBlocksMechanicalCommands(t *testing.T) {
 	if relayGateExitCode == 0 || relayGateExitCode == 1 || relayGateExitCode == 2 || relayGateExitCode == 3 {
 		t.Fatalf("relayGateExitCode = %d, want distinct from 0/1/2/3", relayGateExitCode)
@@ -785,7 +819,7 @@ func TestLoopreviewHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--timeout", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "Exit codes:", "0   clean verifier verdict: pass", "1   clean verifier verdict: fail", "2   clean verifier verdict: needs-human", "3   command failure", "4   pending local relay block"} {
+	for _, want := range []string{"loopcoder loopreview", "--repo", "--pr-number", "--provider", "--base-branch", "--model", "--effort", "--strict", "--timeout", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "Exit codes:", "0   clean verifier verdict: pass", "1   clean verifier verdict: fail", "2   clean verifier verdict: needs-human", "3   command failure", "4   pending local relay block"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -897,7 +931,7 @@ func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
+	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -918,7 +952,7 @@ func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder dispatch-wave", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
+	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1506,7 +1540,7 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"-PrNumber", "152",
 		"-Provider", "claude",
 		"-BaseBranch", "trunk",
-		"-Model", "claude-opus",
+		"-Model", "claude-opus-4-8[1m]",
 		"-Effort", "max",
 		"-Timeout", "15s",
 	}, &stdout, &stderr, Deps{
@@ -1515,7 +1549,7 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 			if opts.RepoPath != repo || opts.PRNumber != 152 || opts.Provider != "claude" || opts.BaseBranch != "trunk" || opts.Timeout != 15*time.Second {
 				t.Fatalf("loopreview opts = %#v", opts)
 			}
-			if opts.Model != "claude-opus" || opts.Effort != "max" {
+			if opts.Model != "claude-opus-4-8[1m]" || opts.Effort != "max" {
 				t.Fatalf("loopreview opts model/effort = %#v", opts)
 			}
 			if opts.Stderr == nil {
@@ -2010,6 +2044,76 @@ verifier:
 	}
 }
 
+func TestLoopreviewUsesConfiguredVerifierProviderAndRegistryDefaults(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+adapters:
+  verifier: claude
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			called = true
+			if opts.Provider != "claude" || opts.Model != "claude-opus-4-8[1m]" || opts.Effort != "max" {
+				t.Fatalf("loopreview opts provider/model/effort = %#v", opts)
+			}
+			return loopreview.Result{
+				Verdict: loopreview.Verdict{
+					Verdict:         loopreview.VerdictPass,
+					Findings:        []loopreview.Finding{},
+					Evidence:        "review passed",
+					SpecConformance: loopreview.SpecConformancePass,
+				},
+				ExitCode: 0,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Loopreview dependency was not called")
+	}
+}
+
+func TestLoopreviewStrictFlagRejectsInvalidVerifierSelection(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"loopreview",
+		"--repo", repo,
+		"--pr-number", "152",
+		"--provider", "claude",
+		"--model", "claude-opus-4-8[1m]",
+		"--effort", "xhigh",
+		"--strict",
+	}, &stdout, &stderr, Deps{
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			called = true
+			return loopreview.Result{}, nil
+		},
+	})
+	if exitCode != loopreviewCommandFailureExitCode {
+		t.Fatalf("RunWithDeps returned exit code %d, want %d", exitCode, loopreviewCommandFailureExitCode)
+	}
+	if called {
+		t.Fatal("Loopreview dependency was called despite strict model rejection")
+	}
+	if !strings.Contains(stderr.String(), "reject") || !strings.Contains(stderr.String(), "valid depths: low, medium, high, max") {
+		t.Fatalf("stderr missing strict rejection:\n%s", stderr.String())
+	}
+}
+
 func TestLoopreviewFlagsOverrideVerifierConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
@@ -2418,6 +2522,7 @@ func TestTickHelpDocumentsFlags(t *testing.T) {
 		"--verifier-model",
 		"--verifier-effort",
 		"--verifier-timeout",
+		"--strict",
 		"--throttle-limit",
 		"--pretty",
 		"--no-pretty",
@@ -2725,7 +2830,7 @@ func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 		Detail:    "unresolved disclosure approval",
 		PathGlobs: []string{"disclosure/**"},
 	}}
-	opts := tickOptionsFromConfig(t.TempDir(), io.Discard, Deps{
+	opts, ok := tickOptionsFromConfig(t.TempDir(), io.Discard, Deps{
 		NewGitHubReader: func(string) orchestration.GitHubReader {
 			return cliFakeReader{}
 		},
@@ -2735,7 +2840,10 @@ func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 		NewPreProdWriter: func(string) orchestration.PreProdWriter {
 			return nil
 		},
-	}, cfg, false, "")
+	}, cfg, false, "", false)
+	if !ok {
+		t.Fatal("tickOptionsFromConfig returned ok=false")
+	}
 
 	want := []orchestration.RiskRedLine{{
 		Category:  "disclosure-compliance",
@@ -3531,6 +3639,11 @@ worker:
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
+	for _, want := range []string{`[loopcoder] warning: worker model selection`, `provider "claude"`, `model "config-worker-model"`, "not listed"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
 }
 
 func TestDispatchFlagsOverrideWorkerConfigForSelectedProvider(t *testing.T) {
@@ -3579,6 +3692,73 @@ worker:
 	})
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+}
+
+func TestDispatchUsesConfiguredWorkerProviderAndRegistryDefaults(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+adapters:
+  worker: claude
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.Provider != "claude" || opts.Model != "claude-opus-4-8[1m]" || opts.Effort != "max" {
+				t.Fatalf("dispatch opts provider/model/effort = %#v", opts)
+			}
+			record := validDispatchAttestation()
+			record.Provider = opts.Provider
+			record.Model = opts.Model
+			record.Effort = opts.Effort
+			return validDispatchResult(record), nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+}
+
+func TestDispatchStrictRejectsInvalidWorkerSelection(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(repo+"/.delivery.yml", []byte(`version: 1
+models:
+  strict: true
+worker:
+  model: config-worker-model
+`), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+
+	called := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1", exitCode)
+	}
+	if called {
+		t.Fatal("Dispatch dependency was called despite strict model rejection")
+	}
+	if !strings.Contains(stderr.String(), "reject") || !strings.Contains(stderr.String(), `model "config-worker-model"`) {
+		t.Fatalf("stderr missing strict rejection:\n%s", stderr.String())
 	}
 }
 
@@ -3633,7 +3813,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 		"--repo", repo,
 		"--from-ready-set",
 		"--run-id", "run-test-wave",
-		"--model", "gpt-5",
+		"--model", "gpt-5.5",
 		"--effort", "high",
 	}, &stdout, &stderr, Deps{
 		Stdin: strings.NewReader(`{"ready":[{"issue":201,"title":"Wave","reason":"ready"}]}`),
@@ -3677,7 +3857,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	if dispatchOpts.IssueNumber != 201 || dispatchOpts.IssueTitle != "Wave" || dispatchOpts.IssueBody != "Body" {
 		t.Fatalf("dispatch opts issue fields = %#v", dispatchOpts)
 	}
-	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5" || dispatchOpts.Effort != "high" {
+	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5.5" || dispatchOpts.Effort != "high" {
 		t.Fatalf("dispatch opts run/model/effort = %#v", dispatchOpts)
 	}
 	text := stdout.String()
@@ -3924,12 +4104,12 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 		"-MaxAttempts", "4",
 		"-BackoffSeconds", "1,2,3",
 		"-Provider", "codex",
-		"-Model", "gpt-5",
+		"-Model", "gpt-5.5",
 		"-Effort", "high",
 		"-UpgradedModel", "gpt-6",
 		"-UpgradedEffort", "xhigh",
 		"-VerifierProvider", "claude",
-		"-VerifierModel", "claude-opus",
+		"-VerifierModel", "claude-opus-4-8[1m]",
 		"-VerifierEffort", "max",
 		"-VerifierTimeout", "15s",
 	}, &stdout, &stderr, Deps{
@@ -3946,13 +4126,13 @@ func TestRecoverRunsWithInjectedRecoverAndAliases(t *testing.T) {
 			if len(opts.BackoffSeconds) != 3 || opts.BackoffSeconds[0] != 1 || opts.BackoffSeconds[2] != 3 {
 				t.Fatalf("BackoffSeconds = %#v, want [1 2 3]", opts.BackoffSeconds)
 			}
-			if opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
+			if opts.Provider != "codex" || opts.Model != "gpt-5.5" || opts.Effort != "high" {
 				t.Fatalf("recover opts provider/model/effort = %#v", opts)
 			}
 			if opts.UpgradedModel != "gpt-6" || opts.UpgradedEffort != "xhigh" {
 				t.Fatalf("recover opts upgraded model/effort = %#v", opts)
 			}
-			if opts.VerifierProvider != "claude" || opts.VerifierModel != "claude-opus" || opts.VerifierEffort != "max" || opts.VerifierTimeout != 15*time.Second {
+			if opts.VerifierProvider != "claude" || opts.VerifierModel != "claude-opus-4-8[1m]" || opts.VerifierEffort != "max" || opts.VerifierTimeout != 15*time.Second {
 				t.Fatalf("recover opts verifier fields = %#v", opts)
 			}
 			if opts.Stderr == nil {
