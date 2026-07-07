@@ -34,6 +34,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"git",
 		"gh",
 		".delivery.yml",
+		"model selection",
 		"provider codex",
 		"provider claude",
 		"repository origin",
@@ -300,6 +301,46 @@ func TestRunWarnsWhenProviderCLIMissing(t *testing.T) {
 	}
 }
 
+func TestRunWarnsForInvalidModelSelectionByDefault(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Worker.Model = "custom-worker-model"
+	env.cfg.Worker.ReasoningEffort = "custom-depth"
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	check := requireCheck(t, report, "model selection")
+	if check.Status != StatusWarn || check.Hard {
+		t.Fatalf("model selection check = %#v, want soft warning", check)
+	}
+	for _, want := range []string{`worker model selection`, `provider "codex"`, `model "custom-worker-model"`, `not listed`} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("model selection message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestRunFailsForInvalidModelSelectionInStrictMode(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Models.Strict = true
+	env.cfg.Worker.Model = "custom-worker-model"
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "model selection")
+	if check.Status != StatusFail || !check.Hard {
+		t.Fatalf("model selection check = %#v, want hard fail", check)
+	}
+	if !strings.Contains(check.Message, "reject") || !strings.Contains(check.Message, `model "custom-worker-model"`) {
+		t.Fatalf("model selection message = %q, want strict rejection", check.Message)
+	}
+}
+
 func TestRunChecksAntigravityProviderWithAgyModels(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Worker = "antigravity"
@@ -443,6 +484,9 @@ func TestRunWarnsWhenDeliveryConfigAbsentAndUsesDefaultProviders(t *testing.T) {
 	}
 	if requireCheck(t, report, "provider claude").Status != StatusOK {
 		t.Fatal("default verifier provider claude was not checked")
+	}
+	if requireCheck(t, report, "model selection").Status != StatusOK {
+		t.Fatal("default model selection was not checked")
 	}
 }
 

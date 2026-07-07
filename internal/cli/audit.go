@@ -48,6 +48,8 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var effortAlias string
 	var timeout time.Duration
 	var timeoutAlias time.Duration
+	var strict bool
+	var strictAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -76,6 +78,8 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "LLM review effort")
 	fs.DurationVar(&timeout, "timeout", lcdefaults.VerifierTimeout, "LLM review timeout")
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "LLM review timeout")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable LLM review attestation on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable LLM review attestation on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable LLM review attestation on stderr")
@@ -84,8 +88,6 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return auditCommandFailureExitCode
 	}
-	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
-	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if repoAlias != "" {
 		repoPath = repoAlias
 	}
@@ -117,6 +119,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if timeoutAlias != 0 {
 		timeout = timeoutAlias
 	}
+	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 	if fs.NArg() != 0 {
@@ -155,17 +158,23 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "audit: %v\n", err)
 			return auditCommandFailureExitCode
 		}
-		if strings.TrimSpace(provider) == "" {
-			provider = strings.TrimSpace(cfg.Adapters.Verifier)
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "verifier",
+			Provider:       provider,
+			Model:          model,
+			Effort:         effort,
+			ConfigProvider: cfg.Adapters.Verifier,
+			ConfigModel:    cfg.Verifier.Model,
+			ConfigEffort:   cfg.Verifier.ReasoningEffort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       stderr,
+		})
+		if !ok {
+			return auditCommandFailureExitCode
 		}
-		model, effort = applyRoleModelEffort(
-			model,
-			effort,
-			modelFlagSet,
-			effortFlagSet,
-			cfg.Verifier.Model,
-			cfg.Verifier.ReasoningEffort,
-		)
+		provider = selection.Provider
+		model = selection.Model
+		effort = selection.Effort
 	}
 
 	result, err := deps.Audit(context.Background(), audit.Options{

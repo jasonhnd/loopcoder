@@ -143,6 +143,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	_ = ghPresent
 
 	checks = append(checks, checkDeliveryConfig(delivery))
+	checks = append(checks, checkModelSelections(delivery))
 	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
@@ -367,6 +368,70 @@ func checkDeliveryConfig(delivery deliveryState) Check {
 		Status:  StatusOK,
 		Message: "present and valid",
 	}
+}
+
+func checkModelSelections(delivery deliveryState) Check {
+	if !delivery.Valid && delivery.Present {
+		return Check{
+			Name:    "model selection",
+			Status:  StatusWarn,
+			Message: "cannot evaluate model/depth selections because .delivery.yml is invalid or unavailable",
+		}
+	}
+	cfg := delivery.Config
+	strict := cfg.Models.Strict
+	results := []models.ValidationResult{
+		models.ValidateSelection(models.Selection{
+			Role:     "worker",
+			Provider: firstNonEmpty(cfg.Adapters.Worker, "codex"),
+			Model:    strings.TrimSpace(cfg.Worker.Model),
+			Depth:    strings.TrimSpace(cfg.Worker.ReasoningEffort),
+		}, models.ValidationOptions{Strict: strict}),
+		models.ValidateSelection(models.Selection{
+			Role:     "verifier",
+			Provider: firstNonEmpty(cfg.Adapters.Verifier, "claude"),
+			Model:    strings.TrimSpace(cfg.Verifier.Model),
+			Depth:    strings.TrimSpace(cfg.Verifier.ReasoningEffort),
+		}, models.ValidationOptions{Strict: strict}),
+	}
+
+	status := StatusOK
+	hard := false
+	messages := []string{}
+	for _, result := range results {
+		for _, diagnostic := range result.Diagnostics {
+			messages = append(messages, diagnostic.Message)
+			if diagnostic.Severity == models.SeverityReject {
+				status = StatusFail
+				hard = true
+			} else if status != StatusFail {
+				status = StatusWarn
+			}
+		}
+	}
+	if len(messages) > 0 {
+		return Check{
+			Name:    "model selection",
+			Status:  status,
+			Message: strings.Join(messages, "; "),
+			Hard:    hard,
+		}
+	}
+	summaries := make([]string, 0, len(results))
+	for _, result := range results {
+		summaries = append(summaries, formatModelSelection(result.Selection))
+	}
+	return Check{
+		Name:    "model selection",
+		Status:  StatusOK,
+		Message: strings.Join(summaries, "; "),
+	}
+}
+
+func formatModelSelection(selection models.Selection) string {
+	model := firstNonEmpty(selection.Model, "(none)")
+	depth := firstNonEmpty(selection.Depth, "(none)")
+	return fmt.Sprintf("%s provider=%s model=%s depth=%s", selection.Role, selection.Provider, model, depth)
 }
 
 func baseDeliveryConfigExists(ctx context.Context, repoPath string, baseBranch string, deps Deps) bool {
