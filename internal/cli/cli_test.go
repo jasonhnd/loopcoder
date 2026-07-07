@@ -1110,6 +1110,45 @@ func TestDoctorRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 }
 
+func TestDoctorPassesFixFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"--repo", repo,
+		"--fix",
+	}, &stdout, &stderr, Deps{
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if !opts.Fix {
+				t.Fatal("Fix = false, want true")
+			}
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:    "fix .delivery.yml",
+				Status:  doctor.StatusOK,
+				Message: "unchanged",
+			}}}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if stdout.String() != "[ok] fix .delivery.yml: unchanged\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestInitHelpDocumentsFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 

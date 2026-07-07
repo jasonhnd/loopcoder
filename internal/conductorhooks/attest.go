@@ -2,6 +2,7 @@ package conductorhooks
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -12,10 +13,10 @@ import (
 const (
 	reporterScopeEnv        = migration.ReporterScopeEnv
 	reporterStateDirEnv     = migration.ReporterStateDirEnv
-	reporterStateSub        = "conductor-reporter"
+	reporterStateSub        = migration.ReporterHookName
 	legacyAttestScopeEnv    = migration.LegacyReporterScopeEnv
 	legacyAttestStateDirEnv = migration.LegacyReporterStateDirEnv
-	legacyAttestStateSub    = "conductor-attest"
+	legacyAttestStateSub    = migration.LegacyReporterHookName
 )
 
 var (
@@ -155,9 +156,28 @@ func recordAttestObservations(statePaths attestStatePaths, in hookInput, now tim
 }
 
 func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (attestStatePaths, error) {
-	if stateDir, _ := migration.ResolveReporterStateDirEnv(env); strings.TrimSpace(stateDir) != "" {
-		primary, err := stateFilePath(sessionID, cwd, stateDir, reporterStateSub)
+	if env == nil {
+		env = func(string) string { return "" }
+	}
+	currentStateDir := strings.TrimSpace(env(reporterStateDirEnv))
+	legacyStateDir := strings.TrimSpace(env(legacyAttestStateDirEnv))
+	if currentStateDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, currentStateDir, reporterStateSub)
 		return attestStatePaths{primary: primary}, err
+	}
+	if legacyStateDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, legacyStateDir, reporterStateSub)
+		if err != nil {
+			return attestStatePaths{}, err
+		}
+		legacy, err := stateFilePathUnderSub(sessionID, legacyStateDir, legacyAttestStateSub)
+		if err != nil {
+			return attestStatePaths{}, err
+		}
+		if legacy == primary {
+			legacy = ""
+		}
+		return attestStatePaths{primary: primary, legacy: legacy}, nil
 	}
 	primary, err := stateFilePath(sessionID, cwd, "", reporterStateSub)
 	if err != nil {
@@ -168,6 +188,10 @@ func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (at
 		return attestStatePaths{}, err
 	}
 	return attestStatePaths{primary: primary, legacy: legacy}, nil
+}
+
+func stateFilePathUnderSub(sessionID, baseDir, sub string) (string, error) {
+	return stateFilePath(sessionID, "", filepath.Join(baseDir, sub), sub)
 }
 
 func readAttestState(statePaths attestStatePaths) (*attestState, error) {

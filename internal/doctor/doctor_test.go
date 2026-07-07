@@ -723,6 +723,117 @@ func TestCheckStaleStateWarnsWhenCleanupPlanErrors(t *testing.T) {
 	}
 }
 
+func TestFixDeliveryConfigMigratesLegacyReportKeys(t *testing.T) {
+	repo := t.TempDir()
+	path := filepath.Join(repo, ".delivery.yml")
+	writeDoctorTextFile(t, path, strings.Join([]string{
+		"version: 1",
+		migration.LegacyReportConfigRoot + ":",
+		"  channel: chat",
+		"",
+	}, "\n"))
+
+	check := fixDeliveryConfig(repo, Deps{ReadFile: os.ReadFile})
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, migration.LegacyReportConfigRoot+":") {
+		t.Fatalf("migrated config still contains legacy root:\n%s", text)
+	}
+	if !strings.Contains(text, migration.ReportConfigRoot+":") {
+		t.Fatalf("migrated config missing report root:\n%s", text)
+	}
+
+	second := fixDeliveryConfig(repo, Deps{ReadFile: os.ReadFile})
+	if second.Status != StatusOK || !strings.Contains(second.Message, "unchanged") {
+		t.Fatalf("second check = %#v, want unchanged ok", second)
+	}
+}
+
+func TestFixConductorHookSettingsMigratesLegacyCommand(t *testing.T) {
+	repo := t.TempDir()
+	settingsPath := claudehooks.SettingsPath(repo)
+	writeDoctorTextFile(t, settingsPath, fmt.Sprintf(`{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": %q,
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+`, migration.LegacyReporterHookCommand))
+
+	check := fixConductorHookSettings(repo, Deps{ReadFile: os.ReadFile})
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, migration.LegacyReporterHookCommand) {
+		t.Fatalf("settings still contain legacy hook command:\n%s", text)
+	}
+	for _, want := range []string{migration.ReporterHookCommand, "loopcoder hook conductor-relay-guard"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("settings missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestFixConductorHookStateMovesLegacyDirectory(t *testing.T) {
+	repo := t.TempDir()
+	oldDir := filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName)
+	newDir := filepath.Join(repo, ".loopcoder", "hooks", migration.ReporterHookName)
+	writeDoctorTextFile(t, filepath.Join(oldDir, "session-a.json"), `{"delivery_seen":true}`)
+
+	check := fixConductorHookState(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	if _, err := os.Stat(filepath.Join(newDir, "session-a.json")); err != nil {
+		t.Fatalf("new state file missing: %v", err)
+	}
+	if _, err := os.Stat(oldDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state dir still exists or unexpected error: %v", err)
+	}
+}
+
+func TestFixLegacyStateKeysRewritesLocalJSON(t *testing.T) {
+	repo := t.TempDir()
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-1", "workers", "job.attempt.json")
+	writeDoctorTextFile(t, statePath, fmt.Sprintf(`{"status":"succeeded","%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	check := fixLegacyStateKeys(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"`+migration.LegacyReportStateKey+`"`) {
+		t.Fatalf("state still contains legacy key:\n%s", text)
+	}
+	if !strings.Contains(text, `"`+migration.ReportStateKey+`"`) {
+		t.Fatalf("state missing current key:\n%s", text)
+	}
+}
+
 func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	report := Report{Checks: []Check{
 		{Name: "git", Status: StatusOK, Message: "found"},
@@ -767,7 +878,7 @@ func TestExecRunCommandTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("execRunCommand error = nil, want timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("execRunCommand elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {

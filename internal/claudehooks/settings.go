@@ -34,7 +34,7 @@ var requiredHookNames = []string{
 // deprecatedCommands are legacy conductor hook command strings. The settings
 // merge strips them so an upgrade installs only current hook entries.
 var deprecatedCommands = []string{
-	"node hooks/conductor-attest.js",
+	migration.LegacyReporterNodeHookCommand,
 	"node hooks/conductor-relay-guard.js",
 	migration.LegacyReporterHookCommand,
 }

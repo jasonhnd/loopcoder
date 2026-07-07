@@ -407,6 +407,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
+		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
 	}
 	if command.Name == "models" {
 		fmt.Fprintln(w, "  --provider string   registry provider key to render")
@@ -574,7 +575,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty reports on stdout (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "hook" {
-		fmt.Fprintln(w, "  <name>    hook to run: conductor-reporter, conductor-relay-guard, or legacy conductor-attest")
+		fmt.Fprintf(w, "  <name>    hook to run: %s, conductor-relay-guard, or legacy %s\n", migration.ReporterHookName, migration.LegacyReporterHookName)
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Reads the hook payload from stdin and runs the named embedded conductor hook.")
 		fmt.Fprintln(w, "Wired into Claude Code settings; unknown or missing names fail open (exit 0).")
@@ -867,10 +868,12 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var baseBranch string
 	var baseBranchAlias string
+	var fix bool
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.BoolVar(&fix, "fix", false, "apply explicit upgrade migrations and stale local state cleanup")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -895,6 +898,7 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	report := deps.Doctor(context.Background(), doctor.Options{
 		RepoPath:   resolvedRepo,
 		BaseBranch: baseBranch,
+		Fix:        fix,
 		BuildInfo: doctor.BuildInfo{
 			Version: deps.BuildInfo.Version,
 			Commit:  deps.BuildInfo.Commit,
@@ -2168,7 +2172,7 @@ func renderUpgradeMigrationStatus(w io.Writer, status upgrade.MigrationStatus) {
 			fmt.Fprintln(w, "  env: ok (no legacy reporter env vars found)")
 		}
 		if len(status.HookDiagnostics) == 0 {
-			fmt.Fprintln(w, "  hook: ok (no legacy conductor-attest hook command found)")
+			fmt.Fprintf(w, "  hook: ok (no legacy %s hook command found)\n", migration.LegacyReporterHookName)
 		}
 		if len(status.OldSurfaceDiagnostics) == 0 {
 			fmt.Fprintln(w, "  old local state: ok (no legacy report state keys or hook-state labels found)")
