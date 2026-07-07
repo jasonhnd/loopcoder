@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 const auditCommandFailureExitCode = 3
@@ -193,19 +193,19 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "audit: %v\n", err)
 		return auditCommandFailureExitCode
 	}
-	if result.Attestation != nil {
+	if result.Report != nil {
 		if deps.Now == nil {
 			deps.Now = DefaultDeps().Now
 		}
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeAuditRelayLedger(resolvedRepo, *result.Attestation, mode, deps.Now()); err != nil {
+		if err := writeAuditRelayLedger(resolvedRepo, *result.Report, mode, deps.Now()); err != nil {
 			result.NeedsHuman = append(result.NeedsHuman, audit.NeedsHuman{
 				Layer:  audit.LayerLLM,
 				Reason: "write audit review relay record: " + err.Error(),
 			})
 			result = audit.Finalize(result)
 		} else if shouldRenderPretty(noPretty) {
-			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
+			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
 				fmt.Fprintf(stderr, "audit: write pretty attestation: %v\n", err)
 				return auditCommandFailureExitCode
 			}
@@ -230,8 +230,8 @@ func auditSelectionIncludesLLM(layers []string) bool {
 	return false
 }
 
-func writeAuditRelayLedger(repoPath string, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+func writeAuditRelayLedger(repoPath string, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	runID := "audit-llm"
 	invocationID := fmt.Sprintf("audit-llm-%d", now.UTC().UnixNano())
 	if _, err := relay.Write(relay.Entry{
@@ -239,7 +239,7 @@ func writeAuditRelayLedger(repoPath string, record attestation.AttestationRecord
 		RunID:        runID,
 		InvocationID: invocationID,
 		Command:      "audit",
-		Role:         attestation.RoleVerifier,
+		Role:         reporter.RoleVerifier,
 		CreatedAt:    now,
 		Header:       record.Header(),
 		Pretty:       pretty,
@@ -249,7 +249,7 @@ func writeAuditRelayLedger(repoPath string, record attestation.AttestationRecord
 	_, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
 		RunID:    invocationID,
-		Role:     string(attestation.RoleVerifier),
+		Role:     string(reporter.RoleVerifier),
 		PRNumber: 0,
 		Block:    pretty,
 	})

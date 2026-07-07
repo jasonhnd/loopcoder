@@ -8,13 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 type invocationMetadata struct {
 	Model  string
 	Effort string
-	Usage  attestation.Usage
+	Usage  reporter.Usage
 }
 
 func resultWithTiming(exitCode int, summary string, metadata invocationMetadata, startedAt, endedAt time.Time) Result {

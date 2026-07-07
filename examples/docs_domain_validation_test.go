@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -406,7 +406,7 @@ func (a *docsDomainFakeAgent) Run(_ context.Context, invocation agent.Invocation
 		StartedAt:  "2026-07-04T00:00:00Z",
 		EndedAt:    "2026-07-04T00:00:02Z",
 		DurationMS: 2000,
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			InputTokens:  int64Ptr(100),
 			OutputTokens: int64Ptr(20),
 			TotalTokens:  int64Ptr(120),

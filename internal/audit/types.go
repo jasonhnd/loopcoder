@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 const (
@@ -51,18 +51,18 @@ type Options struct {
 }
 
 type Result struct {
-	SchemaVersion   int                            `json:"schema_version"`
-	Repo            string                         `json:"repo"`
-	Layers          []string                       `json:"layers"`
-	Threshold       string                         `json:"threshold"`
-	Verdict         string                         `json:"verdict"`
-	Summary         ResultSummary                  `json:"summary"`
-	Findings        []Finding                      `json:"findings"`
-	ToolResults     []ToolResult                   `json:"tool_results"`
-	NeedsHuman      []NeedsHuman                   `json:"needs_human"`
-	BaselineNotices []BaselineNotice               `json:"baseline_notices,omitempty"`
-	Attestation     *attestation.AttestationRecord `json:"-"`
-	RuntimeFailures []string                       `json:"runtime_failures,omitempty"`
+	SchemaVersion   int              `json:"schema_version"`
+	Repo            string           `json:"repo"`
+	Layers          []string         `json:"layers"`
+	Threshold       string           `json:"threshold"`
+	Verdict         string           `json:"verdict"`
+	Summary         ResultSummary    `json:"summary"`
+	Findings        []Finding        `json:"findings"`
+	ToolResults     []ToolResult     `json:"tool_results"`
+	NeedsHuman      []NeedsHuman     `json:"needs_human"`
+	BaselineNotices []BaselineNotice `json:"baseline_notices,omitempty"`
+	Report          *reporter.Report `json:"-"`
+	RuntimeFailures []string         `json:"runtime_failures,omitempty"`
 }
 
 type ResultSummary struct {

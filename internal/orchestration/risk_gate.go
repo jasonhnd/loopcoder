@@ -346,7 +346,7 @@ func isLoopcoderCorePath(file string) bool {
 		"cmd/loopcoder/",
 		"hooks/",
 		"internal/agent/",
-		"internal/attestation/",
+		"internal/reporter/",
 		"internal/compile/",
 		"internal/config/",
 		"internal/conductorhooks/",

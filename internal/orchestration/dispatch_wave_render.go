@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func RenderDispatchWaveText(report DispatchWaveReport) string {
@@ -38,8 +38,8 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 			if strings.TrimSpace(result.PR) != "" {
 				fmt.Fprintf(&out, "  pr: %s\n", result.PR)
 			}
-			if result.Attestation != nil {
-				fmt.Fprintf(&out, "  attestation: %s\n", formatDispatchWaveAttestation(*result.Attestation))
+			if result.Report != nil {
+				fmt.Fprintf(&out, "  attestation: %s\n", formatDispatchWaveReport(*result.Report))
 			}
 			if strings.TrimSpace(result.AttemptPath) != "" {
 				fmt.Fprintf(&out, "  attempt: %s\n", filepath.ToSlash(result.AttemptPath))
@@ -86,7 +86,7 @@ func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty st
 	return out.String()
 }
 
-func formatDispatchWaveAttestation(record attestation.AttestationRecord) string {
+func formatDispatchWaveReport(record reporter.Report) string {
 	return fmt.Sprintf(
 		"provider=%s model=%s(%s) effort=%s permission=%s duration=%s tokens input=%s output=%s total=%s verified=%t",
 		record.Provider,

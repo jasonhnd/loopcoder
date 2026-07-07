@@ -1,4 +1,4 @@
-package attestation
+package reporter
 
 import (
 	"strings"
@@ -48,7 +48,7 @@ func TestPrettyFailedStatusHasPriority(t *testing.T) {
 	record.Verified = true
 
 	got := record.Pretty(PrettyOptions{})
-	if !strings.HasPrefix(got, "❌ attestation failed\n") {
+	if !strings.HasPrefix(got, "\u274c attestation failed\n") {
 		t.Fatalf("Pretty() status = %q, want failed", firstLine(got))
 	}
 	for _, want := range []string{
@@ -166,7 +166,7 @@ func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
 	record := validRecord()
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-	for _, disallowed := range []string{"✅", "❌", "⚠", "\x1b["} {
+	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0", "\x1b["} {
 		if strings.Contains(got, disallowed) {
 			t.Fatalf("Pretty(plain) contains %q:\n%s", disallowed, got)
 		}

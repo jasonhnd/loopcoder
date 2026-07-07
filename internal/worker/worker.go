@@ -12,13 +12,13 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -49,17 +49,17 @@ type Options struct {
 }
 
 type Result struct {
-	OK          bool                           `json:"ok"`
-	Issue       int                            `json:"issue"`
-	Branch      string                         `json:"branch"`
-	RunID       string                         `json:"run_id"`
-	PR          string                         `json:"pr"`
-	Summary     string                         `json:"summary"`
-	AttemptPath string                         `json:"attempt_path"`
-	Status      string                         `json:"status"`
-	ExitCode    int                            `json:"exit_code"`
-	LogBytes    int64                          `json:"log_bytes"`
-	Attestation *attestation.AttestationRecord `json:"attestation,omitempty"`
+	OK          bool             `json:"ok"`
+	Issue       int              `json:"issue"`
+	Branch      string           `json:"branch"`
+	RunID       string           `json:"run_id"`
+	PR          string           `json:"pr"`
+	Summary     string           `json:"summary"`
+	AttemptPath string           `json:"attempt_path"`
+	Status      string           `json:"status"`
+	ExitCode    int              `json:"exit_code"`
+	LogBytes    int64            `json:"log_bytes"`
+	Report      *reporter.Report `json:"report,omitempty"`
 }
 
 type GitClient interface {
@@ -392,8 +392,8 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 	if harvest != nil {
 		exitCode := 0
 		dispatch.tracker.branch = harvest.Branch
-		dispatch.tracker.setAttestation(harvest.Attestation)
-		dispatch.tracker.setUsage(harvest.Attestation.Usage)
+		dispatch.tracker.setReport(harvest.Report)
+		dispatch.tracker.setUsage(harvest.Report.Usage)
 		dispatch.tracker.transition(harvest.Phase, "needs-human", &exitCode, nil)
 		dispatch.tracker.appendEvent("worker_harvested", "needs-human", map[string]string{
 			"branch": harvest.Branch,
@@ -413,22 +413,22 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			Status:      "needs-human",
 			ExitCode:    exitCode,
 			LogBytes:    fileSize(dispatch.logPath),
-			Attestation: &harvest.Attestation,
+			Report:      &harvest.Report,
 		}, nil
 	}
 	return hungResult(dispatch, agentResult), errors.New(hungErr)
 }
 
 func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
-	attestationRecord := buildWorkerAttestation(dispatch.opts, agentResult)
-	dispatch.tracker.setAttestation(attestationRecord)
+	reportRecord := buildWorkerReport(dispatch.opts, agentResult)
+	dispatch.tracker.setReport(reportRecord)
 	dispatch.tracker.writeAttempt()
-	if err := attestationRecord.Validate(); err != nil {
+	if err := reportRecord.Validate(); err != nil {
 		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
 	}
-	dispatch.tracker.setUsage(attestationRecord.Usage)
+	dispatch.tracker.setUsage(reportRecord.Usage)
 	dispatch.tracker.writeAttempt()
-	if _, err := attestationRecord.CanonicalJSON(); err != nil {
+	if _, err := reportRecord.CanonicalJSON(); err != nil {
 		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
 	}
 
@@ -484,7 +484,7 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 		Status:      "succeeded",
 		ExitCode:    exitCode,
 		LogBytes:    logBytes,
-		Attestation: &attestationRecord,
+		Report:      &reportRecord,
 	}, nil
 }
 
@@ -606,14 +606,14 @@ func BuildPrompt(opts PromptOptions) string {
 	return prompt
 }
 
-func buildWorkerAttestation(opts Options, result agent.Result) attestation.AttestationRecord {
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleWorker,
+func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
+	return reporter.Report{
+		Role:        reporter.RoleWorker,
 		Provider:    opts.Provider,
 		Model:       result.Model,
-		ModelSource: attestation.ModelSourceForProvider(opts.Provider),
+		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      result.Effort,
-		Permission:  attestation.PermissionWrite,
+		Permission:  reporter.PermissionWrite,
 		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
@@ -649,12 +649,12 @@ type hungHarvestOptions struct {
 }
 
 type hungHarvestResult struct {
-	Branch      string
-	PR          string
-	Summary     string
-	Phase       string
-	Mode        string
-	Attestation attestation.AttestationRecord
+	Branch  string
+	PR      string
+	Summary string
+	Phase   string
+	Mode    string
+	Report  reporter.Report
 }
 
 func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHarvestResult, error) {
@@ -698,17 +698,17 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 	existing := findOpenHarvestPR(ctx, opts.github, opts.opts.IssueNumber, harvestBranch, opts.warnings)
 	ended := opts.now()
 	if existing != nil {
-		record := buildHarvestConductorAttestation(opts.opts, started, ended)
+		record := buildHarvestConductorReport(opts.opts, started, ended)
 		if err := record.Validate(); err != nil {
 			return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
 		}
 		return &hungHarvestResult{
-			Branch:      firstNonEmpty(existing.HeadRefName, harvestBranch),
-			PR:          existing.URL,
-			Summary:     "harvested from hung/killed worker - existing needs-human PR already open",
-			Phase:       "harvest_adopted",
-			Mode:        "existing-pr",
-			Attestation: record,
+			Branch:  firstNonEmpty(existing.HeadRefName, harvestBranch),
+			PR:      existing.URL,
+			Summary: "harvested from hung/killed worker - existing needs-human PR already open",
+			Phase:   "harvest_adopted",
+			Mode:    "existing-pr",
+			Report:  record,
 		}, nil
 	}
 
@@ -723,7 +723,7 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 	}
 
 	ended = opts.now()
-	record := buildHarvestConductorAttestation(opts.opts, started, ended)
+	record := buildHarvestConductorReport(opts.opts, started, ended)
 	if err := record.Validate(); err != nil {
 		return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
 	}
@@ -733,12 +733,12 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		return nil, fmt.Errorf("gh pr create harvest: %w", err)
 	}
 	return &hungHarvestResult{
-		Branch:      harvestBranch,
-		PR:          prURL,
-		Summary:     "harvested from hung/killed worker - possibly incomplete; needs human review",
-		Phase:       "harvest_pr_opened",
-		Mode:        "created-pr",
-		Attestation: record,
+		Branch:  harvestBranch,
+		PR:      prURL,
+		Summary: "harvested from hung/killed worker - possibly incomplete; needs human review",
+		Phase:   "harvest_pr_opened",
+		Mode:    "created-pr",
+		Report:  record,
 	}, nil
 }
 
@@ -779,12 +779,12 @@ func buildHarvestPRBody(opts Options, result agent.Result, recoveryBrief string)
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "## Hung worker partial attestation")
 	fmt.Fprintln(&out, "```text")
-	fmt.Fprintln(&out, formatHungWorkerPartialAttestation(opts, result))
+	fmt.Fprintln(&out, formatHungWorkerPartialReport(opts, result))
 	fmt.Fprintln(&out, "```")
 	return out.String()
 }
 
-func formatHungWorkerPartialAttestation(opts Options, result agent.Result) string {
+func formatHungWorkerPartialReport(opts Options, result agent.Result) string {
 	lines := []string{
 		"role=worker",
 		"provider=" + firstNonEmpty(opts.Provider, "unknown"),
@@ -819,7 +819,7 @@ func formatHungWorkerPartialAttestation(opts Options, result agent.Result) strin
 	return recovery.Scrub(strings.Join(lines, "\n"))
 }
 
-func buildHarvestConductorAttestation(opts Options, started, ended time.Time) attestation.AttestationRecord {
+func buildHarvestConductorReport(opts Options, started, ended time.Time) reporter.Report {
 	if started.IsZero() {
 		started = time.Now().UTC()
 	}
@@ -830,19 +830,19 @@ func buildHarvestConductorAttestation(opts Options, started, ended time.Time) at
 		ended = started
 	}
 	totalTokens := int64(0)
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleConductor,
+	return reporter.Report{
+		Role:        reporter.RoleConductor,
 		Provider:    firstNonEmpty(opts.Provider, "loopcoder"),
 		Model:       firstNonEmpty(opts.Model, "loopcoder-harvest"),
-		ModelSource: attestation.ModelSourceSelfReported,
+		ModelSource: reporter.ModelSourceSelfReported,
 		Effort:      opts.Effort,
-		Permission:  attestation.PermissionOrchestrate,
+		Permission:  reporter.PermissionOrchestrate,
 		Action:      fmt.Sprintf("harvest hung worker issue #%d", opts.IssueNumber),
 		ExitCode:    0,
 		StartedAt:   state.FormatTimestamp(started),
 		EndedAt:     state.FormatTimestamp(ended),
 		DurationMS:  ended.Sub(started).Milliseconds(),
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			TotalTokens: &totalTokens,
 		},
 		Verified: false,
@@ -1068,8 +1068,8 @@ type attemptTracker struct {
 	logBytes       int64
 	exitCode       *int
 	errorMessage   *string
-	usage          *attestation.Usage
-	attestation    *attestation.AttestationRecord
+	usage          *reporter.Usage
+	reporter       *reporter.Report
 	now            func() time.Time
 	warnings       io.Writer
 	attemptPath    string
@@ -1097,12 +1097,12 @@ func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
 	}
 }
 
-func (t *attemptTracker) setUsage(usage attestation.Usage) {
+func (t *attemptTracker) setUsage(usage reporter.Usage) {
 	t.usage = cloneUsage(&usage)
 }
 
-func (t *attemptTracker) setAttestation(record attestation.AttestationRecord) {
-	t.attestation = cloneAttestation(&record)
+func (t *attemptTracker) setReport(record reporter.Report) {
+	t.reporter = cloneReport(&record)
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
@@ -1187,14 +1187,14 @@ func (t *attemptTracker) writeAttempt() {
 		ExitCode:       t.exitCode,
 		Error:          t.errorMessage,
 		Usage:          cloneUsage(t.usage),
-		Attestation:    cloneAttestation(t.attestation),
+		Report:         cloneReport(t.reporter),
 	}
 	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
 	}
 }
 
-func cloneAttestation(record *attestation.AttestationRecord) *attestation.AttestationRecord {
+func cloneReport(record *reporter.Report) *reporter.Report {
 	if record == nil {
 		return nil
 	}
@@ -1203,7 +1203,7 @@ func cloneAttestation(record *attestation.AttestationRecord) *attestation.Attest
 	return &clone
 }
 
-func cloneUsage(usage *attestation.Usage) *attestation.Usage {
+func cloneUsage(usage *reporter.Usage) *reporter.Usage {
 	if usage == nil {
 		return nil
 	}

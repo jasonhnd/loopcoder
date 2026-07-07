@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -142,13 +142,13 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if result.AttemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-4321.attempt.json") {
 		t.Fatalf("AttemptPath = %q", result.AttemptPath)
 	}
-	if result.Attestation == nil {
+	if result.Report == nil {
 		t.Fatal("result missing attestation")
 	}
-	if err := result.Attestation.Validate(); err != nil {
+	if err := result.Report.Validate(); err != nil {
 		t.Fatalf("result attestation does not validate: %v", err)
 	}
-	canonicalAttestation, err := result.Attestation.CanonicalJSON()
+	canonicalReport, err := result.Report.CanonicalJSON()
 	if err != nil {
 		t.Fatalf("CanonicalJSON returned error: %v", err)
 	}
@@ -156,8 +156,8 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		t.Fatalf("PR body = %q, want %q", fakeGitHub.lastPRBody, want)
 	}
 	for _, forbidden := range []string{
-		result.Attestation.Header(),
-		string(canonicalAttestation),
+		result.Report.Header(),
+		string(canonicalReport),
 		"[attestation]",
 		"```json\n",
 		`"role":"worker"`,
@@ -188,23 +188,23 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 			t.Fatalf("success JSON missing field %q: %s", key, string(data))
 		}
 	}
-	attestationField, ok := jsonFields["attestation"]
+	reportField, ok := jsonFields["report"]
 	if !ok {
-		t.Fatalf("success JSON missing attestation field: %s", string(data))
+		t.Fatalf("success JSON missing report field: %s", string(data))
 	}
-	attestationBytes, err := json.Marshal(attestationField)
+	reportBytes, err := json.Marshal(reportField)
 	if err != nil {
-		t.Fatalf("marshal attestation field: %v", err)
+		t.Fatalf("marshal report field: %v", err)
 	}
-	var renderedAttestation attestation.AttestationRecord
-	if err := json.Unmarshal(attestationBytes, &renderedAttestation); err != nil {
-		t.Fatalf("attestation field invalid: %v", err)
+	var renderedReport reporter.Report
+	if err := json.Unmarshal(reportBytes, &renderedReport); err != nil {
+		t.Fatalf("report field invalid: %v", err)
 	}
-	if err := renderedAttestation.Validate(); err != nil {
-		t.Fatalf("attestation field does not validate: %v", err)
+	if err := renderedReport.Validate(); err != nil {
+		t.Fatalf("report field does not validate: %v", err)
 	}
-	if renderedAttestation.Header() != result.Attestation.Header() {
-		t.Fatalf("attestation JSON header = %q, want %q", renderedAttestation.Header(), result.Attestation.Header())
+	if renderedReport.Header() != result.Report.Header() {
+		t.Fatalf("report JSON header = %q, want %q", renderedReport.Header(), result.Report.Header())
 	}
 
 	attempts, err := state.LoadAttempts(repo, "run-test")
@@ -223,14 +223,14 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if attempts[0].Usage == nil || attempts[0].Usage.TotalTokens == nil || *attempts[0].Usage.TotalTokens != 154 {
 		t.Fatalf("attempt usage = %#v, want total tokens 154", attempts[0].Usage)
 	}
-	if attempts[0].Attestation == nil {
+	if attempts[0].Report == nil {
 		t.Fatal("attempt missing persisted attestation")
 	}
-	if err := attempts[0].Attestation.Validate(); err != nil {
+	if err := attempts[0].Report.Validate(); err != nil {
 		t.Fatalf("attempt attestation does not validate: %v", err)
 	}
-	if attempts[0].Attestation.Header() != result.Attestation.Header() {
-		t.Fatalf("attempt attestation header = %q, want %q", attempts[0].Attestation.Header(), result.Attestation.Header())
+	if attempts[0].Report.Header() != result.Report.Header() {
+		t.Fatalf("attempt attestation header = %q, want %q", attempts[0].Report.Header(), result.Report.Header())
 	}
 	eventCount, err := state.CountEvents(repo, "run-test")
 	if err != nil {
@@ -697,8 +697,8 @@ domain:
 	}
 }
 
-func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
-	record := buildWorkerAttestation(Options{
+func TestGitHubBoundTextBuildersHaveZeroReportFootprint(t *testing.T) {
+	record := buildWorkerReport(Options{
 		IssueNumber: 101,
 		IssueTitle:  "Implement dispatch",
 		Provider:    "codex",
@@ -712,7 +712,7 @@ func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 		"commit message": buildCommitMessage("Implement dispatch", 101),
 	}
 	for name, text := range surfaces {
-		assertNoAttestationFootprint(t, name, text, record)
+		assertNoReportFootprint(t, name, text, record)
 	}
 	if surfaces["pr body"] != "Closes #101\n\nImplemented dispatch." {
 		t.Fatalf("PR body surface = %q", surfaces["pr body"])
@@ -722,8 +722,8 @@ func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 	}
 }
 
-func TestBuildWorkerAttestationAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
-	record := buildWorkerAttestation(Options{
+func TestBuildWorkerReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
+	record := buildWorkerReport(Options{
 		IssueNumber: 559,
 		Provider:    "antigravity",
 	}, agent.Result{
@@ -736,7 +736,7 @@ func TestBuildWorkerAttestationAllowsAntigravitySelfReportedNoUsage(t *testing.T
 		DurationMS: 2000,
 	})
 
-	if record.ModelSource != attestation.ModelSourceSelfReported {
+	if record.ModelSource != reporter.ModelSourceSelfReported {
 		t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)
 	}
 	if record.Usage.TotalTokens != nil || record.Usage.InputTokens != nil || record.Usage.OutputTokens != nil {
@@ -840,7 +840,7 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	}
 }
 
-func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoAttestation(t *testing.T) {
+func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoReport(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
@@ -886,7 +886,7 @@ func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoAttestation(t *testing
 	if err == nil {
 		t.Fatal("Dispatch returned nil error, want hung failure")
 	}
-	if result.Status != "hung" || result.OK || result.Attestation != nil {
+	if result.Status != "hung" || result.OK || result.Report != nil {
 		t.Fatalf("hung result = %#v, want status hung, not ok, no attestation", result)
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
@@ -909,7 +909,7 @@ func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoAttestation(t *testing
 		t.Fatalf("LoadAttempts returned %d attempts, want 1", len(attempts))
 	}
 	got := attempts[0]
-	if got.Status != "hung" || got.Attestation != nil {
+	if got.Status != "hung" || got.Report != nil {
 		t.Fatalf("hung attempt = %#v, want status hung and no attestation", got)
 	}
 	if !strings.Contains(got.Error, "reason=hung") {
@@ -949,7 +949,7 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 			HungReason: agent.HungReasonStall,
 			Model:      "gpt-worker",
 			Effort:     "high",
-			Usage: attestation.Usage{
+			Usage: reporter.Usage{
 				TotalTokens: &totalTokens,
 			},
 			StartedAt:  "2026-06-28T00:00:00Z",
@@ -997,13 +997,13 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	if !result.OK || result.Status != "needs-human" || result.Branch != "loop/issue-101-retry-2" || result.PR != "https://github.com/owner/repo/pull/101" {
 		t.Fatalf("harvest result = %#v", result)
 	}
-	if result.Attestation == nil {
+	if result.Report == nil {
 		t.Fatal("harvest result missing attestation")
 	}
-	if result.Attestation.Role != attestation.RoleConductor || result.Attestation.Permission != attestation.PermissionOrchestrate || result.Attestation.Verified {
-		t.Fatalf("harvest attestation = %#v, want unverified conductor orchestrate", result.Attestation)
+	if result.Report.Role != reporter.RoleConductor || result.Report.Permission != reporter.PermissionOrchestrate || result.Report.Verified {
+		t.Fatalf("harvest attestation = %#v, want unverified conductor orchestrate", result.Report)
 	}
-	if err := result.Attestation.Validate(); err != nil {
+	if err := result.Report.Validate(); err != nil {
 		t.Fatalf("harvest attestation does not validate: %v", err)
 	}
 	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 1 {
@@ -1054,8 +1054,8 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	if got.Status != "needs-human" || got.Branch != "loop/issue-101-retry-2" {
 		t.Fatalf("harvest attempt = %#v, want needs-human retry branch", got)
 	}
-	if got.Attestation == nil || got.Attestation.Role != attestation.RoleConductor {
-		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Attestation)
+	if got.Report == nil || got.Report.Role != reporter.RoleConductor {
+		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Report)
 	}
 }
 
@@ -1113,7 +1113,7 @@ domain:
 	if err == nil {
 		t.Fatal("Dispatch returned nil error, want hung failure")
 	}
-	if result.OK || result.Status != "hung" || result.PR != "" || result.Attestation != nil {
+	if result.OK || result.Status != "hung" || result.PR != "" || result.Report != nil {
 		t.Fatalf("report-only hung result = %#v, want hung without PR or attestation", result)
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
@@ -1132,7 +1132,7 @@ domain:
 	if err != nil {
 		t.Fatalf("LoadAttempts returned error: %v", err)
 	}
-	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Attestation != nil {
+	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Report != nil {
 		t.Fatalf("report-only attempt = %#v, want hung with no attestation", attempts)
 	}
 	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test", "job-101-4321"))
@@ -1338,7 +1338,7 @@ func TestDispatchHungHarvestNoOpsWhenHarvestPRExistsForDifferentAttempt(t *testi
 	}
 }
 
-func TestDispatchHardFailsInvalidAttestationBeforeDelivery(t *testing.T) {
+func TestDispatchHardFailsInvalidReportBeforeDelivery(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
 	var warnings strings.Builder
@@ -1650,7 +1650,7 @@ func TestHandleHungReportOnlyAndWriteRecoveryHelpers(t *testing.T) {
 	if err == nil {
 		t.Fatal("handleHungOrPartialWork returned nil error, want hung error")
 	}
-	if result.OK || result.Status != "hung" || result.Branch != "loop/issue-509" || result.Attestation != nil {
+	if result.OK || result.Status != "hung" || result.Branch != "loop/issue-509" || result.Report != nil {
 		t.Fatalf("hung helper result = %#v", result)
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.forcePushCalls != 0 || fakeGitHub.createPRCalls != 0 {
@@ -1681,7 +1681,7 @@ func TestHandleHungReportOnlyAndWriteRecoveryHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAttempts returned error: %v", err)
 	}
-	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Attestation != nil {
+	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Report != nil {
 		t.Fatalf("hung recovery attempt = %#v", attempts)
 	}
 	events, err := os.ReadFile(state.EventsPath(repo, "run-hung"))
@@ -1708,7 +1708,7 @@ func validWorkerAgentResult(summary string, exitCode int) agent.Result {
 		Summary:  summary,
 		Model:    "gpt-5.5",
 		Effort:   "xhigh",
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			InputTokens:  &inputTokens,
 			OutputTokens: &outputTokens,
 			TotalTokens:  &totalTokens,
@@ -1719,7 +1719,7 @@ func validWorkerAgentResult(summary string, exitCode int) agent.Result {
 	}
 }
 
-func assertNoAttestationFootprint(t *testing.T, surface, text string, record attestation.AttestationRecord) {
+func assertNoReportFootprint(t *testing.T, surface, text string, record reporter.Report) {
 	t.Helper()
 	canonical, err := record.CanonicalJSON()
 	if err != nil {
