@@ -55,11 +55,13 @@ type Deps struct {
 	LookPath       func(file string) (string, error)
 	RunCommand     func(ctx context.Context, dir string, name string, args ...string) (CommandResult, error)
 	LoadConfig     func(path string) (config.Config, error)
+	Getenv         func(string) string
 	ReadFile       func(path string) ([]byte, error)
 	ExecutablePath func() (string, error)
 	UserHomeDir    func() (string, error)
 	SkillMarkdown  func() ([]byte, error)
 	AgentsMarkdown func() ([]byte, error)
+	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
 }
 
 type CommandResult struct {
@@ -111,11 +113,13 @@ func DefaultDeps() Deps {
 		LookPath:       exec.LookPath,
 		RunCommand:     execRunCommand,
 		LoadConfig:     config.Load,
+		Getenv:         os.Getenv,
 		ReadFile:       os.ReadFile,
 		ExecutablePath: os.Executable,
 		UserHomeDir:    os.UserHomeDir,
 		SkillMarkdown:  loopcoder.SkillMarkdown,
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
+		CleanupPlan:    localcleanup.Plan,
 	}
 }
 
@@ -154,6 +158,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
+	checks = append(checks, checkVersionStatus(build, repoPath, deps))
 	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
@@ -179,6 +184,9 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.LoadConfig == nil {
 		deps.LoadConfig = defaults.LoadConfig
 	}
+	if deps.Getenv == nil {
+		deps.Getenv = defaults.Getenv
+	}
 	if deps.ReadFile == nil {
 		deps.ReadFile = defaults.ReadFile
 	}
@@ -193,6 +201,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.AgentsMarkdown == nil {
 		deps.AgentsMarkdown = defaults.AgentsMarkdown
+	}
+	if deps.CleanupPlan == nil {
+		deps.CleanupPlan = defaults.CleanupPlan
 	}
 	return deps
 }
@@ -734,6 +745,51 @@ func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
 
 	parts = append(parts, fmt.Sprintf("min_loopcoder_version=%s is satisfied by selected loopcoder version=%s", minimum, build.Version))
 	return Check{Name: "version compatibility", Status: status, Message: strings.Join(parts, "; ")}
+}
+
+func checkVersionStatus(build BuildInfo, repoPath string, deps Deps) Check {
+	const transitionTarget = "0.6.0"
+
+	versionStatus := upgrade.ClassifyVersionStatus(build.Version, transitionTarget)
+	migrationStatus := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(migrationStatus)
+
+	status := StatusOK
+	parts := []string{
+		fmt.Sprintf("selected version=%s classification=%s", build.Version, versionStatus.CurrentClassification),
+		fmt.Sprintf("upgrade target=%s classification=%s", transitionTarget, versionStatus.TargetClassification),
+	}
+	if strings.TrimSpace(migrationStatus.MinLoopcoderVersion) != "" {
+		parts = append(parts, fmt.Sprintf(".delivery.yml min_loopcoder_version=%s", migrationStatus.MinLoopcoderVersion))
+	}
+	if versionStatus.CompatibilityAliasesActive {
+		parts = append(parts, "0.6.0 compatibility aliases are active for the transition window")
+	}
+	if versionStatus.BreakingBoundary {
+		status = StatusWarn
+		parts = append(parts, "selected version is before the 0.6.0 breaking boundary; run: loopcoder upgrade --version 0.6.0")
+	}
+	if versionStatus.CurrentClassification == upgrade.VersionUnknown {
+		status = StatusWarn
+		parts = append(parts, "selected version cannot be classified for the 0.6.0 transition")
+	}
+	if legacyCount > 0 {
+		status = StatusWarn
+		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); run: loopcoder doctor --repo . --fix", legacyCount))
+	} else {
+		parts = append(parts, "migration scan found no legacy surfaces")
+	}
+	if strings.TrimSpace(migrationStatus.ScanWarning) != "" {
+		if status != StatusWarn {
+			status = StatusWarn
+		}
+		parts = append(parts, migrationStatus.ScanWarning)
+	}
+	return Check{
+		Name:    "version status",
+		Status:  status,
+		Message: strings.Join(parts, "; "),
+	}
 }
 
 func checkAuditReadiness(repoPath string, delivery deliveryState, deps Deps) []Check {
@@ -1367,51 +1423,60 @@ func compareSemver(a, b semver) int {
 }
 
 func checkMigrationStatus(repoPath string, deps Deps) Check {
-	udeps := upgrade.DefaultDeps()
-	udeps.Getwd = func() (string, error) { return repoPath, nil }
-	udeps.ReadFile = deps.ReadFile
-	
-	status := upgrade.ScanMigrationStatus(udeps)
-	
-	legacyCount := len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
-	
+	status := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(status)
+
 	if legacyCount > 0 {
 		return Check{
-			Name: "migration status",
-			Status: StatusWarn,
+			Name:    "migration status",
+			Status:  StatusWarn,
 			Message: fmt.Sprintf("found %d legacy surface(s) requiring migration; run: loopcoder doctor --repo . --fix", legacyCount),
 		}
 	}
 	return Check{
-		Name: "migration status",
-		Status: StatusOK,
+		Name:    "migration status",
+		Status:  StatusOK,
 		Message: "no legacy surfaces found",
 	}
 }
 
+func scanMigrationStatus(repoPath string, deps Deps) upgrade.MigrationStatus {
+	deps = normalizeDeps(deps)
+	udeps := upgrade.DefaultDeps()
+	udeps.Getwd = func() (string, error) { return repoPath, nil }
+	udeps.Getenv = deps.Getenv
+	udeps.ReadFile = deps.ReadFile
+	return upgrade.ScanMigrationStatus(udeps)
+}
+
+func migrationLegacyCount(status upgrade.MigrationStatus) int {
+	return len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
+}
+
 func checkStaleState(repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
 	opts := localcleanup.Options{
 		RepoPath: repoPath,
 	}
-	result, err := localcleanup.Plan(opts)
+	result, err := deps.CleanupPlan(opts)
 	if err != nil {
 		return Check{
-			Name: "stale local state",
-			Status: StatusWarn,
-			Message: fmt.Sprintf("could not scan local state: %v", err),
+			Name:    "stale local state",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not scan local state: %v; after fixing local .loopcoder permissions, rerun: loopcoder doctor --repo .", err),
 		}
 	}
-	
+
 	if len(result.Planned) > 0 {
 		return Check{
-			Name: "stale local state",
-			Status: StatusWarn,
+			Name:    "stale local state",
+			Status:  StatusWarn,
 			Message: fmt.Sprintf("found %d cleanup-eligible item(s); run: loopcoder doctor --repo . --fix", len(result.Planned)),
 		}
 	}
 	return Check{
-		Name: "stale local state",
-		Status: StatusOK,
+		Name:    "stale local state",
+		Status:  StatusOK,
 		Message: "no cleanup-eligible items found",
 	}
 }

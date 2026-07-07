@@ -129,7 +129,7 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
 	}
-	if strings.Contains(stdout.String(), `"` + migration.LegacyReportStateKey + `"`) {
+	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
