@@ -83,7 +83,9 @@ push access.
 - `gh` on `PATH`, authenticated for the target GitHub repository.
 - At least one supported provider CLI on `PATH`. `codex` is the default worker,
   `codex` and `claude` are verified worker and verifier providers, and
-  `gemini` is experimental and unverified end-to-end.
+  `agy` is the Google Antigravity CLI used by provider key `antigravity`.
+  The older direct `gemini` worker adapter remains experimental and is not part
+  of the static model registry.
 - A GitHub repository with a configured remote.
 - For the no-Go installer: `curl`, `tar`, and `sha256sum` or `shasum` on
   Unix-like systems, or PowerShell on Windows. Go is optional for developer
@@ -239,8 +241,10 @@ loopcoder init \
   --verifier-effort medium
 ```
 
-Omitting these flags leaves model and effort absent so each provider inherits
-its own global configuration.
+Omitting these flags leaves model and depth absent in `.delivery.yml`. At run
+time, each role resolves the selected provider's static registry default model
+and then that model's default depth; those resolved defaults are not written
+back to config unless you explicitly persist a preference.
 
 ## Per-Repo Setup
 
@@ -264,9 +268,9 @@ adapters:
   verifier: claude        # Should differ from worker; provider registry key.
   gate: auto              # Default-on production promotion; set human-merge to opt out so humans choose what merges.
 worker:
-  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.
+  # Optional. Absent = static registry default model for the resolved worker provider.
   # model:
-  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.
+  # Optional. Absent = default depth for the resolved worker model.
   # reasoning_effort:
   base_branch: main
   command_hint: "implement the issue, run relevant checks, commit"
@@ -285,10 +289,13 @@ environment:
 #   app:
 #     preview_build: dist/app-preview.zip
 # verifier:
-#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
+#   # Optional. Absent = static registry default model for the resolved verifier provider.
 #   # model:
-#   # Optional. Absent = inherit the verifier provider's global config. loopcoder never sets this on its own.
+#   # Optional. Absent = default depth for the resolved verifier model.
 #   # reasoning_effort:
+# models:
+#   # Optional. false warns and continues; true rejects invalid model/depth selections before launch.
+#   # strict: true
 ci:
   checks: []
 report:
@@ -310,8 +317,8 @@ check triggers deterministic rollback to the recorded `prior_stable_commit`.
 copies those configured artifacts into the JSON report and the human-readable
 summary for dispatched, pending, and pre-prod items.
 
-The verifier role has its own optional model and reasoning-effort settings.
-Quote model IDs that contain YAML-special characters such as `[1m]`:
+The verifier role has its own optional model and `reasoning_effort` depth
+settings. Quote model IDs that contain YAML-special characters such as `[1m]`:
 
 ```yaml
 verifier:
@@ -441,11 +448,53 @@ Layer 2 attestation is local-only, like `loopreview`: pretty blocks, canonical
 JSON, relay records, and logs must not be copied into repository-visible
 artifacts. See [`audit.md`](audit.md) for the full command reference.
 
-## Model And Speed
+## Model And Depth
 
-By default, loopcoder passes no model or reasoning-effort flags to Codex. It
-inherits your global Codex configuration from `~/.codex/config.toml` and never
-chooses a model or effort level for you.
+`loopcoder models` prints the static model registry. It does not read
+`.delivery.yml`, call provider CLIs, call `agy models`, read provider config,
+mutate files, or require provider authentication:
+
+```text
+loopcoder models
+loopcoder models --provider codex
+loopcoder models --provider claude
+loopcoder models --provider antigravity
+```
+
+The registry provider key for Google Antigravity is `antigravity`; `agy` is the
+CLI executable name. `loopcoder models --provider agy` exits non-zero and hints
+to use `--provider antigravity`.
+
+Worker and Verifier model selection is role-scoped. For each role, provider
+comes from the command flag, then `.delivery.yml` (`adapters.worker` or
+`adapters.verifier`), then the built-in role fallback (`codex` for Worker,
+`claude` for Verifier). Model comes from the role command flag, then
+`worker.model` or `verifier.model`, then the static registry default model for
+the resolved provider. Depth comes from the role command `--effort` flag, then
+`worker.reasoning_effort` or `verifier.reasoning_effort`, then the resolved
+model's default depth.
+
+The initial registry defaults are:
+
+| Provider | CLI | Default model | Default depth |
+| --- | --- | --- | --- |
+| `codex` | `codex` | `gpt-5.5` | `high` |
+| `claude` | `claude` | `claude-opus-4-8[1m]` | `max` |
+| `antigravity` | `agy` | `Gemini 3.1 Pro` | `High` |
+
+Configured model and depth values are exact and case-sensitive. By default,
+invalid provider, model, or depth selections warn and keep the selected
+pass-through value. Strict mode rejects invalid selections before launching a
+provider. Enable strict mode durably with:
+
+```yaml
+models:
+  strict: true
+```
+
+For one run, use `--strict` on the commands that resolve Worker or Verifier
+model/depth selections: `dispatch`, `dispatch-wave`, `loopreview`, `audit`,
+`tick`, `trigger`, and `recover`.
 
 For a single run, say what you want in chat, such as:
 
@@ -454,33 +503,42 @@ run faster
 #B use max
 ```
 
-loopcoder then passes the requested one-off override to the worker for that run
-only. Natural-language effort mapping is defined in `SKILL.md`: `fast` or
-`quick` maps to `low`, `balanced` maps to `medium`, `high` maps to `high`, and
-`thorough`, `max`, or `highest` maps to `xhigh`.
+The conductor translates that request into exact provider/model/depth flags for
+that run only. Natural-language depth mapping is still a conductor concern; the
+binary validates exact registry tokens such as `high`, `max`, or Antigravity's
+capitalized `High`.
 
-For a permanent default, say so explicitly, for example:
+For a permanent project preference, say so explicitly, for example:
 
 ```text
 from now on default to high
 ```
 
-Only then should loopcoder write `worker.reasoning_effort` or `worker.model`
-into `.delivery.yml`.
+Only then should loopcoder write `worker.reasoning_effort`, `worker.model`,
+`verifier.reasoning_effort`, or `verifier.model` into `.delivery.yml`. Absent
+fields mean "resolve from the static registry at runtime," not "inherit a
+provider global config."
 
-Verifier model and effort are configured separately under `verifier:`. For
-example, this pins the independent verifier to the configured Claude model and
-maximum effort for every `loopcoder loopreview` run that uses the repo config:
+Antigravity setup uses the Google Antigravity CLI:
 
-```yaml
-verifier:
-  model: "claude-opus-4-8[1m]"
-  reasoning_effort: max
+```text
+agy login
+agy models
+loopcoder doctor --repo .
 ```
 
-The `[1m]` suffix must be quoted in YAML. One-off `loopreview --model` and
-`--effort` overrides remain per-run overrides; `.delivery.yml` is the durable
-project default.
+When the configured Worker or Verifier provider is `antigravity`, `doctor`
+looks for executable `agy` and runs `agy models` as a bounded OAuth readiness
+probe. The Antigravity Worker invocation uses this argv shape after
+registry/default resolution:
+
+```text
+agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"
+```
+
+The mandatory `--add-dir` is the workspace pin. Antigravity read-only mode is
+not available or verified, so `loopreview` and audit-review invocations fail
+closed when selected with provider `antigravity`.
 
 ## Doc-First Process
 
@@ -504,8 +562,11 @@ loopcoder -v
 
 loopcoder doctor --repo .
 
+loopcoder models
+loopcoder models --provider antigravity
+
 loopcoder audit --repo . --layer sast
-loopcoder audit --repo . --layer all --provider claude
+loopcoder audit --repo . --layer all --provider claude --strict
 
 loopcoder skill install --repo .
 
@@ -529,9 +590,13 @@ loopcoder dispatch \
   --issue-number <number> \
   --issue-title "<title>" \
   --provider codex \
+  --strict \
   --pretty
 
-loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2>
+loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
+
+loopcoder tick --repo . --strict
+loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
 
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
@@ -546,11 +611,12 @@ loopcoder recover \
   --issue-number <number> \
   --issue-title "<title>" \
   --issue-body "<body>" \
-  --run-id <run-id>
+  --run-id <run-id> \
+  --strict
 
 loopcoder verify-local --repo . --pr-number <pr>
 
-loopcoder loopreview --repo . --pr-number <pr> --provider claude
+loopcoder loopreview --repo . --pr-number <pr> --provider claude --strict
 loopcoder loopreview --repo . --pr-number <pr> --provider claude --pretty
 
 loopcoder attest \
@@ -621,17 +687,25 @@ the repository worker default is also `codex`; that warning does not block the
 run, but `claude` remains the preferred verifier for default Codex-worker
 repos. `gemini` remains unverified for `loopreview` until issue #188 resolves
 headless authentication.
+`antigravity` is registered as a provider but read-only mode is not available
+or verified, so selecting it for `loopreview` fails closed rather than running
+a mutating review.
 
 ## Attestation
 
-Worker and verifier invocations produce validated local-only attestation records with
-`verified: true`, `model_source: parsed`, provider, real parsed model, effort,
-permission, action, exit code, timing, and token usage. For Claude runs with an
-explicit pinned model, the attested model is the pinned/configured model when
-that exact model appears in provider-reported usage; a token-dominant auxiliary
-model does not override it. Missing required identity or usage fails closed:
-`dispatch` opens no PR, and `loopreview` returns `needs-human` with the
-incomplete-attestation finding. Attestation surfaces are local-only:
+Worker and verifier invocations produce validated local-only attestation records
+with provider, model, effort, permission, action, exit code, timing, and
+verification fields. For providers with parseable usage, including `codex` and
+`claude`, records use `model_source: parsed`, real parsed model identity, and
+token usage. For Claude runs with an explicit pinned model, the attested model
+is the pinned/configured model when that exact model appears in
+provider-reported usage; a token-dominant auxiliary model does not override it.
+Missing required identity or usage fails closed for providers that expose those
+signals: `dispatch` opens no PR, and `loopreview` returns `needs-human` with
+the incomplete-attestation finding. Antigravity is a provider-scoped exception:
+Worker records use the selected `agy --model` string, such as `Gemini 3.1 Pro
+(High)`, as `model_source: self-reported` and accept absent token usage.
+Attestation surfaces are local-only:
 `dispatch` / `loopreview` stderr pretty blocks, foreground `dispatch-wave`
 stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
 gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
@@ -666,15 +740,15 @@ streams one Worker pretty block per dispatched issue to stdout as that Worker
 completes, before the final aggregate wave report. The default block uses emoji
 on an interactive TTY and plain ASCII on a non-TTY.
 
-The pretty block displays the provider vendor (`OpenAI`, `Anthropic`, or
-`Google`) plus a separate `tool` line with the canonical CLI adapter (`codex`,
-`claude`, or `gemini`). It renders parsed model sources as `(detected)` and
-Conductor self-attestation as `(self-reported)`, displays `started` and `ended`
-in the host local timezone to whole seconds, reports duration as human seconds
-plus total seconds, and groups token counts with thousands separators. When
-input and output tokens are present without a total, the pretty display derives
-`total=<input+output>` for display only; canonical JSON and the stable
-`[attestation]` header are unchanged.
+The pretty block displays the provider vendor (`OpenAI`, `Anthropic`,
+`Google`, or `Google Antigravity`) plus a separate `tool` line with the
+provider key (`codex`, `claude`, `gemini`, or `antigravity`). It renders parsed
+model sources as `(detected)` and self-reported sources as `(self-reported)`,
+displays `started` and `ended` in the host local timezone to whole seconds,
+reports duration as human seconds plus total seconds, and groups token counts
+with thousands separators. When input and output tokens are present without a
+total, the pretty display derives `total=<input+output>` for display only;
+canonical JSON and the stable `[attestation]` header are unchanged.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
