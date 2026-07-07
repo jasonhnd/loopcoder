@@ -148,6 +148,93 @@ func TestVersionDefaultsToDevBuildInfo(t *testing.T) {
 	}
 }
 
+func TestModelsCommandPrintsStaticRegistry(t *testing.T) {
+	t.Setenv("PATH", "")
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"models"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if got, want := stdout.String(), expectedModelsOutput(); got != want {
+		t.Fatalf("models output mismatch:\ngot:\n%swant:\n%s", got, want)
+	}
+}
+
+func TestModelsCommandFiltersProvider(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"models", "--provider", "antigravity"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if got, want := stdout.String(), expectedAntigravityModelsOutput(); got != want {
+		t.Fatalf("models --provider antigravity output mismatch:\ngot:\n%swant:\n%s", got, want)
+	}
+}
+
+func TestModelsCommandRejectsAgyProviderWithHint(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"models", "--provider", "agy"}, &stdout, &stderr, Deps{})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	for _, want := range []string{
+		`unknown provider "agy"`,
+		"supported providers: codex, claude, antigravity",
+		"use --provider antigravity",
+		"agy is the CLI executable",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func expectedModelsOutput() string {
+	return "provider: codex\n" +
+		"vendor: OpenAI Codex\n" +
+		"cli: codex\n" +
+		"default: gpt-5.5 / high\n" +
+		"models:\n" +
+		"  - gpt-5.5\n" +
+		"    depths: low, medium, high*, xhigh\n" +
+		"\n" +
+		"provider: claude\n" +
+		"vendor: Anthropic\n" +
+		"cli: claude\n" +
+		"default: claude-opus-4-8[1m] / max\n" +
+		"models:\n" +
+		"  - claude-opus-4-8[1m]\n" +
+		"    depths: low, medium, high, max*\n" +
+		"\n" +
+		expectedAntigravityModelsOutput()
+}
+
+func expectedAntigravityModelsOutput() string {
+	return "provider: antigravity\n" +
+		"vendor: Google Antigravity\n" +
+		"cli: agy\n" +
+		"default: Gemini 3.1 Pro / High\n" +
+		"models:\n" +
+		"  - Gemini 3.1 Pro\n" +
+		"    depths: Low, High*\n" +
+		"  - Opus 4.6\n" +
+		"    depths: Thinking*\n" +
+		"  - GPT-OSS 120B\n" +
+		"    depths: Medium*\n"
+}
+
 func TestAuditCommandRunsInjectedAuditAndRendersJSON(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()

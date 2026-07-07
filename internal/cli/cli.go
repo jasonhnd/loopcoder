@@ -22,6 +22,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -83,6 +84,7 @@ type Deps struct {
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "version", Summary: "print version and build information"},
+	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -245,6 +247,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "version" {
 		return runVersion(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "models" {
+		return runModels(args[1:], stdout, stderr)
+	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
 	}
@@ -395,6 +400,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
+	}
+	if command.Name == "models" {
+		fmt.Fprintln(w, "  --provider string   registry provider key to render")
 	}
 	if command.Name == "audit" {
 		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
@@ -648,6 +656,104 @@ func printVersion(w io.Writer, build BuildInfo) {
 		runtime.GOOS,
 		runtime.GOARCH,
 	)
+}
+
+func runModels(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("models", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var provider string
+	var providerAlias string
+	fs.StringVar(&provider, "provider", "", "registry provider key")
+	fs.StringVar(&providerAlias, "Provider", "", "registry provider key")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if providerAlias != "" {
+		provider = providerAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "models: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	registry := models.DefaultRegistry()
+	providers := registry.Providers
+	provider = strings.TrimSpace(provider)
+	if provider != "" {
+		selected, ok := registry.LookupProvider(provider)
+		if !ok {
+			fmt.Fprintf(stderr, "models: unknown provider %q (supported providers: %s)\n", provider, strings.Join(registry.ProviderNames(), ", "))
+			if provider == "agy" {
+				fmt.Fprintln(stderr, "models: hint: use --provider antigravity; agy is the CLI executable")
+			}
+			return 2
+		}
+		providers = []models.Provider{selected}
+	}
+
+	if err := renderModelProviders(stdout, providers); err != nil {
+		fmt.Fprintf(stderr, "models: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderModelProviders(w io.Writer, providers []models.Provider) error {
+	for providerIndex, provider := range providers {
+		if providerIndex > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(w, "provider: %s\n", provider.Name); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "vendor: %s\n", provider.Vendor); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "cli: %s\n", provider.CLI); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "default: %s / %s\n", provider.DefaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w, "models:"); err != nil {
+			return err
+		}
+		for _, model := range provider.Models {
+			if _, err := fmt.Fprintf(w, "  - %s\n", model.Name); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "    depths: %s\n", renderedDepths(model)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func renderedDefaultDepth(depth string) string {
+	if depth == "" {
+		return "(none)"
+	}
+	return depth
+}
+
+func renderedDepths(model models.Model) string {
+	if len(model.Depths) == 0 {
+		return "(none)"
+	}
+	depths := make([]string, 0, len(model.Depths))
+	for _, depth := range model.Depths {
+		token := depth.Token
+		if token == model.DefaultDepth {
+			token += "*"
+		}
+		depths = append(depths, token)
+	}
+	return strings.Join(depths, ", ")
 }
 
 func runRelay(args []string, stdout, stderr io.Writer) int {
