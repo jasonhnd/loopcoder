@@ -30,7 +30,7 @@ type attestStatePaths struct {
 
 // attestState is the persisted per-session state for the conductor-attest gate.
 // The gate only applies to sessions that actually performed a delivery or merge
-// (DeliverySeen). Attested records a Conductor self-attestation. Reminded makes
+// (DeliverySeen). Attested records a Conductor self-report. Reminded makes
 // the Stop block one-shot so the gate can never loop even without an attest.
 type attestState struct {
 	Attested      bool   `json:"attested"`
@@ -46,7 +46,7 @@ type attestState struct {
 
 // RunAttest is the conductor-attest hook. It fails open on any error or panic.
 // The Stop gate blocks at most once, only on a turn that performed a delivery or
-// merge without a Conductor self-attestation, and it honors Claude Code's
+// merge without a Conductor self-report, and it honors Claude Code's
 // stop_hook_active escape valve — so it can never loop or block planning turns.
 func RunAttest(input []byte, opts Options) (res Result) {
 	defer func() {
@@ -109,14 +109,14 @@ func RunAttest(input []byte, opts Options) (res Result) {
 	}
 
 	return block(strings.Join([]string{
-		"loopcoder conductor attestation is required before completing this delivery or merge turn.",
+		"loopcoder conductor report is required before completing this delivery or merge turn.",
 		"Run `loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action \"<delivery action>\" --duration-ms <ms> --total-tokens <tokens>` with the actual host model and usage, then finish the turn.",
-		"Keep the emitted attestation local: use command output and gitignored .loopcoder/ run records for recovery; do not copy it into PR bodies, comments, merge commits, or merge comments.",
+		"Keep the emitted report local: use command output and gitignored .loopcoder/ run records for recovery; do not copy it into PR bodies, comments, merge commits, or merge comments.",
 	}, "\n"))
 }
 
 // recordAttestObservations updates per-session state from a completed shell
-// tool: it marks a successful Conductor attestation, and separately marks that a
+// tool: it marks a successful Conductor report, and separately marks that a
 // delivery or merge command was observed (which is what makes the Stop gate
 // apply). Fail-open: any error is swallowed.
 func recordAttestObservations(statePaths attestStatePaths, in hookInput, now time.Time) {
@@ -205,7 +205,7 @@ func readAttestStateFile(statePath string) (*attestState, error) {
 
 // isSuccessfulConductorAttest reports whether the tool-complete event is a
 // successful `loopcoder attest --role conductor` invocation whose output carries
-// a conductor attestation.
+// a conductor report.
 func isSuccessfulConductorAttest(in hookInput) bool {
 	if !isShellTool(in.ToolName) {
 		return false
@@ -216,7 +216,7 @@ func isSuccessfulConductorAttest(in hookInput) bool {
 	if !responseSucceeded(in) {
 		return false
 	}
-	return containsConductorAttestation(in.ToolResponse)
+	return containsConductorReport(in.ToolResponse)
 }
 
 // responseSucceeded reports whether a tool response indicates success: not
@@ -333,9 +333,9 @@ func hasRoleConductor(args []string) bool {
 	return false
 }
 
-// containsConductorAttestation reports whether the walked response strings carry
-// a conductor attestation header or the JSON self-reported/unverified marker.
-func containsConductorAttestation(raw json.RawMessage) bool {
+// containsConductorReport reports whether the walked response strings carry
+// a conductor report header or the JSON self-reported/unverified marker.
+func containsConductorReport(raw json.RawMessage) bool {
 	text := collectStringsFromRaw(raw)
 	if conductorHeaderRe.MatchString(text) {
 		return true

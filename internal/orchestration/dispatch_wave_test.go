@@ -180,7 +180,7 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 		t.Fatalf("issue #2 result = %#v, want failed worker error", report.Results[1])
 	}
 	if report.Results[1].Report == nil || report.Results[1].Report.Model != "worker-model-2" {
-		t.Fatalf("issue #2 attestation = %#v, want preserved worker attestation", report.Results[1].Report)
+		t.Fatalf("issue #2 report = %#v, want preserved worker report", report.Results[1].Report)
 	}
 }
 

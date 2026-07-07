@@ -61,7 +61,7 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 	// real, working subcommand. Strip the leading binary token and drive the
 	// rest through the CLI. Under the D gate the conductor reporter hook only
 	// blocks on a delivery/merge turn, so first feed a delivery PostToolUse,
-	// then a Stop: with the marker present and no attestation it must BLOCK
+	// then a Stop: with the marker present and no report it must BLOCK
 	// (exit 2) — proving the installed command is wired to live logic, not a
 	// dangling file reference.
 	fields := strings.Fields(command)
@@ -96,8 +96,8 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 	if code := RunWithDeps(args, &stdout, &stderr, deps); code != 2 {
 		t.Fatalf("installed hook command exit = %d, want 2 (blocking delivery Stop); stderr=%q", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "conductor attestation is required") {
-		t.Fatalf("hook stderr = %q, want the conductor attestation prompt", stderr.String())
+	if !strings.Contains(stderr.String(), "conductor report is required") {
+		t.Fatalf("hook stderr = %q, want the conductor report prompt", stderr.String())
 	}
 }
 
@@ -153,7 +153,7 @@ func TestConductorHookLegacyCommandAliasRunsReporterHook(t *testing.T) {
 	if code := RunWithDeps([]string{"hook", "conductor-attest"}, &stdout, &stderr, deps); code != 2 {
 		t.Fatalf("legacy Stop hook exit = %d, want 2; stderr=%q", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "conductor attestation is required") {
+	if !strings.Contains(stderr.String(), "conductor report is required") {
 		t.Fatalf("legacy hook stderr = %q, want conductor prompt", stderr.String())
 	}
 }

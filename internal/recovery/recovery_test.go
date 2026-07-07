@@ -562,12 +562,12 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		}
 	}
 	if result.DispatchResult == nil || result.DispatchResult.Report == nil {
-		t.Fatalf("retry result missing attestation: %#v", result.DispatchResult)
+		t.Fatalf("retry result missing report: %#v", result.DispatchResult)
 	}
 	if result.DispatchResult.Report.Model != "recover-model-103" ||
 		result.DispatchResult.Report.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Report.Usage.TotalTokens != 321 {
-		t.Fatalf("retry attestation not preserved: %#v", result.DispatchResult.Report)
+		t.Fatalf("retry report not preserved: %#v", result.DispatchResult.Report)
 	}
 }
 
@@ -882,7 +882,7 @@ func TestRecoverRetryErrorPreservesPartialDispatchReport(t *testing.T) {
 				Issue:  103,
 				Status: "failed",
 				Report: recoverReport(103, 654),
-			}, fmt.Errorf("dispatch failed after worker attestation")
+			}, fmt.Errorf("dispatch failed after worker report")
 		},
 	})
 	if err != nil {
@@ -892,12 +892,12 @@ func TestRecoverRetryErrorPreservesPartialDispatchReport(t *testing.T) {
 		t.Fatalf("Action = %q, want %q", result.Action, ActionBlocked)
 	}
 	if result.DispatchResult == nil || result.DispatchResult.Report == nil {
-		t.Fatalf("partial dispatch result missing attestation: %#v", result.DispatchResult)
+		t.Fatalf("partial dispatch result missing report: %#v", result.DispatchResult)
 	}
 	if result.DispatchResult.Report.Model != "recover-model-103" ||
 		result.DispatchResult.Report.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Report.Usage.TotalTokens != 654 {
-		t.Fatalf("partial dispatch attestation not preserved: %#v", result.DispatchResult.Report)
+		t.Fatalf("partial dispatch report not preserved: %#v", result.DispatchResult.Report)
 	}
 	if len(result.RecoveryAttempts) != 2 ||
 		result.RecoveryAttempts[0].Strategy != AttemptStrategySameConfig ||

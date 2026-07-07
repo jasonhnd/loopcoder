@@ -129,7 +129,7 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
-		t.Fatalf("report JSON used legacy attestation key:\n%s", stdout.String())
+		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
 		t.Fatalf("report command mutated relay state: %#v", pending)
@@ -1410,10 +1410,10 @@ func TestAttestSuccessPaths(t *testing.T) {
 			}
 			var record reporter.Report
 			if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
-				t.Fatalf("stdout first line is not attestation JSON: %v\n%s", err, stdout.String())
+				t.Fatalf("stdout first line is not report JSON: %v\n%s", err, stdout.String())
 			}
 			if err := record.Validate(); err != nil {
-				t.Fatalf("attestation JSON does not validate: %v", err)
+				t.Fatalf("report JSON does not validate: %v", err)
 			}
 			if record.ModelSource != reporter.ModelSourceSelfReported {
 				t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)
@@ -4298,7 +4298,7 @@ func clearPrettyEnv(t *testing.T) {
 func expectedDispatchStdout(t *testing.T, result worker.Result) string {
 	t.Helper()
 	if result.Report == nil {
-		t.Fatal("expected dispatch result attestation")
+		t.Fatal("expected dispatch result report")
 	}
 	canonical, err := result.Report.CanonicalJSON()
 	if err != nil {

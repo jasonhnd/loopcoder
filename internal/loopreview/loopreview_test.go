@@ -1894,7 +1894,7 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		t.Fatalf("result = %#v, want pass exit 0", result)
 	}
 	if result.Verdict.Report == nil {
-		t.Fatal("verdict missing attestation")
+		t.Fatal("verdict missing report")
 	}
 	sourceRef := prHeadLocalRef(152)
 	if fakeGit.fetchBase != "main" || fakeGit.fetchPRRef != 152 || fakeGit.fetchPRRefDest != sourceRef || fakeGit.addRev != sourceRef {
@@ -2469,7 +2469,7 @@ func TestRunVerifierNonZeroExitReturnsNeedsHuman(t *testing.T) {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
 	}
 	if result.Verdict.Report == nil || result.Verdict.Report.ExitCode != 7 {
-		t.Fatalf("attestation = %#v, want exit code 7", result.Verdict.Report)
+		t.Fatalf("report = %#v, want exit code 7", result.Verdict.Report)
 	}
 }
 
@@ -2549,7 +2549,7 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
 	}
 	if result.Verdict.Report != nil {
-		t.Fatalf("hung verifier result had attestation: %#v", result.Verdict.Report)
+		t.Fatalf("hung verifier result had report: %#v", result.Verdict.Report)
 	}
 	if fakeAgent.calls != 1 {
 		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)

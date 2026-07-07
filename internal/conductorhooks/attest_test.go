@@ -109,7 +109,7 @@ func TestAttestDeliveryBlocksOnceThenSelfClears(t *testing.T) {
 	if first.ExitCode != 2 {
 		t.Fatalf("expected first Stop after delivery to block (exit 2), got %d", first.ExitCode)
 	}
-	if !regexp.MustCompile(`conductor attestation is required`).MatchString(first.Stderr) {
+	if !regexp.MustCompile(`conductor report is required`).MatchString(first.Stderr) {
 		t.Fatalf("expected reminder message, got %q", first.Stderr)
 	}
 	second := RunAttest(mustJSON(t, attestStop(root, false)), opts)
@@ -118,7 +118,7 @@ func TestAttestDeliveryBlocksOnceThenSelfClears(t *testing.T) {
 	}
 }
 
-// A delivery turn followed by a Conductor attestation clears the gate.
+// A delivery turn followed by a Conductor report clears the gate.
 func TestAttestDeliveryThenAttestAllows(t *testing.T) {
 	root := t.TempDir()
 	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
@@ -133,7 +133,7 @@ func TestAttestDeliveryThenAttestAllows(t *testing.T) {
 	}
 }
 
-func TestAttestDeliveryThenLegacyAttestationHeaderAllows(t *testing.T) {
+func TestAttestDeliveryThenLegacyHeaderAllows(t *testing.T) {
 	root := t.TempDir()
 	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
 
