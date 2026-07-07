@@ -83,7 +83,7 @@ type Deps struct {
 }
 
 var commands = []Command{
-	{Name: "attest", Summary: "emit conductor self-attestation"},
+	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
@@ -97,7 +97,7 @@ var commands = []Command{
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
-	{Name: "relay", Summary: "flush or list pending local attestation relay blocks"},
+	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
@@ -386,7 +386,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --no-pretty                 suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "attest" {
-		fmt.Fprintln(w, "  --role string            attestation role (default \"conductor\")")
+		fmt.Fprintln(w, "  --role string            report role (default \"conductor\")")
 		fmt.Fprintln(w, "  --provider string        conductor host provider (required)")
 		fmt.Fprintln(w, "  --model string           conductor host model (required)")
 		fmt.Fprintln(w, "  --effort string          optional reasoning effort")

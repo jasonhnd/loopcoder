@@ -143,10 +143,10 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		t.Fatalf("AttemptPath = %q", result.AttemptPath)
 	}
 	if result.Report == nil {
-		t.Fatal("result missing attestation")
+		t.Fatal("result missing report")
 	}
 	if err := result.Report.Validate(); err != nil {
-		t.Fatalf("result attestation does not validate: %v", err)
+		t.Fatalf("result report does not validate: %v", err)
 	}
 	canonicalReport, err := result.Report.CanonicalJSON()
 	if err != nil {
@@ -168,7 +168,7 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		`"usage":{"input_tokens":120,"output_tokens":34,"total_tokens":154}`,
 	} {
 		if strings.Contains(fakeGitHub.lastPRBody, forbidden) {
-			t.Fatalf("PR body contains forbidden attestation text %q:\n%s", forbidden, fakeGitHub.lastPRBody)
+			t.Fatalf("PR body contains forbidden report text %q:\n%s", forbidden, fakeGitHub.lastPRBody)
 		}
 	}
 	if fakeGit.lastCommitMessage != "Implement dispatch (closes #101)" {
@@ -224,13 +224,13 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		t.Fatalf("attempt usage = %#v, want total tokens 154", attempts[0].Usage)
 	}
 	if attempts[0].Report == nil {
-		t.Fatal("attempt missing persisted attestation")
+		t.Fatal("attempt missing persisted report")
 	}
 	if err := attempts[0].Report.Validate(); err != nil {
-		t.Fatalf("attempt attestation does not validate: %v", err)
+		t.Fatalf("attempt report does not validate: %v", err)
 	}
 	if attempts[0].Report.Header() != result.Report.Header() {
-		t.Fatalf("attempt attestation header = %q, want %q", attempts[0].Report.Header(), result.Report.Header())
+		t.Fatalf("attempt report header = %q, want %q", attempts[0].Report.Header(), result.Report.Header())
 	}
 	eventCount, err := state.CountEvents(repo, "run-test")
 	if err != nil {
@@ -704,7 +704,7 @@ func TestGitHubBoundTextBuildersHaveZeroReportFootprint(t *testing.T) {
 		Provider:    "codex",
 	}, validWorkerAgentResult("Implemented dispatch.", 0))
 	if err := record.Validate(); err != nil {
-		t.Fatalf("test attestation does not validate: %v", err)
+		t.Fatalf("test report does not validate: %v", err)
 	}
 
 	surfaces := map[string]string{
@@ -887,7 +887,7 @@ func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoReport(t *testing.T) {
 		t.Fatal("Dispatch returned nil error, want hung failure")
 	}
 	if result.Status != "hung" || result.OK || result.Report != nil {
-		t.Fatalf("hung result = %#v, want status hung, not ok, no attestation", result)
+		t.Fatalf("hung result = %#v, want status hung, not ok, no report", result)
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
 		t.Fatalf("hung empty worktree made harvest git calls: add=%d commit=%d push=%d forcePush=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
@@ -910,7 +910,7 @@ func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoReport(t *testing.T) {
 	}
 	got := attempts[0]
 	if got.Status != "hung" || got.Report != nil {
-		t.Fatalf("hung attempt = %#v, want status hung and no attestation", got)
+		t.Fatalf("hung attempt = %#v, want status hung and no report", got)
 	}
 	if !strings.Contains(got.Error, "reason=hung") {
 		t.Fatalf("hung attempt error = %q, want reason=hung", got.Error)
@@ -998,13 +998,13 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 		t.Fatalf("harvest result = %#v", result)
 	}
 	if result.Report == nil {
-		t.Fatal("harvest result missing attestation")
+		t.Fatal("harvest result missing report")
 	}
 	if result.Report.Role != reporter.RoleConductor || result.Report.Permission != reporter.PermissionOrchestrate || result.Report.Verified {
-		t.Fatalf("harvest attestation = %#v, want unverified conductor orchestrate", result.Report)
+		t.Fatalf("harvest report = %#v, want unverified conductor orchestrate", result.Report)
 	}
 	if err := result.Report.Validate(); err != nil {
-		t.Fatalf("harvest attestation does not validate: %v", err)
+		t.Fatalf("harvest report does not validate: %v", err)
 	}
 	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 1 {
 		t.Fatalf("harvest git calls add=%d commit=%d push=%d forcePush=%d, want add/commit/force only", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
@@ -1055,7 +1055,7 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 		t.Fatalf("harvest attempt = %#v, want needs-human retry branch", got)
 	}
 	if got.Report == nil || got.Report.Role != reporter.RoleConductor {
-		t.Fatalf("harvest attempt attestation = %#v, want conductor", got.Report)
+		t.Fatalf("harvest attempt report = %#v, want conductor", got.Report)
 	}
 }
 
@@ -1114,7 +1114,7 @@ domain:
 		t.Fatal("Dispatch returned nil error, want hung failure")
 	}
 	if result.OK || result.Status != "hung" || result.PR != "" || result.Report != nil {
-		t.Fatalf("report-only hung result = %#v, want hung without PR or attestation", result)
+		t.Fatalf("report-only hung result = %#v, want hung without PR or report", result)
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 0 {
 		t.Fatalf("report-only made harvest git calls: add=%d commit=%d push=%d force=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
@@ -1133,7 +1133,7 @@ domain:
 		t.Fatalf("LoadAttempts returned error: %v", err)
 	}
 	if len(attempts) != 1 || attempts[0].Status != "hung" || attempts[0].Report != nil {
-		t.Fatalf("report-only attempt = %#v, want hung with no attestation", attempts)
+		t.Fatalf("report-only attempt = %#v, want hung with no report", attempts)
 	}
 	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test", "job-101-4321"))
 	if err != nil {
@@ -1727,7 +1727,7 @@ func assertNoReportFootprint(t *testing.T, surface, text string, record reporter
 	}
 	for _, forbidden := range []string{record.Header(), string(canonical), "[attestation]"} {
 		if strings.Contains(text, forbidden) {
-			t.Fatalf("%s contains forbidden attestation text %q:\n%s", surface, forbidden, text)
+			t.Fatalf("%s contains forbidden report text %q:\n%s", surface, forbidden, text)
 		}
 	}
 }

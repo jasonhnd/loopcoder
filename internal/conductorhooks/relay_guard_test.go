@@ -13,7 +13,7 @@ const workerHeader = `[reporter] role=worker provider=codex model=gpt-5(parsed) 
 const legacyWorkerHeader = `[attestation] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`
 
 var workerPretty = strings.Join([]string{
-	"attestation: verified",
+	"report: verified",
 	"  role        worker",
 	"  provider    OpenAI",
 	"  tool        codex",
@@ -33,7 +33,7 @@ const verifierHeader = `[reporter] role=verifier provider=claude model=claude-op
 const legacyVerifierHeader = `[attestation] role=verifier provider=claude model=claude-opus-4 effort=high perm=read action="review PR #202" exit=0 dur=17s tokens=80/21|101 verified=true`
 
 var verifierPretty = strings.Join([]string{
-	"attestation: verified",
+	"report: verified",
 	"  role        verifier",
 	"  provider    Anthropic",
 	"  tool        claude",
@@ -78,7 +78,7 @@ func writeWorkerLedgerForCommandWithHeader(t *testing.T, root, command, filename
 	ledgerPath = filepath.Join(dir, filename)
 	block = header + "\n" + workerPretty + "\n"
 	content := strings.Join([]string{
-		"# loopcoder relay attestation",
+		"# loopcoder relay report",
 		"# command=" + command,
 		"# role=worker",
 		"# run_id=run-test",
@@ -109,7 +109,7 @@ func writeVerifierLedgerWithHeader(t *testing.T, root, header, filename string) 
 	ledgerPath = filepath.Join(dir, filename)
 	block = header + "\n" + verifierPretty + "\n"
 	content := strings.Join([]string{
-		"# loopcoder relay attestation",
+		"# loopcoder relay report",
 		"# command=loopreview",
 		"# role=verifier",
 		"# run_id=run-test",
@@ -256,7 +256,7 @@ func TestRelaySwallowedWorkerBlockBlocksStop(t *testing.T) {
 	_, block := writeWorkerLedger(t, root)
 
 	postTool := RunRelayGuard(mustJSON(t, dispatchPostTool(root, map[string]any{
-		"stdout":    "dispatch completed without visible attestation\n",
+		"stdout":    "dispatch completed without visible report\n",
 		"stderr":    "",
 		"exit_code": 0,
 	})), Options{Env: mapEnv(env)})
@@ -268,7 +268,7 @@ func TestRelaySwallowedWorkerBlockBlocksStop(t *testing.T) {
 	if firstStop.ExitCode != 2 {
 		t.Fatalf("expected first Stop exit 2, got %d", firstStop.ExitCode)
 	}
-	if !regexp.MustCompile(`local verbatim attestation relay was missing`).MatchString(firstStop.Stderr) {
+	if !regexp.MustCompile(`local verbatim report relay was missing`).MatchString(firstStop.Stderr) {
 		t.Fatalf("expected missing-relay message, got %q", firstStop.Stderr)
 	}
 	if !strings.Contains(firstStop.Stderr, strings.TrimRight(block, "\n")) {
@@ -404,7 +404,7 @@ func TestRelaySwallowedVerifierBlockBlocksStop(t *testing.T) {
 	_, block := writeVerifierLedger(t, root)
 
 	postTool := RunRelayGuard(mustJSON(t, loopreviewPostTool(root, map[string]any{
-		"stdout":    "loopreview completed without visible attestation\n",
+		"stdout":    "loopreview completed without visible report\n",
 		"stderr":    "",
 		"exit_code": 0,
 	})), Options{Env: mapEnv(env)})
@@ -416,7 +416,7 @@ func TestRelaySwallowedVerifierBlockBlocksStop(t *testing.T) {
 	if firstStop.ExitCode != 2 {
 		t.Fatalf("expected first Stop exit 2, got %d", firstStop.ExitCode)
 	}
-	if !regexp.MustCompile(`local verbatim attestation relay was missing`).MatchString(firstStop.Stderr) {
+	if !regexp.MustCompile(`local verbatim report relay was missing`).MatchString(firstStop.Stderr) {
 		t.Fatalf("expected missing-relay message, got %q", firstStop.Stderr)
 	}
 	if !strings.Contains(firstStop.Stderr, strings.TrimRight(block, "\n")) {
@@ -495,7 +495,7 @@ func TestRelayPowerShellToolRecordsDispatchAndLoopreview(t *testing.T) {
 			ledgerPath, _ := tt.writeLedger(t, root)
 
 			postTool := RunRelayGuard(mustJSON(t, tt.input(root, map[string]any{
-				"stdout":    "completed without visible attestation\n",
+				"stdout":    "completed without visible report\n",
 				"stderr":    "",
 				"exit_code": 0,
 			})), Options{Env: mapEnv(env)})
@@ -668,7 +668,7 @@ func TestRelayScopeOffDisablesGuard(t *testing.T) {
 	}
 
 	postTool := RunRelayGuard(mustJSON(t, dispatchPostTool(root, map[string]any{
-		"stdout":    "dispatch completed without visible attestation\n",
+		"stdout":    "dispatch completed without visible report\n",
 		"stderr":    "",
 		"exit_code": 0,
 	})), Options{Env: mapEnv(env)})
@@ -715,7 +715,7 @@ func TestRelayConductorWorkspaceMarker(t *testing.T) {
 	writeWorkerLedger(t, withMarker)
 	// Auto scope (no SCOPE), default state dir under cwd.
 	post := RunRelayGuard(mustJSON(t, dispatchPostTool(withMarker, map[string]any{
-		"stdout":    "dispatch completed without visible attestation\n",
+		"stdout":    "dispatch completed without visible report\n",
 		"stderr":    "",
 		"exit_code": 0,
 	})), Options{Env: mapEnv(map[string]string{})})
@@ -731,7 +731,7 @@ func TestRelayConductorWorkspaceMarker(t *testing.T) {
 	noMarker := t.TempDir()
 	writeWorkerLedger(t, noMarker)
 	post2 := RunRelayGuard(mustJSON(t, dispatchPostTool(noMarker, map[string]any{
-		"stdout":    "dispatch completed without visible attestation\n",
+		"stdout":    "dispatch completed without visible report\n",
 		"stderr":    "",
 		"exit_code": 0,
 	})), Options{Env: mapEnv(map[string]string{})})

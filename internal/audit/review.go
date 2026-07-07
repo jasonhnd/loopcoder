@@ -192,7 +192,7 @@ repo: %s
 # Review instructions
 - Produce audit findings in the same schema as deterministic findings, with layer "llm".
 - Use severity critical, high, medium, low, or info.
-- Use category values that describe the security class, such as supply-chain-integrity, shared-host-disclosure, path-confinement, untrusted-worktree-execution, verifier-boundary, failure-reporting, local-only-attestation, bounded-io, or config-compatibility.
+- Use category values that describe the security class, such as supply-chain-integrity, shared-host-disclosure, path-confinement, untrusted-worktree-execution, verifier-boundary, failure-reporting, local-only-reporting, bounded-io, or config-compatibility.
 - Return an empty findings array only when the bounded packet and rubric are sufficient and no finding is present.
 - Return findings for concrete security risks; do not report speculative concerns without packet evidence.
 - If the packet is too truncated to decide safely, return one medium finding with rule "llm:insufficient-evidence" and category "bounded-io".
@@ -258,7 +258,7 @@ Language-agnostic rubric categories:
 - execution of trusted tools inside untrusted worktrees;
 - read-only verifier boundaries, including MCP server classification;
 - honest failure reporting and exit-code separation;
-- local-only attestation and relay obligations;
+- local-only report and relay obligations;
 - bounded local file reads, output sizes, and scan scope;
 - additive config compatibility and absent-config behavior.`)
 }

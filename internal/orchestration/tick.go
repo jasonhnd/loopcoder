@@ -106,7 +106,7 @@ type TickOptions struct {
 // TickReport intentionally has no top-level conductor Report. The
 // 0.4.0 tick path is deterministic Go orchestration, not an LLM conductor
 // invocation, so there is no real provider/model/usage record to stamp. Worker
-// dispatch and verifier loopreview attestations remain surfaced on their own
+// dispatch and verifier loopreview reports remain surfaced on their own
 // report entries.
 type TickReport struct {
 	Version          int                       `json:"version"`

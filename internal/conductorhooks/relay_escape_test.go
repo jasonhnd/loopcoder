@@ -13,7 +13,7 @@ func escWriteWorkerLedger(t *testing.T, root string) {
 		t.Fatalf("mkdir ledger dir: %v", err)
 	}
 	header := `[attestation] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #7" exit=0 dur=1s tokens=1/1|2 verified=true`
-	content := "# loopcoder relay attestation\n# command=dispatch\n# role=worker\n# run_id=run-esc\n# issue=7\n" + header + "\nattestation: verified\n  role        worker\n"
+	content := "# loopcoder relay report\n# command=dispatch\n# role=worker\n# run_id=run-esc\n# issue=7\n" + header + "\nreport: verified\n  role        worker\n"
 	if err := os.WriteFile(filepath.Join(dir, "job-7-1.attest"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write ledger: %v", err)
 	}
@@ -33,7 +33,7 @@ func escSwallowedDispatch(root, session string) map[string]any {
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "Bash",
 		"tool_input":      map[string]any{"command": "loopcoder dispatch --repo ."},
-		"tool_response":   map[string]any{"stdout": "dispatch completed without visible attestation\n", "exit_code": 0},
+		"tool_response":   map[string]any{"stdout": "dispatch completed without visible report\n", "exit_code": 0},
 	}
 }
 

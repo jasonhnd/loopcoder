@@ -33,7 +33,7 @@ type relayState struct {
 	Records       map[string]*relayRecord `json:"records"`
 }
 
-// relayRecord tracks one discovered ledger attestation and its surfacing status.
+// relayRecord tracks one discovered ledger report and its surfacing status.
 type relayRecord struct {
 	ID         string `json:"id"`
 	Role       string `json:"role"`
@@ -103,7 +103,7 @@ func RunRelayGuard(input []byte, opts Options) (res Result) {
 	return allow()
 }
 
-// handleToolComplete records newly discovered relay ledger attestations and
+// handleToolComplete records newly discovered relay ledger reports and
 // flags whether each was surfaced in the visible command output.
 func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 	if !isShellTool(in.ToolName) {
@@ -154,7 +154,7 @@ func handleToolComplete(in hookInput, statePath string, now time.Time) Result {
 			command = enforced.kind
 		}
 		status := "pending"
-		if containsSurfacedAttestation(responseText, rec) {
+		if containsSurfacedReport(responseText, rec) {
 			status = "surfaced"
 		}
 		state.Records[rec.id] = &relayRecord{
@@ -188,7 +188,7 @@ func markSurfacedPendingRecords(state *relayState, enforced *relayTarget, respon
 		if rec.Command != "" && rec.Command != enforced.kind {
 			continue
 		}
-		if !containsSurfacedAttestation(responseText, ledgerRecord{role: rec.Role, header: rec.Header}) {
+		if !containsSurfacedReport(responseText, ledgerRecord{role: rec.Role, header: rec.Header}) {
 			continue
 		}
 		rec.Status = "surfaced"
@@ -198,7 +198,7 @@ func markSurfacedPendingRecords(state *relayState, enforced *relayTarget, respon
 	return changed
 }
 
-// handleStop blocks completion when any recorded relay attestation is still
+// handleStop blocks completion when any recorded relay report is still
 // pending (never surfaced in visible output), printing each missing ledger block
 // verbatim.
 func handleStop(statePath string, now time.Time) Result {
@@ -235,7 +235,7 @@ func handleStop(statePath string, now time.Time) Result {
 		}
 		if lr == nil {
 			skipped = append(skipped, rec)
-			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: no attestation block found", filepath.ToSlash(rec.LedgerPath)))
+			skipNotes = append(skipNotes, fmt.Sprintf("- skipped unreadable relay ledger %s: no report block found", filepath.ToSlash(rec.LedgerPath)))
 			continue
 		}
 		blocks = append(blocks, lr.block)
@@ -264,8 +264,8 @@ func handleStop(statePath string, now time.Time) Result {
 	}
 
 	lines := []string{
-		"loopcoder local verbatim attestation relay was missing from the completed command output.",
-		"The missing local-only attestation block(s) are printed below:",
+		"loopcoder local verbatim report relay was missing from the completed command output.",
+		"The missing local-only report block(s) are printed below:",
 		"",
 	}
 	if len(skipNotes) > 0 {
@@ -275,7 +275,7 @@ func handleStop(statePath string, now time.Time) Result {
 	}
 	lines = append(lines,
 		strings.Join(blocks, "\n"),
-		"Keep these attestations local-only: do not copy them into PRs, issues, comments, commits, merge artifacts, docs, or tracked files.",
+		"Keep these reports local-only: do not copy them into PRs, issues, comments, commits, merge artifacts, docs, or tracked files.",
 	)
 	return block(strings.Join(lines, "\n"))
 }
@@ -444,7 +444,7 @@ type ledgerTooLargeError struct{ path string }
 func (e *ledgerTooLargeError) Error() string { return "relay ledger too large: " + e.path }
 
 // readLedgerRecord reads and parses one ledger file. Returns (nil, nil) when the
-// file has no attestation block or no worker/verifier role header. Returns an
+// file has no report block or no worker/verifier role header. Returns an
 // error when the file exceeds the size cap or cannot be read.
 func readLedgerRecord(filePath string) (*ledgerRecord, error) {
 	info, err := os.Stat(filePath)
@@ -459,7 +459,7 @@ func readLedgerRecord(filePath string) (*ledgerRecord, error) {
 		return nil, err
 	}
 	text := string(data)
-	block := ledgerAttestationBlock(text)
+	block := ledgerReportBlock(text)
 	if block == "" {
 		return nil, nil
 	}
@@ -485,10 +485,10 @@ func readLedgerRecord(filePath string) (*ledgerRecord, error) {
 	}, nil
 }
 
-// ledgerAttestationBlock returns the attestation block: from the first line
+// ledgerReportBlock returns the report block: from the first line
 // matching the worker/verifier header to end of text, with trailing newlines
 // trimmed and exactly one "\n" appended. Returns "" when no header is present.
-func ledgerAttestationBlock(text string) string {
+func ledgerReportBlock(text string) string {
 	loc := ledgerHeaderRe.FindStringIndex(text)
 	if loc == nil {
 		return ""
@@ -520,9 +520,9 @@ func recordCommandMatches(kind string, rec ledgerRecord) bool {
 		(kind == "loopreview" && rec.role == "verifier")
 }
 
-// containsSurfacedAttestation reports whether the visible output surfaced the
-// record's attestation (by header, role header, or verified role JSON).
-func containsSurfacedAttestation(text string, rec ledgerRecord) bool {
+// containsSurfacedReport reports whether the visible output surfaced the
+// record's report (by header, role header, or verified role JSON).
+func containsSurfacedReport(text string, rec ledgerRecord) bool {
 	if rec.header != "" && strings.Contains(text, rec.header) {
 		return true
 	}

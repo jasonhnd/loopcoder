@@ -219,14 +219,14 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 
 func TestRenderDispatchWaveIssueCompletionGoldenBytes(t *testing.T) {
 	result := dispatchWaveGoldenReport().Results[0]
-	const pretty = "worker attestation\n  provider codex\n"
+	const pretty = "worker report\n  provider codex\n"
 
 	const want = "DISPATCH WAVE WORKER #7 succeeded\n" +
 		"branch: loop/issue-7\n" +
 		"pr: https://github.com/owner/repo/pull/7\n" +
 		"attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
 		"recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
-		"worker attestation\n" +
+		"worker report\n" +
 		"  provider codex\n" +
 		"\n"
 	if got := RenderDispatchWaveIssueCompletion(result, pretty); got != want {

@@ -4,8 +4,8 @@
 // Both hooks fail open: on ANY error (malformed JSON, missing session id, any
 // filesystem error, or a panic) they return an allow result (exit code 0). The
 // only non-zero exits are the two explicit block cases in RunAttest (Stop
-// without a recorded conductor attestation) and RunRelayGuard (Stop with a
-// pending, un-surfaced relay attestation).
+// without a recorded conductor report) and RunRelayGuard (Stop with a
+// pending, un-surfaced relay report).
 package conductorhooks
 
 import (
