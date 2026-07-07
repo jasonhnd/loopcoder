@@ -188,7 +188,7 @@ During the 0.6.0 transition, readers accept legacy `[attestation]` headers, lega
 
 `loopcoder hook conductor-reporter` enforces the local Conductor self-report step before a delivery or merge turn can finish. `loopcoder hook conductor-relay-guard` prevents hidden Worker and Verifier report blocks from completing a turn. The relay hard gate blocks mechanical progress with exit code `4` while pending Worker/Verifier blocks are unacknowledged; `loopcoder relay flush --repo .` prints and clears them, and `loopcoder relay list --repo .` inspects them.
 
-### loopreview Exit Codes And Relay Gate
+### loopreview exit codes and relay gate
 
 `loopcoder loopreview` reserves process exit codes `0`, `1`, and `2` for clean verifier verdicts only, so CI can distinguish a review decision from a command failure:
 
