@@ -1,4 +1,4 @@
-package attestation
+package reporter
 
 import (
 	"encoding/json"
@@ -20,7 +20,7 @@ func TestCanonicalJSONShapeAndRoundTrip(t *testing.T) {
 		t.Fatalf("canonical JSON = %s, want %s", string(data), want)
 	}
 
-	var roundTrip AttestationRecord
+	var roundTrip Report
 	if err := json.Unmarshal(data, &roundTrip); err != nil {
 		t.Fatalf("round trip unmarshal returned error: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestHeaderFormatting(t *testing.T) {
 func TestValidateSuccess(t *testing.T) {
 	tests := []struct {
 		name   string
-		record AttestationRecord
+		record Report
 	}{
 		{
 			name:   "split and total tokens",
@@ -55,7 +55,7 @@ func TestValidateSuccess(t *testing.T) {
 		},
 		{
 			name: "total only tokens and empty effort",
-			record: AttestationRecord{
+			record: Report{
 				Role:        RoleConductor,
 				Provider:    "codex-cli",
 				Model:       "gpt-5.5",
@@ -74,7 +74,7 @@ func TestValidateSuccess(t *testing.T) {
 		},
 		{
 			name: "split tokens only",
-			record: AttestationRecord{
+			record: Report{
 				Role:        RoleVerifier,
 				Provider:    "claude",
 				Model:       "opus",
@@ -95,7 +95,7 @@ func TestValidateSuccess(t *testing.T) {
 		},
 		{
 			name: "antigravity self-reported without usage",
-			record: AttestationRecord{
+			record: Report{
 				Role:        RoleWorker,
 				Provider:    "antigravity",
 				Model:       "Gemini 3.1 Pro (High)",
@@ -123,7 +123,7 @@ func TestValidateSuccess(t *testing.T) {
 
 func TestValidateAllowsAntigravityAbsentUsageButNotCodex(t *testing.T) {
 	payload := `{"role":"verifier","provider":"antigravity","model":"Gemini 3.1 Pro (High)","model_source":"self-reported","effort":"High","permission":"read-only","action":"review PR #559","exit_code":0,"started_at":"2026-06-28T00:00:00Z","ended_at":"2026-06-28T00:00:02Z","duration_ms":2000,"verified":true}`
-	var record AttestationRecord
+	var record Report
 	if err := json.Unmarshal([]byte(payload), &record); err != nil {
 		t.Fatalf("Unmarshal returned error: %v", err)
 	}
@@ -162,26 +162,26 @@ func TestValidateReportsMissingRequiredFields(t *testing.T) {
 func TestValidateReportsInvalidEnums(t *testing.T) {
 	tests := []struct {
 		name   string
-		update func(*AttestationRecord)
+		update func(*Report)
 		field  string
 	}{
 		{
 			name: "role",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.Role = "builder"
 			},
 			field: "role",
 		},
 		{
 			name: "model_source",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.ModelSource = "guessed"
 			},
 			field: "model_source",
 		},
 		{
 			name: "permission",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.Permission = "admin"
 			},
 			field: "permission",
@@ -198,7 +198,7 @@ func TestValidateReportsInvalidEnums(t *testing.T) {
 }
 
 func TestValidateReportsAllProblems(t *testing.T) {
-	var record AttestationRecord
+	var record Report
 	err := record.Validate()
 	for _, field := range []string{
 		"role",
@@ -218,47 +218,47 @@ func TestValidateReportsAllProblems(t *testing.T) {
 func TestValidateReportsInvalidScalarsAndUsage(t *testing.T) {
 	tests := []struct {
 		name   string
-		update func(*AttestationRecord)
+		update func(*Report)
 		field  string
 	}{
 		{
 			name: "negative exit code",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.ExitCode = -1
 			},
 			field: "exit_code",
 		},
 		{
 			name: "invalid started_at",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.StartedAt = "not-a-time"
 			},
 			field: "started_at",
 		},
 		{
 			name: "invalid ended_at",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.EndedAt = "not-a-time"
 			},
 			field: "ended_at",
 		},
 		{
 			name: "negative duration",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.DurationMS = -1
 			},
 			field: "duration_ms",
 		},
 		{
 			name: "missing token counts",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.Usage = Usage{}
 			},
 			field: "usage",
 		},
 		{
 			name: "negative token count",
-			update: func(record *AttestationRecord) {
+			update: func(record *Report) {
 				record.Usage.InputTokens = int64Ptr(-1)
 			},
 			field: "usage.input_tokens",
@@ -274,8 +274,8 @@ func TestValidateReportsInvalidScalarsAndUsage(t *testing.T) {
 	}
 }
 
-func validRecord() AttestationRecord {
-	return AttestationRecord{
+func validRecord() Report {
+	return Report{
 		Role:        RoleWorker,
 		Provider:    "codex",
 		Model:       "gpt-5.5",
@@ -296,7 +296,7 @@ func validRecord() AttestationRecord {
 	}
 }
 
-func recordWithoutField(t *testing.T, field string) AttestationRecord {
+func recordWithoutField(t *testing.T, field string) Report {
 	t.Helper()
 	data, err := validRecord().CanonicalJSON()
 	if err != nil {
@@ -311,7 +311,7 @@ func recordWithoutField(t *testing.T, field string) AttestationRecord {
 	if err != nil {
 		t.Fatalf("marshal payload returned error: %v", err)
 	}
-	var record AttestationRecord
+	var record Report
 	if err := json.Unmarshal(data, &record); err != nil {
 		t.Fatalf("unmarshal record returned error: %v", err)
 	}

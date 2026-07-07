@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	reportpkg "github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func TestRenderTickTextGoldenBytes(t *testing.T) {
@@ -249,7 +249,7 @@ func TestStateFilesDoNotCallPresentationHelpers(t *testing.T) {
 		"renderPromoteGoNoGoPanel":          true,
 		"RenderDispatchWaveText":            true,
 		"RenderDispatchWaveIssueCompletion": true,
-		"formatDispatchWaveAttestation":     true,
+		"formatDispatchWaveReport":          true,
 		"formatDispatchWaveDuration":        true,
 		"formatDispatchWaveToken":           true,
 		"dispatchWaveCounts":                true,
@@ -329,14 +329,14 @@ func dispatchWaveGoldenReport() DispatchWaveReport {
 				PR:                  "https://github.com/owner/repo/pull/7",
 				AttemptPath:         ".loopcoder/runs/run-wave-golden/workers/job-7.attempt.json",
 				RecoveryContextPath: ".loopcoder/runs/run-wave-golden/recovery/job-7-context.md",
-				Attestation: &attestation.AttestationRecord{
+				Report: &reporter.Report{
 					Provider:    "codex",
 					Model:       "gpt-5",
-					ModelSource: attestation.ModelSourceParsed,
+					ModelSource: reporter.ModelSourceParsed,
 					Effort:      "high",
-					Permission:  attestation.PermissionWrite,
+					Permission:  reporter.PermissionWrite,
 					DurationMS:  1500,
-					Usage: attestation.Usage{
+					Usage: reporter.Usage{
 						InputTokens:  &inputTokens,
 						OutputTokens: &outputTokens,
 						TotalTokens:  &totalTokens,

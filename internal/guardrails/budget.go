@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
@@ -939,7 +939,7 @@ func normalizeIssues(issues []int) []int {
 	return out
 }
 
-func usageTotal(usage *attestation.Usage) (int64, bool) {
+func usageTotal(usage *reporter.Usage) (int64, bool) {
 	if usage == nil {
 		return 0, false
 	}

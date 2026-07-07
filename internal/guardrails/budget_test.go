@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
@@ -85,11 +85,11 @@ func TestEvaluateBudgetBlocksWhenAttemptCapWouldBeExceeded(t *testing.T) {
 	}
 }
 
-func TestEvaluateBudgetUsesAttestationTokenUsage(t *testing.T) {
+func TestEvaluateBudgetUsesReportTokenUsage(t *testing.T) {
 	repo := t.TempDir()
 	input := int64(7)
 	output := int64(8)
-	writeAttempt(t, repo, "run-test", 103, "job-103-1", 1, &attestation.Usage{
+	writeAttempt(t, repo, "run-test", 103, "job-103-1", 1, &reporter.Usage{
 		InputTokens:  &input,
 		OutputTokens: &output,
 	}, nil)
@@ -222,7 +222,7 @@ func writeAllowedLedger(t *testing.T, repo, runID string, issue int, scopeID str
 	}
 }
 
-func writeAttempt(t *testing.T, repo, runID string, issue int, jobID string, attemptNumber int, usage *attestation.Usage, costUSD *float64) {
+func writeAttempt(t *testing.T, repo, runID string, issue int, jobID string, attemptNumber int, usage *reporter.Usage, costUSD *float64) {
 	t.Helper()
 	_, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
 		Version:        1,
@@ -246,8 +246,8 @@ func writeAttempt(t *testing.T, repo, runID string, issue int, jobID string, att
 	}
 }
 
-func usageTotalOnly(tokens int64) *attestation.Usage {
-	return &attestation.Usage{TotalTokens: &tokens}
+func usageTotalOnly(tokens int64) *reporter.Usage {
+	return &reporter.Usage{TotalTokens: &tokens}
 }
 
 func fixedBudgetTime() time.Time {

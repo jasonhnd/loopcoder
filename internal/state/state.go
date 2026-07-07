@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 const runIDTimeLayout = "20060102T150405Z"
@@ -21,49 +21,49 @@ const runIDTimeLayout = "20060102T150405Z"
 var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
 
 type Attempt struct {
-	Version             int                            `json:"version,omitempty"`
-	JobID               string                         `json:"job_id"`
-	Issue               int                            `json:"issue"`
-	Attempt             int                            `json:"attempt"`
-	Provider            string                         `json:"provider,omitempty"`
-	PID                 *int                           `json:"pid,omitempty"`
-	Phase               string                         `json:"phase,omitempty"`
-	Status              string                         `json:"status,omitempty"`
-	Branch              string                         `json:"branch,omitempty"`
-	RecoveryContextPath string                         `json:"recovery_context_path,omitempty"`
-	StartedAt           string                         `json:"started_at,omitempty"`
-	HeartbeatAt         string                         `json:"heartbeat_at,omitempty"`
-	LastProgressAt      string                         `json:"last_progress_at,omitempty"`
-	LogBytes            *int64                         `json:"log_bytes,omitempty"`
-	ExitCode            *int                           `json:"exit_code,omitempty"`
-	Error               string                         `json:"error,omitempty"`
-	Usage               *attestation.Usage             `json:"usage,omitempty"`
-	Attestation         *attestation.AttestationRecord `json:"attestation,omitempty"`
-	CostUSD             *float64                       `json:"cost_usd,omitempty"`
-	Path                string                         `json:"path,omitempty"`
-	LastWriteUTC        time.Time                      `json:"-"`
+	Version             int              `json:"version,omitempty"`
+	JobID               string           `json:"job_id"`
+	Issue               int              `json:"issue"`
+	Attempt             int              `json:"attempt"`
+	Provider            string           `json:"provider,omitempty"`
+	PID                 *int             `json:"pid,omitempty"`
+	Phase               string           `json:"phase,omitempty"`
+	Status              string           `json:"status,omitempty"`
+	Branch              string           `json:"branch,omitempty"`
+	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
+	StartedAt           string           `json:"started_at,omitempty"`
+	HeartbeatAt         string           `json:"heartbeat_at,omitempty"`
+	LastProgressAt      string           `json:"last_progress_at,omitempty"`
+	LogBytes            *int64           `json:"log_bytes,omitempty"`
+	ExitCode            *int             `json:"exit_code,omitempty"`
+	Error               string           `json:"error,omitempty"`
+	Usage               *reporter.Usage  `json:"usage,omitempty"`
+	Report              *reporter.Report `json:"report,omitempty"`
+	CostUSD             *float64         `json:"cost_usd,omitempty"`
+	Path                string           `json:"path,omitempty"`
+	LastWriteUTC        time.Time        `json:"-"`
 }
 
 type AttemptRecord struct {
-	Version             int                            `json:"version"`
-	JobID               string                         `json:"job_id"`
-	Issue               int                            `json:"issue"`
-	Attempt             int                            `json:"attempt"`
-	Provider            string                         `json:"provider"`
-	PID                 int                            `json:"pid"`
-	Phase               string                         `json:"phase"`
-	Status              string                         `json:"status"`
-	Branch              string                         `json:"branch,omitempty"`
-	RecoveryContextPath string                         `json:"recovery_context_path,omitempty"`
-	StartedAt           string                         `json:"started_at"`
-	HeartbeatAt         string                         `json:"heartbeat_at"`
-	LastProgressAt      string                         `json:"last_progress_at"`
-	LogBytes            int64                          `json:"log_bytes"`
-	ExitCode            *int                           `json:"exit_code"`
-	Error               *string                        `json:"error"`
-	Usage               *attestation.Usage             `json:"usage,omitempty"`
-	Attestation         *attestation.AttestationRecord `json:"attestation,omitempty"`
-	CostUSD             *float64                       `json:"cost_usd,omitempty"`
+	Version             int              `json:"version"`
+	JobID               string           `json:"job_id"`
+	Issue               int              `json:"issue"`
+	Attempt             int              `json:"attempt"`
+	Provider            string           `json:"provider"`
+	PID                 int              `json:"pid"`
+	Phase               string           `json:"phase"`
+	Status              string           `json:"status"`
+	Branch              string           `json:"branch,omitempty"`
+	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
+	StartedAt           string           `json:"started_at"`
+	HeartbeatAt         string           `json:"heartbeat_at"`
+	LastProgressAt      string           `json:"last_progress_at"`
+	LogBytes            int64            `json:"log_bytes"`
+	ExitCode            *int             `json:"exit_code"`
+	Error               *string          `json:"error"`
+	Usage               *reporter.Usage  `json:"usage,omitempty"`
+	Report              *reporter.Report `json:"report,omitempty"`
+	CostUSD             *float64         `json:"cost_usd,omitempty"`
 }
 
 type Event struct {
@@ -279,25 +279,26 @@ func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
 }
 
 type attemptJSON struct {
-	Version             int                            `json:"version"`
-	JobID               string                         `json:"job_id"`
-	Issue               json.RawMessage                `json:"issue"`
-	Attempt             json.RawMessage                `json:"attempt"`
-	Provider            string                         `json:"provider"`
-	PID                 json.RawMessage                `json:"pid"`
-	Phase               string                         `json:"phase"`
-	Status              string                         `json:"status"`
-	Branch              string                         `json:"branch"`
-	RecoveryContextPath string                         `json:"recovery_context_path"`
-	StartedAt           string                         `json:"started_at"`
-	HeartbeatAt         string                         `json:"heartbeat_at"`
-	LastProgressAt      string                         `json:"last_progress_at"`
-	LogBytes            json.RawMessage                `json:"log_bytes"`
-	ExitCode            json.RawMessage                `json:"exit_code"`
-	Error               string                         `json:"error"`
-	Usage               *attestation.Usage             `json:"usage"`
-	Attestation         *attestation.AttestationRecord `json:"attestation"`
-	CostUSD             json.RawMessage                `json:"cost_usd"`
+	Version             int              `json:"version"`
+	JobID               string           `json:"job_id"`
+	Issue               json.RawMessage  `json:"issue"`
+	Attempt             json.RawMessage  `json:"attempt"`
+	Provider            string           `json:"provider"`
+	PID                 json.RawMessage  `json:"pid"`
+	Phase               string           `json:"phase"`
+	Status              string           `json:"status"`
+	Branch              string           `json:"branch"`
+	RecoveryContextPath string           `json:"recovery_context_path"`
+	StartedAt           string           `json:"started_at"`
+	HeartbeatAt         string           `json:"heartbeat_at"`
+	LastProgressAt      string           `json:"last_progress_at"`
+	LogBytes            json.RawMessage  `json:"log_bytes"`
+	ExitCode            json.RawMessage  `json:"exit_code"`
+	Error               string           `json:"error"`
+	Usage               *reporter.Usage  `json:"usage"`
+	Report              *reporter.Report `json:"report"`
+	LegacyReport        *reporter.Report `json:"attestation"`
+	CostUSD             json.RawMessage  `json:"cost_usd"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -340,6 +341,11 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		lastWrite = info.ModTime().UTC()
 	}
 
+	report := raw.Report
+	if report == nil {
+		report = raw.LegacyReport
+	}
+
 	return Attempt{
 		Version:             raw.Version,
 		JobID:               jobID,
@@ -358,14 +364,14 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		ExitCode:            rawIntPtr(raw.ExitCode),
 		Error:               raw.Error,
 		Usage:               cloneUsage(raw.Usage),
-		Attestation:         cloneAttestation(raw.Attestation),
+		Report:              cloneReport(report),
 		CostUSD:             rawFloat64Ptr(raw.CostUSD),
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
 }
 
-func cloneAttestation(record *attestation.AttestationRecord) *attestation.AttestationRecord {
+func cloneReport(record *reporter.Report) *reporter.Report {
 	if record == nil {
 		return nil
 	}
@@ -374,7 +380,7 @@ func cloneAttestation(record *attestation.AttestationRecord) *attestation.Attest
 	return &clone
 }
 
-func cloneUsage(usage *attestation.Usage) *attestation.Usage {
+func cloneUsage(usage *reporter.Usage) *reporter.Usage {
 	if usage == nil {
 		return nil
 	}

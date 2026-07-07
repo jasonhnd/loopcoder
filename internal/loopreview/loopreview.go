@@ -24,12 +24,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -86,12 +86,12 @@ type Result struct {
 }
 
 type Verdict struct {
-	Verdict           string                         `json:"verdict"`
-	Findings          []Finding                      `json:"findings"`
-	Evidence          string                         `json:"evidence"`
-	SpecConformance   string                         `json:"spec_conformance"`
-	RenderedArtifacts []RenderedArtifact             `json:"rendered_artifacts,omitempty"`
-	Attestation       *attestation.AttestationRecord `json:"attestation,omitempty"`
+	Verdict           string             `json:"verdict"`
+	Findings          []Finding          `json:"findings"`
+	Evidence          string             `json:"evidence"`
+	SpecConformance   string             `json:"spec_conformance"`
+	RenderedArtifacts []RenderedArtifact `json:"rendered_artifacts,omitempty"`
+	Report            *reporter.Report   `json:"report,omitempty"`
 }
 
 type RenderedArtifact struct {
@@ -383,22 +383,22 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)
 		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
 	}
-	record := verifierAttestation(opts, agentResult)
+	record := verifierReport(opts, agentResult)
 	fmt.Fprintln(warnings, record.Header())
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
-		return resultWithAttestation(verdict, record), nil
+		return resultWithReport(verdict, record), nil
 	}
 	if agentResult.ExitCode != 0 {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier exited with code %d; see %s", opts.Provider, agentResult.ExitCode, logPath)))
-		return resultWithAttestation(verdict, record), nil
+		return resultWithReport(verdict, record), nil
 	}
 
 	verdict, err := ParseVerdict(agentResult.Summary)
 	if err != nil {
 		verdict = needsHumanVerdict("error", "", fmt.Sprintf("structured verdict parse failed: %v", err))
 		verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
-		return resultWithAttestation(verdict, record), nil
+		return resultWithReport(verdict, record), nil
 	}
 	verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
 	if inputs.Spec.ExpectedAbsent {
@@ -422,17 +422,17 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		appendVerdictEvidence(&verdict, note)
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
-	return resultWithAttestation(verdict, record), nil
+	return resultWithReport(verdict, record), nil
 }
 
-func verifierAttestation(opts Options, result agent.Result) attestation.AttestationRecord {
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleVerifier,
+func verifierReport(opts Options, result agent.Result) reporter.Report {
+	return reporter.Report{
+		Role:        reporter.RoleVerifier,
 		Provider:    opts.Provider,
 		Model:       result.Model,
-		ModelSource: attestation.ModelSourceForProvider(opts.Provider),
+		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      result.Effort,
-		Permission:  attestation.PermissionReadOnly,
+		Permission:  reporter.PermissionReadOnly,
 		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
@@ -443,8 +443,8 @@ func verifierAttestation(opts Options, result agent.Result) attestation.Attestat
 	}
 }
 
-func resultWithAttestation(verdict Verdict, record attestation.AttestationRecord) Result {
-	verdict.Attestation = &record
+func resultWithReport(verdict Verdict, record reporter.Report) Result {
+	verdict.Report = &record
 	if err := record.Validate(); err != nil {
 		note := "incomplete verifier attestation: " + err.Error()
 		verdict.Verdict = VerdictNeedsHuman

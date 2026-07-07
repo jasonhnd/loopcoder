@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -30,6 +29,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -1379,7 +1379,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	var ownRelayRecords []relaygate.Record
-	prettyMode := attestation.PrettyModePlain
+	prettyMode := reporter.PrettyModePlain
 	renderPretty := shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
@@ -1398,7 +1398,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if renderPretty {
-		if err := renderTickPrettyAttestations(stderr, tickReport, prettyMode); err != nil {
+		if err := renderTickPrettyReports(stderr, tickReport, prettyMode); err != nil {
 			fmt.Fprintf(stderr, "tick: write pretty attestation: %v\n", err)
 			return 1
 		}
@@ -1615,7 +1615,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	var ownRelayRecords []relaygate.Record
-	prettyMode := attestation.PrettyModePlain
+	prettyMode := reporter.PrettyModePlain
 	renderPretty := shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
@@ -1634,7 +1634,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if renderPretty {
-		if err := renderTriggerPrettyAttestations(stderr, triggerReport, prettyMode); err != nil {
+		if err := renderTriggerPrettyReports(stderr, triggerReport, prettyMode); err != nil {
 			fmt.Fprintf(stderr, "trigger %s: write pretty attestation: %v\n", kind, err)
 			return 1
 		}
@@ -1716,9 +1716,9 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 	}, true
 }
 
-func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerReport, mode attestation.PrettyMode) error {
+func renderTriggerPrettyReports(w io.Writer, report orchestration.TriggerReport, mode reporter.PrettyMode) error {
 	for _, tick := range report.Ticks {
-		if err := renderTickPrettyAttestations(w, tick, mode); err != nil {
+		if err := renderTickPrettyReports(w, tick, mode); err != nil {
 			return err
 		}
 	}
@@ -1736,7 +1736,7 @@ func relayRecordNonces(records []relaygate.Record) map[string]bool {
 	return nonces
 }
 
-func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerReport, mode reporter.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
 	var records []relaygate.Record
 	for _, tick := range report.Ticks {
 		tickRecords, err := writeTickRelayRecords(repoPath, tick, mode, preExisting)
@@ -1748,7 +1748,7 @@ func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerRepor
 	return records, nil
 }
 
-func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mode reporter.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
 	var records []relaygate.Record
 	if report.DispatchWave != nil {
 		runID := strings.TrimSpace(report.DispatchWave.RunID)
@@ -1756,10 +1756,10 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			runID = strings.TrimSpace(report.RunID)
 		}
 		for _, result := range report.DispatchWave.Results {
-			if result.Attestation == nil {
+			if result.Report == nil {
 				continue
 			}
-			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Attestation.Role), prNumberFromPR(result.PR), *result.Attestation, mode, preExisting)
+			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Report.Role), prNumberFromPR(result.PR), *result.Report, mode, preExisting)
 			if err != nil {
 				return records, err
 			}
@@ -1769,7 +1769,7 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 		}
 	}
 	for _, review := range report.Reviews {
-		if review.Attestation == nil {
+		if review.Report == nil {
 			continue
 		}
 		prNumber := review.PRNumber
@@ -1777,7 +1777,7 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			prNumber = prNumberFromPR(review.PR)
 		}
 		runID := fmt.Sprintf("loopreview-pr-%d", prNumber)
-		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Attestation.Role), prNumber, *review.Attestation, mode, preExisting)
+		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Report.Role), prNumber, *review.Report, mode, preExisting)
 		if err != nil {
 			return records, err
 		}
@@ -1788,8 +1788,8 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 	return records, nil
 }
 
-func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record attestation.AttestationRecord, mode attestation.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record reporter.Report, mode reporter.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	nonce := relaygate.Nonce(runID, prNumber, role)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
@@ -1934,22 +1934,22 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return orchestration.PromoteExitCode(report)
 }
 
-func renderTickPrettyAttestations(w io.Writer, report orchestration.TickReport, mode attestation.PrettyMode) error {
+func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode reporter.PrettyMode) error {
 	if report.DispatchWave != nil {
 		for _, result := range report.DispatchWave.Results {
-			if result.Attestation == nil {
+			if result.Report == nil {
 				continue
 			}
-			if err := renderPrettyAttestation(w, *result.Attestation, mode); err != nil {
+			if err := renderPrettyReport(w, *result.Report, mode); err != nil {
 				return err
 			}
 		}
 	}
 	for _, review := range report.Reviews {
-		if review.Attestation == nil {
+		if review.Report == nil {
 			continue
 		}
-		if err := renderPrettyAttestation(w, *review.Attestation, mode); err != nil {
+		if err := renderPrettyReport(w, *review.Report, mode); err != nil {
 			return err
 		}
 	}
@@ -2714,14 +2714,14 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if result.Attestation != nil {
+	if result.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeDispatchRelayLedger(opts, result, *result.Attestation, mode, deps.Now()); err != nil {
+		if err := writeDispatchRelayLedger(opts, result, *result.Report, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "dispatch: write relay ledger: %v\n", err)
 			return 1
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
+			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
 				fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
 				return 1
 			}
@@ -2730,12 +2730,12 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
-func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
+func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
 	invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
 	if invocationID == "" {
 		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
 	}
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        result.RunID,
@@ -2769,15 +2769,15 @@ func relayInvocationIDFromAttemptPath(attemptPath string) string {
 	return strings.TrimSuffix(base, ".attempt.json")
 }
 
-func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+func writeLoopreviewRelayLedger(opts loopreview.Options, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	runID := fmt.Sprintf("loopreview-pr-%d", opts.PRNumber)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        runID,
 		InvocationID: fmt.Sprintf("loopreview-pr-%d-%d", opts.PRNumber, now.UTC().UnixNano()),
 		Command:      "loopreview",
-		Role:         attestation.RoleVerifier,
+		Role:         reporter.RoleVerifier,
 		PRNumber:     opts.PRNumber,
 		CreatedAt:    now,
 		Header:       record.Header(),
@@ -2789,7 +2789,7 @@ func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.Atte
 	_, err = relaygate.Write(relaygate.WriteOptions{
 		RepoPath: opts.RepoPath,
 		RunID:    runID,
-		Role:     string(attestation.RoleVerifier),
+		Role:     string(reporter.RoleVerifier),
 		PRNumber: opts.PRNumber,
 		Block:    pretty,
 	})
@@ -2823,13 +2823,13 @@ func prNumberFromPR(pr string) int {
 }
 
 func renderDispatch(w io.Writer, result worker.Result) error {
-	if result.Attestation == nil {
+	if result.Report == nil {
 		return errors.New("dispatch attestation is missing")
 	}
-	if err := result.Attestation.Validate(); err != nil {
+	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch attestation: %w", err)
 	}
-	canonical, err := result.Attestation.CanonicalJSON()
+	canonical, err := result.Report.CanonicalJSON()
 	if err != nil {
 		return fmt.Errorf("render dispatch attestation JSON: %w", err)
 	}
@@ -2837,7 +2837,7 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(w, result.Attestation.Header()); err != nil {
+	if _, err := fmt.Fprintln(w, result.Report.Header()); err != nil {
 		return err
 	}
 	if _, err := w.Write(append(canonical, '\n')); err != nil {
@@ -2857,7 +2857,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	role := string(attestation.RoleConductor)
+	role := string(reporter.RoleConductor)
 	var roleAlias string
 	var provider string
 	var providerAlias string
@@ -2865,7 +2865,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effort string
 	var effortAlias string
-	permission := string(attestation.PermissionOrchestrate)
+	permission := string(reporter.PermissionOrchestrate)
 	var permissionAlias string
 	var action string
 	var actionAlias string
@@ -2970,7 +2970,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		"role":         role,
 		"provider":     provider,
 		"model":        model,
-		"model_source": string(attestation.ModelSourceSelfReported),
+		"model_source": string(reporter.ModelSourceSelfReported),
 		"effort":       effort,
 		"permission":   permission,
 		"action":       action,
@@ -3028,7 +3028,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
 	}
-	var record attestation.AttestationRecord
+	var record reporter.Report
 	if err := json.Unmarshal(data, &record); err != nil {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
@@ -3043,7 +3043,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if pretty {
-		if err := renderPrettyAttestation(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
+		if err := renderPrettyReport(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
 			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
 			return 1
 		}
@@ -3392,24 +3392,24 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
 	renderPretty := shouldRenderPretty(noPretty)
 	writeWaveRelayRecord := func(runID string, result orchestration.DispatchWaveIssueResult) error {
-		if result.Attestation == nil {
+		if result.Report == nil {
 			return nil
 		}
 		invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
 		if invocationID == "" {
 			invocationID = fmt.Sprintf("dispatch-wave-issue-%d-%d", result.Issue, deps.Now().UTC().UnixNano())
 		}
-		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
 		if _, err := relay.Write(relay.Entry{
 			RepoPath:     resolvedRepo,
 			RunID:        runID,
 			InvocationID: invocationID,
 			Command:      "dispatch-wave",
-			Role:         result.Attestation.Role,
+			Role:         result.Report.Role,
 			Issue:        result.Issue,
 			PR:           result.PR,
 			CreatedAt:    deps.Now(),
-			Header:       result.Attestation.Header(),
+			Header:       result.Report.Header(),
 			Pretty:       prettyBlock,
 		}); err != nil {
 			return err
@@ -3421,7 +3421,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		_, err := relaygate.Write(relaygate.WriteOptions{
 			RepoPath: resolvedRepo,
 			RunID:    runID,
-			Role:     string(result.Attestation.Role),
+			Role:     string(result.Report.Role),
 			PRNumber: prNumber,
 			Block:    prettyBlock,
 		})
@@ -3429,7 +3429,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	streamWaveCompletion := func(completion orchestration.DispatchWaveIssueComplete) error {
 		result := completion.Result
-		if result.Attestation == nil {
+		if result.Report == nil {
 			return nil
 		}
 		if err := writeWaveRelayRecord(completion.RunID, result); err != nil {
@@ -3438,7 +3438,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if !renderPretty {
 			return nil
 		}
-		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
 		text := orchestration.RenderDispatchWaveIssueCompletion(result, prettyBlock)
 		if _, err := stdout.Write([]byte(text)); err != nil {
 			return fmt.Errorf("write worker #%d completion: %w", result.Issue, err)
@@ -3862,14 +3862,14 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	if result.Verdict.Attestation != nil {
+	if result.Verdict.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Attestation, mode, deps.Now()); err != nil {
+		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Report, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
 			return loopreviewCommandFailureExitCode
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, mode); err != nil {
+			if err := renderPrettyReport(stderr, *result.Verdict.Report, mode); err != nil {
 				fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
 				return loopreviewCommandFailureExitCode
 			}
@@ -3977,7 +3977,7 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Status:      result.Status,
 				ExitCode:    result.ExitCode,
 				LogBytes:    result.LogBytes,
-				Attestation: result.Attestation,
+				Report:      result.Report,
 			}, err
 		}
 		recoverDeps.Review = review

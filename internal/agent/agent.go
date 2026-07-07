@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 type Invocation struct {
@@ -43,7 +43,7 @@ type Result struct {
 	Summary    string
 	Model      string
 	Effort     string
-	Usage      attestation.Usage
+	Usage      reporter.Usage
 	StartedAt  string
 	EndedAt    string
 	DurationMS int64

@@ -10,7 +10,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 // Entry describes one local attestation block that a conductor must be able to
@@ -20,7 +20,7 @@ type Entry struct {
 	RunID        string
 	InvocationID string
 	Command      string
-	Role         attestation.Role
+	Role         reporter.Role
 	Issue        int
 	PRNumber     int
 	PR           string

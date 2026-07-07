@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func isTerminalWriter(w io.Writer) bool {
@@ -25,21 +25,21 @@ func shouldRenderPretty(suppress bool) bool {
 	return !(suppress || envFlag("LOOPCODER_NO_PRETTY"))
 }
 
-func prettyModeForTarget(w io.Writer, deps Deps, forceEmoji bool) attestation.PrettyMode {
+func prettyModeForTarget(w io.Writer, deps Deps, forceEmoji bool) reporter.PrettyMode {
 	if plainPrettyForced() {
-		return attestation.PrettyModePlain
+		return reporter.PrettyModePlain
 	}
 	if forceEmoji || envFlag("LOOPCODER_PRETTY") {
-		return attestation.PrettyModeEmoji
+		return reporter.PrettyModeEmoji
 	}
 	if prettyTargetInteractive(w, deps) {
-		return attestation.PrettyModeEmoji
+		return reporter.PrettyModeEmoji
 	}
-	return attestation.PrettyModePlain
+	return reporter.PrettyModePlain
 }
 
-func renderPrettyAttestation(w io.Writer, record attestation.AttestationRecord, mode attestation.PrettyMode) error {
-	_, err := fmt.Fprintln(w, record.Pretty(attestation.PrettyOptions{Mode: mode}))
+func renderPrettyReport(w io.Writer, record reporter.Report, mode reporter.PrettyMode) error {
+	_, err := fmt.Fprintln(w, record.Pretty(reporter.PrettyOptions{Mode: mode}))
 	return err
 }
 

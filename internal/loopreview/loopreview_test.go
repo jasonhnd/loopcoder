@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -1893,7 +1893,7 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	if result.Verdict.Verdict != VerdictPass || result.ExitCode != 0 {
 		t.Fatalf("result = %#v, want pass exit 0", result)
 	}
-	if result.Verdict.Attestation == nil {
+	if result.Verdict.Report == nil {
 		t.Fatal("verdict missing attestation")
 	}
 	sourceRef := prHeadLocalRef(152)
@@ -2333,7 +2333,7 @@ func TestRunReturnsNeedsHumanWhenPRHeadRefSHADoesNotMatch(t *testing.T) {
 	}
 }
 
-func TestRunVerifierAttestation(t *testing.T) {
+func TestRunVerifierReport(t *testing.T) {
 	validSummary := `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`
 	tests := []struct {
 		name        string
@@ -2355,7 +2355,7 @@ func TestRunVerifierAttestation(t *testing.T) {
 				StartedAt:  "2026-06-28T00:00:00Z",
 				EndedAt:    "2026-06-28T00:00:02Z",
 				DurationMS: 2000,
-				Usage: attestation.Usage{
+				Usage: reporter.Usage{
 					TotalTokens: int64Ptr(123),
 				},
 			},
@@ -2374,12 +2374,12 @@ func TestRunVerifierAttestation(t *testing.T) {
 			if result.ExitCode != ExitCodeForVerdict(tt.wantVerdict) {
 				t.Fatalf("exit code = %d, want %d", result.ExitCode, ExitCodeForVerdict(tt.wantVerdict))
 			}
-			if result.Verdict.Attestation == nil {
+			if result.Verdict.Report == nil {
 				t.Fatal("verdict missing attestation")
 			}
 
-			record := result.Verdict.Attestation
-			if record.Role != attestation.RoleVerifier || record.Provider != "codex" || record.ModelSource != attestation.ModelSourceParsed || record.Permission != attestation.PermissionReadOnly || !record.Verified {
+			record := result.Verdict.Report
+			if record.Role != reporter.RoleVerifier || record.Provider != "codex" || record.ModelSource != reporter.ModelSourceParsed || record.Permission != reporter.PermissionReadOnly || !record.Verified {
 				t.Fatalf("attestation identity fields = %#v", record)
 			}
 			if record.Action != "review PR #152" || record.ExitCode != tt.agent.ExitCode {
@@ -2397,8 +2397,8 @@ func TestRunVerifierAttestation(t *testing.T) {
 			if err := json.Unmarshal([]byte(rendered.String()), &payload); err != nil {
 				t.Fatalf("rendered verdict is not JSON: %v\n%s", err, rendered.String())
 			}
-			if _, ok := payload["attestation"]; !ok {
-				t.Fatalf("rendered verdict missing attestation: %s", rendered.String())
+			if _, ok := payload["report"]; !ok {
+				t.Fatalf("rendered verdict missing report: %s", rendered.String())
 			}
 
 			if tt.wantNote != "" {
@@ -2418,8 +2418,8 @@ func TestRunVerifierAttestation(t *testing.T) {
 	}
 }
 
-func TestVerifierAttestationAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
-	record := verifierAttestation(Options{
+func TestVerifierReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
+	record := verifierReport(Options{
 		PRNumber: 559,
 		Provider: "antigravity",
 	}, agent.Result{
@@ -2432,7 +2432,7 @@ func TestVerifierAttestationAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
 		DurationMS: 2000,
 	})
 
-	if record.ModelSource != attestation.ModelSourceSelfReported {
+	if record.ModelSource != reporter.ModelSourceSelfReported {
 		t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)
 	}
 	if record.Usage.TotalTokens != nil || record.Usage.InputTokens != nil || record.Usage.OutputTokens != nil {
@@ -2468,8 +2468,8 @@ func TestRunVerifierNonZeroExitReturnsNeedsHuman(t *testing.T) {
 	if !strings.Contains(result.Verdict.Evidence, "codex verifier exited with code 7") {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
 	}
-	if result.Verdict.Attestation == nil || result.Verdict.Attestation.ExitCode != 7 {
-		t.Fatalf("attestation = %#v, want exit code 7", result.Verdict.Attestation)
+	if result.Verdict.Report == nil || result.Verdict.Report.ExitCode != 7 {
+		t.Fatalf("attestation = %#v, want exit code 7", result.Verdict.Report)
 	}
 }
 
@@ -2548,8 +2548,8 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 	if !strings.Contains(result.Verdict.Evidence, "claude verifier timed out after 10ms") {
 		t.Fatalf("evidence = %q", result.Verdict.Evidence)
 	}
-	if result.Verdict.Attestation != nil {
-		t.Fatalf("hung verifier result had attestation: %#v", result.Verdict.Attestation)
+	if result.Verdict.Report != nil {
+		t.Fatalf("hung verifier result had attestation: %#v", result.Verdict.Report)
 	}
 	if fakeAgent.calls != 1 {
 		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
@@ -2730,7 +2730,7 @@ func validLoopreviewAgentResult(summary string, exitCode int) agent.Result {
 		StartedAt:  "2026-06-28T00:00:00Z",
 		EndedAt:    "2026-06-28T00:00:02Z",
 		DurationMS: 2000,
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			InputTokens:  int64Ptr(12),
 			OutputTokens: int64Ptr(34),
 			TotalTokens:  int64Ptr(46),

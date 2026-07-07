@@ -1,4 +1,4 @@
-package attestation
+package reporter
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// PrettyMode selects the human-oriented attestation rendering style.
+// PrettyMode selects the human-oriented report rendering style.
 type PrettyMode int
 
 const (
@@ -17,16 +17,16 @@ const (
 	PrettyModePlain
 )
 
-// PrettyOptions configures human-oriented attestation rendering.
+// PrettyOptions configures human-oriented report rendering.
 type PrettyOptions struct {
 	Mode PrettyMode
 }
 
-// Pretty renders a human-oriented, multi-line attestation summary.
+// Pretty renders a human-oriented, multi-line report summary.
 //
 // Pretty output is not a machine parse target. Use CanonicalJSON or Header for
 // durable machine or greppable output.
-func (r AttestationRecord) Pretty(options PrettyOptions) string {
+func (r Report) Pretty(options PrettyOptions) string {
 	status := r.prettyStatus()
 	prefix := "   "
 	statusLine := status.emojiLine
@@ -60,21 +60,21 @@ type prettyStatus struct {
 	plainLine string
 }
 
-func (r AttestationRecord) prettyStatus() prettyStatus {
+func (r Report) prettyStatus() prettyStatus {
 	if r.ExitCode != 0 {
 		return prettyStatus{
-			emojiLine: "❌ attestation failed",
+			emojiLine: "\u274c attestation failed",
 			plainLine: "attestation: failed",
 		}
 	}
 	if r.Verified {
 		return prettyStatus{
-			emojiLine: "✅ attestation verified",
+			emojiLine: "\u2705 attestation verified",
 			plainLine: "attestation: verified",
 		}
 	}
 	return prettyStatus{
-		emojiLine: "⚠️ attestation self-reported",
+		emojiLine: "\u26a0\ufe0f attestation self-reported",
 		plainLine: "attestation: self-reported",
 	}
 }

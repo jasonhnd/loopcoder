@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func TestNormalizeLayersAllowsLLMAndAll(t *testing.T) {
@@ -114,14 +114,14 @@ mcp:
 	if finding.Layer != LayerLLM || finding.Tool != auditReviewTool || finding.Severity != SeverityHigh || finding.Rule != "llm:shared-host" {
 		t.Fatalf("finding not normalized: %#v", finding)
 	}
-	if result.Attestation == nil {
-		t.Fatal("Attestation = nil, want verifier attestation")
+	if result.Report == nil {
+		t.Fatal("Report = nil, want verifier report")
 	}
-	if err := result.Attestation.Validate(); err != nil {
-		t.Fatalf("attestation did not validate: %v", err)
+	if err := result.Report.Validate(); err != nil {
+		t.Fatalf("report did not validate: %v", err)
 	}
-	if result.Attestation.Role != attestation.RoleVerifier || result.Attestation.Permission != attestation.PermissionReadOnly || !result.Attestation.Verified {
-		t.Fatalf("attestation semantics = %#v", result.Attestation)
+	if result.Report.Role != reporter.RoleVerifier || result.Report.Permission != reporter.PermissionReadOnly || !result.Report.Verified {
+		t.Fatalf("report semantics = %#v", result.Report)
 	}
 }
 
@@ -348,7 +348,7 @@ func validAgentResult(summary string) agent.Result {
 		StartedAt:  started.Format(time.RFC3339Nano),
 		EndedAt:    ended.Format(time.RFC3339Nano),
 		DurationMS: int64((2 * time.Second).Milliseconds()),
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			TotalTokens: &total,
 		},
 	}
