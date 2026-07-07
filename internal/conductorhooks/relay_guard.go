@@ -18,7 +18,7 @@ const (
 )
 
 var (
-	ledgerHeaderRe     = regexp.MustCompile(`(?m)^\[attestation\]\s+role=(worker|verifier)\b`)
+	ledgerHeaderRe     = regexp.MustCompile(`(?m)^\[(?:attestation|reporter)\]\s+role=(worker|verifier)\b`)
 	trailingNewlinesRe = regexp.MustCompile(`(?:\r?\n)*$`)
 	verifiedTrueJSONRe = regexp.MustCompile(`"verified"\s*:\s*true`)
 )
@@ -526,7 +526,7 @@ func containsSurfacedAttestation(text string, rec ledgerRecord) bool {
 	if rec.header != "" && strings.Contains(text, rec.header) {
 		return true
 	}
-	rolePattern := regexp.MustCompile(`\[attestation\]\s+role=` + regexp.QuoteMeta(rec.role) + `\b`)
+	rolePattern := regexp.MustCompile(`\[(?:attestation|reporter)\]\s+role=` + regexp.QuoteMeta(rec.role) + `\b`)
 	if rolePattern.MatchString(text) {
 		return true
 	}

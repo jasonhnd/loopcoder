@@ -87,7 +87,7 @@ func TestRunChecksConductorHookSettings(t *testing.T) {
 			want: StatusWarn,
 			contains: []string{
 				"active Claude Code settings not found",
-				"conductor-attest",
+				"conductor-reporter",
 				"conductor-relay-guard",
 				"run: loopcoder skill install",
 			},

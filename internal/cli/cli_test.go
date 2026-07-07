@@ -636,6 +636,7 @@ func TestRelayGateNeverGatesAutomationCommands(t *testing.T) {
 		name string
 		args []string
 	}{
+		{name: "hook conductor-reporter", args: []string{"hook", "conductor-reporter"}},
 		{name: "hook conductor-attest", args: []string{"hook", "conductor-attest"}},
 		{name: "hook conductor-relay-guard", args: []string{"hook", "conductor-relay-guard"}},
 		{name: "attest", args: []string{"attest", "--provider", "codex-cli", "--model", "gpt-5", "--action", "test", "--duration-ms", "1", "--total-tokens", "1"}},

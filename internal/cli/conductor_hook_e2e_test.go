@@ -24,7 +24,7 @@ import (
 // actually enforce. This is the seam that had no test before.
 func TestConductorHookInstallEndToEnd(t *testing.T) {
 	// Force the auto-detection path deterministically regardless of ambient env.
-	t.Setenv("LOOPCODER_CONDUCTOR_ATTEST_SCOPE", "auto")
+	t.Setenv("LOOPCODER_CONDUCTOR_REPORTER_SCOPE", "auto")
 
 	project := t.TempDir()
 	skillDir := t.TempDir()
@@ -52,14 +52,14 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 	if bytes.Contains(settings, []byte("node hooks/")) {
 		t.Fatalf("settings still reference a node hooks/* script:\n%s", settings)
 	}
-	command := extractHookCommand(t, settings, "conductor-attest")
-	if command != "loopcoder hook conductor-attest" {
-		t.Fatalf("installed command = %q, want %q", command, "loopcoder hook conductor-attest")
+	command := extractHookCommand(t, settings, "conductor-reporter")
+	if command != "loopcoder hook conductor-reporter" {
+		t.Fatalf("installed command = %q, want %q", command, "loopcoder hook conductor-reporter")
 	}
 
 	// 3. THE REGRESSION CHECK: the exact installed command must resolve to a
 	// real, working subcommand. Strip the leading binary token and drive the
-	// rest through the CLI. Under the D gate the conductor-attest hook only
+	// rest through the CLI. Under the D gate the conductor reporter hook only
 	// blocks on a delivery/merge turn, so first feed a delivery PostToolUse,
 	// then a Stop: with the marker present and no attestation it must BLOCK
 	// (exit 2) — proving the installed command is wired to live logic, not a
@@ -68,7 +68,7 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 	if len(fields) < 2 || fields[0] != "loopcoder" {
 		t.Fatalf("installed command %q is not a loopcoder subcommand invocation", command)
 	}
-	args := fields[1:] // ["hook", "conductor-attest"]
+	args := fields[1:] // ["hook", "conductor-reporter"]
 
 	deliveryPayload := mustJSONBytes(t, map[string]any{
 		"session_id":      "e2e-session",
@@ -105,7 +105,7 @@ func TestConductorHookInstallEndToEnd(t *testing.T) {
 // command does NOT enforce (exits 0) in a plain directory with no marker, so
 // the hook never blocks unrelated, non-loopcoder work.
 func TestConductorHookCommandFailsOpenOutsideWorkspace(t *testing.T) {
-	t.Setenv("LOOPCODER_CONDUCTOR_ATTEST_SCOPE", "auto")
+	t.Setenv("LOOPCODER_CONDUCTOR_REPORTER_SCOPE", "auto")
 
 	bare := t.TempDir() // no marker, no SKILL.md/AGENTS.md/.delivery.yml
 	stopPayload := mustJSONBytes(t, map[string]any{
@@ -119,6 +119,42 @@ func TestConductorHookCommandFailsOpenOutsideWorkspace(t *testing.T) {
 	deps.Stdin = bytes.NewReader(stopPayload)
 	if code := RunWithDeps([]string{"hook", "conductor-attest"}, &stdout, &stderr, deps); code != 0 {
 		t.Fatalf("hook exit = %d in non-workspace dir, want 0 (fail open); stderr=%q", code, stderr.String())
+	}
+}
+
+func TestConductorHookLegacyCommandAliasRunsReporterHook(t *testing.T) {
+	t.Setenv("LOOPCODER_CONDUCTOR_REPORTER_SCOPE", "always")
+
+	project := t.TempDir()
+	deliveryPayload := mustJSONBytes(t, map[string]any{
+		"session_id":      "legacy-alias-session",
+		"cwd":             project,
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "Bash",
+		"tool_input":      map[string]any{"command": "loopcoder dispatch --repo ."},
+		"tool_response":   map[string]any{"exit_code": 0},
+	})
+	stopPayload := mustJSONBytes(t, map[string]any{
+		"session_id":      "legacy-alias-session",
+		"cwd":             project,
+		"hook_event_name": "Stop",
+	})
+
+	deps := DefaultDeps()
+	deps.Stdin = bytes.NewReader(deliveryPayload)
+	var stdout, stderr bytes.Buffer
+	if code := RunWithDeps([]string{"hook", "conductor-attest"}, &stdout, &stderr, deps); code != 0 {
+		t.Fatalf("legacy delivery hook exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	deps.Stdin = bytes.NewReader(stopPayload)
+	if code := RunWithDeps([]string{"hook", "conductor-attest"}, &stdout, &stderr, deps); code != 2 {
+		t.Fatalf("legacy Stop hook exit = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "conductor attestation is required") {
+		t.Fatalf("legacy hook stderr = %q, want conductor prompt", stderr.String())
 	}
 }
 
