@@ -9,7 +9,8 @@ import (
 	"time"
 )
 
-const workerHeader = `[attestation] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`
+const workerHeader = `[reporter] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`
+const legacyWorkerHeader = `[attestation] role=worker provider=codex model=gpt-5(parsed) effort=high perm=write action="implement issue #101" exit=0 dur=42s tokens=120/34|154 verified=true`
 
 var workerPretty = strings.Join([]string{
 	"attestation: verified",
@@ -28,7 +29,8 @@ var workerPretty = strings.Join([]string{
 	"  verified    true",
 }, "\n")
 
-const verifierHeader = `[attestation] role=verifier provider=claude model=claude-opus-4 effort=high perm=read action="review PR #202" exit=0 dur=17s tokens=80/21|101 verified=true`
+const verifierHeader = `[reporter] role=verifier provider=claude model=claude-opus-4 effort=high perm=read action="review PR #202" exit=0 dur=17s tokens=80/21|101 verified=true`
+const legacyVerifierHeader = `[attestation] role=verifier provider=claude model=claude-opus-4 effort=high perm=read action="review PR #202" exit=0 dur=17s tokens=80/21|101 verified=true`
 
 var verifierPretty = strings.Join([]string{
 	"attestation: verified",
@@ -64,12 +66,17 @@ func writeWorkerDispatchWaveLedger(t *testing.T, root string) (ledgerPath, block
 
 func writeWorkerLedgerForCommand(t *testing.T, root, command, filename string) (ledgerPath, block string) {
 	t.Helper()
+	return writeWorkerLedgerForCommandWithHeader(t, root, command, filename, workerHeader)
+}
+
+func writeWorkerLedgerForCommandWithHeader(t *testing.T, root, command, filename, header string) (ledgerPath, block string) {
+	t.Helper()
 	dir := filepath.Join(root, ".loopcoder", "relay", "run-test")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir worker ledger dir: %v", err)
 	}
 	ledgerPath = filepath.Join(dir, filename)
-	block = workerHeader + "\n" + workerPretty + "\n"
+	block = header + "\n" + workerPretty + "\n"
 	content := strings.Join([]string{
 		"# loopcoder relay attestation",
 		"# command=" + command,
@@ -84,14 +91,23 @@ func writeWorkerLedgerForCommand(t *testing.T, root, command, filename string) (
 	return ledgerPath, block
 }
 
+func writeLegacyWorkerLedger(t *testing.T, root string) (ledgerPath, block string) {
+	return writeWorkerLedgerForCommandWithHeader(t, root, "dispatch", "legacy-job-101-1.attest", legacyWorkerHeader)
+}
+
 func writeVerifierLedger(t *testing.T, root string) (ledgerPath, block string) {
+	t.Helper()
+	return writeVerifierLedgerWithHeader(t, root, verifierHeader, "pr-202-1.attest")
+}
+
+func writeVerifierLedgerWithHeader(t *testing.T, root, header, filename string) (ledgerPath, block string) {
 	t.Helper()
 	dir := filepath.Join(root, ".loopcoder", "relay", "run-test")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir verifier ledger dir: %v", err)
 	}
-	ledgerPath = filepath.Join(dir, "pr-202-1.attest")
-	block = verifierHeader + "\n" + verifierPretty + "\n"
+	ledgerPath = filepath.Join(dir, filename)
+	block = header + "\n" + verifierPretty + "\n"
 	content := strings.Join([]string{
 		"# loopcoder relay attestation",
 		"# command=loopreview",
@@ -104,6 +120,10 @@ func writeVerifierLedger(t *testing.T, root string) (ledgerPath, block string) {
 		t.Fatalf("write verifier ledger: %v", err)
 	}
 	return ledgerPath, block
+}
+
+func writeLegacyVerifierLedger(t *testing.T, root string) (ledgerPath, block string) {
+	return writeVerifierLedgerWithHeader(t, root, legacyVerifierHeader, "legacy-pr-202-1.attest")
 }
 
 func dispatchPostTool(root string, response map[string]any) map[string]any {
@@ -261,6 +281,27 @@ func TestRelaySwallowedWorkerBlockBlocksStop(t *testing.T) {
 	}
 }
 
+func TestRelayLegacyWorkerHeaderStillRecordsPending(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, _ := writeLegacyWorkerLedger(t, root)
+
+	postTool := RunRelayGuard(mustJSON(t, dispatchPostTool(root, map[string]any{
+		"stdout":    "dispatch completed without visible report\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{Env: mapEnv(env)})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+
+	rec := requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+	if rec.Header != legacyWorkerHeader {
+		t.Fatalf("record header = %q, want legacy header", rec.Header)
+	}
+}
+
 func TestRelayStopSkipsUnreadableLedgerButBlocksReadablePending(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
@@ -385,6 +426,27 @@ func TestRelaySwallowedVerifierBlockBlocksStop(t *testing.T) {
 	secondStop := RunRelayGuard(mustJSON(t, relayStopInput(root)), Options{Env: mapEnv(env)})
 	if secondStop.ExitCode != 0 {
 		t.Fatalf("expected second Stop exit 0, got %d", secondStop.ExitCode)
+	}
+}
+
+func TestRelayLegacyVerifierHeaderStillRecordsPending(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, _ := writeLegacyVerifierLedger(t, root)
+
+	postTool := RunRelayGuard(mustJSON(t, loopreviewPostTool(root, map[string]any{
+		"stdout":    "loopreview completed without visible report\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{Env: mapEnv(env)})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+
+	rec := requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+	if rec.Header != legacyVerifierHeader {
+		t.Fatalf("record header = %q, want legacy header", rec.Header)
 	}
 }
 
@@ -540,6 +602,41 @@ func TestRelayPendingBackgroundRunCanBeSurfacedByLaterEvent(t *testing.T) {
 	if stop.ExitCode != 0 {
 		t.Fatalf("expected Stop after later surfacing to allow, got %d (stderr=%q)", stop.ExitCode, stop.Stderr)
 	}
+}
+
+func TestRelayPendingLegacyHeaderCanBeSurfacedByReporterRoleHeader(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	env := relayHookEnv(stateDir)
+	ledgerPath, _ := writeLegacyWorkerLedger(t, root)
+	firstSeen := time.Now()
+
+	postTool := RunRelayGuard(mustJSON(t, dispatchPostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    "running in background\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{
+		Env: mapEnv(env),
+		Now: func() time.Time { return firstSeen },
+	})
+	if postTool.ExitCode != 0 {
+		t.Fatalf("expected background PostToolUse exit 0, got %d", postTool.ExitCode)
+	}
+	requireRelayRecordStatus(t, root, stateDir, ledgerPath, "pending")
+
+	later := firstSeen.Add(time.Duration(recentLedgerGraceMs)*time.Millisecond + time.Minute)
+	surfaced := RunRelayGuard(mustJSON(t, dispatchPostToolForTool(root, "PowerShell", map[string]any{
+		"stdout":    workerHeader + "\n",
+		"stderr":    "",
+		"exit_code": 0,
+	})), Options{
+		Env: mapEnv(env),
+		Now: func() time.Time { return later },
+	})
+	if surfaced.ExitCode != 0 {
+		t.Fatalf("expected surfaced PostToolUse exit 0, got %d", surfaced.ExitCode)
+	}
+	requireRelayRecordStatus(t, root, stateDir, ledgerPath, "surfaced")
 }
 
 func TestRelayMalformedInputAllows(t *testing.T) {

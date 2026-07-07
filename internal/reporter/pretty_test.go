@@ -206,7 +206,7 @@ func TestPrettyDoesNotChangeCanonicalContracts(t *testing.T) {
 		t.Fatalf("CanonicalJSON() = %s, want %s", string(data), wantCanonical)
 	}
 
-	const wantHeader = `[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #172" exit=0 dur=42s tokens=120/34|154 verified=true`
+	const wantHeader = `[reporter] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #172" exit=0 dur=42s tokens=120/34|154 verified=true`
 	if got := record.Header(); got != wantHeader {
 		t.Fatalf("Header() = %q, want %q", got, wantHeader)
 	}

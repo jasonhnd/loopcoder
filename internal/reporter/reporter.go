@@ -128,7 +128,7 @@ func fieldPresent(fields map[string]json.RawMessage, name string) bool {
 // Header renders a stable, greppable one-line header for humans.
 func (r Report) Header() string {
 	return fmt.Sprintf(
-		"[attestation] role=%s provider=%s model=%s(%s) effort=%s perm=%s action=%s exit=%d dur=%s tokens=%s verified=%t",
+		"[reporter] role=%s provider=%s model=%s(%s) effort=%s perm=%s action=%s exit=%d dur=%s tokens=%s verified=%t",
 		r.Role,
 		r.Provider,
 		r.Model,

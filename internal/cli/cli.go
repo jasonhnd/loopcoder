@@ -560,7 +560,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stdout (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "hook" {
-		fmt.Fprintln(w, "  <name>    hook to run: conductor-attest or conductor-relay-guard")
+		fmt.Fprintln(w, "  <name>    hook to run: conductor-reporter, conductor-relay-guard, or legacy conductor-attest")
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Reads the hook payload from stdin and runs the named embedded conductor hook.")
 		fmt.Fprintln(w, "Wired into Claude Code settings; unknown or missing names fail open (exit 0).")

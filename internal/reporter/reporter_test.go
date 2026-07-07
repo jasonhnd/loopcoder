@@ -38,7 +38,7 @@ func TestCanonicalJSONShapeAndRoundTrip(t *testing.T) {
 func TestHeaderFormatting(t *testing.T) {
 	record := validRecord()
 
-	const want = `[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #172" exit=0 dur=42s tokens=120/34|154 verified=true`
+	const want = `[reporter] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #172" exit=0 dur=42s tokens=120/34|154 verified=true`
 	if got := record.Header(); got != want {
 		t.Fatalf("Header() = %q, want %q", got, want)
 	}
