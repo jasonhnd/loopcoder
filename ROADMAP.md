@@ -15,11 +15,13 @@ Planned. Make models and their depth tiers discoverable, validated, and defaulte
 choose without guessing. Target models: **claude, gpt (codex), gemini** — gemini reached **via
 the Antigravity (`agy`) provider**, since the direct gemini CLI is dead for personal accounts
 (Google `IneligibleTier`). Depth is a **per-model list of valid tokens that may be empty** (not a
-cross-provider scale), wired per provider: claude `--effort`, codex `reasoning_effort`
-[low..xhigh], agy = whatever `agy models` lists per model (`Gemini 3.1 Pro`→[Low,High],
-`Opus 4.6`→[Thinking], `GPT-OSS 120B`→[Medium]). All three target models thus have depth —
-gemini's comes from agy's tiers. Validation checks membership per model; effort against an empty
-list is a warning.
+cross-provider scale), wired per provider: claude `--effort`, codex `-c model_reasoning_effort=`
+(both **pass-through today — loopcoder does no effort validation yet**), agy = whatever
+`agy models` lists per model (`Gemini 3.1 Pro`→[Low,High], `Opus 4.6`→[Thinking],
+`GPT-OSS 120B`→[Medium]). The registry's per-model tiers are **loopcoder-curated** (not
+provider-derived); the parse-time membership check is **net-new** (today effort is unvalidated
+pass-through). All three target models have depth — gemini's comes from agy's tiers. Effort
+against an empty list is a warning.
 
 Selection is **per-role**: worker and verifier each choose their own model+depth (config;
 per-role override already shipped in spec 0215) and both are validated against the registry. The
@@ -72,12 +74,15 @@ the new agy file in one pass instead of colliding with it.
 - code: emit `[reporter]`; rename `internal/attestation`→`internal/reporter`,
   `AttestationRecord`→`Report`, all Go identifiers + pretty wording + current `docs/reference/*`;
   sweep every emit + match + manual site in lockstep; update golden/inventory tests.
-- code: **transition safety** — `relay_guard.go` accepts BOTH `[attestation]` and `[reporter]`
+- code: **transition safety** — `relay_guard.go` (`ledgerHeaderRe`, `rolePattern`) **and
+  `conductorhooks/attest.go` (`conductorHeaderRe`)** accept BOTH `[attestation]` and `[reporter]`
   for this release so upgrade-lag (binary vs propagated skill manual vs host-side hooks) can
   neither lock out nor fail open; drop `[attestation]` acceptance one version later. (relay
   hard-gate spec 0447 + the "blocking gate must not lock out" rule)
-- code: strengthen — model+depth display (`Gemini 3.1 Pro (High)`); **work-ID per dispatch =
-  reuse existing `RunID` (spec 0390), surfaced in every report**; add `issue`/`branch`/
+- code: strengthen — model+depth display (`Gemini 3.1 Pro (High)`); **work-ID = the worker's
+  internal `RunID` (spec 0390; unique per dispatch, set as `LOOPCODER_RUN_ID`), surfaced in every
+  report — note dispatch's `--run-id` flag is currently ignored (0.5.4 learning), so the ID is
+  loopcoder-generated, not user-set**; add `issue`/`branch`/
   `worktree`/`round` context fields (dispatch/tick-filled, optional); **prefer loopcoder-observed
   ground-truth** (dispatched model+depth, process timing, parsed tokens) over agent self-report,
   marking `self-reported` only where unobservable (e.g. agy); pretty grouping
