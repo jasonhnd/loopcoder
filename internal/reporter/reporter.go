@@ -34,6 +34,11 @@ const (
 // Report is the shared schema emitted for worker, verifier, and conductor
 // invocations.
 type Report struct {
+	WorkID      string      `json:"work_id,omitempty"`
+	Issue       int         `json:"issue,omitempty"`
+	Branch      string      `json:"branch,omitempty"`
+	Worktree    string      `json:"worktree,omitempty"`
+	Round       int         `json:"round,omitempty"`
 	Role        Role        `json:"role"`
 	Provider    string      `json:"provider"`
 	Model       string      `json:"model"`
@@ -242,6 +247,26 @@ func ModelSourceForProvider(provider string) ModelSource {
 		return ModelSourceSelfReported
 	}
 	return ModelSourceParsed
+}
+
+func ModelDepthDisplay(model, effort string) string {
+	model = strings.TrimSpace(model)
+	effort = strings.TrimSpace(effort)
+	if model == "" {
+		return ""
+	}
+	if effort == "" || modelHasDepthSuffix(model, effort) {
+		return model
+	}
+	return fmt.Sprintf("%s (%s)", model, effort)
+}
+
+func modelHasDepthSuffix(model, effort string) bool {
+	suffix := "(" + effort + ")"
+	if strings.HasSuffix(model, suffix) {
+		return true
+	}
+	return strings.HasSuffix(model, " "+suffix)
 }
 
 func validateTimestamp(field, value string) error {

@@ -274,7 +274,7 @@ audit:
 			wantRunnerRun: true,
 		},
 		{
-			name: "missing attestation metadata",
+			name: "missing report metadata",
 			opts: Options{Provider: "codex"},
 			lookup: func(t *testing.T) func(string) (agent.Runner, error) {
 				return func(string) (agent.Runner, error) {
@@ -286,7 +286,7 @@ audit:
 					}), nil
 				}
 			},
-			wantReason:    "incomplete verifier attestation",
+			wantReason:    "incomplete verifier report",
 			wantRunnerRun: true,
 		},
 	}

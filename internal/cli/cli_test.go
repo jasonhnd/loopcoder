@@ -84,6 +84,58 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
+func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
+	repo := t.TempDir()
+	record := validDispatchReport()
+	record.WorkID = "run-report-test"
+	record.Issue = 101
+	record.Branch = "loop/issue-101"
+	record.Round = 1
+
+	if _, err := state.WriteAttempt(repo, "run-report-test", state.AttemptRecord{
+		Version:   1,
+		JobID:     "job-101-1",
+		Issue:     101,
+		Attempt:   1,
+		Provider:  "codex",
+		Status:    "succeeded",
+		Branch:    "loop/issue-101",
+		StartedAt: "2026-06-28T00:00:00Z",
+		Report:    &record,
+	}); err != nil {
+		t.Fatalf("write attempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"report",
+		"--repo", repo,
+		"--work-id", "run-report-test",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		Reports []reporter.Report `json:"reports"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("report output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
+		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
+	}
+	if strings.Contains(stdout.String(), `"attestation"`) {
+		t.Fatalf("report JSON used legacy attestation key:\n%s", stdout.String())
+	}
+	if pending := relaygate.Check(repo); len(pending) != 0 {
+		t.Fatalf("report command mutated relay state: %#v", pending)
+	}
+}
+
 func TestVersionCommandAndRootFlagsPrintBuildInfo(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1411,11 +1463,11 @@ func TestAttestPrettyRendersEmojiWhenInteractive(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"\u26a0\ufe0f attestation self-reported",
-		"   role        conductor",
-		"   model       gpt-5 (self-reported)",
-		"   tokens      total=18,266",
-		"   verified    false",
+		"\u26a0\ufe0f report self-reported",
+		"  role        conductor",
+		"  model       gpt-5 (xhigh) (self-reported)",
+		"  tokens      total=18,266",
+		"  verified    false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, got)
@@ -1454,7 +1506,7 @@ func TestAttestPrettyRendersPlainWhenNonInteractive(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"attestation: self-reported",
+		"report: self-reported",
 		"  role        conductor",
 		"  model       gpt-5 (self-reported)",
 		"  tokens      total=12,345",
@@ -1624,7 +1676,7 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"attestation: verified",
+		"report: verified",
 		"  role        verifier",
 		"  permission  read-only",
 		"  action      \"review PR #152\"",
@@ -1741,10 +1793,10 @@ func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"\u2705 attestation verified",
-		"   role        verifier",
-		"   permission  read-only",
-		"   action      \"review PR #152\"",
+		"\u2705 report verified",
+		"  role        verifier",
+		"  permission  read-only",
+		"  action      \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -1826,8 +1878,8 @@ func TestLoopreviewPrettyInteractiveHonorsNoEmojiEnv(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "attestation: verified") {
-		t.Fatalf("stderr missing plain pretty attestation:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "report: verified") {
+		t.Fatalf("stderr missing plain pretty report:\n%s", stderr.String())
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0"} {
 		if strings.Contains(stderr.String(), disallowed) {
@@ -2907,7 +2959,7 @@ func TestTickSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "attestation: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
 		t.Fatalf("tick stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3040,7 +3092,7 @@ func TestTriggerSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "attestation: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
 		t.Fatalf("trigger stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3178,7 +3230,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"attestation: verified",
+		"report: verified",
 		"  role        worker",
 		"  permission  write",
 		"  action      \"implement issue #101\"",
@@ -3277,7 +3329,7 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"attestation: verified",
+		"report: verified",
 		"  role        worker",
 		"  tokens      input=120  output=34  total=154",
 	} {
@@ -3386,10 +3438,10 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
 	for _, want := range []string{
-		"\u2705 attestation verified",
-		"   role        worker",
-		"   permission  write",
-		"   action      \"implement issue #101\"",
+		"\u2705 report verified",
+		"  role        worker",
+		"  permission  write",
+		"  action      \"implement issue #101\"",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -3438,9 +3490,9 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
 	for _, want := range []string{
-		"\u2705 attestation verified",
-		"   role        worker",
-		"   tokens      input=120  output=34  total=154",
+		"\u2705 report verified",
+		"  role        worker",
+		"  tokens      input=120  output=34  total=154",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -3484,8 +3536,8 @@ func TestDispatchPrettyFlagHonorsNoColorPlainFallback(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "attestation: verified") {
-		t.Fatalf("stderr missing plain pretty attestation:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "report: verified") {
+		t.Fatalf("stderr missing plain pretty report:\n%s", stderr.String())
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0", "\x1b["} {
 		if strings.Contains(stderr.String(), disallowed) {
@@ -3787,8 +3839,8 @@ func TestDispatchDoesNotRenderSuccessJSONWithoutReport(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "dispatch attestation is missing") {
-		t.Fatalf("stderr missing attestation error: %q", stderr.String())
+	if !strings.Contains(stderr.String(), "dispatch report is missing") {
+		t.Fatalf("stderr missing report error: %q", stderr.String())
 	}
 }
 
@@ -3980,7 +4032,7 @@ func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *te
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	gotStdout := stdout.String()
-	if count := strings.Count(gotStdout, "attestation: verified"); count != 2 {
+	if count := strings.Count(gotStdout, "report: verified"); count != 2 {
 		t.Fatalf("stdout pretty block count = %d, want 2:\n%s", count, gotStdout)
 	}
 	for _, want := range []string{

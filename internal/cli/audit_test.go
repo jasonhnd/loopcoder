@@ -46,7 +46,7 @@ func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
 		t.Fatalf("stdout missing relay needs-human verdict:\n%s", stdout.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
-		t.Fatalf("audit JSON serialized local-only attestation:\n%s", stdout.String())
+		t.Fatalf("audit JSON serialized local-only report:\n%s", stdout.String())
 	}
 }
 
@@ -73,11 +73,11 @@ func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stdout=%s stderr=%s", exitCode, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "attestation verified") {
-		t.Fatalf("stderr missing pretty attestation:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "report verified") {
+		t.Fatalf("stderr missing pretty report:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
-		t.Fatalf("audit JSON serialized local-only attestation:\n%s", stdout.String())
+		t.Fatalf("audit JSON serialized local-only report:\n%s", stdout.String())
 	}
 	if _, err := os.Stat(filepath.Join(repo, ".loopcoder", "relay")); err != nil {
 		t.Fatalf("relay state was not written locally: %v", err)

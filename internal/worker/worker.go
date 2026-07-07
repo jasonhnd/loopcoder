@@ -421,15 +421,16 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 
 func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
 	reportRecord := buildWorkerReport(dispatch.opts, agentResult)
+	reportRecord.Worktree = dispatch.worktreePath
 	dispatch.tracker.setReport(reportRecord)
 	dispatch.tracker.writeAttempt()
 	if err := reportRecord.Validate(); err != nil {
-		return Result{}, fmt.Errorf("validate worker attestation: %w", err)
+		return Result{}, fmt.Errorf("validate worker report: %w", err)
 	}
 	dispatch.tracker.setUsage(reportRecord.Usage)
 	dispatch.tracker.writeAttempt()
 	if _, err := reportRecord.CanonicalJSON(); err != nil {
-		return Result{}, fmt.Errorf("render worker attestation JSON: %w", err)
+		return Result{}, fmt.Errorf("render worker report JSON: %w", err)
 	}
 
 	summary := fmt.Sprintf("(%s produced no summary)", dispatch.opts.Provider)
@@ -608,11 +609,15 @@ func BuildPrompt(opts PromptOptions) string {
 
 func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 	return reporter.Report{
+		WorkID:      opts.RunID,
+		Issue:       opts.IssueNumber,
+		Branch:      opts.Branch,
+		Round:       opts.Attempt,
 		Role:        reporter.RoleWorker,
 		Provider:    opts.Provider,
-		Model:       result.Model,
+		Model:       firstNonEmpty(opts.Model, result.Model),
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
-		Effort:      result.Effort,
+		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionWrite,
 		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),
 		ExitCode:    result.ExitCode,
@@ -698,9 +703,9 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 	existing := findOpenHarvestPR(ctx, opts.github, opts.opts.IssueNumber, harvestBranch, opts.warnings)
 	ended := opts.now()
 	if existing != nil {
-		record := buildHarvestConductorReport(opts.opts, started, ended)
+		record := buildHarvestConductorReport(opts.opts, firstNonEmpty(existing.HeadRefName, harvestBranch), opts.worktreePath, started, ended)
 		if err := record.Validate(); err != nil {
-			return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
+			return nil, fmt.Errorf("validate harvest conductor report: %w", err)
 		}
 		return &hungHarvestResult{
 			Branch:  firstNonEmpty(existing.HeadRefName, harvestBranch),
@@ -723,9 +728,9 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 	}
 
 	ended = opts.now()
-	record := buildHarvestConductorReport(opts.opts, started, ended)
+	record := buildHarvestConductorReport(opts.opts, harvestBranch, opts.worktreePath, started, ended)
 	if err := record.Validate(); err != nil {
-		return nil, fmt.Errorf("validate harvest conductor attestation: %w", err)
+		return nil, fmt.Errorf("validate harvest conductor report: %w", err)
 	}
 	body := buildHarvestPRBody(opts.opts, opts.agentResult, briefText)
 	prURL, err := opts.github.CreatePR(ctx, harvestBranch, opts.opts.BaseBranch, buildHarvestPRTitle(opts.opts.IssueTitle, opts.opts.IssueNumber), body)
@@ -777,7 +782,7 @@ func buildHarvestPRBody(opts Options, result agent.Result, recoveryBrief string)
 		fmt.Fprintln(&out, strings.TrimRight(recoveryBrief, "\r\n"))
 	}
 	fmt.Fprintln(&out)
-	fmt.Fprintln(&out, "## Hung worker partial attestation")
+	fmt.Fprintln(&out, "## Hung worker partial report")
 	fmt.Fprintln(&out, "```text")
 	fmt.Fprintln(&out, formatHungWorkerPartialReport(opts, result))
 	fmt.Fprintln(&out, "```")
@@ -819,7 +824,7 @@ func formatHungWorkerPartialReport(opts Options, result agent.Result) string {
 	return recovery.Scrub(strings.Join(lines, "\n"))
 }
 
-func buildHarvestConductorReport(opts Options, started, ended time.Time) reporter.Report {
+func buildHarvestConductorReport(opts Options, branch, worktreePath string, started, ended time.Time) reporter.Report {
 	if started.IsZero() {
 		started = time.Now().UTC()
 	}
@@ -831,6 +836,11 @@ func buildHarvestConductorReport(opts Options, started, ended time.Time) reporte
 	}
 	totalTokens := int64(0)
 	return reporter.Report{
+		WorkID:      opts.RunID,
+		Issue:       opts.IssueNumber,
+		Branch:      firstNonEmpty(branch, opts.Branch),
+		Worktree:    worktreePath,
+		Round:       opts.Attempt,
 		Role:        reporter.RoleConductor,
 		Provider:    firstNonEmpty(opts.Provider, "loopcoder"),
 		Model:       firstNonEmpty(opts.Model, "loopcoder-harvest"),
