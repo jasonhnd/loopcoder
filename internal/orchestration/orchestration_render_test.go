@@ -202,7 +202,7 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 		"- #7 succeeded\n" +
 		"  branch: loop/issue-7\n" +
 		"  pr: https://github.com/owner/repo/pull/7\n" +
-		"  attestation: provider=codex model=gpt-5(parsed) effort=high permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
+		"  report: provider=codex model=gpt-5 (high) source=parsed permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
 		"  attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
 		"  recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
 		"- #8 needs-human\n" +
