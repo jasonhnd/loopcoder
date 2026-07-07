@@ -611,7 +611,7 @@ func buildWorkerAttestation(opts Options, result agent.Result) attestation.Attes
 		Role:        attestation.RoleWorker,
 		Provider:    opts.Provider,
 		Model:       result.Model,
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: attestation.ModelSourceForProvider(opts.Provider),
 		Effort:      result.Effort,
 		Permission:  attestation.PermissionWrite,
 		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),

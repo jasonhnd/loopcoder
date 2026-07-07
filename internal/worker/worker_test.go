@@ -722,6 +722,31 @@ func TestGitHubBoundTextBuildersHaveZeroAttestationFootprint(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerAttestationAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
+	record := buildWorkerAttestation(Options{
+		IssueNumber: 559,
+		Provider:    "antigravity",
+	}, agent.Result{
+		ExitCode:   0,
+		Summary:    "Implemented antigravity runner.",
+		Model:      "Gemini 3.1 Pro (High)",
+		Effort:     "High",
+		StartedAt:  "2026-06-28T00:00:00Z",
+		EndedAt:    "2026-06-28T00:00:02Z",
+		DurationMS: 2000,
+	})
+
+	if record.ModelSource != attestation.ModelSourceSelfReported {
+		t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)
+	}
+	if record.Usage.TotalTokens != nil || record.Usage.InputTokens != nil || record.Usage.OutputTokens != nil {
+		t.Fatalf("Usage = %#v, want empty", record.Usage)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
 func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()

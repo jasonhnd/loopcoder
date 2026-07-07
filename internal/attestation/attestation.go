@@ -210,8 +210,13 @@ func (r AttestationRecord) Validate() error {
 	} else if r.DurationMS < 0 {
 		problems = append(problems, "duration_ms must be non-negative")
 	}
+	usageOptional := r.allowsAbsentUsage()
 	if r.presence.Known && !r.presence.Usage {
-		problems = append(problems, "usage is required")
+		if !usageOptional {
+			problems = append(problems, "usage is required")
+		}
+	} else if usageOptional {
+		problems = append(problems, validateUsageValues(r.Usage)...)
 	} else {
 		problems = append(problems, validateUsage(r.Usage)...)
 	}
@@ -225,6 +230,20 @@ func (r AttestationRecord) Validate() error {
 	return nil
 }
 
+func (r AttestationRecord) allowsAbsentUsage() bool {
+	if strings.TrimSpace(r.Provider) != "antigravity" {
+		return false
+	}
+	return r.Role == RoleWorker || r.Role == RoleVerifier
+}
+
+func ModelSourceForProvider(provider string) ModelSource {
+	if strings.TrimSpace(provider) == "antigravity" {
+		return ModelSourceSelfReported
+	}
+	return ModelSourceParsed
+}
+
 func validateTimestamp(field, value string) error {
 	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
 		return fmt.Errorf("%s must be an RFC3339 timestamp", field)
@@ -233,6 +252,16 @@ func validateTimestamp(field, value string) error {
 }
 
 func validateUsage(usage Usage) []string {
+	problems := validateUsageValues(usage)
+	hasTotal := usage.TotalTokens != nil
+	hasInputOutput := usage.InputTokens != nil && usage.OutputTokens != nil
+	if !hasTotal && !hasInputOutput {
+		problems = append(problems, "usage requires total_tokens or both input_tokens and output_tokens")
+	}
+	return problems
+}
+
+func validateUsageValues(usage Usage) []string {
 	var problems []string
 	if usage.InputTokens != nil && *usage.InputTokens < 0 {
 		problems = append(problems, "usage.input_tokens must be non-negative")
@@ -242,12 +271,6 @@ func validateUsage(usage Usage) []string {
 	}
 	if usage.TotalTokens != nil && *usage.TotalTokens < 0 {
 		problems = append(problems, "usage.total_tokens must be non-negative")
-	}
-
-	hasTotal := usage.TotalTokens != nil
-	hasInputOutput := usage.InputTokens != nil && usage.OutputTokens != nil
-	if !hasTotal && !hasInputOutput {
-		problems = append(problems, "usage requires total_tokens or both input_tokens and output_tokens")
 	}
 	return problems
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"gopkg.in/yaml.v3"
 )
@@ -142,7 +143,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	_ = ghPresent
 
 	checks = append(checks, checkDeliveryConfig(delivery))
-	checks = append(checks, checkProviders(deps, configuredProviders(delivery.Config))...)
+	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
 	checks = append(checks, originCheck)
@@ -403,26 +404,103 @@ func configuredProviders(cfg config.Config) []providerSpec {
 	return providers
 }
 
-func checkProviders(deps Deps, providers []providerSpec) []Check {
+func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []Check {
 	checks := make([]Check, 0, len(providers))
 	for _, provider := range providers {
 		roleText := strings.Join(provider.Roles, ", ")
-		path, err := deps.LookPath(provider.Name)
+		cliName := providerCLIName(provider.Name)
+		path, err := deps.LookPath(cliName)
 		if err != nil || strings.TrimSpace(path) == "" {
+			status := StatusWarn
+			hard := false
+			fix := ""
+			if provider.Name == "antigravity" {
+				status = StatusFail
+				hard = true
+				fix = "; install Google Antigravity CLI and run: agy login"
+			}
 			checks = append(checks, Check{
 				Name:    "provider " + provider.Name,
-				Status:  StatusWarn,
-				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH", roleText, provider.Name),
+				Status:  status,
+				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH%s", roleText, cliName, fix),
+				Hard:    hard,
 			})
+			continue
+		}
+		if provider.Name == "antigravity" {
+			checks = append(checks, checkAntigravityOAuth(ctx, deps, roleText, path))
 			continue
 		}
 		checks = append(checks, Check{
 			Name:    "provider " + provider.Name,
 			Status:  StatusOK,
-			Message: fmt.Sprintf("configured for %s; found at %s; authentication not checked by a stable cheap probe", roleText, path),
+			Message: fmt.Sprintf("configured for %s; CLI %q found at %s; authentication not checked by a stable cheap probe", roleText, cliName, path),
 		})
 	}
 	return checks
+}
+
+func providerCLIName(provider string) string {
+	provider = strings.TrimSpace(provider)
+	if registered, ok := models.LookupProvider(provider); ok && strings.TrimSpace(registered.CLI) != "" {
+		return strings.TrimSpace(registered.CLI)
+	}
+	return provider
+}
+
+func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string) Check {
+	result, err := deps.RunCommand(ctx, "", "agy", "models")
+	if err != nil {
+		detail := commandDetail(result)
+		if detail != "" {
+			detail = ": " + detail
+		}
+		return Check{
+			Name:    "provider antigravity",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models could not run: %v%s; run: agy login", roleText, path, err, detail),
+			Hard:    true,
+		}
+	}
+	if result.ExitCode != 0 {
+		detail := commandDetail(result)
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return Check{
+			Name:    "provider antigravity",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models failed: %s; run: agy login", roleText, path, detail),
+			Hard:    true,
+		}
+	}
+	if antigravityAuthProbeLooksFailed(result.Stdout + "\n" + result.Stderr) {
+		detail := commandDetail(result)
+		return Check{
+			Name:    "provider antigravity",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models reported an authentication problem: %s; run: agy login", roleText, path, firstNonEmpty(detail, "authentication required")),
+			Hard:    true,
+		}
+	}
+	return Check{
+		Name:    "provider antigravity",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s; agy models OAuth probe succeeded", roleText, path),
+	}
+}
+
+func antigravityAuthProbeLooksFailed(text string) bool {
+	lower := strings.ToLower(text)
+	authSignal := strings.Contains(lower, "oauth") ||
+		strings.Contains(lower, "login") ||
+		strings.Contains(lower, "auth")
+	failureSignal := strings.Contains(lower, "error") ||
+		strings.Contains(lower, "failed") ||
+		strings.Contains(lower, "required") ||
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "not logged")
+	return authSignal && failureSignal
 }
 
 func checkOrigin(ctx context.Context, deps Deps, repoPath string, gitPresent bool) (Check, bool) {
@@ -889,18 +967,19 @@ func checkAuditLLMProvider(cfg config.Config, deps Deps) Check {
 			Message: fmt.Sprintf("read-only verifier MCP selection failed for Layer 2: %v", err),
 		}
 	}
-	path, err := deps.LookPath(provider)
+	cliName := providerCLIName(provider)
+	path, err := deps.LookPath(cliName)
 	if err != nil || strings.TrimSpace(path) == "" {
 		return Check{
 			Name:    "audit llm provider",
 			Status:  StatusWarn,
-			Message: fmt.Sprintf("Layer 2 verifier provider %q could not be resolved on PATH", provider),
+			Message: fmt.Sprintf("Layer 2 verifier provider %q CLI %q could not be resolved on PATH", provider, cliName),
 		}
 	}
 	return Check{
 		Name:    "audit llm provider",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("Layer 2 read-only verifier provider %q resolves at %s", provider, path),
+		Message: fmt.Sprintf("Layer 2 read-only verifier provider %q CLI %q resolves at %s", provider, cliName, path),
 	}
 }
 

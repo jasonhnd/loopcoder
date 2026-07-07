@@ -430,7 +430,7 @@ func verifierAttestation(opts Options, result agent.Result) attestation.Attestat
 		Role:        attestation.RoleVerifier,
 		Provider:    opts.Provider,
 		Model:       result.Model,
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: attestation.ModelSourceForProvider(opts.Provider),
 		Effort:      result.Effort,
 		Permission:  attestation.PermissionReadOnly,
 		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
