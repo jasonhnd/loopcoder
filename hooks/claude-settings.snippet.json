@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "loopcoder hook conductor-attest",
+            "command": "loopcoder hook conductor-reporter",
             "timeout": 10
           },
           {
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "loopcoder hook conductor-attest",
+            "command": "loopcoder hook conductor-reporter",
             "timeout": 10
           },
           {

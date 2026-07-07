@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/worker"
@@ -160,7 +160,7 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			if opts.IssueNumber == 2 {
 				result := waveWorkerResult(opts)
-				result.Attestation = waveAttestation(opts.IssueNumber, 202)
+				result.Report = waveReport(opts.IssueNumber, 202)
 				return result, errors.New("worker failed")
 			}
 			return waveWorkerResult(opts), nil
@@ -179,8 +179,8 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 	if report.Results[1].Status != DispatchWaveStatusFailed || report.Results[1].Error != "worker failed" {
 		t.Fatalf("issue #2 result = %#v, want failed worker error", report.Results[1])
 	}
-	if report.Results[1].Attestation == nil || report.Results[1].Attestation.Model != "worker-model-2" {
-		t.Fatalf("issue #2 attestation = %#v, want preserved worker attestation", report.Results[1].Attestation)
+	if report.Results[1].Report == nil || report.Results[1].Report.Model != "worker-model-2" {
+		t.Fatalf("issue #2 report = %#v, want preserved worker report", report.Results[1].Report)
 	}
 }
 
@@ -200,7 +200,7 @@ func TestDispatchWavePropagatesNeedsHumanDispatchResult(t *testing.T) {
 			result := waveWorkerResult(opts)
 			result.Status = DispatchWaveStatusNeedsHuman
 			result.PR = "https://github.com/owner/repo/pull/1"
-			result.Attestation = waveAttestation(opts.IssueNumber, 101)
+			result.Report = waveReport(opts.IssueNumber, 101)
 			return result, nil
 		},
 		LoadAttempts: noAttempts,
@@ -217,7 +217,7 @@ func TestDispatchWavePropagatesNeedsHumanDispatchResult(t *testing.T) {
 	}
 }
 
-func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
+func TestDispatchWavePreservesPerWorkerReports(t *testing.T) {
 	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
 		Reader: fakeReader{views: map[int]gh.Issue{
 			11: {Number: 11, Title: "Eleven"},
@@ -232,7 +232,7 @@ func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
 		},
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			result := waveWorkerResult(opts)
-			result.Attestation = waveAttestation(opts.IssueNumber, int64(opts.IssueNumber*100))
+			result.Report = waveReport(opts.IssueNumber, int64(opts.IssueNumber*100))
 			return result, nil
 		},
 		LoadAttempts: noAttempts,
@@ -244,30 +244,30 @@ func TestDispatchWavePreservesPerWorkerAttestations(t *testing.T) {
 		t.Fatalf("result count = %d, want 2", len(report.Results))
 	}
 	for i, result := range report.Results {
-		if result.Attestation == nil {
-			t.Fatalf("result %d missing attestation: %#v", i, result)
+		if result.Report == nil {
+			t.Fatalf("result %d missing report: %#v", i, result)
 		}
-		if result.Attestation.Action != fmt.Sprintf("implement issue #%d", result.Issue) {
-			t.Fatalf("result %d attestation action = %q, want issue-specific action", i, result.Attestation.Action)
+		if result.Report.Action != fmt.Sprintf("implement issue #%d", result.Issue) {
+			t.Fatalf("result %d report action = %q, want issue-specific action", i, result.Report.Action)
 		}
 	}
-	if report.Results[0].Attestation.Model != "worker-model-11" ||
-		report.Results[1].Attestation.Model != "worker-model-12" {
-		t.Fatalf("attestations collapsed or reordered: %#v", report.Results)
+	if report.Results[0].Report.Model != "worker-model-11" ||
+		report.Results[1].Report.Model != "worker-model-12" {
+		t.Fatalf("reports collapsed or reordered: %#v", report.Results)
 	}
-	if report.Results[0].Attestation.Usage.TotalTokens == nil ||
-		*report.Results[0].Attestation.Usage.TotalTokens != 1100 ||
-		report.Results[1].Attestation.Usage.TotalTokens == nil ||
-		*report.Results[1].Attestation.Usage.TotalTokens != 1200 {
-		t.Fatalf("attestation token usage not preserved per issue: %#v", report.Results)
+	if report.Results[0].Report.Usage.TotalTokens == nil ||
+		*report.Results[0].Report.Usage.TotalTokens != 1100 ||
+		report.Results[1].Report.Usage.TotalTokens == nil ||
+		*report.Results[1].Report.Usage.TotalTokens != 1200 {
+		t.Fatalf("report token usage not preserved per issue: %#v", report.Results)
 	}
 
 	data, err := json.Marshal(report.Results)
 	if err != nil {
 		t.Fatalf("Marshal results: %v", err)
 	}
-	if got := strings.Count(string(data), `"attestation"`); got != 2 {
-		t.Fatalf("marshaled results contain %d attestation fields, want 2: %s", got, string(data))
+	if got := strings.Count(string(data), `"report"`); got != 2 {
+		t.Fatalf("marshaled results contain %d report fields, want 2: %s", got, string(data))
 	}
 }
 
@@ -300,12 +300,12 @@ func TestDispatchWaveStreamsWorkerCompletionBlocksAsWorkersFinish(t *testing.T) 
 					<-releaseSlow
 				}
 				result := waveWorkerResult(opts)
-				result.Attestation = waveAttestation(opts.IssueNumber, int64(opts.IssueNumber*100))
+				result.Report = waveReport(opts.IssueNumber, int64(opts.IssueNumber*100))
 				return result, nil
 			},
 			LoadAttempts: noAttempts,
 			OnIssueComplete: func(completion DispatchWaveIssueComplete) error {
-				pretty := completion.Result.Attestation.Pretty(attestation.PrettyOptions{Mode: attestation.PrettyModePlain})
+				pretty := completion.Result.Report.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain})
 				out.WriteString(RenderDispatchWaveIssueCompletion(completion.Result, pretty))
 				completed <- completion.Result.Issue
 				return nil
@@ -381,14 +381,14 @@ func TestDispatchWaveStreamsWorkerCompletionBlocksAsWorkersFinish(t *testing.T) 
 	}
 }
 
-func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
-	split := waveSplitAttestation(21, 2447, 4461, 6908)
+func TestRenderDispatchWaveTextSurfacesPerWorkerReports(t *testing.T) {
+	split := waveSplitReport(21, 2447, 4461, 6908)
 	split.Provider = "claude"
 	split.Model = "claude-sonnet-4-5"
 	split.Effort = "high"
 	split.DurationMS = 42000
 
-	totalOnly := waveAttestation(22, 102585)
+	totalOnly := waveReport(22, 102585)
 	totalOnly.Provider = "codex"
 	totalOnly.Model = "gpt-5.5"
 	totalOnly.Effort = "xhigh"
@@ -409,7 +409,7 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
 				Branch:      "loop/issue-21",
 				PR:          "https://github.com/owner/repo/pull/21",
 				AttemptPath: ".loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
-				Attestation: split,
+				Report:      split,
 			},
 			{
 				Issue:       22,
@@ -417,7 +417,7 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
 				Branch:      "loop/issue-22",
 				PR:          "https://github.com/owner/repo/pull/22",
 				AttemptPath: ".loopcoder/runs/run-test-wave/workers/job-22.attempt.json",
-				Attestation: totalOnly,
+				Report:      totalOnly,
 			},
 			{
 				Issue:  23,
@@ -432,10 +432,10 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
 		"- #21 succeeded",
 		"  branch: loop/issue-21",
 		"  pr: https://github.com/owner/repo/pull/21",
-		"  attestation: provider=claude model=claude-sonnet-4-5(parsed) effort=high permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
+		"  report: provider=claude model=claude-sonnet-4-5 (high) source=parsed permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
 		"  attempt: .loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
 		"- #22 succeeded",
-		"  attestation: provider=codex model=gpt-5.5(parsed) effort=xhigh permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
+		"  report: provider=codex model=gpt-5.5 (xhigh) source=parsed permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
 		"- #23 skipped",
 		"  error: issue was not ready during preflight",
 		"Verify successful PRs",
@@ -444,11 +444,11 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerAttestations(t *testing.T) {
 			t.Fatalf("rendered dispatch wave missing %q:\n%s", want, text)
 		}
 	}
-	if got := strings.Count(text, "  attestation: "); got != 2 {
-		t.Fatalf("rendered %d attestation lines, want 2:\n%s", got, text)
+	if got := strings.Count(text, "  report: "); got != 2 {
+		t.Fatalf("rendered %d report lines, want 2:\n%s", got, text)
 	}
-	if strings.Contains(text, "attestation: not reported") {
-		t.Fatalf("nil attestation result should omit attestation line:\n%s", text)
+	if strings.Contains(text, "report: not reported") {
+		t.Fatalf("nil report result should omit report line:\n%s", text)
 	}
 }
 
@@ -657,29 +657,29 @@ func waveWorkerResult(opts worker.Options) worker.Result {
 	}
 }
 
-func waveAttestation(issue int, totalTokens int64) *attestation.AttestationRecord {
+func waveReport(issue int, totalTokens int64) *reporter.Report {
 	started := time.Date(2026, 6, 29, 12, 0, issue, 0, time.UTC)
-	return &attestation.AttestationRecord{
-		Role:        attestation.RoleWorker,
+	return &reporter.Report{
+		Role:        reporter.RoleWorker,
 		Provider:    fmt.Sprintf("worker-provider-%d", issue),
 		Model:       fmt.Sprintf("worker-model-%d", issue),
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: reporter.ModelSourceParsed,
 		Effort:      "high",
-		Permission:  attestation.PermissionWrite,
+		Permission:  reporter.PermissionWrite,
 		Action:      fmt.Sprintf("implement issue #%d", issue),
 		ExitCode:    0,
 		StartedAt:   started.Format(time.RFC3339),
 		EndedAt:     started.Add(time.Second).Format(time.RFC3339),
 		DurationMS:  1000,
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			TotalTokens: &totalTokens,
 		},
 		Verified: true,
 	}
 }
 
-func waveSplitAttestation(issue int, inputTokens, outputTokens, totalTokens int64) *attestation.AttestationRecord {
-	record := waveAttestation(issue, totalTokens)
+func waveSplitReport(issue int, inputTokens, outputTokens, totalTokens int64) *reporter.Report {
+	record := waveReport(issue, totalTokens)
 	record.Usage.InputTokens = &inputTokens
 	record.Usage.OutputTokens = &outputTokens
 	return record

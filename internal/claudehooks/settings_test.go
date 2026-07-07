@@ -80,7 +80,7 @@ func TestMergeSettingsUpgradesBashOnlyConductorPostToolUseHooks(t *testing.T) {
 		switch entry.Matcher {
 		case postToolUseShellMatcher:
 			sawPowerShellMatcher = true
-			for _, want := range []string{"loopcoder hook conductor-attest", "loopcoder hook conductor-relay-guard"} {
+			for _, want := range []string{"loopcoder hook conductor-reporter", "loopcoder hook conductor-relay-guard"} {
 				if !entry.HasCommand(want) {
 					t.Fatalf("PowerShell matcher entry missing %q:\n%s", want, merged)
 				}
@@ -101,6 +101,9 @@ func TestMergeSettingsUpgradesBashOnlyConductorPostToolUseHooks(t *testing.T) {
 	}
 	if !sawUserBashHook {
 		t.Fatalf("merged settings did not preserve unrelated Bash user hook:\n%s", merged)
+	}
+	if strings.Contains(string(merged), "loopcoder hook conductor-attest") {
+		t.Fatalf("merged settings retained legacy conductor hook command:\n%s", merged)
 	}
 }
 

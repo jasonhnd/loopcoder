@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func TestFormatTimestampUsesUTCRFC3339(t *testing.T) {
@@ -161,14 +161,14 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 		got.Usage.OutputTokens == nil || *got.Usage.OutputTokens != 5 {
 		t.Fatalf("Usage = %#v, want input=10 output=5", got.Usage)
 	}
-	if got.Attestation == nil {
-		t.Fatal("Attestation = nil, want persisted record")
+	if got.Report == nil {
+		t.Fatal("Report = nil, want persisted record")
 	}
-	if err := got.Attestation.Validate(); err != nil {
-		t.Fatalf("Attestation does not validate: %v", err)
+	if err := got.Report.Validate(); err != nil {
+		t.Fatalf("Report does not validate: %v", err)
 	}
-	if got.Attestation.Action != "implement issue #42" {
-		t.Fatalf("Attestation.Action = %q", got.Attestation.Action)
+	if got.Report.Action != "implement issue #42" {
+		t.Fatalf("Report.Action = %q", got.Report.Action)
 	}
 	if got.CostUSD == nil || *got.CostUSD != 1.25 {
 		t.Fatalf("CostUSD = %#v, want 1.25", got.CostUSD)
@@ -213,7 +213,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	errText := "failed password=hunter2"
 	totalTokens := int64(154)
 	costUSD := 0.42
-	attestationRecord := validAttemptAttestation(101, totalTokens)
+	reportRecord := validAttemptReport(101, totalTokens)
 
 	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
 		Version:        1,
@@ -231,8 +231,8 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		LogBytes:       123,
 		ExitCode:       &exitCode,
 		Error:          &errText,
-		Usage:          &attestation.Usage{TotalTokens: &totalTokens},
-		Attestation:    &attestationRecord,
+		Usage:          &reporter.Usage{TotalTokens: &totalTokens},
+		Report:         &reportRecord,
 		CostUSD:        &costUSD,
 	})
 	if err != nil {
@@ -253,7 +253,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("attempt JSON invalid: %v", err)
 	}
-	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "attestation", "cost_usd"} {
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "report", "cost_usd"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
 		}
@@ -261,12 +261,12 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if got["branch"] != "loop/issue-101-retry-2" {
 		t.Fatalf("branch = %#v", got["branch"])
 	}
-	attestationField, ok := got["attestation"].(map[string]any)
+	reportField, ok := got["report"].(map[string]any)
 	if !ok {
-		t.Fatalf("attestation = %#v", got["attestation"])
+		t.Fatalf("report = %#v", got["report"])
 	}
-	if attestationField["action"] != "implement issue #101" || attestationField["role"] != "worker" {
-		t.Fatalf("attestation field = %#v", attestationField)
+	if reportField["action"] != "implement issue #101" || reportField["role"] != "worker" {
+		t.Fatalf("report field = %#v", reportField)
 	}
 }
 
@@ -387,20 +387,20 @@ func TestEventPromotionCommitFieldsJSONCompatibility(t *testing.T) {
 	}
 }
 
-func validAttemptAttestation(issue int, totalTokens int64) attestation.AttestationRecord {
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleWorker,
+func validAttemptReport(issue int, totalTokens int64) reporter.Report {
+	return reporter.Report{
+		Role:        reporter.RoleWorker,
 		Provider:    "codex",
 		Model:       "gpt-5.5",
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: reporter.ModelSourceParsed,
 		Effort:      "xhigh",
-		Permission:  attestation.PermissionWrite,
+		Permission:  reporter.PermissionWrite,
 		Action:      "implement issue #" + strconv.Itoa(issue),
 		ExitCode:    0,
 		StartedAt:   "2026-06-28T00:00:00Z",
 		EndedAt:     "2026-06-28T00:00:42Z",
 		DurationMS:  42000,
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			TotalTokens: &totalTokens,
 		},
 		Verified: true,

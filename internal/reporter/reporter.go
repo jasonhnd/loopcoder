@@ -1,4 +1,4 @@
-package attestation
+package reporter
 
 import (
 	"encoding/json"
@@ -31,9 +31,14 @@ const (
 	PermissionOrchestrate Permission = "orchestrate"
 )
 
-// AttestationRecord is the shared schema emitted for worker, verifier, and
-// conductor invocations.
-type AttestationRecord struct {
+// Report is the shared schema emitted for worker, verifier, and conductor
+// invocations.
+type Report struct {
+	WorkID      string      `json:"work_id,omitempty"`
+	Issue       int         `json:"issue,omitempty"`
+	Branch      string      `json:"branch,omitempty"`
+	Worktree    string      `json:"worktree,omitempty"`
+	Round       int         `json:"round,omitempty"`
 	Role        Role        `json:"role"`
 	Provider    string      `json:"provider"`
 	Model       string      `json:"model"`
@@ -48,10 +53,10 @@ type AttestationRecord struct {
 	Usage       Usage       `json:"usage"`
 	Verified    bool        `json:"verified"`
 
-	presence attestationPresence
+	presence reportPresence
 }
 
-type attestationPresence struct {
+type reportPresence struct {
 	Known      bool
 	ExitCode   bool
 	DurationMS bool
@@ -67,24 +72,24 @@ type Usage struct {
 	TotalTokens  *int64 `json:"total_tokens,omitempty"`
 }
 
-// ValidationError lists all attestation validation problems found in a record.
+// ValidationError lists all report validation problems found in a record.
 type ValidationError struct {
 	Problems []string
 }
 
 func (e ValidationError) Error() string {
-	return "invalid attestation record: " + strings.Join(e.Problems, "; ")
+	return "invalid report: " + strings.Join(e.Problems, "; ")
 }
 
 // CanonicalJSON returns the machine rendering using the schema's snake_case
 // field names and stable struct field order.
-func (r AttestationRecord) CanonicalJSON() ([]byte, error) {
+func (r Report) CanonicalJSON() ([]byte, error) {
 	return json.Marshal(r)
 }
 
-func (r *AttestationRecord) UnmarshalJSON(data []byte) error {
-	type attestationRecord AttestationRecord
-	var parsed attestationRecord
+func (r *Report) UnmarshalJSON(data []byte) error {
+	type reportRecord Report
+	var parsed reportRecord
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return err
 	}
@@ -94,8 +99,8 @@ func (r *AttestationRecord) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	*r = AttestationRecord(parsed)
-	r.presence = attestationPresence{
+	*r = Report(parsed)
+	r.presence = reportPresence{
 		Known:      true,
 		ExitCode:   fieldPresent(fields, "exit_code"),
 		DurationMS: fieldPresent(fields, "duration_ms"),
@@ -105,15 +110,15 @@ func (r *AttestationRecord) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (r AttestationRecord) HasDurationMS() bool {
+func (r Report) HasDurationMS() bool {
 	return !r.presence.Known || r.presence.DurationMS
 }
 
-func (r AttestationRecord) HasUsage() bool {
+func (r Report) HasUsage() bool {
 	return !r.presence.Known || r.presence.Usage
 }
 
-func (r AttestationRecord) HasVerified() bool {
+func (r Report) HasVerified() bool {
 	return !r.presence.Known || r.presence.Verified
 }
 
@@ -125,10 +130,10 @@ func fieldPresent(fields map[string]json.RawMessage, name string) bool {
 	return strings.TrimSpace(string(raw)) != "null"
 }
 
-// Header renders a stable, greppable one-line attestation header for humans.
-func (r AttestationRecord) Header() string {
+// Header renders a stable, greppable one-line header for humans.
+func (r Report) Header() string {
 	return fmt.Sprintf(
-		"[attestation] role=%s provider=%s model=%s(%s) effort=%s perm=%s action=%s exit=%d dur=%s tokens=%s verified=%t",
+		"[reporter] role=%s provider=%s model=%s(%s) effort=%s perm=%s action=%s exit=%d dur=%s tokens=%s verified=%t",
 		r.Role,
 		r.Provider,
 		r.Model,
@@ -163,7 +168,7 @@ func formatUsage(usage Usage) string {
 
 // Validate checks all required fields and returns every missing or invalid
 // field in one error.
-func (r AttestationRecord) Validate() error {
+func (r Report) Validate() error {
 	var problems []string
 
 	if strings.TrimSpace(string(r.Role)) == "" {
@@ -230,7 +235,7 @@ func (r AttestationRecord) Validate() error {
 	return nil
 }
 
-func (r AttestationRecord) allowsAbsentUsage() bool {
+func (r Report) allowsAbsentUsage() bool {
 	if strings.TrimSpace(r.Provider) != "antigravity" {
 		return false
 	}
@@ -242,6 +247,26 @@ func ModelSourceForProvider(provider string) ModelSource {
 		return ModelSourceSelfReported
 	}
 	return ModelSourceParsed
+}
+
+func ModelDepthDisplay(model, effort string) string {
+	model = strings.TrimSpace(model)
+	effort = strings.TrimSpace(effort)
+	if model == "" {
+		return ""
+	}
+	if effort == "" || modelHasDepthSuffix(model, effort) {
+		return model
+	}
+	return fmt.Sprintf("%s (%s)", model, effort)
+}
+
+func modelHasDepthSuffix(model, effort string) bool {
+	suffix := "(" + effort + ")"
+	if strings.HasSuffix(model, suffix) {
+		return true
+	}
+	return strings.HasSuffix(model, " "+suffix)
 }
 
 func validateTimestamp(field, value string) error {

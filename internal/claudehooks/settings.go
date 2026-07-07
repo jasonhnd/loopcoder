@@ -26,16 +26,16 @@ const (
 // directory and stay in lockstep with the installed binary, instead of a
 // relative node hooks/*.js path that only resolved inside loopcoder's own repo.
 var requiredHookNames = []string{
-	"conductor-attest",
+	"conductor-reporter",
 	"conductor-relay-guard",
 }
 
-// deprecatedCommands are the legacy conductor hook command strings from the
-// pre-binary node hooks/*.js mechanism. The settings merge strips them so an
-// upgrade does not leave behind broken, unresolved hook entries.
+// deprecatedCommands are legacy conductor hook command strings. The settings
+// merge strips them so an upgrade installs only current hook entries.
 var deprecatedCommands = []string{
 	"node hooks/conductor-attest.js",
 	"node hooks/conductor-relay-guard.js",
+	"loopcoder hook conductor-attest",
 }
 
 // RequiredHook describes one required Claude Code hook registration.

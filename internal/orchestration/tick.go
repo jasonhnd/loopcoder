@@ -15,13 +15,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -103,10 +103,10 @@ type TickOptions struct {
 	LoadAttempts    LoadAttemptsFunc
 }
 
-// TickReport intentionally has no top-level conductor AttestationRecord. The
+// TickReport intentionally has no top-level conductor Report. The
 // 0.4.0 tick path is deterministic Go orchestration, not an LLM conductor
 // invocation, so there is no real provider/model/usage record to stamp. Worker
-// dispatch and verifier loopreview attestations remain surfaced on their own
+// dispatch and verifier loopreview reports remain surfaced on their own
 // report entries.
 type TickReport struct {
 	Version          int                       `json:"version"`
@@ -136,17 +136,17 @@ type TickReport struct {
 }
 
 type TickReviewResult struct {
-	Issue              int                            `json:"issue,omitempty"`
-	PR                 string                         `json:"pr,omitempty"`
-	PRNumber           int                            `json:"pr_number,omitempty"`
-	Verdict            string                         `json:"verdict"`
-	SpecConformance    string                         `json:"spec_conformance,omitempty"`
-	Evidence           string                         `json:"evidence,omitempty"`
-	ConfiguredEvidence []config.EvidenceArtifact      `json:"configured_evidence,omitempty"`
-	RenderedArtifacts  []loopreview.RenderedArtifact  `json:"rendered_artifacts,omitempty"`
-	Findings           []loopreview.Finding           `json:"findings"`
-	Error              string                         `json:"error,omitempty"`
-	Attestation        *attestation.AttestationRecord `json:"attestation,omitempty"`
+	Issue              int                           `json:"issue,omitempty"`
+	PR                 string                        `json:"pr,omitempty"`
+	PRNumber           int                           `json:"pr_number,omitempty"`
+	Verdict            string                        `json:"verdict"`
+	SpecConformance    string                        `json:"spec_conformance,omitempty"`
+	Evidence           string                        `json:"evidence,omitempty"`
+	ConfiguredEvidence []config.EvidenceArtifact     `json:"configured_evidence,omitempty"`
+	RenderedArtifacts  []loopreview.RenderedArtifact `json:"rendered_artifacts,omitempty"`
+	Findings           []loopreview.Finding          `json:"findings"`
+	Error              string                        `json:"error,omitempty"`
+	Report             *reporter.Report              `json:"report,omitempty"`
 }
 
 type TickRecoveryResult struct {
@@ -581,7 +581,7 @@ func withTickDefaults(opts TickOptions) TickOptions {
 					Status:      result.Status,
 					ExitCode:    result.ExitCode,
 					LogBytes:    result.LogBytes,
-					Attestation: result.Attestation,
+					Report:      result.Report,
 				}, err
 			}
 			recoverDeps.Review = func(ctx context.Context, reviewOpts loopreview.Options) (loopreview.Result, error) {
@@ -843,7 +843,7 @@ func tickReviewResultFromLoopreview(issueNumber int, pr string, prNumber int, re
 		Evidence:          result.Verdict.Evidence,
 		RenderedArtifacts: copyRenderedArtifacts(result.Verdict.RenderedArtifacts),
 		Findings:          append([]loopreview.Finding(nil), result.Verdict.Findings...),
-		Attestation:       result.Verdict.Attestation,
+		Report:            result.Verdict.Report,
 	}
 }
 

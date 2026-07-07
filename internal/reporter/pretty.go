@@ -1,4 +1,4 @@
-package attestation
+package reporter
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// PrettyMode selects the human-oriented attestation rendering style.
+// PrettyMode selects the human-oriented report rendering style.
 type PrettyMode int
 
 const (
@@ -17,40 +17,44 @@ const (
 	PrettyModePlain
 )
 
-// PrettyOptions configures human-oriented attestation rendering.
+// PrettyOptions configures human-oriented report rendering.
 type PrettyOptions struct {
 	Mode PrettyMode
 }
 
-// Pretty renders a human-oriented, multi-line attestation summary.
+// Pretty renders a human-oriented, multi-line report summary.
 //
 // Pretty output is not a machine parse target. Use CanonicalJSON or Header for
 // durable machine or greppable output.
-func (r AttestationRecord) Pretty(options PrettyOptions) string {
+func (r Report) Pretty(options PrettyOptions) string {
 	status := r.prettyStatus()
-	prefix := "   "
+	prefix := "  "
 	statusLine := status.emojiLine
 	if options.Mode == PrettyModePlain {
-		prefix = "  "
 		statusLine = status.plainLine
 	}
 
 	lines := []string{
 		statusLine,
+		"who",
 		prettyField(prefix, "role", prettyValue(string(r.Role))),
-		prettyField(prefix, "provider", prettyValue(prettyProviderVendor(r.Provider))),
-		prettyField(prefix, "tool", prettyValue(r.Provider)),
-		prettyField(prefix, "model", formatPrettyModel(r.Model, r.ModelSource)),
-		prettyField(prefix, "effort", prettyValue(r.Effort)),
+		prettyField(prefix, "provider", prettyProviderDisplay(r.Provider)),
+		prettyField(prefix, "model", formatPrettyModel(r.Model, r.Effort, r.ModelSource)),
 		prettyField(prefix, "permission", prettyValue(string(r.Permission))),
+		"what",
+	}
+	lines = appendOptionalPrettyContext(lines, prefix, r)
+	lines = append(lines,
 		prettyField(prefix, "action", strconv.Quote(r.Action)),
+		"result",
 		prettyField(prefix, "exit", strconv.Itoa(r.ExitCode)),
+		prettyField(prefix, "duration", formatPrettyDuration(r.DurationMS)),
 		prettyField(prefix, "started", formatPrettyTimestamp(r.StartedAt)),
 		prettyField(prefix, "ended", formatPrettyTimestamp(r.EndedAt)),
-		prettyField(prefix, "duration", formatPrettyDuration(r.DurationMS)),
-		prettyField(prefix, "tokens", formatPrettyUsage(r.Usage)),
 		prettyField(prefix, "verified", strconv.FormatBool(r.Verified)),
-	}
+		"cost",
+		prettyField(prefix, "tokens", formatPrettyUsage(r.Usage)),
+	)
 
 	return strings.Join(lines, "\n")
 }
@@ -60,27 +64,46 @@ type prettyStatus struct {
 	plainLine string
 }
 
-func (r AttestationRecord) prettyStatus() prettyStatus {
+func (r Report) prettyStatus() prettyStatus {
 	if r.ExitCode != 0 {
 		return prettyStatus{
-			emojiLine: "❌ attestation failed",
-			plainLine: "attestation: failed",
+			emojiLine: "\u274c report failed",
+			plainLine: "report: failed",
 		}
 	}
 	if r.Verified {
 		return prettyStatus{
-			emojiLine: "✅ attestation verified",
-			plainLine: "attestation: verified",
+			emojiLine: "\u2705 report verified",
+			plainLine: "report: verified",
 		}
 	}
 	return prettyStatus{
-		emojiLine: "⚠️ attestation self-reported",
-		plainLine: "attestation: self-reported",
+		emojiLine: "\u26a0\ufe0f report self-reported",
+		plainLine: "report: self-reported",
 	}
 }
 
 func prettyField(prefix, label, value string) string {
 	return fmt.Sprintf("%s%-10s  %s", prefix, label, value)
+}
+
+func appendOptionalPrettyContext(lines []string, prefix string, r Report) []string {
+	if strings.TrimSpace(r.WorkID) != "" {
+		lines = append(lines, prettyField(prefix, "work_id", r.WorkID))
+	}
+	if r.Issue > 0 {
+		lines = append(lines, prettyField(prefix, "issue", "#"+strconv.Itoa(r.Issue)))
+	}
+	if strings.TrimSpace(r.Branch) != "" {
+		lines = append(lines, prettyField(prefix, "branch", r.Branch))
+	}
+	if strings.TrimSpace(r.Worktree) != "" {
+		lines = append(lines, prettyField(prefix, "worktree", r.Worktree))
+	}
+	if r.Round > 0 {
+		lines = append(lines, prettyField(prefix, "round", strconv.Itoa(r.Round)))
+	}
+	return lines
 }
 
 func prettyValue(value string) string {
@@ -90,30 +113,25 @@ func prettyValue(value string) string {
 	return value
 }
 
-func prettyProviderVendor(provider string) string {
+func prettyProviderDisplay(provider string) string {
+	provider = strings.TrimSpace(provider)
 	switch provider {
 	case "codex":
-		return "OpenAI"
+		return "OpenAI Codex / codex"
 	case "claude":
-		return "Anthropic"
+		return "Anthropic / claude"
 	case "gemini":
-		return "Google"
+		return "Google / gemini"
 	case "antigravity":
-		return "Google Antigravity"
+		return "Google Antigravity / antigravity"
 	default:
-		return provider
+		return prettyValue(provider)
 	}
 }
 
-func formatPrettyModel(model string, source ModelSource) string {
+func formatPrettyModel(model, effort string, source ModelSource) string {
 	suffix := prettyValue(string(source))
-	switch source {
-	case ModelSourceParsed:
-		suffix = "detected"
-	case ModelSourceSelfReported:
-		suffix = "self-reported"
-	}
-	return fmt.Sprintf("%s (%s)", prettyValue(model), suffix)
+	return fmt.Sprintf("%s (%s)", prettyValue(ModelDepthDisplay(model, effort)), suffix)
 }
 
 func formatPrettyTimestamp(value string) string {

@@ -8,21 +8,29 @@ import (
 )
 
 const (
-	attestScopeEnv    = "LOOPCODER_CONDUCTOR_ATTEST_SCOPE"
-	attestStateDirEnv = "LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR"
-	attestStateSub    = "conductor-attest"
+	reporterScopeEnv        = "LOOPCODER_CONDUCTOR_REPORTER_SCOPE"
+	reporterStateDirEnv     = "LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR"
+	reporterStateSub        = "conductor-reporter"
+	legacyAttestScopeEnv    = "LOOPCODER_CONDUCTOR_ATTEST_SCOPE"
+	legacyAttestStateDirEnv = "LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR"
+	legacyAttestStateSub    = "conductor-attest"
 )
 
 var (
-	conductorHeaderRe   = regexp.MustCompile(`\[attestation\]\s+role=conductor\b`)
+	conductorHeaderRe   = regexp.MustCompile(`\[(?:attestation|reporter)\]\s+role=conductor\b`)
 	roleConductorJSONRe = regexp.MustCompile(`"role"\s*:\s*"conductor"`)
 	modelSourceSelfRe   = regexp.MustCompile(`"model_source"\s*:\s*"self-reported"`)
 	verifiedFalseJSONRe = regexp.MustCompile(`"verified"\s*:\s*false`)
 )
 
+type attestStatePaths struct {
+	primary string
+	legacy  string
+}
+
 // attestState is the persisted per-session state for the conductor-attest gate.
 // The gate only applies to sessions that actually performed a delivery or merge
-// (DeliverySeen). Attested records a Conductor self-attestation. Reminded makes
+// (DeliverySeen). Attested records a Conductor self-report. Reminded makes
 // the Stop block one-shot so the gate can never loop even without an attest.
 type attestState struct {
 	Attested      bool   `json:"attested"`
@@ -38,7 +46,7 @@ type attestState struct {
 
 // RunAttest is the conductor-attest hook. It fails open on any error or panic.
 // The Stop gate blocks at most once, only on a turn that performed a delivery or
-// merge without a Conductor self-attestation, and it honors Claude Code's
+// merge without a Conductor self-report, and it honors Claude Code's
 // stop_hook_active escape valve — so it can never loop or block planning turns.
 func RunAttest(input []byte, opts Options) (res Result) {
 	defer func() {
@@ -55,18 +63,21 @@ func RunAttest(input []byte, opts Options) (res Result) {
 		return allow()
 	}
 
-	if in.SessionID == "" || !shouldEnforce(env(attestScopeEnv), in.HookEventName, in.CWD) {
+	if in.SessionID == "" || !shouldEnforce(firstEnv(env, reporterScopeEnv, legacyAttestScopeEnv), in.HookEventName, in.CWD) {
 		return allow()
 	}
 
-	statePath, err := stateFilePath(in.SessionID, in.CWD, env(attestStateDirEnv), attestStateSub)
+	statePaths, err := resolveAttestStatePaths(in.SessionID, in.CWD, env)
 	if err != nil {
 		return allow()
 	}
-	pruneStateDir(dirOf(statePath), now())
+	pruneStateDir(dirOf(statePaths.primary), now())
+	if statePaths.legacy != "" {
+		pruneStateDir(dirOf(statePaths.legacy), now())
+	}
 
 	if isToolCompleteEvent(in.HookEventName) {
-		recordAttestObservations(statePath, in, now())
+		recordAttestObservations(statePaths, in, now())
 		return allow()
 	}
 
@@ -80,7 +91,7 @@ func RunAttest(input []byte, opts Options) (res Result) {
 		return allow()
 	}
 
-	state, err := readAttestState(statePath)
+	state, err := readAttestState(statePaths)
 	if err != nil || state == nil {
 		return allow()
 	}
@@ -93,27 +104,27 @@ func RunAttest(input []byte, opts Options) (res Result) {
 
 	state.Reminded = true
 	state.RemindedAt = isoTimestamp(now())
-	if err := writeStateJSON(statePath, state); err != nil {
+	if err := writeStateJSON(statePaths.primary, state); err != nil {
 		return allow()
 	}
 
 	return block(strings.Join([]string{
-		"loopcoder conductor attestation is required before completing this delivery or merge turn.",
+		"loopcoder conductor report is required before completing this delivery or merge turn.",
 		"Run `loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action \"<delivery action>\" --duration-ms <ms> --total-tokens <tokens>` with the actual host model and usage, then finish the turn.",
-		"Keep the emitted attestation local: use command output and gitignored .loopcoder/ run records for recovery; do not copy it into PR bodies, comments, merge commits, or merge comments.",
+		"Keep the emitted report local: use command output and gitignored .loopcoder/ run records for recovery; do not copy it into PR bodies, comments, merge commits, or merge comments.",
 	}, "\n"))
 }
 
 // recordAttestObservations updates per-session state from a completed shell
-// tool: it marks a successful Conductor attestation, and separately marks that a
+// tool: it marks a successful Conductor report, and separately marks that a
 // delivery or merge command was observed (which is what makes the Stop gate
 // apply). Fail-open: any error is swallowed.
-func recordAttestObservations(statePath string, in hookInput, now time.Time) {
+func recordAttestObservations(statePaths attestStatePaths, in hookInput, now time.Time) {
 	if !isShellTool(in.ToolName) {
 		return
 	}
 
-	state, err := readAttestState(statePath)
+	state, err := readAttestState(statePaths)
 	if err != nil {
 		return
 	}
@@ -136,11 +147,48 @@ func recordAttestObservations(statePath string, in hookInput, now time.Time) {
 		changed = true
 	}
 	if changed {
-		_ = writeStateJSON(statePath, state)
+		_ = writeStateJSON(statePaths.primary, state)
 	}
 }
 
-func readAttestState(statePath string) (*attestState, error) {
+func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (attestStatePaths, error) {
+	if newDir := strings.TrimSpace(env(reporterStateDirEnv)); newDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, newDir, reporterStateSub)
+		return attestStatePaths{primary: primary}, err
+	}
+	if oldDir := strings.TrimSpace(env(legacyAttestStateDirEnv)); oldDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, oldDir, legacyAttestStateSub)
+		return attestStatePaths{primary: primary}, err
+	}
+	primary, err := stateFilePath(sessionID, cwd, "", reporterStateSub)
+	if err != nil {
+		return attestStatePaths{}, err
+	}
+	legacy, err := stateFilePath(sessionID, cwd, "", legacyAttestStateSub)
+	if err != nil {
+		return attestStatePaths{}, err
+	}
+	return attestStatePaths{primary: primary, legacy: legacy}, nil
+}
+
+func firstEnv(env func(string) string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(env(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func readAttestState(statePaths attestStatePaths) (*attestState, error) {
+	state, err := readAttestStateFile(statePaths.primary)
+	if err != nil || state != nil || statePaths.legacy == "" {
+		return state, err
+	}
+	return readAttestStateFile(statePaths.legacy)
+}
+
+func readAttestStateFile(statePath string) (*attestState, error) {
 	data, err := readStateBytes(statePath)
 	if err != nil {
 		return nil, err
@@ -157,7 +205,7 @@ func readAttestState(statePath string) (*attestState, error) {
 
 // isSuccessfulConductorAttest reports whether the tool-complete event is a
 // successful `loopcoder attest --role conductor` invocation whose output carries
-// a conductor attestation.
+// a conductor report.
 func isSuccessfulConductorAttest(in hookInput) bool {
 	if !isShellTool(in.ToolName) {
 		return false
@@ -168,7 +216,7 @@ func isSuccessfulConductorAttest(in hookInput) bool {
 	if !responseSucceeded(in) {
 		return false
 	}
-	return containsConductorAttestation(in.ToolResponse)
+	return containsConductorReport(in.ToolResponse)
 }
 
 // responseSucceeded reports whether a tool response indicates success: not
@@ -285,9 +333,9 @@ func hasRoleConductor(args []string) bool {
 	return false
 }
 
-// containsConductorAttestation reports whether the walked response strings carry
-// a conductor attestation header or the JSON self-reported/unverified marker.
-func containsConductorAttestation(raw json.RawMessage) bool {
+// containsConductorReport reports whether the walked response strings carry
+// a conductor report header or the JSON self-reported/unverified marker.
+func containsConductorReport(raw json.RawMessage) bool {
 	text := collectStringsFromRaw(raw)
 	if conductorHeaderRe.MatchString(text) {
 		return true

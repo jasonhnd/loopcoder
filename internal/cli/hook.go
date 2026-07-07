@@ -27,7 +27,7 @@ func runHook(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var result conductorhooks.Result
 	switch name {
-	case "conductor-attest":
+	case "conductor-reporter", "conductor-attest":
 		result = conductorhooks.RunAttest(input, conductorhooks.Options{})
 	case "conductor-relay-guard":
 		result = conductorhooks.RunRelayGuard(input, conductorhooks.Options{})

@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -30,6 +29,8 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -82,7 +83,7 @@ type Deps struct {
 }
 
 var commands = []Command{
-	{Name: "attest", Summary: "emit conductor self-attestation"},
+	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
@@ -96,7 +97,8 @@ var commands = []Command{
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
-	{Name: "relay", Summary: "flush or list pending local attestation relay blocks"},
+	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
+	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "resume", Summary: "reconcile a local run"},
@@ -241,6 +243,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "status" {
 		return runStatus(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "report" {
+		return runReport(args[1:], stdout, stderr)
+	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
 	}
@@ -377,11 +382,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
-		fmt.Fprintln(w, "  --pretty                    force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty                 suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                 suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "attest" {
-		fmt.Fprintln(w, "  --role string            attestation role (default \"conductor\")")
+		fmt.Fprintln(w, "  --role string            report role (default \"conductor\")")
 		fmt.Fprintln(w, "  --provider string        conductor host provider (required)")
 		fmt.Fprintln(w, "  --model string           conductor host model (required)")
 		fmt.Fprintln(w, "  --effort string          optional reasoning effort")
@@ -396,7 +401,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --total-tokens int       total token count")
 		fmt.Fprintln(w, "  --model-source string    ignored; forced to self-reported")
 		fmt.Fprintln(w, "  --verified               ignored; forced to false")
-		fmt.Fprintln(w, "  --pretty                 render human-readable attestation instead of durable output")
+		fmt.Fprintln(w, "  --pretty                 render human-readable report instead of durable output")
 	}
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
@@ -451,8 +456,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
-		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty reports on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty reports on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "trigger" {
 		fmt.Fprintln(w, "  <kind>                           trigger kind: cron, goal-loop, or hook")
@@ -465,8 +470,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --max_iterations int             alias for --max-iterations")
 		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
-		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty                         force emoji pretty reports on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                      suppress pretty reports on stderr (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "promote" {
 		fmt.Fprintln(w, "  --repo string              repository path (required)")
@@ -489,6 +494,14 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "status" {
 		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
 		fmt.Fprintln(w, "  --run string    local run id to inspect (default latest modified local run)")
+	}
+	if command.Name == "report" {
+		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
+		fmt.Fprintln(w, "  --work-id string   filter by report work_id")
+		fmt.Fprintln(w, "  --issue int        filter by GitHub issue number")
+		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
+		fmt.Fprintln(w, "  --limit int        maximum reports to render (default 20)")
+		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
 	}
 	if command.Name == "resume" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -527,8 +540,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict               reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
-		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty            suppress pretty attestation on stderr (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty               force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty            suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Exit codes:")
 		fmt.Fprintln(w, "  0   clean verifier verdict: pass")
@@ -556,11 +569,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
-		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
-		fmt.Fprintln(w, "  --no-pretty                suppress pretty attestations on stdout (LOOPCODER_NO_PRETTY)")
+		fmt.Fprintln(w, "  --pretty                   force emoji pretty reports on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
+		fmt.Fprintln(w, "  --no-pretty                suppress pretty reports on stdout (LOOPCODER_NO_PRETTY)")
 	}
 	if command.Name == "hook" {
-		fmt.Fprintln(w, "  <name>    hook to run: conductor-attest or conductor-relay-guard")
+		fmt.Fprintln(w, "  <name>    hook to run: conductor-reporter, conductor-relay-guard, or legacy conductor-attest")
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Reads the hook payload from stdin and runs the named embedded conductor hook.")
 		fmt.Fprintln(w, "Wired into Claude Code settings; unknown or missing names fail open (exit 0).")
@@ -604,7 +617,7 @@ func printRelayHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder relay flush --repo <path>")
 	fmt.Fprintln(w, "  loopcoder relay list --repo <path>")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flush or list pending local-only Worker/Verifier attestation relay blocks.")
+	fmt.Fprintln(w, "Flush or list pending local-only Worker/Verifier report relay blocks.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
@@ -1196,10 +1209,10 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable reports on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable reports on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable reports on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable reports on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1379,7 +1392,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	var ownRelayRecords []relaygate.Record
-	prettyMode := attestation.PrettyModePlain
+	prettyMode := reporter.PrettyModePlain
 	renderPretty := shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
@@ -1398,8 +1411,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if renderPretty {
-		if err := renderTickPrettyAttestations(stderr, tickReport, prettyMode); err != nil {
-			fmt.Fprintf(stderr, "tick: write pretty attestation: %v\n", err)
+		if err := renderTickPrettyReports(stderr, tickReport, prettyMode); err != nil {
+			fmt.Fprintf(stderr, "tick: write pretty report: %v\n", err)
 			return 1
 		}
 		if err := relaygate.Ack(resolvedRepo, ownRelayRecords); err != nil {
@@ -1501,10 +1514,10 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestations on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestations on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestations on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable reports on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable reports on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable reports on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable reports on stderr")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
@@ -1615,7 +1628,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	var ownRelayRecords []relaygate.Record
-	prettyMode := attestation.PrettyModePlain
+	prettyMode := reporter.PrettyModePlain
 	renderPretty := shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
@@ -1634,8 +1647,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if renderPretty {
-		if err := renderTriggerPrettyAttestations(stderr, triggerReport, prettyMode); err != nil {
-			fmt.Fprintf(stderr, "trigger %s: write pretty attestation: %v\n", kind, err)
+		if err := renderTriggerPrettyReports(stderr, triggerReport, prettyMode); err != nil {
+			fmt.Fprintf(stderr, "trigger %s: write pretty report: %v\n", kind, err)
 			return 1
 		}
 		if err := relaygate.Ack(resolvedRepo, ownRelayRecords); err != nil {
@@ -1716,9 +1729,9 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 	}, true
 }
 
-func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerReport, mode attestation.PrettyMode) error {
+func renderTriggerPrettyReports(w io.Writer, report orchestration.TriggerReport, mode reporter.PrettyMode) error {
 	for _, tick := range report.Ticks {
-		if err := renderTickPrettyAttestations(w, tick, mode); err != nil {
+		if err := renderTickPrettyReports(w, tick, mode); err != nil {
 			return err
 		}
 	}
@@ -1736,7 +1749,7 @@ func relayRecordNonces(records []relaygate.Record) map[string]bool {
 	return nonces
 }
 
-func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerReport, mode reporter.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
 	var records []relaygate.Record
 	for _, tick := range report.Ticks {
 		tickRecords, err := writeTickRelayRecords(repoPath, tick, mode, preExisting)
@@ -1748,7 +1761,7 @@ func writeTriggerRelayRecords(repoPath string, report orchestration.TriggerRepor
 	return records, nil
 }
 
-func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mode attestation.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
+func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mode reporter.PrettyMode, preExisting map[string]bool) ([]relaygate.Record, error) {
 	var records []relaygate.Record
 	if report.DispatchWave != nil {
 		runID := strings.TrimSpace(report.DispatchWave.RunID)
@@ -1756,10 +1769,10 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			runID = strings.TrimSpace(report.RunID)
 		}
 		for _, result := range report.DispatchWave.Results {
-			if result.Attestation == nil {
+			if result.Report == nil {
 				continue
 			}
-			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Attestation.Role), prNumberFromPR(result.PR), *result.Attestation, mode, preExisting)
+			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Report.Role), prNumberFromPR(result.PR), *result.Report, mode, preExisting)
 			if err != nil {
 				return records, err
 			}
@@ -1769,7 +1782,7 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 		}
 	}
 	for _, review := range report.Reviews {
-		if review.Attestation == nil {
+		if review.Report == nil {
 			continue
 		}
 		prNumber := review.PRNumber
@@ -1777,7 +1790,7 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			prNumber = prNumberFromPR(review.PR)
 		}
 		runID := fmt.Sprintf("loopreview-pr-%d", prNumber)
-		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Attestation.Role), prNumber, *review.Attestation, mode, preExisting)
+		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Report.Role), prNumber, *review.Report, mode, preExisting)
 		if err != nil {
 			return records, err
 		}
@@ -1788,8 +1801,8 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 	return records, nil
 }
 
-func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record attestation.AttestationRecord, mode attestation.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record reporter.Report, mode reporter.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	nonce := relaygate.Nonce(runID, prNumber, role)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
@@ -1797,6 +1810,7 @@ func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, reco
 		Role:     role,
 		PRNumber: prNumber,
 		Block:    pretty,
+		Report:   &record,
 	}); err != nil {
 		return relaygate.Record{}, false, err
 	}
@@ -1934,22 +1948,22 @@ func runPromote(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return orchestration.PromoteExitCode(report)
 }
 
-func renderTickPrettyAttestations(w io.Writer, report orchestration.TickReport, mode attestation.PrettyMode) error {
+func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode reporter.PrettyMode) error {
 	if report.DispatchWave != nil {
 		for _, result := range report.DispatchWave.Results {
-			if result.Attestation == nil {
+			if result.Report == nil {
 				continue
 			}
-			if err := renderPrettyAttestation(w, *result.Attestation, mode); err != nil {
+			if err := renderPrettyReport(w, *result.Report, mode); err != nil {
 				return err
 			}
 		}
 	}
 	for _, review := range report.Reviews {
-		if review.Attestation == nil {
+		if review.Report == nil {
 			continue
 		}
-		if err := renderPrettyAttestation(w, *review.Attestation, mode); err != nil {
+		if err := renderPrettyReport(w, *review.Report, mode); err != nil {
 			return err
 		}
 	}
@@ -2608,10 +2622,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -2714,15 +2728,15 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if result.Attestation != nil {
+	if result.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeDispatchRelayLedger(opts, result, *result.Attestation, mode, deps.Now()); err != nil {
+		if err := writeDispatchRelayLedger(opts, result, *result.Report, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "dispatch: write relay ledger: %v\n", err)
 			return 1
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyAttestation(stderr, *result.Attestation, mode); err != nil {
-				fmt.Fprintf(stderr, "dispatch: write pretty attestation: %v\n", err)
+			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
 			}
 		}
@@ -2730,12 +2744,12 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
-func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
+func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
 	invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
 	if invocationID == "" {
 		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
 	}
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        result.RunID,
@@ -2747,6 +2761,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 		CreatedAt:    now,
 		Header:       record.Header(),
 		Pretty:       pretty,
+		Report:       &record,
 	})
 	if err != nil {
 		return err
@@ -2757,6 +2772,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 		Role:     string(record.Role),
 		PRNumber: prNumberFromPR(result.PR),
 		Block:    pretty,
+		Report:   &record,
 	})
 	return err
 }
@@ -2769,19 +2785,20 @@ func relayInvocationIDFromAttemptPath(attemptPath string) string {
 	return strings.TrimSuffix(base, ".attempt.json")
 }
 
-func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.AttestationRecord, mode attestation.PrettyMode, now time.Time) error {
-	pretty := record.Pretty(attestation.PrettyOptions{Mode: mode})
+func writeLoopreviewRelayLedger(opts loopreview.Options, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
+	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
 	runID := fmt.Sprintf("loopreview-pr-%d", opts.PRNumber)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        runID,
 		InvocationID: fmt.Sprintf("loopreview-pr-%d-%d", opts.PRNumber, now.UTC().UnixNano()),
 		Command:      "loopreview",
-		Role:         attestation.RoleVerifier,
+		Role:         reporter.RoleVerifier,
 		PRNumber:     opts.PRNumber,
 		CreatedAt:    now,
 		Header:       record.Header(),
 		Pretty:       pretty,
+		Report:       &record,
 	})
 	if err != nil {
 		return err
@@ -2789,9 +2806,10 @@ func writeLoopreviewRelayLedger(opts loopreview.Options, record attestation.Atte
 	_, err = relaygate.Write(relaygate.WriteOptions{
 		RepoPath: opts.RepoPath,
 		RunID:    runID,
-		Role:     string(attestation.RoleVerifier),
+		Role:     string(reporter.RoleVerifier),
 		PRNumber: opts.PRNumber,
 		Block:    pretty,
+		Report:   &record,
 	})
 	return err
 }
@@ -2823,21 +2841,21 @@ func prNumberFromPR(pr string) int {
 }
 
 func renderDispatch(w io.Writer, result worker.Result) error {
-	if result.Attestation == nil {
-		return errors.New("dispatch attestation is missing")
+	if result.Report == nil {
+		return errors.New("dispatch report is missing")
 	}
-	if err := result.Attestation.Validate(); err != nil {
-		return fmt.Errorf("validate dispatch attestation: %w", err)
+	if err := result.Report.Validate(); err != nil {
+		return fmt.Errorf("validate dispatch report: %w", err)
 	}
-	canonical, err := result.Attestation.CanonicalJSON()
+	canonical, err := result.Report.CanonicalJSON()
 	if err != nil {
-		return fmt.Errorf("render dispatch attestation JSON: %w", err)
+		return fmt.Errorf("render dispatch report JSON: %w", err)
 	}
 	data, err := worker.MarshalResult(result)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(w, result.Attestation.Header()); err != nil {
+	if _, err := fmt.Fprintln(w, result.Report.Header()); err != nil {
 		return err
 	}
 	if _, err := w.Write(append(canonical, '\n')); err != nil {
@@ -2857,7 +2875,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	role := string(attestation.RoleConductor)
+	role := string(reporter.RoleConductor)
 	var roleAlias string
 	var provider string
 	var providerAlias string
@@ -2865,7 +2883,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effort string
 	var effortAlias string
-	permission := string(attestation.PermissionOrchestrate)
+	permission := string(reporter.PermissionOrchestrate)
 	var permissionAlias string
 	var action string
 	var actionAlias string
@@ -2920,8 +2938,8 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&ignoredModelSourceAlias, "ModelSource", "", "model source")
 	fs.BoolVar(&ignoredVerified, "verified", false, "verified")
 	fs.BoolVar(&ignoredVerifiedAlias, "Verified", false, "verified")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable report")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -2970,7 +2988,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		"role":         role,
 		"provider":     provider,
 		"model":        model,
-		"model_source": string(attestation.ModelSourceSelfReported),
+		"model_source": string(reporter.ModelSourceSelfReported),
 		"effort":       effort,
 		"permission":   permission,
 		"action":       action,
@@ -3028,7 +3046,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
 	}
-	var record attestation.AttestationRecord
+	var record reporter.Report
 	if err := json.Unmarshal(data, &record); err != nil {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
@@ -3043,7 +3061,7 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	if pretty {
-		if err := renderPrettyAttestation(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
+		if err := renderPrettyReport(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
 			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
 			return 1
 		}
@@ -3261,10 +3279,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.IntVar(&throttleLimit, "throttle-limit", lcdefaults.DispatchWaveThrottleLimit, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3392,24 +3410,24 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
 	renderPretty := shouldRenderPretty(noPretty)
 	writeWaveRelayRecord := func(runID string, result orchestration.DispatchWaveIssueResult) error {
-		if result.Attestation == nil {
+		if result.Report == nil {
 			return nil
 		}
 		invocationID := relayInvocationIDFromAttemptPath(result.AttemptPath)
 		if invocationID == "" {
 			invocationID = fmt.Sprintf("dispatch-wave-issue-%d-%d", result.Issue, deps.Now().UTC().UnixNano())
 		}
-		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
 		if _, err := relay.Write(relay.Entry{
 			RepoPath:     resolvedRepo,
 			RunID:        runID,
 			InvocationID: invocationID,
 			Command:      "dispatch-wave",
-			Role:         result.Attestation.Role,
+			Role:         result.Report.Role,
 			Issue:        result.Issue,
 			PR:           result.PR,
 			CreatedAt:    deps.Now(),
-			Header:       result.Attestation.Header(),
+			Header:       result.Report.Header(),
 			Pretty:       prettyBlock,
 		}); err != nil {
 			return err
@@ -3421,7 +3439,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		_, err := relaygate.Write(relaygate.WriteOptions{
 			RepoPath: resolvedRepo,
 			RunID:    runID,
-			Role:     string(result.Attestation.Role),
+			Role:     string(result.Report.Role),
 			PRNumber: prNumber,
 			Block:    prettyBlock,
 		})
@@ -3429,7 +3447,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	streamWaveCompletion := func(completion orchestration.DispatchWaveIssueComplete) error {
 		result := completion.Result
-		if result.Attestation == nil {
+		if result.Report == nil {
 			return nil
 		}
 		if err := writeWaveRelayRecord(completion.RunID, result); err != nil {
@@ -3438,7 +3456,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if !renderPretty {
 			return nil
 		}
-		prettyBlock := result.Attestation.Pretty(attestation.PrettyOptions{Mode: prettyMode})
+		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
 		text := orchestration.RenderDispatchWaveIssueCompletion(result, prettyBlock)
 		if _, err := stdout.Write([]byte(text)); err != nil {
 			return fmt.Errorf("write worker #%d completion: %w", result.Issue, err)
@@ -3765,10 +3783,10 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.DurationVar(&opts.Timeout, "timeout", loopreview.DefaultVerifierTimeout, "verifier timeout")
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "verifier timeout")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable attestation on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable attestation on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable attestation on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return loopreviewCommandFailureExitCode
@@ -3862,15 +3880,15 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	if result.Verdict.Attestation != nil {
+	if result.Verdict.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Attestation, mode, deps.Now()); err != nil {
+		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Report, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
 			return loopreviewCommandFailureExitCode
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyAttestation(stderr, *result.Verdict.Attestation, mode); err != nil {
-				fmt.Fprintf(stderr, "loopreview: write pretty attestation: %v\n", err)
+			if err := renderPrettyReport(stderr, *result.Verdict.Report, mode); err != nil {
+				fmt.Fprintf(stderr, "loopreview: write pretty report: %v\n", err)
 				return loopreviewCommandFailureExitCode
 			}
 		}
@@ -3977,7 +3995,7 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Status:      result.Status,
 				ExitCode:    result.ExitCode,
 				LogBytes:    result.LogBytes,
-				Attestation: result.Attestation,
+				Report:      result.Report,
 			}, err
 		}
 		recoverDeps.Review = review
@@ -4083,6 +4101,121 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func runReport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	var workID string
+	var workIDAlias string
+	var issue int
+	var issueAlias int
+	var role string
+	var roleAlias string
+	limit := reportquery.DefaultLimit
+	var limitAlias int
+	format := "text"
+	var formatAlias string
+
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&workID, "work-id", "", "work id")
+	fs.StringVar(&workIDAlias, "WorkId", "", "work id")
+	fs.IntVar(&issue, "issue", 0, "issue number")
+	fs.IntVar(&issueAlias, "Issue", 0, "issue number")
+	fs.StringVar(&role, "role", "", "role")
+	fs.StringVar(&roleAlias, "Role", "", "role")
+	fs.IntVar(&limit, "limit", reportquery.DefaultLimit, "limit")
+	fs.IntVar(&limitAlias, "Limit", 0, "limit")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if workIDAlias != "" {
+		workID = workIDAlias
+	}
+	if issueAlias != 0 {
+		issue = issueAlias
+	}
+	if roleAlias != "" {
+		role = roleAlias
+	}
+	if limitAlias != 0 {
+		limit = limitAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	switch format {
+	case "text", "json":
+	default:
+		fmt.Fprintf(stderr, "report: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	reportRole := reporter.Role(strings.TrimSpace(role))
+	if reportRole != "" && !validReportRole(reportRole) {
+		fmt.Fprintf(stderr, "report: invalid --role %q; want worker, verifier, or conductor\n", role)
+		return 2
+	}
+	if issue < 0 {
+		fmt.Fprintln(stderr, "report: --issue must be non-negative")
+		return 2
+	}
+	if limit <= 0 {
+		fmt.Fprintln(stderr, "report: --limit must be positive")
+		return 2
+	}
+
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "report: %v\n", err)
+		return 2
+	}
+	records, err := reportquery.List(reportquery.Options{
+		RepoPath: resolvedRepo,
+		WorkID:   workID,
+		Issue:    issue,
+		Role:     reportRole,
+		Limit:    limit,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "report: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		data, err := reportquery.MarshalJSON(records)
+		if err != nil {
+			fmt.Fprintf(stderr, "report: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(append(data, '\n')); err != nil {
+			fmt.Fprintf(stderr, "report: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if _, err := stdout.Write([]byte(reportquery.RenderText(records))); err != nil {
+		fmt.Fprintf(stderr, "report: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func validReportRole(role reporter.Role) bool {
+	switch role {
+	case reporter.RoleWorker, reporter.RoleVerifier, reporter.RoleConductor:
+		return true
+	default:
+		return false
+	}
 }
 
 func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -4244,7 +4377,7 @@ func checkRelayGate(repoPath string, stdout, stderr io.Writer) (int, bool) {
 }
 
 func renderRelayGate(w io.Writer, repoPath string, records []relaygate.Record) error {
-	if _, err := fmt.Fprintln(w, "loopcoder relay gate: pending local-only Worker/Verifier attestation block(s) must be relayed before this command can run."); err != nil {
+	if _, err := fmt.Fprintln(w, "loopcoder relay gate: pending local-only Worker/Verifier report block(s) must be relayed before this command can run."); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "Run `loopcoder relay flush --repo %s` to print and acknowledge the pending block(s).\n\n", repoPath); err != nil {

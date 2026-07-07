@@ -368,7 +368,7 @@ func assertNoMissingRequiredHooks(t *testing.T, data []byte) {
 func assertHookCommandCounts(t *testing.T, data []byte, wantEach int) {
 	t.Helper()
 	for _, command := range []string{
-		"loopcoder hook conductor-attest",
+		"loopcoder hook conductor-reporter",
 		"loopcoder hook conductor-relay-guard",
 	} {
 		if got := strings.Count(string(data), command); got != wantEach {

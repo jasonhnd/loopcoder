@@ -18,8 +18,15 @@ func mapEnv(m map[string]string) func(string) string {
 // attestHookEnv mirrors the JS hookEnv(stateDir): scope always + state dir.
 func attestHookEnv(stateDir string) map[string]string {
 	return map[string]string{
-		attestScopeEnv:    "always",
-		attestStateDirEnv: stateDir,
+		reporterScopeEnv:    "always",
+		reporterStateDirEnv: stateDir,
+	}
+}
+
+func legacyAttestHookEnv(stateDir string) map[string]string {
+	return map[string]string{
+		legacyAttestScopeEnv:    "always",
+		legacyAttestStateDirEnv: stateDir,
 	}
 }
 
@@ -53,6 +60,14 @@ func attestDispatchPost(root string) map[string]any {
 }
 
 func attestAttestPost(root string) map[string]any {
+	return attestAttestPostWithHeader(root, "[reporter]")
+}
+
+func legacyAttestAttestPost(root string) map[string]any {
+	return attestAttestPostWithHeader(root, "[attestation]")
+}
+
+func attestAttestPostWithHeader(root, token string) map[string]any {
 	return map[string]any{
 		"session_id":      "session-1",
 		"cwd":             root,
@@ -62,7 +77,7 @@ func attestAttestPost(root string) map[string]any {
 			"command": `loopcoder attest --role conductor --provider claude-code --model opus --permission orchestrate --action "merge PR #10" --duration-ms 1 --total-tokens 2`,
 		},
 		"tool_response": map[string]any{
-			"stdout":      "{\"role\":\"conductor\",\"model_source\":\"self-reported\",\"verified\":false}\n[attestation] role=conductor provider=claude-code model=opus(self-reported) effort=default perm=orchestrate action=\"merge PR #10\" exit=0 dur=1ms tokens=2 verified=false\n",
+			"stdout":      "{\"role\":\"conductor\",\"model_source\":\"self-reported\",\"verified\":false}\n" + token + " role=conductor provider=claude-code model=opus(self-reported) effort=default perm=orchestrate action=\"merge PR #10\" exit=0 dur=1ms tokens=2 verified=false\n",
 			"stderr":      "",
 			"interrupted": false,
 			"isImage":     false,
@@ -94,7 +109,7 @@ func TestAttestDeliveryBlocksOnceThenSelfClears(t *testing.T) {
 	if first.ExitCode != 2 {
 		t.Fatalf("expected first Stop after delivery to block (exit 2), got %d", first.ExitCode)
 	}
-	if !regexp.MustCompile(`conductor attestation is required`).MatchString(first.Stderr) {
+	if !regexp.MustCompile(`conductor report is required`).MatchString(first.Stderr) {
 		t.Fatalf("expected reminder message, got %q", first.Stderr)
 	}
 	second := RunAttest(mustJSON(t, attestStop(root, false)), opts)
@@ -103,7 +118,7 @@ func TestAttestDeliveryBlocksOnceThenSelfClears(t *testing.T) {
 	}
 }
 
-// A delivery turn followed by a Conductor attestation clears the gate.
+// A delivery turn followed by a Conductor report clears the gate.
 func TestAttestDeliveryThenAttestAllows(t *testing.T) {
 	root := t.TempDir()
 	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
@@ -115,6 +130,109 @@ func TestAttestDeliveryThenAttestAllows(t *testing.T) {
 	stop := RunAttest(mustJSON(t, attestStop(root, false)), opts)
 	if stop.ExitCode != 0 {
 		t.Fatalf("expected Stop after attest to allow (exit 0), got %d (stderr=%q)", stop.ExitCode, stop.Stderr)
+	}
+}
+
+func TestAttestDeliveryThenLegacyHeaderAllows(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(attestHookEnv(filepath.Join(root, "state")))}
+
+	RunAttest(mustJSON(t, attestDispatchPost(root)), opts)
+	if r := RunAttest(mustJSON(t, legacyAttestAttestPost(root)), opts); r.ExitCode != 0 {
+		t.Fatalf("legacy attest PostToolUse exit = %d (stderr=%q)", r.ExitCode, r.Stderr)
+	}
+	stop := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if stop.ExitCode != 0 {
+		t.Fatalf("expected Stop after legacy attest header to allow (exit 0), got %d (stderr=%q)", stop.ExitCode, stop.Stderr)
+	}
+}
+
+func TestAttestLegacyEnvKeysStillEnableHook(t *testing.T) {
+	root := t.TempDir()
+	opts := Options{Env: mapEnv(legacyAttestHookEnv(filepath.Join(root, "legacy-state")))}
+
+	if r := RunAttest(mustJSON(t, attestDispatchPost(root)), opts); r.ExitCode != 0 {
+		t.Fatalf("dispatch PostToolUse exit = %d", r.ExitCode)
+	}
+	first := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if first.ExitCode != 2 {
+		t.Fatalf("expected old env keys to enable Stop block (exit 2), got %d", first.ExitCode)
+	}
+}
+
+func TestAttestNewEnvKeysWinOverLegacyEnvKeys(t *testing.T) {
+	root := t.TempDir()
+	env := legacyAttestHookEnv(filepath.Join(root, "legacy-state"))
+	env[reporterScopeEnv] = "off"
+	env[reporterStateDirEnv] = filepath.Join(root, "reporter-state")
+	opts := Options{Env: mapEnv(env)}
+
+	if r := RunAttest(mustJSON(t, attestDispatchPost(root)), opts); r.ExitCode != 0 {
+		t.Fatalf("dispatch PostToolUse exit = %d", r.ExitCode)
+	}
+	stop := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if stop.ExitCode != 0 {
+		t.Fatalf("expected new scope env to override legacy scope env (exit 0), got %d", stop.ExitCode)
+	}
+}
+
+func TestAttestNewStateDirEnvWinsOverLegacyStateDirEnv(t *testing.T) {
+	root := t.TempDir()
+	legacyStateDir := filepath.Join(root, "legacy-state")
+	legacyPath, err := stateFilePath("session-1", root, legacyStateDir, legacyAttestStateSub)
+	if err != nil {
+		t.Fatalf("legacy stateFilePath: %v", err)
+	}
+	if err := writeStateJSON(legacyPath, &attestState{
+		DeliverySeen:  true,
+		DeliveryAt:    "2026-06-28T00:00:00.000Z",
+		SessionIDHash: hashText("session-1")[:32],
+	}); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+
+	env := map[string]string{
+		reporterScopeEnv:        "always",
+		reporterStateDirEnv:     filepath.Join(root, "reporter-state"),
+		legacyAttestStateDirEnv: legacyStateDir,
+	}
+	stop := RunAttest(mustJSON(t, attestStop(root, false)), Options{Env: mapEnv(env)})
+	if stop.ExitCode != 0 {
+		t.Fatalf("expected new state dir env to ignore legacy state dir (exit 0), got %d", stop.ExitCode)
+	}
+}
+
+func TestAttestReadsLegacyPersistedStateWhenReporterStateAbsent(t *testing.T) {
+	root := t.TempDir()
+	legacyPath, err := stateFilePath("session-1", root, "", legacyAttestStateSub)
+	if err != nil {
+		t.Fatalf("legacy stateFilePath: %v", err)
+	}
+	legacyState := attestState{
+		DeliverySeen:  true,
+		DeliveryAt:    "2026-06-28T00:00:00.000Z",
+		SessionIDHash: hashText("session-1")[:32],
+	}
+	if err := writeStateJSON(legacyPath, &legacyState); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+
+	opts := Options{Env: mapEnv(map[string]string{reporterScopeEnv: "always"})}
+	first := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if first.ExitCode != 2 {
+		t.Fatalf("expected Stop to block from legacy state (exit 2), got %d", first.ExitCode)
+	}
+
+	reporterPath, err := stateFilePath("session-1", root, "", reporterStateSub)
+	if err != nil {
+		t.Fatalf("reporter stateFilePath: %v", err)
+	}
+	reporterState, err := readAttestStateFile(reporterPath)
+	if err != nil {
+		t.Fatalf("read reporter state: %v", err)
+	}
+	if reporterState == nil || !reporterState.Reminded {
+		t.Fatalf("reporter state after legacy fallback = %#v, want reminded state", reporterState)
 	}
 }
 

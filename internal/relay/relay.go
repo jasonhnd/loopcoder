@@ -1,4 +1,4 @@
-// Package relay writes local-only attestation relay ledger files.
+// Package relay writes local-only report relay ledger files.
 package relay
 
 import (
@@ -10,23 +10,24 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
-// Entry describes one local attestation block that a conductor must be able to
+// Entry describes one local report block that a conductor must be able to
 // surface verbatim. Files written by this package are gitignored local state.
 type Entry struct {
 	RepoPath     string
 	RunID        string
 	InvocationID string
 	Command      string
-	Role         attestation.Role
+	Role         reporter.Role
 	Issue        int
 	PRNumber     int
 	PR           string
 	CreatedAt    time.Time
 	Header       string
 	Pretty       string
+	Report       *reporter.Report
 }
 
 // Write appends one relay entry under .loopcoder/relay/<run>/<invocation>.attest.
@@ -38,10 +39,10 @@ func Write(entry Entry) (string, error) {
 	runID := sanitizePathPart(entry.RunID, "no-run")
 	invocationID := sanitizePathPart(entry.InvocationID, "invocation")
 	if strings.TrimSpace(entry.Header) == "" {
-		return "", fmt.Errorf("attestation header is required")
+		return "", fmt.Errorf("report header is required")
 	}
 	if strings.TrimSpace(entry.Pretty) == "" {
-		return "", fmt.Errorf("attestation pretty block is required")
+		return "", fmt.Errorf("report pretty block is required")
 	}
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now().UTC()
@@ -71,7 +72,7 @@ func Write(entry Entry) (string, error) {
 
 func render(entry Entry) string {
 	var b strings.Builder
-	b.WriteString("# loopcoder relay attestation\n")
+	b.WriteString("# loopcoder relay report\n")
 	writeMeta(&b, "command", entry.Command)
 	writeMeta(&b, "role", string(entry.Role))
 	writeMeta(&b, "run_id", entry.RunID)
@@ -83,6 +84,11 @@ func render(entry Entry) string {
 	}
 	writeMeta(&b, "pr", entry.PR)
 	writeMeta(&b, "created_at", entry.CreatedAt.UTC().Format(time.RFC3339Nano))
+	if entry.Report != nil {
+		if data, err := entry.Report.CanonicalJSON(); err == nil {
+			writeMeta(&b, "report_json", string(data))
+		}
+	}
 	b.WriteString(strings.TrimRight(entry.Header, "\r\n"))
 	b.WriteByte('\n')
 	b.WriteString(strings.TrimRight(entry.Pretty, "\r\n"))

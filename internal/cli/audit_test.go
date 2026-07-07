@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
@@ -20,7 +20,7 @@ func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
 		t.Fatalf("write .loopcoder file: %v", err)
 	}
 
-	record := validCLIAuditAttestation()
+	record := validCLIAuditReport()
 	var stdout, stderr bytes.Buffer
 	exitCode := RunWithDeps([]string{
 		"audit",
@@ -35,7 +35,7 @@ func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
 				t.Fatalf("Provider = %q, want codex from verifier config", opts.Provider)
 			}
 			result := audit.NewResult(repo, []string{audit.LayerLLM}, audit.SeverityMedium)
-			result.Attestation = &record
+			result.Report = &record
 			return audit.Finalize(result), nil
 		},
 	})
@@ -46,14 +46,14 @@ func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
 		t.Fatalf("stdout missing relay needs-human verdict:\n%s", stdout.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
-		t.Fatalf("audit JSON serialized local-only attestation:\n%s", stdout.String())
+		t.Fatalf("audit JSON serialized local-only report:\n%s", stdout.String())
 	}
 }
 
 func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
 	repo := t.TempDir()
 	writeCLIAuditConfig(t, repo)
-	record := validCLIAuditAttestation()
+	record := validCLIAuditReport()
 
 	var stdout, stderr bytes.Buffer
 	exitCode := RunWithDeps([]string{
@@ -66,18 +66,18 @@ func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
 		Now: func() time.Time { return time.Date(2026, 7, 5, 1, 2, 3, 0, time.UTC) },
 		Audit: func(context.Context, audit.Options) (audit.Result, error) {
 			result := audit.NewResult(repo, []string{audit.LayerLLM}, audit.SeverityMedium)
-			result.Attestation = &record
+			result.Report = &record
 			return audit.Finalize(result), nil
 		},
 	})
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stdout=%s stderr=%s", exitCode, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "attestation verified") {
-		t.Fatalf("stderr missing pretty attestation:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "report verified") {
+		t.Fatalf("stderr missing pretty report:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
-		t.Fatalf("audit JSON serialized local-only attestation:\n%s", stdout.String())
+		t.Fatalf("audit JSON serialized local-only report:\n%s", stdout.String())
 	}
 	if _, err := os.Stat(filepath.Join(repo, ".loopcoder", "relay")); err != nil {
 		t.Fatalf("relay state was not written locally: %v", err)
@@ -97,23 +97,23 @@ verifier:
 	}
 }
 
-func validCLIAuditAttestation() attestation.AttestationRecord {
+func validCLIAuditReport() reporter.Report {
 	started := time.Date(2026, 7, 5, 1, 2, 3, 0, time.UTC)
 	ended := started.Add(time.Second)
 	total := int64(9)
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleVerifier,
+	return reporter.Report{
+		Role:        reporter.RoleVerifier,
 		Provider:    "codex",
 		Model:       "test-model",
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: reporter.ModelSourceParsed,
 		Effort:      "high",
-		Permission:  attestation.PermissionReadOnly,
+		Permission:  reporter.PermissionReadOnly,
 		Action:      "audit LLM security review",
 		ExitCode:    0,
 		StartedAt:   started.Format(time.RFC3339Nano),
 		EndedAt:     ended.Format(time.RFC3339Nano),
 		DurationMS:  1000,
-		Usage: attestation.Usage{
+		Usage: reporter.Usage{
 			TotalTokens: &total,
 		},
 		Verified: true,

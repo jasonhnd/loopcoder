@@ -17,10 +17,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 const (
@@ -84,33 +84,33 @@ func runLLMLayer(ctx context.Context, repoPath string, cfg config.Config, plan P
 		MCPServers:   mcpServers,
 	})
 	if agentResult.Hung {
-		record := auditReviewAttestation(provider, agentResult)
+		record := auditReviewReport(provider, model, effort, repoPath, agentResult)
 		emitAuditReviewHeader(opts.Stderr, record)
 		addNeedsHuman(result, LayerLLM, auditReviewHungReason(provider, logPath, timeout, agentResult.HungReason))
-		attachAuditReviewAttestation(result, record)
+		attachAuditReviewReport(result, record)
 		return
 	}
-	record := auditReviewAttestation(provider, agentResult)
+	record := auditReviewReport(provider, model, effort, repoPath, agentResult)
 	emitAuditReviewHeader(opts.Stderr, record)
 	if agentErr != nil {
 		addNeedsHuman(result, LayerLLM, fmt.Sprintf("%s audit review failed: %v; see %s", provider, agentErr, logPath))
-		attachAuditReviewAttestation(result, record)
+		attachAuditReviewReport(result, record)
 		return
 	}
 	if agentResult.ExitCode != 0 {
 		addNeedsHuman(result, LayerLLM, fmt.Sprintf("%s audit review exited with code %d; see %s", provider, agentResult.ExitCode, logPath))
-		attachAuditReviewAttestation(result, record)
+		attachAuditReviewReport(result, record)
 		return
 	}
 
 	findings, err := parseAuditReviewFindings(agentResult.Summary)
 	if err != nil {
 		addNeedsHuman(result, LayerLLM, fmt.Sprintf("structured audit review parse failed: %v", err))
-		attachAuditReviewAttestation(result, record)
+		attachAuditReviewReport(result, record)
 		return
 	}
 	result.Findings = append(result.Findings, findings...)
-	attachAuditReviewAttestation(result, record)
+	attachAuditReviewReport(result, record)
 }
 
 type auditReviewPacket struct {
@@ -192,7 +192,7 @@ repo: %s
 # Review instructions
 - Produce audit findings in the same schema as deterministic findings, with layer "llm".
 - Use severity critical, high, medium, low, or info.
-- Use category values that describe the security class, such as supply-chain-integrity, shared-host-disclosure, path-confinement, untrusted-worktree-execution, verifier-boundary, failure-reporting, local-only-attestation, bounded-io, or config-compatibility.
+- Use category values that describe the security class, such as supply-chain-integrity, shared-host-disclosure, path-confinement, untrusted-worktree-execution, verifier-boundary, failure-reporting, local-only-reporting, bounded-io, or config-compatibility.
 - Return an empty findings array only when the bounded packet and rubric are sufficient and no finding is present.
 - Return findings for concrete security risks; do not report speculative concerns without packet evidence.
 - If the packet is too truncated to decide safely, return one medium finding with rule "llm:insufficient-evidence" and category "bounded-io".
@@ -258,7 +258,7 @@ Language-agnostic rubric categories:
 - execution of trusted tools inside untrusted worktrees;
 - read-only verifier boundaries, including MCP server classification;
 - honest failure reporting and exit-code separation;
-- local-only attestation and relay obligations;
+- local-only report and relay obligations;
 - bounded local file reads, output sizes, and scan scope;
 - additive config compatibility and absent-config behavior.`)
 }
@@ -512,14 +512,16 @@ func parseAuditReviewFindings(raw string) ([]Finding, error) {
 	return findings, nil
 }
 
-func auditReviewAttestation(provider string, result agent.Result) attestation.AttestationRecord {
-	return attestation.AttestationRecord{
-		Role:        attestation.RoleVerifier,
+func auditReviewReport(provider, model, effort, repoPath string, result agent.Result) reporter.Report {
+	return reporter.Report{
+		WorkID:      "audit-llm",
+		Worktree:    repoPath,
+		Role:        reporter.RoleVerifier,
 		Provider:    provider,
-		Model:       result.Model,
-		ModelSource: attestation.ModelSourceForProvider(provider),
-		Effort:      result.Effort,
-		Permission:  attestation.PermissionReadOnly,
+		Model:       firstNonEmpty(model, result.Model),
+		ModelSource: reporter.ModelSourceForProvider(provider),
+		Effort:      firstNonEmpty(effort, result.Effort),
+		Permission:  reporter.PermissionReadOnly,
 		Action:      "audit LLM security review",
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
@@ -530,18 +532,18 @@ func auditReviewAttestation(provider string, result agent.Result) attestation.At
 	}
 }
 
-func attachAuditReviewAttestation(result *Result, record attestation.AttestationRecord) {
-	result.Attestation = &record
+func attachAuditReviewReport(result *Result, record reporter.Report) {
+	result.Report = &record
 	if err := record.Validate(); err != nil {
-		addNeedsHuman(result, LayerLLM, "incomplete verifier attestation: "+err.Error())
+		addNeedsHuman(result, LayerLLM, "incomplete verifier report: "+err.Error())
 		return
 	}
-	if record.Role != attestation.RoleVerifier || record.Permission != attestation.PermissionReadOnly || !record.Verified {
-		addNeedsHuman(result, LayerLLM, "invalid verifier attestation semantics")
+	if record.Role != reporter.RoleVerifier || record.Permission != reporter.PermissionReadOnly || !record.Verified {
+		addNeedsHuman(result, LayerLLM, "invalid verifier report semantics")
 	}
 }
 
-func emitAuditReviewHeader(w io.Writer, record attestation.AttestationRecord) {
+func emitAuditReviewHeader(w io.Writer, record reporter.Report) {
 	if w != nil {
 		fmt.Fprintln(w, record.Header())
 	}

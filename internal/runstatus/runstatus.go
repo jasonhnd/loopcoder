@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
@@ -87,12 +87,12 @@ type metadataRecord struct {
 }
 
 type verifierRecord struct {
-	Issue       int
-	JobID       string
-	PR          string
-	Verdict     string
-	Attestation *attestation.AttestationRecord
-	Path        string
+	Issue   int
+	JobID   string
+	PR      string
+	Verdict string
+	Report  *reporter.Report
+	Path    string
 }
 
 func Load(opts Options) (Report, error) {
@@ -263,7 +263,7 @@ func Render(report Report) string {
 }
 
 func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *verifierRecord) Row {
-	worker := attempt.Attestation
+	worker := attempt.Report
 	usage := attempt.Usage
 	if worker != nil {
 		if worker.HasUsage() {
@@ -278,11 +278,11 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 		Issue:                formatIssue(attempt.Issue),
 		WorkerJob:            display(attempt.JobID),
 		PR:                   display(metadataPR(attempt, metadata)),
-		WorkerProvider:       display(firstNonEmpty(attestationProvider(worker), attempt.Provider)),
-		WorkerModel:          display(attestationModel(worker)),
-		WorkerModelSource:    display(attestationModelSource(worker)),
-		WorkerEffort:         display(attestationEffort(worker)),
-		WorkerPermission:     display(attestationPermission(worker)),
+		WorkerProvider:       display(firstNonEmpty(reportProvider(worker), attempt.Provider)),
+		WorkerModel:          display(reportModel(worker)),
+		WorkerModelSource:    display(reportModelSource(worker)),
+		WorkerEffort:         display(reportEffort(worker)),
+		WorkerPermission:     display(reportPermission(worker)),
 		WorkerDuration:       formatDuration(worker),
 		WorkerInputTokens:    input,
 		WorkerOutputTokens:   output,
@@ -309,25 +309,25 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 		return row
 	}
 
-	verifierUsage := (*attestation.Usage)(nil)
-	if verifier.Attestation != nil && verifier.Attestation.HasUsage() {
-		verifierUsage = &verifier.Attestation.Usage
+	verifierUsage := (*reporter.Usage)(nil)
+	if verifier.Report != nil && verifier.Report.HasUsage() {
+		verifierUsage = &verifier.Report.Usage
 	}
 	vInput, vOutput, vTotal := formatUsage(verifierUsage)
 	if row.PR == NotReported {
 		row.PR = display(verifier.PR)
 	}
 	row.VerifierVerdict = display(verifier.Verdict)
-	row.VerifierProvider = display(attestationProvider(verifier.Attestation))
-	row.VerifierModel = display(attestationModel(verifier.Attestation))
-	row.VerifierModelSource = display(attestationModelSource(verifier.Attestation))
-	row.VerifierEffort = display(attestationEffort(verifier.Attestation))
-	row.VerifierPermission = display(attestationPermission(verifier.Attestation))
-	row.VerifierDuration = formatDuration(verifier.Attestation)
+	row.VerifierProvider = display(reportProvider(verifier.Report))
+	row.VerifierModel = display(reportModel(verifier.Report))
+	row.VerifierModelSource = display(reportModelSource(verifier.Report))
+	row.VerifierEffort = display(reportEffort(verifier.Report))
+	row.VerifierPermission = display(reportPermission(verifier.Report))
+	row.VerifierDuration = formatDuration(verifier.Report)
 	row.VerifierInputTokens = vInput
 	row.VerifierOutputTokens = vOutput
 	row.VerifierTotalTokens = vTotal
-	row.VerifierVerified = formatVerified(verifier.Attestation)
+	row.VerifierVerified = formatVerified(verifier.Report)
 	row.verifierRecordSortKey = verifier.Path
 	return row
 }
@@ -592,31 +592,33 @@ func verifierFromMap(values map[string]any, path string) (verifierRecord, bool) 
 		Verdict: firstString(values, "verdict", "verifier_verdict"),
 		Path:    path,
 	}
-	if attestationValue, ok := values["attestation"]; ok {
-		record.Attestation = parseAttestation(attestationValue)
+	if reportValue, ok := values["report"]; ok {
+		record.Report = parseReport(reportValue)
+	} else if reportValue, ok := values["attestation"]; ok {
+		record.Report = parseReport(reportValue)
 	}
-	if record.Attestation != nil && record.Attestation.Role != attestation.RoleVerifier {
-		record.Attestation = nil
+	if record.Report != nil && record.Report.Role != reporter.RoleVerifier {
+		record.Report = nil
 	}
-	if record.PR == "" && record.Attestation != nil {
-		record.PR = parsePRFromAction(record.Attestation.Action)
+	if record.PR == "" && record.Report != nil {
+		record.PR = parsePRFromAction(record.Report.Action)
 	}
-	if record.Issue == 0 && record.Attestation != nil {
-		record.Issue = parseIssueFromAction(record.Attestation.Action)
+	if record.Issue == 0 && record.Report != nil {
+		record.Issue = parseIssueFromAction(record.Report.Action)
 	}
 
-	if record.Verdict == "" && record.Attestation == nil {
+	if record.Verdict == "" && record.Report == nil {
 		return verifierRecord{}, false
 	}
 	return record, true
 }
 
-func parseAttestation(value any) *attestation.AttestationRecord {
+func parseReport(value any) *reporter.Report {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return nil
 	}
-	var record attestation.AttestationRecord
+	var record reporter.Report
 	if err := json.Unmarshal(data, &record); err != nil {
 		return nil
 	}
@@ -632,7 +634,7 @@ func dedupeVerifierRecords(records []verifierRecord) []verifierRecord {
 			record.JobID,
 			normalizePRID(record.PR),
 			record.Verdict,
-			attestationHeader(record.Attestation),
+			reportHeader(record.Report),
 			filepath.ToSlash(record.Path),
 		}, "\x00")
 		if seen[key] {
@@ -800,56 +802,56 @@ func display(value string) string {
 	return value
 }
 
-func attestationProvider(record *attestation.AttestationRecord) string {
+func reportProvider(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}
 	return record.Provider
 }
 
-func attestationModel(record *attestation.AttestationRecord) string {
+func reportModel(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}
 	return record.Model
 }
 
-func attestationModelSource(record *attestation.AttestationRecord) string {
+func reportModelSource(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}
 	return string(record.ModelSource)
 }
 
-func attestationEffort(record *attestation.AttestationRecord) string {
+func reportEffort(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}
 	return record.Effort
 }
 
-func attestationPermission(record *attestation.AttestationRecord) string {
+func reportPermission(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}
 	return string(record.Permission)
 }
 
-func formatDuration(record *attestation.AttestationRecord) string {
+func formatDuration(record *reporter.Report) string {
 	if record == nil || !record.HasDurationMS() {
 		return NotReported
 	}
 	return (time.Duration(record.DurationMS) * time.Millisecond).String()
 }
 
-func formatVerified(record *attestation.AttestationRecord) string {
+func formatVerified(record *reporter.Report) string {
 	if record == nil || !record.HasVerified() {
 		return NotReported
 	}
 	return strconv.FormatBool(record.Verified)
 }
 
-func formatUsage(usage *attestation.Usage) (string, string, string) {
+func formatUsage(usage *reporter.Usage) (string, string, string) {
 	if usage == nil {
 		return NotReported, NotReported, NotReported
 	}
@@ -893,7 +895,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func attestationHeader(record *attestation.AttestationRecord) string {
+func reportHeader(record *reporter.Report) string {
 	if record == nil {
 		return ""
 	}

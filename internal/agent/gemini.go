@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 type GeminiRunner struct{}
@@ -188,8 +188,8 @@ func modelFromGeminiModels(value any) string {
 	return ""
 }
 
-func findGeminiUsage(root map[string]any) attestation.Usage {
-	var usage attestation.Usage
+func findGeminiUsage(root map[string]any) reporter.Usage {
+	var usage reporter.Usage
 	for _, candidate := range geminiUsageCandidateMaps(root) {
 		mergeUsage(&usage, usageFromMap(candidate))
 	}
@@ -223,15 +223,15 @@ func geminiUsageCandidateMaps(root map[string]any) []map[string]any {
 	return candidates
 }
 
-func usageFromMap(values map[string]any) attestation.Usage {
-	var usage attestation.Usage
+func usageFromMap(values map[string]any) reporter.Usage {
+	var usage reporter.Usage
 	usage.InputTokens = firstInt64Value(values, "input_tokens", "inputTokens", "inputTokenCount", "prompt_tokens", "promptTokens", "promptTokenCount")
 	usage.OutputTokens = firstInt64Value(values, "output_tokens", "outputTokens", "outputTokenCount", "completion_tokens", "completionTokens", "candidate_tokens", "candidatesTokenCount")
 	usage.TotalTokens = firstInt64Value(values, "total_tokens", "totalTokens", "totalTokenCount")
 	return usage
 }
 
-func mergeUsage(dst *attestation.Usage, src attestation.Usage) {
+func mergeUsage(dst *reporter.Usage, src reporter.Usage) {
 	if dst.InputTokens == nil {
 		dst.InputTokens = src.InputTokens
 	}

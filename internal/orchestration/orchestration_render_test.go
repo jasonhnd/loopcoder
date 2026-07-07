@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	reportpkg "github.com/jasonhnd/loopcoder/internal/report"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func TestRenderTickTextGoldenBytes(t *testing.T) {
@@ -202,7 +202,7 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 		"- #7 succeeded\n" +
 		"  branch: loop/issue-7\n" +
 		"  pr: https://github.com/owner/repo/pull/7\n" +
-		"  attestation: provider=codex model=gpt-5(parsed) effort=high permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
+		"  report: provider=codex model=gpt-5 (high) source=parsed permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
 		"  attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
 		"  recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
 		"- #8 needs-human\n" +
@@ -219,14 +219,14 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 
 func TestRenderDispatchWaveIssueCompletionGoldenBytes(t *testing.T) {
 	result := dispatchWaveGoldenReport().Results[0]
-	const pretty = "worker attestation\n  provider codex\n"
+	const pretty = "worker report\n  provider codex\n"
 
 	const want = "DISPATCH WAVE WORKER #7 succeeded\n" +
 		"branch: loop/issue-7\n" +
 		"pr: https://github.com/owner/repo/pull/7\n" +
 		"attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
 		"recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
-		"worker attestation\n" +
+		"worker report\n" +
 		"  provider codex\n" +
 		"\n"
 	if got := RenderDispatchWaveIssueCompletion(result, pretty); got != want {
@@ -249,7 +249,7 @@ func TestStateFilesDoNotCallPresentationHelpers(t *testing.T) {
 		"renderPromoteGoNoGoPanel":          true,
 		"RenderDispatchWaveText":            true,
 		"RenderDispatchWaveIssueCompletion": true,
-		"formatDispatchWaveAttestation":     true,
+		"formatDispatchWaveReport":          true,
 		"formatDispatchWaveDuration":        true,
 		"formatDispatchWaveToken":           true,
 		"dispatchWaveCounts":                true,
@@ -329,14 +329,14 @@ func dispatchWaveGoldenReport() DispatchWaveReport {
 				PR:                  "https://github.com/owner/repo/pull/7",
 				AttemptPath:         ".loopcoder/runs/run-wave-golden/workers/job-7.attempt.json",
 				RecoveryContextPath: ".loopcoder/runs/run-wave-golden/recovery/job-7-context.md",
-				Attestation: &attestation.AttestationRecord{
+				Report: &reporter.Report{
 					Provider:    "codex",
 					Model:       "gpt-5",
-					ModelSource: attestation.ModelSourceParsed,
+					ModelSource: reporter.ModelSourceParsed,
 					Effort:      "high",
-					Permission:  attestation.PermissionWrite,
+					Permission:  reporter.PermissionWrite,
 					DurationMS:  1500,
-					Usage: attestation.Usage{
+					Usage: reporter.Usage{
 						InputTokens:  &inputTokens,
 						OutputTokens: &outputTokens,
 						TotalTokens:  &totalTokens,

@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/attestation"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -108,17 +108,17 @@ type DispatchOptions struct {
 }
 
 type DispatchResult struct {
-	OK          bool                           `json:"ok"`
-	Issue       int                            `json:"issue"`
-	Branch      string                         `json:"branch"`
-	RunID       string                         `json:"run_id"`
-	PR          string                         `json:"pr"`
-	Summary     string                         `json:"summary"`
-	AttemptPath string                         `json:"attempt_path"`
-	Status      string                         `json:"status"`
-	ExitCode    int                            `json:"exit_code"`
-	LogBytes    int64                          `json:"log_bytes"`
-	Attestation *attestation.AttestationRecord `json:"attestation,omitempty"`
+	OK          bool             `json:"ok"`
+	Issue       int              `json:"issue"`
+	Branch      string           `json:"branch"`
+	RunID       string           `json:"run_id"`
+	PR          string           `json:"pr"`
+	Summary     string           `json:"summary"`
+	AttemptPath string           `json:"attempt_path"`
+	Status      string           `json:"status"`
+	ExitCode    int              `json:"exit_code"`
+	LogBytes    int64            `json:"log_bytes"`
+	Report      *reporter.Report `json:"report,omitempty"`
 }
 
 type Result struct {

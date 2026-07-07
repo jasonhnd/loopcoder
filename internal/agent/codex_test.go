@@ -357,7 +357,7 @@ tokens used: 1,234
 		},
 		{
 			name:   "missing header fields",
-			output: "raw output without attestation header",
+			output: "raw output without report header",
 		},
 	}
 
