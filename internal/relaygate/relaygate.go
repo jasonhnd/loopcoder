@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 const (
@@ -24,13 +25,14 @@ const (
 
 var removePendingRecord = os.Remove
 
-// Record is one unacknowledged local-only pretty attestation block.
+// Record is one unacknowledged local-only pretty report block.
 type Record struct {
-	Version  int    `json:"version"`
-	Nonce    string `json:"nonce"`
-	Role     string `json:"role"`
-	PRNumber int    `json:"pr_number"`
-	Block    string `json:"block"`
+	Version  int              `json:"version"`
+	Nonce    string           `json:"nonce"`
+	Role     string           `json:"role"`
+	PRNumber int              `json:"pr_number"`
+	Block    string           `json:"block"`
+	Report   *reporter.Report `json:"report,omitempty"`
 }
 
 // WriteOptions describes the pending relay record to write.
@@ -40,6 +42,7 @@ type WriteOptions struct {
 	Role     string
 	PRNumber int
 	Block    string
+	Report   *reporter.Report
 }
 
 // Nonce deterministically derives a pending relay nonce from run id, PR, and role.
@@ -74,6 +77,7 @@ func Write(opts WriteOptions) (string, error) {
 		Role:     role,
 		PRNumber: opts.PRNumber,
 		Block:    ensureTrailingNewline(opts.Block),
+		Report:   cloneReport(opts.Report),
 	}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
@@ -118,6 +122,35 @@ func Write(opts WriteOptions) (string, error) {
 	}
 	cleanup = false
 	return path, nil
+}
+
+func cloneReport(record *reporter.Report) *reporter.Report {
+	if record == nil {
+		return nil
+	}
+	clone := *record
+	clone.Usage = cloneUsage(&record.Usage)
+	return &clone
+}
+
+func cloneUsage(usage *reporter.Usage) reporter.Usage {
+	if usage == nil {
+		return reporter.Usage{}
+	}
+	clone := *usage
+	if usage.InputTokens != nil {
+		value := *usage.InputTokens
+		clone.InputTokens = &value
+	}
+	if usage.OutputTokens != nil {
+		value := *usage.OutputTokens
+		clone.OutputTokens = &value
+	}
+	if usage.TotalTokens != nil {
+		value := *usage.TotalTokens
+		clone.TotalTokens = &value
+	}
+	return clone
 }
 
 // Check returns pending records. It fails open when the pending directory cannot

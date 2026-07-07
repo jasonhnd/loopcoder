@@ -1027,7 +1027,7 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 		" M file.go",
 		"?? new.go",
 		"last useful log line",
-		"## Hung worker partial attestation",
+		"## Hung worker partial report",
 		"role=worker",
 		"provider=codex",
 		"model=gpt-worker",
@@ -1386,15 +1386,15 @@ func TestDispatchHardFailsInvalidReportBeforeDelivery(t *testing.T) {
 		RemoveAll: os.RemoveAll,
 	})
 	if err == nil {
-		t.Fatal("Dispatch returned nil error, want attestation failure")
+		t.Fatal("Dispatch returned nil error, want report failure")
 	}
-	for _, want := range []string{"validate worker attestation", "model is required", "usage requires total_tokens or both input_tokens and output_tokens"} {
+	for _, want := range []string{"validate worker report", "model is required", "usage requires total_tokens or both input_tokens and output_tokens"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error missing %q: %v", want, err)
 		}
 	}
 	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 {
-		t.Fatalf("delivery git calls after attestation failure: add=%d commit=%d push=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls)
+		t.Fatalf("delivery git calls after report failure: add=%d commit=%d push=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls)
 	}
 	if fakeGitHub.createPRCalls != 0 {
 		t.Fatalf("CreatePR calls = %d, want 0", fakeGitHub.createPRCalls)

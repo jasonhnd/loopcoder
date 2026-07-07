@@ -39,7 +39,7 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 				fmt.Fprintf(&out, "  pr: %s\n", result.PR)
 			}
 			if result.Report != nil {
-				fmt.Fprintf(&out, "  attestation: %s\n", formatDispatchWaveReport(*result.Report))
+				fmt.Fprintf(&out, "  report: %s\n", formatDispatchWaveReport(*result.Report))
 			}
 			if strings.TrimSpace(result.AttemptPath) != "" {
 				fmt.Fprintf(&out, "  attempt: %s\n", filepath.ToSlash(result.AttemptPath))
@@ -88,11 +88,10 @@ func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty st
 
 func formatDispatchWaveReport(record reporter.Report) string {
 	return fmt.Sprintf(
-		"provider=%s model=%s(%s) effort=%s permission=%s duration=%s tokens input=%s output=%s total=%s verified=%t",
+		"provider=%s model=%s source=%s permission=%s duration=%s tokens input=%s output=%s total=%s verified=%t",
 		record.Provider,
-		record.Model,
+		reporter.ModelDepthDisplay(record.Model, record.Effort),
 		record.ModelSource,
-		record.Effort,
 		record.Permission,
 		formatDispatchWaveDuration(record.DurationMS),
 		formatDispatchWaveToken(record.Usage.InputTokens),

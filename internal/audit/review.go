@@ -84,13 +84,13 @@ func runLLMLayer(ctx context.Context, repoPath string, cfg config.Config, plan P
 		MCPServers:   mcpServers,
 	})
 	if agentResult.Hung {
-		record := auditReviewReport(provider, agentResult)
+		record := auditReviewReport(provider, model, effort, repoPath, agentResult)
 		emitAuditReviewHeader(opts.Stderr, record)
 		addNeedsHuman(result, LayerLLM, auditReviewHungReason(provider, logPath, timeout, agentResult.HungReason))
 		attachAuditReviewReport(result, record)
 		return
 	}
-	record := auditReviewReport(provider, agentResult)
+	record := auditReviewReport(provider, model, effort, repoPath, agentResult)
 	emitAuditReviewHeader(opts.Stderr, record)
 	if agentErr != nil {
 		addNeedsHuman(result, LayerLLM, fmt.Sprintf("%s audit review failed: %v; see %s", provider, agentErr, logPath))
@@ -512,13 +512,15 @@ func parseAuditReviewFindings(raw string) ([]Finding, error) {
 	return findings, nil
 }
 
-func auditReviewReport(provider string, result agent.Result) reporter.Report {
+func auditReviewReport(provider, model, effort, repoPath string, result agent.Result) reporter.Report {
 	return reporter.Report{
+		WorkID:      "audit-llm",
+		Worktree:    repoPath,
 		Role:        reporter.RoleVerifier,
 		Provider:    provider,
-		Model:       result.Model,
+		Model:       firstNonEmpty(model, result.Model),
 		ModelSource: reporter.ModelSourceForProvider(provider),
-		Effort:      result.Effort,
+		Effort:      firstNonEmpty(effort, result.Effort),
 		Permission:  reporter.PermissionReadOnly,
 		Action:      "audit LLM security review",
 		ExitCode:    result.ExitCode,
@@ -533,11 +535,11 @@ func auditReviewReport(provider string, result agent.Result) reporter.Report {
 func attachAuditReviewReport(result *Result, record reporter.Report) {
 	result.Report = &record
 	if err := record.Validate(); err != nil {
-		addNeedsHuman(result, LayerLLM, "incomplete verifier attestation: "+err.Error())
+		addNeedsHuman(result, LayerLLM, "incomplete verifier report: "+err.Error())
 		return
 	}
 	if record.Role != reporter.RoleVerifier || record.Permission != reporter.PermissionReadOnly || !record.Verified {
-		addNeedsHuman(result, LayerLLM, "invalid verifier attestation semantics")
+		addNeedsHuman(result, LayerLLM, "invalid verifier report semantics")
 	}
 }
 

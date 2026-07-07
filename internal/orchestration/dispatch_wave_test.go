@@ -245,21 +245,21 @@ func TestDispatchWavePreservesPerWorkerReports(t *testing.T) {
 	}
 	for i, result := range report.Results {
 		if result.Report == nil {
-			t.Fatalf("result %d missing attestation: %#v", i, result)
+			t.Fatalf("result %d missing report: %#v", i, result)
 		}
 		if result.Report.Action != fmt.Sprintf("implement issue #%d", result.Issue) {
-			t.Fatalf("result %d attestation action = %q, want issue-specific action", i, result.Report.Action)
+			t.Fatalf("result %d report action = %q, want issue-specific action", i, result.Report.Action)
 		}
 	}
 	if report.Results[0].Report.Model != "worker-model-11" ||
 		report.Results[1].Report.Model != "worker-model-12" {
-		t.Fatalf("attestations collapsed or reordered: %#v", report.Results)
+		t.Fatalf("reports collapsed or reordered: %#v", report.Results)
 	}
 	if report.Results[0].Report.Usage.TotalTokens == nil ||
 		*report.Results[0].Report.Usage.TotalTokens != 1100 ||
 		report.Results[1].Report.Usage.TotalTokens == nil ||
 		*report.Results[1].Report.Usage.TotalTokens != 1200 {
-		t.Fatalf("attestation token usage not preserved per issue: %#v", report.Results)
+		t.Fatalf("report token usage not preserved per issue: %#v", report.Results)
 	}
 
 	data, err := json.Marshal(report.Results)
@@ -432,10 +432,10 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerReports(t *testing.T) {
 		"- #21 succeeded",
 		"  branch: loop/issue-21",
 		"  pr: https://github.com/owner/repo/pull/21",
-		"  attestation: provider=claude model=claude-sonnet-4-5(parsed) effort=high permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
+		"  report: provider=claude model=claude-sonnet-4-5 (high) source=parsed permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
 		"  attempt: .loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
 		"- #22 succeeded",
-		"  attestation: provider=codex model=gpt-5.5(parsed) effort=xhigh permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
+		"  report: provider=codex model=gpt-5.5 (xhigh) source=parsed permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
 		"- #23 skipped",
 		"  error: issue was not ready during preflight",
 		"Verify successful PRs",
@@ -444,11 +444,11 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerReports(t *testing.T) {
 			t.Fatalf("rendered dispatch wave missing %q:\n%s", want, text)
 		}
 	}
-	if got := strings.Count(text, "  attestation: "); got != 2 {
-		t.Fatalf("rendered %d attestation lines, want 2:\n%s", got, text)
+	if got := strings.Count(text, "  report: "); got != 2 {
+		t.Fatalf("rendered %d report lines, want 2:\n%s", got, text)
 	}
-	if strings.Contains(text, "attestation: not reported") {
-		t.Fatalf("nil attestation result should omit attestation line:\n%s", text)
+	if strings.Contains(text, "report: not reported") {
+		t.Fatalf("nil report result should omit report line:\n%s", text)
 	}
 }
 

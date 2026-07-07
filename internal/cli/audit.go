@@ -80,10 +80,10 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.DurationVar(&timeoutAlias, "Timeout", 0, "LLM review timeout")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
-	fs.BoolVar(&pretty, "pretty", false, "render human-readable LLM review attestation on stderr")
-	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable LLM review attestation on stderr")
-	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable LLM review attestation on stderr")
-	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable LLM review attestation on stderr")
+	fs.BoolVar(&pretty, "pretty", false, "render human-readable LLM review report on stderr")
+	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable LLM review report on stderr")
+	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable LLM review report on stderr")
+	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable LLM review report on stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return auditCommandFailureExitCode
@@ -206,7 +206,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 			result = audit.Finalize(result)
 		} else if shouldRenderPretty(noPretty) {
 			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
-				fmt.Fprintf(stderr, "audit: write pretty attestation: %v\n", err)
+				fmt.Fprintf(stderr, "audit: write pretty report: %v\n", err)
 				return auditCommandFailureExitCode
 			}
 		}
@@ -243,6 +243,7 @@ func writeAuditRelayLedger(repoPath string, record reporter.Report, mode reporte
 		CreatedAt:    now,
 		Header:       record.Header(),
 		Pretty:       pretty,
+		Report:       &record,
 	}); err != nil {
 		return err
 	}
@@ -252,6 +253,7 @@ func writeAuditRelayLedger(repoPath string, record reporter.Report, mode reporte
 		Role:     string(reporter.RoleVerifier),
 		PRNumber: 0,
 		Block:    pretty,
+		Report:   &record,
 	})
 	return err
 }

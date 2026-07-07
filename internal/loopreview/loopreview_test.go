@@ -2342,12 +2342,12 @@ func TestRunVerifierReport(t *testing.T) {
 		wantNote    string
 	}{
 		{
-			name:        "valid attestation stays pass",
+			name:        "valid report stays pass",
 			agent:       validLoopreviewAgentResult(validSummary, 0),
 			wantVerdict: VerdictPass,
 		},
 		{
-			name: "incomplete attestation forces needs human",
+			name: "incomplete report forces needs human",
 			agent: agent.Result{
 				ExitCode:   0,
 				Summary:    validSummary,
@@ -2360,7 +2360,7 @@ func TestRunVerifierReport(t *testing.T) {
 				},
 			},
 			wantVerdict: VerdictNeedsHuman,
-			wantNote:    "incomplete verifier attestation",
+			wantNote:    "incomplete verifier report",
 		},
 	}
 
@@ -2375,18 +2375,18 @@ func TestRunVerifierReport(t *testing.T) {
 				t.Fatalf("exit code = %d, want %d", result.ExitCode, ExitCodeForVerdict(tt.wantVerdict))
 			}
 			if result.Verdict.Report == nil {
-				t.Fatal("verdict missing attestation")
+				t.Fatal("verdict missing report")
 			}
 
 			record := result.Verdict.Report
 			if record.Role != reporter.RoleVerifier || record.Provider != "codex" || record.ModelSource != reporter.ModelSourceParsed || record.Permission != reporter.PermissionReadOnly || !record.Verified {
-				t.Fatalf("attestation identity fields = %#v", record)
+				t.Fatalf("report identity fields = %#v", record)
 			}
 			if record.Action != "review PR #152" || record.ExitCode != tt.agent.ExitCode {
-				t.Fatalf("attestation action/exit = (%q, %d), want review PR #152/%d", record.Action, record.ExitCode, tt.agent.ExitCode)
+				t.Fatalf("report action/exit = (%q, %d), want review PR #152/%d", record.Action, record.ExitCode, tt.agent.ExitCode)
 			}
 			if !strings.Contains(stderr.String(), record.Header()) {
-				t.Fatalf("stderr missing attestation header %q:\n%s", record.Header(), stderr.String())
+				t.Fatalf("stderr missing report header %q:\n%s", record.Header(), stderr.String())
 			}
 
 			var rendered strings.Builder
@@ -2409,10 +2409,10 @@ func TestRunVerifierReport(t *testing.T) {
 					}
 				}
 				if !found {
-					t.Fatalf("findings missing incomplete-attestation note: %#v", result.Verdict.Findings)
+					t.Fatalf("findings missing incomplete-report note: %#v", result.Verdict.Findings)
 				}
 			} else if err := record.Validate(); err != nil {
-				t.Fatalf("valid attestation did not validate: %v", err)
+				t.Fatalf("valid report did not validate: %v", err)
 			}
 		})
 	}
@@ -2430,7 +2430,7 @@ func TestVerifierReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
 		StartedAt:  "2026-06-28T00:00:00Z",
 		EndedAt:    "2026-06-28T00:00:02Z",
 		DurationMS: 2000,
-	})
+	}, reviewInputs{}, reviewRefs{}, "", "loopreview-559")
 
 	if record.ModelSource != reporter.ModelSourceSelfReported {
 		t.Fatalf("ModelSource = %q, want self-reported", record.ModelSource)

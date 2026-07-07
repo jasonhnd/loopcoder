@@ -364,6 +364,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
+	workID := fmt.Sprintf("loopreview-%d", opts.PRNumber)
 	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
@@ -375,7 +376,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		Stderr:       warnings,
 		HardCap:      opts.Timeout,
 		StallTimeout: config.DurationSeconds(resilience.Verifier.StallTimeoutSeconds, VerifierStallTimeout),
-		RunID:        fmt.Sprintf("loopreview-%d", opts.PRNumber),
+		RunID:        workID,
 		Role:         "verifier",
 		MCPServers:   mcpServers,
 	})
@@ -383,7 +384,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)
 		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
 	}
-	record := verifierReport(opts, agentResult)
+	record := verifierReport(opts, agentResult, inputs, refs, worktreePath, workID)
 	fmt.Fprintln(warnings, record.Header())
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
@@ -425,13 +426,21 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	return resultWithReport(verdict, record), nil
 }
 
-func verifierReport(opts Options, result agent.Result) reporter.Report {
+func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs reviewRefs, worktreePath, workID string) reporter.Report {
+	issueNumber := 0
+	if inputs.IssuePresent {
+		issueNumber = inputs.Issue.Number
+	}
 	return reporter.Report{
+		WorkID:      workID,
+		Issue:       issueNumber,
+		Branch:      refs.HeadBranch,
+		Worktree:    worktreePath,
 		Role:        reporter.RoleVerifier,
 		Provider:    opts.Provider,
-		Model:       result.Model,
+		Model:       firstNonEmpty(opts.Model, result.Model),
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
-		Effort:      result.Effort,
+		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionReadOnly,
 		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
 		ExitCode:    result.ExitCode,
@@ -446,7 +455,7 @@ func verifierReport(opts Options, result agent.Result) reporter.Report {
 func resultWithReport(verdict Verdict, record reporter.Report) Result {
 	verdict.Report = &record
 	if err := record.Validate(); err != nil {
-		note := "incomplete verifier attestation: " + err.Error()
+		note := "incomplete verifier report: " + err.Error()
 		verdict.Verdict = VerdictNeedsHuman
 		verdict.SpecConformance = SpecConformanceNotApplicable
 		verdict.Findings = append(nonNilFindings(verdict.Findings), Finding{
