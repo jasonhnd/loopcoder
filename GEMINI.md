@@ -18,10 +18,10 @@ Gemini host specifics:
 - Do not choose model or effort settings for the user. Follow the configured
   `adapters.worker` and any explicit user overrides exactly as described in
   [`SKILL.md`](SKILL.md).
-- Relay the verbatim pretty attestation block per Worker and per Verifier from
+- Relay the verbatim pretty report block per Worker and per Verifier from
   command stderr exactly as required by [`SKILL.md`](SKILL.md). Never redirect,
   hide, or suppress `loopcoder dispatch`, `loopcoder dispatch-wave`, or
-  `loopcoder loopreview` stderr; every attestation block must be locally
+  `loopcoder loopreview` stderr; every report block must be locally
   visible and relayed verbatim, never summarized. For `dispatch` and
   `loopreview`, this is locally enforced by `conductor-relay-guard` where hooks
   are active.
@@ -34,14 +34,15 @@ Gemini host specifics:
   `loopcoder attest --role conductor ...` at least once per active host session
   with the real Gemini host model,
   timing, action, and usage available for the session. Treat the emitted
-  attestation as local-only: keep it in command output and gitignored
+  report as local-only: keep it in command output and gitignored
   `.loopcoder/` run records for recovery, and do not copy it into PR bodies,
   issue or PR comments, commit messages, merge commits, merge comments, docs,
   examples, fixtures, or tracked files. This is locally enforced by
-  `conductor-attest` where hooks are active.
+  `conductor-reporter` where hooks are active. The `loopcoder attest` verb and
+  old `conductor-attest` hook name remain one-version compatibility aliases.
 - Install conductor hooks into the active project `.claude/settings.json` with
   `loopcoder skill install --repo <project>`. The install path wires both
-  `loopcoder hook conductor-attest` and `loopcoder hook conductor-relay-guard`;
+  `loopcoder hook conductor-reporter` and `loopcoder hook conductor-relay-guard`;
   `loopcoder doctor` warns when either hook command is missing or when
   `loopcoder` does not resolve on `PATH`.
 - Gemini hook enforcement is best-effort in this repository. Gemini CLI exposes
@@ -59,7 +60,7 @@ Gemini host specifics:
           "hooks": [
             {
               "type": "command",
-              "command": "loopcoder hook conductor-attest",
+              "command": "loopcoder hook conductor-reporter",
               "timeout": 10
             },
             {
@@ -75,7 +76,7 @@ Gemini host specifics:
           "hooks": [
             {
               "type": "command",
-              "command": "loopcoder hook conductor-attest",
+              "command": "loopcoder hook conductor-reporter",
               "timeout": 10
             },
             {

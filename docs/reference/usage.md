@@ -169,7 +169,7 @@ loopcoder skill install --repo <project>
 
 The command writes the bundled `SKILL.md` and `AGENTS.md` files to the Claude
 Code loopcoder skill directory and merges two hook commands into
-`<project>/.claude/settings.json`: `loopcoder hook conductor-attest` and
+`<project>/.claude/settings.json`: `loopcoder hook conductor-reporter` and
 `loopcoder hook conductor-relay-guard`. The hooks are embedded in the loopcoder
 binary and invoked as subcommands, so they resolve regardless of the working
 directory and need no Node dependency; the merge upgrades any stale
@@ -179,10 +179,12 @@ preserves unrelated settings and hooks, and writes a gitignored
 installed repo. `loopcoder doctor --repo <project>` warns when either conductor
 hook command is missing or when `loopcoder` does not resolve on `PATH`.
 
-`loopcoder hook conductor-attest` enforces the local Conductor self-attestation
-step before a delivery or merge turn can finish.
+`loopcoder hook conductor-reporter` enforces the local Conductor self-report
+step before a delivery or merge turn can finish. The old
+`loopcoder hook conductor-attest` command remains a one-version compatibility
+alias during the reporter transition.
 `loopcoder hook conductor-relay-guard` enforces local visible relay of Worker
-and Verifier attestation from `loopcoder dispatch`, `loopcoder dispatch-wave`,
+and Verifier reports from `loopcoder dispatch`, `loopcoder dispatch-wave`,
 and `loopcoder loopreview`. Do not redirect, hide, or suppress `dispatch` or
 `loopreview` stderr, and keep foreground `dispatch-wave` stdout visible because
 each Worker pretty block streams there as that Worker completes. The relay guard
@@ -352,7 +354,7 @@ For compatibility signals such as `min_loopcoder_version`, see
    resulting changes, pushes the branch, opens a PR, and cleans up.
 
 6. loopcoder runs `loopcoder loopreview` for each PR, checks the diff and
-   `gh pr checks`, relays Worker and Verifier attestation blocks verbatim, and
+   `gh pr checks`, relays Worker and Verifier report blocks verbatim, and
    reports progress, failures, risks, and final run state through
    `loopcoder status`. `codex` and `claude` have real verifier smoke proof;
    ambiguous, malformed, timed-out, or incomplete verifier output is still
@@ -414,7 +416,7 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   baseline files, required `audit` CI check wiring, and Layer 2 verifier
   provider resolution;
 - project Claude Code conductor hook settings, warning when the
-  `loopcoder hook conductor-attest` or `loopcoder hook conductor-relay-guard`
+  `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
 - conductor runtime responsibility, which remains user-provided by the active
   host.
@@ -444,7 +446,7 @@ must record a justification, date, review/expiry date, and either a
 `fingerprint` or `normalized_evidence`; stale waivers are reported without
 gating, while expired or malformed waivers require human judgment.
 
-Layer 2 attestation is local-only, like `loopreview`: pretty blocks, canonical
+Layer 2 reports are local-only, like `loopreview`: pretty blocks, canonical
 JSON, relay records, and logs must not be copied into repository-visible
 artifacts. See [`audit.md`](audit.md) for the full command reference.
 
@@ -662,7 +664,7 @@ loopcoder lease release --repo . --run-id <run-id>
 
 `loopcoder loopreview` has 0.3.3 smoke proof for the `claude` and `codex`
 verifier mechanism: both providers returned a valid structured
-verdict plus attestation within the timeout. This proof does not make the
+verdict plus report within the timeout. This proof does not make the
 LLM verdict itself deterministic; `pass` and `fail` remain model judgments that
 can vary across otherwise valid runs.
 
@@ -691,51 +693,55 @@ headless authentication.
 or verified, so selecting it for `loopreview` fails closed rather than running
 a mutating review.
 
-## Attestation
+## Reporter
 
-Worker and verifier invocations produce validated local-only attestation records
+Worker and verifier invocations produce validated local-only reports
 with provider, model, effort, permission, action, exit code, timing, and
 verification fields. For providers with parseable usage, including `codex` and
 `claude`, records use `model_source: parsed`, real parsed model identity, and
-token usage. For Claude runs with an explicit pinned model, the attested model
+token usage. For Claude runs with an explicit pinned model, the reported model
 is the pinned/configured model when that exact model appears in
 provider-reported usage; a token-dominant auxiliary model does not override it.
 Missing required identity or usage fails closed for providers that expose those
 signals: `dispatch` opens no PR, and `loopreview` returns `needs-human` with
-the incomplete-attestation finding. Antigravity is a provider-scoped exception:
+the incomplete-report finding. Antigravity is a provider-scoped exception:
 Worker records use the selected `agy --model` string, such as `Gemini 3.1 Pro
 (High)`, as `model_source: self-reported` and accept absent token usage.
-Attestation surfaces are local-only:
+Reporter surfaces are local-only:
 `dispatch` / `loopreview` stderr pretty blocks, foreground `dispatch-wave`
 stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
 gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
-comments are not attestation surfaces and must not contain attestation headers
+comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
 For every successful `loopcoder dispatch`, stdout contains three
 newline-terminated records in this order:
 
-1. The stable Worker attestation header from `record.Header()`.
-2. The Worker attestation canonical JSON from `record.CanonicalJSON()`.
-3. The dispatch result JSON, whose `attestation` object is the same validated
-   Worker attestation record.
+1. The stable Worker report header from `record.Header()`.
+2. The Worker report canonical JSON from `record.CanonicalJSON()`.
+3. The dispatch result JSON, whose `report` object is the same validated
+   Worker report.
 
 Example:
 
 ```text
-[attestation] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #218" exit=0 dur=42s tokens=2447/4461|6908 verified=true
+[reporter] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #218" exit=0 dur=42s tokens=2447/4461|6908 verified=true
 {"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}
-{"ok":true,"issue":218,"branch":"loop/issue-218","run_id":"run-218","pr":"https://github.com/owner/repo/pull/999","summary":"Worker summary","attempt_path":".loopcoder/runs/run-218/workers/job-218-1.attempt.json","status":"succeeded","exit_code":0,"log_bytes":12345,"attestation":{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}}
+{"ok":true,"issue":218,"branch":"loop/issue-218","run_id":"run-218","pr":"https://github.com/owner/repo/pull/999","summary":"Worker summary","attempt_path":".loopcoder/runs/run-218/workers/job-218-1.attempt.json","status":"succeeded","exit_code":0,"log_bytes":12345,"report":{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}}
 ```
 
 The final non-empty stdout line remains the dispatch result JSON. Consumers
 that need only the summary should parse the last line; conductors that need
-Worker attestation can read either the local header or the nested
-`attestation` object. The canonical JSON line is the exact machine rendering of
-that same record and is not wrapped in Markdown on stdout.
+Worker reports can read either the local header or the nested `report` object.
+During the 0.6.0 transition, readers accept legacy `[attestation]` headers and
+nested `attestation` objects from prior output, but newly emitted output uses
+`[reporter]` and `report` per
+[`../specs/0567-reporter.md`](../specs/0567-reporter.md). The canonical JSON
+line is the exact machine rendering of that same record and is not wrapped in
+Markdown on stdout.
 
 `loopcoder dispatch` and `loopcoder loopreview` emit the human-readable pretty
-attestation block to stderr by default. Foreground `loopcoder dispatch-wave`
+report block to stderr by default. Foreground `loopcoder dispatch-wave`
 streams one Worker pretty block per dispatched issue to stdout as that Worker
 completes, before the final aggregate wave report. The default block uses emoji
 on an interactive TTY and plain ASCII on a non-TTY.
@@ -748,7 +754,7 @@ displays `started` and `ended` in the host local timezone to whole seconds,
 reports duration as human seconds plus total seconds, and groups token counts
 with thousands separators. When input and output tokens are present without a
 total, the pretty display derives `total=<input+output>` for display only;
-canonical JSON and the stable `[attestation]` header are unchanged.
+canonical JSON and the stable `[reporter]` header are unchanged.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
@@ -758,9 +764,9 @@ ASCII form.
 
 Pretty output is diagnostic local output only. It never appears between the
 three `dispatch` stdout records, and it does not change `loopreview` verdict
-JSON, canonical JSON, or the stable `Header()` / `[attestation] ...` contracts.
+JSON, canonical JSON, or the stable `Header()` / `[reporter] ...` contracts.
 Together with result JSON and gitignored `.loopcoder/` run records, it is a
-local attestation surface only. It is not copied into PR bodies, comments,
+local reporter surface only. It is not copied into PR bodies, comments,
 commits, merge commit bodies, merge comments, or other repository-visible
 artifacts. The conductor must keep `dispatch` and `loopreview` stderr visible,
 keep foreground `dispatch-wave` stdout visible, and relay each Worker or
@@ -770,17 +776,19 @@ to stdout and clears them, while `relay list` inspects pending records without
 clearing. `conductor-relay-guard` locally backstops hidden or suppressed
 `dispatch`, `dispatch-wave`, and `loopreview` blocks where hooks are active.
 Machine consumers should continue to parse local canonical JSON or stable
-headers.
+headers. For one release, relay and conductor hook matchers accept both
+`[reporter]` and legacy `[attestation]` tokens.
 
-`loopcoder attest` is for Conductor self-attestation. It emits canonical JSON
-followed by the one-line `[attestation] ...` header, forces `model_source` to
+`loopcoder attest` is the one-version compatibility alias for Conductor
+self-reports. It emits canonical JSON followed by the one-line `[reporter] ...`
+header, forces `model_source` to
 `self-reported`, and forces `verified` to `false` even if flags try to set other
 values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
 
 Keep the default `loopcoder attest` output for local machine-readable
-Conductor attestation. Use `loopcoder attest --pretty` only for direct human
+Conductor reports. Use `loopcoder attest --pretty` only for direct human
 reading; it prints the pretty rendering to stdout instead of the canonical JSON
 plus header. Conductor recovery after compaction or same-host session transfer
 reads gitignored `.loopcoder/` run records and local command results, never
@@ -790,7 +798,7 @@ Pretty output uses emoji when the target is an interactive terminal, or when
 emoji is forced, and emoji is not disabled:
 
 ```text
-✅ attestation verified
+✅ report verified
    role        worker
    provider    OpenAI
    tool        codex
@@ -810,7 +818,7 @@ Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
 `LOOPCODER_PLAIN=1` uses the plain ASCII form with the same fields:
 
 ```text
-attestation: verified
+report: verified
   role        verifier
   provider    Anthropic
   tool        claude
@@ -826,7 +834,8 @@ attestation: verified
   verified    true
 ```
 
-Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md),
+Design rationale: [`../specs/0567-reporter.md`](../specs/0567-reporter.md),
+[`../specs/0146-attestation.md`](../specs/0146-attestation.md),
 [`../specs/0214-human-readable-attestation.md`](../specs/0214-human-readable-attestation.md),
 [`../specs/0218-surface-worker-attestation.md`](../specs/0218-surface-worker-attestation.md),
 [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),

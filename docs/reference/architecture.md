@@ -68,7 +68,7 @@ files, linked issue, and referenced merged spec from `origin/<base-branch>`,
 builds a bounded review packet with explicit truncation markers, and invokes a
 verifier provider with a structured JSON verdict schema. The verdict is one of
 `pass`, `fail`, or `needs-human`; malformed output, timeouts, provider failure,
-incomplete attestation, or an unreadable referenced spec become `needs-human`.
+incomplete reports, or an unreadable referenced spec become `needs-human`.
 
 The verifier provider should differ from the worker provider. If the invoked
 verifier matches `.delivery.yml`'s worker provider, the CLI emits an advisory
@@ -77,7 +77,7 @@ default production gate consumes the verifier verdict.
 
 As of the 0.3.3 provider proof, `claude` and `codex` are verified
 `loopreview` providers in the mechanism sense: both providers returned a valid
-structured verdict plus attestation within a `--timeout 180s` smoke run. The
+structured verdict plus report within a `--timeout 180s` smoke run. The
 LLM verdict itself is non-deterministic, so the proof does not mean either
 provider will always return `pass` for the same PR. One representative
 point-in-time run against merged PR #202 completed with no input truncation for
@@ -276,7 +276,8 @@ Documentation and code are intentionally not bundled in the same issue or PR.
   design. It includes larger ideas that are not built in the current system.
 - [`../specs/0000-loopcoder-v1.md`](../specs/0000-loopcoder-v1.md) is the
   original v1 design record.
-- [`../specs/0146-attestation.md`](../specs/0146-attestation.md) defines per-invocation Worker, Verifier, and Conductor attestation.
+- [`../specs/0567-reporter.md`](../specs/0567-reporter.md) defines the live reporter rename and 0.6.0 transition window.
+- [`../specs/0146-attestation.md`](../specs/0146-attestation.md) is the historical foundation for per-invocation Worker, Verifier, and Conductor reports.
 - [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md) defines budget caps and loop circuit-breakers.
 - [`../specs/`](../specs/) contains frozen design records. This architecture
   document is the living current-behavior reference.
