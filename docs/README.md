@@ -19,6 +19,7 @@ Every document is exactly one of these types:
 - [`learnings.md`](learnings.md): append-only operational learnings.
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
+- [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
 - [`reference/usage.md`](reference/usage.md): setup and end-to-end usage.
