@@ -707,13 +707,13 @@ func scanLegacyStateRoot(root string, deps Deps) ([]OldSurfaceDiagnostic, int, [
 				skipped = append(skipped, filepath.ToSlash(path)+": "+err.Error())
 				continue
 			}
-			if !bytes.Contains(data, []byte(`"attestation"`)) {
+			if !bytes.Contains(data, []byte(`"` + migration.LegacyReportStateKey + `"`)) {
 				continue
 			}
 			diagnostics = append(diagnostics, OldSurfaceDiagnostic{
 				Surface:    "state-key",
-				Legacy:     "attestation",
-				Current:    "report",
+				Legacy:     migration.LegacyReportStateKey,
+				Current:    migration.ReportStateKey,
 				Location:   path,
 				FixCommand: "loopcoder doctor --repo . --fix",
 				Detail:     "legacy report result key is still present",

@@ -129,7 +129,7 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
 	}
-	if strings.Contains(stdout.String(), `"attestation"`) {
+	if strings.Contains(stdout.String(), `"` + migration.LegacyReportStateKey + `"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
@@ -1357,8 +1357,8 @@ func TestUpgradeRenders060MigrationStatus(t *testing.T) {
 					OldSurfaceDiagnostics: []upgrade.OldSurfaceDiagnostic{
 						{
 							Surface:    "state-key",
-							Legacy:     "attestation",
-							Current:    "report",
+							Legacy:     migration.LegacyReportStateKey,
+							Current:    migration.ReportStateKey,
 							Location:   "/repo/.loopcoder/runs/run/workers/job.attempt.json",
 							FixCommand: "loopcoder doctor --repo . --fix",
 							Detail:     "legacy report result key is still present",
@@ -1382,10 +1382,10 @@ func TestUpgradeRenders060MigrationStatus(t *testing.T) {
 		"verified managed files: SKILL.md, AGENTS.md",
 		"Migration status:",
 		"delivery version: schema=1 min_loopcoder_version=0.5.0",
-		"config: legacy config-key \"attestation\" accepted as \"report\"",
-		"env: legacy env \"LOOPCODER_CONDUCTOR_ATTEST_SCOPE\" accepted as \"LOOPCODER_CONDUCTOR_REPORTER_SCOPE\"",
-		"hook: legacy hook-command \"loopcoder hook conductor-attest\" accepted as \"loopcoder hook conductor-reporter\"",
-		"old local state: legacy state-key \"attestation\" accepted as \"report\"",
+		"config: legacy config-key \"" + migration.LegacyReportConfigRoot + "\" accepted as \"" + migration.ReportConfigRoot + "\"",
+		"env: legacy env \"" + migration.LegacyReporterScopeEnv + "\" accepted as \"" + migration.ReporterScopeEnv + "\"",
+		"hook: legacy hook-command \"" + migration.LegacyReporterHookCommand + "\" accepted as \"" + migration.ReporterHookCommand + "\"",
+		"old local state: legacy state-key \"" + migration.LegacyReportStateKey + "\" accepted as \"" + migration.ReportStateKey + "\"",
 		"fix: loopcoder doctor --repo . --fix",
 		"Run: loopcoder doctor --repo .",
 	} {

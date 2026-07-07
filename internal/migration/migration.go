@@ -32,6 +32,9 @@ const (
 	LegacyReportConfigRoot    = "attestation"
 	ReportConfigChannel       = ReportConfigRoot + ".channel"
 	LegacyReportConfigChannel = LegacyReportConfigRoot + ".channel"
+
+	ReportStateKey       = ReportConfigRoot
+	LegacyReportStateKey = LegacyReportConfigRoot
 )
 
 type Entry struct {

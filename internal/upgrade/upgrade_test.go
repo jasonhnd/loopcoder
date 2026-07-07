@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 func TestResolveReleaseLatestAndPinned(t *testing.T) {
@@ -736,11 +737,14 @@ func TestRunReports060MigrationStatusAfterUpgrade(t *testing.T) {
 	fsys := newFakeFS()
 	layout := home.New(filepath.Join("home", ".loopcoder"))
 	repo := t.TempDir()
+	deliveryBody := "version: 1\nmin_loopcoder_version: 0.5.0\n" + migration.LegacyReportConfigRoot + ":\n  channel: chat\n"
+	settingsBody := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"` + migration.LegacyReporterHookCommand + `","timeout":10}]}]}}`
+	attemptBody := `{"issue":589,"attempt":1,"` + migration.LegacyReportStateKey + `":{"role":"worker","provider":"codex","model":"gpt-5"}}`
 	writeTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
-	writeTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\nmin_loopcoder_version: 0.5.0\nattestation:\n  channel: chat\n")
-	writeTextFile(t, filepath.Join(repo, ".claude", "settings.json"), `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"loopcoder hook conductor-attest","timeout":10}]}]}}`)
-	writeTextFile(t, filepath.Join(repo, ".loopcoder", "hooks", "conductor-attest"), "{}\n")
-	writeTextFile(t, filepath.Join(repo, ".loopcoder", "runs", "run-20260708T000000Z-issue-589", "workers", "job.attempt.json"), `{"issue":589,"attempt":1,"attestation":{"role":"worker","provider":"codex","model":"gpt-5"}}`)
+	writeTextFile(t, filepath.Join(repo, ".delivery.yml"), deliveryBody)
+	writeTextFile(t, filepath.Join(repo, ".claude", "settings.json"), settingsBody)
+	writeTextFile(t, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName), "{}\n")
+	writeTextFile(t, filepath.Join(repo, ".loopcoder", "runs", "run-20260708T000000Z-issue-589", "workers", "job.attempt.json"), attemptBody)
 
 	result, err := Run(context.Background(), Options{
 		RequestedVersion: "v0.6.0",
@@ -754,7 +758,7 @@ func TestRunReports060MigrationStatusAfterUpgrade(t *testing.T) {
 				return "https://api.example.test"
 			case EnvUpgradeRepo:
 				return "owner/repo"
-			case "LOOPCODER_CONDUCTOR_ATTEST_SCOPE":
+			case migration.LegacyReporterScopeEnv:
 				return "auto"
 			default:
 				return ""
