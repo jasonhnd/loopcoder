@@ -25,8 +25,9 @@ const (
 	ReporterHookName       = "conductor-reporter"
 	LegacyReporterHookName = "conductor-attest"
 
-	ReporterHookCommand       = "loopcoder hook " + ReporterHookName
-	LegacyReporterHookCommand = "loopcoder hook " + LegacyReporterHookName
+	ReporterHookCommand           = "loopcoder hook " + ReporterHookName
+	LegacyReporterHookCommand     = "loopcoder hook " + LegacyReporterHookName
+	LegacyReporterNodeHookCommand = "node hooks/" + LegacyReporterHookName + ".js"
 
 	ReportConfigRoot          = "report"
 	LegacyReportConfigRoot    = "attestation"
