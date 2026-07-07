@@ -517,7 +517,7 @@ func auditReviewAttestation(provider string, result agent.Result) attestation.At
 		Role:        attestation.RoleVerifier,
 		Provider:    provider,
 		Model:       result.Model,
-		ModelSource: attestation.ModelSourceParsed,
+		ModelSource: attestation.ModelSourceForProvider(provider),
 		Effort:      result.Effort,
 		Permission:  attestation.PermissionReadOnly,
 		Action:      "audit LLM security review",
