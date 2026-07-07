@@ -54,8 +54,11 @@ up unless `--keep-worktree` is set. The provider edits files only; loopcoder
 owns commit, push, PR creation, and cleanup.
 
 The worker provider is selected through the shared provider registry. The
-current registry supports `codex`, `claude`, and `gemini`, with `codex` as the
-default in the dispatch path. See [`worker.md`](worker.md) for provider details.
+current worker provider registry supports `codex`, `claude`, `antigravity`,
+and experimental direct `gemini`, with `codex` as the default in the dispatch
+path. The static model registry used by `loopcoder models` covers `codex`,
+`claude`, and `antigravity`; the direct `gemini` adapter remains outside that
+registry. See [`worker.md`](worker.md) for provider details.
 
 ### Verifier
 
@@ -83,6 +86,9 @@ both providers: `codex` returned `pass` in 77.398s wall time with parsed model
 70.686s wall time with parsed model `claude-haiku-4-5-20251001`, no explicit
 effort, and 2,447 input / 4,947 output tokens. `gemini` remains unverified for
 `loopreview` until issue #188 resolves headless authentication.
+`antigravity` is registered for provider execution but read-only mode is not
+available or verified, so selecting it for `loopreview` fails closed instead of
+running a mutating review.
 
 ## Ports And Adapters
 
@@ -101,10 +107,38 @@ loopcoder is organized around stable responsibilities with native adapters:
 
 `.delivery.yml` selects per-repo defaults such as base branch, worker provider,
 verifier provider, promotion gate, required hosted checks, local command gates,
-and resilience thresholds. Optional model and effort values are passed only when
-the user or configuration explicitly supplies them. The promotion gate defaults
-to `auto`; `human-merge` is the explicit opt-out for projects where humans choose
+model/depth strictness, and resilience thresholds. Worker and Verifier
+model/depth values resolve independently from command flags, then role-scoped
+config, then the static model registry defaults. The promotion gate defaults to
+`auto`; `human-merge` is the explicit opt-out for projects where humans choose
 production merges.
+
+## Model Registry
+
+`internal/models` is a static, leaf model registry. It is rendered by
+`loopcoder models [--provider <provider>]` without reading `.delivery.yml`,
+calling provider CLIs, calling `agy models`, or requiring provider
+authentication. The registry providers are:
+
+| Provider | Vendor | CLI | Default |
+| --- | --- | --- | --- |
+| `codex` | OpenAI Codex | `codex` | `gpt-5.5` / `high` |
+| `claude` | Anthropic | `claude` | `claude-opus-4-8[1m]` / `max` |
+| `antigravity` | Google Antigravity | `agy` | `Gemini 3.1 Pro` / `High` |
+
+Selection is role-scoped. Worker and Verifier each resolve provider, model, and
+depth independently. If model is absent, the resolved provider's registry
+default model is used. If depth is absent, the resolved model's default depth
+is used. If a model is configured but depth is omitted, the configured model's
+default depth is used rather than the provider default depth.
+
+Validation is exact and case-sensitive. In default mode, invalid selections
+emit warnings and preserve pass-through values. With `.delivery.yml`
+`models.strict: true` or a one-run `--strict` flag, invalid selections reject
+before Worker or Verifier provider launch. `loopcoder doctor` reports the same
+model/depth validation and, when `antigravity` is configured, checks executable
+`agy` plus `agy models` OAuth readiness and points users to `agy login` on
+failure.
 
 ## State Model
 

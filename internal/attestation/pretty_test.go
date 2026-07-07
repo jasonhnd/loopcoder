@@ -111,6 +111,7 @@ func TestPrettyProviderVendorMappingAndToolLine(t *testing.T) {
 		{provider: "codex", vendor: "OpenAI"},
 		{provider: "claude", vendor: "Anthropic"},
 		{provider: "gemini", vendor: "Google"},
+		{provider: "antigravity", vendor: "Google Antigravity"},
 		{provider: "custom-cli", vendor: "custom-cli"},
 	}
 

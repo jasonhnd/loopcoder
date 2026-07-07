@@ -93,6 +93,23 @@ func TestValidateSuccess(t *testing.T) {
 				Verified: true,
 			},
 		},
+		{
+			name: "antigravity self-reported without usage",
+			record: AttestationRecord{
+				Role:        RoleWorker,
+				Provider:    "antigravity",
+				Model:       "Gemini 3.1 Pro (High)",
+				ModelSource: ModelSourceSelfReported,
+				Effort:      "High",
+				Permission:  PermissionWrite,
+				Action:      "implement issue #559",
+				ExitCode:    0,
+				StartedAt:   "2026-06-28T00:00:00Z",
+				EndedAt:     "2026-06-28T00:00:02Z",
+				DurationMS:  2000,
+				Verified:    true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -102,6 +119,22 @@ func TestValidateSuccess(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateAllowsAntigravityAbsentUsageButNotCodex(t *testing.T) {
+	payload := `{"role":"verifier","provider":"antigravity","model":"Gemini 3.1 Pro (High)","model_source":"self-reported","effort":"High","permission":"read-only","action":"review PR #559","exit_code":0,"started_at":"2026-06-28T00:00:00Z","ended_at":"2026-06-28T00:00:02Z","duration_ms":2000,"verified":true}`
+	var record AttestationRecord
+	if err := json.Unmarshal([]byte(payload), &record); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Antigravity Validate returned error: %v", err)
+	}
+
+	record.Provider = "codex"
+	record.ModelSource = ModelSourceParsed
+	err := record.Validate()
+	assertValidationErrorNamesField(t, err, "usage")
 }
 
 func TestValidateReportsMissingRequiredFields(t *testing.T) {

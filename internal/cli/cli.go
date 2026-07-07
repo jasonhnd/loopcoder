@@ -22,6 +22,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -83,6 +84,7 @@ type Deps struct {
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-attestation"},
 	{Name: "version", Summary: "print version and build information"},
+	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -245,6 +247,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "version" {
 		return runVersion(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "models" {
+		return runModels(args[1:], stdout, stderr)
+	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
 	}
@@ -369,6 +374,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -396,6 +402,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
 	}
+	if command.Name == "models" {
+		fmt.Fprintln(w, "  --provider string   registry provider key to render")
+	}
 	if command.Name == "audit" {
 		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
 		fmt.Fprintln(w, "  --format string               output format: text, json, or both (default \"text\")")
@@ -405,6 +414,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --threshold string            alias for --severity-threshold")
 		fmt.Fprintf(w, "  --base-branch string          base branch for config lookup (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --config-from-base            read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --strict                      reject invalid LLM model/depth selections instead of warning")
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Exit codes:")
 		fmt.Fprintln(w, "  0   clean audit verdict")
@@ -438,6 +448,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-model string          optional verifier model override for this pass")
 		fmt.Fprintln(w, "  --verifier-effort string         optional verifier reasoning effort override for this pass")
 		fmt.Fprintln(w, "  --verifier-timeout duration      verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -452,6 +463,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --goal string                    goal predicate: roadmap-exhausted or no-ready-work (goal-loop)")
 		fmt.Fprintln(w, "  --max-iterations int             maximum tick firings before needs-human (goal-loop)")
 		fmt.Fprintln(w, "  --max_iterations int             alias for --max-iterations")
+		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty attestations on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty attestations on stderr (LOOPCODER_NO_PRETTY)")
@@ -502,15 +514,17 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-model string         optional verifier model override for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-effort string        optional verifier effort override for recovered PRs")
 		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
+		fmt.Fprintln(w, "  --strict                        reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintln(w, "  --pr-number int        pull request number to review (required)")
-		fmt.Fprintln(w, "  --provider string      verifier provider (required)")
+		fmt.Fprintln(w, "  --provider string      optional verifier provider override for this run")
 		fmt.Fprintf(w, "  --base-branch string   base branch for merged spec lookup (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --model string         optional verifier model override for this run")
 		fmt.Fprintln(w, "  --effort string        optional verifier reasoning effort override for this run")
+		fmt.Fprintln(w, "  --strict               reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
 		fmt.Fprintln(w, "  --pretty               force emoji pretty attestation on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -539,6 +553,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
+		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty attestations on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
@@ -648,6 +663,104 @@ func printVersion(w io.Writer, build BuildInfo) {
 		runtime.GOOS,
 		runtime.GOARCH,
 	)
+}
+
+func runModels(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("models", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var provider string
+	var providerAlias string
+	fs.StringVar(&provider, "provider", "", "registry provider key")
+	fs.StringVar(&providerAlias, "Provider", "", "registry provider key")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if providerAlias != "" {
+		provider = providerAlias
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "models: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	registry := models.DefaultRegistry()
+	providers := registry.Providers
+	provider = strings.TrimSpace(provider)
+	if provider != "" {
+		selected, ok := registry.LookupProvider(provider)
+		if !ok {
+			fmt.Fprintf(stderr, "models: unknown provider %q (supported providers: %s)\n", provider, strings.Join(registry.ProviderNames(), ", "))
+			if provider == "agy" {
+				fmt.Fprintln(stderr, "models: hint: use --provider antigravity; agy is the CLI executable")
+			}
+			return 2
+		}
+		providers = []models.Provider{selected}
+	}
+
+	if err := renderModelProviders(stdout, providers); err != nil {
+		fmt.Fprintf(stderr, "models: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderModelProviders(w io.Writer, providers []models.Provider) error {
+	for providerIndex, provider := range providers {
+		if providerIndex > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(w, "provider: %s\n", provider.Name); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "vendor: %s\n", provider.Vendor); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "cli: %s\n", provider.CLI); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "default: %s / %s\n", provider.DefaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w, "models:"); err != nil {
+			return err
+		}
+		for _, model := range provider.Models {
+			if _, err := fmt.Fprintf(w, "  - %s\n", model.Name); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "    depths: %s\n", renderedDepths(model)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func renderedDefaultDepth(depth string) string {
+	if depth == "" {
+		return "(none)"
+	}
+	return depth
+}
+
+func renderedDepths(model models.Model) string {
+	if len(model.Depths) == 0 {
+		return "(none)"
+	}
+	depths := make([]string, 0, len(model.Depths))
+	for _, depth := range model.Depths {
+		token := depth.Token
+		if token == model.DefaultDepth {
+			token += "*"
+		}
+		depths = append(depths, token)
+	}
+	return strings.Join(depths, ", ")
 }
 
 func runRelay(args []string, stdout, stderr io.Writer) int {
@@ -1048,6 +1161,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var throttleLimitAlias int
 	var configFromBase bool
 	var configFromBaseAlias bool
+	var strict bool
+	var strictAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -1077,6 +1192,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.DurationVar(&verifierTimeoutAlias, "VerifierTimeout", 0, "verifier timeout")
 	fs.IntVar(&throttleLimit, "throttle-limit", lcdefaults.DispatchWaveThrottleLimit, "throttle limit")
 	fs.IntVar(&throttleLimitAlias, "ThrottleLimit", 0, "throttle limit")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
@@ -1089,10 +1206,6 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	baseBranchFlagSet := flagWasSet(fs, "base-branch") || flagWasSet(fs, "BaseBranch")
 	preProdBranchFlagSet := flagWasSet(fs, "pre-prod-branch") || flagWasSet(fs, "PreProdBranch")
-	workerModelFlagSet := flagWasSet(fs, "worker-model") || flagWasSet(fs, "WorkerModel")
-	workerEffortFlagSet := flagWasSet(fs, "worker-effort") || flagWasSet(fs, "WorkerEffort")
-	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
-	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
 	if repoPath == "" {
 		repoPath = repoAlias
 	}
@@ -1130,6 +1243,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		throttleLimit = throttleLimitAlias
 	}
 	configFromBase = configFromBase || configFromBaseAlias
+	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 
@@ -1179,22 +1293,40 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if strings.TrimSpace(verifierProvider) == "" {
 		verifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
 	}
-	workerModel, workerEffort = applyRoleModelEffort(
-		workerModel,
-		workerEffort,
-		workerModelFlagSet,
-		workerEffortFlagSet,
-		cfg.Worker.Model,
-		cfg.Worker.ReasoningEffort,
-	)
-	verifierModel, verifierEffort = applyRoleModelEffort(
-		verifierModel,
-		verifierEffort,
-		verifierModelFlagSet,
-		verifierEffortFlagSet,
-		cfg.Verifier.Model,
-		cfg.Verifier.ReasoningEffort,
-	)
+	workerSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "worker",
+		Provider:       workerProvider,
+		Model:          workerModel,
+		Effort:         workerEffort,
+		ConfigProvider: cfg.Adapters.Worker,
+		ConfigModel:    cfg.Worker.Model,
+		ConfigEffort:   cfg.Worker.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
+	}
+	workerProvider = workerSelection.Provider
+	workerModel = workerSelection.Model
+	workerEffort = workerSelection.Effort
+	verifierSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "verifier",
+		Provider:       verifierProvider,
+		Model:          verifierModel,
+		Effort:         verifierEffort,
+		ConfigProvider: cfg.Adapters.Verifier,
+		ConfigModel:    cfg.Verifier.Model,
+		ConfigEffort:   cfg.Verifier.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
+	}
+	verifierProvider = verifierSelection.Provider
+	verifierModel = verifierSelection.Model
+	verifierEffort = verifierSelection.Effort
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   workerProvider,
 		Verifier: verifierProvider,
@@ -1345,6 +1477,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var maxIterationsSnakeAlias int
 	var configFromBase bool
 	var configFromBaseAlias bool
+	var strict bool
+	var strictAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -1363,6 +1497,8 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&maxIterations, "max-iterations", 0, "max iterations")
 	fs.IntVar(&maxIterationsSnakeAlias, "max_iterations", 0, "max iterations")
 	fs.IntVar(&maxIterationsAlias, "MaxIterations", 0, "max iterations")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable attestations on stderr")
@@ -1395,6 +1531,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if maxIterationsAlias != 0 {
 		maxIterations = maxIterationsAlias
 	}
+	strict = strict || strictAlias
 	configFromBase = configFromBase || configFromBaseAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -1446,7 +1583,10 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if baseBranchFlagSet {
 		tickBaseBranch = baseBranch
 	}
-	tickOptions := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg, configFromBase, tickBaseBranch)
+	tickOptions, ok := tickOptionsFromConfig(resolvedRepo, stderr, deps, cfg, configFromBase, tickBaseBranch, strict)
+	if !ok {
+		return 1
+	}
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   tickOptions.WorkerProvider,
 		Verifier: tickOptions.VerifierProvider,
@@ -1506,7 +1646,7 @@ func runTrigger(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return orchestration.TriggerExitCode(triggerReport)
 }
 
-func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config, configFromBase bool, explicitBaseBranch string) orchestration.TickOptions {
+func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg config.Config, configFromBase bool, explicitBaseBranch string, strictOverride bool) (orchestration.TickOptions, bool) {
 	baseBranch := strings.TrimSpace(explicitBaseBranch)
 	if baseBranch == "" {
 		baseBranch = strings.TrimSpace(cfg.Worker.BaseBranch)
@@ -1518,19 +1658,41 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 	if preProdBranch == "" {
 		preProdBranch = lcdefaults.PreProdBranch
 	}
+	workerSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "worker",
+		ConfigProvider: cfg.Adapters.Worker,
+		ConfigModel:    cfg.Worker.Model,
+		ConfigEffort:   cfg.Worker.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strictOverride,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return orchestration.TickOptions{}, false
+	}
+	verifierSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "verifier",
+		ConfigProvider: cfg.Adapters.Verifier,
+		ConfigModel:    cfg.Verifier.Model,
+		ConfigEffort:   cfg.Verifier.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strictOverride,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return orchestration.TickOptions{}, false
+	}
 	return orchestration.TickOptions{
 		Reader:             deps.NewGitHubReader(repoPath),
 		IssueWriter:        deps.NewIssueWriter(repoPath),
 		RepoPath:           repoPath,
 		BaseBranch:         baseBranch,
 		PreProdBranch:      preProdBranch,
-		WorkerProvider:     strings.TrimSpace(cfg.Adapters.Worker),
-		WorkerModel:        strings.TrimSpace(cfg.Worker.Model),
-		WorkerEffort:       strings.TrimSpace(cfg.Worker.ReasoningEffort),
+		WorkerProvider:     workerSelection.Provider,
+		WorkerModel:        workerSelection.Model,
+		WorkerEffort:       workerSelection.Effort,
 		ConfigFromBase:     configFromBase,
-		VerifierProvider:   strings.TrimSpace(cfg.Adapters.Verifier),
-		VerifierModel:      strings.TrimSpace(cfg.Verifier.Model),
-		VerifierEffort:     strings.TrimSpace(cfg.Verifier.ReasoningEffort),
+		VerifierProvider:   verifierSelection.Provider,
+		VerifierModel:      verifierSelection.Model,
+		VerifierEffort:     verifierSelection.Effort,
 		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
 		ThrottleLimit:      lcdefaults.DispatchWaveThrottleLimit,
 		RequiredChecks:     cfg.CI.Checks,
@@ -1551,7 +1713,7 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		Recover:         deps.Recover,
 		PreProdWriter:   deps.NewPreProdWriter(repoPath),
 		StatePush:       deps.StatePush,
-	}
+	}, true
 }
 
 func renderTriggerPrettyAttestations(w io.Writer, report orchestration.TriggerReport, mode attestation.PrettyMode) error {
@@ -2409,6 +2571,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var effortAlias string
 	var configFromBaseAlias bool
 	var keepWorktreeAlias bool
+	var strict bool
+	var strictAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -2432,12 +2596,14 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&attemptAlias, "Attempt", 0, "attempt")
 	fs.StringVar(&opts.RecoveryContext, "recovery-context", "", "recovery context")
 	fs.StringVar(&recoveryContextAlias, "RecoveryContext", "", "recovery context")
-	fs.StringVar(&opts.Provider, "provider", "codex", "provider")
+	fs.StringVar(&opts.Provider, "provider", "", "provider")
 	fs.StringVar(&providerAlias, "Provider", "", "provider")
 	fs.StringVar(&opts.Model, "model", "", "model")
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
@@ -2450,8 +2616,6 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
-	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -2490,6 +2654,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 	opts.Stderr = stderr
@@ -2522,14 +2687,23 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	opts.Model, opts.Effort = applyRoleModelEffort(
-		opts.Model,
-		opts.Effort,
-		modelFlagSet,
-		effortFlagSet,
-		cfg.Worker.Model,
-		cfg.Worker.ReasoningEffort,
-	)
+	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "worker",
+		Provider:       opts.Provider,
+		Model:          opts.Model,
+		Effort:         opts.Effort,
+		ConfigProvider: cfg.Adapters.Worker,
+		ConfigModel:    cfg.Worker.Model,
+		ConfigEffort:   cfg.Worker.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
+	}
+	opts.Provider = selection.Provider
+	opts.Model = selection.Model
+	opts.Effort = selection.Effort
 
 	result, err := deps.Dispatch(context.Background(), opts)
 	if err != nil {
@@ -2925,14 +3099,89 @@ func loadDeliveryConfigWithOptions(repoPath string, opts config.LoadOptions) (co
 	return config.LoadForRepo(context.Background(), repoPath, opts)
 }
 
-func applyRoleModelEffort(model, effort string, modelFlagSet, effortFlagSet bool, roleModel, roleEffort string) (string, string) {
-	if !modelFlagSet && strings.TrimSpace(model) == "" {
+func applyRoleModelEffort(model, effort string, roleModel, roleEffort string) (string, string) {
+	if strings.TrimSpace(model) == "" {
 		model = strings.TrimSpace(roleModel)
 	}
-	if !effortFlagSet && strings.TrimSpace(effort) == "" {
+	if strings.TrimSpace(effort) == "" {
 		effort = strings.TrimSpace(roleEffort)
 	}
 	return model, effort
+}
+
+type roleSelectionInput struct {
+	Role           string
+	Provider       string
+	Model          string
+	Effort         string
+	ConfigProvider string
+	ConfigModel    string
+	ConfigEffort   string
+	Strict         bool
+	Warnings       io.Writer
+}
+
+type roleSelection struct {
+	Provider string
+	Model    string
+	Effort   string
+}
+
+func resolveAndValidateRoleSelection(input roleSelectionInput) (roleSelection, bool) {
+	provider := strings.TrimSpace(input.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(input.ConfigProvider)
+	}
+	if provider == "" {
+		provider = defaultProviderForRole(input.Role)
+	}
+	model, effort := applyRoleModelEffort(
+		input.Model,
+		input.Effort,
+		input.ConfigModel,
+		input.ConfigEffort,
+	)
+	result := models.ValidateSelection(models.Selection{
+		Role:     input.Role,
+		Provider: provider,
+		Model:    model,
+		Depth:    effort,
+	}, models.ValidationOptions{Strict: input.Strict})
+	if !writeSelectionDiagnostics(input.Warnings, result.Diagnostics) {
+		return roleSelection{
+			Provider: result.Selection.Provider,
+			Model:    result.Selection.Model,
+			Effort:   result.Selection.Depth,
+		}, false
+	}
+	return roleSelection{
+		Provider: result.Selection.Provider,
+		Model:    result.Selection.Model,
+		Effort:   result.Selection.Depth,
+	}, true
+}
+
+func writeSelectionDiagnostics(w io.Writer, diagnostics []models.Diagnostic) bool {
+	if w == nil {
+		w = io.Discard
+	}
+	ok := true
+	for _, diagnostic := range diagnostics {
+		fmt.Fprintln(w, diagnostic.Message)
+		if diagnostic.Severity == models.SeverityReject {
+			ok = false
+		}
+	}
+	return ok
+}
+
+func defaultProviderForRole(role string) string {
+	switch strings.TrimSpace(role) {
+	case "verifier":
+		return "claude"
+	default:
+		return "codex"
+	}
 }
 
 func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -2979,6 +3228,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var effortAlias string
 	var configFromBase bool
 	var configFromBaseAlias bool
+	var strict bool
+	var strictAlias bool
 	var throttleLimit int
 	var throttleLimitAlias int
 	var pretty bool
@@ -3004,6 +3255,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.IntVar(&throttleLimit, "throttle-limit", lcdefaults.DispatchWaveThrottleLimit, "throttle limit")
@@ -3016,8 +3269,6 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
-	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if repoPath == "" {
 		repoPath = repoAlias
 	}
@@ -3044,6 +3295,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		effort = effortAlias
 	}
 	configFromBase = configFromBase || configFromBaseAlias
+	strict = strict || strictAlias
 	if throttleLimitAlias != 0 {
 		throttleLimit = throttleLimitAlias
 	}
@@ -3119,14 +3371,23 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
 		return 1
 	}
-	model, effort = applyRoleModelEffort(
-		model,
-		effort,
-		modelFlagSet,
-		effortFlagSet,
-		cfg.Worker.Model,
-		cfg.Worker.ReasoningEffort,
-	)
+	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "worker",
+		Provider:       provider,
+		Model:          model,
+		Effort:         effort,
+		ConfigProvider: cfg.Adapters.Worker,
+		ConfigModel:    cfg.Worker.Model,
+		ConfigEffort:   cfg.Worker.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
+	}
+	provider = selection.Provider
+	model = selection.Model
+	effort = selection.Effort
 
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
 	renderPretty := shouldRenderPretty(noPretty)
@@ -3266,6 +3527,8 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var verifierModelAlias string
 	var verifierEffortAlias string
 	var verifierTimeoutAlias time.Duration
+	var strict bool
+	var strictAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -3283,12 +3546,14 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.IntVar(&maxAttemptsAlias, "MaxAttempts", 0, "max attempts")
 	fs.StringVar(&backoffSecondsValue, "backoff-seconds", csvInts(lcdefaults.WorkerRetryBackoffSeconds()), "backoff seconds")
 	fs.StringVar(&backoffSecondsAlias, "BackoffSeconds", "", "backoff seconds")
-	fs.StringVar(&opts.Provider, "provider", "codex", "provider")
+	fs.StringVar(&opts.Provider, "provider", "", "provider")
 	fs.StringVar(&providerAlias, "Provider", "", "provider")
 	fs.StringVar(&opts.Model, "model", "", "model")
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
@@ -3307,10 +3572,6 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
-	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
-	verifierModelFlagSet := flagWasSet(fs, "verifier-model") || flagWasSet(fs, "VerifierModel")
-	verifierEffortFlagSet := flagWasSet(fs, "verifier-effort") || flagWasSet(fs, "VerifierEffort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -3363,6 +3624,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if verifierTimeoutAlias != 0 {
 		opts.VerifierTimeout = verifierTimeoutAlias
 	}
+	strict = strict || strictAlias
 	opts.Stderr = stderr
 
 	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
@@ -3404,25 +3666,40 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "recover: %v\n", err)
 		return 1
 	}
-	opts.Model, opts.Effort = applyRoleModelEffort(
-		opts.Model,
-		opts.Effort,
-		modelFlagSet,
-		effortFlagSet,
-		cfg.Worker.Model,
-		cfg.Worker.ReasoningEffort,
-	)
-	if strings.TrimSpace(opts.VerifierProvider) == "" {
-		opts.VerifierProvider = strings.TrimSpace(cfg.Adapters.Verifier)
+	workerSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "worker",
+		Provider:       opts.Provider,
+		Model:          opts.Model,
+		Effort:         opts.Effort,
+		ConfigProvider: cfg.Adapters.Worker,
+		ConfigModel:    cfg.Worker.Model,
+		ConfigEffort:   cfg.Worker.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
 	}
-	opts.VerifierModel, opts.VerifierEffort = applyRoleModelEffort(
-		opts.VerifierModel,
-		opts.VerifierEffort,
-		verifierModelFlagSet,
-		verifierEffortFlagSet,
-		cfg.Verifier.Model,
-		cfg.Verifier.ReasoningEffort,
-	)
+	opts.Provider = workerSelection.Provider
+	opts.Model = workerSelection.Model
+	opts.Effort = workerSelection.Effort
+	verifierSelection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "verifier",
+		Provider:       opts.VerifierProvider,
+		Model:          opts.VerifierModel,
+		Effort:         opts.VerifierEffort,
+		ConfigProvider: cfg.Adapters.Verifier,
+		ConfigModel:    cfg.Verifier.Model,
+		ConfigEffort:   cfg.Verifier.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return 1
+	}
+	opts.VerifierProvider = verifierSelection.Provider
+	opts.VerifierModel = verifierSelection.Model
+	opts.VerifierEffort = verifierSelection.Effort
 	opts.Budget = cfg.Guardrails.Budget
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
 
@@ -3463,6 +3740,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var baseBranchAlias string
 	var configFromBaseAlias bool
 	var timeoutAlias time.Duration
+	var strict bool
+	var strictAlias bool
 	var pretty bool
 	var prettyAlias bool
 	var noPretty bool
@@ -3478,6 +3757,8 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
@@ -3492,8 +3773,6 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if err := fs.Parse(args); err != nil {
 		return loopreviewCommandFailureExitCode
 	}
-	modelFlagSet := flagWasSet(fs, "model") || flagWasSet(fs, "Model")
-	effortFlagSet := flagWasSet(fs, "effort") || flagWasSet(fs, "Effort")
 	if opts.RepoPath == "" {
 		opts.RepoPath = repoAlias
 	}
@@ -3516,6 +3795,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if timeoutAlias != 0 {
 		opts.Timeout = timeoutAlias
 	}
+	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
 
@@ -3525,10 +3805,6 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if opts.PRNumber <= 0 {
 		fmt.Fprintln(stderr, "loopreview: --pr-number is required")
-		return loopreviewCommandFailureExitCode
-	}
-	if strings.TrimSpace(opts.Provider) == "" {
-		fmt.Fprintln(stderr, "loopreview: --provider is required")
 		return loopreviewCommandFailureExitCode
 	}
 	if opts.Timeout <= 0 {
@@ -3552,16 +3828,26 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	opts.Model, opts.Effort = applyRoleModelEffort(
-		opts.Model,
-		opts.Effort,
-		modelFlagSet,
-		effortFlagSet,
-		cfg.Verifier.Model,
-		cfg.Verifier.ReasoningEffort,
-	)
+	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+		Role:           "verifier",
+		Provider:       opts.Provider,
+		Model:          opts.Model,
+		Effort:         opts.Effort,
+		ConfigProvider: cfg.Adapters.Verifier,
+		ConfigModel:    cfg.Verifier.Model,
+		ConfigEffort:   cfg.Verifier.ReasoningEffort,
+		Strict:         cfg.Models.Strict || strict,
+		Warnings:       stderr,
+	})
+	if !ok {
+		return loopreviewCommandFailureExitCode
+	}
+	opts.Provider = selection.Provider
+	opts.Model = selection.Model
+	opts.Effort = selection.Effort
+	workerProvider := strings.TrimSpace(cfg.Adapters.Worker)
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
-		Worker:   cfg.Adapters.Worker,
+		Worker:   workerProvider,
 		Verifier: opts.Provider,
 	}); warning != "" {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)

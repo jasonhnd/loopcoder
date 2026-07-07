@@ -23,6 +23,7 @@ type Config struct {
 	Worker       Worker       `yaml:"worker"`
 	Verifier     Verifier     `yaml:"verifier"`
 	CI           CI           `yaml:"ci"`
+	Models       Models       `yaml:"models"`
 	Verification Verification `yaml:"verification"`
 	Resilience   Resilience   `yaml:"resilience"`
 	Guardrails   Guardrails   `yaml:"guardrails"`
@@ -85,6 +86,10 @@ type Worker struct {
 type Verifier struct {
 	Model           string `yaml:"model"`
 	ReasoningEffort string `yaml:"reasoning_effort"`
+}
+
+type Models struct {
+	Strict bool `yaml:"strict"`
 }
 
 type CI struct {

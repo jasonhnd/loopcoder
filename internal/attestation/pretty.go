@@ -98,6 +98,8 @@ func prettyProviderVendor(provider string) string {
 		return "Anthropic"
 	case "gemini":
 		return "Google"
+	case "antigravity":
+		return "Google Antigravity"
 	default:
 		return provider
 	}

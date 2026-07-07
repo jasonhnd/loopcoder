@@ -13,10 +13,12 @@ Within the 0.x release line, patch releases preserve compatibility for:
 - documented CLI flags;
 - documented GitHub label names, including dependency labels such as
   `blocked-by:#N`.
+- documented provider keys and static `loopcoder models` output semantics.
 
 Patch releases may add optional fields, flags, labels, checks, diagnostics, or
 bug fixes. They must not remove, rename, or change the meaning of an existing
-documented field, flag, or label in a way that breaks working projects.
+documented field, flag, provider key, model/depth default, or label in a way
+that breaks working projects.
 
 Breaking compatibility requires a minor release. The minor release must include
 migration guidance and `loopcoder doctor` output that explains what changed and
@@ -45,18 +47,44 @@ min_loopcoder_version: 0.3.0
 Together they let a project reject unsupported combinations before dispatch,
 review, recovery, or merge work starts.
 
+Role-scoped model and depth configuration is also part of the documented
+project configuration contract:
+
+```yaml
+worker:
+  model: gpt-5.5
+  reasoning_effort: high
+verifier:
+  model: "claude-opus-4-8[1m]"
+  reasoning_effort: max
+models:
+  strict: true
+```
+
+Absent `worker.model`, `worker.reasoning_effort`, `verifier.model`, or
+`verifier.reasoning_effort` fields resolve at runtime from the static model
+registry: provider default model first, then the resolved model's default depth.
+`models.strict: true` changes invalid model/depth diagnostics from warnings to
+command-blocking rejections. Patch releases may add new registry rows or
+optional depth tokens, but they must not silently change the meaning of an
+existing documented provider/model/depth token.
+
 ## Doctor Behavior
 
 `loopcoder doctor` is the compatibility reporting surface. It should report the
 selected binary path and version, selected track, embedded and installed
 playbook versions when applicable, `.delivery.yml` schema version,
-`min_loopcoder_version` compatibility, and the final compatibility result.
+`min_loopcoder_version` compatibility, model/depth selection diagnostics,
+provider CLI readiness, and the final compatibility result.
 
 If the selected binary is too old, the schema version is unsupported, or a known
-field, flag, or label has been removed or renamed, `doctor` should explain the
-incompatibility and point to the relevant migration guidance. Incompatible
-configuration or automation must produce an explicit diagnostic instead of a
-silent fallback.
+field, flag, provider key, model/depth token, or label has been removed or
+renamed, `doctor` should explain the incompatibility and point to the relevant
+migration guidance. Incompatible configuration or automation must produce an
+explicit diagnostic instead of a silent fallback. When provider `antigravity`
+is configured, doctor checks executable `agy` and runs `agy models` as the
+current OAuth readiness probe; authentication failures should point to
+`agy login`.
 
 ## CHANGELOG Discipline
 
@@ -75,5 +103,8 @@ requirements must record that change in the changelog.
   release, upgrade, `min_loopcoder_version`, `doctor`, and 0.x compatibility
   policy rationale.
 - [`0215-per-role-model-override.md`](../specs/0215-per-role-model-override.md):
-  role-scoped `.delivery.yml` model and effort fields that must follow this
+  role-scoped `.delivery.yml` model and depth fields that must follow this
   stability policy once documented.
+- [`0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md):
+  static model registry, `loopcoder models`, strict validation, and
+  Antigravity provider setup.
