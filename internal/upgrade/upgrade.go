@@ -707,7 +707,7 @@ func scanLegacyStateRoot(root string, deps Deps) ([]OldSurfaceDiagnostic, int, [
 				skipped = append(skipped, filepath.ToSlash(path)+": "+err.Error())
 				continue
 			}
-			if !bytes.Contains(data, []byte(`"` + migration.LegacyReportStateKey + `"`)) {
+			if !bytes.Contains(data, []byte(`"`+migration.LegacyReportStateKey+`"`)) {
 				continue
 			}
 			diagnostics = append(diagnostics, OldSurfaceDiagnostic{
