@@ -1,8 +1,9 @@
 # Worker Adapter
 
 This document describes the worker adapter as built in `loopcoder dispatch`,
-the native `loopcoder` binary subcommand. As of 0.3.3 the adapter is
-provider-pluggable and uses the shared provider registry.
+the native `loopcoder` binary subcommand. The adapter is provider-pluggable and
+uses the shared agent provider registry. Model/depth discovery and validation
+use the separate static model registry rendered by `loopcoder models`.
 
 ## Purpose
 
@@ -15,30 +16,35 @@ The selected provider only edits files in the fresh worktree. It does not
 commit, push, or open the PR; loopcoder owns those VCS steps. The worker prompt
 requires the provider's final summary to be in English.
 
-## Supported worker providers
+## Supported Worker Providers
 
-As of 0.3.3 the worker is provider-pluggable. The adapter step is delegated to a
-provider registry, and three providers are registered:
+The adapter step is delegated to the agent provider registry. The current
+registered worker providers are:
 
 - `codex` (default; verified)
 - `claude` (verified)
+- `antigravity` (Google Antigravity through the `agy` CLI)
 - `gemini` (experimental/unverified)
 
-The `gemini` worker adapter code is present and registered, but it has not been
-verified end-to-end because the Gemini CLI was not usable in the development
-environment due to missing authentication.
+The static model registry used by `loopcoder models` contains curated defaults
+and valid depth tokens for `codex`, `claude`, and `antigravity`. It does not
+list direct `gemini`; direct `gemini` remains a registered experimental runner,
+but in default validation mode it produces an unknown-provider warning and keeps
+pass-through behavior, while strict mode rejects it before provider launch.
 
-The provider is selected per dispatch with the `--provider` flag and defaults to
-`codex`. The registry rejects any unknown provider with an actionable error.
+The provider is selected per dispatch with `--provider`, then
+`.delivery.yml` `adapters.worker`, then the built-in worker default `codex`.
+The agent registry rejects a provider that has no runner. The static model
+registry validates and default-fills only providers it knows about.
 
-`--model` and `--effort` are provider-specific. `codex` and `claude` honor the
-reasoning-effort knob; `gemini` has no effort knob, so `--effort` is ignored for
-it (logged once, not an error). As always, loopcoder passes these only when the
-caller sets them and otherwise inherits each provider's own configuration.
+Role-specific model and depth behavior is documented below in
+[Model And Effort](#model-and-effort).
 
-For the full design — roles, the provider abstraction, and per-provider adapter
-facts — see
+For the full design - roles, the provider abstraction, and per-provider adapter
+facts - see
 [`../specs/0131-multi-provider-roles.md`](../specs/0131-multi-provider-roles.md).
+Model/depth selection rationale lives in
+[`../specs/0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md).
 
 ## Flow
 
@@ -52,8 +58,8 @@ For one issue, `loopcoder dispatch` runs these steps in order:
    branch, current working directory, and rules.
 4. Run the selected provider through the registry in the worktree, capturing its
    log and summary with provider-specific adapter behavior.
-5. Build and validate the Worker `AttestationRecord` from parsed provider
-   output.
+5. Build and validate the Worker `AttestationRecord` from provider output or
+   provider-scoped self-reported metadata.
 6. Verify that file changes exist with `git status --porcelain`.
 7. Commit all changes with the issue title and `closes #<IssueNumber>` in the
    commit message.
@@ -69,10 +75,12 @@ producing a successful result.
 ## Attestation
 
 A successful dispatch creates the Worker `AttestationRecord` after the provider
-exits and before commit, push, or PR creation. The record is derived from the
-provider output and carries `role: worker`, the selected provider, the real
-parsed model and effort, `model_source: parsed`, `permission: write`, the issue
-action, exit code, timing, duration, token usage, and `verified: true`.
+exits and before commit, push, or PR creation. The record carries
+`role: worker`, the selected provider, model, effort, `permission: write`, the
+issue action, exit code, timing, duration, and `verified: true`. For `codex`
+and `claude`, model identity and token usage are parsed from provider output.
+For `antigravity`, the selected model string is self-reported, for example
+`Gemini 3.1 Pro (High)`, and token usage may be absent.
 
 For Claude invocations with an explicit configured model, the attested model is
 the pinned/configured model when that exact model appears in Claude's reported
@@ -86,12 +94,12 @@ dispatch result JSON `attestation` object, stderr pretty output, and gitignored
 contain delivery text such as the issue closing line and provider summary.
 
 This replaces the older bare `worker: <provider>` line. If attestation
-validation fails, including missing model identity or token usage, dispatch
-hard-fails before delivery and opens no PR. `codex` and `claude` are the
-verified worker providers; `gemini` remains experimental/unverified end-to-end,
-and the same validation still applies to it.
+validation fails, dispatch hard-fails before delivery and opens no PR.
+Antigravity's self-reported model and absent token-usage leniency is
+provider-scoped and does not relax `codex` or `claude` validation.
 
-Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
+Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md)
+and [`../specs/0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md).
 
 ## Provider Invocation
 
@@ -123,6 +131,20 @@ The `claude` adapter runs `claude --print --dangerously-skip-permissions
 --output-format json ...` with the prompt on stdin, and parses the JSON `result`
 field as the summary.
 
+The `antigravity` adapter runs `agy` with closed stdin, passes the prompt with
+`-p <prompt>`, and always includes `--add-dir <worktree>` to pin the workspace:
+
+```text
+agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"
+```
+
+The process working directory is also set to the worktree, but the mandatory
+`--add-dir` flag is the workspace-selection mechanism. Without it, `agy` may
+ignore process CWD and write under its own scratch directory. The adapter
+captures plain stdout as the summary. `antigravity` has no verified read-only
+mode in this release, so read-only Verifier and audit-review invocations fail
+closed before launching `agy`.
+
 The `gemini` adapter runs `gemini --prompt <prompt> --yolo --output-format json
 ...` and parses the JSON response fields, falling back to raw stdout when
 needed. Gemini has no reasoning-effort flag, so a supplied `--effort` is logged
@@ -151,41 +173,80 @@ deterministic and in the conductor's hands:
 | `--run-id` | No | generated | Run id used for attempt state and recovery context. |
 | `--attempt` | No | `1` | Attempt number recorded in state and recovery output. |
 | `--recovery-context` | No | unset | Prior recovery context to append to the worker prompt. |
-| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, or experimental/unverified `gemini`. |
-| `--model` | No | unset | Optional provider-specific model override. Passed only when set. |
-| `--effort` | No | unset | Optional provider-specific reasoning effort override. `codex` and `claude` honor it; `gemini` logs an advisory and ignores it. |
+| `--provider` | No | role config or `codex` | Worker provider. Registered runners include `codex`, `claude`, `antigravity`, and experimental direct `gemini`; the static model registry covers `codex`, `claude`, and `antigravity`. |
+| `--model` | No | role config or registry default | Optional worker model override for this run. |
+| `--effort` | No | role config or selected model default | Optional worker reasoning-effort/depth override for this run. |
+| `--strict` | No | false | Reject invalid model/depth selections instead of warning and preserving pass-through behavior. |
 | `--keep-worktree` | No | false | Keeps the worktree and scratch directory for inspection instead of cleaning them up. |
 | `--pretty` | No | false | Forces the human-readable pretty attestation block to stderr in emoji form, even on non-TTY output; absent still uses the default pretty behavior. |
 | `--no-pretty` | No | false | Suppresses the human-readable pretty attestation block. This wins over `--pretty` and `LOOPCODER_PRETTY`. |
 
 ## Model And Effort
 
-`--model` and `--effort` are optional knobs. The adapter passes them to
-the selected provider only when the caller provides non-empty values and the
-provider supports the relevant flag:
+Worker model/depth selection resolves in this order:
+
+1. Provider: `dispatch --provider`, then `.delivery.yml` `adapters.worker`,
+   then `codex`.
+2. Model: `dispatch --model`, then `worker.model`, then the static registry
+   default for the resolved provider.
+3. Depth: `dispatch --effort`, then `worker.reasoning_effort`, then the static
+   registry default for the selected model.
+
+Empty strings and YAML null values are absent. If a model is configured but
+depth is absent, loopcoder uses that model's default depth, not the provider
+default depth for a different model. If depth is configured but model is
+absent, loopcoder resolves the provider default model and validates the
+configured depth against that model.
+
+The static registry defaults are:
+
+| Provider | CLI | Default model | Default depth |
+| --- | --- | --- | --- |
+| `codex` | `codex` | `gpt-5.5` | `high` |
+| `claude` | `claude` | `claude-opus-4-8[1m]` | `max` |
+| `antigravity` | `agy` | `Gemini 3.1 Pro` | `High` |
+
+Provider execution maps the resolved values to native flags:
 
 - `codex`: `--model` becomes `-m <model>` and `--effort` becomes
   `-c model_reasoning_effort=<effort>`.
 - `claude`: `--model` becomes `--model <model>` and `--effort` becomes
   `--effort <effort>`.
+- `antigravity`: `model` plus `reasoning_effort` becomes a selected model
+  string such as `Gemini 3.1 Pro (High)`, passed as `--model <selected>`.
 - `gemini`: `--model` becomes `-m <model>` and `--effort` is ignored with a
   one-time advisory because the Gemini CLI has no separate effort knob.
 
-When both are absent, loopcoder passes no model or reasoning-effort flags and
-the selected provider inherits its own configured defaults.
+Validation is exact and case-sensitive. By default, invalid provider, model,
+or depth selections print a warning and loopcoder preserves the selected
+pass-through value. Strict mode rejects invalid selections before launching the
+provider. Enable strict mode durably with:
 
-loopcoder never chooses a model or reasoning effort on its own. The conductor
-playbook in [`SKILL.md`](../../SKILL.md) says to inherit the selected provider's
-own setting by default, and
-[`BACKLOG.md` B1](../BACKLOG.md#b1--worker-model--speed-selection) records the same
-principle: configuration and command-line overrides should reflect only what the
-user has explicitly requested.
+```yaml
+models:
+  strict: true
+```
+
+or for one run with `dispatch --strict`, `dispatch-wave --strict`, or another
+command that resolves Worker model/depth selections.
+
+`loopcoder models [--provider <provider>]` prints the current static registry
+and marks each model's default depth with `*`. It never calls provider CLIs or
+reads `.delivery.yml`.
 
 ## Verifier Model And Effort Config
 
 The independent verifier uses its own role-scoped `.delivery.yml` settings.
 This keeps verifier choice separate from the worker provider and lets projects
-pin a stronger review model without changing the worker default:
+pin a stronger review model without changing the worker default. Verifier
+provider, model, and depth resolve separately from Worker values:
+
+1. Provider: `loopreview --provider`, then `.delivery.yml`
+   `adapters.verifier`, then `claude`.
+2. Model: `loopreview --model`, then `verifier.model`, then the resolved
+   provider's registry default model.
+3. Depth: `loopreview --effort`, then `verifier.reasoning_effort`, then the
+   selected model's registry default depth.
 
 ```yaml
 verifier:
@@ -194,8 +255,10 @@ verifier:
 ```
 
 The `[1m]` suffix must be quoted in YAML. When these fields are present,
-`loopcoder loopreview` passes the configured model and effort to the verifier
-provider; one-off `--model` and `--effort` flags remain per-run overrides.
+`loopcoder loopreview` passes the resolved model and effort to the verifier
+provider. One-off `--model`, `--effort`, and `--strict` flags remain per-run
+overrides. `antigravity` has no verified read-only mode in this release, so a
+Verifier selection using `antigravity` fails closed as `needs-human`.
 
 ## Output
 

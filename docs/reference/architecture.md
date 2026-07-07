@@ -53,9 +53,12 @@ changes exist, commits, pushes, opens the PR, writes attempt state, and cleans
 up unless `--keep-worktree` is set. The provider edits files only; loopcoder
 owns commit, push, PR creation, and cleanup.
 
-The worker provider is selected through the shared provider registry. The
-current registry supports `codex`, `claude`, and `gemini`, with `codex` as the
-default in the dispatch path. See [`worker.md`](worker.md) for provider details.
+The worker provider is selected through the shared agent provider registry.
+Registered runners include `codex`, `claude`, `antigravity`, and experimental
+direct `gemini`, with `codex` as the dispatch default. The separate static
+model registry rendered by `loopcoder models` provides discoverable
+model/depth defaults and validation for `codex`, `claude`, and `antigravity`.
+See [`worker.md`](worker.md) for provider details.
 
 ### Verifier
 
@@ -82,7 +85,10 @@ both providers: `codex` returned `pass` in 77.398s wall time with parsed model
 `gpt-5.5`, effort `xhigh`, and 18,266 total tokens; `claude` returned `pass` in
 70.686s wall time with parsed model `claude-haiku-4-5-20251001`, no explicit
 effort, and 2,447 input / 4,947 output tokens. `gemini` remains unverified for
-`loopreview` until issue #188 resolves headless authentication.
+`loopreview` until issue #188 resolves headless authentication. `antigravity`
+is registered through `agy`, but its runner has no verified read-only mode in
+this release, so Verifier invocations fail closed instead of running mutating
+review.
 
 ## Ports And Adapters
 
@@ -100,10 +106,12 @@ loopcoder is organized around stable responsibilities with native adapters:
 | Reporter | Surface progress, verdicts, failures, and final status | The conductor chat |
 
 `.delivery.yml` selects per-repo defaults such as base branch, worker provider,
-verifier provider, promotion gate, required hosted checks, local command gates,
-and resilience thresholds. Optional model and effort values are passed only when
-the user or configuration explicitly supplies them. The promotion gate defaults
-to `auto`; `human-merge` is the explicit opt-out for projects where humans choose
+verifier provider, role-scoped model/depth preferences, strict model
+validation, promotion gate, required hosted checks, local command gates, and
+resilience thresholds. Worker and Verifier provider/model/depth selections
+resolve independently from command flags, then role config, then static
+registry defaults where available. The promotion gate defaults to `auto`;
+`human-merge` is the explicit opt-out for projects where humans choose
 production merges.
 
 ## State Model

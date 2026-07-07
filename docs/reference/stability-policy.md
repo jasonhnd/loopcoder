@@ -11,6 +11,7 @@ Within the 0.x release line, patch releases preserve compatibility for:
 
 - documented `.delivery.yml` schema fields;
 - documented CLI flags;
+- documented `loopcoder models` provider keys and output fields;
 - documented GitHub label names, including dependency labels such as
   `blocked-by:#N`.
 
@@ -45,6 +46,25 @@ min_loopcoder_version: 0.3.0
 Together they let a project reject unsupported combinations before dispatch,
 review, recovery, or merge work starts.
 
+The documented role-scoped model/depth fields are part of the same
+configuration contract:
+
+```yaml
+worker:
+  model: gpt-5.5
+  reasoning_effort: high
+verifier:
+  model: "claude-opus-4-8[1m]"
+  reasoning_effort: max
+models:
+  strict: true
+```
+
+`models.strict` changes invalid model/depth diagnostics from warn-and-continue
+to reject-before-launch. The `loopcoder models` command is the documented
+discovery surface for static registry provider keys, models, depth tokens, and
+defaults.
+
 ## Doctor Behavior
 
 `loopcoder doctor` is the compatibility reporting surface. It should report the
@@ -77,3 +97,6 @@ requirements must record that change in the changelog.
 - [`0215-per-role-model-override.md`](../specs/0215-per-role-model-override.md):
   role-scoped `.delivery.yml` model and effort fields that must follow this
   stability policy once documented.
+- [`0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md):
+  static model registry discovery, strict model/depth validation, and
+  Antigravity provider setup.
