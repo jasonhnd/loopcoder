@@ -147,6 +147,19 @@ func TestAttestDeliveryThenLegacyAttestationHeaderAllows(t *testing.T) {
 	}
 }
 
+func TestConductorHeaderMatcherAcceptsReporterAndLegacyTokens(t *testing.T) {
+	for _, token := range []string{"[reporter]", "[attestation]"} {
+		t.Run(token, func(t *testing.T) {
+			raw := mustJSON(t, map[string]any{
+				"stdout": token + ` role=conductor provider=codex-cli model=gpt-5(self-reported) effort=default perm=orchestrate action="dispatch" exit=0 dur=1ms tokens=2 verified=false`,
+			})
+			if !containsConductorAttestation(raw) {
+				t.Fatalf("containsConductorAttestation(%s) = false, want true", token)
+			}
+		})
+	}
+}
+
 func TestAttestLegacyEnvKeysStillEnableHook(t *testing.T) {
 	root := t.TempDir()
 	opts := Options{Env: mapEnv(legacyAttestHookEnv(filepath.Join(root, "legacy-state")))}

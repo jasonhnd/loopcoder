@@ -56,6 +56,62 @@ func relayHookEnv(stateDir string) map[string]string {
 	}
 }
 
+func TestRelayHeaderMatchersAcceptReporterAndLegacyTokens(t *testing.T) {
+	tests := []struct {
+		name       string
+		role       string
+		write      func(*testing.T, string) (string, string)
+		visibleSet []string
+	}{
+		{
+			name:       "worker reporter ledger",
+			role:       "worker",
+			write:      writeWorkerLedger,
+			visibleSet: []string{workerHeader, legacyWorkerHeader},
+		},
+		{
+			name:       "worker legacy ledger",
+			role:       "worker",
+			write:      writeLegacyWorkerLedger,
+			visibleSet: []string{workerHeader, legacyWorkerHeader},
+		},
+		{
+			name:       "verifier reporter ledger",
+			role:       "verifier",
+			write:      writeVerifierLedger,
+			visibleSet: []string{verifierHeader, legacyVerifierHeader},
+		},
+		{
+			name:       "verifier legacy ledger",
+			role:       "verifier",
+			write:      writeLegacyVerifierLedger,
+			visibleSet: []string{verifierHeader, legacyVerifierHeader},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			ledgerPath, _ := tt.write(t, root)
+			rec, err := readLedgerRecord(ledgerPath)
+			if err != nil {
+				t.Fatalf("readLedgerRecord returned error: %v", err)
+			}
+			if rec == nil {
+				t.Fatal("readLedgerRecord returned nil record")
+			}
+			if rec.role != tt.role {
+				t.Fatalf("ledger role = %q, want %q", rec.role, tt.role)
+			}
+			for _, visible := range tt.visibleSet {
+				if !containsSurfacedAttestation(visible, *rec) {
+					t.Fatalf("containsSurfacedAttestation(%q, %s ledger) = false, want true", visible, tt.role)
+				}
+			}
+		})
+	}
+}
+
 func writeWorkerLedger(t *testing.T, root string) (ledgerPath, block string) {
 	return writeWorkerLedgerForCommand(t, root, "dispatch", "job-101-1.attest")
 }

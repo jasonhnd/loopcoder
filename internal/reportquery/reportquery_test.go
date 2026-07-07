@@ -2,6 +2,7 @@ package reportquery
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -99,6 +100,44 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 	}
 	if _, err := filepath.Rel(repo, records[1].Path); err != nil {
 		t.Fatalf("worker source path is not under repo: %v", err)
+	}
+}
+
+func TestListReadsLegacyAttestationEnvelopeAsReport(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-legacy"
+	legacyReport := testReport(reporter.RoleVerifier, "claude", "claude-opus-4-8[1m]", "max", "review PR #579", "2026-07-07T00:02:00Z")
+	path := filepath.Join(repo, ".loopcoder", "runs", runID, "verifiers", "pr-579.loopreview.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll verifier dir: %v", err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"verdict":     "pass",
+		"attestation": legacyReport,
+	})
+	if err != nil {
+		t.Fatalf("Marshal legacy payload: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile legacy payload: %v", err)
+	}
+
+	records, err := List(Options{RepoPath: repo})
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("List returned %d records, want one legacy report: %#v", len(records), records)
+	}
+	if records[0].Report.Role != reporter.RoleVerifier || records[0].Report.Action != "review PR #579" {
+		t.Fatalf("legacy report = %#v, want verifier PR report", records[0].Report)
+	}
+	output, err := MarshalJSON(records)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	if strings.Contains(string(output), "attestation") {
+		t.Fatalf("legacy input leaked old envelope name to JSON output: %s", string(output))
 	}
 }
 
