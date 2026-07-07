@@ -5,14 +5,16 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 const (
-	reporterScopeEnv        = "LOOPCODER_CONDUCTOR_REPORTER_SCOPE"
-	reporterStateDirEnv     = "LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR"
+	reporterScopeEnv        = migration.ReporterScopeEnv
+	reporterStateDirEnv     = migration.ReporterStateDirEnv
 	reporterStateSub        = "conductor-reporter"
-	legacyAttestScopeEnv    = "LOOPCODER_CONDUCTOR_ATTEST_SCOPE"
-	legacyAttestStateDirEnv = "LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR"
+	legacyAttestScopeEnv    = migration.LegacyReporterScopeEnv
+	legacyAttestStateDirEnv = migration.LegacyReporterStateDirEnv
 	legacyAttestStateSub    = "conductor-attest"
 )
 
@@ -63,7 +65,8 @@ func RunAttest(input []byte, opts Options) (res Result) {
 		return allow()
 	}
 
-	if in.SessionID == "" || !shouldEnforce(firstEnv(env, reporterScopeEnv, legacyAttestScopeEnv), in.HookEventName, in.CWD) {
+	scope, _ := migration.ResolveReporterScopeEnv(env)
+	if in.SessionID == "" || !shouldEnforce(scope, in.HookEventName, in.CWD) {
 		return allow()
 	}
 
@@ -152,12 +155,8 @@ func recordAttestObservations(statePaths attestStatePaths, in hookInput, now tim
 }
 
 func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (attestStatePaths, error) {
-	if newDir := strings.TrimSpace(env(reporterStateDirEnv)); newDir != "" {
-		primary, err := stateFilePath(sessionID, cwd, newDir, reporterStateSub)
-		return attestStatePaths{primary: primary}, err
-	}
-	if oldDir := strings.TrimSpace(env(legacyAttestStateDirEnv)); oldDir != "" {
-		primary, err := stateFilePath(sessionID, cwd, oldDir, legacyAttestStateSub)
+	if stateDir, _ := migration.ResolveReporterStateDirEnv(env); strings.TrimSpace(stateDir) != "" {
+		primary, err := stateFilePath(sessionID, cwd, stateDir, reporterStateSub)
 		return attestStatePaths{primary: primary}, err
 	}
 	primary, err := stateFilePath(sessionID, cwd, "", reporterStateSub)
@@ -169,15 +168,6 @@ func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (at
 		return attestStatePaths{}, err
 	}
 	return attestStatePaths{primary: primary, legacy: legacy}, nil
-}
-
-func firstEnv(env func(string) string, keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(env(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func readAttestState(statePaths attestStatePaths) (*attestState, error) {

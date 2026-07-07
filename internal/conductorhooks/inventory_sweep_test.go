@@ -194,6 +194,7 @@ func legacyEnvelopeKey(rel, line string) bool {
 		"docs/reference/worker.md",
 		"internal/cli/audit_test.go",
 		"internal/cli/cli_test.go",
+		"internal/migration/migration.go",
 		"internal/reportquery/reportquery.go",
 		"internal/reportquery/reportquery_test.go",
 		"internal/runstatus/runstatus.go",

@@ -1,10 +1,14 @@
 package config
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"gopkg.in/yaml.v3"
 )
 
@@ -770,6 +774,123 @@ guardrails:
 	if cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts == nil || *cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts != 3 {
 		t.Fatalf("Guardrails.CircuitBreaker.MaxNoProgressAttempts = %#v, want 3", cfg.Guardrails.CircuitBreaker.MaxNoProgressAttempts)
 	}
+}
+
+func TestParseReadsLegacyReportConfig(t *testing.T) {
+	data := []byte("version: 1\n" + migration.LegacyReportConfigRoot + ":\n  channel: legacy-chat\n")
+
+	cfg, diagnostics, err := ParseWithDiagnostics(data)
+	if err != nil {
+		t.Fatalf("ParseWithDiagnostics returned error: %v", err)
+	}
+
+	if cfg.Report.Channel != "legacy-chat" {
+		t.Fatalf("Report.Channel = %q, want legacy-chat", cfg.Report.Channel)
+	}
+	assertMigrationDiagnostic(t, diagnostics, migration.LegacyReportConfigRoot, false)
+	assertMigrationDiagnostic(t, diagnostics, migration.LegacyReportConfigChannel, false)
+}
+
+func TestParsePrefersReportConfigOverLegacyConflict(t *testing.T) {
+	data := []byte("version: 1\nreport:\n  channel: current-chat\n" + migration.LegacyReportConfigRoot + ":\n  channel: legacy-chat\n")
+
+	cfg, diagnostics, err := ParseWithDiagnostics(data)
+	if err != nil {
+		t.Fatalf("ParseWithDiagnostics returned error: %v", err)
+	}
+
+	if cfg.Report.Channel != "current-chat" {
+		t.Fatalf("Report.Channel = %q, want current-chat", cfg.Report.Channel)
+	}
+	assertMigrationDiagnostic(t, diagnostics, migration.LegacyReportConfigRoot, true)
+	assertMigrationDiagnostic(t, diagnostics, migration.LegacyReportConfigChannel, true)
+}
+
+func TestMigrateDeliveryYAMLRewritesLegacyReportConfig(t *testing.T) {
+	data := []byte("version: 1\n" + migration.LegacyReportConfigRoot + ":\n  channel: legacy-chat\nci:\n  checks: [verify]\n")
+
+	result, err := MigrateDeliveryYAML(data)
+	if err != nil {
+		t.Fatalf("MigrateDeliveryYAML returned error: %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("MigrateDeliveryYAML changed = false, want true")
+	}
+	text := string(result.Data)
+	if strings.Contains(text, migration.LegacyReportConfigRoot+":") {
+		t.Fatalf("migrated config still contains legacy root key:\n%s", text)
+	}
+	for _, want := range []string{"report:", "channel: legacy-chat", "ci:", "checks: [verify]"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("migrated config missing %q:\n%s", want, text)
+		}
+	}
+
+	cfg, err := Parse(result.Data)
+	if err != nil {
+		t.Fatalf("Parse migrated config returned error: %v", err)
+	}
+	if cfg.Report.Channel != "legacy-chat" {
+		t.Fatalf("Report.Channel = %q, want legacy-chat", cfg.Report.Channel)
+	}
+}
+
+func TestMigrateDeliveryYAMLRemovesLegacyWhenReportExists(t *testing.T) {
+	data := []byte("version: 1\nreport:\n  channel: current-chat\n" + migration.LegacyReportConfigRoot + ":\n  channel: legacy-chat\n")
+
+	result, err := MigrateDeliveryYAML(data)
+	if err != nil {
+		t.Fatalf("MigrateDeliveryYAML returned error: %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("MigrateDeliveryYAML changed = false, want true")
+	}
+	text := string(result.Data)
+	if strings.Contains(text, migration.LegacyReportConfigRoot+":") {
+		t.Fatalf("migrated config still contains legacy root key:\n%s", text)
+	}
+	if !strings.Contains(text, "channel: current-chat") {
+		t.Fatalf("migrated config lost current report value:\n%s", text)
+	}
+	assertMigrationDiagnostic(t, result.Diagnostics, migration.LegacyReportConfigRoot, true)
+}
+
+func TestLoadForRepoWarnsForLegacyReportConfig(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\n"+migration.LegacyReportConfigRoot+":\n  channel: legacy-chat\n"), 0o644); err != nil {
+		t.Fatalf("write .delivery.yml: %v", err)
+	}
+	var warnings strings.Builder
+
+	cfg, err := LoadForRepo(context.Background(), repo, LoadOptions{Warnings: &warnings})
+	if err != nil {
+		t.Fatalf("LoadForRepo returned error: %v", err)
+	}
+	if cfg.Report.Channel != "legacy-chat" {
+		t.Fatalf("Report.Channel = %q, want legacy-chat", cfg.Report.Channel)
+	}
+	for _, want := range []string{migration.LegacyReportConfigRoot, migration.ReportConfigRoot, "loopcoder doctor --repo . --fix"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warning missing %q:\n%s", want, warnings.String())
+		}
+	}
+}
+
+func assertMigrationDiagnostic(t *testing.T, diagnostics []migration.Diagnostic, legacy string, conflict bool) {
+	t.Helper()
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Legacy != legacy {
+			continue
+		}
+		if diagnostic.Conflict != conflict {
+			t.Fatalf("diagnostic for %q conflict = %v, want %v", legacy, diagnostic.Conflict, conflict)
+		}
+		if diagnostic.Current == "" || diagnostic.FixCommand == "" {
+			t.Fatalf("diagnostic for %q missing current/fix fields: %#v", legacy, diagnostic)
+		}
+		return
+	}
+	t.Fatalf("diagnostic for %q missing in %#v", legacy, diagnostics)
 }
 
 func TestParseTreatsEmptyVerifierFieldsAsAbsent(t *testing.T) {
