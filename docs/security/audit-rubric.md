@@ -16,6 +16,6 @@ Additional checks for the loopcoder repository:
   checksums, and scrubbed state distinct from trusted source files.
 - Confirm verifier and audit-review invocations remain read-only and receive
   only MCP servers locally classified as read-only.
-- Confirm audit, dispatch, loopreview, status, and attestation outputs stay on
+- Confirm audit, dispatch, loopreview, status, and reporter outputs stay on
   local surfaces unless an explicit tracked artifact is part of the command's
   documented contract.

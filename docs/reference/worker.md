@@ -58,7 +58,7 @@ For one issue, `loopcoder dispatch` runs these steps in order:
    branch, current working directory, and rules.
 4. Run the selected provider through the registry in the worktree, capturing its
    log and summary with provider-specific adapter behavior.
-5. Build and validate the Worker `AttestationRecord` from parsed provider
+5. Build and validate the Worker `Report` from parsed provider
    output.
 6. Verify that file changes exist with `git status --porcelain`.
 7. Commit all changes with the issue title and `closes #<IssueNumber>` in the
@@ -72,35 +72,36 @@ If the provider exits non-zero, makes no file changes, commit fails, push fails,
 or PR creation fails, the subcommand returns a failed result instead of
 producing a successful result.
 
-## Attestation
+## Reporter
 
-A successful dispatch creates the Worker `AttestationRecord` after the provider
+A successful dispatch creates the Worker `Report` after the provider
 exits and before commit, push, or PR creation. For providers with parseable
 usage, the record is derived from provider output and carries `role: worker`,
 the selected provider, the real parsed model and effort,
 `model_source: parsed`, `permission: write`, the issue action, exit code,
 timing, duration, token usage, and `verified: true`.
 
-For Claude invocations with an explicit configured model, the attested model is
+For Claude invocations with an explicit configured model, the reported model is
 the pinned/configured model when that exact model appears in Claude's reported
 model usage. Auxiliary models can still appear in provider usage, but a larger
-auxiliary token count does not relabel the Worker or Verifier attestation away
+auxiliary token count does not relabel the Worker or Verifier report away
 from the configured model that the provider reported.
 
-Worker attestation is surfaced locally only: the `dispatch` stdout records, the
-dispatch result JSON `attestation` object, stderr pretty output, and gitignored
-`.loopcoder/` run records. The PR body does not carry attestation; it should
+Worker reports are surfaced locally only: the `dispatch` stdout records, the
+dispatch result JSON `report` object, stderr pretty output, and gitignored
+`.loopcoder/` run records. The PR body does not carry reports; it should
 contain delivery text such as the issue closing line and provider summary.
 
-This replaces the older bare `worker: <provider>` line. If attestation
+This replaces the older bare `worker: <provider>` line. If report
 validation fails, including missing model identity or token usage, dispatch
 hard-fails before delivery and opens no PR. Antigravity is a provider-scoped
 exception: because the `agy` CLI does not expose stable parseable model usage
-or token usage in this path, Worker attestation uses the selected Antigravity
+or token usage in this path, Worker reports use the selected Antigravity
 model string as `model_source: self-reported` and accepts absent token usage.
 This exception does not relax validation for `codex`, `claude`, or `gemini`.
 
-Design rationale: [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
+Design rationale: [`../specs/0567-reporter.md`](../specs/0567-reporter.md) and
+the historical foundation in [`../specs/0146-attestation.md`](../specs/0146-attestation.md).
 
 ## Provider Invocation
 
@@ -180,8 +181,8 @@ deterministic and in the conductor's hands:
 | `--effort` | No | resolved model default | Optional provider-specific reasoning effort/depth override. When absent, role config and then the resolved model's default depth are used. |
 | `--strict` | No | false | Reject invalid model/depth selections instead of warning and preserving the pass-through value. |
 | `--keep-worktree` | No | false | Keeps the worktree and scratch directory for inspection instead of cleaning them up. |
-| `--pretty` | No | false | Forces the human-readable pretty attestation block to stderr in emoji form, even on non-TTY output; absent still uses the default pretty behavior. |
-| `--no-pretty` | No | false | Suppresses the human-readable pretty attestation block. This wins over `--pretty` and `LOOPCODER_PRETTY`. |
+| `--pretty` | No | false | Forces the human-readable pretty report block to stderr in emoji form, even on non-TTY output; absent still uses the default pretty behavior. |
+| `--no-pretty` | No | false | Suppresses the human-readable pretty report block. This wins over `--pretty` and `LOOPCODER_PRETTY`. |
 
 ## Model And Depth
 
@@ -236,14 +237,14 @@ provider's static registry default model and then that model's default depth.
 
 On success, `loopcoder dispatch` prints three newline-terminated stdout records:
 
-1. the stable Worker attestation header;
-2. the Worker attestation canonical JSON;
+1. the stable Worker report header;
+2. the Worker report canonical JSON;
 3. the dispatch result JSON.
 
 The final non-empty stdout line is the dispatch result JSON:
 
 ```json
-{"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234,"attestation":{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #24","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}}
+{"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234,"report":{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #24","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}}
 ```
 
 The dispatch result fields are:
@@ -259,24 +260,29 @@ The dispatch result fields are:
 - `status`: attempt status.
 - `exit_code`: provider exit code.
 - `log_bytes`: size of the provider log.
-- `attestation`: the same validated Worker `AttestationRecord` emitted in the
+- `report`: the same validated Worker `Report` emitted in the
   first two stdout records.
 
-As of 0.3.5, `dispatch` writes the human-readable pretty attestation block to
-stderr by default with the polished display format. The default block uses
+During the 0.6.0 transition, readers accept legacy dispatch result JSON with an
+`attestation` object and legacy `[attestation]` headers, but new output uses
+the `report` object and `[reporter]` header per
+[`../specs/0567-reporter.md`](../specs/0567-reporter.md).
+
+The default pretty behavior introduced in 0.3.5 writes the human-readable pretty
+report block to stderr by default with the polished display format. The default block uses
 emoji on an interactive TTY and plain ASCII on a non-TTY. It shows the provider
 vendor plus the CLI `tool`, renders the model source as `(detected)` or
 `(self-reported)`, uses host-local timestamps to whole seconds, reports
 duration in seconds, and groups token counts with thousands separators. When
 input and output tokens are present without a total, the pretty block derives a
 display-only total. This never changes or reorders the three stdout records,
-the stable `Header()` / `[attestation] ...` line, or the canonical JSON, and it
-never adds attestation to PR bodies.
+the stable `Header()` / `[reporter] ...` line, or the canonical JSON, and it
+never adds reports to PR bodies.
 
 Example pretty block:
 
 ```text
-attestation: verified
+report: verified
   role        worker
   provider    OpenAI
   tool        codex
@@ -304,6 +310,7 @@ block per dispatched issue. Pretty output is for human diagnostics and
 conductor relay, not for machine parsing.
 
 Design rationale:
+[`../specs/0567-reporter.md`](../specs/0567-reporter.md),
 [`../specs/0282-default-pretty-attestation.md`](../specs/0282-default-pretty-attestation.md),
 [`../specs/0296-attestation-display-polish.md`](../specs/0296-attestation-display-polish.md),
 and [`../specs/0300-model-attribution.md`](../specs/0300-model-attribution.md).

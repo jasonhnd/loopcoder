@@ -14,8 +14,8 @@ The command has two layers:
   scanning, and native sensitive-file permission scanning.
 - Layer 2, `llm`: an adversarial read-only security-review lens. It reuses the
   configured verifier provider, passes the built-in threat model plus any
-  configured rubric, requires structured findings, and emits verifier
-  attestation locally.
+  configured rubric, requires structured findings, and emits a verifier report
+  locally.
 
 Run only the deterministic floor:
 
@@ -107,10 +107,10 @@ loopcoder audit --repo . --layer sast
 Layer 2 is not required in hosted CI because it depends on provider credentials
 and nondeterministic model output.
 
-## Attestation
+## Reporter
 
 Layer 2 uses verifier semantics: role `verifier`, permission `read-only`, and a
-validated local-only attestation record. Pretty attestation, canonical JSON,
-relay records, and audit logs are local machine surfaces only. Do not copy them
+validated local-only report. Pretty reports, canonical JSON, relay records, and
+audit logs are local machine surfaces only. Do not copy them
 into PR bodies, issue or PR comments, commits, merge comments, docs, examples,
 fixtures, or other tracked artifacts.

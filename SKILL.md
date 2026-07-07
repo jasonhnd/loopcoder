@@ -39,47 +39,50 @@ this loop.
   risk-gate-passing PRs into the configured pre-prod branch; production merges
   happen only for PRs or batches the user names, via `gh pr merge`.
 
-## Conductor attestation
+## Conductor Report
 
-Per [`docs/specs/0146-attestation.md`](docs/specs/0146-attestation.md), the
-Conductor must self-attest at least once per active host session before
-completing any delivery or merge turn:
+Per [`docs/specs/0567-reporter.md`](docs/specs/0567-reporter.md), the
+Conductor must self-report at least once per active host session before
+completing any delivery or merge turn. The `attest` command verb remains a
+one-version compatibility alias for the Conductor reporter emitter:
 
 ```text
 loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action "<delivery action>" --duration-ms <ms> --total-tokens <tokens>
 ```
 
 Use the actual host provider, model, effort, action, timing, and token usage
-available in the host session. The Conductor record is self-reported and must
+available in the host session. The Conductor report is self-reported and must
 remain visibly different from binary-verified Worker or Verifier records.
 
 Claude Code enforcement is provided by the project hook
-`loopcoder hook conductor-attest`, embedded in the loopcoder binary. Install the
+`loopcoder hook conductor-reporter`, embedded in the loopcoder binary. Install the
 conductor hooks into the active project `.claude/settings.json` with
 `loopcoder skill install --repo <project>`; the install merges both
-`loopcoder hook conductor-attest` and `loopcoder hook conductor-relay-guard`,
+`loopcoder hook conductor-reporter` and `loopcoder hook conductor-relay-guard`,
 and `loopcoder doctor` warns when either hook command is missing. Codex and Gemini host notes in
 [`AGENTS.md`](AGENTS.md) and [`GEMINI.md`](GEMINI.md) describe their current
 best-effort hook story. If the active host is not actually enforcing the hook,
-the manual attestation step is still mandatory and must be reported honestly.
+the manual reporter step is still mandatory and must be reported honestly. The
+old `conductor-attest` hook command remains a one-version alias during the
+reporter transition.
 
-The emitted Conductor attestation is local-only. Keep it visible in command
+The emitted Conductor report is local-only. Keep it visible in command
 output and ensure recovery uses gitignored `.loopcoder/` run records; do not
 copy it into PR bodies, issue or PR comments, merge comments, merge commit
 bodies, commit messages, or other repository-visible artifacts. A later
-Conductor recovers attestation from `.loopcoder/` records and command result
+Conductor recovers reports from `.loopcoder/` records and command result
 JSON, never GitHub artifacts.
 
 ## Local-only relay and status
 
 Per [`docs/specs/0316-conductor-local-enforcement.md`](docs/specs/0316-conductor-local-enforcement.md)
 and [`docs/specs/0447-relay-enforcement-hardgate.md`](docs/specs/0447-relay-enforcement-hardgate.md),
-Worker and Verifier attestation relay is a hard local visible-output
-obligation. Never swallow the attestation block: do not redirect, hide, or
+Worker and Verifier report relay is a hard local visible-output
+obligation. Never swallow the report block: do not redirect, hide, or
 suppress stderr from `loopcoder dispatch` or `loopcoder loopreview`, and keep
 foreground `loopcoder dispatch-wave` stdout visible because each Worker pretty
 block streams there as that Worker completes. Each Worker and Verifier pretty
-attestation block must be relayed verbatim, never summarized, merged,
+report block must be relayed verbatim, never summarized, merged,
 rewrapped, or hand-reformatted.
 
 The Go binary enforces a cross-command relay gate for mechanical progress. When
@@ -105,7 +108,7 @@ progress and re-emits pending blocks, and the Claude Code hook verifies visible
 surfacing where installed, but no binary can force an adversarial host LLM to
 type into the user channel without host cooperation.
 
-These blocks remain local-only; do not copy attestation or `loopcoder status`
+These blocks remain local-only; do not copy reports or `loopcoder status`
 output into PR bodies, issue or PR comments, commit messages, merge artifacts,
 docs, examples, fixtures, or any other tracked file.
 
@@ -276,15 +279,16 @@ Bounds and scrutiny:
    - Call the selected backend once per ready issue or ready wave. Do not recreate worktree, worker-agent invocation, commit, push, or PR logic in the conductor.
    - Invoke `loopcoder dispatch` and `loopcoder dispatch-wave` with
      `LOOPCODER_PRETTY=1` or `--pretty` so stderr includes the emoji pretty
-     attestation block. Keep command stderr visible; do not redirect, hide, or
+     report block. Keep command stderr visible; do not redirect, hide, or
      suppress it. Capture each worker's output, job handle, PR URL, failure
-     details, final dispatch result, and Worker pretty attestation block from
+     details, final dispatch result, and Worker pretty report block from
      stderr. Relay that block verbatim, one per Worker. The stable
-     `[attestation] ...` header, canonical JSON, and final result
-     `attestation` object remain local machine contracts, symmetric with the
-     Verifier attestation from `loopreview`, and must not be copied into PR
+     `[reporter] ...` header, canonical JSON, and final result
+     `report` object are local machine contracts, symmetric with the
+     Verifier report from `loopreview`, and must not be copied into PR
      bodies, comments, commits, merge bodies, or other repository-visible
-     artifacts.
+     artifacts. During the 0.6.0 transition, matchers still accept legacy
+     `[attestation]` headers and `attestation` result objects for one version.
 
    Example shape:
 
@@ -313,7 +317,7 @@ Bounds and scrutiny:
 
      Add `--base-branch <base-branch>` when the run is not targeting the default base branch.
      Use `LOOPCODER_PRETTY=1` instead of `--pretty` if that better fits the
-     conductor shell, but the Verifier pretty attestation block must be emitted
+     conductor shell, but the Verifier pretty report block must be emitted
      in emoji form on stderr for relay.
    - Read the structured `loopreview` verdict (`pass`, `fail`, or `needs-human`) plus its findings, evidence, and spec-conformance field. A malformed verdict, unreadable referenced design doc, or verifier infrastructure / permission failure is `needs-human`, never a silent pass.
    - Follow the "Verification gate" subsection below, which folds the independent Verifier verdict together with hosted checks from `gh pr checks <pr>` and deterministic local gates from `loopcoder verify-local --repo . --pr-number <pr>`.
@@ -337,13 +341,13 @@ Bounds and scrutiny:
      `loopcoder status --repo . --run <run-id>`. Relay the command output
      locally instead of maintaining a hand-typed status table.
    - Every worker-dispatch progress report and final summary must relay the
-     pretty attestation block verbatim from the command's stderr, one block per
+     pretty report block verbatim from the command's stderr, one block per
      Worker and one block per Verifier. The relayed block is the source of truth
      for the human form; it renders `unset` or omits absent fields according to
      the pretty renderer.
    - Keep Worker and Verifier pretty blocks separate. Do not merge them into
      one synthetic record and do not sum Worker and Verifier tokens. Existing
-     fail-closed attestation behavior remains unchanged.
+     fail-closed reporter behavior remains unchanged.
    - Continue until the DAG is drained or blocked.
    - Run the learning review from "Learnings (self-improvement)": collect
      worker-returned candidates, draft any proposed learning entries for human
@@ -354,7 +358,7 @@ Bounds and scrutiny:
      "Improvement review" and stop after its candidate report unless the human
      approves issue creation.
    - End with a final summary listing issues, PRs, relayed Worker and Verifier
-     pretty attestation blocks, verifier status, check status, and any human
+     pretty report blocks, verifier status, check status, and any human
      decisions still needed.
    - Merge only through the "Merge ordering" step, following `.delivery.yml` merge settings when present.
 
