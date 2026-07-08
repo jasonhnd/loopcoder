@@ -102,8 +102,8 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 	logPath := filepath.Join(t.TempDir(), "antigravity.log")
 	prompt := "do the sensitive work"
 	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
-		if cmd.Path != "agy" {
-			t.Fatalf("Path = %q, want agy", cmd.Path)
+		if got := strings.TrimSuffix(filepath.Base(cmd.Path), ".exe"); got != "agy" {
+			t.Fatalf("Path = %q, want agy executable", cmd.Path)
 		}
 		if cmd.Dir != worktree {
 			t.Fatalf("Dir = %q, want %q", cmd.Dir, worktree)

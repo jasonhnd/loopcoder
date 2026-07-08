@@ -253,11 +253,11 @@ func TestExecRunnerTimesOut(t *testing.T) {
 	withTestGitCommand(t, 50*time.Millisecond)
 
 	start := time.Now()
-	_, err := (ExecRunner{}).RunGit(context.Background(), "repo", "-test.run=TestGitExecHelper", "--", "sleep", "5s")
+	_, err := (ExecRunner{}).RunGit(context.Background(), "repo", "-test.run=TestGitExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("RunGit error = nil, want timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("RunGit elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {

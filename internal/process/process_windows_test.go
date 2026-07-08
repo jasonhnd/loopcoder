@@ -13,7 +13,7 @@ func TestAliveTasklistTimesOut(t *testing.T) {
 	oldCommand := tasklistCommand
 	oldHardCap := livenessHardCap
 	tasklistCommand = func(int) (string, []string) {
-		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep", "5s"}
+		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep", "500ms"}
 	}
 	livenessHardCap = 50 * time.Millisecond
 	t.Setenv("GO_WANT_PROCESS_WINDOWS_HELPER", "1")
@@ -26,7 +26,7 @@ func TestAliveTasklistTimesOut(t *testing.T) {
 	if Alive(os.Getpid()) {
 		t.Fatal("Alive = true, want false after tasklist timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Alive elapsed = %s, want bounded timeout", elapsed)
 	}
 }

@@ -28,4 +28,18 @@ Before tagging a release:
 4. Confirm the three surfaces agree on command names, config keys, compatibility aliases, breaking-change wording, and upgrade steps.
 5. Run the release's required local verification, including markdown well-formedness checks when available and `go build ./...` for loopcoder source releases.
 
+After publishing a release, run the consumer artifact smoke:
+
+```powershell
+pwsh scripts/release-smoke.ps1 -Version 0.6.1
+```
+
+The smoke script downloads the published archive for the current platform,
+verifies `SHA256SUMS` with cosign, checks the archive checksum, runs
+`loopcoder version`, exercises a temporary-repository `init` / `skill install`
+/ `doctor --format json` / `report` path, and confirms
+`loopcoder upgrade --version 0.6.1` recognizes the selected binary as already
+latest. It is verification-only and must not create tags, publish releases, or
+upload assets.
+
 Historical changelog entries and accepted specs are release history. Do not terminology-sweep old release entries or shipped specs merely because current naming changed.
