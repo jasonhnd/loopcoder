@@ -432,6 +432,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "init" {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
+		fmt.Fprintln(w, "  --repo string               repository path (default \".\")")
+		fmt.Fprintln(w, "  --gate string               generated promotion gate: human-merge or auto (default \"human-merge\")")
 		fmt.Fprintln(w, "  --worker-model string       optional first-run worker model to persist")
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
@@ -922,6 +924,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var opts scaffold.Options
 	var forceAlias bool
+	var repoPathAlias string
+	var gateAlias string
 	var workerModelAlias string
 	var workerEffortAlias string
 	var verifierModelAlias string
@@ -929,6 +933,10 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing files")
+	fs.StringVar(&opts.RepoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoPathAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.Gate, "gate", "", "generated promotion gate")
+	fs.StringVar(&gateAlias, "Gate", "", "generated promotion gate")
 	fs.StringVar(&opts.WorkerModel, "worker-model", "", "worker model")
 	fs.StringVar(&workerModelAlias, "WorkerModel", "", "worker model")
 	fs.StringVar(&opts.WorkerEffort, "worker-effort", "", "worker reasoning effort")
@@ -943,6 +951,12 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if forceAlias {
 		opts.Force = true
+	}
+	if repoPathAlias != "" {
+		opts.RepoPath = repoPathAlias
+	}
+	if gateAlias != "" {
+		opts.Gate = gateAlias
 	}
 	if workerModelAlias != "" {
 		opts.WorkerModel = workerModelAlias
@@ -961,7 +975,7 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	resolvedRepo, err := resolveRepo(".")
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "init: %v\n", err)
 		return 2
@@ -1998,6 +2012,9 @@ func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
 		default:
 			fmt.Fprintf(stdout, "  %s label %s\n", label.Status, label.Name)
 		}
+	}
+	if result.LocalStateExclude != nil {
+		fmt.Fprintf(stdout, "  local-state %s %s\n", result.LocalStateExclude.Status, result.LocalStateExclude.Path)
 	}
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
