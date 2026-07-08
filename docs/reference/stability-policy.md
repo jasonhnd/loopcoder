@@ -3,7 +3,12 @@
 This living reference describes loopcoder's 0.x compatibility policy for
 project configuration, documented commands, and documented GitHub labels.
 
-Current stable release: `0.3.7`.
+Current stable release: `0.6.1`.
+
+v0.6.1 is the customer-ready bridge for the public 0.6 line. It is the
+customer install and upgrade target for the 0.6 capabilities; the latest public
+release before this bridge was v0.5.4, and customer docs should not direct
+users to install or upgrade to a nonexistent public v0.6.0 release.
 
 ## 0.x Stability Promise
 
@@ -76,6 +81,10 @@ selected binary path and version, selected track, embedded and installed
 playbook versions when applicable, `.delivery.yml` schema version,
 `min_loopcoder_version` compatibility, model/depth selection diagnostics,
 provider CLI readiness, and the final compatibility result.
+In v0.6.1, `doctor --format json` also exposes the ordered check list for host
+tools, including local `.loopcoder/` exclude protection, tracked local-state
+risk, reportquery readability, installed skill freshness, and project hook
+wiring.
 
 If the selected binary is too old, the schema version is unsupported, or a known
 field, flag, provider key, model/depth token, or label has been removed or

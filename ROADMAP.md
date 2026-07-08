@@ -9,9 +9,30 @@ Format for loopcoder work units:
 - Use "## [epic] ..." for a slice DAG; add "- doc:" / "- code:" lines for explicit slices.
 -->
 
+## 0.6.1 — Customer-ready bridge release — current public 0.6 target
+
+Shipping target. v0.6.1 is the customer-ready bridge for the public 0.6 line.
+It packages the 0.6 capabilities for external consumers while keeping larger
+SQLite/global-project-registry and native sub-agent orchestration work out of
+scope for a later 0.7.0 line.
+
+- docs: release truth across README, usage, stability policy, changelog,
+  roadmap, and v0.6.1 release note.
+- docs: customer quickstart in install/version/init/skill-install/doctor/report
+  order, including the command side-effect table and `.loopcoder/` local-state
+  boundary.
+- code: local `.loopcoder/` protection through `.git/info/exclude` in
+  `init --repo` and `skill install --repo`.
+- code: first-run `init --repo/--gate`, defaulting new scaffolds to
+  `adapters.gate: human-merge`.
+- code: `doctor --format text|json`, local-state checks, reportquery
+  readability, installed-skill and hook checks.
+- code: `report --format json` compatibility array plus richer `records`
+  entries with source, run id, and local path.
+
 ## 0.6.0 — Model & depth selection: discovery, validation, defaults (+ agy provider)
 
-Planned. Make models and their depth tiers discoverable, validated, and defaulted so operators
+Implemented for the 0.6 line and released to customers through v0.6.1. Make models and their depth tiers discoverable, validated, and defaulted so operators
 choose without guessing. Target models: **claude, gpt (codex), gemini** — gemini reached **via
 the Antigravity (`agy`) provider**, since the direct gemini CLI is dead for personal accounts
 (Google `IneligibleTier`). Depth is a **per-model list of valid tokens that may be empty** (not a
@@ -55,7 +76,7 @@ that the translation matched intent — validation catches *invalid* picks, the 
 
 ## 0.6.0 — reporter (attestation → reporter rename + light strengthening)
 
-Planned (BREAKING). Rename `attestation`→`reporter` **including the operator-visible
+Implemented for the 0.6 line and released to customers through v0.6.1. Rename `attestation`→`reporter` **including the operator-visible
 `[attestation]`→`[reporter]` token** (a rename nobody can see is pointless) — Go package, type,
 emitted header, and all human prose. The hard part is the relay hard-gate: the token is emitted,
 matched (`relay_guard.go`), and instructed for verbatim relay (SKILL.md, host-hook templates,
@@ -96,7 +117,7 @@ the new agy file in one pass instead of colliding with it.
 
 ## 0.6.0 — Upgrade, migration & operational health (doctor)
 
-Planned. 0.6.0 is the first BREAKING release (reporter rename), so it must ship a clean upgrade
+Implemented for the 0.6 line and released to customers through v0.6.1. 0.6.0 is the first BREAKING release (reporter rename), so it must ship a clean upgrade
 from 0.5.x and a defined self-check. Everything we froze (`.attest` ledgers, CanonicalJSON field
 names) migrates as a no-op; only renamed config keys and stale logs need real handling.
 
