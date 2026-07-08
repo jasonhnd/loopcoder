@@ -107,9 +107,15 @@ try {
         Fail "archive did not contain loopcoder binary"
     }
 
-    $versionOutput = & $binary version
-    Write-Host $versionOutput
-    if ($versionOutput -notmatch "version=$plainVersion" -or $versionOutput -match "commit=unknown|date=unknown") {
+    $versionOutput = @(& $binary version)
+    $versionOutput | ForEach-Object { Write-Host $_ }
+    $versionLines = @($versionOutput | Where-Object { $_ -match '(^|\s)version=' })
+    if ($versionLines.Count -ne 1) {
+        Fail "downloaded binary emitted $($versionLines.Count) version lines; want exactly one"
+    }
+    $versionLine = [string]$versionLines[0]
+    $versionPattern = "(^|\s)version=$([regex]::Escape($plainVersion))(\s|$)"
+    if ($versionLine -notmatch $versionPattern -or $versionLine -match "(^|\s)(commit|date)=unknown(\s|$)") {
         Fail "downloaded binary did not report $plainVersion with non-placeholder commit/date"
     }
 

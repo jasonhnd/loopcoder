@@ -426,7 +426,8 @@ func TestExtractGoListBackboneCapturesOutput(t *testing.T) {
 
 func TestExtractGoListBackboneTimesOutUnavailable(t *testing.T) {
 	repo := repoWithGoMod(t)
-	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep", "500ms")
+	sentinel := filepath.Join(t.TempDir(), "helper-completed")
+	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep-then-write", "500ms", sentinel)
 
 	start := time.Now()
 	backbone, err := ExtractGoListBackbone(context.Background(), repo)
@@ -438,6 +439,9 @@ func TestExtractGoListBackboneTimesOutUnavailable(t *testing.T) {
 	}
 	if backbone.Available {
 		t.Fatalf("Available = true, want unavailable after timeout: %#v", backbone)
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("timeout helper completed after hard cap; sentinel stat err = %v", err)
 	}
 }
 
@@ -497,6 +501,12 @@ func runExecHelper() {
 		fmt.Fprintf(os.Stdout, "{\"ImportPath\":\"example.com/repo\",\"Dir\":%q,\"Name\":\"repo\"}\n", dir)
 	case "sleep":
 		time.Sleep(parseHelperDuration(args[0]))
+	case "sleep-then-write":
+		time.Sleep(parseHelperDuration(args[0]))
+		if err := os.WriteFile(args[1], []byte("completed"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write sentinel: %v\n", err)
+			os.Exit(2)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
