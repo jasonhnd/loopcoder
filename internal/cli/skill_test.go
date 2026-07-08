@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 )
 
 func TestSkillInstallHelpDocumentsFlags(t *testing.T) {
@@ -56,6 +57,8 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 					{Path: filepath.Join(target, skillFilename), Status: SkillInstallFileOverwritten},
 					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileUpdated},
 				},
+				LocalStateExclude: &SkillInstallFileResult{Path: filepath.Join(project, ".git", "info", "exclude"), Status: SkillInstallFileUpdated},
+				Warnings:          []string{"local .loopcoder/ exclude was not installed for other-repo: not a git repository"},
 			}, nil
 		},
 	})
@@ -65,18 +68,19 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 	if !called {
 		t.Fatal("SkillInstall dependency was not called")
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
-	}
 	for _, want := range []string{
 		"loopcoder skill install complete",
 		"directory " + target,
 		"overwritten " + filepath.Join(target, skillFilename),
 		"updated " + filepath.Join(target, agentsFilename),
+		"local-state updated " + filepath.Join(project, ".git", "info", "exclude"),
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
 		}
+	}
+	if !strings.Contains(stderr.String(), "skill install: warning: local .loopcoder/ exclude was not installed") {
+		t.Fatalf("stderr missing warning:\n%s", stderr.String())
 	}
 }
 
@@ -144,6 +148,78 @@ func TestInstallSkillMergesHookSettingsFreshAndIdempotent(t *testing.T) {
 	}
 	assertHookCommandCounts(t, second, 2)
 	assertPostToolUseMatcher(t, second, "Bash|PowerShell|pwsh")
+}
+
+func TestInstallSkillProtectsLocalStateAfterProjectWrites(t *testing.T) {
+	fsys := newSkillFakeFS()
+	project := "repo"
+	protectCalled := false
+	deps := skillDepsForTest(fsys)
+	deps.ProtectLocalState = func(_ context.Context, repoPath string) (gitlocal.ProtectResult, error) {
+		protectCalled = true
+		if repoPath != project {
+			t.Fatalf("ProtectLocalState repoPath = %q, want %q", repoPath, project)
+		}
+		if _, ok := fsys.files[filepath.Clean(filepath.Join(project, conductorWorkspaceMarkerRelPath))]; !ok {
+			t.Fatal("ProtectLocalState called before conductor workspace marker was written")
+		}
+		return gitlocal.ProtectResult{
+			ExcludePath: filepath.Join(project, ".git", "info", "exclude"),
+			Status:      gitlocal.ProtectUpdated,
+		}, nil
+	}
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: project}, deps)
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+	if !protectCalled {
+		t.Fatal("ProtectLocalState was not called")
+	}
+	if result.LocalStateExclude == nil {
+		t.Fatal("LocalStateExclude is nil")
+	}
+	if result.LocalStateExclude.Path != filepath.Join(project, ".git", "info", "exclude") || result.LocalStateExclude.Status != SkillInstallFileUpdated {
+		t.Fatalf("LocalStateExclude = %#v, want updated git exclude", result.LocalStateExclude)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Warnings = %#v, want none", result.Warnings)
+	}
+}
+
+func TestInstallSkillWarnsForNonGitProject(t *testing.T) {
+	fsys := newSkillFakeFS()
+	deps := skillDepsForTest(fsys)
+	deps.ProtectLocalState = func(context.Context, string) (gitlocal.ProtectResult, error) {
+		return gitlocal.ProtectResult{}, gitlocal.ErrNotGitRepository
+	}
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: "not-git"}, deps)
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+	if result.LocalStateExclude != nil {
+		t.Fatalf("LocalStateExclude = %#v, want nil", result.LocalStateExclude)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "not a git repository") {
+		t.Fatalf("Warnings = %#v, want non-git warning", result.Warnings)
+	}
+}
+
+func TestInstallSkillFailsOnLocalStateProtectionError(t *testing.T) {
+	fsys := newSkillFakeFS()
+	deps := skillDepsForTest(fsys)
+	deps.ProtectLocalState = func(context.Context, string) (gitlocal.ProtectResult, error) {
+		return gitlocal.ProtectResult{}, errors.New("permission denied")
+	}
+
+	_, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: "repo"}, deps)
+	if err == nil {
+		t.Fatal("InstallSkill returned nil error, want protect failure")
+	}
+	if !strings.Contains(err.Error(), "protect local loopcoder state") || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error = %v, want local-state protection failure", err)
+	}
 }
 
 func TestInstallSkillPreservesExistingClaudeSettings(t *testing.T) {
@@ -336,6 +412,12 @@ func skillDepsForTest(fsys *skillFakeFS) SkillInstallDeps {
 		},
 		AgentsMarkdown: func() ([]byte, error) {
 			return []byte("agents content\n"), nil
+		},
+		ProtectLocalState: func(_ context.Context, repoPath string) (gitlocal.ProtectResult, error) {
+			return gitlocal.ProtectResult{
+				ExcludePath: filepath.Join(displayProjectDir(repoPath), ".git", "info", "exclude"),
+				Status:      gitlocal.ProtectUnchanged,
+			}, nil
 		},
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 )
 
 const (
@@ -36,13 +37,14 @@ type SkillInstallOptions struct {
 }
 
 type SkillInstallDeps struct {
-	UserHomeDir    func() (string, error)
-	Stat           func(string) (fs.FileInfo, error)
-	MkdirAll       func(string, fs.FileMode) error
-	ReadFile       func(string) ([]byte, error)
-	WriteFile      func(string, []byte, fs.FileMode) error
-	SkillMarkdown  func() ([]byte, error)
-	AgentsMarkdown func() ([]byte, error)
+	UserHomeDir       func() (string, error)
+	Stat              func(string) (fs.FileInfo, error)
+	MkdirAll          func(string, fs.FileMode) error
+	ReadFile          func(string) ([]byte, error)
+	WriteFile         func(string, []byte, fs.FileMode) error
+	SkillMarkdown     func() ([]byte, error)
+	AgentsMarkdown    func() ([]byte, error)
+	ProtectLocalState func(context.Context, string) (gitlocal.ProtectResult, error)
 }
 
 type SkillInstallFileStatus string
@@ -60,26 +62,31 @@ type SkillInstallFileResult struct {
 }
 
 type SkillInstallResult struct {
-	Dir             string
-	Files           []SkillInstallFileResult
-	HookSettings    *SkillInstallFileResult
-	WorkspaceMarker *SkillInstallFileResult
+	Dir               string
+	Files             []SkillInstallFileResult
+	HookSettings      *SkillInstallFileResult
+	WorkspaceMarker   *SkillInstallFileResult
+	LocalStateExclude *SkillInstallFileResult
+	Warnings          []string
 }
 
 func DefaultSkillInstallDeps() SkillInstallDeps {
 	return SkillInstallDeps{
-		UserHomeDir:    os.UserHomeDir,
-		Stat:           os.Stat,
-		MkdirAll:       os.MkdirAll,
-		ReadFile:       os.ReadFile,
-		WriteFile:      os.WriteFile,
-		SkillMarkdown:  loopcoder.SkillMarkdown,
-		AgentsMarkdown: loopcoder.AgentsMarkdown,
+		UserHomeDir:       os.UserHomeDir,
+		Stat:              os.Stat,
+		MkdirAll:          os.MkdirAll,
+		ReadFile:          os.ReadFile,
+		WriteFile:         os.WriteFile,
+		SkillMarkdown:     loopcoder.SkillMarkdown,
+		AgentsMarkdown:    loopcoder.AgentsMarkdown,
+		ProtectLocalState: gitlocal.ProtectLoopcoderState,
 	}
 }
 
 func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInstallDeps) (SkillInstallResult, error) {
-	_ = ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deps = normalizeSkillInstallDeps(deps)
 
 	dir, err := resolveSkillInstallDir(opts.Dir, deps.UserHomeDir)
@@ -127,6 +134,21 @@ func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInsta
 	}
 	result.WorkspaceMarker = &marker
 
+	localState, err := deps.ProtectLocalState(ctx, opts.ProjectDir)
+	if err != nil {
+		if errors.Is(err, gitlocal.ErrNotGitRepository) {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayProjectDir(opts.ProjectDir), err))
+		} else {
+			return result, fmt.Errorf("protect local loopcoder state: %w", err)
+		}
+	} else {
+		localStateResult := SkillInstallFileResult{
+			Path:   localState.ExcludePath,
+			Status: SkillInstallFileStatus(localState.Status),
+		}
+		result.LocalStateExclude = &localStateResult
+	}
+
 	return result, nil
 }
 
@@ -152,6 +174,9 @@ func normalizeSkillInstallDeps(deps SkillInstallDeps) SkillInstallDeps {
 	}
 	if deps.AgentsMarkdown == nil {
 		deps.AgentsMarkdown = defaults.AgentsMarkdown
+	}
+	if deps.ProtectLocalState == nil {
+		deps.ProtectLocalState = defaults.ProtectLocalState
 	}
 	return deps
 }
@@ -289,6 +314,14 @@ func writeConductorWorkspaceMarker(deps SkillInstallDeps, projectDir string) (Sk
 	return SkillInstallFileResult{Path: path, Status: status}, nil
 }
 
+func displayProjectDir(projectDir string) string {
+	projectDir = strings.TrimSpace(projectDir)
+	if projectDir == "" {
+		return "."
+	}
+	return projectDir
+}
+
 func runSkill(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "skill: expected subcommand")
@@ -349,6 +382,7 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	renderSkillInstallResult(stdout, result)
+	renderSkillInstallWarnings(stderr, result)
 	return 0
 }
 
@@ -387,5 +421,18 @@ func renderSkillInstallResult(w io.Writer, result SkillInstallResult) {
 	}
 	if result.WorkspaceMarker != nil {
 		fmt.Fprintf(w, "  marker %s %s\n", result.WorkspaceMarker.Status, result.WorkspaceMarker.Path)
+	}
+	if result.LocalStateExclude != nil {
+		fmt.Fprintf(w, "  local-state %s %s\n", result.LocalStateExclude.Status, result.LocalStateExclude.Path)
+	}
+}
+
+func renderSkillInstallWarnings(w io.Writer, result SkillInstallResult) {
+	for _, warning := range result.Warnings {
+		warning = strings.TrimSpace(warning)
+		if warning == "" {
+			continue
+		}
+		fmt.Fprintf(w, "skill install: warning: %s\n", warning)
 	}
 }
