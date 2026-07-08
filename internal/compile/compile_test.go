@@ -426,7 +426,7 @@ func TestExtractGoListBackboneCapturesOutput(t *testing.T) {
 
 func TestExtractGoListBackboneTimesOutUnavailable(t *testing.T) {
 	repo := repoWithGoMod(t)
-	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep", "500ms")
+	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep-then-golist-json", "500ms")
 
 	start := time.Now()
 	backbone, err := ExtractGoListBackbone(context.Background(), repo)
@@ -489,19 +489,26 @@ func runExecHelper() {
 	args := os.Args[separator+2:]
 	switch mode {
 	case "golist-json":
-		dir, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
-			os.Exit(2)
-		}
-		fmt.Fprintf(os.Stdout, "{\"ImportPath\":\"example.com/repo\",\"Dir\":%q,\"Name\":\"repo\"}\n", dir)
+		writeGoListJSON()
 	case "sleep":
 		time.Sleep(parseHelperDuration(args[0]))
+	case "sleep-then-golist-json":
+		time.Sleep(parseHelperDuration(args[0]))
+		writeGoListJSON()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
 	}
 	os.Exit(0)
+}
+
+func writeGoListJSON() {
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Fprintf(os.Stdout, "{\"ImportPath\":\"example.com/repo\",\"Dir\":%q,\"Name\":\"repo\"}\n", dir)
 }
 
 func parseHelperDuration(value string) time.Duration {

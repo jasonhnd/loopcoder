@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
@@ -17,10 +19,9 @@ func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
 
 	var missing []string
 	for _, command := range Commands() {
-		needle := "loopcoder " + command.Name
 		for rel, text := range docs {
-			if !strings.Contains(text, needle) {
-				missing = append(missing, rel+" missing "+needle)
+			if !commandDocsContainCommand(text, command.Name) {
+				missing = append(missing, rel+" missing loopcoder "+command.Name)
 			}
 		}
 	}
@@ -28,6 +29,45 @@ func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("registered command documentation inventory mismatch:\n%s", strings.Join(missing, "\n"))
 	}
+}
+
+func TestCommandDocsCommandMatcherRejectsPrefixCollisions(t *testing.T) {
+	if commandDocsContainCommand("`loopcoder dispatch-wave`", "dispatch") {
+		t.Fatal("matcher accepted dispatch from dispatch-wave")
+	}
+	for _, text := range []string{
+		"`loopcoder dispatch`",
+		"loopcoder dispatch --repo .",
+		"loopcoder dispatch\n",
+		"loopcoder dispatch",
+	} {
+		if !commandDocsContainCommand(text, "dispatch") {
+			t.Fatalf("matcher rejected exact command in %q", text)
+		}
+	}
+}
+
+func commandDocsContainCommand(text, name string) bool {
+	needle := "loopcoder " + name
+	for search := text; ; {
+		index := strings.Index(search, needle)
+		if index < 0 {
+			return false
+		}
+		after := search[index+len(needle):]
+		if after == "" {
+			return true
+		}
+		next, _ := utf8.DecodeRuneInString(after)
+		if commandDocsCommandBoundary(next) {
+			return true
+		}
+		search = after
+	}
+}
+
+func commandDocsCommandBoundary(r rune) bool {
+	return r == '`' || unicode.IsSpace(r)
 }
 
 func commandDocsGitRoot(t *testing.T) string {

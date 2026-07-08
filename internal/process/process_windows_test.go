@@ -12,8 +12,8 @@ import (
 func TestAliveTasklistTimesOut(t *testing.T) {
 	oldCommand := tasklistCommand
 	oldHardCap := livenessHardCap
-	tasklistCommand = func(int) (string, []string) {
-		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep", "500ms"}
+	tasklistCommand = func(pid int) (string, []string) {
+		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep-then-tasklist", "500ms", fmt.Sprint(pid)}
 	}
 	livenessHardCap = 50 * time.Millisecond
 	t.Setenv("GO_WANT_PROCESS_WINDOWS_HELPER", "1")
@@ -49,6 +49,9 @@ func TestProcessWindowsExecHelper(t *testing.T) {
 	switch mode := os.Args[separator+1]; mode {
 	case "sleep":
 		time.Sleep(parseHelperDuration(os.Args[separator+2]))
+	case "sleep-then-tasklist":
+		time.Sleep(parseHelperDuration(os.Args[separator+2]))
+		fmt.Fprintf(os.Stdout, "loopcoder.exe                  %s Console                    1     12,345 K\n", os.Args[separator+3])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
