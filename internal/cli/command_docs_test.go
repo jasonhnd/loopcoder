@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
@@ -19,7 +21,7 @@ func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
 	for _, command := range Commands() {
 		needle := "loopcoder " + command.Name
 		for rel, text := range docs {
-			if !strings.Contains(text, needle) {
+			if !containsLoopcoderCommand(text, command.Name) {
 				missing = append(missing, rel+" missing "+needle)
 			}
 		}
@@ -28,6 +30,75 @@ func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("registered command documentation inventory mismatch:\n%s", strings.Join(missing, "\n"))
 	}
+}
+
+func TestCommandDocsMatchCommandTokenBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		text    string
+		command string
+		want    bool
+	}{
+		{
+			name:    "exact code span",
+			text:    "`loopcoder dispatch`",
+			command: "dispatch",
+			want:    true,
+		},
+		{
+			name:    "followed by subcommand argument",
+			text:    "loopcoder state push",
+			command: "state",
+			want:    true,
+		},
+		{
+			name:    "prefix collision with hyphenated command",
+			text:    "`loopcoder dispatch-wave`",
+			command: "dispatch",
+			want:    false,
+		},
+		{
+			name:    "prefix collision with longer token",
+			text:    "`loopcoder verify-local`",
+			command: "verify",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsLoopcoderCommand(tt.text, tt.command); got != tt.want {
+				t.Fatalf("containsLoopcoderCommand(%q, %q) = %t, want %t", tt.text, tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+func containsLoopcoderCommand(text, name string) bool {
+	needle := "loopcoder " + name
+	for offset := 0; ; {
+		index := strings.Index(text[offset:], needle)
+		if index < 0 {
+			return false
+		}
+		end := offset + index + len(needle)
+		if isCommandTokenBoundary(text[end:]) {
+			return true
+		}
+		offset = end
+	}
+}
+
+func isCommandTokenBoundary(rest string) bool {
+	if rest == "" {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return !isCommandTokenRune(r)
+}
+
+func isCommandTokenRune(r rune) bool {
+	return r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 func commandDocsGitRoot(t *testing.T) string {
