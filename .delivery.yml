@@ -6,7 +6,7 @@ adapters:
   worker: codex           # Codex implements each issue.
   vcs: github             # GitHub hosts PRs and checks.
   verifier: claude        # SHOULD differ from worker; provider registry key.
-  gate: human-merge       # loopcoder itself stays human-gated on purpose; other projects now default to auto.
+  gate: human-merge       # loopcoder-core stays human-gated; consumer projects opt into auto with init --gate auto or config.
 worker:
   # Optional. Absent = inherit your codex global config (~/.codex/config.toml). loopcoder never sets these on its own; they appear only when you state a permanent preference.
   # model:

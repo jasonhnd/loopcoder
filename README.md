@@ -15,9 +15,9 @@
 
 ## What it is
 
-loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches provider-pluggable workers in isolated git worktrees, opens pull requests, runs an independent read-only verifier, and auto-promotes qualifying work to production by default.
+loopcoder is an autonomous delivery loop. Describe what you want shipped in one chat; it plans the work into GitHub issues, dispatches provider-pluggable workers in isolated git worktrees, opens pull requests, runs an independent read-only verifier, and promotes qualifying work through the configured production gate.
 
-It removes the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. Set `adapters.gate: human-merge` when you want humans to choose production merges explicitly. Repo-facing artifacts and worker summaries are written in English.
+It removes the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. New v0.6.1 scaffolds start with `adapters.gate: human-merge`; pass `loopcoder init --repo . --gate auto` or edit `.delivery.yml` when a project should opt into automatic production promotion. Repo-facing artifacts and worker summaries are written in English.
 
 v0.6.1 is the customer-ready bridge for the public 0.6 line. It packages role-scoped model/depth discovery, the Google Antigravity `agy` provider path, reporter output, upgrade/migration compatibility, first-run `init --repo/--gate`, machine-readable `doctor`, local-state protection, and richer `report` records into the customer install target. The latest public release before this bridge was v0.5.4; customer install and upgrade commands should target v0.6.1, not a nonexistent public v0.6.0 release.
 
@@ -30,12 +30,12 @@ flowchart LR
   dispatch --> pr[pull requests]
   pr --> review[loopreview verifier<br/>read-only verdict + required checks]
   review --> preprod[pre-prod]
-  preprod --> gate{{auto gate<br/>or human-merge opt-out}}
+  preprod --> gate{{configured gate<br/>human-merge or auto}}
   gate --> prod[production]
   prod -. next layer .-> plan
 ```
 
-The conductor is a configured agent session. The worker defaults to `codex`; `codex` and `claude` are verified worker providers, and `antigravity` is the Google Antigravity CLI path through executable `agy`. The older direct `gemini` adapter remains experimental and outside the static model registry. The verifier is configured separately and should normally differ from the worker. The production promotion gate defaults to `auto`; set `adapters.gate: human-merge` to opt out.
+The conductor is a configured agent session. The worker defaults to `codex`; `codex` and `claude` are verified worker providers, and `antigravity` is the Google Antigravity CLI path through executable `agy`. The older direct `gemini` adapter remains experimental and outside the static model registry. The verifier is configured separately and should normally differ from the worker. For runtime compatibility, an empty or missing production promotion gate still normalizes to `auto`; new `loopcoder init --repo .` scaffolds write `adapters.gate: human-merge` unless you pass `--gate auto`.
 
 ## What it looks like
 
@@ -97,7 +97,7 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 
 ## Usage
 
-- In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; production promotion is automatic by default when the gate passes, with `human-merge` available as an explicit opt-out.
+- In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; new scaffolds keep production promotion human-directed, while projects can opt into automatic promotion with `adapters.gate: auto`.
 - The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
 
 ```bash
@@ -223,14 +223,14 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into `loopcoder status`, and reports progress. It never writes the code itself.
 - Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh git worktree, then opens a PR. The verified worker providers are `codex` and `claude`; `antigravity` is the `agy` provider path; direct `gemini` remains experimental/unverified.
 - Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status. `codex` and `claude` have verifier smoke proof; `antigravity` fails closed for read-only review.
-- Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step defaults to `gate: auto`, which auto-promotes to production only when CI is green, `loopreview` passed, configured evidence is present, and the red-line floor is clean.
+- Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step uses the effective production gate: legacy empty or missing gates normalize to `auto`, but new v0.6.1 scaffolds write `gate: human-merge`. With `gate: auto`, production promotion still requires green CI, passed `loopreview`, configured evidence, and a clean red-line floor.
 - Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and production promotion gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, `verifier`, and `gate`.
 - Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
 - Cross-platform: one Go binary; providers run through native adapters, and worktree creation is serialized with a cross-platform file lock.
 
 ## Why loopcoder
 
-- Production promotion defaults to `auto`, with a deterministic conjunctive gate, production rollback to the recorded prior-stable SHA, and `human-merge` as the explicit opt-out.
+- Production promotion has two deliberate defaults: legacy gate-less configs normalize to `auto`, while new `init` scaffolds write `human-merge` unless the project explicitly opts into `auto`. Automatic promotion uses a deterministic conjunctive gate and records the prior-stable SHA for rollback.
 - Isolated git worktrees -- parallel workers do not collide; conflicts are handled at merge time.
 - Doc-first -- code implements a merged design, and review checks conformance to it.
 - Model/depth registry -- operators can discover exact model and depth tokens, validate selections, and keep Worker and Verifier choices independent.
