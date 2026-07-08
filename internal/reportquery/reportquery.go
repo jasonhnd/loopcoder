@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -27,7 +28,7 @@ const (
 	maxReportDirEntries = 20000
 )
 
-var reporterHeaderRe = regexp.MustCompile(`^\[(?:reporter|attestation)\]\s+`)
+var reporterHeaderRe = regexp.MustCompile(fmt.Sprintf(`^\[(?:%s|%s)\]\s+`, regexp.QuoteMeta(migration.ReporterHeaderToken), regexp.QuoteMeta(migration.LegacyReporterHeaderToken)))
 
 type Options struct {
 	RepoPath string
@@ -86,6 +87,9 @@ func RenderText(records []Record) string {
 	for _, record := range records {
 		r := record.Report
 		fmt.Fprintf(&out, "- work_id: %s\n", display(r.WorkID))
+		fmt.Fprintf(&out, "  source: %s\n", display(record.Source))
+		fmt.Fprintf(&out, "  run_id: %s\n", display(record.RunID))
+		fmt.Fprintf(&out, "  path: %s\n", display(record.Path))
 		fmt.Fprintf(&out, "  role: %s\n", display(string(r.Role)))
 		fmt.Fprintf(&out, "  provider: %s\n", display(r.Provider))
 		fmt.Fprintf(&out, "  model: %s\n", display(reporter.ModelDepthDisplay(r.Model, r.Effort)))
@@ -110,12 +114,27 @@ func RenderText(records []Record) string {
 
 func MarshalJSON(records []Record) ([]byte, error) {
 	reports := make([]reporter.Report, 0, len(records))
+	jsonRecords := make([]jsonRecord, 0, len(records))
 	for _, record := range records {
 		reports = append(reports, record.Report)
+		jsonRecords = append(jsonRecords, jsonRecord{
+			Report: record.Report,
+			Source: record.Source,
+			RunID:  record.RunID,
+			Path:   record.Path,
+		})
 	}
 	return json.Marshal(struct {
 		Reports []reporter.Report `json:"reports"`
-	}{Reports: reports})
+		Records []jsonRecord      `json:"records"`
+	}{Reports: reports, Records: jsonRecords})
+}
+
+type jsonRecord struct {
+	Report reporter.Report `json:"report"`
+	Source string          `json:"source"`
+	RunID  string          `json:"run_id"`
+	Path   string          `json:"path"`
 }
 
 func loadRunReports(repoPath string) ([]Record, error) {
@@ -276,11 +295,11 @@ func collectReports(data []byte) []reporter.Report {
 					records = append(records, report)
 				}
 			}
-			if raw, ok := typed["report"]; ok {
+			if raw, ok := typed[migration.ReportStateKey]; ok {
 				if report, ok := parseReportValue(raw); ok {
 					records = append(records, report)
 				}
-			} else if raw, ok := typed["attestation"]; ok {
+			} else if raw, ok := typed[migration.LegacyReportStateKey]; ok {
 				if report, ok := parseReportValue(raw); ok {
 					records = append(records, report)
 				}
@@ -388,6 +407,7 @@ func loadPendingRelayReports(repoPath string) ([]Record, error) {
 			records = append(records, Record{
 				Report:  *pending.Report,
 				Source:  "relay-pending",
+				RunID:   pending.RunID,
 				Path:    path,
 				modTime: info.ModTime().UTC(),
 			})
@@ -397,6 +417,7 @@ func loadPendingRelayReports(repoPath string) ([]Record, error) {
 			records = append(records, Record{
 				Report:  report,
 				Source:  "relay-pending",
+				RunID:   pending.RunID,
 				Path:    path,
 				modTime: info.ModTime().UTC(),
 			})
