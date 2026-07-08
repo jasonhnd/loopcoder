@@ -122,12 +122,24 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	}
 	var payload struct {
 		Reports []reporter.Report `json:"reports"`
+		Records []struct {
+			Report reporter.Report `json:"report"`
+			Source string          `json:"source"`
+			RunID  string          `json:"run_id"`
+			Path   string          `json:"path"`
+		} `json:"records"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("report output is not JSON: %v\n%s", err, stdout.String())
 	}
 	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
+	}
+	if len(payload.Records) != 1 {
+		t.Fatalf("records = %d, want one filtered local record: %s", len(payload.Records), stdout.String())
+	}
+	if payload.Records[0].Report.WorkID != "run-report-test" || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != "run-report-test" || payload.Records[0].Path == "" {
+		t.Fatalf("records = %#v, want one filtered local record with source context", payload.Records)
 	}
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
