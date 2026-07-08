@@ -971,6 +971,42 @@ func TestFixLegacyStateKeysRewritesLocalJSON(t *testing.T) {
 	}
 }
 
+func TestFixLegacyStateKeysRewritesLocalJSONLCompact(t *testing.T) {
+	repo := t.TempDir()
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-1", "events.jsonl")
+	writeDoctorTextFile(t, statePath, strings.Join([]string{
+		fmt.Sprintf(`{"event":"one","%s":{"role":"worker","usage":{"total_tokens":12}}}`, migration.LegacyReportStateKey),
+		fmt.Sprintf(`{"event":"two","%s":{"role":"verifier"}}`, migration.LegacyReportStateKey),
+		"",
+	}, "\n"))
+
+	check := fixLegacyStateKeys(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"`+migration.LegacyReportStateKey+`"`) {
+		t.Fatalf("state still contains legacy key:\n%s", text)
+	}
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("JSONL line count = %d, want 2 compact records:\n%s", len(lines), text)
+	}
+	for i, line := range lines {
+		var object map[string]any
+		if err := json.Unmarshal([]byte(line), &object); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v\n%s", i+1, err, line)
+		}
+		if _, ok := object[migration.ReportStateKey]; !ok {
+			t.Fatalf("line %d missing current key: %s", i+1, line)
+		}
+	}
+}
+
 func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	report := Report{Checks: []Check{
 		{Name: "git", Status: StatusOK, Message: "found"},
