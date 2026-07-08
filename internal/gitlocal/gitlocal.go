@@ -142,6 +142,10 @@ func protectsLoopcoderState(data []byte) bool {
 	return false
 }
 
+func ExcludesLoopcoderState(data []byte) bool {
+	return protectsLoopcoderState(data)
+}
+
 func appendManagedExcludeBlock(current []byte) []byte {
 	var next []byte
 	next = append(next, current...)

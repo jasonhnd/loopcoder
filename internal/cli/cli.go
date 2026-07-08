@@ -407,6 +407,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
 	}
 	if command.Name == "models" {
@@ -868,14 +869,24 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var baseBranch string
 	var baseBranchAlias string
+	var outputFormat string
 	var fix bool
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&outputFormat, "format", "text", "output format: text or json")
 	fs.BoolVar(&fix, "fix", false, "apply explicit upgrade migrations and stale local state cleanup")
 
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	if outputFormat == "" {
+		outputFormat = "text"
+	}
+	if outputFormat != "text" && outputFormat != "json" {
+		fmt.Fprintf(stderr, "doctor: unsupported --format %q (want text or json)\n", outputFormat)
 		return 2
 	}
 	if repoAlias != "" {
@@ -895,18 +906,26 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
+	build := doctor.BuildInfo{
+		Version: deps.BuildInfo.Version,
+		Commit:  deps.BuildInfo.Commit,
+		Date:    deps.BuildInfo.Date,
+	}
 	report := deps.Doctor(context.Background(), doctor.Options{
 		RepoPath:   resolvedRepo,
 		BaseBranch: baseBranch,
 		Fix:        fix,
-		BuildInfo: doctor.BuildInfo{
-			Version: deps.BuildInfo.Version,
-			Commit:  deps.BuildInfo.Commit,
-			Date:    deps.BuildInfo.Date,
-		},
+		BuildInfo:  build,
 	})
-	if err := doctor.Render(stdout, report); err != nil {
-		fmt.Fprintf(stderr, "doctor: write output: %v\n", err)
+	report = doctor.WithMetadata(report, resolvedRepo, build)
+	var renderErr error
+	if outputFormat == "json" {
+		renderErr = doctor.RenderJSON(stdout, report)
+	} else {
+		renderErr = doctor.Render(stdout, report)
+	}
+	if renderErr != nil {
+		fmt.Fprintf(stderr, "doctor: write output: %v\n", renderErr)
 		return 1
 	}
 	return report.ExitCode()

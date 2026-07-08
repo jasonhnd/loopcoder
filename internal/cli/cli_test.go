@@ -1072,7 +1072,7 @@ func TestDoctorHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder doctor", "--repo"} {
+	for _, want := range []string{"loopcoder doctor", "--repo", "--format"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1119,6 +1119,98 @@ func TestDoctorRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if stdout.String() != "[ok] git: found\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestDoctorRendersJSONFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"--repo", repo,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "0.6.1",
+			Commit:  "abc123",
+			Date:    "2026-07-08T00:00:00Z",
+		},
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:       "tracked .loopcoder",
+				Status:     doctor.StatusFail,
+				Message:    "tracked",
+				Hard:       true,
+				FixCommand: "git rm -r --cached .loopcoder && echo .loopcoder/ >> .git/info/exclude",
+			}}}
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		RepoPath string `json:"repo_path"`
+		Version  string `json:"version"`
+		Commit   string `json:"commit"`
+		Date     string `json:"date"`
+		ExitCode int    `json:"exit_code"`
+		Checks   []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Hard       bool   `json:"hard"`
+			Message    string `json:"message"`
+			FixCommand string `json:"fix_command"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.RepoPath != repo || payload.Version != "0.6.1" || payload.Commit != "abc123" || payload.Date != "2026-07-08T00:00:00Z" {
+		t.Fatalf("metadata = %#v", payload)
+	}
+	if payload.ExitCode != 1 || len(payload.Checks) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Checks[0].Name != "tracked .loopcoder" || payload.Checks[0].Status != "fail" || !payload.Checks[0].Hard || payload.Checks[0].FixCommand == "" {
+		t.Fatalf("check = %#v", payload.Checks[0])
+	}
+}
+
+func TestDoctorRejectsUnsupportedFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"--repo", repo,
+		"--format", "yaml",
+	}, &stdout, &stderr, Deps{
+		Doctor: func(context.Context, doctor.Options) doctor.Report {
+			called = true
+			return doctor.Report{}
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if called {
+		t.Fatal("Doctor dependency should not be called for invalid format")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unsupported --format") {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 
