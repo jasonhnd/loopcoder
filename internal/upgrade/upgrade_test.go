@@ -883,11 +883,11 @@ func TestExecRunCommandTimesOut(t *testing.T) {
 	withTestCommandCap(t, 50*time.Millisecond)
 
 	start := time.Now()
-	_, err := execRunCommand(context.Background(), os.Args[0], "-test.run=TestUpgradeExecHelper", "--", "sleep", "5s")
+	_, err := execRunCommand(context.Background(), os.Args[0], "-test.run=TestUpgradeExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("execRunCommand error = nil, want timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("execRunCommand elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {

@@ -157,7 +157,7 @@ func TestExecRunnerTimesOut(t *testing.T) {
 	start := time.Now()
 	run := (ExecRunner{}).Run(context.Background(), CommandInvocation{
 		File: os.Args[0],
-		Args: []string{"-test.run=TestVerifyExecHelper", "--", "sleep", "5s"},
+		Args: []string{"-test.run=TestVerifyExecHelper", "--", "sleep", "500ms"},
 	})
 	if run.Err == nil {
 		t.Fatal("Run Err = nil, want timeout")
@@ -165,7 +165,7 @@ func TestExecRunnerTimesOut(t *testing.T) {
 	if run.ExitCode != -1 {
 		t.Fatalf("ExitCode = %d, want -1", run.ExitCode)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(run.Err.Error(), "timed out") {

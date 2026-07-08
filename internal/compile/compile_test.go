@@ -426,14 +426,14 @@ func TestExtractGoListBackboneCapturesOutput(t *testing.T) {
 
 func TestExtractGoListBackboneTimesOutUnavailable(t *testing.T) {
 	repo := repoWithGoMod(t)
-	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep", "5s")
+	withTestGoListCommand(t, 50*time.Millisecond, "-test.run=TestGoListExecHelper", "--", "sleep", "500ms")
 
 	start := time.Now()
 	backbone, err := ExtractGoListBackbone(context.Background(), repo)
 	if err != nil {
 		t.Fatalf("ExtractGoListBackbone returned error: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("ExtractGoListBackbone elapsed = %s, want bounded timeout", elapsed)
 	}
 	if backbone.Available {

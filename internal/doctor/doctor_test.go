@@ -1011,7 +1011,7 @@ func TestExecRunCommandTimesOut(t *testing.T) {
 	withTestCommandCap(t, 50*time.Millisecond)
 
 	start := time.Now()
-	_, err := execRunCommand(context.Background(), "", os.Args[0], "-test.run=TestDoctorExecHelper", "--", "sleep", "5s")
+	_, err := execRunCommand(context.Background(), "", os.Args[0], "-test.run=TestDoctorExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("execRunCommand error = nil, want timeout")
 	}

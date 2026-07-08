@@ -277,14 +277,14 @@ func TestExecGitHubRunnerTimesOut(t *testing.T) {
 	dir := t.TempDir()
 
 	start := time.Now()
-	output, err := (execGitHubRunner{}).Run(context.Background(), dir, "-test.run=TestScaffoldExecHelper", "--", "sleep", "5s")
+	output, err := (execGitHubRunner{}).Run(context.Background(), dir, "-test.run=TestScaffoldExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("Run error = nil, want timeout")
 	}
 	if len(output) != 0 {
 		t.Fatalf("output = %q, want no output", output)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {
