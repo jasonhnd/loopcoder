@@ -263,39 +263,43 @@ The dispatch result fields are:
 - `report`: the same validated Worker `Report` emitted in the
   first two stdout records.
 
-During the 0.6.0 transition, readers accept legacy dispatch result JSON with an
+During the 0.6.x transition window, readers accept legacy dispatch result JSON with an
 `attestation` object and legacy `[attestation]` headers, but new output uses
 the `report` object and `[reporter]` header per
 [`../specs/0567-reporter.md`](../specs/0567-reporter.md).
 
-The default pretty behavior introduced in 0.3.5 writes the human-readable pretty
-report block to stderr by default with the polished display format. The default block uses
-emoji on an interactive TTY and plain ASCII on a non-TTY. It shows the provider
-vendor plus the CLI `tool`, renders the model source as `(detected)` or
-`(self-reported)`, uses host-local timestamps to whole seconds, reports
-duration in seconds, and groups token counts with thousands separators. When
-input and output tokens are present without a total, the pretty block derives a
-display-only total. This never changes or reorders the three stdout records,
-the stable `Header()` / `[reporter] ...` line, or the canonical JSON, and it
-never adds reports to PR bodies.
+The default pretty behavior writes the human-readable pretty report block to
+stderr by default with the polished display format. The default block uses
+emoji on an interactive TTY and plain ASCII on a non-TTY. It shows provider
+vendor and provider key on one combined line, such as `OpenAI Codex / codex`,
+renders the model and depth plus source as `gpt-5.5 (xhigh) (parsed)` or
+`Gemini 3.1 Pro (High) (self-reported)`, uses host-local timestamps to whole
+seconds, reports duration in seconds, and groups token counts with thousands
+separators. When input and output tokens are present without a total, the
+pretty block derives a display-only total. This never changes or reorders the
+three stdout records, the stable `Header()` / `[reporter] ...` line, or the
+canonical JSON, and it never adds reports to PR bodies.
 
 Example pretty block:
 
 ```text
 report: verified
+who
   role        worker
-  provider    OpenAI
-  tool        codex
-  model       gpt-5.5 (detected)
-  effort      xhigh
+  provider    OpenAI Codex / codex
+  model       gpt-5.5 (xhigh) (parsed)
   permission  write
+what
+  issue       #293
   action      "implement issue #293"
+result
   exit        0
+  duration    7m53.9s (473.9 s)
   started     2026-06-30 14:25:21 JST
   ended       2026-06-30 14:33:15 JST
-  duration    7m53.9s (473.9 s)
-  tokens      total=165,268
   verified    true
+cost
+  tokens      total=165,268
 ```
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces emoji pretty output even on non-TTY

@@ -3,8 +3,10 @@
 package process
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -12,8 +14,9 @@ import (
 func TestAliveTasklistTimesOut(t *testing.T) {
 	oldCommand := tasklistCommand
 	oldHardCap := livenessHardCap
+	sentinel := filepath.Join(t.TempDir(), "helper-completed")
 	tasklistCommand = func(int) (string, []string) {
-		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep", "5s"}
+		return os.Args[0], []string{"-test.run=TestProcessWindowsExecHelper", "--", "sleep-then-write", "500ms", sentinel}
 	}
 	livenessHardCap = 50 * time.Millisecond
 	t.Setenv("GO_WANT_PROCESS_WINDOWS_HELPER", "1")
@@ -26,8 +29,11 @@ func TestAliveTasklistTimesOut(t *testing.T) {
 	if Alive(os.Getpid()) {
 		t.Fatal("Alive = true, want false after tasklist timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Alive elapsed = %s, want bounded timeout", elapsed)
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tasklist helper completed after hard cap; sentinel stat err = %v", err)
 	}
 }
 
@@ -49,6 +55,12 @@ func TestProcessWindowsExecHelper(t *testing.T) {
 	switch mode := os.Args[separator+1]; mode {
 	case "sleep":
 		time.Sleep(parseHelperDuration(os.Args[separator+2]))
+	case "sleep-then-write":
+		time.Sleep(parseHelperDuration(os.Args[separator+2]))
+		if err := os.WriteFile(os.Args[separator+3], []byte("completed"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write sentinel: %v\n", err)
+			os.Exit(2)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)

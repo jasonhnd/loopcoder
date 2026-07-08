@@ -20,9 +20,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	"gopkg.in/yaml.v3"
@@ -74,14 +76,19 @@ type CommandResult struct {
 }
 
 type Check struct {
-	Name    string
-	Status  Status
-	Message string
-	Hard    bool
+	Name       string
+	Status     Status
+	Message    string
+	Hard       bool
+	FixCommand string
 }
 
 type Report struct {
-	Checks []Check
+	RepoPath string
+	Version  string
+	Commit   string
+	Date     string
+	Checks   []Check
 }
 
 func (r Report) ExitCode() int {
@@ -109,6 +116,61 @@ func Render(w io.Writer, report Report) error {
 		}
 	}
 	return nil
+}
+
+func RenderJSON(w io.Writer, report Report) error {
+	type renderedCheck struct {
+		Name       string `json:"name"`
+		Status     Status `json:"status"`
+		Hard       bool   `json:"hard"`
+		Message    string `json:"message"`
+		FixCommand string `json:"fix_command"`
+	}
+	checks := make([]renderedCheck, 0, len(report.Checks))
+	for _, check := range report.Checks {
+		checks = append(checks, renderedCheck{
+			Name:       check.Name,
+			Status:     check.Status,
+			Hard:       check.Hard,
+			Message:    check.Message,
+			FixCommand: check.FixCommand,
+		})
+	}
+	payload := struct {
+		RepoPath string          `json:"repo_path"`
+		Version  string          `json:"version"`
+		Commit   string          `json:"commit"`
+		Date     string          `json:"date"`
+		ExitCode int             `json:"exit_code"`
+		Checks   []renderedCheck `json:"checks"`
+	}{
+		RepoPath: report.RepoPath,
+		Version:  report.Version,
+		Commit:   report.Commit,
+		Date:     report.Date,
+		ExitCode: report.ExitCode(),
+		Checks:   checks,
+	}
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(payload)
+}
+
+func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
+	build = normalizeBuildInfo(build)
+	if strings.TrimSpace(report.RepoPath) == "" {
+		report.RepoPath = repoPath
+	}
+	if strings.TrimSpace(report.Version) == "" {
+		report.Version = build.Version
+	}
+	if strings.TrimSpace(report.Commit) == "" {
+		report.Commit = build.Commit
+	}
+	if strings.TrimSpace(report.Date) == "" {
+		report.Date = build.Date
+	}
+	return report
 }
 
 func DefaultDeps() Deps {
@@ -154,6 +216,8 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	ghCheck, ghPresent := checkGH(ctx, deps)
 	checks = append(checks, ghCheck)
 	_ = ghPresent
+	checks = append(checks, checkLocalStateExclude(ctx, repoPath, gitPresent, deps))
+	checks = append(checks, checkTrackedLoopcoderState(ctx, repoPath, gitPresent, deps))
 
 	checks = append(checks, checkDeliveryConfig(delivery))
 	checks = append(checks, checkModelSelections(delivery))
@@ -169,6 +233,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
+	checks = append(checks, checkReportQuery(repoPath))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
@@ -177,7 +242,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		Message: "user-provided by the active Claude Code or Codex host; loopcoder does not ship it",
 	})
 
-	return Report{Checks: checks}
+	return WithMetadata(Report{Checks: checks}, repoPath, build)
 }
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
@@ -210,7 +275,7 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		BuildInfo:  build,
 	}, deps)
 	checks = append(checks, readOnly.Checks...)
-	return Report{Checks: checks}
+	return WithMetadata(Report{Checks: checks}, repoPath, build)
 }
 
 func fixDeliveryConfig(repoPath string, deps Deps) Check {
@@ -594,6 +659,134 @@ func checkGH(ctx context.Context, deps Deps) (Check, bool) {
 		Status:  StatusOK,
 		Message: fmt.Sprintf("found at %s and authenticated", path),
 	}, true
+}
+
+type depsGitRunner struct {
+	deps Deps
+}
+
+func (r depsGitRunner) RunGit(ctx context.Context, repoPath string, args ...string) ([]byte, error) {
+	result, err := r.deps.RunCommand(ctx, repoPath, "git", args...)
+	if err != nil {
+		return nil, err
+	}
+	if result.ExitCode != 0 {
+		detail := commandDetail(result)
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return nil, errors.New(detail)
+	}
+	return []byte(result.Stdout), nil
+}
+
+func checkLocalStateExclude(ctx context.Context, repoPath string, gitPresent bool, deps Deps) Check {
+	const fixCommand = "loopcoder skill install --repo ."
+	if !gitPresent {
+		return Check{
+			Name:    "local-state exclude",
+			Status:  StatusWarn,
+			Message: "cannot verify .loopcoder/ exclude protection because git is missing",
+		}
+	}
+	excludePath, err := gitlocal.ResolveExcludePath(ctx, repoPath, depsGitRunner{deps: deps})
+	if err != nil {
+		return Check{
+			Name:    "local-state exclude",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve .git/info/exclude for .loopcoder/ protection: %v", err),
+		}
+	}
+	data, err := deps.ReadFile(excludePath)
+	if err != nil {
+		if isNotExist(err) {
+			return Check{
+				Name:       "local-state exclude",
+				Status:     StatusWarn,
+				Message:    fmt.Sprintf(".loopcoder/ is not protected because %s does not exist; run: %s", excludePath, fixCommand),
+				FixCommand: fixCommand,
+			}
+		}
+		return Check{
+			Name:    "local-state exclude",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not read %s for .loopcoder/ protection: %v", excludePath, err),
+		}
+	}
+	if !gitlocal.ExcludesLoopcoderState(data) {
+		return Check{
+			Name:       "local-state exclude",
+			Status:     StatusWarn,
+			Message:    fmt.Sprintf(".loopcoder/ is not protected by %s; run: %s", excludePath, fixCommand),
+			FixCommand: fixCommand,
+		}
+	}
+	return Check{
+		Name:    "local-state exclude",
+		Status:  StatusOK,
+		Message: fmt.Sprintf(".loopcoder/ is protected by %s", excludePath),
+	}
+}
+
+func checkTrackedLoopcoderState(ctx context.Context, repoPath string, gitPresent bool, deps Deps) Check {
+	const fixCommand = "git rm -r --cached .loopcoder && echo .loopcoder/ >> .git/info/exclude"
+	if !gitPresent {
+		return Check{
+			Name:    "tracked .loopcoder",
+			Status:  StatusWarn,
+			Message: "cannot inspect tracked .loopcoder files because git is missing",
+		}
+	}
+	result, err := deps.RunCommand(ctx, repoPath, "git", "ls-files", ".loopcoder")
+	if err != nil {
+		return Check{
+			Name:    "tracked .loopcoder",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect tracked .loopcoder files: %v", err),
+		}
+	}
+	if result.ExitCode != 0 {
+		detail := commandDetail(result)
+		if detail == "" {
+			detail = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return Check{
+			Name:    "tracked .loopcoder",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect tracked .loopcoder files: %s", detail),
+		}
+	}
+	tracked := nonEmptyLines(result.Stdout)
+	if len(tracked) > 0 {
+		return Check{
+			Name:       "tracked .loopcoder",
+			Status:     StatusFail,
+			Message:    fmt.Sprintf("found %d tracked .loopcoder file(s); run: %s", len(tracked), fixCommand),
+			Hard:       true,
+			FixCommand: fixCommand,
+		}
+	}
+	return Check{
+		Name:    "tracked .loopcoder",
+		Status:  StatusOK,
+		Message: "no tracked .loopcoder files found",
+	}
+}
+
+func checkReportQuery(repoPath string) Check {
+	records, err := reportquery.List(reportquery.Options{RepoPath: repoPath, Limit: 1})
+	if err != nil {
+		return Check{
+			Name:    "report query",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not read local report records: %v", err),
+		}
+	}
+	return Check{
+		Name:    "report query",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("local report records are readable (%d diagnostic sample record(s))", len(records)),
+	}
 }
 
 type deliveryState struct {
@@ -1623,6 +1816,16 @@ func firstNonEmptyLine(text string) string {
 		}
 	}
 	return ""
+}
+
+func nonEmptyLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
 }
 
 func parseRemoteHeadBranch(output string) (string, bool) {

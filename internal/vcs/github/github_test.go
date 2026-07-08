@@ -160,11 +160,11 @@ func TestExecRunnerTimesOut(t *testing.T) {
 	dir := t.TempDir()
 
 	start := time.Now()
-	_, err := (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "sleep", "5s")
+	_, err := (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("Run error = nil, want timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {

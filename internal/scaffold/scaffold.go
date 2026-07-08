@@ -16,6 +16,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/execresult"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -34,6 +35,7 @@ var (
 type Options struct {
 	RepoPath       string
 	Force          bool
+	Gate           string
 	WorkerModel    string
 	WorkerEffort   string
 	VerifierModel  string
@@ -41,8 +43,9 @@ type Options struct {
 }
 
 type Deps struct {
-	FS     FileSystem
-	GitHub GitHubRunner
+	FS                FileSystem
+	GitHub            GitHubRunner
+	ProtectLocalState func(context.Context, string) (gitlocal.ProtectResult, error)
 }
 
 type FileSystem interface {
@@ -80,9 +83,15 @@ type LabelResult struct {
 }
 
 type Result struct {
-	Files    []FileResult
-	Labels   []LabelResult
-	Warnings []string
+	Files             []FileResult
+	Labels            []LabelResult
+	LocalStateExclude *LocalStateResult
+	Warnings          []string
+}
+
+type LocalStateResult struct {
+	Path   string
+	Status gitlocal.ProtectStatus
 }
 
 type LabelSpec struct {
@@ -117,8 +126,9 @@ func DefaultLabels() []LabelSpec {
 
 func DefaultDeps() Deps {
 	return Deps{
-		FS:     osFileSystem{},
-		GitHub: execGitHubRunner{},
+		FS:                osFileSystem{},
+		GitHub:            execGitHubRunner{},
+		ProtectLocalState: gitlocal.ProtectLoopcoderState,
 	}
 }
 
@@ -130,8 +140,14 @@ func Init(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if deps.GitHub == nil {
 		deps.GitHub = defaults.GitHub
 	}
+	if deps.ProtectLocalState == nil {
+		deps.ProtectLocalState = defaults.ProtectLocalState
+	}
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		opts.RepoPath = "."
+	}
+	if err := validateGate(opts.Gate); err != nil {
+		return Result{}, err
 	}
 
 	var result Result
@@ -152,6 +168,20 @@ func Init(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	labels, warnings := ensureLabels(ctx, opts.RepoPath, deps.GitHub)
 	result.Labels = labels
 	result.Warnings = append(result.Warnings, warnings...)
+
+	localState, err := deps.ProtectLocalState(ctx, opts.RepoPath)
+	if err != nil {
+		if errors.Is(err, gitlocal.ErrNotGitRepository) {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayRepoPath(opts.RepoPath), err))
+		} else {
+			return Result{}, fmt.Errorf("protect local loopcoder state: %w", err)
+		}
+	} else {
+		result.LocalStateExclude = &LocalStateResult{
+			Path:   localState.ExcludePath,
+			Status: localState.Status,
+		}
+	}
 	return result, nil
 }
 
@@ -179,6 +209,7 @@ func writeFile(fsys FileSystem, path string, data []byte, force bool) (FileResul
 }
 
 func DeliveryTemplate(opts Options) string {
+	gate := normalizeScaffoldGate(opts.Gate)
 	workerModel := strings.TrimSpace(opts.WorkerModel)
 	workerEffort := strings.TrimSpace(opts.WorkerEffort)
 	verifierModel := strings.TrimSpace(opts.VerifierModel)
@@ -194,7 +225,11 @@ func DeliveryTemplate(opts Options) string {
 	b.WriteString("  worker: codex           # Default worker provider.\n")
 	b.WriteString("  vcs: github             # GitHub hosts PRs and checks.\n")
 	b.WriteString("  verifier: claude        # Should differ from worker; provider registry key.\n")
-	b.WriteString("  gate: auto              # Default-on production promotion; set human-merge to opt out so humans choose what merges.\n")
+	if gate == "auto" {
+		b.WriteString("  gate: auto              # Explicit first-run opt-in to automatic production promotion when all gates pass.\n")
+	} else {
+		b.WriteString("  gate: human-merge       # First-run safe default: humans choose what promotes to production.\n")
+	}
 	b.WriteString("worker:\n")
 	b.WriteString("  # Optional. Absent = inherit the worker provider's global config. loopcoder never sets this on its own.\n")
 	writeOptionalScalar(&b, "  ", "model", workerModel)
@@ -346,6 +381,31 @@ func formatInlineInts(values []int) string {
 		parts = append(parts, strconv.Itoa(value))
 	}
 	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func normalizeScaffoldGate(gate string) string {
+	gate = strings.TrimSpace(gate)
+	if gate == "" {
+		return "human-merge"
+	}
+	return gate
+}
+
+func validateGate(gate string) error {
+	switch normalizeScaffoldGate(gate) {
+	case "human-merge", "auto":
+		return nil
+	default:
+		return fmt.Errorf("invalid adapters.gate %q; allowed values: human-merge, auto", strings.TrimSpace(gate))
+	}
+}
+
+func displayRepoPath(repoPath string) string {
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath == "" {
+		return "."
+	}
+	return repoPath
 }
 
 func writeOptionalScalar(b *strings.Builder, indent, key, value string) {

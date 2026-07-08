@@ -20,6 +20,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -122,12 +123,24 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	}
 	var payload struct {
 		Reports []reporter.Report `json:"reports"`
+		Records []struct {
+			Report reporter.Report `json:"report"`
+			Source string          `json:"source"`
+			RunID  string          `json:"run_id"`
+			Path   string          `json:"path"`
+		} `json:"records"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("report output is not JSON: %v\n%s", err, stdout.String())
 	}
 	if len(payload.Reports) != 1 || payload.Reports[0].WorkID != "run-report-test" || payload.Reports[0].Issue != 101 {
 		t.Fatalf("reports = %#v, want one filtered local report", payload.Reports)
+	}
+	if len(payload.Records) != 1 {
+		t.Fatalf("records = %d, want one filtered local record: %s", len(payload.Records), stdout.String())
+	}
+	if payload.Records[0].Report.WorkID != "run-report-test" || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != "run-report-test" || payload.Records[0].Path == "" {
+		t.Fatalf("records = %#v, want one filtered local record with source context", payload.Records)
 	}
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
@@ -1060,7 +1073,7 @@ func TestDoctorHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder doctor", "--repo"} {
+	for _, want := range []string{"loopcoder doctor", "--repo", "--format"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1107,6 +1120,98 @@ func TestDoctorRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if stdout.String() != "[ok] git: found\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestDoctorRendersJSONFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"--repo", repo,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		BuildInfo: BuildInfo{
+			Version: "0.6.1",
+			Commit:  "abc123",
+			Date:    "2026-07-08T00:00:00Z",
+		},
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:       "tracked .loopcoder",
+				Status:     doctor.StatusFail,
+				Message:    "tracked",
+				Hard:       true,
+				FixCommand: "git rm -r --cached .loopcoder && echo .loopcoder/ >> .git/info/exclude",
+			}}}
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		RepoPath string `json:"repo_path"`
+		Version  string `json:"version"`
+		Commit   string `json:"commit"`
+		Date     string `json:"date"`
+		ExitCode int    `json:"exit_code"`
+		Checks   []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Hard       bool   `json:"hard"`
+			Message    string `json:"message"`
+			FixCommand string `json:"fix_command"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.RepoPath != repo || payload.Version != "0.6.1" || payload.Commit != "abc123" || payload.Date != "2026-07-08T00:00:00Z" {
+		t.Fatalf("metadata = %#v", payload)
+	}
+	if payload.ExitCode != 1 || len(payload.Checks) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Checks[0].Name != "tracked .loopcoder" || payload.Checks[0].Status != "fail" || !payload.Checks[0].Hard || payload.Checks[0].FixCommand == "" {
+		t.Fatalf("check = %#v", payload.Checks[0])
+	}
+}
+
+func TestDoctorRejectsUnsupportedFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"doctor",
+		"--repo", repo,
+		"--format", "yaml",
+	}, &stdout, &stderr, Deps{
+		Doctor: func(context.Context, doctor.Options) doctor.Report {
+			called = true
+			return doctor.Report{}
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2", exitCode)
+	}
+	if called {
+		t.Fatal("Doctor dependency should not be called for invalid format")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unsupported --format") {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 
@@ -1160,7 +1265,7 @@ func TestInitHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder init", "--force", "--worker-model", "--worker-effort", "--verifier-model", "--verifier-effort"} {
+	for _, want := range []string{"loopcoder init", "--force", "--repo", "--gate", "--worker-model", "--worker-effort", "--verifier-model", "--verifier-effort"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1170,9 +1275,12 @@ func TestInitHelpDocumentsFlags(t *testing.T) {
 func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	called := false
+	repo := t.TempDir()
 
 	exitCode := RunWithDeps([]string{
 		"init",
+		"-Repo", repo,
+		"-Gate", "auto",
 		"-Force",
 		"-WorkerModel", "gpt-5",
 		"-WorkerEffort", "high",
@@ -1181,10 +1289,10 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}, &stdout, &stderr, Deps{
 		Init: func(_ context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			called = true
-			if strings.TrimSpace(opts.RepoPath) == "" {
-				t.Fatal("RepoPath is empty")
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
 			}
-			if !opts.Force || opts.WorkerModel != "gpt-5" || opts.WorkerEffort != "high" || opts.VerifierModel != "claude-sonnet" || opts.VerifierEffort != "max" {
+			if opts.Gate != "auto" || !opts.Force || opts.WorkerModel != "gpt-5" || opts.WorkerEffort != "high" || opts.VerifierModel != "claude-sonnet" || opts.VerifierEffort != "max" {
 				t.Fatalf("init opts = %#v", opts)
 			}
 			return scaffold.Result{
@@ -1195,7 +1303,8 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 				Labels: []scaffold.LabelResult{
 					{Name: "delivery:unit", Status: scaffold.LabelCreated},
 				},
-				Warnings: []string{"gh label setup skipped: gh not found"},
+				LocalStateExclude: &scaffold.LocalStateResult{Path: filepath.Join(repo, ".git", "info", "exclude"), Status: gitlocal.ProtectUpdated},
+				Warnings:          []string{"gh label setup skipped: gh not found"},
 			}, nil
 		},
 	})
@@ -1205,7 +1314,7 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	if !called {
 		t.Fatal("Init dependency was not called")
 	}
-	for _, want := range []string{"loopcoder init complete", "overwritten .delivery.yml", "exists ROADMAP.md", "created label delivery:unit"} {
+	for _, want := range []string{"loopcoder init complete", "overwritten .delivery.yml", "exists ROADMAP.md", "created label delivery:unit", "local-state updated"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
 		}

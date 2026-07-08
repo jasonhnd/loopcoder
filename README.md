@@ -4,12 +4,12 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.6.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.6.1-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
 
-[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-05x-to-060) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-05x-to-061) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
@@ -19,7 +19,7 @@ loopcoder is an autonomous delivery loop. Describe what you want shipped in one 
 
 It removes the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. Set `adapters.gate: human-merge` when you want humans to choose production merges explicitly. Repo-facing artifacts and worker summaries are written in English.
 
-v0.6.0 adds role-scoped model/depth discovery, the Google Antigravity `agy` provider path, the reporter rename from the old attestation vocabulary, and the 0.5.x to 0.6.0 upgrade/doctor migration workflow.
+v0.6.1 is the customer-ready bridge for the public 0.6 line. It packages role-scoped model/depth discovery, the Google Antigravity `agy` provider path, reporter output, upgrade/migration compatibility, first-run `init --repo/--gate`, machine-readable `doctor`, local-state protection, and richer `report` records into the customer install target. The latest public release before this bridge was v0.5.4; customer install and upgrade commands should target v0.6.1, not a nonexistent public v0.6.0 release.
 
 ## The loop
 
@@ -51,49 +51,49 @@ loop  > done. 2 PRs promoted, 0 blocked.
 
 ## Install
 
-Install from GitHub Releases with the no-Go scripts:
+Install v0.6.1 from GitHub Releases with the no-Go scripts:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
 ```
 
 ```powershell
+$env:LOOPCODER_VERSION = "0.6.1"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
 Or install with Go:
 
 ```bash
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.6.1
 ```
 
 Then confirm the binary:
 
 ```bash
-loopcoder --version
-loopcoder doctor --repo .
+loopcoder version
 ```
 
-For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder --version` and `loopcoder doctor`, run `loopcoder init` in each repo, install the playbook and project conductor hooks with `loopcoder skill install --repo <repo>`, then drive `/loopcoder <your need>`.
+For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
 
-Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
+Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. The release install scripts verify signed `SHA256SUMS` before trusting checksums, using cosign on the script path. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
 
 Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell runtime. See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
-## Upgrade From 0.5.x To 0.6.0
+## Upgrade From 0.5.x To 0.6.1
 
-0.6.0 is the first breaking transition release because the live operator-facing reporting subsystem was renamed from attestation to reporter. Upgrade from 0.5.x with an explicit diagnose/fix/confirm flow:
+v0.6.1 is the public customer-ready bridge for the 0.6 line. Upgrade from v0.5.4 or older 0.5.x releases to v0.6.1, then refresh each project's hooks and local-state protection:
 
 ```text
-loopcoder upgrade --version 0.6.0
-loopcoder doctor --repo .
-loopcoder doctor --repo . --fix
+loopcoder upgrade --version 0.6.1
+loopcoder version
+loopcoder skill install --repo .
 loopcoder doctor --repo .
 ```
 
-`loopcoder upgrade` selects the 0.6.0 binary from GitHub Releases, verifies signed checksums, swaps the selected binary atomically or stages the Windows deferred replacement, and refreshes the bundled loopcoder skill. The first `doctor` run is read-only and safe anytime. `doctor --fix` is the opt-in local repair path for config-key migration, conductor hook command migration, hook state migration, local state key migration, and stale `.loopcoder/` cleanup. The final `doctor` run confirms whether legacy surfaces or cleanup-eligible state remain.
+`loopcoder upgrade --version 0.6.1` selects the machine-level binary from GitHub Releases, verifies signed checksums, swaps the selected binary atomically or stages the Windows deferred replacement, and refreshes the global bundled skill. Each project must still run `loopcoder skill install --repo <repo>` to write or refresh project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection for `.loopcoder/`. `loopcoder doctor --repo <repo>` is the read-only readiness check; `doctor --fix` remains the opt-in 0.5.x-to-0.6.x migration/cleanup mode, not a first-run requirement.
 
-Environment variables cannot be edited by loopcoder. If doctor reports old `LOOPCODER_CONDUCTOR_ATTEST_SCOPE` or `LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR`, move those shell settings to `LOOPCODER_CONDUCTOR_REPORTER_SCOPE` or `LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR` yourself and reopen the shell.
+Environment variables cannot be edited by loopcoder. If doctor reports old `LOOPCODER_CONDUCTOR_ATTEST_SCOPE` or `LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR`, move those shell settings to `LOOPCODER_CONDUCTOR_REPORTER_SCOPE` or `LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR` yourself and reopen the shell. Re-running `loopcoder upgrade --version 0.6.1` after selecting v0.6.1 should report that the selected binary is already latest.
 
 ## Usage
 
@@ -101,27 +101,47 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 - The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
 
 ```bash
+loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
+loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
+loopcoder doctor --repo . --format json       # machine-readable readiness report
 loopcoder doctor --repo . --fix               # explicit local repair/cleanup mode
-loopcoder upgrade --version 0.6.0             # signed self-upgrade from GitHub Releases
+loopcoder init --repo .                       # scaffold first-run repo files with human-merge gate
+loopcoder init --repo . --gate auto           # explicitly opt into automatic production promotion
+loopcoder skill install --repo .              # install global skill and project hooks
+loopcoder discover --repo .                   # advanced: discover CI failures and file issues
+loopcoder compile --repo .                    # advanced: compile ROADMAP.md into issues
 loopcoder ready-set     --repo .              # classify ready vs blocked work
+loopcoder tick          --repo .              # run one unattended delivery pass
+loopcoder trigger goal-loop --repo .          # advanced: run an automation trigger
+loopcoder promote      --repo .               # may change production branch when gates pass
+loopcoder upgrade --version 0.6.1             # signed self-upgrade from GitHub Releases
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
+loopcoder relay list    --repo .              # inspect pending local relay blocks
+loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
 loopcoder report        --repo .              # list recent local reporter records
-loopcoder relay list    --repo .              # inspect pending local relay blocks
-loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
+loopcoder report --repo . --format json       # list reports plus records/source/run/path context
+loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
+loopcoder state pull    --repo .              # pull state branch summaries
+loopcoder lease acquire --repo . --run-id <id> # acquire conductor lease
+loopcoder lease release --repo . --run-id <id> # release conductor lease
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>
 loopcoder loopreview    --repo . --pr-number 43 --provider claude --strict
 loopcoder verify-local  --repo . --pr-number 43
-loopcoder audit         --repo . --layer sast
+loopcoder dispatch-wave --repo . --issue-numbers 41,42
+loopcoder hook conductor-reporter             # internal: host hook integration
+loopcoder ps --repo .                         # list loopcoder-managed worker processes
+loopcoder kill --repo . --run <run-id>        # terminate loopcoder-managed processes for one run
+loopcoder kill --repo . --all                 # terminate all loopcoder-managed processes for this repo
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
-`dispatch` and `loopreview` emit local-only human-readable pretty report blocks to stderr by default, while foreground `dispatch-wave` streams each Worker pretty block to stdout as that Worker completes and still prints the aggregate wave report. The durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a one-version compatibility alias for direct Conductor self-reports.
+`dispatch` and `loopreview` emit local-only human-readable pretty report blocks to stderr by default, while foreground `dispatch-wave` streams each Worker pretty block to stdout as that Worker completes and still prints the aggregate wave report. The durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
 
 ### Model And Depth
 
@@ -174,7 +194,7 @@ The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity W
 
 ### Doctor And Migration
 
-`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, Worker and Verifier provider CLIs, provider auth probes where stable, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, migration status, and stale local state counts.
+`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, Worker and Verifier provider CLIs, provider auth probes where stable, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, and ordered `checks[]` objects with `name`, `status`, `hard`, `message`, and `fix_command`.
 
 `loopcoder doctor --repo . --fix` performs only the 0.6.0 local repair actions: migrate legacy `.delivery.yml attestation` keys to `report`, refresh conductor hook settings to `loopcoder hook conductor-reporter`, move legacy hook state from `conductor-attest` to `conductor-reporter`, rewrite eligible local state keys from `attestation` to `report`, and prune cleanup-eligible gitignored `.loopcoder/` state. It does not install provider CLIs, run provider login, flush pending relay records, edit tracked docs, choose models, commit, push, or mutate GitHub.
 
@@ -184,7 +204,7 @@ The stale-state cleanup policy retains active runs, recent runs, the newest reta
 
 Worker, Verifier, audit, and Conductor invocations now produce validated local-only reports with `[reporter]` headers and result JSON `report` objects. Reports cover role, provider, model, model source, effort/depth, permission, action, exit code, timing, token usage when available, and verification status. Pretty output groups the same data for humans; machine consumers should parse stable headers, canonical JSON, or the nested `report` object.
 
-During the 0.6.0 transition, readers accept legacy `[attestation]` headers, legacy result JSON `attestation` objects, the old `loopcoder hook conductor-attest` command, old `.delivery.yml attestation` keys, and old `LOOPCODER_CONDUCTOR_ATTEST_*` env vars. New output and writes use `[reporter]`, `report`, `report.channel`, `conductor-reporter`, and `LOOPCODER_CONDUCTOR_REPORTER_*`. Frozen local machinery stays frozen: `.loopcoder/relay/*.attest` keeps its extension and canonical report JSON field names are unchanged.
+During the 0.6.x transition window, readers accept legacy `[attestation]` headers, legacy result JSON `attestation` objects, the old `loopcoder hook conductor-attest` command, old `.delivery.yml attestation` keys, and old `LOOPCODER_CONDUCTOR_ATTEST_*` env vars. New output and writes use `[reporter]`, `report`, `report.channel`, `conductor-reporter`, and `LOOPCODER_CONDUCTOR_REPORTER_*`. Frozen local machinery stays frozen: `.loopcoder/relay/*.attest` keeps its extension and canonical report JSON field names are unchanged.
 
 `loopcoder hook conductor-reporter` enforces the local Conductor self-report step before a delivery or merge turn can finish. `loopcoder hook conductor-relay-guard` prevents hidden Worker and Verifier report blocks from completing a turn. The relay hard gate blocks mechanical progress with exit code `4` while pending Worker/Verifier blocks are unacknowledged; `loopcoder relay flush --repo .` prints and clears them, and `loopcoder relay list --repo .` inspects them.
 
@@ -218,7 +238,7 @@ During the 0.6.0 transition, readers accept legacy `[attestation]` headers, lega
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net.
 - Audit -- `loopcoder audit` provides a read-only security audit with a deterministic SAST floor for CI and an optional read-only LLM review lens for local adversarial analysis. See [`docs/reference/audit.md`](docs/reference/audit.md).
 - Reporter -- worker and verifier invocations produce validated local-only reports. PR bodies, merge commits, and merge comments do not carry `[reporter]` headers or canonical JSON.
-- Doctor and upgrade -- 0.6.0 has a defined 0.5.x upgrade, migration status report, explicit `doctor --fix` repair mode, and stale local state retention policy.
+- Doctor and upgrade -- 0.6.1 has a defined 0.5.x upgrade path, migration status report, explicit `doctor --fix` repair mode, `doctor --format json`, local-state protection checks, and stale local state retention policy.
 - Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 
 ## Design
@@ -242,7 +262,7 @@ During the 0.6.0 transition, readers accept legacy `[attestation]` headers, lega
 
 ## Status
 
-v0.6.0 is the current cross-platform native Go CLI and the first breaking transition release. It adds the static model/depth registry, role-scoped model validation, the Antigravity `agy` Worker provider, reporter terminology for new live output, one-release compatibility with legacy attestation tokens and keys, signed self-upgrade migration reporting, expanded `doctor`, explicit `doctor --fix`, and stale local state retention. The repository remains self-hosted with `gate: human-merge` for loopcoder-core safety; consumer projects can use the default auto production gate or opt out with `human-merge`.
+v0.6.1 is the current customer-ready bridge release for the public 0.6 line. It adds the 0.6 capabilities plus first-run repo safety: `init --repo/--gate` defaults new scaffolds to `human-merge`, `init` and `skill install` protect `.loopcoder/` through local `.git/info/exclude`, `doctor --format json` exposes machine-readable checks, and `report --format json` includes both `reports` and `records` with source/run/path context. The repository remains self-hosted with `gate: human-merge` for loopcoder-core safety; consumer projects can opt into automatic production promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
 
 ## License
 

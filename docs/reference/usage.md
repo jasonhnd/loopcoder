@@ -12,69 +12,108 @@ GitHub, git worktrees, worker providers, and PR review.
 
 Use this flow to onboard an existing repository from zero to a driven
 loopcoder loop. One installed binary can serve many local repositories; each
-repository keeps its own `.delivery.yml` and loopcoder run state.
+repository keeps its own `.delivery.yml` and repo-local `.loopcoder/` run
+state.
 
 Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
 push access.
 
-1. Install the binary once per machine, shared across all local projects.
+1. Install the v0.6.1 binary once per machine, shared across all local
+   projects.
 
    Unix-like systems:
 
    ```text
-   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
    ```
 
    Windows PowerShell:
 
    ```text
+   $env:LOOPCODER_VERSION = "0.6.1"
    irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
    ```
 
    The installer puts `loopcoder` under `~/.loopcoder/bin`. Keep that directory
    on `PATH`, or set `LOOPCODER_BIN` to the full binary path.
 
-2. Verify the install and global environment.
+2. Verify the selected binary.
 
    ```text
-   loopcoder --version
-   loopcoder doctor
+   loopcoder version
    ```
 
-3. Install the conductor playbook once per agent home and wire project
-   conductor hooks into the repository's Claude Code settings.
-
-   ```text
-   loopcoder skill install --repo <repo>
-   ```
-
-   This writes the bundled `SKILL.md` plus the Codex `AGENTS.md` entrypoint to
-   the Claude Code loopcoder skill directory and merges the loopcoder conductor
-   hooks into `<repo>/.claude/settings.json`.
-
-4. Initialize each consumer repository.
+3. Initialize the consumer repository from the repository root.
 
    ```text
    cd <repo>
-   loopcoder init
-   loopcoder doctor
+   loopcoder init --repo .
    ```
 
-   `loopcoder init` scaffolds `.delivery.yml`, `ROADMAP.md`, and the GitHub
-   labels loopcoder uses. The follow-up `loopcoder doctor` confirms `git`, `gh`
-   auth, provider CLIs, `origin`, the default branch, and project conductor
-   hook settings for that repository.
+   `loopcoder init --repo .` scaffolds `.delivery.yml`, `ROADMAP.md`, GitHub
+   labels, and local `.git/info/exclude` protection for `.loopcoder/`. New
+   scaffolds default to `adapters.gate: human-merge`; pass `--gate auto` only
+   when the project should opt into automatic production promotion.
 
-5. Drive the loop from a conductor session in the repository.
+4. Install the conductor playbook once per agent home and wire project
+   conductor hooks into this repository.
+
+   ```text
+   loopcoder skill install --repo .
+   ```
+
+   This writes the bundled `SKILL.md` plus the Codex `AGENTS.md` entrypoint to
+   the Claude Code loopcoder skill directory, merges loopcoder conductor hooks
+   into `.claude/settings.json`, writes `.loopcoder/conductor-workspace`, and
+   ensures local `.git/info/exclude` protects `.loopcoder/`.
+
+5. Diagnose the repository without mutating it.
+
+   ```text
+   loopcoder doctor --repo .
+   ```
+
+6. Confirm local report querying works. A fresh repository may have no reports
+   yet; the command is still read-only and should render a valid empty report
+   list.
+
+   ```text
+   loopcoder report --repo .
+   ```
+
+7. Drive the loop from a conductor session in the repository.
 
    ```text
    /loopcoder <your need>
    ```
 
    The conductor plans the work, dispatches workers, runs `loopreview`, and
-   reports promotion status. Production promotion is automatic by default when
-   the gate passes; set `adapters.gate: human-merge` to opt out.
+   reports promotion status. New v0.6.1 scaffolds use `human-merge`; projects
+   can opt into automatic production promotion with `loopcoder init --repo .
+   --gate auto` or an explicit config edit.
+
+Command side effects in the first-run path:
+
+| Command | Side effects |
+| --- | --- |
+| `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
+| `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
+| `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
+| `loopcoder report --repo .` | Read-only local report query. |
+| `loopcoder status --repo .` | Read-only local run status. |
+| `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
+| `loopcoder promote --repo .` | May change the configured production branch, subject to `adapters.gate` and the human command that invokes promotion. |
+
+`.loopcoder/` is repo-local machine state. It is intentionally used for run
+state, relay ledgers, recovery, status, and report queries, but it must not be
+committed to normal business branches. `init` and `skill install --repo`
+protect it with local `.git/info/exclude`; `loopcoder state push` is the
+explicit publishing path for state summaries. A machine can serve many
+projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
+the machine-level binary and bundled skill live under the user's machine-level
+loopcoder/agent directories. v0.6.1 introduces no SQLite database or global
+project registry.
 
 ## Prerequisites
 
@@ -87,54 +126,48 @@ push access.
   The older direct `gemini` worker adapter remains experimental and is not part
   of the static model registry.
 - A GitHub repository with a configured remote.
-- For the no-Go installer: `curl`, `tar`, and `sha256sum` or `shasum` on
-  Unix-like systems, or PowerShell on Windows. Go is optional for developer
-  installs and local source builds.
+- For the no-Go installer: `curl`, `tar`, `cosign`, and `sha256sum` or
+  `shasum` on Unix-like systems, or PowerShell and cosign on Windows. The
+  install scripts verify signed `SHA256SUMS` before trusting checksums. Go is
+  optional for developer installs and local source builds.
 
 ## Install
 
 The supported consumer distribution is GitHub Releases. Tagged releases publish
-Windows, macOS, and Linux archives for `amd64` and `arm64`, plus `SHA256SUMS`.
-The install scripts select the matching release asset, verify it against
-`SHA256SUMS`, install under `~/.loopcoder/bin`, and update or print PATH
-instructions. The scripts do not require Go.
+Windows, macOS, and Linux archives for `amd64` and `arm64`, plus `SHA256SUMS`
+and signature material. The install scripts select the matching release asset,
+verify the `SHA256SUMS` signature with cosign before trusting checksums, install
+under `~/.loopcoder/bin`, and update or print PATH instructions. The scripts
+do not require Go.
 
 On Unix-like systems:
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
 ```
 
-To pin a version:
-
-```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.7
-```
+To choose a different release, replace `0.6.1` with the desired version.
 
 On Windows PowerShell:
 
 ```text
+$env:LOOPCODER_VERSION = "0.6.1"
 irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
 ```
 
-To pin a version on Windows:
+To choose a different release on Windows, set `LOOPCODER_VERSION` to the
+desired version before invoking the installer.
+
+After installation, confirm the selected binary:
 
 ```text
-$env:LOOPCODER_VERSION = "0.3.7"
-irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
-```
-
-After installation, confirm the selected binary and environment:
-
-```text
-loopcoder --version
-loopcoder doctor
+loopcoder version
 ```
 
 `go install` remains available for users who already have Go:
 
 ```text
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@latest
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.6.1
 ```
 
 From a source checkout, you can also build a development binary locally:
@@ -176,8 +209,10 @@ directory and need no Node dependency; the merge upgrades any stale
 `node hooks/*.js` entries idempotently. The merge is project-scoped and
 preserves unrelated settings and hooks, and writes a gitignored
 `.loopcoder/conductor-workspace` marker that activates auto-enforcement in the
-installed repo. `loopcoder doctor --repo <project>` warns when either conductor
-hook command is missing or when `loopcoder` does not resolve on `PATH`.
+installed repo. It also ensures local `.git/info/exclude` protects
+`.loopcoder/` so repo-local machine state is not accidentally committed.
+`loopcoder doctor --repo <project>` warns when either conductor hook command is
+missing or when `loopcoder` does not resolve on `PATH`.
 
 `loopcoder hook conductor-reporter` enforces the local Conductor self-report
 step before a delivery or merge turn can finish. The old
@@ -212,20 +247,30 @@ docs, examples, fixtures, or tracked files.
 
 ## Repository Initialization
 
-Run `loopcoder init` from a repository root to scaffold the local loopcoder
-starting point:
+Run `loopcoder init --repo <path>` to scaffold the local loopcoder starting
+point:
 
 ```text
-loopcoder init
+loopcoder init --repo .
 ```
 
 `init` creates `.delivery.yml` and `ROADMAP.md` when they are absent and
-ensures the default GitHub labels used by loopcoder are present. Existing
+ensures the default GitHub labels used by loopcoder are present. It also
+protects `.loopcoder/` in local `.git/info/exclude`; it does not modify tracked
+`.gitignore` and does not untrack already tracked files. Existing
 `.delivery.yml` and `ROADMAP.md` files are left untouched by default; use
 `--force` to overwrite those two files with the current scaffold:
 
 ```text
-loopcoder init --force
+loopcoder init --repo . --force
+```
+
+New scaffolds default to `adapters.gate: human-merge` so humans choose
+production promotion. To opt into automatic production promotion in a new
+scaffold, pass:
+
+```text
+loopcoder init --repo . --gate auto
 ```
 
 Label setup is best-effort through `gh label list` and `gh label create`. If
@@ -236,7 +281,7 @@ The model and reasoning-effort flags are first-run persistence helpers. Use
 them only when you want the generated `.delivery.yml` to pin project defaults:
 
 ```text
-loopcoder init \
+loopcoder init --repo . \
   --worker-model gpt-5.5 \
   --worker-effort high \
   --verifier-model claude-haiku-4-5-20251001 \
@@ -251,11 +296,14 @@ back to config unless you explicitly persist a preference.
 ## Per-Repo Setup
 
 Use `loopcoder init` or manually add a `.delivery.yml` file at the repository
-root. If it is absent, loopcoder uses the current defaults: GitHub issues, git
+root. If it is absent at runtime, loopcoder uses the current defaults: GitHub issues, git
 worktrees, the Codex worker adapter, GitHub PRs/checks/merges, independent
 `loopreview` verification, pre-prod-only auto-integration for clean `tick` PRs,
-default `auto` production promotion, and chat reporting. Use `gate:
-human-merge` when a project needs humans to choose production merges explicitly.
+default `auto` production promotion, and chat reporting. v0.6.1 changes only
+the generated scaffold default: `loopcoder init --repo .` writes `gate:
+human-merge`, while `loopcoder init --repo . --gate auto` writes `gate: auto`.
+Existing gate-less configs still normalize as before and are not silently
+migrated.
 
 The current example is:
 
@@ -268,7 +316,7 @@ adapters:
   worker: codex           # Default worker provider.
   vcs: github             # GitHub hosts PRs and checks.
   verifier: claude        # Should differ from worker; provider registry key.
-  gate: auto              # Default-on production promotion; set human-merge to opt out so humans choose what merges.
+  gate: human-merge       # First-run safe default; pass init --gate auto to opt into automatic production promotion.
 worker:
   # Optional. Absent = static registry default model for the resolved worker provider.
   # model:
@@ -333,8 +381,8 @@ For compatibility signals such as `min_loopcoder_version`, see
 
 ## End-To-End Use
 
-1. In a new repository, run `loopcoder init` once, or add `.delivery.yml`
-   manually.
+1. In a new repository, run `loopcoder init --repo .` once, or add
+   `.delivery.yml` manually.
 
 2. State a delivery need, for example:
 
@@ -398,6 +446,8 @@ loopcoder version=<version> commit=<commit> date=<build-date> go=<go-version> pl
 
 ```text
 loopcoder doctor --repo .
+loopcoder doctor --repo . --format text
+loopcoder doctor --repo . --format json
 ```
 
 It reports `[ok]`, `[warn]`, or `[fail]` checks for:
@@ -415,6 +465,10 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   commands, required tool availability, parser recognition, rubric and
   baseline files, required `audit` CI check wiring, and Layer 2 verifier
   provider resolution;
+- local-state protection: whether `.git/info/exclude` protects `.loopcoder/`,
+  whether `.loopcoder/` files are already tracked, and the exact safe fix
+  command when local state is tracked;
+- reportquery readability for local report/run/relay records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -425,6 +479,27 @@ Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
 does not invent provider-authentication status when the provider has no stable
 probe.
+
+`doctor --format json` emits a stable support surface:
+
+```json
+{
+  "repo_path": "/absolute/repo",
+  "version": "0.6.1",
+  "commit": "abc123",
+  "date": "2026-07-08T00:00:00Z",
+  "exit_code": 0,
+  "checks": [
+    {
+      "name": "local-state exclude",
+      "status": "ok",
+      "hard": false,
+      "message": ".loopcoder/ is protected by .git/info/exclude",
+      "fix_command": ""
+    }
+  ]
+}
+```
 
 ## Security Audit
 
@@ -563,6 +638,7 @@ loopcoder --version
 loopcoder -v
 
 loopcoder doctor --repo .
+loopcoder doctor --repo . --format json
 
 loopcoder models
 loopcoder models --provider antigravity
@@ -572,10 +648,14 @@ loopcoder audit --repo . --layer all --provider claude --strict
 
 loopcoder skill install --repo .
 
-loopcoder init
-loopcoder init --force
-loopcoder init --worker-model <model> --worker-effort <effort>
-loopcoder init --verifier-model <model> --verifier-effort <effort>
+loopcoder init --repo .
+loopcoder init --repo . --force
+loopcoder init --repo . --gate auto
+loopcoder init --repo . --worker-model <model> --worker-effort <effort>
+loopcoder init --repo . --verifier-model <model> --verifier-effort <effort>
+
+loopcoder discover --repo .
+loopcoder compile --repo .
 
 loopcoder ready-set --repo . --base-branch main --format text
 
@@ -599,9 +679,12 @@ loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --
 
 loopcoder tick --repo . --strict
 loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
+loopcoder promote --repo .
 
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
+loopcoder report --repo .
+loopcoder report --repo . --format json
 
 loopcoder relay list --repo .
 loopcoder relay flush --repo .
@@ -643,7 +726,21 @@ loopcoder state push --repo . --run-id <run-id>
 loopcoder state pull --repo .
 loopcoder lease acquire --repo . --run-id <run-id>
 loopcoder lease release --repo . --run-id <run-id>
+
+loopcoder upgrade --version 0.6.1
+
+loopcoder hook conductor-reporter
+loopcoder hook conductor-relay-guard
+loopcoder ps --repo .
+loopcoder kill --repo . --run <run-id>
+loopcoder kill --repo . --all
 ```
+
+`hook` is for host hook integration rather than normal customer workflow.
+`discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
+advanced/operator commands. `state push` is the explicit state-branch publish
+path; `kill` only targets loopcoder-managed processes for a run or repository
+and should not be used as a bare process-name terminator.
 
 ## Exit Codes
 
@@ -714,6 +811,56 @@ gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
+`loopcoder report` is the read-only query surface for those local records:
+
+```text
+loopcoder report --repo .
+loopcoder report --repo . --work-id <run-id>
+loopcoder report --repo . --issue 218
+loopcoder report --repo . --role worker
+loopcoder report --repo . --format json
+```
+
+Text output includes enough local context to locate the record:
+
+```text
+REPORTS
+- work_id: run-218
+  source: attempt
+  run_id: run-218
+  path: .loopcoder/runs/run-218/workers/job-218-1.attempt.json
+  role: worker
+  provider: codex
+  model: gpt-5.5 (xhigh)
+```
+
+JSON output keeps the compatibility `reports` array and adds `records` with
+source/run/path context:
+
+```json
+{
+  "reports": [
+    {
+      "role": "worker",
+      "provider": "codex",
+      "model": "gpt-5.5"
+    }
+  ],
+  "records": [
+    {
+      "report": {
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5"
+      },
+      "source": "attempt",
+      "run_id": "run-218",
+      "path": ".loopcoder/runs/run-218/workers/job-218-1.attempt.json"
+    }
+  ]
+}
+```
+
 For every successful `loopcoder dispatch`, stdout contains three
 newline-terminated records in this order:
 
@@ -733,7 +880,7 @@ Example:
 The final non-empty stdout line remains the dispatch result JSON. Consumers
 that need only the summary should parse the last line; conductors that need
 Worker reports can read either the local header or the nested `report` object.
-During the 0.6.0 transition, readers accept legacy `[attestation]` headers and
+During the 0.6.x transition window, readers accept legacy `[attestation]` headers and
 nested `attestation` objects from prior output, but newly emitted output uses
 `[reporter]` and `report` per
 [`../specs/0567-reporter.md`](../specs/0567-reporter.md). The canonical JSON
@@ -746,15 +893,15 @@ streams one Worker pretty block per dispatched issue to stdout as that Worker
 completes, before the final aggregate wave report. The default block uses emoji
 on an interactive TTY and plain ASCII on a non-TTY.
 
-The pretty block displays the provider vendor (`OpenAI`, `Anthropic`,
-`Google`, or `Google Antigravity`) plus a separate `tool` line with the
-provider key (`codex`, `claude`, `gemini`, or `antigravity`). It renders parsed
-model sources as `(detected)` and self-reported sources as `(self-reported)`,
-displays `started` and `ended` in the host local timezone to whole seconds,
-reports duration as human seconds plus total seconds, and groups token counts
-with thousands separators. When input and output tokens are present without a
-total, the pretty display derives `total=<input+output>` for display only;
-canonical JSON and the stable `[reporter]` header are unchanged.
+The pretty block displays provider vendor and provider key on one combined
+line, such as `OpenAI Codex / codex`, `Anthropic / claude`, or
+`Google Antigravity / antigravity`. It renders parsed model sources as
+`(parsed)` and self-reported sources as `(self-reported)`, displays `started`
+and `ended` in the host local timezone to whole seconds, reports duration as
+human seconds plus total seconds, and groups token counts with thousands
+separators. When input and output tokens are present without a total, the
+pretty display derives `total=<input+output>` for display only; canonical JSON
+and the stable `[reporter]` header are unchanged.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
@@ -799,19 +946,24 @@ emoji is forced, and emoji is not disabled:
 
 ```text
 ✅ report verified
+who
    role        worker
-   provider    OpenAI
-   tool        codex
-   model       gpt-5.5 (detected)
-   effort      xhigh
+   provider    OpenAI Codex / codex
+   model       gpt-5.5 (xhigh) (parsed)
    permission  write
+what
+   work_id     run-218
+   issue       #218
+   branch      loop/issue-218
    action      "implement issue #218"
+result
    exit        0
+   duration    7m53.9s (473.9 s)
    started     2026-06-30 14:25:21 JST
    ended       2026-06-30 14:33:15 JST
-   duration    7m53.9s (473.9 s)
-   tokens      total=165,268
    verified    true
+cost
+   tokens      total=165,268
 ```
 
 Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
@@ -819,19 +971,21 @@ Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
 
 ```text
 report: verified
+who
   role        verifier
-  provider    Anthropic
-  tool        claude
-  model       claude-opus-4-8[1m] (detected)
-  effort      max
+  provider    Anthropic / claude
+  model       claude-opus-4-8[1m] (max) (parsed)
   permission  read-only
+what
   action      "review PR #295"
+result
   exit        0
+  duration    2m7.0s (127.0 s)
   started     2026-06-30 14:33:51 JST
   ended       2026-06-30 14:35:58 JST
-  duration    2m7.0s (127.0 s)
-  tokens      input=2,447  output=9,844  total=12,291
   verified    true
+cost
+  tokens      input=2,447  output=9,844  total=12,291
 ```
 
 Design rationale: [`../specs/0567-reporter.md`](../specs/0567-reporter.md),

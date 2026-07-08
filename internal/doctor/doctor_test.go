@@ -3,6 +3,7 @@ package doctor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -35,6 +36,8 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	for _, name := range []string{
 		"git",
 		"gh",
+		"local-state exclude",
+		"tracked .loopcoder",
 		".delivery.yml",
 		"model selection",
 		"provider codex",
@@ -53,6 +56,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"audit llm provider",
 		"loopcoder skill",
 		"conductor hooks",
+		"report query",
 		"migration status",
 		"stale local state",
 		"conductor runtime",
@@ -67,6 +71,139 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+}
+
+func TestRunChecksLocalStateExcludeProtection(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*fakeDoctorEnv)
+		want       Status
+		wantFix    string
+		wantSubstr string
+	}{
+		{
+			name:       "protected",
+			want:       StatusOK,
+			wantSubstr: "is protected by",
+		},
+		{
+			name: "missing exclude",
+			setup: func(env *fakeDoctorEnv) {
+				delete(env.files, filepath.Clean(filepath.Join("/repo", ".git", "info", "exclude")))
+			},
+			want:       StatusWarn,
+			wantFix:    "loopcoder skill install --repo .",
+			wantSubstr: "does not exist",
+		},
+		{
+			name: "not excluded",
+			setup: func(env *fakeDoctorEnv) {
+				env.files[filepath.Clean(filepath.Join("/repo", ".git", "info", "exclude"))] = []byte("# other\n")
+			},
+			want:       StatusWarn,
+			wantFix:    "loopcoder skill install --repo .",
+			wantSubstr: "is not protected",
+		},
+		{
+			name: "not a git repository",
+			setup: func(env *fakeDoctorEnv) {
+				env.commands[cmdKey("git", "rev-parse", "--is-inside-work-tree")] = CommandResult{
+					Stderr:   "not a git repository",
+					ExitCode: 128,
+				}
+			},
+			want:       StatusWarn,
+			wantSubstr: "could not resolve",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := healthyDoctorEnv()
+			if tt.setup != nil {
+				tt.setup(env)
+			}
+
+			report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+			check := requireCheck(t, report, "local-state exclude")
+			if check.Status != tt.want {
+				t.Fatalf("status = %s, want %s (%s)", check.Status, tt.want, check.Message)
+			}
+			if check.FixCommand != tt.wantFix {
+				t.Fatalf("FixCommand = %q, want %q", check.FixCommand, tt.wantFix)
+			}
+			if !strings.Contains(check.Message, tt.wantSubstr) {
+				t.Fatalf("message = %q, want containing %q", check.Message, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestRunHardFailsForTrackedLoopcoderState(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.commands[cmdKey("git", "ls-files", ".loopcoder")] = CommandResult{
+		Stdout: ".loopcoder/runs/run-1/workers/worker.attempt.json\n",
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "tracked .loopcoder")
+	const wantFix = "git rm -r --cached .loopcoder && echo .loopcoder/ >> .git/info/exclude"
+	if check.Status != StatusFail || !check.Hard {
+		t.Fatalf("check = %#v, want hard fail", check)
+	}
+	if check.FixCommand != wantFix {
+		t.Fatalf("FixCommand = %q, want %q", check.FixCommand, wantFix)
+	}
+	if !strings.Contains(check.Message, wantFix) {
+		t.Fatalf("message = %q, want fix command", check.Message)
+	}
+}
+
+func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
+	report := WithMetadata(Report{Checks: []Check{
+		{Name: "local-state exclude", Status: StatusWarn, Message: "missing", FixCommand: "loopcoder skill install --repo ."},
+		{Name: "tracked .loopcoder", Status: StatusFail, Message: "tracked", Hard: true, FixCommand: "git rm -r --cached .loopcoder && echo .loopcoder/ >> .git/info/exclude"},
+	}}, "/repo", BuildInfo{Version: "0.6.1", Commit: "abc123", Date: "2026-07-08T00:00:00Z"})
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		RepoPath string `json:"repo_path"`
+		Version  string `json:"version"`
+		Commit   string `json:"commit"`
+		Date     string `json:"date"`
+		ExitCode int    `json:"exit_code"`
+		Checks   []struct {
+			Name       string `json:"name"`
+			Status     Status `json:"status"`
+			Hard       bool   `json:"hard"`
+			Message    string `json:"message"`
+			FixCommand string `json:"fix_command"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.RepoPath != "/repo" || payload.Version != "0.6.1" || payload.Commit != "abc123" || payload.Date != "2026-07-08T00:00:00Z" {
+		t.Fatalf("metadata = %#v", payload)
+	}
+	if payload.ExitCode != 1 {
+		t.Fatalf("exit_code = %d, want 1", payload.ExitCode)
+	}
+	if len(payload.Checks) != 2 {
+		t.Fatalf("checks len = %d, want 2", len(payload.Checks))
+	}
+	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
+		t.Fatalf("tracked check = %#v", payload.Checks[1])
 	}
 }
 
@@ -874,7 +1011,7 @@ func TestExecRunCommandTimesOut(t *testing.T) {
 	withTestCommandCap(t, 50*time.Millisecond)
 
 	start := time.Now()
-	_, err := execRunCommand(context.Background(), "", os.Args[0], "-test.run=TestDoctorExecHelper", "--", "sleep", "5s")
+	_, err := execRunCommand(context.Background(), "", os.Args[0], "-test.run=TestDoctorExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("execRunCommand error = nil, want timeout")
 	}
@@ -973,6 +1110,13 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			cmdKey("git", "remote", "show", "origin"): {
 				Stdout: "* remote origin\n  HEAD branch: trunk\n",
 			},
+			cmdKey("git", "rev-parse", "--is-inside-work-tree"): {
+				Stdout: "true\n",
+			},
+			cmdKey("git", "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"): {
+				Stdout: filepath.Join(".git", "info", "exclude") + "\n",
+			},
+			cmdKey("git", "ls-files", ".loopcoder"): {},
 		},
 		cfg: config.Config{
 			Version: 1,
@@ -1012,6 +1156,7 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			filepath.Clean(filepath.Join("/repo", ".github", "workflows", "ci.yml")):         []byte("jobs:\n  audit:\n    runs-on: ubuntu-latest\n"),
 			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-rubric.md")):    []byte("# Audit Rubric\n"),
 			filepath.Clean(filepath.Join("/repo", "docs", "security", "audit-baseline.yml")): []byte("version: 1\nwaivers: []\n"),
+			filepath.Clean(filepath.Join("/repo", ".git", "info", "exclude")):                []byte("# loopcoder local state\n.loopcoder/\n"),
 		},
 	}
 }
@@ -1098,6 +1243,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 		}
 		if data, ok := f.files[clean]; ok {
 			return append([]byte(nil), data...), nil
+		}
+		if clean == filepath.Clean(filepath.Join("/repo", ".git", "info", "exclude")) {
+			return nil, os.ErrNotExist
 		}
 		if f.fileErr != nil {
 			return nil, f.fileErr

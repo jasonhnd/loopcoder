@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-07-08
+
+0.6.1 is the customer-ready bridge for the public 0.6 line. The latest public
+release before this bridge was v0.5.4; customer install and upgrade commands
+target v0.6.1 rather than a nonexistent public v0.6.0 release. It packages the
+0.6 model/depth, Antigravity, reporter, doctor, upgrade, local-state, report,
+state, lease, and process-management work into an operable first-run flow.
+
+### Added
+
+- **First-run repository safety** - `loopcoder init --repo <path>` scaffolds a
+  repository from any working directory, supports `--gate human-merge|auto`,
+  defaults new scaffolds to `adapters.gate: human-merge`, and protects
+  `.loopcoder/` through local `.git/info/exclude`.
+- **Project hook local-state protection** - `loopcoder skill install --repo
+  <repo>` refreshes the global bundled skill, project hook settings,
+  `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection.
+- **Machine-readable doctor** - `loopcoder doctor --format text|json` keeps
+  text output while adding JSON with `repo_path`, build metadata, `exit_code`,
+  and ordered checks with `name`, `status`, `hard`, `message`, and
+  `fix_command`.
+- **Local-state and reportquery diagnostics** - doctor reports whether
+  `.loopcoder/` is excluded, whether local state is already tracked, whether
+  reportquery can read local records, whether the managed skill is fresh, and
+  whether project conductor hooks are installed.
+- **Richer report JSON** - `loopcoder report --format json` keeps the
+  compatibility `reports` array and adds `records[]` entries containing the
+  report plus source, run id, and local path context.
+- **Customer release note source** - `.github/release-notes/v0.6.1.md` is the
+  public release-note body for the bridge release.
+
+### Changed
+
+- **Release-facing documentation truth** - README, usage docs, stability
+  policy, roadmap, and release notes now consistently describe v0.6.1 as the
+  current customer install target for the 0.6 line.
+- **Customer quickstart** - the first-run flow is now install, `loopcoder
+  version`, `loopcoder init --repo .`, `loopcoder skill install --repo .`,
+  `loopcoder doctor --repo .`, `loopcoder report --repo .`, then
+  dispatch/tick/loopreview through the conductor workflow.
+- **Command inventory coverage** - README and usage command lists now cover
+  every command registered by `internal/cli.Commands()`, including `report`,
+  `state`, `lease`, `ps`, and `kill`, with internal or advanced commands
+  labeled.
+- **Pretty-output docs** - reference docs now match the current pretty renderer,
+  where the provider line combines vendor and provider key, such as
+  `OpenAI Codex / codex`.
+
+### Upgrade
+
+Upgrade from v0.5.4 or older 0.5.x releases with:
+
+```text
+loopcoder upgrade --version 0.6.1
+loopcoder version
+loopcoder skill install --repo .
+loopcoder doctor --repo .
+```
+
+`loopcoder upgrade --version 0.6.1` selects the machine-level binary, verifies
+signed checksums, and refreshes the global bundled skill. Each project still
+needs `loopcoder skill install --repo <repo>` to refresh project hooks and local
+`.loopcoder/` exclude protection, followed by `loopcoder doctor --repo <repo>`
+to confirm readiness. A second upgrade to v0.6.1 should report that the
+selected binary is already latest.
+
+### Notes
+
+- `.loopcoder/` remains repo-local machine state. It is protected through local
+  `.git/info/exclude` and must not be committed to normal business branches;
+  `loopcoder state push` is the explicit state-branch publishing path.
+- v0.6.1 introduces no SQLite database, global project registry, project alias
+  map, or native sub-agent scheduler.
+- The 0.5.x to 0.6.x reporter compatibility window remains intact: legacy
+  inputs and aliases are still accepted, while new output and new docs use
+  reporter terminology.
+
 ## [0.6.0] - 2026-07-08
 
 0.6.0 is loopcoder's first breaking transition release. It completes three related units: model/depth discovery and validation, the live operator-facing rename from attestation to reporter, and the 0.5.x to 0.6.0 upgrade/migration/doctor path. The release keeps old local machine contracts readable for one transition window while making new output, docs, hooks, and config use the reporter vocabulary.

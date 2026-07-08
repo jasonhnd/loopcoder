@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 )
 
 func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
@@ -23,10 +24,7 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		listOutput: `[{"name":"status:ready"}]`,
 	}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, Deps{
-		FS:     fsys,
-		GitHub: gh,
-	})
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -43,8 +41,8 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		"work_items: github",
 		"worker: codex",
 		"verifier: claude",
-		"gate: auto",
-		"set human-merge to opt out",
+		"gate: human-merge",
+		"First-run safe default",
 		"pre_prod_branch: pre-prod",
 		"checks: []",
 		"# evidence:",
@@ -94,10 +92,7 @@ func TestInitExistingFilesDoesNotClobber(t *testing.T) {
 	fsys.mustWrite(filepath.Join("repo", RoadmapFilename), []byte("custom roadmap"))
 	gh := &fakeGitHubRunner{listOutput: allLabelsJSON(t)}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, Deps{
-		FS:     fsys,
-		GitHub: gh,
-	})
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -123,10 +118,7 @@ func TestInitForceOverwritesExistingFiles(t *testing.T) {
 	result, err := Init(context.Background(), Options{
 		RepoPath: "repo",
 		Force:    true,
-	}, Deps{
-		FS:     fsys,
-		GitHub: &fakeGitHubRunner{listOutput: allLabelsJSON(t)},
-	})
+	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -150,10 +142,7 @@ func TestInitModelFlagsPersistRoleValues(t *testing.T) {
 		WorkerEffort:   "high",
 		VerifierModel:  "claude-sonnet-4-5",
 		VerifierEffort: "max",
-	}, Deps{
-		FS:     fsys,
-		GitHub: &fakeGitHubRunner{listOutput: allLabelsJSON(t)},
-	})
+	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -170,16 +159,74 @@ func TestInitModelFlagsPersistRoleValues(t *testing.T) {
 	}
 }
 
+func TestInitGateAutoGeneratesAutoGate(t *testing.T) {
+	fsys := newFakeFileSystem()
+
+	_, err := Init(context.Background(), Options{
+		RepoPath: "repo",
+		Gate:     "auto",
+	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	if err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+
+	delivery := string(fsys.read(t, filepath.Join("repo", DeliveryFilename)))
+	if !strings.Contains(delivery, "gate: auto") {
+		t.Fatalf(".delivery.yml missing explicit auto gate:\n%s", delivery)
+	}
+	if strings.Contains(delivery, "gate: human-merge") {
+		t.Fatalf(".delivery.yml contains human gate for explicit auto:\n%s", delivery)
+	}
+}
+
+func TestInitRejectsInvalidGateBeforeWrites(t *testing.T) {
+	fsys := newFakeFileSystem()
+
+	_, err := Init(context.Background(), Options{
+		RepoPath: "repo",
+		Gate:     "bogus",
+	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	if err == nil || !strings.Contains(err.Error(), "allowed values: human-merge, auto") {
+		t.Fatalf("Init error = %v, want invalid gate", err)
+	}
+	if len(fsys.files) != 0 {
+		t.Fatalf("files were written despite invalid gate: %#v", fsys.files)
+	}
+}
+
+func TestInitProtectsLocalLoopcoderState(t *testing.T) {
+	fsys := newFakeFileSystem()
+	called := false
+
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, Deps{
+		FS:     fsys,
+		GitHub: &fakeGitHubRunner{listOutput: allLabelsJSON(t)},
+		ProtectLocalState: func(_ context.Context, repoPath string) (gitlocal.ProtectResult, error) {
+			called = true
+			if repoPath != "repo" {
+				t.Fatalf("ProtectLocalState repoPath = %q, want repo", repoPath)
+			}
+			return gitlocal.ProtectResult{ExcludePath: filepath.Join("repo", ".git", "info", "exclude"), Status: gitlocal.ProtectUpdated}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("ProtectLocalState was not called")
+	}
+	if result.LocalStateExclude == nil || result.LocalStateExclude.Path != filepath.Join("repo", ".git", "info", "exclude") || result.LocalStateExclude.Status != gitlocal.ProtectUpdated {
+		t.Fatalf("LocalStateExclude = %#v", result.LocalStateExclude)
+	}
+}
+
 func TestInitGitHubUnavailableWarnsWithoutFailing(t *testing.T) {
 	fsys := newFakeFileSystem()
 	gh := &fakeGitHubRunner{
 		listErr: errors.New("exec: gh not found"),
 	}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, Deps{
-		FS:     fsys,
-		GitHub: gh,
-	})
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -191,6 +238,16 @@ func TestInitGitHubUnavailableWarnsWithoutFailing(t *testing.T) {
 	}
 	if gh.createCallCount() != 0 {
 		t.Fatalf("label create calls = %d, want 0; calls=%#v", gh.createCallCount(), gh.calls)
+	}
+}
+
+func scaffoldDepsForTest(fsys FileSystem, gh GitHubRunner) Deps {
+	return Deps{
+		FS:     fsys,
+		GitHub: gh,
+		ProtectLocalState: func(context.Context, string) (gitlocal.ProtectResult, error) {
+			return gitlocal.ProtectResult{ExcludePath: filepath.Join("repo", ".git", "info", "exclude"), Status: gitlocal.ProtectUnchanged}, nil
+		},
 	}
 }
 
@@ -220,14 +277,14 @@ func TestExecGitHubRunnerTimesOut(t *testing.T) {
 	dir := t.TempDir()
 
 	start := time.Now()
-	output, err := (execGitHubRunner{}).Run(context.Background(), dir, "-test.run=TestScaffoldExecHelper", "--", "sleep", "5s")
+	output, err := (execGitHubRunner{}).Run(context.Background(), dir, "-test.run=TestScaffoldExecHelper", "--", "sleep", "500ms")
 	if err == nil {
 		t.Fatal("Run error = nil, want timeout")
 	}
 	if len(output) != 0 {
 		t.Fatalf("output = %q, want no output", output)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("Run elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {

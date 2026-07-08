@@ -407,6 +407,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
 	}
 	if command.Name == "models" {
@@ -432,6 +433,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "init" {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
+		fmt.Fprintln(w, "  --repo string               repository path (default \".\")")
+		fmt.Fprintln(w, "  --gate string               generated promotion gate: human-merge or auto (default \"human-merge\")")
 		fmt.Fprintln(w, "  --worker-model string       optional first-run worker model to persist")
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
@@ -868,14 +871,24 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var repoAlias string
 	var baseBranch string
 	var baseBranchAlias string
+	var outputFormat string
 	var fix bool
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
+	fs.StringVar(&outputFormat, "format", "text", "output format: text or json")
 	fs.BoolVar(&fix, "fix", false, "apply explicit upgrade migrations and stale local state cleanup")
 
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	if outputFormat == "" {
+		outputFormat = "text"
+	}
+	if outputFormat != "text" && outputFormat != "json" {
+		fmt.Fprintf(stderr, "doctor: unsupported --format %q (want text or json)\n", outputFormat)
 		return 2
 	}
 	if repoAlias != "" {
@@ -895,18 +908,26 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
+	build := doctor.BuildInfo{
+		Version: deps.BuildInfo.Version,
+		Commit:  deps.BuildInfo.Commit,
+		Date:    deps.BuildInfo.Date,
+	}
 	report := deps.Doctor(context.Background(), doctor.Options{
 		RepoPath:   resolvedRepo,
 		BaseBranch: baseBranch,
 		Fix:        fix,
-		BuildInfo: doctor.BuildInfo{
-			Version: deps.BuildInfo.Version,
-			Commit:  deps.BuildInfo.Commit,
-			Date:    deps.BuildInfo.Date,
-		},
+		BuildInfo:  build,
 	})
-	if err := doctor.Render(stdout, report); err != nil {
-		fmt.Fprintf(stderr, "doctor: write output: %v\n", err)
+	report = doctor.WithMetadata(report, resolvedRepo, build)
+	var renderErr error
+	if outputFormat == "json" {
+		renderErr = doctor.RenderJSON(stdout, report)
+	} else {
+		renderErr = doctor.Render(stdout, report)
+	}
+	if renderErr != nil {
+		fmt.Fprintf(stderr, "doctor: write output: %v\n", renderErr)
 		return 1
 	}
 	return report.ExitCode()
@@ -922,6 +943,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var opts scaffold.Options
 	var forceAlias bool
+	var repoPathAlias string
+	var gateAlias string
 	var workerModelAlias string
 	var workerEffortAlias string
 	var verifierModelAlias string
@@ -929,6 +952,10 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing files")
+	fs.StringVar(&opts.RepoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoPathAlias, "Repo", "", "repository path")
+	fs.StringVar(&opts.Gate, "gate", "", "generated promotion gate")
+	fs.StringVar(&gateAlias, "Gate", "", "generated promotion gate")
 	fs.StringVar(&opts.WorkerModel, "worker-model", "", "worker model")
 	fs.StringVar(&workerModelAlias, "WorkerModel", "", "worker model")
 	fs.StringVar(&opts.WorkerEffort, "worker-effort", "", "worker reasoning effort")
@@ -943,6 +970,12 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if forceAlias {
 		opts.Force = true
+	}
+	if repoPathAlias != "" {
+		opts.RepoPath = repoPathAlias
+	}
+	if gateAlias != "" {
+		opts.Gate = gateAlias
 	}
 	if workerModelAlias != "" {
 		opts.WorkerModel = workerModelAlias
@@ -961,7 +994,7 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
-	resolvedRepo, err := resolveRepo(".")
+	resolvedRepo, err := resolveRepo(opts.RepoPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "init: %v\n", err)
 		return 2
@@ -1998,6 +2031,9 @@ func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
 		default:
 			fmt.Fprintf(stdout, "  %s label %s\n", label.Status, label.Name)
 		}
+	}
+	if result.LocalStateExclude != nil {
+		fmt.Fprintf(stdout, "  local-state %s %s\n", result.LocalStateExclude.Status, result.LocalStateExclude.Path)
 	}
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
