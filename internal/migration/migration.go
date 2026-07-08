@@ -34,6 +34,9 @@ const (
 	ReportConfigChannel       = ReportConfigRoot + ".channel"
 	LegacyReportConfigChannel = LegacyReportConfigRoot + ".channel"
 
+	ReporterHeaderToken       = "reporter"
+	LegacyReporterHeaderToken = LegacyReportConfigRoot
+
 	ReportStateKey       = ReportConfigRoot
 	LegacyReportStateKey = LegacyReportConfigRoot
 )
