@@ -20,6 +20,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -1264,7 +1265,7 @@ func TestInitHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder init", "--force", "--worker-model", "--worker-effort", "--verifier-model", "--verifier-effort"} {
+	for _, want := range []string{"loopcoder init", "--force", "--repo", "--gate", "--worker-model", "--worker-effort", "--verifier-model", "--verifier-effort"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1274,9 +1275,12 @@ func TestInitHelpDocumentsFlags(t *testing.T) {
 func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	called := false
+	repo := t.TempDir()
 
 	exitCode := RunWithDeps([]string{
 		"init",
+		"-Repo", repo,
+		"-Gate", "auto",
 		"-Force",
 		"-WorkerModel", "gpt-5",
 		"-WorkerEffort", "high",
@@ -1285,10 +1289,10 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}, &stdout, &stderr, Deps{
 		Init: func(_ context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			called = true
-			if strings.TrimSpace(opts.RepoPath) == "" {
-				t.Fatal("RepoPath is empty")
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
 			}
-			if !opts.Force || opts.WorkerModel != "gpt-5" || opts.WorkerEffort != "high" || opts.VerifierModel != "claude-sonnet" || opts.VerifierEffort != "max" {
+			if opts.Gate != "auto" || !opts.Force || opts.WorkerModel != "gpt-5" || opts.WorkerEffort != "high" || opts.VerifierModel != "claude-sonnet" || opts.VerifierEffort != "max" {
 				t.Fatalf("init opts = %#v", opts)
 			}
 			return scaffold.Result{
@@ -1299,7 +1303,8 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 				Labels: []scaffold.LabelResult{
 					{Name: "delivery:unit", Status: scaffold.LabelCreated},
 				},
-				Warnings: []string{"gh label setup skipped: gh not found"},
+				LocalStateExclude: &scaffold.LocalStateResult{Path: filepath.Join(repo, ".git", "info", "exclude"), Status: gitlocal.ProtectUpdated},
+				Warnings:          []string{"gh label setup skipped: gh not found"},
 			}, nil
 		},
 	})
@@ -1309,7 +1314,7 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	if !called {
 		t.Fatal("Init dependency was not called")
 	}
-	for _, want := range []string{"loopcoder init complete", "overwritten .delivery.yml", "exists ROADMAP.md", "created label delivery:unit"} {
+	for _, want := range []string{"loopcoder init complete", "overwritten .delivery.yml", "exists ROADMAP.md", "created label delivery:unit", "local-state updated"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
 		}
