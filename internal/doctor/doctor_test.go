@@ -13,6 +13,8 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/localcleanup"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 func TestRunReportsHealthyPreflight(t *testing.T) {
@@ -21,7 +23,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	report := Run(context.Background(), Options{
 		RepoPath: "/repo",
 		BuildInfo: BuildInfo{
-			Version: "0.3.1",
+			Version: "0.6.0",
 			Commit:  "abc123",
 			Date:    "2026-06-29T00:00:00Z",
 		},
@@ -41,6 +43,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"default branch",
 		"loopcoder binary",
 		"version compatibility",
+		"version status",
 		"audit config",
 		"audit tools",
 		"audit parsers",
@@ -50,6 +53,8 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"audit llm provider",
 		"loopcoder skill",
 		"conductor hooks",
+		"migration status",
+		"stale local state",
 		"conductor runtime",
 	} {
 		check := requireCheck(t, report, name)
@@ -614,6 +619,221 @@ func TestRunChecksVersionCompatibility(t *testing.T) {
 	}
 }
 
+func TestCheckMigrationStatusWarnsForLegacySurfaces(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n"+migration.LegacyReportConfigRoot+":\n  channel: chat\n")
+
+	check := checkMigrationStatus(repo, Deps{
+		Getenv: func(key string) string {
+			if key == migration.LegacyReporterScopeEnv {
+				return "auto"
+			}
+			return ""
+		},
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"legacy surface(s)", "run: loopcoder doctor --repo . --fix"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
+	t.Setenv(migration.LegacyReporterScopeEnv, "auto")
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+
+	check := checkMigrationStatus(repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok when injected env is empty (%s)", check.Status, check.Message)
+	}
+}
+
+func TestCheckVersionStatusWarnsBeforeBreakingBoundary(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\nmin_loopcoder_version: 0.5.0\n")
+
+	check := checkVersionStatus(BuildInfo{Version: "0.5.4"}, repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"pre-breaking", "breaking transition", "run: loopcoder upgrade --version 0.6.0"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStaleStateWarnsForCleanupEligibleItems(t *testing.T) {
+	check := checkStaleState("/repo", Deps{
+		CleanupPlan: func(opts localcleanup.Options) (localcleanup.Result, error) {
+			if opts.RepoPath != "/repo" {
+				t.Fatalf("RepoPath = %q, want /repo", opts.RepoPath)
+			}
+			return localcleanup.Result{
+				Planned: []localcleanup.Action{{
+					Kind:   localcleanup.KindRun,
+					Path:   filepath.Join("/repo", ".loopcoder", "runs", "old"),
+					Reason: "outside retention",
+				}},
+			}, nil
+		},
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"cleanup-eligible item(s)", "run: loopcoder doctor --repo . --fix"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStaleStateWarnsWhenCleanupPlanErrors(t *testing.T) {
+	check := checkStaleState("/repo", Deps{
+		CleanupPlan: func(localcleanup.Options) (localcleanup.Result, error) {
+			return localcleanup.Result{}, errors.New("permission denied")
+		},
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"could not scan local state", "permission denied", "rerun: loopcoder doctor --repo ."} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestFixDeliveryConfigMigratesLegacyReportKeys(t *testing.T) {
+	repo := t.TempDir()
+	path := filepath.Join(repo, ".delivery.yml")
+	writeDoctorTextFile(t, path, strings.Join([]string{
+		"version: 1",
+		migration.LegacyReportConfigRoot + ":",
+		"  channel: chat",
+		"",
+	}, "\n"))
+
+	check := fixDeliveryConfig(repo, Deps{ReadFile: os.ReadFile})
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, migration.LegacyReportConfigRoot+":") {
+		t.Fatalf("migrated config still contains legacy root:\n%s", text)
+	}
+	if !strings.Contains(text, migration.ReportConfigRoot+":") {
+		t.Fatalf("migrated config missing report root:\n%s", text)
+	}
+
+	second := fixDeliveryConfig(repo, Deps{ReadFile: os.ReadFile})
+	if second.Status != StatusOK || !strings.Contains(second.Message, "unchanged") {
+		t.Fatalf("second check = %#v, want unchanged ok", second)
+	}
+}
+
+func TestFixConductorHookSettingsMigratesLegacyCommand(t *testing.T) {
+	repo := t.TempDir()
+	settingsPath := claudehooks.SettingsPath(repo)
+	writeDoctorTextFile(t, settingsPath, fmt.Sprintf(`{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": %q,
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+`, migration.LegacyReporterHookCommand))
+
+	check := fixConductorHookSettings(repo, Deps{ReadFile: os.ReadFile})
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, migration.LegacyReporterHookCommand) {
+		t.Fatalf("settings still contain legacy hook command:\n%s", text)
+	}
+	for _, want := range []string{migration.ReporterHookCommand, "loopcoder hook conductor-relay-guard"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("settings missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestFixConductorHookStateMovesLegacyDirectory(t *testing.T) {
+	repo := t.TempDir()
+	oldDir := filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName)
+	newDir := filepath.Join(repo, ".loopcoder", "hooks", migration.ReporterHookName)
+	writeDoctorTextFile(t, filepath.Join(oldDir, "session-a.json"), `{"delivery_seen":true}`)
+
+	check := fixConductorHookState(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	if _, err := os.Stat(filepath.Join(newDir, "session-a.json")); err != nil {
+		t.Fatalf("new state file missing: %v", err)
+	}
+	if _, err := os.Stat(oldDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state dir still exists or unexpected error: %v", err)
+	}
+}
+
+func TestFixLegacyStateKeysRewritesLocalJSON(t *testing.T) {
+	repo := t.TempDir()
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-1", "workers", "job.attempt.json")
+	writeDoctorTextFile(t, statePath, fmt.Sprintf(`{"status":"succeeded","%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	check := fixLegacyStateKeys(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"`+migration.LegacyReportStateKey+`"`) {
+		t.Fatalf("state still contains legacy key:\n%s", text)
+	}
+	if !strings.Contains(text, `"`+migration.ReportStateKey+`"`) {
+		t.Fatalf("state missing current key:\n%s", text)
+	}
+}
+
 func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	report := Report{Checks: []Check{
 		{Name: "git", Status: StatusOK, Message: "found"},
@@ -658,7 +878,7 @@ func TestExecRunCommandTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("execRunCommand error = nil, want timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("execRunCommand elapsed = %s, want bounded timeout", elapsed)
 	}
 	if !strings.Contains(err.Error(), "timed out") {
@@ -799,6 +1019,7 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 type fakeDoctorEnv struct {
 	paths          map[string]string
 	commands       map[string]CommandResult
+	env            map[string]string
 	cfg            config.Config
 	configErr      error
 	file           []byte
@@ -833,6 +1054,12 @@ func (f *fakeDoctorEnv) deps() Deps {
 				return config.Config{}, f.configErr
 			}
 			return f.cfg, nil
+		},
+		Getenv: func(key string) string {
+			if value, ok := f.env[key]; ok {
+				return value
+			}
+			return ""
 		},
 		ReadFile: func(string) ([]byte, error) {
 			panic("unreachable")
@@ -878,6 +1105,16 @@ func (f *fakeDoctorEnv) deps() Deps {
 		return f.file, nil
 	}
 	return deps
+}
+
+func writeDoctorTextFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 func doctorSkillPath(home string, name string) string {

@@ -29,6 +29,7 @@ var removePendingRecord = os.Remove
 type Record struct {
 	Version  int              `json:"version"`
 	Nonce    string           `json:"nonce"`
+	RunID    string           `json:"run_id,omitempty"`
 	Role     string           `json:"role"`
 	PRNumber int              `json:"pr_number"`
 	Block    string           `json:"block"`
@@ -74,6 +75,7 @@ func Write(opts WriteOptions) (string, error) {
 	rec := Record{
 		Version:  recordVersion,
 		Nonce:    nonce,
+		RunID:    strings.TrimSpace(opts.RunID),
 		Role:     role,
 		PRNumber: opts.PRNumber,
 		Block:    ensureTrailingNewline(opts.Block),

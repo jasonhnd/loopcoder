@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -140,6 +141,9 @@ func frozenAttestationText(rel, line string) bool {
 	if historicalSpecReference(line) {
 		return true
 	}
+	if releaseTransitionDocumentation(rel) {
+		return true
+	}
 	if dualTokenMatcher(line) {
 		return true
 	}
@@ -155,6 +159,14 @@ func frozenAttestationText(rel, line string) bool {
 func historicalSpecReference(line string) bool {
 	lower := strings.ToLower(line)
 	return strings.Contains(lower, "specs/") && strings.Contains(lower, "-attestation")
+}
+
+func releaseTransitionDocumentation(rel string) bool {
+	if rel == "README.md" || rel == "docs/reference/releasing.md" {
+		return true
+	}
+	matched, err := path.Match(".github/release-notes/*.md", rel)
+	return err == nil && matched
 }
 
 func dualTokenMatcher(line string) bool {
@@ -194,6 +206,7 @@ func legacyEnvelopeKey(rel, line string) bool {
 		"docs/reference/worker.md",
 		"internal/cli/audit_test.go",
 		"internal/cli/cli_test.go",
+		"internal/migration/migration.go",
 		"internal/reportquery/reportquery.go",
 		"internal/reportquery/reportquery_test.go",
 		"internal/runstatus/runstatus.go",

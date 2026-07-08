@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 const (
@@ -26,16 +27,16 @@ const (
 // directory and stay in lockstep with the installed binary, instead of a
 // relative node hooks/*.js path that only resolved inside loopcoder's own repo.
 var requiredHookNames = []string{
-	"conductor-reporter",
+	migration.ReporterHookName,
 	"conductor-relay-guard",
 }
 
 // deprecatedCommands are legacy conductor hook command strings. The settings
 // merge strips them so an upgrade installs only current hook entries.
 var deprecatedCommands = []string{
-	"node hooks/conductor-attest.js",
+	migration.LegacyReporterNodeHookCommand,
 	"node hooks/conductor-relay-guard.js",
-	"loopcoder hook conductor-attest",
+	migration.LegacyReporterHookCommand,
 }
 
 // RequiredHook describes one required Claude Code hook registration.

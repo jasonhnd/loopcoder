@@ -2,18 +2,21 @@ package conductorhooks
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 const (
-	reporterScopeEnv        = "LOOPCODER_CONDUCTOR_REPORTER_SCOPE"
-	reporterStateDirEnv     = "LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR"
-	reporterStateSub        = "conductor-reporter"
-	legacyAttestScopeEnv    = "LOOPCODER_CONDUCTOR_ATTEST_SCOPE"
-	legacyAttestStateDirEnv = "LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR"
-	legacyAttestStateSub    = "conductor-attest"
+	reporterScopeEnv        = migration.ReporterScopeEnv
+	reporterStateDirEnv     = migration.ReporterStateDirEnv
+	reporterStateSub        = migration.ReporterHookName
+	legacyAttestScopeEnv    = migration.LegacyReporterScopeEnv
+	legacyAttestStateDirEnv = migration.LegacyReporterStateDirEnv
+	legacyAttestStateSub    = migration.LegacyReporterHookName
 )
 
 var (
@@ -63,7 +66,8 @@ func RunAttest(input []byte, opts Options) (res Result) {
 		return allow()
 	}
 
-	if in.SessionID == "" || !shouldEnforce(firstEnv(env, reporterScopeEnv, legacyAttestScopeEnv), in.HookEventName, in.CWD) {
+	scope, _ := migration.ResolveReporterScopeEnv(env)
+	if in.SessionID == "" || !shouldEnforce(scope, in.HookEventName, in.CWD) {
 		return allow()
 	}
 
@@ -152,13 +156,28 @@ func recordAttestObservations(statePaths attestStatePaths, in hookInput, now tim
 }
 
 func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (attestStatePaths, error) {
-	if newDir := strings.TrimSpace(env(reporterStateDirEnv)); newDir != "" {
-		primary, err := stateFilePath(sessionID, cwd, newDir, reporterStateSub)
+	if env == nil {
+		env = func(string) string { return "" }
+	}
+	currentStateDir := strings.TrimSpace(env(reporterStateDirEnv))
+	legacyStateDir := strings.TrimSpace(env(legacyAttestStateDirEnv))
+	if currentStateDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, currentStateDir, reporterStateSub)
 		return attestStatePaths{primary: primary}, err
 	}
-	if oldDir := strings.TrimSpace(env(legacyAttestStateDirEnv)); oldDir != "" {
-		primary, err := stateFilePath(sessionID, cwd, oldDir, legacyAttestStateSub)
-		return attestStatePaths{primary: primary}, err
+	if legacyStateDir != "" {
+		primary, err := stateFilePath(sessionID, cwd, legacyStateDir, reporterStateSub)
+		if err != nil {
+			return attestStatePaths{}, err
+		}
+		legacy, err := stateFilePathUnderSub(sessionID, legacyStateDir, legacyAttestStateSub)
+		if err != nil {
+			return attestStatePaths{}, err
+		}
+		if legacy == primary {
+			legacy = ""
+		}
+		return attestStatePaths{primary: primary, legacy: legacy}, nil
 	}
 	primary, err := stateFilePath(sessionID, cwd, "", reporterStateSub)
 	if err != nil {
@@ -171,13 +190,8 @@ func resolveAttestStatePaths(sessionID, cwd string, env func(string) string) (at
 	return attestStatePaths{primary: primary, legacy: legacy}, nil
 }
 
-func firstEnv(env func(string) string, keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(env(key)); value != "" {
-			return value
-		}
-	}
-	return ""
+func stateFilePathUnderSub(sessionID, baseDir, sub string) (string, error) {
+	return stateFilePath(sessionID, "", filepath.Join(baseDir, sub), sub)
 }
 
 func readAttestState(statePaths attestStatePaths) (*attestState, error) {

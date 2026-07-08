@@ -7,6 +7,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/conductorhooks"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 const maxHookInputBytes int64 = lcdefaults.HookInputMaxBytes
@@ -27,7 +28,7 @@ func runHook(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	var result conductorhooks.Result
 	switch name {
-	case "conductor-reporter", "conductor-attest":
+	case migration.ReporterHookName, migration.LegacyReporterHookName:
 		result = conductorhooks.RunAttest(input, conductorhooks.Options{})
 	case "conductor-relay-guard":
 		result = conductorhooks.RunRelayGuard(input, conductorhooks.Options{})

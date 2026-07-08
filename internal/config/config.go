@@ -14,7 +14,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
-	"gopkg.in/yaml.v3"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
 type Config struct {
@@ -386,41 +386,48 @@ func Default() Config {
 
 // Load reads and parses a .delivery.yml file from disk.
 func Load(path string) (Config, error) {
+	cfg, _, err := LoadWithDiagnostics(path)
+	return cfg, err
+}
+
+func LoadWithDiagnostics(path string) (Config, []migration.Diagnostic, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("read delivery config: %w", err)
+		return Config{}, nil, fmt.Errorf("read delivery config: %w", err)
 	}
-	return Parse(data)
+	return ParseWithDiagnostics(data)
 }
 
 // Parse reads .delivery.yml data, tolerating absent optional sections.
 func Parse(data []byte) (Config, error) {
-	cfg := Default()
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse delivery config: %w", err)
-	}
+	cfg, _, err := ParseWithDiagnostics(data)
+	return cfg, err
+}
+
+func validateParsedConfig(cfg Config) error {
 	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := validateGuardrailCircuitBreaker(cfg.Guardrails.CircuitBreaker); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := validateMCP(cfg.MCP); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := validateDomainCommands(cfg.Domain); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := validateAudit(cfg.Audit); err != nil {
-		return Config{}, err
+		return err
 	}
-	return cfg, nil
+	return nil
 }
 
 func LoadForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Config, error) {
 	cfg := Default()
-	loaded, err := Load(filepath.Join(repoPath, ".delivery.yml"))
+	loaded, diagnostics, err := LoadWithDiagnostics(filepath.Join(repoPath, ".delivery.yml"))
 	if err == nil {
+		warnMigrationDiagnostics(opts.Warnings, diagnostics)
 		return loaded, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -436,10 +443,11 @@ func LoadForRepo(ctx context.Context, repoPath string, opts LoadOptions) (Config
 		return cfg, nil
 	}
 	if opts.ConfigFromBase {
-		loaded, err := Parse(baseConfig)
+		loaded, diagnostics, err := ParseWithDiagnostics(baseConfig)
 		if err != nil {
 			return cfg, err
 		}
+		warnMigrationDiagnostics(opts.Warnings, diagnostics)
 		return loaded, nil
 	}
 	return cfg, ConfigMismatchError{BaseBranch: baseBranch}

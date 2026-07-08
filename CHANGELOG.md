@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-08
+
+0.6.0 is loopcoder's first breaking transition release. It completes three related units: model/depth discovery and validation, the live operator-facing rename from attestation to reporter, and the 0.5.x to 0.6.0 upgrade/migration/doctor path. The release keeps old local machine contracts readable for one transition window while making new output, docs, hooks, and config use the reporter vocabulary.
+
+### Breaking
+
+- **Operator-visible reporter rename** - new Worker, Verifier, audit, and Conductor output uses `[reporter]` headers and result JSON `report` objects. The old `[attestation]` token and result JSON `attestation` key are still accepted by readers, relay gates, and conductor hooks for this 0.6.0 transition release, but new output emits the new names only.
+- **Conductor hook command rename** - the current hook command is `loopcoder hook conductor-reporter`. The old `loopcoder hook conductor-attest` command remains a one-version alias so upgraded binaries, installed skills, and host hook settings cannot lock each other out during rollout.
+- **Config/env rename window** - `.delivery.yml report:` replaces the old `attestation:` root, and `report.channel` replaces `attestation.channel`. The new env vars are `LOOPCODER_CONDUCTOR_REPORTER_SCOPE` and `LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR`; the old `LOOPCODER_CONDUCTOR_ATTEST_SCOPE` and `LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR` remain accepted for one release, with the new vars winning when both are set.
+- **Frozen local machinery stays frozen** - `.loopcoder/relay/*.attest` ledger extensions, canonical report JSON field names such as `usage.total_tokens`, old historical specs, and existing local run records are not terminology-swept. This deliberately avoids breaking recovery and relay evidence that was produced by 0.5.x.
+
+### Added
+
+- **Static model and depth registry** - `loopcoder models` lists the curated provider/model/depth table used by Worker and Verifier selection. The initial registry covers `codex` (`gpt-5.5`, default `high`), `claude` (`claude-opus-4-8[1m]`, default `max`), and `antigravity` (`Gemini 3.1 Pro`, default `High`, plus `Opus 4.6` / `Thinking` and `GPT-OSS 120B` / `Medium`).
+- **Role-scoped model/depth validation** - Worker and Verifier providers resolve independently from command flags, `.delivery.yml`, and registry defaults. Invalid provider, model, or depth values warn by default and pass through for compatibility; `models.strict: true` or per-run `--strict` rejects invalid selections before launch.
+- **Google Antigravity provider** - provider key `antigravity` runs the `agy` CLI, using `agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"`. The required `--add-dir` pins the worktree so Antigravity edits the intended repository instead of its own scratch directory.
+- **`loopcoder report`** - a read-only reporter query surface for recent local reports, keyed by work ID, role, provider, model/depth, timing, tokens, and result context.
+- **0.5.x to 0.6.0 migration diagnostics** - `loopcoder upgrade` classifies the selected and target versions as pre-breaking, breaking transition, post-transition, or unknown, refreshes bundled skills, and reports whether compatibility aliases are active.
+- **Expanded `loopcoder doctor`** - `doctor --repo .` is now the read-only operational health entry point for git/gh, provider CLI readiness, provider auth probes where stable, `.delivery.yml` validity, model/depth validation, reporter/relay wiring, selected binary version, migration status, installed skill freshness, audit readiness, and stale local state counts.
+- **Explicit `doctor --fix` mode** - `loopcoder doctor --repo . --fix` is the opt-in mutating repair path for reporter config-key migration, conductor hook command migration, hook state migration, eligible local state key rewrites, and stale local state cleanup.
+- **Stale local state retention policy** - cleanup retains active runs, newest run directories, recent run directories, pending relay obligations, recent `.attest` ledgers, newest `.attest` ledgers, recent audit logs, referenced audit logs, and recent worktree-liveness artifacts. Cleanup is bounded, skips symlinks, and stays under the repo's `.loopcoder/` tree.
+- **Release documentation rule** - [`docs/reference/releasing.md`](docs/reference/releasing.md) now requires every version bump to rewrite the changelog entry, GitHub Release Note, and README release-facing sections completely and in detail before the release is ready.
+
+### Changed
+
+- **Reporter terminology is the live surface** - Go package/type names, CLI pretty output, current reference docs, hook templates, relay guard wording, worker/verifier/audit result objects, and conductor playbooks now talk about reports and reporter records. Historical changelog entries and shipped specs keep their old wording as history.
+- **Pretty report output shows stronger context** - reports can include work ID, issue, branch, worktree, round, selected model/depth, provider vendor, tool key, model source, host-local timing, grouped token counts, and verified status. Antigravity Worker reports are self-reported and accept absent token usage because `agy` does not expose stable parseable usage in this path.
+- **Release workflow uses the full release-note body** - the tag-triggered release job now reads `.github/release-notes/<tag>.md` when present, so `v0.6.0` publishes the detailed operator-facing GitHub Release Note instead of the previous one-line automated body.
+- **README current-release documentation** - the top-level README now documents 0.6.0 as current, including model/depth selection, Antigravity setup, reporter transition aliases, upgrade commands, `doctor --fix`, and stale local state cleanup.
+
+### Upgrade
+
+Users upgrading from 0.5.x should run:
+
+```text
+loopcoder upgrade --version 0.6.0
+loopcoder doctor --repo .
+loopcoder doctor --repo . --fix
+loopcoder doctor --repo .
+```
+
+`loopcoder upgrade` selects the 0.6.0 binary from GitHub Releases, verifies signed checksums, swaps the binary atomically or stages the Windows deferred replacement, and refreshes the bundled loopcoder skill. The first `doctor` run is diagnose-only and safe anytime; `doctor --fix` performs the explicit local migration/cleanup actions; the final `doctor` confirms no legacy surfaces or cleanup-eligible state remain. Environment variables cannot be rewritten by doctor, so any old `LOOPCODER_CONDUCTOR_ATTEST_*` shell settings must be changed by the operator.
+
+### Notes
+
+- The 0.6.0 transition intentionally accepts both old and new reporter tokens and keys, but new writes use `[reporter]`, `report`, `report.channel`, and `conductor-reporter`. A later release will decide when to remove old aliases.
+- Antigravity is a write-capable Worker provider. It is not a verified read-only Verifier or audit-review provider, so read-only selections fail closed instead of launching `agy` in a mode it cannot safely provide.
+- `doctor` is not a reporter role and does not emit or satisfy Worker, Verifier, audit, or Conductor report obligations. It is an operator preflight and repair command.
+- CI remains the full loopcoder gate: verify, Go build/test, staticcheck, govulncheck, and audit.
+
 ## [0.5.4] - 2026-07-06
 
 Two reliability lines: make the 0.5.3 `loopcoder audit` usable in real consumer repositories, and harden the `loopreview` verifier against false `needs-human` verdicts on large PRs. Per [`docs/specs/0533-audit-consumer-repo-usability.md`](docs/specs/0533-audit-consumer-repo-usability.md), [`docs/specs/0535-loopreview-packet-truncation-reliability.md`](docs/specs/0535-loopreview-packet-truncation-reliability.md), and [`docs/specs/0539-loopreview-cited-spec-not-conformance-target.md`](docs/specs/0539-loopreview-cited-spec-not-conformance-target.md). Built by loopcoder itself under the self-hosting guard (human merge gate).

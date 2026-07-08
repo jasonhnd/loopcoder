@@ -33,7 +33,7 @@ func TestWriteUsesDeterministicNonceAndCheckReturnsPending(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("Check returned %d records, want 1", len(records))
 	}
-	if records[0].Nonce != nonce || records[0].Role != "worker" || records[0].PRNumber != 101 {
+	if records[0].Nonce != nonce || records[0].RunID != "run-test" || records[0].Role != "worker" || records[0].PRNumber != 101 {
 		t.Fatalf("record = %#v, want deterministic worker PR record", records[0])
 	}
 	if records[0].Block != testPrettyBlock {

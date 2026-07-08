@@ -236,6 +236,31 @@ func TestAttestReadsLegacyPersistedStateWhenReporterStateAbsent(t *testing.T) {
 	}
 }
 
+func TestAttestReadsCustomLegacyStateDirSubdirFallback(t *testing.T) {
+	root := t.TempDir()
+	legacyStateDir := filepath.Join(root, "custom-legacy-state")
+	legacyPath, err := stateFilePathUnderSub("session-1", legacyStateDir, legacyAttestStateSub)
+	if err != nil {
+		t.Fatalf("legacy stateFilePathUnderSub: %v", err)
+	}
+	if err := writeStateJSON(legacyPath, &attestState{
+		DeliverySeen:  true,
+		DeliveryAt:    "2026-06-28T00:00:00.000Z",
+		SessionIDHash: hashText("session-1")[:32],
+	}); err != nil {
+		t.Fatalf("write legacy custom state: %v", err)
+	}
+
+	opts := Options{Env: mapEnv(map[string]string{
+		reporterScopeEnv:        "always",
+		legacyAttestStateDirEnv: legacyStateDir,
+	})}
+	first := RunAttest(mustJSON(t, attestStop(root, false)), opts)
+	if first.ExitCode != 2 {
+		t.Fatalf("expected Stop to block from custom legacy state dir fallback (exit 2), got %d", first.ExitCode)
+	}
+}
+
 // stop_hook_active is an escape valve: even an unattested delivery turn must not
 // block when Claude Code signals we are already in a stop-loop.
 func TestAttestStopHookActiveEscape(t *testing.T) {

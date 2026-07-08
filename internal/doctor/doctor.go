@@ -3,6 +3,7 @@ package doctor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +20,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/localcleanup"
+	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	"gopkg.in/yaml.v3"
 )
 
@@ -47,17 +51,20 @@ type Options struct {
 	RepoPath   string
 	BaseBranch string
 	BuildInfo  BuildInfo
+	Fix        bool
 }
 
 type Deps struct {
 	LookPath       func(file string) (string, error)
 	RunCommand     func(ctx context.Context, dir string, name string, args ...string) (CommandResult, error)
 	LoadConfig     func(path string) (config.Config, error)
+	Getenv         func(string) string
 	ReadFile       func(path string) ([]byte, error)
 	ExecutablePath func() (string, error)
 	UserHomeDir    func() (string, error)
 	SkillMarkdown  func() ([]byte, error)
 	AgentsMarkdown func() ([]byte, error)
+	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
 }
 
 type CommandResult struct {
@@ -109,11 +116,13 @@ func DefaultDeps() Deps {
 		LookPath:       exec.LookPath,
 		RunCommand:     execRunCommand,
 		LoadConfig:     config.Load,
+		Getenv:         os.Getenv,
 		ReadFile:       os.ReadFile,
 		ExecutablePath: os.Executable,
 		UserHomeDir:    os.UserHomeDir,
 		SkillMarkdown:  loopcoder.SkillMarkdown,
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
+		CleanupPlan:    localcleanup.Plan,
 	}
 }
 
@@ -131,6 +140,10 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		baseBranch = lcdefaults.BaseBranch
 	}
 	build := normalizeBuildInfo(opts.BuildInfo)
+
+	if opts.Fix {
+		return runFix(ctx, repoPath, baseBranch, build, deps)
+	}
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
 	checks := make([]Check, 0, 10)
@@ -152,9 +165,12 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	checks = append(checks, checkBinary(build, deps))
 	checks = append(checks, checkCompatibility(delivery, build))
+	checks = append(checks, checkVersionStatus(build, repoPath, deps))
 	checks = append(checks, checkAuditReadiness(repoPath, delivery, deps)...)
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
+	checks = append(checks, checkMigrationStatus(repoPath, deps))
+	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
 		Status:  StatusOK,
@@ -162,6 +178,302 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	})
 
 	return Report{Checks: checks}
+}
+
+func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
+	checks := []Check{
+		fixDeliveryConfig(repoPath, deps),
+		fixConductorHookSettings(repoPath, deps),
+		fixConductorHookState(repoPath),
+		fixLegacyStateKeys(repoPath),
+		fixStaleState(repoPath),
+	}
+	status := scanMigrationStatus(repoPath, deps)
+	remaining := migrationLegacyCount(status)
+	if remaining > 0 {
+		checks = append(checks, Check{
+			Name:    "post-upgrade repair",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("repair completed with %d legacy surface(s) still reported; env vars must be changed in the shell and unreadable state may need manual repair", remaining),
+		})
+	} else {
+		checks = append(checks, Check{
+			Name:    "post-upgrade repair",
+			Status:  StatusOK,
+			Message: "repair scan found no remaining legacy surfaces",
+		})
+	}
+
+	readOnly := Run(ctx, Options{
+		RepoPath:   repoPath,
+		BaseBranch: baseBranch,
+		BuildInfo:  build,
+	}, deps)
+	checks = append(checks, readOnly.Checks...)
+	return Report{Checks: checks}
+}
+
+func fixDeliveryConfig(repoPath string, deps Deps) Check {
+	path := filepath.Join(repoPath, ".delivery.yml")
+	data, err := deps.ReadFile(path)
+	if err != nil {
+		if isNotExist(err) {
+			return Check{Name: "fix .delivery.yml", Status: StatusOK, Message: "unchanged; .delivery.yml not present"}
+		}
+		return Check{Name: "fix .delivery.yml", Status: StatusFail, Message: fmt.Sprintf("could not read .delivery.yml: %v", err), Hard: true}
+	}
+	result, err := config.MigrateDeliveryYAML(data)
+	if err != nil {
+		return Check{Name: "fix .delivery.yml", Status: StatusFail, Message: err.Error(), Hard: true}
+	}
+	if !result.Changed {
+		return Check{Name: "fix .delivery.yml", Status: StatusOK, Message: "unchanged; no legacy config keys found"}
+	}
+	if err := writeFileAtomic(path, result.Data, 0o644); err != nil {
+		return Check{Name: "fix .delivery.yml", Status: StatusFail, Message: fmt.Sprintf("migration rendered but write failed: %v", err), Hard: true}
+	}
+	return Check{
+		Name:    "fix .delivery.yml",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("changed; migrated %d legacy config key diagnostic(s) to report keys", len(result.Diagnostics)),
+	}
+}
+
+func fixConductorHookSettings(repoPath string, deps Deps) Check {
+	path := claudehooks.SettingsPath(repoPath)
+	data, err := deps.ReadFile(path)
+	if err != nil && !isNotExist(err) {
+		return Check{Name: "fix conductor hooks", Status: StatusFail, Message: fmt.Sprintf("could not read Claude Code settings: %v", err), Hard: true}
+	}
+	created := isNotExist(err)
+	merged, changed, err := claudehooks.MergeSettings(data)
+	if err != nil {
+		return Check{Name: "fix conductor hooks", Status: StatusFail, Message: err.Error(), Hard: true}
+	}
+	if !changed && !created {
+		return Check{Name: "fix conductor hooks", Status: StatusOK, Message: "unchanged; conductor hook settings already use current commands"}
+	}
+	if err := writeFileAtomic(path, merged, 0o644); err != nil {
+		return Check{Name: "fix conductor hooks", Status: StatusFail, Message: fmt.Sprintf("could not write Claude Code settings: %v", err), Hard: true}
+	}
+	status := "changed"
+	if created {
+		status = "created"
+	}
+	return Check{Name: "fix conductor hooks", Status: StatusOK, Message: status + "; wrote current conductor hook commands"}
+}
+
+func fixConductorHookState(repoPath string) Check {
+	oldPath := filepath.Join(repoPath, ".loopcoder", "hooks", migration.LegacyReporterHookName)
+	newPath := filepath.Join(repoPath, ".loopcoder", "hooks", migration.ReporterHookName)
+	return migrateHookStateDir(oldPath, newPath, "fix hook state")
+}
+
+func migrateHookStateDir(oldPath, newPath, name string) Check {
+	oldInfo, oldErr := os.Lstat(oldPath)
+	if oldErr != nil {
+		if isNotExist(oldErr) {
+			return Check{Name: name, Status: StatusOK, Message: "unchanged; legacy hook state not present"}
+		}
+		return Check{Name: name, Status: StatusFail, Message: fmt.Sprintf("could not inspect legacy hook state: %v", oldErr), Hard: true}
+	}
+	if oldInfo.Mode()&os.ModeSymlink != 0 || !oldInfo.IsDir() {
+		return Check{Name: name, Status: StatusFail, Message: "legacy hook state is not a regular directory; refusing to migrate", Hard: true}
+	}
+	if newInfo, err := os.Lstat(newPath); err == nil {
+		if newInfo.Mode()&os.ModeSymlink != 0 || !newInfo.IsDir() {
+			return Check{Name: name, Status: StatusFail, Message: "current hook state path exists but is not a regular directory; refusing to merge", Hard: true}
+		}
+		moved, err := moveDirContents(oldPath, newPath)
+		if err != nil {
+			return Check{Name: name, Status: StatusFail, Message: fmt.Sprintf("could not merge legacy hook state: %v", err), Hard: true}
+		}
+		if err := os.Remove(oldPath); err != nil {
+			return Check{Name: name, Status: StatusWarn, Message: fmt.Sprintf("changed; moved %d legacy state file(s), but could not remove old directory: %v", moved, err)}
+		}
+		return Check{Name: name, Status: StatusOK, Message: fmt.Sprintf("changed; moved %d legacy state file(s) into current hook state", moved)}
+	} else if !isNotExist(err) {
+		return Check{Name: name, Status: StatusFail, Message: fmt.Sprintf("could not inspect current hook state: %v", err), Hard: true}
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		return Check{Name: name, Status: StatusFail, Message: fmt.Sprintf("could not create hook state parent: %v", err), Hard: true}
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return Check{Name: name, Status: StatusFail, Message: fmt.Sprintf("could not move legacy hook state: %v", err), Hard: true}
+	}
+	return Check{Name: name, Status: StatusOK, Message: "changed; moved legacy hook state to current label"}
+}
+
+func moveDirContents(oldPath, newPath string) (int, error) {
+	entries, err := os.ReadDir(oldPath)
+	if err != nil {
+		return 0, err
+	}
+	moved := 0
+	for _, entry := range entries {
+		source := filepath.Join(oldPath, entry.Name())
+		target := filepath.Join(newPath, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			return moved, fmt.Errorf("refusing to move symlink %s", source)
+		}
+		if _, err := os.Lstat(target); err == nil {
+			continue
+		} else if !isNotExist(err) {
+			return moved, err
+		}
+		if err := os.Rename(source, target); err != nil {
+			return moved, err
+		}
+		moved++
+	}
+	return moved, nil
+}
+
+func fixLegacyStateKeys(repoPath string) Check {
+	roots := []string{
+		filepath.Join(repoPath, ".loopcoder", "runs"),
+		filepath.Join(repoPath, ".loopcoder", "relay", "pending"),
+	}
+	changed := 0
+	var diagnostics []string
+	for _, root := range roots {
+		n, err := rewriteLegacyStateKeys(root)
+		changed += n
+		if err != nil {
+			diagnostics = append(diagnostics, err.Error())
+		}
+	}
+	if len(diagnostics) > 0 {
+		return Check{Name: "fix state keys", Status: StatusWarn, Message: fmt.Sprintf("changed %d file(s); skipped some state: %s", changed, strings.Join(diagnostics, "; "))}
+	}
+	if changed == 0 {
+		return Check{Name: "fix state keys", Status: StatusOK, Message: "unchanged; no legacy report state keys found"}
+	}
+	return Check{Name: "fix state keys", Status: StatusOK, Message: fmt.Sprintf("changed; rewrote %d local state file(s) from legacy report key to current key", changed)}
+}
+
+func rewriteLegacyStateKeys(root string) (int, error) {
+	if !pathExists(root) {
+		return 0, nil
+	}
+	changed := 0
+	var skipped []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			skipped = append(skipped, filepath.ToSlash(path)+": "+walkErr.Error())
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		didChange, err := rewriteLegacyStateKeyFile(path)
+		if err != nil {
+			skipped = append(skipped, filepath.ToSlash(path)+": "+err.Error())
+			return nil
+		}
+		if didChange {
+			changed++
+		}
+		return nil
+	})
+	if err != nil {
+		skipped = append(skipped, err.Error())
+	}
+	if len(skipped) > 0 {
+		return changed, errors.New(strings.Join(skipped, "; "))
+	}
+	return changed, nil
+}
+
+func rewriteLegacyStateKeyFile(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Contains(data, []byte(`"`+migration.LegacyReportStateKey+`"`)) {
+		return false, nil
+	}
+	var out []byte
+	if strings.HasSuffix(path, ".jsonl") {
+		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		changed := false
+		rendered := make([]string, len(lines))
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				rendered[i] = line
+				continue
+			}
+			lineData, didChange, err := rewriteLegacyStateKeyJSON([]byte(line))
+			if err != nil {
+				return false, err
+			}
+			changed = changed || didChange
+			rendered[i] = strings.TrimSuffix(string(lineData), "\n")
+		}
+		if !changed {
+			return false, nil
+		}
+		out = []byte(strings.Join(rendered, "\n"))
+	} else {
+		var changed bool
+		out, changed, err = rewriteLegacyStateKeyJSON(data)
+		if err != nil || !changed {
+			return false, err
+		}
+	}
+	return true, writeFileAtomic(path, out, 0o644)
+}
+
+func rewriteLegacyStateKeyJSON(data []byte) ([]byte, bool, error) {
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, false, err
+	}
+	legacy, ok := object[migration.LegacyReportStateKey]
+	if !ok {
+		return data, false, nil
+	}
+	if _, hasCurrent := object[migration.ReportStateKey]; !hasCurrent {
+		object[migration.ReportStateKey] = legacy
+	}
+	delete(object, migration.LegacyReportStateKey)
+	out, err := json.MarshalIndent(object, "", "  ")
+	if err != nil {
+		return nil, false, err
+	}
+	out = append(out, '\n')
+	return out, true, nil
+}
+
+func fixStaleState(repoPath string) Check {
+	result, err := localcleanup.Cleanup(localcleanup.Options{
+		RepoPath: repoPath,
+		Apply:    true,
+	})
+	if err != nil {
+		return Check{Name: "fix stale local state", Status: StatusWarn, Message: fmt.Sprintf("could not apply stale cleanup: %v", err)}
+	}
+	if len(result.Planned) == 0 {
+		return Check{Name: "fix stale local state", Status: StatusOK, Message: "unchanged; no cleanup-eligible items found"}
+	}
+	message := fmt.Sprintf("changed; removed %d of %d cleanup-eligible item(s)", len(result.Removed), len(result.Planned))
+	if len(result.Diagnostics) > 0 {
+		return Check{Name: "fix stale local state", Status: StatusWarn, Message: message + "; diagnostics: " + strings.Join(result.Diagnostics, "; ")}
+	}
+	return Check{Name: "fix stale local state", Status: StatusOK, Message: message}
 }
 
 func normalizeDeps(deps Deps) Deps {
@@ -174,6 +486,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.LoadConfig == nil {
 		deps.LoadConfig = defaults.LoadConfig
+	}
+	if deps.Getenv == nil {
+		deps.Getenv = defaults.Getenv
 	}
 	if deps.ReadFile == nil {
 		deps.ReadFile = defaults.ReadFile
@@ -189,6 +504,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.AgentsMarkdown == nil {
 		deps.AgentsMarkdown = defaults.AgentsMarkdown
+	}
+	if deps.CleanupPlan == nil {
+		deps.CleanupPlan = defaults.CleanupPlan
 	}
 	return deps
 }
@@ -730,6 +1048,51 @@ func checkCompatibility(delivery deliveryState, build BuildInfo) Check {
 
 	parts = append(parts, fmt.Sprintf("min_loopcoder_version=%s is satisfied by selected loopcoder version=%s", minimum, build.Version))
 	return Check{Name: "version compatibility", Status: status, Message: strings.Join(parts, "; ")}
+}
+
+func checkVersionStatus(build BuildInfo, repoPath string, deps Deps) Check {
+	const transitionTarget = "0.6.0"
+
+	versionStatus := upgrade.ClassifyVersionStatus(build.Version, transitionTarget)
+	migrationStatus := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(migrationStatus)
+
+	status := StatusOK
+	parts := []string{
+		fmt.Sprintf("selected version=%s classification=%s", build.Version, versionStatus.CurrentClassification),
+		fmt.Sprintf("upgrade target=%s classification=%s", transitionTarget, versionStatus.TargetClassification),
+	}
+	if strings.TrimSpace(migrationStatus.MinLoopcoderVersion) != "" {
+		parts = append(parts, fmt.Sprintf(".delivery.yml min_loopcoder_version=%s", migrationStatus.MinLoopcoderVersion))
+	}
+	if versionStatus.CompatibilityAliasesActive {
+		parts = append(parts, "0.6.0 compatibility aliases are active for the transition window")
+	}
+	if versionStatus.BreakingBoundary {
+		status = StatusWarn
+		parts = append(parts, "selected version is before the 0.6.0 breaking boundary; run: loopcoder upgrade --version 0.6.0")
+	}
+	if versionStatus.CurrentClassification == upgrade.VersionUnknown {
+		status = StatusWarn
+		parts = append(parts, "selected version cannot be classified for the 0.6.0 transition")
+	}
+	if legacyCount > 0 {
+		status = StatusWarn
+		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); run: loopcoder doctor --repo . --fix", legacyCount))
+	} else {
+		parts = append(parts, "migration scan found no legacy surfaces")
+	}
+	if strings.TrimSpace(migrationStatus.ScanWarning) != "" {
+		if status != StatusWarn {
+			status = StatusWarn
+		}
+		parts = append(parts, migrationStatus.ScanWarning)
+	}
+	return Check{
+		Name:    "version status",
+		Status:  status,
+		Message: strings.Join(parts, "; "),
+	}
 }
 
 func checkAuditReadiness(repoPath string, delivery deliveryState, deps Deps) []Check {
@@ -1360,4 +1723,106 @@ func compareSemver(a, b semver) int {
 		return -1
 	}
 	return strings.Compare(a.prerelease, b.prerelease)
+}
+
+func checkMigrationStatus(repoPath string, deps Deps) Check {
+	status := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(status)
+
+	if legacyCount > 0 {
+		return Check{
+			Name:    "migration status",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("found %d legacy surface(s) requiring migration; run: loopcoder doctor --repo . --fix", legacyCount),
+		}
+	}
+	return Check{
+		Name:    "migration status",
+		Status:  StatusOK,
+		Message: "no legacy surfaces found",
+	}
+}
+
+func scanMigrationStatus(repoPath string, deps Deps) upgrade.MigrationStatus {
+	deps = normalizeDeps(deps)
+	udeps := upgrade.DefaultDeps()
+	udeps.Getwd = func() (string, error) { return repoPath, nil }
+	udeps.Getenv = deps.Getenv
+	udeps.ReadFile = deps.ReadFile
+	return upgrade.ScanMigrationStatus(udeps)
+}
+
+func migrationLegacyCount(status upgrade.MigrationStatus) int {
+	return len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
+}
+
+func checkStaleState(repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	opts := localcleanup.Options{
+		RepoPath: repoPath,
+	}
+	result, err := deps.CleanupPlan(opts)
+	if err != nil {
+		return Check{
+			Name:    "stale local state",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not scan local state: %v; after fixing local .loopcoder permissions, rerun: loopcoder doctor --repo .", err),
+		}
+	}
+
+	if len(result.Planned) > 0 {
+		return Check{
+			Name:    "stale local state",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("found %d cleanup-eligible item(s); run: loopcoder doctor --repo . --fix", len(result.Planned)),
+		}
+	}
+	return Check{
+		Name:    "stale local state",
+		Status:  StatusOK,
+		Message: "no cleanup-eligible items found",
+	}
+}
+
+func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }
