@@ -33,6 +33,7 @@ const (
 type SkillInstallOptions struct {
 	Dir        string
 	Force      bool
+	GlobalOnly bool
 	ProjectDir string
 }
 
@@ -122,31 +123,33 @@ func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInsta
 		result.Files = append(result.Files, fileResult)
 	}
 
-	hookSettings, err := writeConductorHookSettings(deps, opts.ProjectDir)
-	if err != nil {
-		return result, err
-	}
-	result.HookSettings = &hookSettings
+	if !opts.GlobalOnly {
+		hookSettings, err := writeConductorHookSettings(deps, opts.ProjectDir)
+		if err != nil {
+			return result, err
+		}
+		result.HookSettings = &hookSettings
 
-	marker, err := writeConductorWorkspaceMarker(deps, opts.ProjectDir)
-	if err != nil {
-		return result, err
-	}
-	result.WorkspaceMarker = &marker
+		marker, err := writeConductorWorkspaceMarker(deps, opts.ProjectDir)
+		if err != nil {
+			return result, err
+		}
+		result.WorkspaceMarker = &marker
 
-	localState, err := deps.ProtectLocalState(ctx, opts.ProjectDir)
-	if err != nil {
-		if errors.Is(err, gitlocal.ErrNotGitRepository) {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayProjectDir(opts.ProjectDir), err))
+		localState, err := deps.ProtectLocalState(ctx, opts.ProjectDir)
+		if err != nil {
+			if errors.Is(err, gitlocal.ErrNotGitRepository) {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayProjectDir(opts.ProjectDir), err))
+			} else {
+				return result, fmt.Errorf("protect local loopcoder state: %w", err)
+			}
 		} else {
-			return result, fmt.Errorf("protect local loopcoder state: %w", err)
+			localStateResult := SkillInstallFileResult{
+				Path:   localState.ExcludePath,
+				Status: SkillInstallFileStatus(localState.Status),
+			}
+			result.LocalStateExclude = &localStateResult
 		}
-	} else {
-		localStateResult := SkillInstallFileResult{
-			Path:   localState.ExcludePath,
-			Status: SkillInstallFileStatus(localState.Status),
-		}
-		result.LocalStateExclude = &localStateResult
 	}
 
 	return result, nil
@@ -358,6 +361,7 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&projectDirAlias, "Repo", "", "project directory for Claude Code .claude/settings.json")
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing skill files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing skill files")
+	fs.BoolVar(&opts.GlobalOnly, "global-only", false, "refresh only the global skill files")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -396,6 +400,7 @@ func printSkillHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --dir string    Claude Code loopcoder skill directory (default \"~/.claude/skills/loopcoder\")")
 	fmt.Fprintln(w, "  --repo string   project directory for Claude Code .claude/settings.json (default \".\")")
 	fmt.Fprintln(w, "  --force         overwrite existing skill files")
+	fmt.Fprintln(w, "  --global-only   refresh only the global skill files")
 	fmt.Fprintln(w, "  --help          show command help")
 }
 

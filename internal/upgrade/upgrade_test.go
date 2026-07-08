@@ -464,8 +464,8 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 			if name != stablePath {
 				t.Fatalf("refresh binary = %q, want selected stable binary %q", name, stablePath)
 			}
-			if !reflect.DeepEqual(args, []string{"skill", "install"}) {
-				t.Fatalf("refresh args = %#v, want skill install", args)
+			if !reflect.DeepEqual(args, []string{"skill", "install", "--global-only"}) {
+				t.Fatalf("refresh args = %#v, want global-only skill install", args)
 			}
 			return CommandResult{
 				Stdout: "loopcoder skill install complete\n" +
@@ -1134,7 +1134,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 3 || os.Args[1] != "skill" || os.Args[2] != "install" {
+	if len(os.Args) != 4 || os.Args[1] != "skill" || os.Args[2] != "install" || os.Args[3] != "--global-only" {
 		fmt.Fprintf(os.Stderr, "unexpected args: %v\n", os.Args[1:])
 		os.Exit(2)
 	}

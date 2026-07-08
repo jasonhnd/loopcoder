@@ -26,7 +26,7 @@ func TestSkillInstallHelpDocumentsFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder skill install", "--dir", "~/.claude/skills/loopcoder", "--repo", "--force"} {
+	for _, want := range []string{"loopcoder skill install", "--dir", "~/.claude/skills/loopcoder", "--repo", "--force", "--global-only"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -84,6 +84,44 @@ func TestSkillInstallRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 }
 
+func TestSkillInstallGlobalOnlySkipsProjectWrites(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	target := filepath.Join("home", ".claude", "skills", "loopcoder")
+	project := filepath.Join("work", "repo")
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"skill",
+		"install",
+		"--dir", target,
+		"--repo", project,
+		"--global-only",
+	}, &stdout, &stderr, Deps{
+		SkillInstall: func(_ context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
+			called = true
+			if opts.Dir != target || opts.ProjectDir != project || !opts.GlobalOnly {
+				t.Fatalf("skill install opts = %#v", opts)
+			}
+			return SkillInstallResult{
+				Dir: target,
+				Files: []SkillInstallFileResult{
+					{Path: filepath.Join(target, skillFilename), Status: SkillInstallFileUpdated},
+					{Path: filepath.Join(target, agentsFilename), Status: SkillInstallFileUnchanged},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("SkillInstall dependency was not called")
+	}
+	if strings.Contains(stdout.String(), "hooks ") || strings.Contains(stdout.String(), "marker ") || strings.Contains(stdout.String(), "local-state ") {
+		t.Fatalf("stdout contains project-scoped install output:\n%s", stdout.String())
+	}
+}
+
 func TestInstallSkillWritesDefaultClaudeSkillDir(t *testing.T) {
 	fsys := newSkillFakeFS()
 
@@ -112,6 +150,33 @@ func TestInstallSkillWritesDefaultClaudeSkillDir(t *testing.T) {
 	}
 	if result.HookSettings.Path != claudehooks.SettingsPath(".") {
 		t.Fatalf("HookSettings.Path = %q, want default project settings", result.HookSettings.Path)
+	}
+}
+
+func TestInstallSkillGlobalOnlyDoesNotTouchProject(t *testing.T) {
+	fsys := newSkillFakeFS()
+	protectCalled := false
+	deps := skillDepsForTest(fsys)
+	deps.ProtectLocalState = func(context.Context, string) (gitlocal.ProtectResult, error) {
+		protectCalled = true
+		return gitlocal.ProtectResult{}, nil
+	}
+
+	result, err := InstallSkill(context.Background(), SkillInstallOptions{ProjectDir: "repo", GlobalOnly: true}, deps)
+	if err != nil {
+		t.Fatalf("InstallSkill returned error: %v", err)
+	}
+	if result.HookSettings != nil || result.WorkspaceMarker != nil || result.LocalStateExclude != nil {
+		t.Fatalf("project-scoped results = hooks:%#v marker:%#v local-state:%#v, want nil", result.HookSettings, result.WorkspaceMarker, result.LocalStateExclude)
+	}
+	if protectCalled {
+		t.Fatal("ProtectLocalState was called for global-only install")
+	}
+	if _, ok := fsys.files[claudehooks.SettingsPath("repo")]; ok {
+		t.Fatal("global-only install wrote project hook settings")
+	}
+	if _, ok := fsys.files[filepath.Clean(filepath.Join("repo", conductorWorkspaceMarkerRelPath))]; ok {
+		t.Fatal("global-only install wrote conductor workspace marker")
 	}
 }
 

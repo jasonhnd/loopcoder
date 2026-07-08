@@ -1102,7 +1102,7 @@ func refreshSkill(ctx context.Context, deps Deps, binaryPath string) SkillRefres
 		return result
 	}
 
-	commandResult, err := deps.RunCommand(ctx, binaryPath, "skill", "install")
+	commandResult, err := deps.RunCommand(ctx, binaryPath, "skill", "install", "--global-only")
 	if err != nil {
 		result.Warning = fmt.Sprintf("run %s skill install: %v", binaryPath, err)
 		return result
