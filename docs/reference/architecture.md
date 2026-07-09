@@ -58,7 +58,9 @@ current worker provider registry supports `codex`, `claude`, `antigravity`,
 and experimental direct `gemini`, with `codex` as the default in the dispatch
 path. The static model registry used by `loopcoder models` covers `codex`,
 `claude`, and `antigravity`; the direct `gemini` adapter remains outside that
-registry. See [`worker.md`](worker.md) for provider details.
+registry. See [`worker.md`](worker.md) for provider details and
+[`runtime-capabilities.md`](runtime-capabilities.md) for the provider and host
+runtime capability contract.
 
 ### Verifier
 
