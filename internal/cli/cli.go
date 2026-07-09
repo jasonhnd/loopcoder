@@ -512,6 +512,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
@@ -4423,6 +4424,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var baseBranchAlias string
 	var runID string
 	var runIDAlias string
+	var outputFormat string
+	var outputFormatAlias string
 	var configFromBase bool
 	var configFromBaseAlias bool
 
@@ -4432,6 +4435,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&outputFormat, "format", "text", "output format")
+	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
@@ -4447,10 +4452,19 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if runIDAlias != "" {
 		runID = runIDAlias
 	}
+	if outputFormatAlias != "" {
+		outputFormat = outputFormatAlias
+	}
 	configFromBase = configFromBase || configFromBaseAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "resume: --repo is required")
+		return 2
+	}
+	switch outputFormat {
+	case "text", "json", "both":
+	default:
+		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, or both\n", outputFormat)
 		return 2
 	}
 
@@ -4503,7 +4517,23 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 
-	fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+	if outputFormat == "text" || outputFormat == "both" {
+		fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+	}
+	if outputFormat == "both" {
+		fmt.Fprintln(stdout)
+	}
+	if outputFormat == "json" || outputFormat == "both" {
+		data, err := report.MarshalResumeJSON(resumeReport)
+		if err != nil {
+			fmt.Fprintf(stderr, "resume: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
+	}
 	return 0
 }
 

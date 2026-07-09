@@ -480,6 +480,25 @@ same decision from the same inputs.
 The conductor should append reconciliation decisions to `events.jsonl` so later
 sessions can see why a worker was killed, adopted, retried, or blocked.
 
+`loopcoder resume --format json` is the read-only recovery inspection surface.
+It must include:
+
+- `run_tree`: the inspected run plus durable parent/child edges, current
+  lifecycle state, whether each run appears interrupted, and a conservative
+  per-run `recovery_decision`.
+- per-issue `recovery_decision`: `outcome`, `safe_to_resume`, `retry_allowed`,
+  `needs_human`, recovery context paths, and PR links when present.
+- guardrail-frozen or otherwise ambiguous work as
+  `recovery_decision.needs_human: true`; resume must not retry, adopt, push, or
+  merge these cases.
+- failed, cancelled, abandoned, hung, or orphaned work as retryable only when
+  the existing budget and circuit-breaker ledgers do not already require human
+  input.
+
+The JSON report is an inspection artifact, not an automatic mutation path.
+Recovery commands may write attempts and guardrail ledgers; resume reports the
+decision that follows from those durable records.
+
 ## Relationship To Scheduling
 
 The resilience layer does not change the two ordering axes in

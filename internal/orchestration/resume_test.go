@@ -195,6 +195,7 @@ func TestComputeResumeMarksGuardrailFrozenIssueBlocked(t *testing.T) {
 		Observed: guardrails.Observed{
 			NoProgressAttempts: 2,
 		},
+		RecoveryContextPath:    ".loopcoder/runs/run-test/recovery/job-7-context.md",
 		LastMaterialProgressAt: "2026-06-27T12:00:00Z",
 		DecisionAt:             time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC),
 	}); err != nil {
@@ -223,13 +224,101 @@ func TestComputeResumeMarksGuardrailFrozenIssueBlocked(t *testing.T) {
 	if issue.Classification != "guardrail-frozen" || issue.ActionKind != "blocked" {
 		t.Fatalf("resume issue = %#v, want guardrail-frozen blocked", issue)
 	}
+	if issue.RecoveryDecision == nil ||
+		!issue.RecoveryDecision.NeedsHuman ||
+		issue.RecoveryDecision.RetryAllowed ||
+		issue.RecoveryDecision.Outcome != "needs-human" ||
+		issue.RecoveryDecision.RecoveryContextPath != ".loopcoder/runs/run-test/recovery/job-7-context.md" {
+		t.Fatalf("recovery decision = %#v, want needs-human guardrail-frozen decision with recovery context", issue.RecoveryDecision)
+	}
 	if !strings.Contains(issue.Action, "guardrails.circuit_breaker.max_no_progress_attempts") {
 		t.Fatalf("action missing circuit reason:\n%s", issue.Action)
 	}
 	evidence := strings.Join(issue.Evidence, "\n")
-	for _, want := range []string{"guardrail: guardrails.circuit_breaker.max_no_progress_attempts", "no-progress waves=0, attempts=2", "last material progress=2026-06-27T12:00:00Z"} {
+	for _, want := range []string{"guardrail: guardrails.circuit_breaker.max_no_progress_attempts", "no-progress waves=0, attempts=2", "last material progress=2026-06-27T12:00:00Z", "recovery: .loopcoder/runs/run-test/recovery/job-7-context.md"} {
 		if !strings.Contains(evidence, want) {
 			t.Fatalf("evidence missing %q:\n%s", want, evidence)
 		}
 	}
+}
+
+func TestComputeResumeIncludesInterruptedParentChildRunTree(t *testing.T) {
+	repo := t.TempDir()
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp: "2026-07-09T00:00:00Z",
+		RunID:     "run-parent",
+		State:     state.StatePlanned,
+		Source:    "test",
+	}); err != nil {
+		t.Fatalf("append parent planned: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:01Z",
+		RunID:      "run-parent",
+		State:      state.StateRunning,
+		ChildRunID: "run-child",
+		Source:     "test",
+	}); err != nil {
+		t.Fatalf("append parent running: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:02Z",
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		State:       state.StatePlanned,
+		Source:      "test",
+	}); err != nil {
+		t.Fatalf("append child planned: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:03Z",
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		State:       state.StateRunning,
+		Source:      "test",
+	}); err != nil {
+		t.Fatalf("append child running: %v", err)
+	}
+
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader: fakeReader{
+			repo: "owner/repo",
+		},
+		RepoPath:     repo,
+		BaseBranch:   "main",
+		RunID:        "run-parent",
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 9, 0, 1, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+	if result.RunTree.RootRunID != "run-parent" || len(result.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree = %#v, want parent plus child", result.RunTree)
+	}
+	nodes := map[string]state.LifecycleState{}
+	decisions := map[string]*reportDecisionProbe{}
+	for _, node := range result.RunTree.Nodes {
+		nodes[node.RunID] = state.LifecycleState(node.State)
+		decisions[node.RunID] = &reportDecisionProbe{
+			Interrupted:  node.Interrupted,
+			Outcome:      node.RecoveryDecision.Outcome,
+			SafeToResume: node.RecoveryDecision.SafeToResume,
+		}
+	}
+	if nodes["run-parent"] != state.StateRunning || nodes["run-child"] != state.StateRunning {
+		t.Fatalf("node states = %#v", nodes)
+	}
+	for runID, decision := range decisions {
+		if !decision.Interrupted || decision.Outcome != "resume" || !decision.SafeToResume {
+			t.Fatalf("%s decision = %#v, want interrupted safe resume", runID, decision)
+		}
+	}
+}
+
+type reportDecisionProbe struct {
+	Interrupted  bool
+	Outcome      string
+	SafeToResume bool
 }
