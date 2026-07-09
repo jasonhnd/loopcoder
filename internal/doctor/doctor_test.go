@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -60,6 +61,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"conductor hooks",
 		"report query",
 		"storage",
+		"project registry",
 		"migration status",
 		"stale local state",
 		"conductor runtime",
@@ -218,6 +220,59 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRunWarnsForAmbiguousProjectRegistryIdentity(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.projectShow = func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {
+		return registry.ShowResult{
+			Project: registry.Project{
+				ProjectID:      "proj_current",
+				LocalPath:      opts.RepoPath,
+				IdentitySource: registry.IdentityGitHub,
+			},
+			Conflicts: []registry.Project{{
+				ProjectID:      "proj_conflict",
+				IdentitySource: registry.IdentityGitRemote,
+			}},
+		}, nil
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "project registry")
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"ambiguous", "proj_conflict", "loopcoder projects show --repo ."} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestRenderJSONIncludesProjectRegistryCheck(t *testing.T) {
+	report := WithMetadata(Report{Checks: []Check{
+		{Name: "project registry", Status: StatusWarn, Message: "project identity is ambiguous"},
+	}}, "/repo", BuildInfo{})
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		Checks []struct {
+			Name    string `json:"name"`
+			Status  Status `json:"status"`
+			Message string `json:"message"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.Checks) != 1 || payload.Checks[0].Name != "project registry" || payload.Checks[0].Status != StatusWarn {
+		t.Fatalf("payload checks = %#v", payload.Checks)
 	}
 }
 
@@ -871,7 +926,7 @@ func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{"loopcoder.db", "schema_version=1", "health=ok"} {
+	for _, want := range []string{"loopcoder.db", fmt.Sprintf("schema_version=%d", storage.CurrentSchemaVersion), "health=ok"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("message = %q, want containing %q", check.Message, want)
 		}
@@ -1362,6 +1417,7 @@ type fakeDoctorEnv struct {
 	userHome       string
 	skillFiles     map[string][]byte
 	files          map[string][]byte
+	projectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -1415,6 +1471,20 @@ func (f *fakeDoctorEnv) deps() Deps {
 				SchemaVersion: storage.CurrentSchemaVersion,
 				OK:            true,
 				Message:       "healthy",
+			}, nil
+		},
+		ProjectShow: func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {
+			if f.projectShow != nil {
+				return f.projectShow(context.Background(), opts)
+			}
+			return registry.ShowResult{
+				Registered: true,
+				Project: registry.Project{
+					ProjectID:      "proj_test",
+					DisplayName:    "repo",
+					LocalPath:      opts.RepoPath,
+					IdentitySource: registry.IdentityGitHub,
+				},
 			}, nil
 		},
 	}

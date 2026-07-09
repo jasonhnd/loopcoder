@@ -17,7 +17,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 1
+	CurrentSchemaVersion = 2
 
 	driverName = "sqlite"
 )
@@ -125,6 +125,18 @@ var migrations = []migration{
 				created_at TEXT NOT NULL
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_reports_run_id ON reports(run_id)`,
+		},
+	},
+	{
+		version: 2,
+		name:    "project identity fields",
+		statements: []string{
+			`ALTER TABLE projects ADD COLUMN local_path_canonical TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE projects ADD COLUMN git_root TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE projects ADD COLUMN remote_url_normalized TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE projects ADD COLUMN identity_source TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_projects_local_path_canonical ON projects(local_path_canonical)`,
+			`CREATE INDEX IF NOT EXISTS idx_projects_remote_url_normalized ON projects(remote_url_normalized)`,
 		},
 	},
 }

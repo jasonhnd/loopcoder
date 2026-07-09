@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -71,6 +73,7 @@ type Deps struct {
 	AgentsMarkdown func() ([]byte, error)
 	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
 	StorageHealth  func(context.Context, string) (storage.Health, error)
+	ProjectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 }
 
 type CommandResult struct {
@@ -228,6 +231,9 @@ func DefaultDeps() Deps {
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
 		CleanupPlan:    localcleanup.Plan,
 		StorageHealth:  storage.CheckHealth,
+		ProjectShow: func(ctx context.Context, opts registry.Options) (registry.ShowResult, error) {
+			return registry.Show(ctx, opts, registry.DefaultDeps())
+		},
 	}
 }
 
@@ -280,6 +286,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, checkReportQuery(repoPath))
 	checks = append(checks, checkStorageHealth(ctx, deps))
+	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
@@ -628,6 +635,9 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.StorageHealth == nil {
 		deps.StorageHealth = defaults.StorageHealth
 	}
+	if deps.ProjectShow == nil {
+		deps.ProjectShow = defaults.ProjectShow
+	}
 	return deps
 }
 
@@ -888,6 +898,69 @@ func checkStorageHealth(ctx context.Context, deps Deps) Check {
 		Name:    "storage",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("path=%s schema_version=%d health=ok", path, health.SchemaVersion),
+	}
+}
+
+func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for project registry: %v", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusInfo,
+			Message: "project is not registered; global registry database has not been created",
+		}
+	}
+	if !health.OK {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect project registry because storage is unhealthy: %s", firstNonEmpty(health.Message, "unhealthy")),
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect project registry: %v", err),
+		}
+	}
+	if len(result.Conflicts) > 0 {
+		ids := make([]string, 0, len(result.Conflicts))
+		for _, conflict := range result.Conflicts {
+			ids = append(ids, conflict.ProjectID)
+		}
+		sort.Strings(ids)
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("project identity is ambiguous; local path also matches registered project(s): %s; run: loopcoder projects show --repo .", strings.Join(ids, ", ")),
+		}
+	}
+	if !result.Registered {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("project is not registered; resolved candidate %s from %s; run: loopcoder projects register --repo .", result.Project.ProjectID, result.Project.IdentitySource),
+		}
+	}
+	return Check{
+		Name:    "project registry",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("registered project_id=%s identity=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, result.Project.LocalPath),
 	}
 }
 

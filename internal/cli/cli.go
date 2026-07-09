@@ -27,6 +27,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -87,6 +88,7 @@ var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
+	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -256,6 +258,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "models" {
 		return runModels(args[1:], stdout, stderr)
 	}
+	if command.Name == "projects" {
+		return runProjects(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
 	}
@@ -361,6 +366,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "relay" {
 		printRelayHelp(w)
+		return
+	}
+	if command.Name == "projects" {
+		printProjectsHelp(w)
 		return
 	}
 
@@ -758,6 +767,199 @@ func renderModelProviders(w io.Writer, providers []models.Provider) error {
 		}
 	}
 	return nil
+}
+
+func runProjects(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		printProjectsHelp(stdout)
+		return 0
+	}
+	action := args[0]
+	switch action {
+	case "register":
+		return runProjectsRegister(args[1:], stdout, stderr, deps)
+	case "list":
+		return runProjectsList(args[1:], stdout, stderr, deps)
+	case "show":
+		return runProjectsShow(args[1:], stdout, stderr, deps)
+	case "remove":
+		return runProjectsRemove(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "projects: unknown subcommand %q\n\n", action)
+		printProjectsHelp(stderr)
+		return 2
+	}
+}
+
+func printProjectsHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder projects register --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects list [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Register, inspect, list, and remove projects from the machine-local registry.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
+	fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help            show command help")
+}
+
+func runProjectsRegister(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects register", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Register(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects register: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects register", result)
+	}
+	action := "registered"
+	if result.Updated {
+		action = "updated"
+	}
+	fmt.Fprintf(stdout, "%s project %s (%s)\n", action, result.Project.ProjectID, result.Project.DisplayName)
+	fmt.Fprintf(stdout, "path: %s\n", result.Project.LocalPath)
+	fmt.Fprintf(stdout, "identity: %s\n", result.Project.IdentitySource)
+	if result.Project.RemoteURLNormalized != "" {
+		fmt.Fprintf(stdout, "remote: %s\n", result.Project.RemoteURLNormalized)
+	}
+	return 0
+}
+
+func runProjectsList(args []string, stdout, stderr io.Writer, deps Deps) int {
+	_, format, ok := parseProjectsRepoFormat("projects list", args, stderr, false)
+	if !ok {
+		return 2
+	}
+	projects, err := registry.List(context.Background(), registry.Options{Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects list: %v\n", err)
+		return 1
+	}
+	payload := struct {
+		Projects []registry.Project `json:"projects"`
+	}{Projects: projects}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects list", payload)
+	}
+	if len(projects) == 0 {
+		fmt.Fprintln(stdout, "no registered projects")
+		return 0
+	}
+	for _, project := range projects {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", project.ProjectID, project.DisplayName, project.IdentitySource, project.LocalPath)
+	}
+	return 0
+}
+
+func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects show", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Show(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects show: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects show", result)
+	}
+	status := "not registered"
+	if result.Registered {
+		status = "registered"
+	}
+	fmt.Fprintf(stdout, "status: %s\n", status)
+	fmt.Fprintf(stdout, "project_id: %s\n", result.Project.ProjectID)
+	fmt.Fprintf(stdout, "display_name: %s\n", result.Project.DisplayName)
+	fmt.Fprintf(stdout, "path: %s\n", result.Project.LocalPath)
+	fmt.Fprintf(stdout, "identity: %s\n", result.Project.IdentitySource)
+	if result.Project.RemoteURLNormalized != "" {
+		fmt.Fprintf(stdout, "remote: %s\n", result.Project.RemoteURLNormalized)
+	}
+	if len(result.Conflicts) > 0 {
+		fmt.Fprintln(stdout, "conflicts:")
+		for _, conflict := range result.Conflicts {
+			fmt.Fprintf(stdout, "  - %s %s %s\n", conflict.ProjectID, conflict.IdentitySource, conflict.RemoteURLNormalized)
+		}
+	}
+	return 0
+}
+
+func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects remove", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Remove(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects remove: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects remove", result)
+	}
+	if result.Removed {
+		fmt.Fprintf(stdout, "removed project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+	} else {
+		fmt.Fprintf(stdout, "project %s is not registered\n", result.Project.ProjectID)
+	}
+	fmt.Fprintln(stdout, "run_history_deleted: false")
+	return 0
+}
+
+func parseProjectsRepoFormat(name string, args []string, stderr io.Writer, includeRepo bool) (string, string, bool) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	format := "text"
+	var formatAlias string
+	if includeRepo {
+		fs.StringVar(&repoPath, "repo", ".", "repository path")
+		fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	}
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	if err := fs.Parse(args); err != nil {
+		return "", "", false
+	}
+	if includeRepo && repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "%s: invalid --format %q; want text or json\n", name, format)
+		return "", "", false
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", name, fs.Arg(0))
+		return "", "", false
+	}
+	return repoPath, format, true
+}
+
+func writeProjectJSON(stdout, stderr io.Writer, prefix string, payload any) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(payload); err != nil {
+		fmt.Fprintf(stderr, "%s: write output: %v\n", prefix, err)
+		return 1
+	}
+	return 0
 }
 
 func renderedDefaultDepth(depth string) string {

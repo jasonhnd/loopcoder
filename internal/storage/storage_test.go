@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,55 @@ func TestOpenMigratesExistingEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesProjectIdentityColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	for _, statement := range []string{
+		`CREATE TABLE migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE projects (
+			id TEXT PRIMARY KEY,
+			remote_url TEXT NOT NULL DEFAULT '',
+			github_owner TEXT NOT NULL DEFAULT '',
+			github_name TEXT NOT NULL DEFAULT '',
+			local_path TEXT NOT NULL,
+			default_branch TEXT NOT NULL DEFAULT '',
+			display_name TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE SET NULL, parent_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, issue_number INTEGER, status TEXT NOT NULL DEFAULT '', started_at TEXT, ended_at TEXT, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE run_events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, sequence INTEGER NOT NULL, ts TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', UNIQUE(run_id, sequence))`,
+		`CREATE TABLE run_edges (parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, child_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, edge_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, PRIMARY KEY(parent_run_id, child_run_id))`,
+		`CREATE TABLE reports (id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, role TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', started_at TEXT, ended_at TEXT, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (1, 'initial runtime schema', '2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec v1 fixture statement: %v\n%s", err, statement)
+		}
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	if health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, CurrentSchemaVersion)
+	}
+	for _, column := range []string{"local_path_canonical", "git_root", "remote_url_normalized", "identity_source"} {
+		if !projectColumnExists(t, store, column) {
+			t.Fatalf("missing migrated projects column %s", column)
+		}
+	}
+}
+
 func TestOpenFailsForUnsupportedSchemaVersion(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -83,7 +133,7 @@ func TestOpenFailsForUnsupportedSchemaVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open returned nil error, want unsupported version")
 	}
-	for _, want := range []string{"unsupported storage schema version 999", "supports schema version 1"} {
+	for _, want := range []string{"unsupported storage schema version 999", fmt.Sprintf("supports schema version %d", CurrentSchemaVersion)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want containing %q", err.Error(), want)
 		}
@@ -212,6 +262,36 @@ func tableExists(t *testing.T, store Store, table string) bool {
 		t.Fatalf("query table %s: %v", table, err)
 	}
 	return count == 1
+}
+
+func projectColumnExists(t *testing.T, store Store, column string) bool {
+	t.Helper()
+	found := false
+	if err := store.WithTx(context.Background(), func(tx Tx) error {
+		rows, err := tx.Query(context.Background(), `PRAGMA table_info(projects)`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name string
+			var typ string
+			var notNull int
+			var defaultValue any
+			var pk int
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+				return err
+			}
+			if name == column {
+				found = true
+			}
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("query projects columns: %v", err)
+	}
+	return found
 }
 
 func createRawDB(t *testing.T, path string) *sql.DB {
