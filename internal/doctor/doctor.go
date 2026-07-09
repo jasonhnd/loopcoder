@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
@@ -89,6 +90,7 @@ type Report struct {
 	Commit   string
 	Date     string
 	Checks   []Check
+	Host     hostprofile.Profile
 }
 
 func (r Report) ExitCode() int {
@@ -142,6 +144,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		Commit   string          `json:"commit"`
 		Date     string          `json:"date"`
 		ExitCode int             `json:"exit_code"`
+		Host     any             `json:"host_profile,omitempty"`
 		Checks   []renderedCheck `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
@@ -150,6 +153,9 @@ func RenderJSON(w io.Writer, report Report) error {
 		Date:     report.Date,
 		ExitCode: report.ExitCode(),
 		Checks:   checks,
+	}
+	if strings.TrimSpace(report.Host.Name) != "" {
+		payload.Host = report.Host
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
@@ -236,13 +242,10 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkReportQuery(repoPath))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
 	checks = append(checks, checkStaleState(repoPath, deps))
-	checks = append(checks, Check{
-		Name:    "conductor runtime",
-		Status:  StatusOK,
-		Message: "user-provided by the active Claude Code or Codex host; loopcoder does not ship it",
-	})
+	host, hostCheck := resolveHostProfile(delivery.Config.Host.Profile, deps)
+	checks = append(checks, hostCheck)
 
-	return WithMetadata(Report{Checks: checks}, repoPath, build)
+	return WithMetadata(Report{Checks: checks, Host: host}, repoPath, build)
 }
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
@@ -1990,6 +1993,28 @@ func checkStaleState(repoPath string, deps Deps) Check {
 		Name:    "stale local state",
 		Status:  StatusOK,
 		Message: "no cleanup-eligible items found",
+	}
+}
+
+func resolveHostProfile(configProfile string, deps Deps) (hostprofile.Profile, Check) {
+	profile, err := hostprofile.Resolve(configProfile, deps.Getenv)
+	if err != nil {
+		return hostprofile.Profile{}, Check{
+			Name:    "conductor runtime",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("host profile could not be resolved: %v", err),
+		}
+	}
+	return profile, Check{
+		Name:   "conductor runtime",
+		Status: StatusOK,
+		Message: fmt.Sprintf("%s resolved from %s; cwd=%s; repo=%s; output=%s",
+			profile.Name,
+			profile.Source,
+			profile.CWDPolicy,
+			profile.RepoPathPolicy,
+			profile.OutputPolicy,
+		),
 	}
 }
 

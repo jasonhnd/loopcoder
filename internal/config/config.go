@@ -14,6 +14,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
@@ -32,6 +33,7 @@ type Config struct {
 	Domain       Domain       `yaml:"domain,omitempty"`
 	MCP          MCP          `yaml:"mcp,omitempty"`
 	Audit        Audit        `yaml:"audit,omitempty"`
+	Host         Host         `yaml:"host,omitempty"`
 	Report       Report       `yaml:"report"`
 }
 
@@ -135,6 +137,10 @@ type ResilienceVerifier struct {
 
 type Report struct {
 	Channel string `yaml:"channel"`
+}
+
+type Host struct {
+	Profile string `yaml:"profile,omitempty"`
 }
 
 type Environment struct {
@@ -418,6 +424,9 @@ func validateParsedConfig(cfg Config) error {
 		return err
 	}
 	if err := validateAudit(cfg.Audit); err != nil {
+		return err
+	}
+	if err := validateHost(cfg.Host); err != nil {
 		return err
 	}
 	return nil
@@ -827,6 +836,13 @@ func validateAudit(a Audit) error {
 		if command.TimeoutSeconds < 0 {
 			return fmt.Errorf("invalid delivery config: %s.timeout_seconds must not be negative", path)
 		}
+	}
+	return nil
+}
+
+func validateHost(h Host) error {
+	if err := hostprofile.ValidateName(h.Profile); err != nil {
+		return fmt.Errorf("invalid delivery config: %w", err)
 	}
 	return nil
 }

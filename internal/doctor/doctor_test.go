@@ -207,6 +207,44 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 }
 
+func TestRunReportsHostProfileInDoctorJSON(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Host.Profile = "claudecode"
+	env.file = []byte("version: 1\nhost:\n  profile: claudecode\n")
+	env.env = map[string]string{"LOOPCODER_HOST": "codex"}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if report.Host.Name != "codex" || report.Host.Source != "env:LOOPCODER_HOST" {
+		t.Fatalf("Host = %#v, want codex from env override", report.Host)
+	}
+	check := requireCheck(t, report, "conductor runtime")
+	if check.Status != StatusOK || !strings.Contains(check.Message, "codex resolved from env:LOOPCODER_HOST") {
+		t.Fatalf("conductor runtime check = %#v", check)
+	}
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		Host struct {
+			Name            string `json:"name"`
+			Source          string `json:"source"`
+			OutputPolicy    string `json:"output_policy"`
+			MachineReadable bool   `json:"machine_readable"`
+		} `json:"host_profile"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.Host.Name != "codex" || payload.Host.Source != "env:LOOPCODER_HOST" || !payload.Host.MachineReadable {
+		t.Fatalf("host_profile = %#v", payload.Host)
+	}
+	if !strings.Contains(payload.Host.OutputPolicy, "JSON formats emit only JSON on stdout") {
+		t.Fatalf("output_policy = %q", payload.Host.OutputPolicy)
+	}
+}
+
 func TestRunChecksConductorHookSettings(t *testing.T) {
 	tests := []struct {
 		name     string

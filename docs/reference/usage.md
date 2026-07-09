@@ -326,6 +326,9 @@ worker:
   command_hint: "implement the issue, run relevant checks, commit"
 environment:
   pre_prod_branch: pre-prod # Tick auto-merges clean PRs here only; promote is the separate production step.
+# host:
+#   # Optional. auto detects the calling agent host; explicit values are codex, claude, claudecode, claude-code, paseo, or generic.
+#   profile: auto
 # evidence:
 #   # Optional. Tick copies configured evidence onto dispatched, pending, and pre-prod report items.
 #   website:
@@ -367,6 +370,12 @@ explicit human promotion behavior unless the project opts into `auto`.
 `preview_url`, `example_output`, `test_results`, and `preview_build`. `tick`
 copies those configured artifacts into the JSON report and the human-readable
 summary for dispatched, pending, and pre-prod items.
+
+`host.profile` is optional and describes the interactive agent host that invokes
+the `loopcoder` binary. It is separate from Worker and Verifier provider/model
+selection. Set `LOOPCODER_HOST` for a one-off override, or configure
+`host.profile: auto`, `codex`, `claude`, `claudecode`, `claude-code`, `paseo`,
+or `generic`; see [`host-profiles.md`](host-profiles.md).
 
 The verifier role has its own optional model and `reasoning_effort` depth
 settings. Quote model IDs that contain YAML-special characters such as `[1m]`:
@@ -473,8 +482,8 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
-- conductor runtime responsibility, which remains user-provided by the active
-  host.
+- resolved host invocation profile, including explicit `LOOPCODER_HOST`,
+  configured `host.profile`, detected host signals, and generic fallback.
 
 Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
@@ -490,6 +499,19 @@ probe.
   "commit": "abc123",
   "date": "2026-07-08T00:00:00Z",
   "exit_code": 0,
+  "host_profile": {
+    "name": "codex",
+    "source": "env:LOOPCODER_HOST",
+    "cwd_policy": "resolve cwd before command execution",
+    "repo_path_policy": "normalize --repo to an absolute directory path",
+    "env_policy": "preserve caller environment; LOOPCODER_* variables are loopcoder-owned",
+    "output_policy": "human output on stdout, diagnostics on stderr, JSON formats emit only JSON on stdout",
+    "nested_subagents": true,
+    "private_api": false,
+    "hooks": "best-effort",
+    "machine_readable": true,
+    "human_description": "Codex-style host"
+  },
   "checks": [
     {
       "name": "local-state exclude",
