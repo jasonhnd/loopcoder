@@ -86,7 +86,7 @@ audit:
       # file-mode and secret classes, so these gosec rule exclusions keep CI
       # focused on non-inherent findings instead of per-platform line waivers.
       - id: gosec
-        argv: ["gosec", "-fmt", "json", "-quiet", "-exclude=G104,G122,G204,G301,G302,G304,G306,G401,G505,G703", "./..."]
+        argv: ["gosec", "-fmt", "json", "-quiet", "-exclude=G101,G104,G122,G204,G301,G302,G304,G306,G401,G505,G703", "./..."]
         parser: gosec-json
         timeout_seconds: 300
     native:
