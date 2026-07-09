@@ -3,6 +3,7 @@ package doctor
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -333,6 +334,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkReportQuery(repoPath))
 	checks = append(checks, checkStorageHealth(ctx, deps))
 	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
+	checks = append(checks, checkLocalStateImport(ctx, repoPath, deps))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
@@ -1012,6 +1014,104 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 		Status:  StatusOK,
 		Message: fmt.Sprintf("registered project_id=%s identity=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, result.Project.LocalPath),
 	}
+}
+
+func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	if !legacyLocalStatePresent(repoPath) {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusOK,
+			Message: "no repo-local .loopcoder history found for storage import",
+		}
+	}
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("repo-local .loopcoder history exists, but loopcoder home could not be resolved: %v; run: loopcoder migrate local-state --repo .", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists || !health.OK {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists and has not been imported into healthy storage; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil || !result.Registered {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but this project has no import status; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	status, malformed, err := readLocalStateImportStatus(ctx, path, result.Project.ProjectID)
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect local state import status: %v; run: loopcoder migrate local-state --repo .", err),
+		}
+	}
+	if strings.TrimSpace(status) == "" {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but no import status is recorded for this project; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	if malformed > 0 {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("last local state import status=%s with %d malformed record(s); fix records or rerun: loopcoder migrate local-state --repo .", status, malformed),
+		}
+	}
+	return Check{
+		Name:    "local state import",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("repo-local .loopcoder history import recorded for project_id=%s status=%s", result.Project.ProjectID, status),
+	}
+}
+
+func legacyLocalStatePresent(repoPath string) bool {
+	for _, rel := range []string{
+		filepath.Join(".loopcoder", "runs"),
+		filepath.Join(".loopcoder", "relay"),
+		filepath.Join(".loopcoder", "audit"),
+	} {
+		info, err := os.Stat(filepath.Join(repoPath, rel))
+		if err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func readLocalStateImportStatus(ctx context.Context, dbPath, projectID string) (string, int, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer db.Close()
+	var status string
+	var malformed int
+	err = db.QueryRowContext(ctx, `SELECT status, malformed_count FROM legacy_import_status WHERE project_id = ?`, projectID).Scan(&status, &malformed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, nil
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	return status, malformed, nil
 }
 
 type deliveryState struct {

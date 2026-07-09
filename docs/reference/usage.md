@@ -108,6 +108,7 @@ Command side effects in the first-run path:
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry. |
+| `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
@@ -667,6 +668,9 @@ loopcoder projects list --format json
 loopcoder projects show --repo .
 loopcoder projects remove --repo .
 
+loopcoder migrate local-state --repo .
+loopcoder migrate local-state --repo . --format json
+
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
 
@@ -761,10 +765,10 @@ loopcoder kill --repo . --all
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
-`discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
-advanced/operator commands. `state push` is the explicit state-branch publish
-path; `kill` only targets loopcoder-managed processes for a run or repository
-and should not be used as a bare process-name terminator.
+`discover`, `compile`, `trigger`, `state`, `lease`, `migrate`, `ps`, and
+`kill` are advanced/operator commands. `state push` is the explicit
+state-branch publish path; `kill` only targets loopcoder-managed processes for
+a run or repository and should not be used as a bare process-name terminator.
 
 ## Exit Codes
 
@@ -834,6 +838,26 @@ stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
 gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
+
+## Local State Migration
+
+`loopcoder migrate local-state --repo .` imports v0.6.x repo-local
+`.loopcoder/` attempts, events, reports, recovery briefs, relay records, and
+audit-style JSON/JSONL records into the v0.7.0 machine-local SQLite store under
+`$LOOPCODER_HOME/data/loopcoder.db`.
+
+The migration is explicit and idempotent. It registers or refreshes the current
+project identity, records source-path and content-hash metadata, and skips
+records already imported on prior runs. Malformed JSON or JSONL input is
+reported with a source path and line when available, but malformed records do
+not abort import of other valid records.
+
+The command copies state only. It does not delete `.loopcoder/`, rewrite legacy
+files, edit tracked repository files, mutate GitHub, or publish state to the
+state branch. Existing file readers remain the fallback during the
+compatibility window. After migration, `loopcoder report --repo . --format json`
+includes imported records with `source` values such as `imported:attempt` plus
+the original source path metadata.
 
 `loopcoder report` is the read-only query surface for those local records:
 

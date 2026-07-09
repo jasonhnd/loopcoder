@@ -17,7 +17,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 2
+	CurrentSchemaVersion = 3
 
 	driverName = "sqlite"
 )
@@ -139,9 +139,46 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_projects_remote_url_normalized ON projects(remote_url_normalized)`,
 		},
 	},
+	{
+		version: 3,
+		name:    "legacy local state import metadata",
+		statements: []string{
+			`ALTER TABLE reports ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE reports ADD COLUMN source_path TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE reports ADD COLUMN source_hash TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE reports ADD COLUMN source_kind TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_reports_project_id ON reports(project_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_reports_source_hash ON reports(source_hash)`,
+			`CREATE TABLE IF NOT EXISTS legacy_import_records (
+				id TEXT PRIMARY KEY,
+				project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				run_id TEXT,
+				record_type TEXT NOT NULL,
+				source_path TEXT NOT NULL,
+				source_line INTEGER NOT NULL DEFAULT 0,
+				source_hash TEXT NOT NULL,
+				payload_json TEXT NOT NULL DEFAULT '{}',
+				imported_at TEXT NOT NULL
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
+			`CREATE INDEX IF NOT EXISTS idx_legacy_import_records_project ON legacy_import_records(project_id)`,
+			`CREATE TABLE IF NOT EXISTS legacy_import_status (
+				project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+				repo_path TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				completed_at TEXT NOT NULL,
+				status TEXT NOT NULL,
+				scanned_count INTEGER NOT NULL DEFAULT 0,
+				imported_count INTEGER NOT NULL DEFAULT 0,
+				skipped_count INTEGER NOT NULL DEFAULT 0,
+				malformed_count INTEGER NOT NULL DEFAULT 0,
+				message TEXT NOT NULL DEFAULT ''
+			)`,
+		},
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports"}
+var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "legacy_import_records", "legacy_import_status"}
 
 type migration struct {
 	version    int

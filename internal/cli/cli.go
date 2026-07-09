@@ -21,6 +21,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -55,33 +56,34 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter   func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive     func(pid int) bool
-	Now              func() time.Time
-	IsTerminal       func(w io.Writer) bool
-	Stdin            io.Reader
-	BuildInfo        BuildInfo
-	ComputeReadySet  func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick             func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover         func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote          func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify           func(ctx context.Context, opts verify.Options) verify.Result
-	Audit            func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init             func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade          func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	SkillInstall     func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush        func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull        func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader   func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter    func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter  func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter  func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive      func(pid int) bool
+	Now               func() time.Time
+	IsTerminal        func(w io.Writer) bool
+	Stdin             io.Reader
+	BuildInfo         BuildInfo
+	ComputeReadySet   func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick              func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover          func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile           func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch          func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview        func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote           func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover           func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify            func(ctx context.Context, opts verify.Options) verify.Result
+	Audit             func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor            func(ctx context.Context, opts doctor.Options) doctor.Report
+	Init              func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade           func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall      func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush         func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull         func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
@@ -98,6 +100,7 @@ var commands = []Command{
 	{Name: "trigger", Summary: "run automation triggers for tick"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
+	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
@@ -194,6 +197,9 @@ func DefaultDeps() Deps {
 		Upgrade: func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error) {
 			return upgrade.Run(ctx, opts, upgrade.DefaultDeps())
 		},
+		MigrateLocalState: func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
+			return localmigrate.LocalState(ctx, opts, localmigrate.DefaultDeps())
+		},
 		SkillInstall: func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
 			return InstallSkill(ctx, opts, DefaultSkillInstallDeps())
 		},
@@ -288,6 +294,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "migrate" {
+		return runMigrate(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "skill" {
 		return runSkill(args[1:], stdout, stderr, deps)
 	}
@@ -370,6 +379,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "projects" {
 		printProjectsHelp(w)
+		return
+	}
+	if command.Name == "migrate" {
+		printMigrateHelp(w)
 		return
 	}
 
@@ -960,6 +973,129 @@ func writeProjectJSON(stdout, stderr io.Writer, prefix string, payload any) int 
 		return 1
 	}
 	return 0
+}
+
+func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		printMigrateHelp(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "local-state":
+		return runMigrateLocalState(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
+		printMigrateHelp(stderr)
+		return 2
+	}
+}
+
+func printMigrateHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--format text|json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Import legacy repo-local .loopcoder records into machine-local storage.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Subcommands:")
+	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --help        show command help")
+}
+
+func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.MigrateLocalState == nil {
+		deps.MigrateLocalState = DefaultDeps().MigrateLocalState
+	}
+	fs := flag.NewFlagSet("migrate local-state", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	format := "text"
+	var formatAlias string
+
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	switch format {
+	case "text", "json":
+	default:
+		fmt.Fprintf(stderr, "migrate local-state: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+		return 2
+	}
+	result, err := deps.MigrateLocalState(context.Background(), localmigrate.Options{
+		RepoPath: resolvedRepo,
+		Now:      deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		data, err := json.Marshal(result)
+		if err != nil {
+			fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(append(data, '\n')); err != nil {
+			fmt.Fprintf(stderr, "migrate local-state: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if _, err := stdout.Write([]byte(renderMigrateLocalStateText(result))); err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderMigrateLocalStateText(result localmigrate.Result) string {
+	var out strings.Builder
+	fmt.Fprintln(&out, "LOCAL STATE MIGRATION")
+	fmt.Fprintf(&out, "status: %s\n", result.Status)
+	fmt.Fprintf(&out, "project_id: %s\n", displayText(result.ProjectID))
+	fmt.Fprintf(&out, "database: %s\n", displayText(result.DatabasePath))
+	fmt.Fprintf(&out, "scanned: %d\n", result.ScannedCount)
+	fmt.Fprintf(&out, "imported: %d\n", result.ImportedCount)
+	fmt.Fprintf(&out, "skipped: %d\n", result.SkippedCount)
+	fmt.Fprintf(&out, "reports: %d\n", result.ReportCount)
+	fmt.Fprintf(&out, "malformed: %d\n", result.MalformedCount)
+	if len(result.Diagnostics) > 0 {
+		fmt.Fprintln(&out, "diagnostics:")
+		for _, diagnostic := range result.Diagnostics {
+			if diagnostic.Line > 0 {
+				fmt.Fprintf(&out, "  - %s:%d: %s\n", diagnostic.SourcePath, diagnostic.Line, diagnostic.Message)
+			} else {
+				fmt.Fprintf(&out, "  - %s: %s\n", diagnostic.SourcePath, diagnostic.Message)
+			}
+		}
+	}
+	return out.String()
+}
+
+func displayText(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "not reported"
+	}
+	return value
 }
 
 func renderedDefaultDepth(depth string) string {

@@ -108,6 +108,7 @@ loopcoder projects register --repo .          # add or refresh this checkout in 
 loopcoder projects list --format json         # list registered projects for machine use
 loopcoder projects show --repo .              # inspect this checkout's resolved registry identity
 loopcoder projects remove --repo .            # remove registry entry without deleting run history
+loopcoder migrate local-state --repo .        # copy legacy .loopcoder records into local storage
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -214,6 +215,12 @@ loopcoder projects remove --repo .
 ```
 
 `show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source. `remove --repo .` deletes only the project registry row; historical run records are left in the database and are not deleted by default. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
+
+### Local State Migration
+
+`loopcoder migrate local-state --repo .` explicitly imports v0.6.x repo-local `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into `$LOOPCODER_HOME/data/loopcoder.db`. It registers or refreshes the project identity, stores source-path and hash metadata for imported records, and is safe to re-run without duplicating imported reports. Malformed JSON or JSONL records are reported with their source path and line when available, but valid records from the same migration continue importing.
+
+The command copies local state into the machine-local store only. It does not delete `.loopcoder/`, rewrite local files, edit tracked repository files, mutate GitHub, or publish state. Existing file readers remain the compatibility fallback, and `loopcoder report --repo . --format json` includes imported records after migration.
 
 `loopcoder doctor --repo . --fix` performs only the 0.6.0 local repair actions: migrate legacy `.delivery.yml attestation` keys to `report`, refresh conductor hook settings to `loopcoder hook conductor-reporter`, move legacy hook state from `conductor-attest` to `conductor-reporter`, rewrite eligible local state keys from `attestation` to `report`, and prune cleanup-eligible gitignored `.loopcoder/` state. It does not install provider CLIs, run provider login, flush pending relay records, edit tracked docs, choose models, commit, push, or mutate GitHub.
 

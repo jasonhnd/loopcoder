@@ -4,6 +4,7 @@ package reportquery
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,10 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 const (
@@ -31,11 +35,12 @@ const (
 var reporterHeaderRe = regexp.MustCompile(fmt.Sprintf(`^\[(?:%s|%s)\]\s+`, regexp.QuoteMeta(migration.ReporterHeaderToken), regexp.QuoteMeta(migration.LegacyReporterHeaderToken)))
 
 type Options struct {
-	RepoPath string
-	WorkID   string
-	Issue    int
-	Role     reporter.Role
-	Limit    int
+	RepoPath     string
+	WorkID       string
+	Issue        int
+	Role         reporter.Role
+	Limit        int
+	SkipImported bool
 }
 
 type Record struct {
@@ -57,6 +62,13 @@ func List(opts Options) ([]Record, error) {
 	}
 
 	var records []Record
+	if !opts.SkipImported {
+		importedRecords, err := loadImportedReports(repoPath)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, importedRecords...)
+	}
 	runRecords, err := loadRunReports(repoPath)
 	if err != nil {
 		return nil, err
@@ -75,6 +87,70 @@ func List(opts Options) ([]Record, error) {
 		records = records[:limit]
 	}
 	return records, nil
+}
+
+func loadImportedReports(repoPath string) ([]Record, error) {
+	layout, err := home.Resolve(home.DefaultDeps())
+	if err != nil {
+		return nil, nil
+	}
+	dbPath := layout.DatabasePath()
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, nil
+	}
+	ctx := context.Background()
+	show, err := registry.Show(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath}, registry.DefaultDeps())
+	if err != nil || !show.Registered {
+		return nil, nil
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath})
+	if err != nil {
+		return nil, fmt.Errorf("read imported reports: %w", err)
+	}
+	defer store.Close()
+
+	var records []Record
+	err = store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT COALESCE(run_id, ''), payload_json, source_kind, source_path, created_at FROM reports WHERE project_id = ? ORDER BY ended_at DESC, started_at DESC, created_at DESC, id DESC`, show.Project.ProjectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var runID string
+			var payload string
+			var sourceKind string
+			var sourcePath string
+			var createdAt string
+			if err := rows.Scan(&runID, &payload, &sourceKind, &sourcePath, &createdAt); err != nil {
+				return err
+			}
+			var report reporter.Report
+			if err := json.Unmarshal([]byte(payload), &report); err != nil {
+				continue
+			}
+			records = append(records, Record{
+				Report:  report,
+				Source:  importedSource(sourceKind),
+				RunID:   runID,
+				Path:    sourcePath,
+				modTime: parseTime(createdAt),
+			})
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read imported reports: %w", err)
+	}
+	return records, nil
+}
+
+func importedSource(sourceKind string) string {
+	sourceKind = strings.TrimSpace(sourceKind)
+	if sourceKind == "" {
+		return "imported"
+	}
+	return "imported:" + sourceKind
 }
 
 func RenderText(records []Record) string {
