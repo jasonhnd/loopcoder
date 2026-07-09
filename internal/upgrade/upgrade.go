@@ -1102,9 +1102,9 @@ func refreshSkill(ctx context.Context, deps Deps, binaryPath string) SkillRefres
 		return result
 	}
 
-	commandResult, err := deps.RunCommand(ctx, binaryPath, "skill", "install")
+	commandResult, err := deps.RunCommand(ctx, binaryPath, "skill", "install", "--global-only")
 	if err != nil {
-		result.Warning = fmt.Sprintf("run %s skill install: %v", binaryPath, err)
+		result.Warning = fmt.Sprintf("run %s skill install --global-only: %v", binaryPath, err)
 		return result
 	}
 	if commandResult.ExitCode != 0 {
@@ -1115,13 +1115,13 @@ func refreshSkill(ctx context.Context, deps Deps, binaryPath string) SkillRefres
 		if detail == "" {
 			detail = fmt.Sprintf("exit code %d", commandResult.ExitCode)
 		}
-		result.Warning = fmt.Sprintf("%s skill install failed: %s", binaryPath, detail)
+		result.Warning = fmt.Sprintf("%s skill install --global-only failed: %s", binaryPath, detail)
 		return result
 	}
 
 	dir, files, err := parseSkillInstallOutput(commandResult.Stdout)
 	if err != nil {
-		result.Warning = fmt.Sprintf("parse %s skill install output: %v", binaryPath, err)
+		result.Warning = fmt.Sprintf("parse %s skill install --global-only output: %v", binaryPath, err)
 		return result
 	}
 	result.Dir = dir

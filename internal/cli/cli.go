@@ -2081,7 +2081,7 @@ func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	renderUpgradeSuccess(stdout, result)
 	if result.SkillRefresh.Warning != "" {
-		fmt.Fprintf(stderr, "[loopcoder] warning: skill refresh failed after upgrade: %s; run: loopcoder skill install\n", result.SkillRefresh.Warning)
+		fmt.Fprintf(stderr, "[loopcoder] warning: skill refresh failed after upgrade: %s; run: loopcoder skill install --global-only\n", result.SkillRefresh.Warning)
 	}
 	return 0
 }
@@ -2166,7 +2166,7 @@ func renderUpgradeSkillRefresh(w io.Writer, result upgrade.SkillRefreshResult) {
 	if strings.TrimSpace(result.BinaryPath) == "" {
 		return
 	}
-	fmt.Fprintf(w, "Skill refresh: %s skill install\n", result.BinaryPath)
+	fmt.Fprintf(w, "Skill refresh: %s skill install --global-only\n", result.BinaryPath)
 	if result.Warning != "" {
 		return
 	}
