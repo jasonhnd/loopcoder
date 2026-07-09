@@ -246,12 +246,69 @@ Report delivery run state with the program-rendered local status command:
 ```text
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
+loopcoder status --repo . --format json
+loopcoder status --repo . --run <run-id> --format json
 ```
 
 When `--run` is omitted, `status` selects the latest modified local run. The
-output is read-only and local-only: it reads gitignored `.loopcoder/` state and
-must not be copied into PR bodies, issues, comments, commits, merge artifacts,
-docs, examples, fixtures, or tracked files.
+text output includes a readable run tree, and JSON output exposes the stable
+`run_tree` object for machine consumers. Each node includes `project_id`,
+`run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
+role, provider, model, effort, permission, lifecycle status/source, timestamps,
+last error, and report summary when those fields are present in local records.
+The output is read-only and local-only: it reads gitignored `.loopcoder/` state
+and must not be copied into PR bodies, issues, comments, commits, merge
+artifacts, docs, examples, fixtures, or tracked files.
+
+Example JSON shape:
+
+```json
+{
+  "run_id": "run-20260709T000000Z-wave",
+  "project": {
+    "project_id": "proj_abc123"
+  },
+  "run_tree": {
+    "root_run_id": "run-20260709T000000Z-wave",
+    "selected_run_id": "run-20260709T000000Z-wave",
+    "nodes": [
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-20260709T000000Z-wave",
+        "child_run_ids": ["run-20260709T000001Z-child-worker"],
+        "depth": 0,
+        "lifecycle_status": "running"
+      },
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-20260709T000001Z-child-worker",
+        "parent_run_id": "run-20260709T000000Z-wave",
+        "child_run_ids": [],
+        "depth": 1,
+        "issue": 651,
+        "pr": "https://github.com/owner/repo/pull/651",
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "lifecycle_status": "succeeded",
+        "started_at": "2026-07-09T00:00:01Z",
+        "updated_at": "2026-07-09T00:02:00Z",
+        "ended_at": "2026-07-09T00:02:00Z",
+        "report_summary": "implement issue #651"
+      }
+    ],
+    "summary": {
+      "run_count": 2,
+      "terminal_runs": 1,
+      "interrupted_runs": 1,
+      "failed_runs": 0,
+      "needs_human_runs": 0
+    }
+  }
+}
+```
 
 ## Repository Initialization
 
@@ -711,6 +768,7 @@ loopcoder promote --repo .
 
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
+loopcoder status --repo . --format json
 loopcoder report --repo .
 loopcoder report --repo . --format json
 
@@ -864,6 +922,7 @@ the original source path metadata.
 ```text
 loopcoder report --repo .
 loopcoder report --repo . --work-id <run-id>
+loopcoder report --repo . --run <run-id> --format json
 loopcoder report --repo . --issue 218
 loopcoder report --repo . --role worker
 loopcoder report --repo . --format json
@@ -883,7 +942,9 @@ REPORTS
 ```
 
 JSON output keeps the compatibility `reports` array and adds `records` with
-source/run/path context:
+source/run/path context. When `--run <run-id>` is provided with JSON output,
+the payload also includes the same additive `run_tree` object exposed by
+`loopcoder status --format json`:
 
 ```json
 {
@@ -905,7 +966,33 @@ source/run/path context:
       "run_id": "run-218",
       "path": ".loopcoder/runs/run-218/workers/job-218-1.attempt.json"
     }
-  ]
+  ],
+  "run_tree": {
+    "root_run_id": "run-218",
+    "selected_run_id": "run-218",
+    "nodes": [
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-218",
+        "child_run_ids": [],
+        "depth": 0,
+        "issue": 218,
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "xhigh",
+        "permission": "write",
+        "lifecycle_status": "succeeded"
+      }
+    ],
+    "summary": {
+      "run_count": 1,
+      "terminal_runs": 1,
+      "interrupted_runs": 0,
+      "failed_runs": 0,
+      "needs_human_runs": 0
+    }
+  }
 }
 ```
 

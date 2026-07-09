@@ -197,6 +197,153 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	}
 }
 
+func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-cli-parent"
+	child := "run-cli-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StatePlanned,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+	record := validDispatchReport()
+	record.Issue = 651
+	if _, err := state.WriteAttempt(repo, child, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-651-1",
+		Issue:          651,
+		Attempt:        1,
+		Provider:       "codex",
+		Status:         "succeeded",
+		Phase:          "codex_exited",
+		StartedAt:      "2026-07-09T00:00:02Z",
+		HeartbeatAt:    "2026-07-09T00:00:03Z",
+		LastProgressAt: "2026-07-09T00:00:03Z",
+		Report:         &record,
+	}); err != nil {
+		t.Fatalf("write child attempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", child, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		RunID   string `json:"run_id"`
+		Project struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+		RunTree struct {
+			RootRunID string `json:"root_run_id"`
+			Nodes     []struct {
+				RunID       string `json:"run_id"`
+				ParentRunID string `json:"parent_run_id"`
+				Issue       int    `json:"issue"`
+				Provider    string `json:"provider"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("status output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.RunID != child || payload.Project.ProjectID == "" || payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
+		t.Fatalf("status JSON = %#v", payload)
+	}
+	var foundChild bool
+	for _, node := range payload.RunTree.Nodes {
+		if node.RunID == child && node.ParentRunID == parent && node.Issue == 651 && node.Provider == "codex" {
+			foundChild = true
+		}
+	}
+	if !foundChild {
+		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+}
+
+func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-report-parent"
+	child := "run-report-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StatePlanned,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+	record := validDispatchReport()
+	record.WorkID = child
+	record.Issue = 651
+	if _, err := state.WriteAttempt(repo, child, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-651-1",
+		Issue:          651,
+		Attempt:        1,
+		Provider:       "codex",
+		Status:         "succeeded",
+		StartedAt:      "2026-07-09T00:00:02Z",
+		HeartbeatAt:    "2026-07-09T00:00:03Z",
+		LastProgressAt: "2026-07-09T00:00:03Z",
+		Report:         &record,
+	}); err != nil {
+		t.Fatalf("write child attempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"report", "--repo", repo, "--run", child, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		Reports []reporter.Report `json:"reports"`
+		Records []struct {
+			RunID string `json:"run_id"`
+		} `json:"records"`
+		RunTree struct {
+			RootRunID string `json:"root_run_id"`
+			Nodes     []struct {
+				RunID string `json:"run_id"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("report output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if len(payload.Reports) != 1 || len(payload.Records) != 1 || payload.Records[0].RunID != child {
+		t.Fatalf("report records = %#v %#v", payload.Reports, payload.Records)
+	}
+	if payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree = %#v", payload.RunTree)
+	}
+}
+
 func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	repo := t.TempDir()
 	var stdout, stderr bytes.Buffer
