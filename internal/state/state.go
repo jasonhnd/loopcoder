@@ -20,7 +20,7 @@ import (
 
 const runIDTimeLayout = "20060102T150405Z"
 
-var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave|child-[a-z0-9][a-z0-9-]{0,62})$`)
+var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave|child-(?:[a-z0-9][a-z0-9-]{0,62}|\d+-[a-z0-9][a-z0-9-]{0,62}))$`)
 
 const (
 	StatusPlanned    = "planned"
@@ -163,9 +163,12 @@ func RunIDForWave(at time.Time) string {
 	return fmt.Sprintf("run-%s-wave", at.UTC().Format(runIDTimeLayout))
 }
 
-// RunIDForChild returns a run id in the run-<utc-compact>-child-<slug> shape.
-func RunIDForChild(slug string, at time.Time) string {
-	return fmt.Sprintf("run-%s-child-%s", at.UTC().Format(runIDTimeLayout), normalizeChildRunSlug(slug))
+// RunIDForChild returns a run id in the run-<utc-compact>-child-<index>-<slug> shape.
+func RunIDForChild(slug string, index int, at time.Time) string {
+	if index < 0 {
+		index = 0
+	}
+	return fmt.Sprintf("run-%s-child-%d-%s", at.UTC().Format(runIDTimeLayout), index, normalizeChildRunSlug(slug))
 }
 
 // IsRunID reports whether value matches the documented run id shape.

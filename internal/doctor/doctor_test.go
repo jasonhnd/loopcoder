@@ -1180,7 +1180,7 @@ func TestCheckStorageHealthFailsUnsupportedDatabase(t *testing.T) {
 
 func TestCheckNestedRunHealthWarnsForMissingParent(t *testing.T) {
 	repo := t.TempDir()
-	child := state.RunIDForChild("docs-pass", time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
+	child := state.RunIDForChild("docs-pass", 0, time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
 	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
 		Timestamp:   "2026-07-09T00:00:00Z",
 		RunID:       child,
