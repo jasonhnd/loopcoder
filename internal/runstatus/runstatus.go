@@ -43,6 +43,11 @@ type Report struct {
 	RunPath             string
 	EventCount          int
 	VerifierRecordCount int
+	LifecycleState      string
+	LifecycleSource     string
+	LifecycleEvents     int
+	ParentRunID         string
+	ChildRunIDs         []string
 	Rows                []Row
 }
 
@@ -136,6 +141,10 @@ func Load(opts Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+	if err != nil {
+		return Report{}, err
+	}
 
 	eventMetadata, eventVerifiers, eventCount, err := loadEventRecords(repoPath, runID, now)
 	if err != nil {
@@ -169,6 +178,11 @@ func Load(opts Options) (Report, error) {
 		RunPath:             runPath,
 		EventCount:          eventCount,
 		VerifierRecordCount: len(verifiers),
+		LifecycleState:      string(lifecycle.State),
+		LifecycleSource:     lifecycle.Source,
+		LifecycleEvents:     len(lifecycle.History),
+		ParentRunID:         lifecycle.ParentRunID,
+		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
 		Rows:                rows,
 	}, nil
 }
@@ -180,6 +194,17 @@ func Render(report Report) string {
 	fmt.Fprintf(&out, "Source: %s\n", filepath.ToSlash(report.RunPath))
 	fmt.Fprintf(&out, "Events: %d\n", report.EventCount)
 	fmt.Fprintf(&out, "Verifier records: %d\n", report.VerifierRecordCount)
+	fmt.Fprintf(&out, "Lifecycle: %s", display(report.LifecycleState))
+	if strings.TrimSpace(report.LifecycleSource) != "" {
+		fmt.Fprintf(&out, " (source=%s entries=%d)", display(report.LifecycleSource), report.LifecycleEvents)
+	}
+	fmt.Fprintln(&out)
+	if strings.TrimSpace(report.ParentRunID) != "" {
+		fmt.Fprintf(&out, "ParentRunId: %s\n", display(report.ParentRunID))
+	}
+	if len(report.ChildRunIDs) > 0 {
+		fmt.Fprintf(&out, "ChildRunIds: %s\n", strings.Join(report.ChildRunIDs, ","))
+	}
 	fmt.Fprintln(&out)
 
 	headers := []string{

@@ -239,6 +239,16 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if eventCount != 9 {
 		t.Fatalf("event count = %d, want 9", eventCount)
 	}
+	lifecycle, err := state.LoadLifecycle(repo, "run-test")
+	if err != nil {
+		t.Fatalf("LoadLifecycle returned error: %v", err)
+	}
+	if lifecycle.State != state.StateSucceeded || lifecycle.Source != "lifecycle" {
+		t.Fatalf("lifecycle = %#v, want explicit succeeded", lifecycle)
+	}
+	if len(lifecycle.History) != 2 || lifecycle.History[0].State != state.StateRunning || lifecycle.History[1].State != state.StateSucceeded {
+		t.Fatalf("lifecycle history = %#v, want running -> succeeded", lifecycle.History)
+	}
 	if fakeAgent.invocation.WorktreePath == "" || fakeAgent.invocation.Prompt == "" || fakeAgent.invocation.LogPath == "" {
 		t.Fatalf("agent invocation missing required fields: %#v", fakeAgent.invocation)
 	}
