@@ -195,8 +195,17 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 			Source             string `json:"source"`
 			SupportsJSONOutput bool   `json:"supports_json_output"`
 		} `json:"host_profile"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+			Host     string `json:"host"`
+			Role     string `json:"role"`
+			Support  string `json:"support"`
+			Status   Status `json:"status"`
+			Code     string `json:"code"`
+		} `json:"provider_compatibility"`
 		Checks []struct {
 			Name       string `json:"name"`
+			Code       string `json:"code"`
 			Status     Status `json:"status"`
 			Hard       bool   `json:"hard"`
 			Message    string `json:"message"`
@@ -215,11 +224,77 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
 		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
 	}
+	if payload.ProviderCompatibility == nil {
+		t.Fatalf("provider_compatibility missing from payload: %s", out.String())
+	}
 	if len(payload.Checks) != 2 {
 		t.Fatalf("checks len = %d, want 2", len(payload.Checks))
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRunJSONIncludesProviderCompatibilityMatrix(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		ProviderCompatibility []struct {
+			Provider            string   `json:"provider"`
+			Host                string   `json:"host"`
+			Role                string   `json:"role"`
+			Support             string   `json:"support"`
+			Status              Status   `json:"status"`
+			Code                string   `json:"code"`
+			MissingCapabilities []string `json:"missing_capabilities"`
+		} `json:"provider_compatibility"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Code   string `json:"code"`
+			Status Status `json:"status"`
+			Hard   bool   `json:"hard"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.ProviderCompatibility) == 0 {
+		t.Fatalf("provider_compatibility is empty:\n%s", out.String())
+	}
+
+	foundMatrixEntry := false
+	for _, entry := range payload.ProviderCompatibility {
+		if entry.Provider == "antigravity" && entry.Host == "claude-code" && entry.Role == "verifier" {
+			foundMatrixEntry = true
+			if entry.Support != "unsupported" || entry.Status != StatusFail || entry.Code != "unsupported_read_only_mode" {
+				t.Fatalf("antigravity verifier matrix entry = %#v", entry)
+			}
+			if !containsString(entry.MissingCapabilities, "read-only") {
+				t.Fatalf("antigravity verifier missing capabilities = %#v, want read-only", entry.MissingCapabilities)
+			}
+		}
+	}
+	if !foundMatrixEntry {
+		t.Fatalf("provider_compatibility missing antigravity/claude-code/verifier entry")
+	}
+
+	foundSelectedWorker := false
+	for _, check := range payload.Checks {
+		if check.Name == "provider compatibility codex worker" {
+			foundSelectedWorker = true
+			if check.Status != StatusOK || check.Code != "supported" || check.Hard {
+				t.Fatalf("selected worker compatibility check = %#v", check)
+			}
+		}
+	}
+	if !foundSelectedWorker {
+		t.Fatalf("checks missing selected worker provider compatibility")
 	}
 }
 
@@ -589,6 +664,9 @@ func TestRunFailsAntigravityProviderWhenAgyMissing(t *testing.T) {
 	if check.Status != StatusFail || !check.Hard {
 		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
 	}
+	if check.Code != "missing_executable" {
+		t.Fatalf("provider antigravity code = %q, want missing_executable", check.Code)
+	}
 	for _, want := range []string{`CLI "agy" was not found on PATH`, "run: agy login"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
@@ -614,6 +692,9 @@ func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
 	if check.Status != StatusFail || !check.Hard {
 		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
 	}
+	if check.Code != "unauthenticated_provider" {
+		t.Fatalf("provider antigravity code = %q, want unauthenticated_provider", check.Code)
+	}
 	for _, want := range []string{"agy models failed", "OAuth login required", "run: agy login"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
@@ -622,6 +703,30 @@ func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
 	auditProvider := requireCheck(t, report, "audit llm provider")
 	if auditProvider.Status != StatusOK || !strings.Contains(auditProvider.Message, `CLI "agy" resolves`) {
 		t.Fatalf("audit llm provider check = %#v, want agy CLI resolution", auditProvider)
+	}
+}
+
+func TestRunFailsClosedForUnsupportedVerifierReadOnlyProvider(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Adapters.Verifier = "antigravity"
+	env.paths["agy"] = "/bin/agy"
+	env.commands[cmdKey("agy", "models")] = CommandResult{
+		Stdout: "Gemini 3.1 Pro\n",
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "provider compatibility antigravity verifier")
+	if check.Status != StatusFail || !check.Hard || check.Code != "unsupported_read_only_mode" {
+		t.Fatalf("compatibility check = %#v, want hard unsupported read-only fail", check)
+	}
+	for _, want := range []string{"role=verifier", "support=unsupported", "missing=read-only"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
 	}
 }
 
@@ -1558,4 +1663,13 @@ func requireCheck(t *testing.T, report Report, name string) Check {
 		t.Fatalf("missing check %q in %#v", name, report.Checks)
 	}
 	return check
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

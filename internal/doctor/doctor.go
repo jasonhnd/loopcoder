@@ -27,8 +27,10 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/provider"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
@@ -84,6 +86,7 @@ type CommandResult struct {
 
 type Check struct {
 	Name       string
+	Code       string
 	Status     Status
 	Message    string
 	Hard       bool
@@ -91,12 +94,13 @@ type Check struct {
 }
 
 type Report struct {
-	RepoPath    string
-	Version     string
-	Commit      string
-	Date        string
-	HostProfile HostProfile
-	Checks      []Check
+	RepoPath              string
+	Version               string
+	Commit                string
+	Date                  string
+	HostProfile           HostProfile
+	ProviderCompatibility []ProviderCompatibility
+	Checks                []Check
 }
 
 type HostProfile struct {
@@ -108,6 +112,18 @@ type HostProfile struct {
 	SupportsJSONOutput bool
 	DetectedBy         []string
 	KnownLimitations   []string
+}
+
+type ProviderCompatibility struct {
+	Provider             string
+	Host                 string
+	Role                 string
+	Support              string
+	Status               Status
+	Code                 string
+	RequiredCapabilities []string
+	MissingCapabilities  []string
+	KnownLimitations     []string
 }
 
 func (r Report) ExitCode() int {
@@ -140,6 +156,7 @@ func Render(w io.Writer, report Report) error {
 func RenderJSON(w io.Writer, report Report) error {
 	type renderedCheck struct {
 		Name       string `json:"name"`
+		Code       string `json:"code,omitempty"`
 		Status     Status `json:"status"`
 		Hard       bool   `json:"hard"`
 		Message    string `json:"message"`
@@ -155,24 +172,51 @@ func RenderJSON(w io.Writer, report Report) error {
 		DetectedBy         []string `json:"detected_by,omitempty"`
 		KnownLimitations   []string `json:"known_limitations,omitempty"`
 	}
+	type renderedProviderCompatibility struct {
+		Provider             string   `json:"provider"`
+		Host                 string   `json:"host"`
+		Role                 string   `json:"role"`
+		Support              string   `json:"support"`
+		Status               Status   `json:"status"`
+		Code                 string   `json:"code"`
+		RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+		MissingCapabilities  []string `json:"missing_capabilities,omitempty"`
+		KnownLimitations     []string `json:"known_limitations,omitempty"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		checks = append(checks, renderedCheck{
 			Name:       check.Name,
+			Code:       check.Code,
 			Status:     check.Status,
 			Hard:       check.Hard,
 			Message:    check.Message,
 			FixCommand: check.FixCommand,
 		})
 	}
+	compatibility := make([]renderedProviderCompatibility, 0, len(report.ProviderCompatibility))
+	for _, entry := range report.ProviderCompatibility {
+		compatibility = append(compatibility, renderedProviderCompatibility{
+			Provider:             entry.Provider,
+			Host:                 entry.Host,
+			Role:                 entry.Role,
+			Support:              entry.Support,
+			Status:               entry.Status,
+			Code:                 entry.Code,
+			RequiredCapabilities: append([]string(nil), entry.RequiredCapabilities...),
+			MissingCapabilities:  append([]string(nil), entry.MissingCapabilities...),
+			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
+		})
+	}
 	payload := struct {
-		RepoPath string              `json:"repo_path"`
-		Version  string              `json:"version"`
-		Commit   string              `json:"commit"`
-		Date     string              `json:"date"`
-		ExitCode int                 `json:"exit_code"`
-		Host     renderedHostProfile `json:"host_profile"`
-		Checks   []renderedCheck     `json:"checks"`
+		RepoPath              string                          `json:"repo_path"`
+		Version               string                          `json:"version"`
+		Commit                string                          `json:"commit"`
+		Date                  string                          `json:"date"`
+		ExitCode              int                             `json:"exit_code"`
+		Host                  renderedHostProfile             `json:"host_profile"`
+		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
+		Checks                []renderedCheck                 `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
 		Version:  report.Version,
@@ -189,7 +233,8 @@ func RenderJSON(w io.Writer, report Report) error {
 			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
 			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
 		},
-		Checks: checks,
+		ProviderCompatibility: compatibility,
+		Checks:                checks,
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
@@ -273,6 +318,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, hostCheck)
 	checks = append(checks, checkModelSelections(delivery))
 	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
+	checks = append(checks, checkProviderCompatibility(delivery.Config, host)...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
 	checks = append(checks, originCheck)
@@ -295,7 +341,11 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		Message: "user-provided by the active Claude Code or Codex host; loopcoder does not ship it",
 	})
 
-	return WithMetadata(Report{HostProfile: host, Checks: checks}, repoPath, build)
+	return WithMetadata(Report{
+		HostProfile:           host,
+		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
+		Checks:                checks,
+	}, repoPath, build)
 }
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
@@ -1228,6 +1278,7 @@ func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []
 			}
 			checks = append(checks, Check{
 				Name:    "provider " + provider.Name,
+				Code:    "missing_executable",
 				Status:  status,
 				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH%s", roleText, cliName, fix),
 				Hard:    hard,
@@ -1240,11 +1291,118 @@ func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []
 		}
 		checks = append(checks, Check{
 			Name:    "provider " + provider.Name,
+			Code:    "provider_ready",
 			Status:  StatusOK,
 			Message: fmt.Sprintf("configured for %s; CLI %q found at %s; authentication not checked by a stable cheap probe", roleText, cliName, path),
 		})
 	}
 	return checks
+}
+
+func checkProviderCompatibility(cfg config.Config, host HostProfile) []Check {
+	hostName := firstNonEmpty(host.Name, "generic-local")
+	configured := configuredProviders(cfg)
+	checks := make([]Check, 0, len(configured)*2)
+	for _, spec := range configured {
+		for _, role := range spec.Roles {
+			compatRole := runtimecap.RoleWorker
+			if role == "verifier" {
+				compatRole = runtimecap.RoleVerifier
+			}
+			entry := provider.Check(runtimecap.DefaultContract(), spec.Name, hostName, compatRole)
+			checks = append(checks, checkFromCompatibilityEntry(entry, true))
+		}
+	}
+
+	worker := strings.TrimSpace(cfg.Adapters.Worker)
+	if worker == "" {
+		worker = "codex"
+	}
+	nested := provider.Check(runtimecap.DefaultContract(), worker, hostName, runtimecap.RoleNestedSubagents)
+	nestedCheck := checkFromCompatibilityEntry(nested, false)
+	nestedCheck.Name = "provider compatibility " + worker + " nested-subagents"
+	checks = append(checks, nestedCheck)
+	return checks
+}
+
+func checkFromCompatibilityEntry(entry runtimecap.CompatibilityEntry, selected bool) Check {
+	status := compatibilityStatus(entry.Support)
+	hard := selected && entry.Support == runtimecap.SupportUnsupported
+	if !selected && entry.Support == runtimecap.SupportUnsupported {
+		status = StatusInfo
+	}
+	missing := formatCapabilities(entry.MissingCapabilities)
+	required := formatCapabilities(entry.RequiredCapabilities)
+	parts := []string{
+		fmt.Sprintf("provider=%s host=%s role=%s support=%s", entry.Provider, entry.Host, entry.Role, entry.Support),
+	}
+	if required != "" {
+		parts = append(parts, "requires="+required)
+	}
+	if missing != "" {
+		parts = append(parts, "missing="+missing)
+	}
+	if len(entry.KnownLimitations) > 0 {
+		parts = append(parts, "limitations: "+strings.Join(entry.KnownLimitations, "; "))
+	}
+	return Check{
+		Name:    fmt.Sprintf("provider compatibility %s %s", entry.Provider, entry.Role),
+		Code:    entry.Code,
+		Status:  status,
+		Message: strings.Join(parts, "; "),
+		Hard:    hard,
+	}
+}
+
+func compatibilityStatus(support runtimecap.SupportLevel) Status {
+	switch support {
+	case runtimecap.SupportSupported:
+		return StatusOK
+	case runtimecap.SupportExperimental:
+		return StatusWarn
+	default:
+		return StatusFail
+	}
+}
+
+func formatCapabilities(capabilities []runtimecap.ProviderCapability) string {
+	if len(capabilities) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		out = append(out, string(capability))
+	}
+	return strings.Join(out, ",")
+}
+
+func renderProviderCompatibility(entries []runtimecap.CompatibilityEntry) []ProviderCompatibility {
+	out := make([]ProviderCompatibility, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, ProviderCompatibility{
+			Provider:             entry.Provider,
+			Host:                 entry.Host,
+			Role:                 string(entry.Role),
+			Support:              string(entry.Support),
+			Status:               compatibilityStatus(entry.Support),
+			Code:                 entry.Code,
+			RequiredCapabilities: formatCompatibilityCapabilities(entry.RequiredCapabilities),
+			MissingCapabilities:  formatCompatibilityCapabilities(entry.MissingCapabilities),
+			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
+		})
+	}
+	return out
+}
+
+func formatCompatibilityCapabilities(capabilities []runtimecap.ProviderCapability) []string {
+	if len(capabilities) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		out = append(out, string(capability))
+	}
+	return out
 }
 
 func providerCLIName(provider string) string {
@@ -1264,6 +1422,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		}
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models could not run: %v%s; run: agy login", roleText, path, err, detail),
 			Hard:    true,
@@ -1276,6 +1435,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		}
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models failed: %s; run: agy login", roleText, path, detail),
 			Hard:    true,
@@ -1285,6 +1445,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		detail := commandDetail(result)
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models reported an authentication problem: %s; run: agy login", roleText, path, firstNonEmpty(detail, "authentication required")),
 			Hard:    true,
@@ -1292,6 +1453,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 	}
 	return Check{
 		Name:    "provider antigravity",
+		Code:    "provider_authenticated",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s; agy models OAuth probe succeeded", roleText, path),
 	}

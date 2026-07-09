@@ -18,6 +18,22 @@ const (
 	ProviderTokenUsage      ProviderCapability = "token-usage"
 )
 
+type CompatibilityRole string
+
+const (
+	RoleWorker          CompatibilityRole = "worker"
+	RoleVerifier        CompatibilityRole = "verifier"
+	RoleNestedSubagents CompatibilityRole = "nested-subagents"
+)
+
+type SupportLevel string
+
+const (
+	SupportSupported    SupportLevel = "supported"
+	SupportExperimental SupportLevel = "experimental"
+	SupportUnsupported  SupportLevel = "unsupported"
+)
+
 type ProviderRuntime struct {
 	Name                   string
 	Executable             string
@@ -47,6 +63,17 @@ type HostRuntime struct {
 type Contract struct {
 	Providers []ProviderRuntime
 	Hosts     []HostRuntime
+}
+
+type CompatibilityEntry struct {
+	Provider             string
+	Host                 string
+	Role                 CompatibilityRole
+	Support              SupportLevel
+	Code                 string
+	RequiredCapabilities []ProviderCapability
+	MissingCapabilities  []ProviderCapability
+	KnownLimitations     []string
 }
 
 type UnsupportedCapabilityError struct {
@@ -93,6 +120,14 @@ func LookupHost(name string) (HostRuntime, bool) {
 
 func RequireProviderCapability(provider string, capability ProviderCapability) error {
 	return DefaultContract().RequireProviderCapability(provider, capability)
+}
+
+func SmokeMatrix() []CompatibilityEntry {
+	return DefaultContract().SmokeMatrix()
+}
+
+func EvaluateCompatibility(providerName, hostName string, role CompatibilityRole) CompatibilityEntry {
+	return DefaultContract().EvaluateCompatibility(providerName, hostName, role)
 }
 
 func (c Contract) ProviderNames() []string {
@@ -153,6 +188,137 @@ func (c Contract) RequireProviderCapability(providerName string, capability Prov
 		Supported:   supported,
 		Limitations: append([]string(nil), provider.KnownLimitations...),
 	}
+}
+
+func (c Contract) SmokeMatrix() []CompatibilityEntry {
+	roles := []CompatibilityRole{RoleWorker, RoleVerifier, RoleNestedSubagents}
+	entries := make([]CompatibilityEntry, 0, len(c.Providers)*len(c.Hosts)*len(roles))
+	for _, host := range c.Hosts {
+		for _, provider := range c.Providers {
+			for _, role := range roles {
+				entries = append(entries, c.EvaluateCompatibility(provider.Name, host.Name, role))
+			}
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Host != entries[j].Host {
+			return entries[i].Host < entries[j].Host
+		}
+		if entries[i].Provider != entries[j].Provider {
+			return entries[i].Provider < entries[j].Provider
+		}
+		return entries[i].Role < entries[j].Role
+	})
+	return entries
+}
+
+func (c Contract) EvaluateCompatibility(providerName, hostName string, role CompatibilityRole) CompatibilityEntry {
+	providerName = strings.TrimSpace(providerName)
+	hostName = strings.TrimSpace(hostName)
+	if hostName == "" {
+		hostName = "generic-local"
+	}
+	provider, providerOK := c.LookupProvider(providerName)
+	host, hostOK := c.LookupHost(hostName)
+	entry := CompatibilityEntry{
+		Provider: providerName,
+		Host:     hostName,
+		Role:     role,
+		Support:  SupportSupported,
+		Code:     "supported",
+	}
+	if entry.Role == "" {
+		entry.Role = RoleWorker
+	}
+	if !providerOK {
+		entry.Support = SupportUnsupported
+		entry.Code = "unknown_provider"
+		entry.KnownLimitations = []string{"provider is not in the runtime capability contract"}
+		return entry
+	}
+	if !hostOK {
+		entry.Support = SupportUnsupported
+		entry.Code = "unknown_host"
+		entry.KnownLimitations = []string{"host profile is not in the runtime capability contract"}
+		return entry
+	}
+	entry.Provider = provider.Name
+	entry.Host = host.Name
+	entry.KnownLimitations = append(entry.KnownLimitations, provider.KnownLimitations...)
+	entry.KnownLimitations = append(entry.KnownLimitations, host.KnownLimitations...)
+
+	entry.RequiredCapabilities = requiredProviderCapabilities(entry.Role)
+	for _, capability := range entry.RequiredCapabilities {
+		if !provider.Supports(capability) {
+			entry.MissingCapabilities = append(entry.MissingCapabilities, capability)
+		}
+	}
+	if !host.PreservesStdout {
+		entry.KnownLimitations = append(entry.KnownLimitations, "host does not preserve stdout")
+	}
+	if !host.PreservesStderr {
+		entry.KnownLimitations = append(entry.KnownLimitations, "host does not preserve stderr")
+	}
+	if entry.Role == RoleVerifier && !host.SupportsJSONOutput {
+		entry.KnownLimitations = append(entry.KnownLimitations, "host does not preserve JSON output")
+	}
+
+	if len(entry.MissingCapabilities) > 0 || !host.PreservesStdout || !host.PreservesStderr || (entry.Role == RoleVerifier && !host.SupportsJSONOutput) {
+		entry.Support = SupportUnsupported
+		entry.Code = compatibilityUnsupportedCode(entry.Role, entry.MissingCapabilities)
+		return entry
+	}
+	if providerExperimental(provider.Name) || hostExperimental(host.Name) {
+		entry.Support = SupportExperimental
+		entry.Code = "experimental"
+		return entry
+	}
+	return entry
+}
+
+func requiredProviderCapabilities(role CompatibilityRole) []ProviderCapability {
+	switch role {
+	case RoleVerifier:
+		return []ProviderCapability{ProviderReadOnly, ProviderJSONOutput, ProviderCancellation}
+	case RoleNestedSubagents:
+		return []ProviderCapability{ProviderNestedSubagents, ProviderCancellation}
+	default:
+		return []ProviderCapability{ProviderCancellation}
+	}
+}
+
+func compatibilityUnsupportedCode(role CompatibilityRole, missing []ProviderCapability) string {
+	missingSet := map[ProviderCapability]bool{}
+	for _, capability := range missing {
+		missingSet[capability] = true
+	}
+	switch {
+	case role == RoleVerifier && missingSet[ProviderReadOnly]:
+		return "unsupported_read_only_mode"
+	case role == RoleNestedSubagents && missingSet[ProviderNestedSubagents]:
+		return "unsupported_nested_agents"
+	case missingSet[ProviderJSONOutput]:
+		return "unsupported_json_output"
+	case missingSet[ProviderMCPConfig]:
+		return "unsupported_mcp_config"
+	case missingSet[ProviderCancellation]:
+		return "unsupported_cancellation"
+	default:
+		return "unsupported_provider_mode"
+	}
+}
+
+func providerExperimental(name string) bool {
+	switch name {
+	case "gemini", "antigravity":
+		return true
+	default:
+		return false
+	}
+}
+
+func hostExperimental(name string) bool {
+	return name == "generic-local"
 }
 
 func (p ProviderRuntime) Supports(capability ProviderCapability) bool {

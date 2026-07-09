@@ -115,6 +115,41 @@ func TestRequireProviderCapabilityPassesSupportedCapability(t *testing.T) {
 	}
 }
 
+func TestSmokeMatrixIncludesProviderHostRoleCompatibility(t *testing.T) {
+	matrix := runtimecap.SmokeMatrix()
+	if len(matrix) == 0 {
+		t.Fatal("SmokeMatrix returned no entries")
+	}
+
+	var codexWorker, antigravityVerifier, claudeNested runtimecap.CompatibilityEntry
+	for _, entry := range matrix {
+		switch {
+		case entry.Provider == "codex" && entry.Host == "codex-cli" && entry.Role == runtimecap.RoleWorker:
+			codexWorker = entry
+		case entry.Provider == "antigravity" && entry.Host == "claude-code" && entry.Role == runtimecap.RoleVerifier:
+			antigravityVerifier = entry
+		case entry.Provider == "claude" && entry.Host == "claude-code" && entry.Role == runtimecap.RoleNestedSubagents:
+			claudeNested = entry
+		}
+	}
+	if codexWorker.Support != runtimecap.SupportSupported || codexWorker.Code != "supported" {
+		t.Fatalf("codex worker entry = %#v, want supported", codexWorker)
+	}
+	if antigravityVerifier.Support != runtimecap.SupportUnsupported || antigravityVerifier.Code != "unsupported_read_only_mode" {
+		t.Fatalf("antigravity verifier entry = %#v, want unsupported read-only", antigravityVerifier)
+	}
+	if claudeNested.Support != runtimecap.SupportSupported || claudeNested.Code != "supported" {
+		t.Fatalf("claude nested entry = %#v, want supported", claudeNested)
+	}
+}
+
+func TestEvaluateCompatibilityMarksGenericAndGeminiExperimental(t *testing.T) {
+	entry := runtimecap.EvaluateCompatibility("gemini", "generic-local", runtimecap.RoleWorker)
+	if entry.Support != runtimecap.SupportExperimental || entry.Code != "experimental" {
+		t.Fatalf("entry = %#v, want experimental", entry)
+	}
+}
+
 func TestInvariantViolationsRejectInvalidContract(t *testing.T) {
 	contract := runtimecap.Contract{
 		Providers: []runtimecap.ProviderRuntime{
