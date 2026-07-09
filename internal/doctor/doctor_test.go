@@ -17,6 +17,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -63,6 +64,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"storage",
 		"project registry",
 		"migration status",
+		"nested runs",
 		"stale local state",
 		"conductor runtime",
 	} {
@@ -195,6 +197,20 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 			Source             string `json:"source"`
 			SupportsJSONOutput bool   `json:"supports_json_output"`
 		} `json:"host_profile"`
+		Runtime struct {
+			Database struct {
+				Status Status `json:"status"`
+			} `json:"database"`
+			ProjectRegistry struct {
+				Status Status `json:"status"`
+			} `json:"project_registry"`
+			Migration struct {
+				Status Status `json:"status"`
+			} `json:"migration"`
+			NestedRuns struct {
+				Status Status `json:"status"`
+			} `json:"nested_runs"`
+		} `json:"runtime"`
 		ProviderCompatibility []struct {
 			Provider string `json:"provider"`
 			Host     string `json:"host"`
@@ -224,6 +240,9 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
 		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
 	}
+	if payload.Runtime.Database.Status != "" || payload.Runtime.ProjectRegistry.Status != "" || payload.Runtime.Migration.Status != "" || payload.Runtime.NestedRuns.Status != "" {
+		t.Fatalf("runtime should be empty for manually constructed report: %#v", payload.Runtime)
+	}
 	if payload.ProviderCompatibility == nil {
 		t.Fatalf("provider_compatibility missing from payload: %s", out.String())
 	}
@@ -232,6 +251,85 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRunJSONIncludesV07RuntimeHealth(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		Runtime struct {
+			HomeDir  string `json:"home_dir"`
+			Database struct {
+				Path          string `json:"path"`
+				Exists        bool   `json:"exists"`
+				SchemaVersion int    `json:"schema_version"`
+				Status        Status `json:"status"`
+				Message       string `json:"message"`
+			} `json:"database"`
+			ProjectRegistry struct {
+				Status         Status `json:"status"`
+				Registered     bool   `json:"registered"`
+				ProjectID      string `json:"project_id"`
+				IdentitySource string `json:"identity_source"`
+				ConflictCount  int    `json:"conflict_count"`
+			} `json:"project_registry"`
+			Migration struct {
+				Status         Status `json:"status"`
+				LegacySurfaces int    `json:"legacy_surfaces"`
+			} `json:"migration"`
+			NestedRuns struct {
+				Status       Status `json:"status"`
+				RunCount     int    `json:"run_count"`
+				ProblemCount int    `json:"problem_count"`
+			} `json:"nested_runs"`
+		} `json:"runtime"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+		} `json:"provider_compatibility"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Status Status `json:"status"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.Runtime.HomeDir == "" || !strings.Contains(payload.Runtime.Database.Path, "loopcoder.db") {
+		t.Fatalf("runtime paths missing: %#v", payload.Runtime)
+	}
+	if !payload.Runtime.Database.Exists || payload.Runtime.Database.SchemaVersion != storage.CurrentSchemaVersion || payload.Runtime.Database.Status != StatusOK {
+		t.Fatalf("database runtime = %#v", payload.Runtime.Database)
+	}
+	if !payload.Runtime.ProjectRegistry.Registered || payload.Runtime.ProjectRegistry.ProjectID != "proj_test" || payload.Runtime.ProjectRegistry.IdentitySource != string(registry.IdentityGitHub) {
+		t.Fatalf("project registry runtime = %#v", payload.Runtime.ProjectRegistry)
+	}
+	if payload.Runtime.Migration.Status != StatusOK || payload.Runtime.Migration.LegacySurfaces != 0 {
+		t.Fatalf("migration runtime = %#v", payload.Runtime.Migration)
+	}
+	if payload.Runtime.NestedRuns.Status != StatusOK || payload.Runtime.NestedRuns.ProblemCount != 0 {
+		t.Fatalf("nested runs runtime = %#v", payload.Runtime.NestedRuns)
+	}
+	if len(payload.ProviderCompatibility) == 0 {
+		t.Fatalf("provider compatibility missing")
+	}
+	foundNestedCheck := false
+	for _, check := range payload.Checks {
+		if check.Name == "nested runs" {
+			foundNestedCheck = true
+			if check.Status != StatusOK {
+				t.Fatalf("nested runs check = %#v", check)
+			}
+		}
+	}
+	if !foundNestedCheck {
+		t.Fatalf("nested runs check missing")
 	}
 }
 
@@ -1074,6 +1172,29 @@ func TestCheckStorageHealthFailsUnsupportedDatabase(t *testing.T) {
 		t.Fatalf("status = %s, want fail (%s)", check.Status, check.Message)
 	}
 	for _, want := range []string{"health=fail", "unsupported storage schema version 999"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckNestedRunHealthWarnsForMissingParent(t *testing.T) {
+	repo := t.TempDir()
+	child := state.RunIDForChild("docs-pass", time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:00Z",
+		RunID:       child,
+		ParentRunID: "run-20260709T000000Z-wave",
+		State:       state.StateQueued,
+	}); err != nil {
+		t.Fatalf("AppendLifecycleTransition: %v", err)
+	}
+
+	check := checkNestedRunHealth(repo)
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"missing parent", "loopcoder status --repo . --format json"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("message = %q, want containing %q", check.Message, want)
 		}
