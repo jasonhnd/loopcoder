@@ -37,8 +37,46 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 		"RunId: run-test (requested run)",
 		"Events: 1",
 		"Verifier records: 1",
+		"Lifecycle: succeeded (source=legacy entries=1)",
 		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
 		"status is read-only and local-only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-lifecycle"
+	writeAttempt(t, repo, runID, 103, 1, "job-103-1", workerReport(103, usageTotal(1030)))
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:00Z",
+		RunID:       runID,
+		ParentRunID: "run-parent",
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append planned lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:01Z",
+		RunID:      runID,
+		State:      state.StateQueued,
+		ChildRunID: "run-child",
+	}); err != nil {
+		t.Fatalf("append queued lifecycle: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+	for _, want := range []string{
+		"Lifecycle: queued (source=lifecycle entries=2)",
+		"ParentRunId: run-parent",
+		"ChildRunIds: run-child",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, got)
