@@ -50,14 +50,36 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 	}
 }
 
+func TestDefaultContractRepresentsExistingHosts(t *testing.T) {
+	if got, want := runtimecap.HostNames(), []string{"claude-code", "codex-cli", "generic-local", "paseo-style"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HostNames = %#v, want %#v", got, want)
+	}
+
+	for _, name := range []string{"codex-cli", "claude-code", "paseo-style", "generic-local"} {
+		t.Run(name, func(t *testing.T) {
+			host, ok := runtimecap.LookupHost(name)
+			if !ok {
+				t.Fatalf("LookupHost(%q) returned false", name)
+			}
+			if host.Name != name || host.InvocationStyle == "" || !host.PreservesStdout || !host.PreservesStderr || !host.SupportsJSONOutput {
+				t.Fatalf("host capability = %#v", host)
+			}
+		})
+	}
+}
+
 func TestContractReturnsCopies(t *testing.T) {
 	contract := runtimecap.DefaultContract()
 	contract.Providers[0].Name = "changed"
 	contract.Providers[0].KnownLimitations = append(contract.Providers[0].KnownLimitations, "changed")
 	contract.Hosts[0].Name = "changed"
+	contract.Hosts[0].KnownLimitations = append(contract.Hosts[0].KnownLimitations, "changed")
 
 	next := runtimecap.DefaultContract()
 	if next.Providers[0].Name == "changed" || next.Hosts[0].Name == "changed" {
+		t.Fatalf("DefaultContract leaked mutation: %#v", next)
+	}
+	if len(next.Hosts[0].KnownLimitations) > 0 && next.Hosts[0].KnownLimitations[len(next.Hosts[0].KnownLimitations)-1] == "changed" {
 		t.Fatalf("DefaultContract leaked mutation: %#v", next)
 	}
 }

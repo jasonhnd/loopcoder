@@ -86,6 +86,52 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
+func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"doctor", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			return doctor.WithMetadata(doctor.Report{
+				HostProfile: doctor.HostProfile{
+					Name:               "codex-cli",
+					Source:             "env",
+					Selector:           "LOOPCODER_HOST",
+					InvocationStyle:    "interactive Codex CLI conductor session calls loopcoder as a local subprocess",
+					SupportsJSONOutput: true,
+				},
+				Checks: []doctor.Check{{
+					Name:    "host profile",
+					Status:  doctor.StatusOK,
+					Message: "profile=codex-cli source=env selector=LOOPCODER_HOST",
+				}},
+			}, opts.RepoPath, doctor.BuildInfo{Version: "0.7.0", Commit: "abc123", Date: "2026-07-10T00:00:00Z"})
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		HostProfile struct {
+			Name   string `json:"name"`
+			Source string `json:"source"`
+		} `json:"host_profile"`
+		Checks []struct {
+			Name string `json:"name"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not clean doctor JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.HostProfile.Name != "codex-cli" || payload.HostProfile.Source != "env" || len(payload.Checks) != 1 {
+		t.Fatalf("payload = %#v, want host profile and one check", payload)
+	}
+}
+
 func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()

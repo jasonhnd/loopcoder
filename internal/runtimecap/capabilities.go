@@ -79,8 +79,16 @@ func ProviderNames() []string {
 	return DefaultContract().ProviderNames()
 }
 
+func HostNames() []string {
+	return DefaultContract().HostNames()
+}
+
 func LookupProvider(name string) (ProviderRuntime, bool) {
 	return DefaultContract().LookupProvider(name)
+}
+
+func LookupHost(name string) (HostRuntime, bool) {
+	return DefaultContract().LookupHost(name)
 }
 
 func RequireProviderCapability(provider string, capability ProviderCapability) error {
@@ -96,6 +104,15 @@ func (c Contract) ProviderNames() []string {
 	return names
 }
 
+func (c Contract) HostNames() []string {
+	names := make([]string, 0, len(c.Hosts))
+	for _, host := range c.Hosts {
+		names = append(names, host.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (c Contract) LookupProvider(name string) (ProviderRuntime, bool) {
 	for _, provider := range c.Providers {
 		if provider.Name == name {
@@ -103,6 +120,15 @@ func (c Contract) LookupProvider(name string) (ProviderRuntime, bool) {
 		}
 	}
 	return ProviderRuntime{}, false
+}
+
+func (c Contract) LookupHost(name string) (HostRuntime, bool) {
+	for _, host := range c.Hosts {
+		if host.Name == name {
+			return cloneHost(host), true
+		}
+	}
+	return HostRuntime{}, false
 }
 
 func (c Contract) RequireProviderCapability(providerName string, capability ProviderCapability) error {
@@ -203,9 +229,9 @@ func cloneContract(contract Contract) Contract {
 	for _, provider := range contract.Providers {
 		providers = append(providers, cloneProvider(provider))
 	}
-	hosts := append([]HostRuntime(nil), contract.Hosts...)
-	for index := range hosts {
-		hosts[index].KnownLimitations = append([]string(nil), hosts[index].KnownLimitations...)
+	hosts := make([]HostRuntime, 0, len(contract.Hosts))
+	for _, host := range contract.Hosts {
+		hosts = append(hosts, cloneHost(host))
 	}
 	return Contract{Providers: providers, Hosts: hosts}
 }
@@ -221,6 +247,11 @@ func cloneProvider(provider ProviderRuntime) ProviderRuntime {
 		provider.UnsupportedSuggestions = suggestions
 	}
 	return provider
+}
+
+func cloneHost(host HostRuntime) HostRuntime {
+	host.KnownLimitations = append([]string(nil), host.KnownLimitations...)
+	return host
 }
 
 var staticContract = Contract{
@@ -312,6 +343,18 @@ var staticContract = Contract{
 			SupportsCancel:     true,
 			KnownLimitations: []string{
 				"the host owns session lifetime and must keep stderr visible for local relay obligations",
+			},
+		},
+		{
+			Name:               "generic-local",
+			InvocationStyle:    "unknown local agent host calls loopcoder as a subprocess",
+			PreservesStdout:    true,
+			PreservesStderr:    true,
+			SupportsJSONOutput: true,
+			SupportsTimeouts:   true,
+			SupportsCancel:     true,
+			KnownLimitations: []string{
+				"host-specific hook behavior and stderr relay guarantees are not known; use LOOPCODER_HOST or host.profile when invoking from a known host",
 			},
 		},
 	},
