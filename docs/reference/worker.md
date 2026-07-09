@@ -45,6 +45,8 @@ selections before launching the provider.
 For the full design — roles, the provider abstraction, and per-provider adapter
 facts — see
 [`../specs/0131-multi-provider-roles.md`](../specs/0131-multi-provider-roles.md).
+For the current provider and host runtime capability table, see
+[`runtime-capabilities.md`](runtime-capabilities.md).
 
 ## Flow
 

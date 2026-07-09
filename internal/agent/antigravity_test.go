@@ -165,10 +165,76 @@ func TestAntigravityRunnerReadOnlyFailsClosedWithoutLaunchingAgy(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run returned nil error, want read-only failure")
 	}
-	if !strings.Contains(err.Error(), "read-only mode is not available or verified") {
-		t.Fatalf("Run error = %v", err)
+	for _, want := range []string{
+		`provider "antigravity" does not support read-only`,
+		"choose a supporting provider: claude, codex, gemini",
+		"use antigravity only for write-mode worker dispatch",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Run error = %v, want substring %q", err, want)
+		}
 	}
 	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (High)" || result.Effort != "High" {
 		t.Fatalf("read-only result = %#v", result)
+	}
+}
+
+func TestAntigravityRunnerMCPFailsClosedWithoutLaunchingAgy(t *testing.T) {
+	restore := stubRunSupervised(t, func(context.Context, *exec.Cmd, supervisedexec.Options) (supervisedexec.Result, error) {
+		t.Fatal("antigravity invocation with MCP should fail before launching agy")
+		return supervisedexec.Result{}, nil
+	})
+	defer restore()
+
+	_, err := AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "use tools",
+		LogPath:      filepath.Join(t.TempDir(), "antigravity.log"),
+		MCPServers: []MCPServer{{
+			Name:      "worker-index",
+			Transport: "stdio",
+			Command:   "./tools/worker-index",
+			Roles:     []string{"worker"},
+		}},
+		Role: "worker",
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want MCP unsupported failure")
+	}
+	for _, want := range []string{
+		"antigravity MCP configuration",
+		`provider "antigravity" does not support mcp-config`,
+		"remove MCP servers for this invocation",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Run error = %v, want substring %q", err, want)
+		}
+	}
+}
+
+func TestAntigravityRunnerOutputSchemaFailsClosedWithoutLaunchingAgy(t *testing.T) {
+	restore := stubRunSupervised(t, func(context.Context, *exec.Cmd, supervisedexec.Options) (supervisedexec.Result, error) {
+		t.Fatal("antigravity invocation with output schema should fail before launching agy")
+		return supervisedexec.Result{}, nil
+	})
+	defer restore()
+
+	_, err := AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "return json",
+		LogPath:      filepath.Join(t.TempDir(), "antigravity.log"),
+		OutputSchema: `{"type":"object"}`,
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want output schema unsupported failure")
+	}
+	for _, want := range []string{
+		"antigravity output schema",
+		`provider "antigravity" does not support json-output`,
+		"do not select antigravity for schema-enforced JSON verifier output",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Run error = %v, want substring %q", err, want)
+		}
 	}
 }
