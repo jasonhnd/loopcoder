@@ -34,6 +34,7 @@ type SkillInstallOptions struct {
 	Dir        string
 	Force      bool
 	ProjectDir string
+	GlobalOnly bool
 }
 
 type SkillInstallDeps struct {
@@ -120,6 +121,10 @@ func InstallSkill(ctx context.Context, opts SkillInstallOptions, deps SkillInsta
 			return result, err
 		}
 		result.Files = append(result.Files, fileResult)
+	}
+
+	if opts.GlobalOnly {
+		return result, nil
 	}
 
 	hookSettings, err := writeConductorHookSettings(deps, opts.ProjectDir)
@@ -352,12 +357,15 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var dirAlias string
 	var projectDirAlias string
 	var forceAlias bool
+	var globalOnlyAlias bool
 	fs.StringVar(&opts.Dir, "dir", "", "Claude Code loopcoder skill directory")
 	fs.StringVar(&dirAlias, "Dir", "", "Claude Code loopcoder skill directory")
 	fs.StringVar(&opts.ProjectDir, "repo", ".", "project directory for Claude Code .claude/settings.json")
 	fs.StringVar(&projectDirAlias, "Repo", "", "project directory for Claude Code .claude/settings.json")
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing skill files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing skill files")
+	fs.BoolVar(&opts.GlobalOnly, "global-only", false, "install only global skill files")
+	fs.BoolVar(&globalOnlyAlias, "GlobalOnly", false, "install only global skill files")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -370,6 +378,9 @@ func runSkillInstall(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if forceAlias {
 		opts.Force = true
+	}
+	if globalOnlyAlias {
+		opts.GlobalOnly = true
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "skill install: unexpected argument %q\n", fs.Arg(0))
@@ -396,6 +407,7 @@ func printSkillHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --dir string    Claude Code loopcoder skill directory (default \"~/.claude/skills/loopcoder\")")
 	fmt.Fprintln(w, "  --repo string   project directory for Claude Code .claude/settings.json (default \".\")")
 	fmt.Fprintln(w, "  --force         overwrite existing skill files")
+	fmt.Fprintln(w, "  --global-only   install only global skill files")
 	fmt.Fprintln(w, "  --help          show command help")
 }
 

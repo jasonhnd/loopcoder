@@ -464,8 +464,8 @@ func TestRunInstallsStagedAtomic(t *testing.T) {
 			if name != stablePath {
 				t.Fatalf("refresh binary = %q, want selected stable binary %q", name, stablePath)
 			}
-			if !reflect.DeepEqual(args, []string{"skill", "install"}) {
-				t.Fatalf("refresh args = %#v, want skill install", args)
+			if !reflect.DeepEqual(args, []string{"skill", "install", "--global-only"}) {
+				t.Fatalf("refresh args = %#v, want skill install --global-only", args)
 			}
 			return CommandResult{
 				Stdout: "loopcoder skill install complete\n" +
@@ -613,6 +613,10 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 	loopcoderHome := filepath.Join(t.TempDir(), ".loopcoder")
 	layout := home.New(loopcoderHome)
 	userHome := t.TempDir()
+	cwdRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwdRepo, ".git", "info"), 0o755); err != nil {
+		t.Fatalf("create cwd git metadata: %v", err)
+	}
 	skillDir := filepath.Join(userHome, ".claude", "skills", "loopcoder")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
 		t.Fatalf("create stale skill dir: %v", err)
@@ -687,6 +691,7 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 			}
 			cmd := exec.CommandContext(ctx, name, args...)
 			cmd.Env = append(os.Environ(), "HOME="+userHome, "USERPROFILE="+userHome)
+			cmd.Dir = cwdRepo
 			var stdout strings.Builder
 			var stderr strings.Builder
 			cmd.Stdout = &stdout
@@ -720,6 +725,15 @@ func TestRunRefreshesSkillFromNewBinaryAndUpdatesStaleFiles(t *testing.T) {
 	}
 	if got := readFileString(t, filepath.Join(skillDir, "README.md")); got != "user note\n" {
 		t.Fatalf("unrelated file = %q, want preserved", got)
+	}
+	for _, path := range []string{
+		filepath.Join(cwdRepo, ".claude", "settings.json"),
+		filepath.Join(cwdRepo, ".loopcoder", "conductor-workspace"),
+		filepath.Join(cwdRepo, ".git", "info", "exclude"),
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("upgrade global skill refresh wrote project-scoped cwd file %s (err=%v)", path, err)
+		}
 	}
 }
 
@@ -1134,7 +1148,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 3 || os.Args[1] != "skill" || os.Args[2] != "install" {
+	if len(os.Args) != 4 || os.Args[1] != "skill" || os.Args[2] != "install" || os.Args[3] != "--global-only" {
 		fmt.Fprintf(os.Stderr, "unexpected args: %v\n", os.Args[1:])
 		os.Exit(2)
 	}
