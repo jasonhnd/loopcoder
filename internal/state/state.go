@@ -18,7 +18,7 @@ import (
 
 const runIDTimeLayout = "20060102T150405Z"
 
-var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
+var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave|child-[a-z0-9][a-z0-9-]{0,62})$`)
 
 type Attempt struct {
 	Version             int              `json:"version,omitempty"`
@@ -107,9 +107,44 @@ func RunIDForWave(at time.Time) string {
 	return fmt.Sprintf("run-%s-wave", at.UTC().Format(runIDTimeLayout))
 }
 
+// RunIDForChild returns a run id in the run-<utc-compact>-child-<slug> shape.
+func RunIDForChild(slug string, at time.Time) string {
+	return fmt.Sprintf("run-%s-child-%s", at.UTC().Format(runIDTimeLayout), normalizeChildRunSlug(slug))
+}
+
 // IsRunID reports whether value matches the documented run id shape.
 func IsRunID(value string) bool {
 	return runIDPattern.MatchString(value)
+}
+
+func normalizeChildRunSlug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var out strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if valid {
+			out.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if out.Len() == 0 || lastDash {
+			continue
+		}
+		out.WriteByte('-')
+		lastDash = true
+	}
+	slug := strings.Trim(out.String(), "-")
+	if slug == "" {
+		return "child"
+	}
+	if len(slug) > 63 {
+		slug = strings.TrimRight(slug[:63], "-")
+	}
+	if slug == "" {
+		return "child"
+	}
+	return slug
 }
 
 // LatestRunID selects the newest local run directory by modification time.

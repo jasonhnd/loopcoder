@@ -60,6 +60,17 @@ func TestRunIDForIssueUsesDocumentedShape(t *testing.T) {
 	}
 }
 
+func TestRunIDForChildUsesDocumentedShape(t *testing.T) {
+	got := RunIDForChild("Nested Scheduler!", time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC))
+	want := "run-20260709T120000Z-child-nested-scheduler"
+	if got != want {
+		t.Fatalf("RunIDForChild() = %q, want %q", got, want)
+	}
+	if !IsRunID(got) {
+		t.Fatalf("IsRunID(%q) = false, want true", got)
+	}
+}
+
 func TestLatestRunIDSelectsNewestRunDirectory(t *testing.T) {
 	repo := t.TempDir()
 	runsRoot := filepath.Join(repo, ".loopcoder", "runs")
