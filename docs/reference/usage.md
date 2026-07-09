@@ -355,11 +355,12 @@ report:
 `environment.pre_prod_branch` defaults to `pre-prod`. If that branch is absent,
 empty, reserved as `main`/production, or cannot accept the merge, `tick` skips
 auto-merge, records `needs-human`, and leaves production untouched. Promotion to
-production remains a separate `promote` step: with the default `gate: auto`, it
-auto-promotes only when required CI is green, `loopreview` passed, configured
-evidence is present, and the red-line floor is clean. A failed post-promote
-check triggers deterministic rollback to the recorded `prior_stable_commit`.
-`gate: human-merge` keeps the old explicit human promotion behavior.
+production remains a separate `promote` step: with an effective `gate: auto`
+value, it auto-promotes only when required CI is green, `loopreview` passed,
+configured evidence is present, and the red-line floor is clean. A failed
+post-promote check triggers deterministic rollback to the recorded
+`prior_stable_commit`. New scaffolds use `gate: human-merge`, which keeps the
+explicit human promotion behavior unless the project opts into `auto`.
 
 `evidence` is optional. When present, it is keyed by project type (`website`,
 `cli`, `library`, or `app`) and supports simple proof fields such as
@@ -416,12 +417,12 @@ For compatibility signals such as `min_loopcoder_version`, see
    just-created merge commit and a required check is red, `tick` reverts that
    commit on pre-prod and records the PR as `needs-human`.
 
-8. `loopcoder promote` advances the pre-prod batch to production/main. With the
-   default `gate: auto`, promotion happens only after the deterministic gate has
-   CI-green, verifier-pass, evidence-present, and red-line-clean signals, and it
-   records rollback SHAs before merging. With `gate: human-merge`, you name the
-   pre-prod batch or PRs to promote and loopcoder uses the explicit human merge
-   path. `tick` never auto-merges to `main`.
+8. `loopcoder promote` advances the pre-prod batch to production/main. With an
+   effective `gate: auto` value, promotion happens only after the deterministic
+   gate has CI-green, verifier-pass, evidence-present, and red-line-clean
+   signals, and it records rollback SHAs before merging. With `gate:
+   human-merge`, you name the pre-prod batch or PRs to promote and loopcoder
+   uses the explicit human merge path. `tick` never auto-merges to `main`.
 
 ## Version And Doctor
 
