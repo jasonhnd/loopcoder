@@ -23,6 +23,7 @@ type ResumeOptions struct {
 	RunID        string
 	RunNote      string
 	Attempts     []state.Attempt
+	RunRecords   []state.RunRecord
 	EventCount   int
 	Thresholds   config.ResilienceWorker
 	ProcessAlive ProcessAliveFunc
@@ -116,6 +117,7 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 	if err != nil {
 		return report.ResumeReport{}, fmt.Errorf("read guardrail ledger: %w", err)
 	}
+	runDecisions := resumeRunDecisions(opts.RepoPath, opts.RunRecords, frozenByIssue)
 
 	issues := make([]report.ResumeIssue, 0, len(candidateIssueNumbers))
 	for _, number := range candidateIssueNumbers {
@@ -185,14 +187,205 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 		Local: report.ResumeLocalState{
 			AttemptCount: len(opts.Attempts),
 			EventCount:   opts.EventCount,
+			RunCount:     len(opts.RunRecords),
 		},
 		Thresholds: report.ResumeThresholds{
 			HeartbeatFreshSeconds: opts.Thresholds.HeartbeatIntervalSeconds * 2,
 			StaleAfterSeconds:     opts.Thresholds.StaleAfterSeconds,
 			HungAfterSeconds:      opts.Thresholds.HungAfterSeconds,
 		},
-		Issues: issues,
+		Issues:       issues,
+		RunDecisions: runDecisions,
 	}, nil
+}
+
+func resumeRunDecisions(repoPath string, records []state.RunRecord, frozenByIssue map[int]guardrails.FrozenIssue) []report.ResumeRunDecision {
+	if len(records) == 0 {
+		return nil
+	}
+	children := map[string][]state.RunRecord{}
+	for _, record := range records {
+		if strings.TrimSpace(record.ParentRunID) != "" {
+			children[record.ParentRunID] = append(children[record.ParentRunID], record)
+		}
+	}
+	for parent := range children {
+		sort.Slice(children[parent], func(i, j int) bool {
+			return children[parent][i].RunID < children[parent][j].RunID
+		})
+	}
+
+	out := make([]report.ResumeRunDecision, 0, len(records))
+	for _, record := range records {
+		role := "root"
+		if strings.TrimSpace(record.ParentRunID) != "" {
+			role = "child"
+		} else if len(children[record.RunID]) > 0 || len(record.ChildRunIDs) > 0 {
+			role = "parent"
+		}
+		decision := classifyResumeRunRecord(repoPath, record, role, children[record.RunID], frozenByIssue)
+		out = append(out, decision)
+	}
+	return out
+}
+
+func classifyResumeRunRecord(repoPath string, record state.RunRecord, role string, children []state.RunRecord, frozenByIssue map[int]guardrails.FrozenIssue) report.ResumeRunDecision {
+	status := strings.ToLower(strings.TrimSpace(record.Status))
+	recoveryPath := resumeRunRecoveryPath(repoPath, record)
+	evidence := []string{
+		"run state: " + firstNonEmpty(record.Status, "unknown"),
+		"recovery: " + firstNonEmpty(filepath.ToSlash(recoveryPath), "none"),
+	}
+	if len(children) > 0 {
+		childIDs := make([]string, 0, len(children))
+		for _, child := range children {
+			childIDs = append(childIDs, child.RunID)
+		}
+		evidence = append(evidence, "children: "+strings.Join(childIDs, ", "))
+	}
+	if strings.TrimSpace(record.PR) != "" {
+		evidence = append(evidence, "PR: "+record.PR)
+	}
+
+	decision := report.ResumeRunDecision{
+		RunID:               record.RunID,
+		ParentRunID:         record.ParentRunID,
+		Role:                role,
+		Issue:               record.Issue,
+		Status:              record.Status,
+		RecoveryContextPath: filepath.ToSlash(recoveryPath),
+		PR:                  record.PR,
+		Evidence:            evidence,
+	}
+
+	if resumeRunTerminal(status) {
+		decision.Classification = "complete"
+		decision.ActionKind = "none"
+		decision.Action = "run reached terminal state; no recovery needed"
+		return decision
+	}
+	if strings.TrimSpace(record.PR) != "" {
+		decision.Classification = "adopt-PR"
+		decision.ActionKind = "blocked"
+		decision.Action = "open PR exists; adopt it before retrying"
+		return decision
+	}
+	if record.Issue > 0 {
+		if frozen, ok := frozenByIssue[record.Issue]; ok {
+			decision.Classification = "guardrail-frozen"
+			decision.ActionKind = "blocked"
+			decision.Action = frozen.Message
+			decision.Evidence = append(decision.Evidence,
+				fmt.Sprintf("guardrail: %s", frozen.Reason),
+				fmt.Sprintf("no-progress waves=%d, attempts=%d", frozen.Observed.NoProgressWaves, frozen.Observed.NoProgressAttempts),
+			)
+			return decision
+		}
+	}
+
+	if role == "parent" && resumeRunInterrupted(status) {
+		unsafeChildren := interruptedUnsafeChildren(children)
+		if len(unsafeChildren) > 0 {
+			decision.Classification = "interrupted-parent"
+			decision.ActionKind = "blocked"
+			decision.Action = "parent interrupted with unsafe child run(s): " + strings.Join(unsafeChildren, ", ")
+			return decision
+		}
+		if len(interruptedChildren(children)) > 0 {
+			decision.Classification = "interrupted-parent"
+			decision.ActionKind = "ready"
+			decision.Action = "resume or recover interrupted child run(s) before continuing the parent"
+			return decision
+		}
+		if len(children) > 0 {
+			decision.Classification = "interrupted-parent"
+			decision.ActionKind = "ready"
+			decision.Action = "resume the interrupted parent after verifying child outcomes"
+			return decision
+		}
+	}
+
+	if role == "child" && resumeRunInterrupted(status) {
+		decision.Classification = "interrupted-child"
+		if record.Issue <= 0 || strings.TrimSpace(recoveryPath) == "" {
+			decision.ActionKind = "blocked"
+			decision.Action = "needs-human: child run lacks issue or recovery context for a safe retry"
+			return decision
+		}
+		decision.ActionKind = "ready"
+		decision.Action = fmt.Sprintf("safe to run recover for issue #%d with run %s; guardrails will bound retry", record.Issue, record.RunID)
+		return decision
+	}
+
+	if resumeRunInterrupted(status) {
+		decision.Classification = "interrupted"
+		if record.Issue > 0 && strings.TrimSpace(recoveryPath) != "" {
+			decision.ActionKind = "ready"
+			decision.Action = fmt.Sprintf("safe to run recover for issue #%d with run %s; guardrails will bound retry", record.Issue, record.RunID)
+		} else {
+			decision.ActionKind = "blocked"
+			decision.Action = "needs-human: run lacks issue or recovery context for a safe retry"
+		}
+		return decision
+	}
+
+	decision.Classification = "needs-human"
+	decision.ActionKind = "blocked"
+	decision.Action = "needs-human: run state is ambiguous after interruption"
+	return decision
+}
+
+func resumeRunRecoveryPath(_ string, record state.RunRecord) string {
+	if strings.TrimSpace(record.RecoveryContextPath) == "" {
+		return ""
+	}
+	if filepath.IsAbs(record.RecoveryContextPath) {
+		return filepath.Clean(record.RecoveryContextPath)
+	}
+	return filepath.Clean(record.RecoveryContextPath)
+}
+
+func resumeRunTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "succeeded", "failed", "cancelled", "canceled", "abandoned", "needs-human":
+		return true
+	default:
+		return false
+	}
+}
+
+func resumeRunInterrupted(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "planned", "queued", "running", "waiting", "stale", "hung", "orphaned":
+		return true
+	default:
+		return false
+	}
+}
+
+func interruptedUnsafeChildren(children []state.RunRecord) []string {
+	out := make([]string, 0)
+	for _, child := range children {
+		if !resumeRunInterrupted(child.Status) {
+			continue
+		}
+		if child.Issue <= 0 || strings.TrimSpace(child.RecoveryContextPath) == "" {
+			out = append(out, child.RunID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func interruptedChildren(children []state.RunRecord) []string {
+	out := make([]string, 0)
+	for _, child := range children {
+		if resumeRunInterrupted(child.Status) {
+			out = append(out, child.RunID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func resumeCandidateIssueNumbers(openIssues []gh.Issue, checkedPRs []checkedPR, attempts []state.Attempt) []int {

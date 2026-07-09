@@ -7,44 +7,60 @@ import (
 )
 
 type ResumeReport struct {
-	Version     int
-	Repo        string
-	RepoPath    string
-	BaseBranch  string
-	RunID       *string
-	RunNote     string
-	GeneratedAt string
-	GitHub      ResumeGitHubSnapshot
-	Local       ResumeLocalState
-	Thresholds  ResumeThresholds
-	Issues      []ResumeIssue
+	Version      int                  `json:"version"`
+	Repo         string               `json:"repo"`
+	RepoPath     string               `json:"repo_path,omitempty"`
+	BaseBranch   string               `json:"base_branch"`
+	RunID        *string              `json:"run_id,omitempty"`
+	RunNote      string               `json:"run_note,omitempty"`
+	GeneratedAt  string               `json:"generated_at"`
+	GitHub       ResumeGitHubSnapshot `json:"github"`
+	Local        ResumeLocalState     `json:"local"`
+	Thresholds   ResumeThresholds     `json:"thresholds"`
+	Issues       []ResumeIssue        `json:"issues"`
+	RunDecisions []ResumeRunDecision  `json:"run_decisions,omitempty"`
 }
 
 type ResumeGitHubSnapshot struct {
-	OpenIssueCount int
-	OpenPRCount    int
+	OpenIssueCount int `json:"open_issue_count"`
+	OpenPRCount    int `json:"open_pr_count"`
 }
 
 type ResumeLocalState struct {
-	AttemptCount int
-	EventCount   int
+	AttemptCount int `json:"attempt_count"`
+	EventCount   int `json:"event_count"`
+	RunCount     int `json:"run_count,omitempty"`
 }
 
 type ResumeThresholds struct {
-	HeartbeatFreshSeconds int
-	StaleAfterSeconds     int
-	HungAfterSeconds      int
+	HeartbeatFreshSeconds int `json:"heartbeat_fresh_seconds"`
+	StaleAfterSeconds     int `json:"stale_after_seconds"`
+	HungAfterSeconds      int `json:"hung_after_seconds"`
 }
 
 type ResumeIssue struct {
-	Issue          int
-	Title          string
-	State          string
-	Labels         []string
-	Classification string
-	ActionKind     string
-	Action         string
-	Evidence       []string
+	Issue          int      `json:"issue"`
+	Title          string   `json:"title"`
+	State          string   `json:"state"`
+	Labels         []string `json:"labels,omitempty"`
+	Classification string   `json:"classification"`
+	ActionKind     string   `json:"action_kind"`
+	Action         string   `json:"action"`
+	Evidence       []string `json:"evidence,omitempty"`
+}
+
+type ResumeRunDecision struct {
+	RunID               string   `json:"run_id"`
+	ParentRunID         string   `json:"parent_run_id,omitempty"`
+	Role                string   `json:"role"`
+	Issue               int      `json:"issue,omitempty"`
+	Status              string   `json:"status,omitempty"`
+	Classification      string   `json:"classification"`
+	ActionKind          string   `json:"action_kind"`
+	Action              string   `json:"action"`
+	RecoveryContextPath string   `json:"recovery_context_path,omitempty"`
+	PR                  string   `json:"pr,omitempty"`
+	Evidence            []string `json:"evidence,omitempty"`
 }
 
 func RenderResumeText(report ResumeReport) string {
@@ -63,7 +79,11 @@ func RenderResumeText(report ResumeReport) string {
 	fmt.Fprintf(&out, "RunId: %s\n", runID)
 	fmt.Fprintf(&out, "Generated at: %s\n", report.GeneratedAt)
 	fmt.Fprintf(&out, "GitHub snapshot: open issues=%d, open PRs=%d\n", report.GitHub.OpenIssueCount, report.GitHub.OpenPRCount)
-	fmt.Fprintf(&out, "Local state: attempts=%d, events=%d\n", report.Local.AttemptCount, report.Local.EventCount)
+	fmt.Fprintf(&out, "Local state: attempts=%d, events=%d", report.Local.AttemptCount, report.Local.EventCount)
+	if report.Local.RunCount > 0 {
+		fmt.Fprintf(&out, ", runs=%d", report.Local.RunCount)
+	}
+	fmt.Fprintln(&out)
 	fmt.Fprintf(
 		&out,
 		"Thresholds: heartbeat fresh <= %ds, stale progress > %ds, hung progress > %ds\n",
@@ -89,6 +109,26 @@ func RenderResumeText(report ResumeReport) string {
 				fmt.Fprintf(&out, "  evidence: %s\n", evidence)
 			}
 			fmt.Fprintf(&out, "  next: %s\n", issue.Action)
+		}
+	}
+
+	if len(report.RunDecisions) > 0 {
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "Run recovery decisions")
+		for _, decision := range report.RunDecisions {
+			fmt.Fprintf(&out, "- %s (%s)\n", decision.RunID, decision.Role)
+			if strings.TrimSpace(decision.ParentRunID) != "" {
+				fmt.Fprintf(&out, "  parent: %s\n", decision.ParentRunID)
+			}
+			if decision.Issue > 0 {
+				fmt.Fprintf(&out, "  issue: #%d\n", decision.Issue)
+			}
+			fmt.Fprintf(&out, "  status: %s\n", displayResumeValue(decision.Status))
+			fmt.Fprintf(&out, "  classification: %s\n", decision.Classification)
+			for _, evidence := range decision.Evidence {
+				fmt.Fprintf(&out, "  evidence: %s\n", evidence)
+			}
+			fmt.Fprintf(&out, "  next: %s\n", decision.Action)
 		}
 	}
 
@@ -128,4 +168,12 @@ func resumeIssuesByAction(issues []ResumeIssue, actionKind string) []ResumeIssue
 		}
 	}
 	return out
+}
+
+func displayResumeValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	return value
 }

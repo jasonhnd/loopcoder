@@ -233,3 +233,87 @@ func TestComputeResumeMarksGuardrailFrozenIssueBlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestComputeResumeReportsInterruptedParentAndSafeChild(t *testing.T) {
+	repo := t.TempDir()
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader: fakeReader{
+			repo:   "owner/repo",
+			issues: []gh.Issue{{Number: 650, Title: "Nested recovery", State: "OPEN"}},
+		},
+		RepoPath:   repo,
+		BaseBranch: "main",
+		RunID:      "run-parent",
+		RunRecords: []state.RunRecord{
+			{
+				RunID:       "run-parent",
+				Status:      "running",
+				ChildRunIDs: []string{"run-child"},
+			},
+			{
+				RunID:               "run-child",
+				ParentRunID:         "run-parent",
+				Issue:               650,
+				Status:              "running",
+				RecoveryContextPath: ".loopcoder/runs/run-child/recovery/job-650-context.md",
+			},
+		},
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+	if result.Local.RunCount != 2 {
+		t.Fatalf("run count = %d, want 2", result.Local.RunCount)
+	}
+	if len(result.RunDecisions) != 2 {
+		t.Fatalf("run decisions = %#v, want 2", result.RunDecisions)
+	}
+	parent := result.RunDecisions[0]
+	child := result.RunDecisions[1]
+	if parent.Classification != "interrupted-parent" || parent.ActionKind != "ready" {
+		t.Fatalf("parent decision = %#v, want interrupted-parent ready", parent)
+	}
+	if child.Classification != "interrupted-child" || child.ActionKind != "ready" {
+		t.Fatalf("child decision = %#v, want interrupted-child ready", child)
+	}
+	if !strings.Contains(child.Action, "safe to run recover for issue #650") ||
+		!strings.Contains(child.Action, "guardrails will bound retry") {
+		t.Fatalf("child action missing recovery guidance: %s", child.Action)
+	}
+}
+
+func TestComputeResumeBlocksUnsafeInterruptedChild(t *testing.T) {
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader: fakeReader{
+			repo:   "owner/repo",
+			issues: []gh.Issue{{Number: 650, Title: "Nested recovery", State: "OPEN"}},
+		},
+		RepoPath:   t.TempDir(),
+		BaseBranch: "main",
+		RunID:      "run-parent",
+		RunRecords: []state.RunRecord{
+			{RunID: "run-parent", Status: "running", ChildRunIDs: []string{"run-child"}},
+			{RunID: "run-child", ParentRunID: "run-parent", Status: "running"},
+		},
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+	if len(result.RunDecisions) != 2 {
+		t.Fatalf("run decisions = %#v, want 2", result.RunDecisions)
+	}
+	parent := result.RunDecisions[0]
+	child := result.RunDecisions[1]
+	if parent.Classification != "interrupted-parent" || parent.ActionKind != "blocked" || !strings.Contains(parent.Action, "unsafe child") {
+		t.Fatalf("parent decision = %#v, want unsafe-child block", parent)
+	}
+	if child.Classification != "interrupted-child" || child.ActionKind != "blocked" || !strings.Contains(child.Action, "needs-human") {
+		t.Fatalf("child decision = %#v, want needs-human block", child)
+	}
+}

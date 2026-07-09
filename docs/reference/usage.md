@@ -738,6 +738,29 @@ loopcoder kill --repo . --all
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
+
+### Interrupted parent and child run recovery
+
+`loopcoder resume --repo . --run-id <run-id>` is still read-only. When optional
+`.loopcoder/runs/<run-id>/run.json` metadata is present, resume also inspects the
+local run tree and reports recovery decisions for interrupted parent and child
+runs. Parent runs with interrupted children are reported separately from child
+runs so the conductor can recover the child first instead of duplicating work in
+the parent.
+
+Safe interrupted child runs show a ready action to run `loopcoder recover` for
+the child issue and run ID; the recover command then enforces the configured
+retry budget and circuit breaker before dispatching. Unsafe cases, such as a
+child run without an issue number or recovery context, are reported as
+`needs-human` / blocked and require an operator decision. Existing PR links are
+reported as adoptable work and must not be retried as duplicates.
+
+Recovery attempt records are appended under
+`.loopcoder/runs/<run-id>/recovery/issue-<n>-attempts.jsonl`. Their JSON includes
+the recovery `decision` plus `parent_run_id` and `child_run_id` when recovery is
+acting on a child run, so later resume/report tooling can explain why a retry,
+adoption, success, or blocked outcome occurred.
+
 `discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
 advanced/operator commands. `state push` is the explicit state-branch publish
 path; `kill` only targets loopcoder-managed processes for a run or repository

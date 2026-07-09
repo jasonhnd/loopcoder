@@ -21,6 +21,7 @@ func TestRenderResumeTextIncludesDocumentedSections(t *testing.T) {
 		Local: ResumeLocalState{
 			AttemptCount: 3,
 			EventCount:   4,
+			RunCount:     2,
 		},
 		Thresholds: ResumeThresholds{
 			HeartbeatFreshSeconds: 30,
@@ -48,6 +49,19 @@ func TestRenderResumeTextIncludesDocumentedSections(t *testing.T) {
 				Evidence:       []string{"PR: none open", "attempt: none"},
 			},
 		},
+		RunDecisions: []ResumeRunDecision{
+			{
+				RunID:          "run-child",
+				ParentRunID:    "run-parent",
+				Role:           "child",
+				Issue:          81,
+				Status:         "running",
+				Classification: "interrupted-child",
+				ActionKind:     "ready",
+				Action:         "safe to run recover for issue #81 with run run-child; guardrails will bound retry",
+				Evidence:       []string{"run state: running", "recovery: .loopcoder/runs/run-child/recovery/job-81-context.md"},
+			},
+		},
 	})
 
 	for _, want := range []string{
@@ -55,10 +69,13 @@ func TestRenderResumeTextIncludesDocumentedSections(t *testing.T) {
 		"Repo: owner/repo",
 		"RunId: run-20260626T120000Z-wave (requested run)",
 		"GitHub snapshot: open issues=2, open PRs=1",
-		"Local state: attempts=3, events=4",
+		"Local state: attempts=3, events=4, runs=2",
 		"Thresholds: heartbeat fresh <= 30s, stale progress > 120s, hung progress > 300s",
 		"Issues",
 		"classification: ready",
+		"Run recovery decisions",
+		"run-child (child)",
+		"safe to run recover for issue #81",
 		"Next ready actions",
 		"Blocked / awaiting human input",
 		"Safety",

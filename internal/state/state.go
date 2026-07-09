@@ -25,6 +25,8 @@ type Attempt struct {
 	JobID               string           `json:"job_id"`
 	Issue               int              `json:"issue"`
 	Attempt             int              `json:"attempt"`
+	ParentRunID         string           `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string         `json:"child_run_ids,omitempty"`
 	Provider            string           `json:"provider,omitempty"`
 	PID                 *int             `json:"pid,omitempty"`
 	Phase               string           `json:"phase,omitempty"`
@@ -49,6 +51,8 @@ type AttemptRecord struct {
 	JobID               string           `json:"job_id"`
 	Issue               int              `json:"issue"`
 	Attempt             int              `json:"attempt"`
+	ParentRunID         string           `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string         `json:"child_run_ids,omitempty"`
 	Provider            string           `json:"provider"`
 	PID                 int              `json:"pid"`
 	Phase               string           `json:"phase"`
@@ -81,6 +85,21 @@ type Event struct {
 	MergeCommit       string  `json:"merge_commit,omitempty"`
 	PriorStableCommit string  `json:"prior_stable_commit,omitempty"`
 	Details           any     `json:"details,omitempty"`
+}
+
+type RunRecord struct {
+	Version             int       `json:"version,omitempty"`
+	RunID               string    `json:"run_id"`
+	ParentRunID         string    `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string  `json:"child_run_ids,omitempty"`
+	Issue               int       `json:"issue,omitempty"`
+	Status              string    `json:"status,omitempty"`
+	Phase               string    `json:"phase,omitempty"`
+	RecoveryContextPath string    `json:"recovery_context_path,omitempty"`
+	PR                  string    `json:"pr,omitempty"`
+	UpdatedAt           string    `json:"updated_at,omitempty"`
+	Path                string    `json:"path,omitempty"`
+	LastWriteUTC        time.Time `json:"-"`
 }
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.
@@ -168,6 +187,10 @@ func AttemptPath(repoPath, runID, jobID string) string {
 
 func RecoveryBriefPath(repoPath, runID, jobID string) string {
 	return filepath.Join(RecoveryPath(repoPath, runID), jobID+"-context.md")
+}
+
+func RunRecordPath(repoPath, runID string) string {
+	return filepath.Join(RunPath(repoPath, runID), "run.json")
 }
 
 // WriteAttempt writes a compact attempt sidecar under workers/<job>.attempt.json.
@@ -278,11 +301,121 @@ func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
 	return attempts, nil
 }
 
+// LoadRunTree reads optional run.json metadata for runID and its descendants.
+// Missing metadata is not an error because v0.6.x runs only wrote attempt files.
+func LoadRunTree(repoPath, runID string) ([]RunRecord, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, nil
+	}
+
+	records, err := loadAllRunRecords(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	children := map[string][]string{}
+	for id, record := range records {
+		for _, child := range record.ChildRunIDs {
+			child = strings.TrimSpace(child)
+			if child != "" {
+				children[id] = append(children[id], child)
+			}
+		}
+		parent := strings.TrimSpace(record.ParentRunID)
+		if parent != "" {
+			children[parent] = append(children[parent], id)
+		}
+	}
+
+	seen := map[string]bool{}
+	var out []RunRecord
+	var walk func(string)
+	walk = func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		record, ok := records[id]
+		if !ok {
+			return
+		}
+		seen[id] = true
+		out = append(out, record)
+		sort.Strings(children[id])
+		for _, child := range children[id] {
+			walk(child)
+		}
+	}
+	walk(runID)
+	return out, nil
+}
+
+func loadAllRunRecords(repoPath string) (map[string]RunRecord, error) {
+	entries, err := os.ReadDir(RunsRoot(repoPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read runs directory: %w", err)
+	}
+	records := map[string]RunRecord{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := RunRecordPath(repoPath, entry.Name())
+		record, ok, err := readRunRecord(path, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			records[record.RunID] = record
+		}
+	}
+	return records, nil
+}
+
+func readRunRecord(path, fallbackRunID string) (RunRecord, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return RunRecord{}, false, nil
+		}
+		return RunRecord{}, false, fmt.Errorf("read run record: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return RunRecord{}, false, nil
+	}
+	var record RunRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return RunRecord{}, false, fmt.Errorf("parse run record %s: %w", path, err)
+	}
+	if strings.TrimSpace(record.RunID) == "" {
+		record.RunID = fallbackRunID
+	}
+	record.RunID = strings.TrimSpace(record.RunID)
+	record.ParentRunID = strings.TrimSpace(record.ParentRunID)
+	record.ChildRunIDs = cleanStringList(record.ChildRunIDs)
+	record.RecoveryContextPath = strings.TrimSpace(record.RecoveryContextPath)
+	record.PR = strings.TrimSpace(record.PR)
+	record.Path = path
+	if info, err := os.Stat(path); err == nil {
+		record.LastWriteUTC = info.ModTime().UTC()
+	}
+	return record, true, nil
+}
+
 type attemptJSON struct {
 	Version             int              `json:"version"`
 	JobID               string           `json:"job_id"`
 	Issue               json.RawMessage  `json:"issue"`
 	Attempt             json.RawMessage  `json:"attempt"`
+	ParentRunID         string           `json:"parent_run_id"`
+	ChildRunIDs         []string         `json:"child_run_ids"`
 	Provider            string           `json:"provider"`
 	PID                 json.RawMessage  `json:"pid"`
 	Phase               string           `json:"phase"`
@@ -351,6 +484,8 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		JobID:               jobID,
 		Issue:               issue,
 		Attempt:             attemptNumber,
+		ParentRunID:         strings.TrimSpace(raw.ParentRunID),
+		ChildRunIDs:         cleanStringList(raw.ChildRunIDs),
 		Provider:            raw.Provider,
 		PID:                 rawIntPtr(raw.PID),
 		Phase:               raw.Phase,
@@ -369,6 +504,21 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func cleanStringList(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {

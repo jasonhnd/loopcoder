@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -502,9 +503,11 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 	}, Deps{
 		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
 		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			childAttempt := recoverAttempt(repo, 2, "job-103-2", "failed", "second error")
+			childAttempt.ParentRunID = "run-parent"
 			return []state.Attempt{
 				recoverAttempt(repo, 1, "job-103-1", "failed", "first error"),
-				recoverAttempt(repo, 2, "job-103-2", "failed", "second error"),
+				childAttempt,
 			}, nil
 		},
 		Sleep: func(_ context.Context, duration time.Duration) error {
@@ -568,6 +571,21 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		result.DispatchResult.Report.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Report.Usage.TotalTokens != 321 {
 		t.Fatalf("retry report not preserved: %#v", result.DispatchResult.Report)
+	}
+	if len(result.RecoveryAttempts) != 1 || result.RecoveryAttempts[0].Decision != string(ActionRetry) {
+		t.Fatalf("recovery attempts = %#v, want retry decision", result.RecoveryAttempts)
+	}
+	if result.RecoveryAttempts[0].ParentRunID != "run-parent" || result.RecoveryAttempts[0].ChildRunID != "run-test" {
+		t.Fatalf("recovery lineage = %#v, want parent run-parent and child run-test", result.RecoveryAttempts[0])
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("Marshal recovery result: %v", err)
+	}
+	for _, want := range []string{`"decision":"retry"`, `"parent_run_id":"run-parent"`, `"child_run_id":"run-test"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("recovery JSON missing %q: %s", want, string(data))
+		}
 	}
 }
 

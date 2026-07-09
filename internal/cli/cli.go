@@ -4485,6 +4485,11 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "resume: %v\n", err)
 		return 1
 	}
+	runRecords, err := state.LoadRunTree(resolvedRepo, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "resume: %v\n", err)
+		return 1
+	}
 
 	resumeReport, err := orchestration.ComputeResume(context.Background(), orchestration.ResumeOptions{
 		Reader:       deps.NewGitHubReader(resolvedRepo),
@@ -4493,6 +4498,7 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		RunID:        runID,
 		RunNote:      runNote,
 		Attempts:     attempts,
+		RunRecords:   runRecords,
 		EventCount:   eventCount,
 		Thresholds:   cfg.Resilience.Worker,
 		ProcessAlive: deps.ProcessAlive,

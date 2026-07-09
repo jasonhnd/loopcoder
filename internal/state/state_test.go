@@ -98,6 +98,55 @@ func TestLatestRunIDReturnsEmptyWhenRunsRootMissing(t *testing.T) {
 	}
 }
 
+func TestLoadRunTreeReadsParentAndChildRecords(t *testing.T) {
+	repo := t.TempDir()
+	writeRunRecord(t, repo, "run-parent", RunRecord{
+		RunID:       "run-parent",
+		Status:      "running",
+		ChildRunIDs: []string{"run-child"},
+	})
+	writeRunRecord(t, repo, "run-child", RunRecord{
+		RunID:               "run-child",
+		ParentRunID:         "run-parent",
+		Issue:               650,
+		Status:              "running",
+		RecoveryContextPath: ".loopcoder/runs/run-child/recovery/job-650-context.md",
+	})
+	writeRunRecord(t, repo, "run-unrelated", RunRecord{
+		RunID:  "run-unrelated",
+		Status: "running",
+	})
+
+	tree, err := LoadRunTree(repo, "run-parent")
+	if err != nil {
+		t.Fatalf("LoadRunTree returned error: %v", err)
+	}
+	if len(tree) != 2 {
+		t.Fatalf("tree length = %d, want 2: %#v", len(tree), tree)
+	}
+	if tree[0].RunID != "run-parent" || tree[1].RunID != "run-child" {
+		t.Fatalf("tree order = %#v", tree)
+	}
+	if tree[1].ParentRunID != "run-parent" || tree[1].Issue != 650 {
+		t.Fatalf("child record = %#v", tree[1])
+	}
+}
+
+func writeRunRecord(t *testing.T, repo, runID string, record RunRecord) {
+	t.Helper()
+	path := RunRecordPath(repo, runID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll run record: %v", err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal run record: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile run record: %v", err)
+	}
+}
+
 func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	repo := t.TempDir()
 	workers := filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers")

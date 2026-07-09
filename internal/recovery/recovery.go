@@ -122,12 +122,12 @@ type DispatchResult struct {
 }
 
 type Result struct {
-	Action           Action
-	Report           string
-	DispatchResult   *DispatchResult
-	ReviewResult     *loopreview.Result
-	RecoveryAttempts []AttemptRecord
-	AdoptedPR        *AdoptedPR
+	Action           Action             `json:"action"`
+	Report           string             `json:"report,omitempty"`
+	DispatchResult   *DispatchResult    `json:"dispatch_result,omitempty"`
+	ReviewResult     *loopreview.Result `json:"review_result,omitempty"`
+	RecoveryAttempts []AttemptRecord    `json:"recovery_attempts,omitempty"`
+	AdoptedPR        *AdoptedPR         `json:"adopted_pr,omitempty"`
 }
 
 type PullRequestReader interface {
@@ -171,7 +171,10 @@ type AttemptRecord struct {
 	Version             int                 `json:"version"`
 	Issue               int                 `json:"issue"`
 	RunID               string              `json:"run_id"`
+	ParentRunID         string              `json:"parent_run_id,omitempty"`
+	ChildRunID          string              `json:"child_run_id,omitempty"`
 	Attempt             int                 `json:"attempt"`
+	Decision            string              `json:"decision,omitempty"`
 	Strategy            string              `json:"strategy"`
 	Status              string              `json:"status"`
 	Branch              string              `json:"branch,omitempty"`
@@ -360,7 +363,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			blockReason := ""
 			if latestHung {
 				blockReason = HungReasonLedger
-				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath))
+				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath, latestHistoryAttempt(attempts)))
 			}
 			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, blockReason))
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
@@ -381,12 +384,16 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		retryBranch := fmt.Sprintf("loop/issue-%d-retry-%d", opts.IssueNumber, nextAttempt)
 		backoffSeconds := selectBackoffSeconds(priorAttempts, opts.BackoffSeconds)
 		report.WriteString(renderRetryReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, retryBranch, strategy, model, effort, backoffSeconds))
+		latestAttempt := latestHistoryAttempt(attempts)
 
 		record := AttemptRecord{
 			Version:             AttemptRecordVersion,
 			Issue:               opts.IssueNumber,
 			RunID:               opts.RunID,
+			ParentRunID:         recoveryParentRunID(latestAttempt),
+			ChildRunID:          recoveryChildRunID(opts, latestAttempt),
 			Attempt:             nextAttempt,
+			Decision:            string(ActionRetry),
 			Strategy:            strategy,
 			Status:              "running",
 			Branch:              retryBranch,
@@ -866,13 +873,16 @@ func ensureHungReason(detail string) string {
 	return HungReasonLedger + ": " + detail
 }
 
-func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempts int, latestBriefPath string) AttemptRecord {
+func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempts int, latestBriefPath string, latest *attemptHistoryEntry) AttemptRecord {
 	now := state.FormatTimestamp(recoverNow(opts))
 	record := AttemptRecord{
 		Version:             AttemptRecordVersion,
 		Issue:               opts.IssueNumber,
 		RunID:               opts.RunID,
+		ParentRunID:         recoveryParentRunID(latest),
+		ChildRunID:          recoveryChildRunID(opts, latest),
 		Attempt:             priorAttempts,
+		Decision:            string(ActionBlocked),
 		Strategy:            AttemptStrategySameConfig,
 		Status:              guardrails.StatusNeedsHuman,
 		RecoveryContextPath: latestBriefPath,
@@ -884,6 +894,20 @@ func recordHungNeedsHuman(repoPath string, opts Options, deps Deps, priorAttempt
 		fmt.Fprintf(opts.Stderr, "[loopcoder] warning: failed to record hung needs-human attempt for issue #%d: %v\n", opts.IssueNumber, err)
 	}
 	return record
+}
+
+func recoveryParentRunID(latest *attemptHistoryEntry) string {
+	if latest == nil {
+		return ""
+	}
+	return strings.TrimSpace(latest.Record.ParentRunID)
+}
+
+func recoveryChildRunID(opts Options, latest *attemptHistoryEntry) string {
+	if latest != nil && strings.TrimSpace(latest.Record.ParentRunID) != "" {
+		return strings.TrimSpace(opts.RunID)
+	}
+	return ""
 }
 
 func dispatchFailureDetail(result DispatchResult, err error) string {
