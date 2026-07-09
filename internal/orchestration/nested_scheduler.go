@@ -23,6 +23,8 @@ const (
 	NestedStatusNeedsHuman = "needs-human"
 	NestedStatusSkipped    = "skipped"
 	NestedStatusCancelled  = "cancelled"
+	NestedStatusTimedOut   = "timed_out"
+	NestedStatusAbandoned  = "abandoned"
 	NestedStatusQueued     = "queued"
 
 	NestedEventChildQueued   = "nested.child.queued"
@@ -212,9 +214,20 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		select {
 		case <-ctx.Done():
 			result := childResultFromPlan(children[index])
-			result.Status = NestedStatusCancelled
+			result.Status = normalizeNestedStatus(state.FailureStatus(ctx.Err()))
+			if result.Status == "" {
+				result.Status = NestedStatusCancelled
+			}
 			result.Error = ctx.Err().Error()
-			result.FinishedAt = state.FormatTimestamp(clock())
+			finishedAt := clock().UTC()
+			result.FinishedAt = state.FormatTimestamp(finishedAt)
+			eventMu.Lock()
+			err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
+			eventMu.Unlock()
+			setCompleteErr(err)
+			if err := recordNestedEvent(opts, children[index].RunID, children[index], result, NestedEventChildFinished, finishedAt); err != nil {
+				setCompleteErr(err)
+			}
 			results[index] = result
 			continue
 		case sem <- struct{}{}:
@@ -238,7 +251,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			executed, err := opts.Execute(ctx, child)
 			result = mergeChildResult(result, executed)
 			if err != nil {
-				result.Status = NestedStatusFailed
+				result.Status = normalizeNestedStatus(state.FailureStatus(err))
 				result.Error = err.Error()
 			}
 			result.Status = normalizeNestedStatus(result.Status)
@@ -290,16 +303,12 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 		return nil, fmt.Errorf("child run count %d exceeds max children %d", len(children), opts.MaxChildren)
 	}
 	out := make([]ChildRunPlan, 0, len(children))
-	seen := map[string]bool{}
+	seenRunIDs := map[string]bool{}
 	for index, child := range children {
 		child.ID = strings.TrimSpace(child.ID)
 		if child.ID == "" {
 			return nil, fmt.Errorf("child[%d].id is required", index)
 		}
-		if seen[child.ID] {
-			return nil, fmt.Errorf("duplicate child id %q", child.ID)
-		}
-		seen[child.ID] = true
 		if child.Required == child.Optional {
 			return nil, fmt.Errorf("child %q must set exactly one of required or optional", child.ID)
 		}
@@ -315,11 +324,15 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 		}
 		child.Scope = normalizeChildScope(child.Scope)
 		if child.RunID == "" {
-			child.RunID = state.RunIDForChild(child.ID, started.Add(time.Duration(index)*time.Nanosecond))
+			child.RunID = state.RunIDForChild(child.ID, index, started)
 		}
 		if !state.IsRunID(child.RunID) {
 			return nil, fmt.Errorf("child %q run id %q is invalid", child.ID, child.RunID)
 		}
+		if seenRunIDs[child.RunID] {
+			return nil, fmt.Errorf("duplicate child run id %q", child.RunID)
+		}
+		seenRunIDs[child.RunID] = true
 		out = append(out, child)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -495,6 +508,10 @@ func normalizeNestedStatus(status string) string {
 		return NestedStatusSkipped
 	case NestedStatusCancelled, "canceled":
 		return NestedStatusCancelled
+	case NestedStatusTimedOut, "timeout", "timed-out":
+		return NestedStatusTimedOut
+	case NestedStatusAbandoned:
+		return NestedStatusAbandoned
 	case "", NestedStatusFailed, "failure", "error":
 		return NestedStatusFailed
 	default:
@@ -509,7 +526,7 @@ func nestedParentStatus(results []ChildRunResult) string {
 			continue
 		}
 		switch result.Status {
-		case NestedStatusFailed, NestedStatusCancelled:
+		case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusSkipped:
 			return NestedStatusFailed
 		case NestedStatusNeedsHuman:
 			needsHuman = true

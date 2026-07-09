@@ -870,6 +870,9 @@ func runProjectsList(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "projects list: %v\n", err)
 		return 1
 	}
+	if projects == nil {
+		projects = []registry.Project{}
+	}
 	payload := struct {
 		Projects []registry.Project `json:"projects"`
 	}{Projects: projects}

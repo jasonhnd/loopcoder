@@ -609,6 +609,23 @@ func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
 	}
 }
 
+func TestProjectsListJSONUsesEmptyArrayWhenNoProjects(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "list", "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("list JSON: %v\n%s", err, stdout.String())
+	}
+	if got := strings.TrimSpace(string(payload["projects"])); got != "[]" {
+		t.Fatalf("projects JSON = %s, want []\nfull output:\n%s", got, stdout.String())
+	}
+}
+
 func TestProjectsShowJSONWorksWhenUnregistered(t *testing.T) {
 	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/unregistered.git")
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
