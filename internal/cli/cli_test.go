@@ -313,6 +313,126 @@ func TestModelsCommandRejectsAgyProviderWithHint(t *testing.T) {
 	}
 }
 
+func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/repo.git")
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var registerOut, registerErr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &registerOut, &registerErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("register exit = %d stderr=%q", exitCode, registerErr.String())
+	}
+	var registered struct {
+		Project struct {
+			ProjectID           string `json:"project_id"`
+			DisplayName         string `json:"display_name"`
+			RemoteURLNormalized string `json:"remote_url_normalized"`
+			IdentitySource      string `json:"identity_source"`
+		} `json:"project"`
+		Created bool `json:"created"`
+	}
+	if err := json.Unmarshal(registerOut.Bytes(), &registered); err != nil {
+		t.Fatalf("register JSON: %v\n%s", err, registerOut.String())
+	}
+	if !registered.Created || registered.Project.ProjectID == "" || registered.Project.DisplayName != "repo" || registered.Project.IdentitySource != "github" {
+		t.Fatalf("registered = %#v", registered)
+	}
+
+	var secondOut, secondErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &secondOut, &secondErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("second register exit = %d stderr=%q", exitCode, secondErr.String())
+	}
+	var second struct {
+		Updated bool `json:"updated"`
+	}
+	if err := json.Unmarshal(secondOut.Bytes(), &second); err != nil {
+		t.Fatalf("second register JSON: %v\n%s", err, secondOut.String())
+	}
+	if !second.Updated {
+		t.Fatalf("second = %#v, want updated", second)
+	}
+
+	var listOut, listErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "list", "--format", "json"}, &listOut, &listErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list exit = %d stderr=%q", exitCode, listErr.String())
+	}
+	var list struct {
+		Projects []struct {
+			ProjectID string `json:"project_id"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(listOut.Bytes(), &list); err != nil {
+		t.Fatalf("list JSON: %v\n%s", err, listOut.String())
+	}
+	if len(list.Projects) != 1 || list.Projects[0].ProjectID != registered.Project.ProjectID {
+		t.Fatalf("list = %#v, want one registered project", list)
+	}
+
+	var showOut, showErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &showOut, &showErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show exit = %d stderr=%q", exitCode, showErr.String())
+	}
+	var show struct {
+		Registered bool `json:"registered"`
+		Project    struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(showOut.Bytes(), &show); err != nil {
+		t.Fatalf("show JSON: %v\n%s", err, showOut.String())
+	}
+	if !show.Registered || show.Project.ProjectID != registered.Project.ProjectID {
+		t.Fatalf("show = %#v, want registered project", show)
+	}
+
+	var removeOut, removeErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "remove", "--repo", repo, "--format", "json"}, &removeOut, &removeErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("remove exit = %d stderr=%q", exitCode, removeErr.String())
+	}
+	var removed struct {
+		Removed           bool `json:"removed"`
+		RunHistoryDeleted bool `json:"run_history_deleted"`
+	}
+	if err := json.Unmarshal(removeOut.Bytes(), &removed); err != nil {
+		t.Fatalf("remove JSON: %v\n%s", err, removeOut.String())
+	}
+	if !removed.Removed || removed.RunHistoryDeleted {
+		t.Fatalf("removed = %#v, want removed without run history deletion", removed)
+	}
+}
+
+func TestProjectsShowJSONWorksWhenUnregistered(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/unregistered.git")
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var show struct {
+		Registered bool `json:"registered"`
+		Project    struct {
+			ProjectID      string `json:"project_id"`
+			IdentitySource string `json:"identity_source"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &show); err != nil {
+		t.Fatalf("show JSON: %v\n%s", err, stdout.String())
+	}
+	if show.Registered || show.Project.ProjectID == "" || show.Project.IdentitySource != "github" {
+		t.Fatalf("show = %#v, want unregistered github candidate", show)
+	}
+}
+
 func expectedModelsOutput() string {
 	return "provider: codex\n" +
 		"vendor: OpenAI Codex\n" +
@@ -4762,6 +4882,25 @@ func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {
 	runCLITestGit(t, repo, "commit", "-m", "add delivery config")
 	runCLITestGit(t, repo, "checkout", "main")
 	return repo
+}
+
+func initProjectRegistryCLITestRepo(t *testing.T, remote string) string {
+	t.Helper()
+	repo := t.TempDir()
+	runCLITestGit(t, repo, "init", "-b", "main")
+	runCLITestGit(t, repo, "config", "user.email", "loopcoder-test@example.com")
+	runCLITestGit(t, repo, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runCLITestGit(t, repo, "add", "README.md")
+	runCLITestGit(t, repo, "commit", "-m", "initial")
+	runCLITestGit(t, repo, "remote", "add", "origin", remote)
+	return repo
+}
+
+func fixedCLINow() time.Time {
+	return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 }
 
 func runCLITestGit(t *testing.T, repo string, args ...string) {

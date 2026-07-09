@@ -104,6 +104,10 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
+loopcoder projects register --repo .          # add or refresh this checkout in the global project registry
+loopcoder projects list --format json         # list registered projects for machine use
+loopcoder projects show --repo .              # inspect this checkout's resolved registry identity
+loopcoder projects remove --repo .            # remove registry entry without deleting run history
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -194,7 +198,22 @@ The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity W
 
 ### Doctor And Migration
 
-`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, resolved host profile, Worker and Verifier provider CLIs, provider auth probes where stable, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile` object, and ordered `checks[]` objects with `name`, `status`, `hard`, `message`, and `fix_command`.
+`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, resolved host profile, Worker and Verifier provider CLIs, provider auth probes where stable, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, storage health, project registry identity, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile` object, and ordered `checks[]` objects with `name`, `status`, `hard`, `message`, and `fix_command`.
+
+### Project Registry
+
+`loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects.
+
+```text
+loopcoder projects register --repo .
+loopcoder projects list
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects show --repo . --format json
+loopcoder projects remove --repo .
+```
+
+`show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source. `remove --repo .` deletes only the project registry row; historical run records are left in the database and are not deleted by default. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
 
 `loopcoder doctor --repo . --fix` performs only the 0.6.0 local repair actions: migrate legacy `.delivery.yml attestation` keys to `report`, refresh conductor hook settings to `loopcoder hook conductor-reporter`, move legacy hook state from `conductor-attest` to `conductor-reporter`, rewrite eligible local state keys from `attestation` to `report`, and prune cleanup-eligible gitignored `.loopcoder/` state. It does not install provider CLIs, run provider login, flush pending relay records, edit tracked docs, choose models, commit, push, or mutate GitHub.
 

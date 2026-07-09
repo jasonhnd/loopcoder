@@ -74,7 +74,14 @@ push access.
    loopcoder doctor --repo .
    ```
 
-6. Confirm local report querying works. A fresh repository may have no reports
+6. Register the checkout in the machine-local project registry.
+
+   ```text
+   loopcoder projects register --repo .
+   loopcoder projects show --repo .
+   ```
+
+7. Confirm local report querying works. A fresh repository may have no reports
    yet; the command is still read-only and should render a valid empty report
    list.
 
@@ -82,7 +89,7 @@ push access.
    loopcoder report --repo .
    ```
 
-7. Drive the loop from a conductor session in the repository.
+8. Drive the loop from a conductor session in the repository.
 
    ```text
    /loopcoder <your need>
@@ -100,6 +107,7 @@ Command side effects in the first-run path:
 | `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
+| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
@@ -111,9 +119,8 @@ committed to normal business branches. `init` and `skill install --repo`
 protect it with local `.git/info/exclude`; `loopcoder state push` is the
 explicit publishing path for state summaries. A machine can serve many
 projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
-the machine-level binary and bundled skill live under the user's machine-level
-loopcoder/agent directories. v0.6.1 introduces no SQLite database or global
-project registry.
+the machine-level binary, bundled skill, and v0.7.0 SQLite project registry
+live under the user's machine-level loopcoder/agent directories.
 
 ## Prerequisites
 
@@ -470,6 +477,8 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   whether `.loopcoder/` files are already tracked, and the exact safe fix
   command when local state is tracked;
 - reportquery readability for local report/run/relay records;
+- storage health and the current checkout's machine-local project registry
+  identity, including ambiguity warnings;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -652,6 +661,11 @@ loopcoder doctor --repo . --format json
 
 loopcoder models
 loopcoder models --provider antigravity
+
+loopcoder projects register --repo .
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects remove --repo .
 
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
