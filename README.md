@@ -279,6 +279,7 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/reference/architecture.md`](docs/reference/architecture.md) -- current architecture and limits.
 - [`docs/reference/audit.md`](docs/reference/audit.md) -- read-only security audit command.
 - [`docs/reference/releasing.md`](docs/reference/releasing.md) -- release documentation rule.
+- [`docs/reference/self-bootstrap.md`](docs/reference/self-bootstrap.md) -- v0.7.0 self-bootstrap acceptance checklist.
 - [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) -- dependency-aware scheduling.
 - [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md) -- required checks and verifier verdicts.
