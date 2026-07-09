@@ -348,16 +348,20 @@ func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	repo := t.TempDir()
 	var stdout, stderr bytes.Buffer
 
-	exitCode := RunWithDeps([]string{"migrate", "local-state", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+	exitCode := RunWithDeps([]string{"migrate", "local-state", "--repo", repo, "--dry-run", "--format", "json"}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
 		MigrateLocalState: func(_ context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
 			if opts.RepoPath != repo {
 				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
 			}
+			if !opts.DryRun {
+				t.Fatalf("DryRun = false, want true")
+			}
 			return localmigrate.Result{
 				RepoPath:       opts.RepoPath,
 				ProjectID:      "proj_test",
 				DatabasePath:   filepath.Join(repo, "loopcoder.db"),
+				DryRun:         opts.DryRun,
 				Status:         "completed-with-warnings",
 				ScannedCount:   3,
 				ImportedCount:  2,
@@ -379,6 +383,7 @@ func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	}
 	var payload struct {
 		ProjectID      string                    `json:"project_id"`
+		DryRun         bool                      `json:"dry_run"`
 		Status         string                    `json:"status"`
 		MalformedCount int                       `json:"malformed_count"`
 		Diagnostics    []localmigrate.Diagnostic `json:"diagnostics"`
@@ -386,7 +391,7 @@ func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
 	}
-	if payload.ProjectID != "proj_test" || payload.Status != "completed-with-warnings" || payload.MalformedCount != 1 || len(payload.Diagnostics) != 1 {
+	if payload.ProjectID != "proj_test" || !payload.DryRun || payload.Status != "completed-with-warnings" || payload.MalformedCount != 1 || len(payload.Diagnostics) != 1 {
 		t.Fatalf("payload = %#v", payload)
 	}
 }

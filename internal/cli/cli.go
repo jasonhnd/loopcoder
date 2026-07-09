@@ -1007,7 +1007,7 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Import legacy repo-local .loopcoder records into machine-local storage.")
 	fmt.Fprintln(w)
@@ -1015,6 +1015,9 @@ func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
+	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
+	fmt.Fprintln(w, "  --format      output format for local-state: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help        show command help")
 }
 
@@ -1029,11 +1032,15 @@ func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) in
 	var repoAlias string
 	format := "text"
 	var formatAlias string
+	dryRun := false
+	var dryRunAlias bool
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&dryRun, "dry-run", false, "scan legacy records without writing machine-local storage")
+	fs.BoolVar(&dryRunAlias, "DryRun", false, "scan legacy records without writing machine-local storage")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1043,6 +1050,7 @@ func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) in
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	dryRun = dryRun || dryRunAlias
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
 	case "text", "json":
@@ -1057,6 +1065,7 @@ func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) in
 	}
 	result, err := deps.MigrateLocalState(context.Background(), localmigrate.Options{
 		RepoPath: resolvedRepo,
+		DryRun:   dryRun,
 		Now:      deps.Now,
 	})
 	if err != nil {
@@ -1088,6 +1097,9 @@ func renderMigrateLocalStateText(result localmigrate.Result) string {
 	fmt.Fprintf(&out, "status: %s\n", result.Status)
 	fmt.Fprintf(&out, "project_id: %s\n", displayText(result.ProjectID))
 	fmt.Fprintf(&out, "database: %s\n", displayText(result.DatabasePath))
+	if result.DryRun {
+		fmt.Fprintln(&out, "dry_run: true")
+	}
 	fmt.Fprintf(&out, "scanned: %d\n", result.ScannedCount)
 	fmt.Fprintf(&out, "imported: %d\n", result.ImportedCount)
 	fmt.Fprintf(&out, "skipped: %d\n", result.SkippedCount)

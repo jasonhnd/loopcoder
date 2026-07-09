@@ -63,6 +63,33 @@ func TestLocalStateImportIsIdempotent(t *testing.T) {
 	assertDBCount(t, dbPath, `SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`, first.ProjectID, 1)
 }
 
+func TestLocalStateDryRunReportsCandidatesWithoutWritingStorage(t *testing.T) {
+	repo, dbPath := initImportFixture(t)
+
+	result, err := LocalState(context.Background(), Options{RepoPath: repo, DryRun: true, Now: fixedImportNow}, importDeps(t))
+	if err != nil {
+		t.Fatalf("LocalState dry run returned error: %v", err)
+	}
+	if !result.DryRun {
+		t.Fatalf("DryRun = false, want true")
+	}
+	if result.Status != statusDryRunWithWarnings {
+		t.Fatalf("Status = %q, want dry-run warnings for malformed JSONL", result.Status)
+	}
+	if result.ProjectID != "" {
+		t.Fatalf("ProjectID = %q, want empty because dry run does not register the project", result.ProjectID)
+	}
+	if result.DatabasePath != dbPath {
+		t.Fatalf("DatabasePath = %q, want %q", result.DatabasePath, dbPath)
+	}
+	if result.ScannedCount == 0 || result.ImportedCount == 0 || result.ReportCount != 1 || result.MalformedCount != 1 {
+		t.Fatalf("dry-run counts = scanned %d imported %d reports %d malformed %d, want candidates and malformed record reported", result.ScannedCount, result.ImportedCount, result.ReportCount, result.MalformedCount)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("dry run created or touched database path %s: %v", dbPath, err)
+	}
+}
+
 func TestImportedReportsRemainQueryableWhenRepoLocalFilesAreAbsent(t *testing.T) {
 	repo, _ := initImportFixture(t)
 	result, err := LocalState(context.Background(), Options{RepoPath: repo, Now: fixedImportNow}, importDeps(t))

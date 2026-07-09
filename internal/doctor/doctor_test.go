@@ -1217,6 +1217,20 @@ func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
 	}
 }
 
+func TestCheckLocalStateImportIgnoresAuditOnlyState(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".loopcoder", "audit", "audit.jsonl"), `{"ok":true}`+"\n")
+
+	check := checkLocalStateImport(context.Background(), repo, Deps{})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if !strings.Contains(check.Message, "no repo-local .loopcoder history found") {
+		t.Fatalf("message = %q, want no history message", check.Message)
+	}
+}
+
 func TestCheckVersionStatusWarnsBeforeBreakingBoundary(t *testing.T) {
 	repo := t.TempDir()
 	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
