@@ -129,8 +129,10 @@ loopcoder relay list    --repo .              # inspect pending local relay bloc
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder status --repo . --format json       # inspect latest run tree as stable JSON
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
+loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
 loopcoder state pull    --repo .              # pull state branch summaries
 loopcoder lease acquire --repo . --run-id <id> # acquire conductor lease

@@ -432,6 +432,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
 	}
+	if command.Name == "status" {
+		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string      run id; omit to inspect the latest local run")
+		fmt.Fprintln(w, "  --run-id string   alias for --run")
+		fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+	}
+	if command.Name == "report" {
+		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
+		fmt.Fprintln(w, "  --work-id string   filter by report work id")
+		fmt.Fprintln(w, "  --run string       include run tree for a run id in JSON output")
+		fmt.Fprintln(w, "  --issue int        filter by issue number")
+		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
+		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
+		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+	}
 	if command.Name == "models" {
 		fmt.Fprintln(w, "  --provider string   registry provider key to render")
 	}
@@ -4588,6 +4603,8 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	var repoAlias string
 	var runID string
 	var runIDAlias string
+	format := "text"
+	var formatAlias string
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4595,6 +4612,8 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	fs.StringVar(&runIDAlias, "Run", "", "run id")
 	fs.StringVar(&runIDAlias, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -4604,6 +4623,15 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	}
 	if runIDAlias != "" {
 		runID = runIDAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	switch format {
+	case "text", "json":
+	default:
+		fmt.Fprintf(stderr, "status: invalid --format %q; want text or json\n", format)
+		return 2
 	}
 
 	resolvedRepo, err := resolveRepo(repoPath)
@@ -4620,6 +4648,18 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 1
 	}
+	if format == "json" {
+		data, err := runstatus.MarshalJSON(report)
+		if err != nil {
+			fmt.Fprintf(stderr, "status: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
@@ -4635,6 +4675,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	var repoAlias string
 	var workID string
 	var workIDAlias string
+	var runID string
+	var runIDAlias string
 	var issue int
 	var issueAlias int
 	var role string
@@ -4648,6 +4690,10 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&workID, "work-id", "", "work id")
 	fs.StringVar(&workIDAlias, "WorkId", "", "work id")
+	fs.StringVar(&runID, "run", "", "run id")
+	fs.StringVar(&runIDAlias, "Run", "", "run id")
+	fs.StringVar(&runIDAlias, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.IntVar(&issue, "issue", 0, "issue number")
 	fs.IntVar(&issueAlias, "Issue", 0, "issue number")
 	fs.StringVar(&role, "role", "", "role")
@@ -4665,6 +4711,12 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 	if workIDAlias != "" {
 		workID = workIDAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	if strings.TrimSpace(runID) != "" && strings.TrimSpace(workID) == "" {
+		workID = runID
 	}
 	if issueAlias != 0 {
 		issue = issueAlias
@@ -4715,7 +4767,19 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if format == "json" {
-		data, err := reportquery.MarshalJSON(records)
+		var runTree any
+		if strings.TrimSpace(runID) != "" {
+			statusReport, err := runstatus.Load(runstatus.Options{
+				RepoPath: resolvedRepo,
+				RunID:    runID,
+			})
+			if err != nil {
+				fmt.Fprintf(stderr, "report: %v\n", err)
+				return 1
+			}
+			runTree = statusReport.RunTree
+		}
+		data, err := reportquery.MarshalJSONWithRunTree(records, runTree)
 		if err != nil {
 			fmt.Fprintf(stderr, "report: %v\n", err)
 			return 1

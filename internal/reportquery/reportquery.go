@@ -189,6 +189,10 @@ func RenderText(records []Record) string {
 }
 
 func MarshalJSON(records []Record) ([]byte, error) {
+	return MarshalJSONWithRunTree(records, nil)
+}
+
+func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 	reports := make([]reporter.Report, 0, len(records))
 	jsonRecords := make([]jsonRecord, 0, len(records))
 	for _, record := range records {
@@ -200,10 +204,12 @@ func MarshalJSON(records []Record) ([]byte, error) {
 			Path:   record.Path,
 		})
 	}
-	return json.Marshal(struct {
+	payload := struct {
 		Reports []reporter.Report `json:"reports"`
 		Records []jsonRecord      `json:"records"`
-	}{Reports: reports, Records: jsonRecords})
+		RunTree any               `json:"run_tree,omitempty"`
+	}{Reports: reports, Records: jsonRecords, RunTree: runTree}
+	return json.Marshal(payload)
 }
 
 type jsonRecord struct {
