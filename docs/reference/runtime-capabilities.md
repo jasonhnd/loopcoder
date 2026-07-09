@@ -45,6 +45,46 @@ read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,
 loopcoder must fail closed before launching `agy` and point the user to a
 supporting provider such as `codex` or `claude`.
 
+## Compatibility Smoke Matrix
+
+`doctor --format json` includes a `provider_compatibility[]` smoke matrix built
+from the runtime capability contract. Each entry has `provider`, `host`, `role`,
+`support`, `status`, `code`, and the required or missing provider capabilities.
+The matrix is local and static; it does not log in, launch paid remote calls, or
+try to automate provider authentication.
+
+Support levels:
+
+| Level | Meaning |
+| --- | --- |
+| `supported` | The provider and host combination satisfies the local capability contract for that role. |
+| `experimental` | The combination is usable but still has known limitations or is not part of the fully verified path. |
+| `unsupported` | The combination must fail closed before provider launch when selected for that role. |
+
+Current role matrix:
+
+| Provider | Worker | Verifier / read-only | Nested sub-agents |
+| --- | --- | --- | --- |
+| `codex` | supported | supported | unsupported |
+| `claude` | supported | supported | supported |
+| `gemini` | experimental | experimental | unsupported |
+| `antigravity` | experimental | unsupported | unsupported |
+
+Current host matrix:
+
+| Host profile | Support level | Notes |
+| --- | --- | --- |
+| `codex-cli` | supported | Hook enforcement is best-effort unless manually wired by the host. |
+| `claude-code` | supported | Project hook install writes conductor reporter and relay guard commands. |
+| `paseo-style` | supported | The host owns session lifetime and stderr visibility. |
+| `generic-local` | experimental | Fallback when no explicit host profile or known host signal is available. |
+
+Doctor adds selected-provider checks for the active Worker and Verifier roles.
+Those checks distinguish `missing_executable`, `unauthenticated_provider`,
+`unsupported_read_only_mode`, and `unsupported_nested_agents`. Unavailable
+optional providers do not hard-fail unless they are selected by `.delivery.yml`
+or command defaults.
+
 ## Host Invocation Contract
 
 The Conductor host is the active human or automation session that calls the

@@ -131,8 +131,20 @@ try {
         & $binary skill install --repo $repoTmp | Out-Host
     }
     $doctorJson = & $binary doctor --repo $repoTmp --format json
-    $doctorJson | ConvertFrom-Json | Out-Null
+    $doctorPayload = $doctorJson | ConvertFrom-Json
     Write-Host $doctorJson
+    $defaultWorkerSmoke = @($doctorPayload.provider_compatibility | Where-Object {
+        $_.provider -eq "codex" -and $_.role -eq "worker" -and $_.support -eq "supported"
+    })
+    if ($defaultWorkerSmoke.Count -lt 1) {
+        Fail "doctor JSON did not include supported default codex worker provider compatibility"
+    }
+    $defaultWorkerCheck = @($doctorPayload.checks | Where-Object {
+        $_.name -eq "provider compatibility codex worker" -and $_.code -eq "supported" -and $_.status -eq "ok"
+    })
+    if ($defaultWorkerCheck.Count -ne 1) {
+        Fail "doctor JSON did not include an ok selected default codex worker compatibility check"
+    }
     Invoke-Checked "loopcoder report" {
         & $binary report --repo $repoTmp | Out-Host
     }
