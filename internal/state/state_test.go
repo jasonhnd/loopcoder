@@ -60,6 +60,18 @@ func TestRunIDForIssueUsesDocumentedShape(t *testing.T) {
 	}
 }
 
+func TestRunIDForChildUsesSafeNestedShape(t *testing.T) {
+	parent := "run-20260709T120000Z-wave"
+	got := RunIDForChild(parent, "API / Docs Child!")
+	want := "run-20260709T120000Z-wave-child-api-docs-child"
+	if got != want {
+		t.Fatalf("RunIDForChild() = %q, want %q", got, want)
+	}
+	if !IsRunID(got) {
+		t.Fatalf("IsRunID(%q) = false, want true", got)
+	}
+}
+
 func TestLatestRunIDSelectsNewestRunDirectory(t *testing.T) {
 	repo := t.TempDir()
 	runsRoot := filepath.Join(repo, ".loopcoder", "runs")
