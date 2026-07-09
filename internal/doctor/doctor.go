@@ -1426,7 +1426,6 @@ func legacyLocalStatePresent(repoPath string) bool {
 	for _, rel := range []string{
 		filepath.Join(".loopcoder", "runs"),
 		filepath.Join(".loopcoder", "relay"),
-		filepath.Join(".loopcoder", "audit"),
 	} {
 		info, err := os.Stat(filepath.Join(repoPath, rel))
 		if err == nil && info.IsDir() {

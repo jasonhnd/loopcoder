@@ -757,6 +757,7 @@ loopcoder projects list --format json
 loopcoder projects show --repo .
 loopcoder projects remove --repo .
 
+loopcoder migrate local-state --repo . --dry-run
 loopcoder migrate local-state --repo .
 loopcoder migrate local-state --repo . --format json
 
@@ -932,9 +933,10 @@ or canonical JSON.
 ## Local State Migration
 
 `loopcoder migrate local-state --repo .` imports v0.6.x repo-local
-`.loopcoder/` attempts, events, reports, recovery briefs, relay records, and
-audit-style JSON/JSONL records into the v0.7.0 machine-local SQLite store under
-`$LOOPCODER_HOME/data/loopcoder.db`.
+`.loopcoder/` attempts, events, reports, recovery briefs, and relay records into
+the v0.7.0 machine-local SQLite store under `$LOOPCODER_HOME/data/loopcoder.db`.
+Use `--dry-run` first to scan the same sources and report the records that would
+be imported without registering the project or writing the database.
 
 The migration is explicit and idempotent. It registers or refreshes the current
 project identity, records source-path and content-hash metadata, and skips
@@ -948,6 +950,18 @@ state branch. Existing file readers remain the fallback during the
 compatibility window. After migration, `loopcoder report --repo . --format json`
 includes imported records with `source` values such as `imported:attempt` plus
 the original source path metadata.
+
+Audit logs remain file-only repo-local state. They are not imported by
+`migrate local-state`, and an audit-only `.loopcoder/audit/` directory does not
+make `loopcoder doctor --repo .` require a local-state migration.
+
+To back up the v0.7.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
+and, when present, `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and
+`$LOOPCODER_HOME/tmp/` while no loopcoder command is running. To remove the
+machine-local runtime state completely, delete those same paths; the next
+loopcoder command recreates storage as needed. Removing machine-local runtime
+state does not delete repo-local `.loopcoder/` history, and deleting
+repo-local `.loopcoder/` is still a manual user action outside migration.
 
 `loopcoder report` is the read-only query surface for those local records:
 

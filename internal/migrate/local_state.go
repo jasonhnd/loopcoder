@@ -26,6 +26,8 @@ import (
 const (
 	statusCompleted             = "completed"
 	statusCompletedWithWarnings = "completed-with-warnings"
+	statusDryRun                = "dry-run"
+	statusDryRunWithWarnings    = "dry-run-with-warnings"
 	maxLegacyFileBytes          = 4 * 1024 * 1024
 	maxLegacyLineBytes          = 1024 * 1024
 )
@@ -34,6 +36,7 @@ const (
 type Options struct {
 	RepoPath     string
 	DatabasePath string
+	DryRun       bool
 	Now          func() time.Time
 }
 
@@ -50,6 +53,7 @@ type Result struct {
 	RepoPath        string           `json:"repo_path"`
 	ProjectID       string           `json:"project_id"`
 	DatabasePath    string           `json:"database_path"`
+	DryRun          bool             `json:"dry_run,omitempty"`
 	Status          string           `json:"status"`
 	ScannedCount    int              `json:"scanned_count"`
 	ImportedCount   int              `json:"imported_count"`
@@ -124,6 +128,37 @@ func LocalState(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	dbPath, err := databasePath(opts.DatabasePath, deps)
 	if err != nil {
 		return Result{}, fmt.Errorf("migrate local state: resolve storage: %w", err)
+	}
+
+	if opts.DryRun {
+		result := Result{
+			RepoPath:        absRepo,
+			DatabasePath:    dbPath,
+			DryRun:          true,
+			Status:          statusDryRun,
+			ImportStartedAt: formatTimestamp(now),
+		}
+		ic := importContext{
+			opts:   opts,
+			now:    now,
+			repo:   absRepo,
+			result: &result,
+		}
+		if err := ic.importRuns(ctx); err != nil {
+			return Result{}, err
+		}
+		if err := ic.importRelayRecords(ctx); err != nil {
+			return Result{}, err
+		}
+		if err := ic.importReports(ctx); err != nil {
+			return Result{}, err
+		}
+		result.MalformedCount = len(result.Diagnostics)
+		if result.MalformedCount > 0 {
+			result.Status = statusDryRunWithWarnings
+		}
+		result.ImportEndedAt = formatTimestamp(normalizeNow(opts.Now)())
+		return result, nil
 	}
 
 	reg, err := deps.Register(ctx, registry.Options{
@@ -454,6 +489,9 @@ func (ic importContext) ensureRun(ctx context.Context, runID string, issue int, 
 	if runID == "" {
 		return nil
 	}
+	if ic.opts.DryRun {
+		return nil
+	}
 	if strings.TrimSpace(updatedAt) == "" {
 		updatedAt = formatTimestamp(ic.now)
 	}
@@ -473,6 +511,9 @@ func (ic importContext) ensureRun(ctx context.Context, runID string, issue int, 
 }
 
 func (ic importContext) insertRunEvent(ctx context.Context, runID string, sequence int, event legacyEvent) error {
+	if ic.opts.DryRun {
+		return nil
+	}
 	eventType := firstNonEmpty(event.Event, event.Phase, event.Status, "legacy")
 	ts := firstNonEmpty(event.Timestamp, formatTimestamp(ic.now))
 	id := stableID("legacy_event", ic.project.ProjectID, runID, fmt.Sprint(sequence), string(event.Payload))
@@ -487,6 +528,10 @@ func (ic importContext) insertReport(ctx context.Context, record reportquery.Rec
 	payload, err := json.Marshal(record.Report)
 	if err != nil {
 		return fmt.Errorf("migrate local state: marshal report: %w", err)
+	}
+	if ic.opts.DryRun {
+		ic.result.ImportedCount++
+		return ic.insertLegacyRecord(ctx, "report", record.RunID, record.Path, 0, payload)
 	}
 	if strings.TrimSpace(record.RunID) != "" {
 		if err := ic.ensureRun(ctx, record.RunID, record.Report.Issue, "", record.Report.StartedAt, record.Report.EndedAt); err != nil {
@@ -541,6 +586,10 @@ func (ic importContext) insertLegacyRecord(ctx context.Context, recordType, runI
 }
 
 func (ic importContext) insertLegacyRecordCounted(ctx context.Context, recordType, runID, path string, line int, payload []byte) error {
+	if ic.opts.DryRun {
+		ic.result.ImportedCount++
+		return nil
+	}
 	sourcePath := ic.sourcePath(path)
 	sourceHash := hashHex(payload)
 	id := stableID("legacy_record", ic.project.ProjectID, recordType, sourcePath, fmt.Sprint(line), sourceHash)
