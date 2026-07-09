@@ -17,7 +17,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 1
+	CurrentSchemaVersion = 2
 
 	driverName = "sqlite"
 )
@@ -28,6 +28,10 @@ type Store interface {
 	Path() string
 	Health(context.Context) (Health, error)
 	WithTx(context.Context, func(Tx) error) error
+	UpsertRun(context.Context, RunRecord) error
+	TransitionRun(context.Context, RunTransition) (RunLifecycle, error)
+	RunLifecycle(context.Context, string) (RunLifecycle, error)
+	ImportLegacyRunEvents(context.Context, string, []LegacyRunEvent) (RunLifecycle, error)
 }
 
 // Tx is the storage transaction boundary exposed to internal callers.
@@ -127,6 +131,29 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_reports_run_id ON reports(run_id)`,
 		},
 	},
+	{
+		version: 2,
+		name:    "durable run lifecycle schema",
+		statements: []string{
+			`ALTER TABLE runs ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE runs ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_runs_root_run_id ON runs(root_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_events_event_type ON run_events(event_type)`,
+			`ALTER TABLE run_edges ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN child_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE run_edges ADD COLUMN ordinal INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE run_edges ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN permission TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN aggregation_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN status TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_plan_child_key ON run_edges(plan_id, child_key) WHERE plan_id <> '' AND child_key <> ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
+		},
+	},
 }
 
 var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports"}
@@ -151,11 +178,10 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, fmt.Errorf("open storage: create data directory: %w", err)
 	}
 
-	db, err := sql.Open(driverName, path)
+	db, err := sql.Open(driverName, sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open storage %s: %w", path, err)
 	}
-	db.SetMaxOpenConns(1)
 	store := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
 	if err := store.configure(ctx); err != nil {
 		_ = db.Close()
@@ -187,15 +213,11 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 	}
 	health.Exists = true
 
-	db, err := sql.Open(driverName, path)
+	db, err := sql.Open(driverName, sqliteDSN(path))
 	if err != nil {
 		return health, fmt.Errorf("storage health: open %s: %w", path, err)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
-		return health, fmt.Errorf("storage health: enable foreign keys: %w", err)
-	}
 	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
 		return health, fmt.Errorf("storage health: enable read-only mode: %w", err)
 	}
@@ -270,13 +292,12 @@ func (tx sqlTx) QueryRow(ctx context.Context, query string, args ...any) *sql.Ro
 }
 
 func (s *sqliteStore) configure(ctx context.Context) error {
-	for _, statement := range []string{
-		`PRAGMA foreign_keys = ON`,
-		`PRAGMA busy_timeout = 5000`,
-	} {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("open storage %s: configure sqlite: %w", s.path, err)
-		}
+	var foreignKeys int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("open storage %s: inspect sqlite foreign_keys pragma: %w", s.path, err)
+	}
+	if foreignKeys != 1 {
+		return fmt.Errorf("open storage %s: sqlite foreign_keys pragma is disabled", s.path)
 	}
 	return nil
 }
@@ -390,4 +411,12 @@ func normalizeNow(now func() time.Time) func() time.Time {
 
 func formatTimestamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func sqliteDSN(path string) string {
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
