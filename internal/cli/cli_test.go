@@ -4515,6 +4515,94 @@ func TestResumeRunsWithInjectedReaderAndDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestResumeJSONIncludesNestedRunRecoveryDecision(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	parentRun := "run-parent"
+	childRun := "run-child"
+
+	if err := os.MkdirAll(state.RunPath(repo, parentRun), 0o755); err != nil {
+		t.Fatalf("MkdirAll parent run: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(state.RunPath(repo, parentRun), "state.json"), []byte(`{"run_id":"run-parent","status":"interrupted","child_run_ids":["run-child"]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile parent state: %v", err)
+	}
+	if err := os.MkdirAll(state.RunPath(repo, childRun), 0o755); err != nil {
+		t.Fatalf("MkdirAll child run: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(state.RunPath(repo, childRun), "state.json"), []byte(`{"run_id":"run-child","parent_run_id":"run-parent","status":"abandoned"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile child state: %v", err)
+	}
+	if _, err := state.WriteAttempt(repo, childRun, state.AttemptRecord{
+		Version:             1,
+		JobID:               "job-650-child",
+		Issue:               650,
+		Attempt:             1,
+		Provider:            "codex",
+		PID:                 999999,
+		Phase:               "codex_exec",
+		Status:              "running",
+		Branch:              "loop/issue-650",
+		RecoveryContextPath: ".loopcoder/runs/run-child/recovery/job-650-child-context.md",
+		StartedAt:           state.FormatTimestamp(now.Add(-10 * time.Minute)),
+		HeartbeatAt:         state.FormatTimestamp(now.Add(-10 * time.Minute)),
+		LastProgressAt:      state.FormatTimestamp(now.Add(-10 * time.Minute)),
+		LogBytes:            42,
+	}); err != nil {
+		t.Fatalf("WriteAttempt child: %v", err)
+	}
+	if err := state.AppendEvent(repo, parentRun, state.Event{Timestamp: state.FormatTimestamp(now), RunID: parentRun, JobID: "parent", Issue: 0, Phase: "resume", Status: "interrupted"}); err != nil {
+		t.Fatalf("AppendEvent parent: %v", err)
+	}
+	if err := state.AppendEvent(repo, childRun, state.Event{Timestamp: state.FormatTimestamp(now), RunID: childRun, JobID: "job-650-child", Issue: 650, Phase: "codex_exec", Status: "running"}); err != nil {
+		t.Fatalf("AppendEvent child: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{"resume", "--repo", repo, "--run-id", parentRun, "--format", "json"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				issues: []gh.Issue{{Number: 650, Title: "Nested recovery", State: "OPEN"}},
+			}
+		},
+		ProcessAlive: func(int) bool { return false },
+		Now:          func() time.Time { return now },
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got report.ResumeReport
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if got.Local.AttemptCount != 1 || got.Local.EventCount != 2 {
+		t.Fatalf("local counts = %#v, want attempts=1 events=2", got.Local)
+	}
+	if len(got.RunTree) != 2 {
+		t.Fatalf("run_tree = %#v, want parent and child", got.RunTree)
+	}
+	runAttempts := map[string]int{}
+	for _, run := range got.RunTree {
+		runAttempts[run.RunID] = run.AttemptCount
+	}
+	if runAttempts[childRun] != 1 {
+		t.Fatalf("child run attempt count = %d, want 1; tree=%#v", runAttempts[childRun], got.RunTree)
+	}
+	if len(got.Issues) != 1 {
+		t.Fatalf("issues = %#v, want one", got.Issues)
+	}
+	issue := got.Issues[0]
+	if issue.RunID != childRun || issue.ParentRunID != parentRun {
+		t.Fatalf("issue run fields = %#v", issue)
+	}
+	if issue.RecoveryDecision.Kind != "orphaned" || !issue.RecoveryDecision.SafeToResume || issue.RecoveryDecision.NeedsHuman {
+		t.Fatalf("recovery_decision = %#v, want orphaned safe resume", issue.RecoveryDecision)
+	}
+	if issue.RecoveryDecision.RecoveryContextPath == "" || issue.RecoveryDecision.Branch != "loop/issue-650" {
+		t.Fatalf("recovery_decision missing context/branch: %#v", issue.RecoveryDecision)
+	}
+}
+
 func TestResumeRequiresRepo(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 

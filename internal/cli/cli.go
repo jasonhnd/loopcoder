@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -512,6 +513,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
@@ -4425,6 +4427,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var runIDAlias string
 	var configFromBase bool
 	var configFromBaseAlias bool
+	outputFormat := "text"
+	var outputFormatAlias string
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4432,6 +4436,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&outputFormat, "format", "text", "output format: text or json")
+	fs.StringVar(&outputFormatAlias, "Format", "", "output format: text or json")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
@@ -4447,10 +4453,17 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if runIDAlias != "" {
 		runID = runIDAlias
 	}
+	if outputFormatAlias != "" {
+		outputFormat = outputFormatAlias
+	}
 	configFromBase = configFromBase || configFromBaseAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "resume: --repo is required")
+		return 2
+	}
+	if outputFormat != "text" && outputFormat != "json" {
+		fmt.Fprintf(stderr, "resume: invalid --format %q; want text or json\n", outputFormat)
 		return 2
 	}
 
@@ -4475,12 +4488,7 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 	}
 
-	attempts, err := state.LoadAttempts(resolvedRepo, runID)
-	if err != nil {
-		fmt.Fprintf(stderr, "resume: %v\n", err)
-		return 1
-	}
-	eventCount, err := state.CountEvents(resolvedRepo, runID)
+	attempts, runTree, eventCount, err := loadResumeRunTree(resolvedRepo, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "resume: %v\n", err)
 		return 1
@@ -4492,6 +4500,7 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		BaseBranch:   baseBranch,
 		RunID:        runID,
 		RunNote:      runNote,
+		RunTree:      runTree,
 		Attempts:     attempts,
 		EventCount:   eventCount,
 		Thresholds:   cfg.Resilience.Worker,
@@ -4503,8 +4512,106 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 
+	if outputFormat == "json" {
+		data, err := report.MarshalResumeJSON(resumeReport)
+		if err != nil {
+			fmt.Fprintf(stderr, "resume: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
 	return 0
+}
+
+func loadResumeRunTree(repoPath, rootRunID string) ([]state.Attempt, []report.ResumeRun, int, error) {
+	rootRunID = strings.TrimSpace(rootRunID)
+	if rootRunID == "" {
+		return nil, nil, 0, nil
+	}
+	type queuedRun struct {
+		runID  string
+		parent string
+	}
+	queue := []queuedRun{{runID: rootRunID}}
+	seen := map[string]bool{}
+	var attempts []state.Attempt
+	var runTree []report.ResumeRun
+	totalEvents := 0
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		current.runID = strings.TrimSpace(current.runID)
+		if current.runID == "" || seen[current.runID] {
+			continue
+		}
+		seen[current.runID] = true
+
+		meta, err := state.LoadRunMetadata(repoPath, current.runID)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("run %q: %w", current.runID, err)
+		}
+		if strings.TrimSpace(meta.ParentRunID) == "" {
+			meta.ParentRunID = strings.TrimSpace(current.parent)
+		}
+		runAttempts, err := state.LoadAttempts(repoPath, current.runID)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("run %q: %w", current.runID, err)
+		}
+		children := append([]string(nil), meta.ChildRunIDs...)
+		for i := range runAttempts {
+			if runAttempts[i].ParentRunID == "" {
+				runAttempts[i].ParentRunID = meta.ParentRunID
+			}
+			children = append(children, runAttempts[i].ChildRunIDs...)
+		}
+		children = uniqueResumeRunIDs(children)
+		for i := range runAttempts {
+			runAttempts[i].ChildRunIDs = uniqueResumeRunIDs(append(runAttempts[i].ChildRunIDs, meta.ChildRunIDs...))
+		}
+		attempts = append(attempts, runAttempts...)
+
+		eventCount, err := state.CountEvents(repoPath, current.runID)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("run %q: %w", current.runID, err)
+		}
+		totalEvents += eventCount
+		runTree = append(runTree, report.ResumeRun{
+			RunID:        current.runID,
+			ParentRunID:  meta.ParentRunID,
+			ChildRunIDs:  children,
+			Status:       meta.Status,
+			AttemptCount: len(runAttempts),
+			EventCount:   eventCount,
+			SourcePath:   filepath.ToSlash(state.RunPath(repoPath, current.runID)),
+		})
+		for _, child := range children {
+			if !seen[child] {
+				queue = append(queue, queuedRun{runID: child, parent: current.runID})
+			}
+		}
+	}
+	return attempts, runTree, totalEvents, nil
+}
+
+func uniqueResumeRunIDs(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func latestRunIDWithNote(repoPath string) (string, string, error) {

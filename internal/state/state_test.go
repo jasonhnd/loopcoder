@@ -109,6 +109,8 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
   "version": 1,
   "issue": "42",
   "attempt": 2,
+  "parent_run_id": "run-parent",
+  "child_run_ids": ["run-child"],
   "provider": "codex",
   "pid": "1234",
   "phase": "codex_started",
@@ -145,6 +147,9 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	if got.Issue != 42 || got.Attempt != 2 {
 		t.Fatalf("Issue/Attempt = %d/%d, want 42/2", got.Issue, got.Attempt)
 	}
+	if got.RunID != "run-test" || got.ParentRunID != "run-parent" || len(got.ChildRunIDs) != 1 || got.ChildRunIDs[0] != "run-child" {
+		t.Fatalf("run relationship fields = run:%q parent:%q children:%#v", got.RunID, got.ParentRunID, got.ChildRunIDs)
+	}
 	if got.Branch != "loop/issue-42-retry-2" {
 		t.Fatalf("Branch = %q, want loop/issue-42-retry-2", got.Branch)
 	}
@@ -175,6 +180,35 @@ func TestLoadAttemptsInfersOptionalFields(t *testing.T) {
 	}
 	if got.Path != attemptPath {
 		t.Fatalf("Path = %q, want %q", got.Path, attemptPath)
+	}
+}
+
+func TestLoadRunMetadataReadsParentChildState(t *testing.T) {
+	repo := t.TempDir()
+	runPath := RunPath(repo, "run-parent")
+	if err := os.MkdirAll(runPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll run path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runPath, "state.json"), []byte(`{
+  "run_id": "run-parent",
+  "parent_run_id": "run-root",
+  "status": "interrupted",
+  "child_run_ids": ["run-child-a"],
+  "child_runs": [{"run_id": "run-child-b"}, "run-child-c"]
+}`), 0o644); err != nil {
+		t.Fatalf("WriteFile state: %v", err)
+	}
+
+	got, err := LoadRunMetadata(repo, "run-parent")
+	if err != nil {
+		t.Fatalf("LoadRunMetadata returned error: %v", err)
+	}
+	if got.RunID != "run-parent" || got.ParentRunID != "run-root" || got.Status != "interrupted" {
+		t.Fatalf("metadata scalar fields = %#v", got)
+	}
+	wantChildren := []string{"run-child-a", "run-child-b", "run-child-c"}
+	if strings.Join(got.ChildRunIDs, ",") != strings.Join(wantChildren, ",") {
+		t.Fatalf("ChildRunIDs = %#v, want %#v", got.ChildRunIDs, wantChildren)
 	}
 }
 

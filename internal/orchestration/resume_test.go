@@ -8,6 +8,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -231,5 +232,65 @@ func TestComputeResumeMarksGuardrailFrozenIssueBlocked(t *testing.T) {
 		if !strings.Contains(evidence, want) {
 			t.Fatalf("evidence missing %q:\n%s", want, evidence)
 		}
+	}
+}
+
+func TestComputeResumeClassifiesInterruptedChildRunRecoveryDecision(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	result, err := ComputeResume(context.Background(), ResumeOptions{
+		Reader: fakeReader{
+			repo:   "owner/repo",
+			issues: []gh.Issue{{Number: 650, Title: "Nested recovery", State: "OPEN"}},
+		},
+		RepoPath:   "C:/repo",
+		BaseBranch: "main",
+		RunID:      "run-parent",
+		RunTree: []report.ResumeRun{
+			{RunID: "run-parent", ChildRunIDs: []string{"run-child"}, Status: "interrupted", EventCount: 1},
+			{RunID: "run-child", ParentRunID: "run-parent", Status: "abandoned", EventCount: 2},
+		},
+		Attempts: []state.Attempt{{
+			JobID:               "job-child-1",
+			Issue:               650,
+			Attempt:             1,
+			RunID:               "run-child",
+			ParentRunID:         "run-parent",
+			Status:              "running",
+			Phase:               "codex_exec",
+			Branch:              "loop/issue-650",
+			RecoveryContextPath: ".loopcoder/runs/run-child/recovery/job-child-1-context.md",
+			HeartbeatAt:         "2026-07-09T11:50:00Z",
+			LastProgressAt:      "2026-07-09T11:50:00Z",
+		}},
+		EventCount:   3,
+		Thresholds:   config.Default().Resilience.Worker,
+		ProcessAlive: func(int) bool { return false },
+		Now:          now,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResume returned error: %v", err)
+	}
+	if len(result.RunTree) != 2 {
+		t.Fatalf("RunTree = %#v, want parent and child", result.RunTree)
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("Issues = %#v, want one", result.Issues)
+	}
+	issue := result.Issues[0]
+	if issue.RunID != "run-child" || issue.ParentRunID != "run-parent" {
+		t.Fatalf("issue run relationship = %#v", issue)
+	}
+	if issue.Classification != "orphaned" || issue.ActionKind != "ready" {
+		t.Fatalf("classification/action = %q/%q, want orphaned/ready", issue.Classification, issue.ActionKind)
+	}
+	if !issue.RecoveryDecision.SafeToResume || issue.RecoveryDecision.NeedsHuman {
+		t.Fatalf("recovery decision = %#v, want safe without needs-human", issue.RecoveryDecision)
+	}
+	if issue.RecoveryDecision.RecoveryContextPath != ".loopcoder/runs/run-child/recovery/job-child-1-context.md" ||
+		issue.RecoveryDecision.Branch != "loop/issue-650" {
+		t.Fatalf("recovery decision missing context/branch: %#v", issue.RecoveryDecision)
+	}
+	if !strings.Contains(strings.Join(issue.Evidence, "\n"), "run: run-child (parent run-parent)") {
+		t.Fatalf("evidence missing parent/child run line: %#v", issue.Evidence)
 	}
 }

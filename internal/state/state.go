@@ -25,6 +25,9 @@ type Attempt struct {
 	JobID               string           `json:"job_id"`
 	Issue               int              `json:"issue"`
 	Attempt             int              `json:"attempt"`
+	RunID               string           `json:"run_id,omitempty"`
+	ParentRunID         string           `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string         `json:"child_run_ids,omitempty"`
 	Provider            string           `json:"provider,omitempty"`
 	PID                 *int             `json:"pid,omitempty"`
 	Phase               string           `json:"phase,omitempty"`
@@ -49,6 +52,8 @@ type AttemptRecord struct {
 	JobID               string           `json:"job_id"`
 	Issue               int              `json:"issue"`
 	Attempt             int              `json:"attempt"`
+	ParentRunID         string           `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string         `json:"child_run_ids,omitempty"`
 	Provider            string           `json:"provider"`
 	PID                 int              `json:"pid"`
 	Phase               string           `json:"phase"`
@@ -81,6 +86,14 @@ type Event struct {
 	MergeCommit       string  `json:"merge_commit,omitempty"`
 	PriorStableCommit string  `json:"prior_stable_commit,omitempty"`
 	Details           any     `json:"details,omitempty"`
+}
+
+type RunMetadata struct {
+	RunID       string   `json:"run_id"`
+	ParentRunID string   `json:"parent_run_id,omitempty"`
+	ChildRunIDs []string `json:"child_run_ids,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Path        string   `json:"path,omitempty"`
 }
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.
@@ -212,7 +225,52 @@ func LoadAttempts(repoPath, runID string) ([]Attempt, error) {
 	if strings.TrimSpace(runID) == "" {
 		return nil, nil
 	}
-	return LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+	attempts, err := LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+	if err != nil {
+		return nil, err
+	}
+	meta, _ := LoadRunMetadata(repoPath, runID)
+	for i := range attempts {
+		attempts[i].RunID = runID
+		if attempts[i].ParentRunID == "" {
+			attempts[i].ParentRunID = meta.ParentRunID
+		}
+		if len(attempts[i].ChildRunIDs) == 0 {
+			attempts[i].ChildRunIDs = append([]string(nil), meta.ChildRunIDs...)
+		}
+	}
+	return attempts, nil
+}
+
+func LoadRunMetadata(repoPath, runID string) (RunMetadata, error) {
+	meta := RunMetadata{
+		RunID: strings.TrimSpace(runID),
+		Path:  filepath.Join(RunPath(repoPath, runID), "state.json"),
+	}
+	if meta.RunID == "" {
+		return meta, nil
+	}
+	data, err := os.ReadFile(meta.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return meta, nil
+		}
+		return meta, fmt.Errorf("read run metadata: %w", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return meta, fmt.Errorf("parse run metadata: %w", err)
+	}
+	if value := firstStringValue(raw, "run_id", "id"); value != "" {
+		meta.RunID = value
+	}
+	meta.ParentRunID = firstStringValue(raw, "parent_run_id", "parent")
+	meta.Status = firstStringValue(raw, "status", "state")
+	meta.ChildRunIDs = uniqueStrings(append(
+		stringListValue(raw, "child_run_ids", "child_runs", "children"),
+		nestedRunIDs(raw, "child_runs", "children")...,
+	))
+	return meta, nil
 }
 
 func CountEvents(repoPath, runID string) (int, error) {
@@ -283,6 +341,9 @@ type attemptJSON struct {
 	JobID               string           `json:"job_id"`
 	Issue               json.RawMessage  `json:"issue"`
 	Attempt             json.RawMessage  `json:"attempt"`
+	RunID               string           `json:"run_id"`
+	ParentRunID         string           `json:"parent_run_id"`
+	ChildRunIDs         []string         `json:"child_run_ids"`
 	Provider            string           `json:"provider"`
 	PID                 json.RawMessage  `json:"pid"`
 	Phase               string           `json:"phase"`
@@ -351,6 +412,9 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		JobID:               jobID,
 		Issue:               issue,
 		Attempt:             attemptNumber,
+		RunID:               strings.TrimSpace(raw.RunID),
+		ParentRunID:         strings.TrimSpace(raw.ParentRunID),
+		ChildRunIDs:         uniqueStrings(raw.ChildRunIDs),
 		Provider:            raw.Provider,
 		PID:                 rawIntPtr(raw.PID),
 		Phase:               raw.Phase,
@@ -369,6 +433,81 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func firstStringValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		if value, ok := raw.(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+func stringListValue(values map[string]any, keys ...string) []string {
+	var out []string
+	for _, key := range keys {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		switch typed := raw.(type) {
+		case []string:
+			out = append(out, typed...)
+		case []any:
+			for _, item := range typed {
+				if value, ok := item.(string); ok {
+					out = append(out, value)
+				}
+			}
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func nestedRunIDs(values map[string]any, keys ...string) []string {
+	var out []string
+	for _, key := range keys {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		items, ok := raw.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			object, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if value := firstStringValue(object, "run_id", "id"); value != "" {
+				out = append(out, value)
+			}
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {

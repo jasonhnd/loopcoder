@@ -217,7 +217,12 @@ failure, dispatch writes a scrubbed Markdown recovery brief with issue, branch,
 worktree, log, changed files, existing PR lookup, and log tail. `recover` first
 adopts an existing PR when one is found, otherwise retries on a retry branch
 with bounded backoff until the configured max attempts, then blocks for a human
-decision. `statebranch` can publish scrubbed run snapshots, log tails, and a
+decision. `resume` also reads optional `parent_run_id` and `child_run_ids`
+metadata from run `state.json` and attempt sidecars so interrupted parent runs
+can surface child attempts without dispatching duplicate work. Its JSON output
+includes the run tree and each issue's recovery decision, including whether the
+local state is safe to resume, needs human input, and which recovery context,
+branch, or PR informed the decision. `statebranch` can publish scrubbed run snapshots, log tails, and a
 best-effort lease to `loopcoder/state`. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 

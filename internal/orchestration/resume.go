@@ -22,6 +22,7 @@ type ResumeOptions struct {
 	BaseBranch   string
 	RunID        string
 	RunNote      string
+	RunTree      []report.ResumeRun
 	Attempts     []state.Attempt
 	EventCount   int
 	Thresholds   config.ResilienceWorker
@@ -159,14 +160,18 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 			}
 		}
 		issues = append(issues, report.ResumeIssue{
-			Issue:          number,
-			Title:          issue.Title,
-			State:          normalizeIssueState(issue.State),
-			Labels:         labels,
-			Classification: action.Classification,
-			ActionKind:     action.ActionKind,
-			Action:         action.Action,
-			Evidence:       evidence,
+			Issue:            number,
+			Title:            issue.Title,
+			State:            normalizeIssueState(issue.State),
+			Labels:           labels,
+			RunID:            latestRunID(latest),
+			ParentRunID:      latestParentRunID(latest),
+			ChildRunIDs:      latestChildRunIDs(latest),
+			Classification:   action.Classification,
+			ActionKind:       action.ActionKind,
+			Action:           action.Action,
+			RecoveryDecision: resumeRecoveryDecision(action, latest, primaryPR),
+			Evidence:         evidence,
 		})
 	}
 
@@ -191,7 +196,8 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 			StaleAfterSeconds:     opts.Thresholds.StaleAfterSeconds,
 			HungAfterSeconds:      opts.Thresholds.HungAfterSeconds,
 		},
-		Issues: issues,
+		RunTree: normalizeResumeRunTree(opts.RunTree, opts.RunID, opts.EventCount, opts.Attempts),
+		Issues:  issues,
 	}, nil
 }
 
@@ -446,6 +452,7 @@ func resumeEvidenceLines(
 
 	attemptEvidence := "attempt: none"
 	branchEvidence := "branch: n/a"
+	runEvidence := "run: n/a"
 	if latest != nil {
 		sidecar := repoRelativePath(repoPath, latest.Path)
 		if strings.TrimSpace(sidecar) == "" {
@@ -462,6 +469,12 @@ func resumeEvidenceLines(
 		if strings.TrimSpace(latest.Branch) != "" {
 			branchEvidence = "branch: " + latest.Branch
 		}
+		if strings.TrimSpace(latest.RunID) != "" {
+			runEvidence = "run: " + latest.RunID
+			if strings.TrimSpace(latest.ParentRunID) != "" {
+				runEvidence += " (parent " + latest.ParentRunID + ")"
+			}
+		}
 	}
 
 	if strings.TrimSpace(pidEvidence) == "" {
@@ -474,11 +487,151 @@ func resumeEvidenceLines(
 	return []string{
 		prEvidence,
 		attemptEvidence,
+		runEvidence,
 		pidEvidence,
 		branchEvidence,
 		fmt.Sprintf("heartbeat age=%s, progress age=%s", formatResumeAge(heartbeatAge), formatResumeAge(progressAge)),
 		resumeClosureEvidence(issue),
 	}
+}
+
+func latestRunID(attempt *state.Attempt) string {
+	if attempt == nil {
+		return ""
+	}
+	return attempt.RunID
+}
+
+func latestParentRunID(attempt *state.Attempt) string {
+	if attempt == nil {
+		return ""
+	}
+	return attempt.ParentRunID
+}
+
+func latestChildRunIDs(attempt *state.Attempt) []string {
+	if attempt == nil {
+		return nil
+	}
+	return append([]string(nil), attempt.ChildRunIDs...)
+}
+
+func resumeRecoveryDecision(action resumeAction, latest *state.Attempt, primaryPR *checkedPR) report.ResumeRecoveryDecision {
+	decision := report.ResumeRecoveryDecision{
+		Kind:         action.Classification,
+		SafeToResume: action.ActionKind == "ready",
+		NeedsHuman:   resumeNeedsHuman(action, primaryPR),
+		Reason:       action.Action,
+	}
+	if latest != nil {
+		decision.RecoveryContextPath = filepath.ToSlash(latest.RecoveryContextPath)
+		decision.Branch = latest.Branch
+	}
+	if primaryPR != nil {
+		decision.PR = fmt.Sprintf("#%d", primaryPR.PR.Number)
+		if strings.TrimSpace(primaryPR.PR.URL) != "" {
+			decision.PR = primaryPR.PR.URL
+		}
+		if decision.Branch == "" {
+			decision.Branch = primaryPR.PR.HeadRefName
+		}
+	}
+	return decision
+}
+
+func resumeNeedsHuman(action resumeAction, primaryPR *checkedPR) bool {
+	if primaryPR != nil {
+		return false
+	}
+	switch action.Classification {
+	case "done", "ready", "running", "orphaned":
+		return false
+	case "hung":
+		return action.ActionKind != "ready"
+	default:
+		return action.ActionKind == "blocked"
+	}
+}
+
+func normalizeResumeRunTree(runTree []report.ResumeRun, rootRunID string, rootEvents int, attempts []state.Attempt) []report.ResumeRun {
+	byRun := map[string]*report.ResumeRun{}
+	attemptCountByRun := map[string]int{}
+	add := func(run report.ResumeRun) {
+		run.RunID = strings.TrimSpace(run.RunID)
+		if run.RunID == "" {
+			return
+		}
+		current, ok := byRun[run.RunID]
+		if !ok {
+			copy := run
+			copy.ChildRunIDs = sortedUniqueStrings(copy.ChildRunIDs)
+			byRun[run.RunID] = &copy
+			return
+		}
+		if current.ParentRunID == "" {
+			current.ParentRunID = run.ParentRunID
+		}
+		if current.Status == "" {
+			current.Status = run.Status
+		}
+		if current.SourcePath == "" {
+			current.SourcePath = run.SourcePath
+		}
+		if run.EventCount > current.EventCount {
+			current.EventCount = run.EventCount
+		}
+		if run.AttemptCount > current.AttemptCount {
+			current.AttemptCount = run.AttemptCount
+		}
+		current.ChildRunIDs = sortedUniqueStrings(append(current.ChildRunIDs, run.ChildRunIDs...))
+	}
+	for _, run := range runTree {
+		add(run)
+	}
+	if strings.TrimSpace(rootRunID) != "" {
+		add(report.ResumeRun{RunID: rootRunID, EventCount: rootEvents})
+	}
+	for _, attempt := range attempts {
+		if strings.TrimSpace(attempt.RunID) == "" {
+			continue
+		}
+		add(report.ResumeRun{
+			RunID:       attempt.RunID,
+			ParentRunID: attempt.ParentRunID,
+			ChildRunIDs: attempt.ChildRunIDs,
+		})
+		attemptCountByRun[attempt.RunID]++
+	}
+	out := make([]report.ResumeRun, 0, len(byRun))
+	for _, run := range byRun {
+		run.ChildRunIDs = sortedUniqueStrings(run.ChildRunIDs)
+		if count := attemptCountByRun[run.RunID]; count > 0 {
+			run.AttemptCount = count
+		}
+		out = append(out, *run)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ParentRunID != out[j].ParentRunID {
+			return out[i].ParentRunID < out[j].ParentRunID
+		}
+		return out[i].RunID < out[j].RunID
+	})
+	return out
+}
+
+func sortedUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func resumeClosureEvidence(issue gh.Issue) string {

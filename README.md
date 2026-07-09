@@ -123,6 +123,7 @@ loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz e
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
+loopcoder resume --repo . --format json       # machine-readable resume/recovery decisions
 loopcoder status        --repo .              # render local-only run status
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context

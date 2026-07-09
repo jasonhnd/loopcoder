@@ -691,6 +691,7 @@ loopcoder relay list --repo .
 loopcoder relay flush --repo .
 
 loopcoder resume --repo . --run-id <run-id>
+loopcoder resume --repo . --run-id <run-id> --format json
 
 loopcoder recover \
   --repo . \

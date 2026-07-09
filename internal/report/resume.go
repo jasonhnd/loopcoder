@@ -2,49 +2,84 @@ package report
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
 type ResumeReport struct {
-	Version     int
-	Repo        string
-	RepoPath    string
-	BaseBranch  string
-	RunID       *string
-	RunNote     string
-	GeneratedAt string
-	GitHub      ResumeGitHubSnapshot
-	Local       ResumeLocalState
-	Thresholds  ResumeThresholds
-	Issues      []ResumeIssue
+	Version     int                  `json:"version"`
+	Repo        string               `json:"repo"`
+	RepoPath    string               `json:"repo_path"`
+	BaseBranch  string               `json:"base_branch"`
+	RunID       *string              `json:"run_id"`
+	RunNote     string               `json:"run_note"`
+	GeneratedAt string               `json:"generated_at"`
+	GitHub      ResumeGitHubSnapshot `json:"github"`
+	Local       ResumeLocalState     `json:"local"`
+	Thresholds  ResumeThresholds     `json:"thresholds"`
+	RunTree     []ResumeRun          `json:"run_tree"`
+	Issues      []ResumeIssue        `json:"issues"`
 }
 
 type ResumeGitHubSnapshot struct {
-	OpenIssueCount int
-	OpenPRCount    int
+	OpenIssueCount int `json:"open_issue_count"`
+	OpenPRCount    int `json:"open_pr_count"`
 }
 
 type ResumeLocalState struct {
-	AttemptCount int
-	EventCount   int
+	AttemptCount int `json:"attempt_count"`
+	EventCount   int `json:"event_count"`
 }
 
 type ResumeThresholds struct {
-	HeartbeatFreshSeconds int
-	StaleAfterSeconds     int
-	HungAfterSeconds      int
+	HeartbeatFreshSeconds int `json:"heartbeat_fresh_seconds"`
+	StaleAfterSeconds     int `json:"stale_after_seconds"`
+	HungAfterSeconds      int `json:"hung_after_seconds"`
+}
+
+type ResumeRun struct {
+	RunID        string   `json:"run_id"`
+	ParentRunID  string   `json:"parent_run_id,omitempty"`
+	ChildRunIDs  []string `json:"child_run_ids"`
+	Status       string   `json:"status,omitempty"`
+	AttemptCount int      `json:"attempt_count"`
+	EventCount   int      `json:"event_count"`
+	SourcePath   string   `json:"source_path,omitempty"`
 }
 
 type ResumeIssue struct {
-	Issue          int
-	Title          string
-	State          string
-	Labels         []string
-	Classification string
-	ActionKind     string
-	Action         string
-	Evidence       []string
+	Issue            int                    `json:"issue"`
+	Title            string                 `json:"title"`
+	State            string                 `json:"state"`
+	Labels           []string               `json:"labels"`
+	RunID            string                 `json:"run_id,omitempty"`
+	ParentRunID      string                 `json:"parent_run_id,omitempty"`
+	ChildRunIDs      []string               `json:"child_run_ids,omitempty"`
+	Classification   string                 `json:"classification"`
+	ActionKind       string                 `json:"action_kind"`
+	Action           string                 `json:"action"`
+	RecoveryDecision ResumeRecoveryDecision `json:"recovery_decision"`
+	Evidence         []string               `json:"evidence"`
+}
+
+type ResumeRecoveryDecision struct {
+	Kind                string `json:"kind"`
+	SafeToResume        bool   `json:"safe_to_resume"`
+	NeedsHuman          bool   `json:"needs_human"`
+	Reason              string `json:"reason"`
+	RecoveryContextPath string `json:"recovery_context_path,omitempty"`
+	PR                  string `json:"pr,omitempty"`
+	Branch              string `json:"branch,omitempty"`
+}
+
+func MarshalResumeJSON(resume ResumeReport) ([]byte, error) {
+	resume = normalizeResume(resume)
+	data, err := json.MarshalIndent(resume, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal resume JSON: %w", err)
+	}
+	return append(data, '\n'), nil
 }
 
 func RenderResumeText(report ResumeReport) string {
@@ -72,6 +107,30 @@ func RenderResumeText(report ResumeReport) string {
 		report.Thresholds.HungAfterSeconds,
 	)
 	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Run tree")
+	if len(report.RunTree) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, run := range report.RunTree {
+			children := "none"
+			if len(run.ChildRunIDs) > 0 {
+				children = strings.Join(run.ChildRunIDs, ", ")
+			}
+			parent := run.ParentRunID
+			if strings.TrimSpace(parent) == "" {
+				parent = "none"
+			}
+			status := run.Status
+			if strings.TrimSpace(status) == "" {
+				status = "unknown"
+			}
+			fmt.Fprintf(&out, "- %s\n", run.RunID)
+			fmt.Fprintf(&out, "  parent: %s; children: %s; status: %s\n", parent, children, status)
+			fmt.Fprintf(&out, "  attempts: %d; events: %d\n", run.AttemptCount, run.EventCount)
+		}
+	}
+
+	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Issues")
 
 	if len(report.Issues) == 0 {
@@ -83,8 +142,12 @@ func RenderResumeText(report ResumeReport) string {
 				labelText = strings.Join(issue.Labels, ", ")
 			}
 			fmt.Fprintf(&out, "- #%d %s\n", issue.Issue, issue.Title)
+			if strings.TrimSpace(issue.RunID) != "" {
+				fmt.Fprintf(&out, "  run: %s\n", issue.RunID)
+			}
 			fmt.Fprintf(&out, "  state: %s; labels: %s\n", issue.State, labelText)
 			fmt.Fprintf(&out, "  classification: %s\n", issue.Classification)
+			fmt.Fprintf(&out, "  decision: %s; safe_to_resume=%t; needs_human=%t\n", issue.RecoveryDecision.Kind, issue.RecoveryDecision.SafeToResume, issue.RecoveryDecision.NeedsHuman)
 			for _, evidence := range issue.Evidence {
 				fmt.Fprintf(&out, "  evidence: %s\n", evidence)
 			}
@@ -128,4 +191,30 @@ func resumeIssuesByAction(issues []ResumeIssue, actionKind string) []ResumeIssue
 		}
 	}
 	return out
+}
+
+func normalizeResume(resume ResumeReport) ResumeReport {
+	if resume.RunTree == nil {
+		resume.RunTree = []ResumeRun{}
+	}
+	if resume.Issues == nil {
+		resume.Issues = []ResumeIssue{}
+	}
+	for i := range resume.RunTree {
+		if resume.RunTree[i].ChildRunIDs == nil {
+			resume.RunTree[i].ChildRunIDs = []string{}
+		}
+	}
+	for i := range resume.Issues {
+		if resume.Issues[i].Labels == nil {
+			resume.Issues[i].Labels = []string{}
+		}
+		if resume.Issues[i].ChildRunIDs == nil {
+			resume.Issues[i].ChildRunIDs = []string{}
+		}
+		if resume.Issues[i].Evidence == nil {
+			resume.Issues[i].Evidence = []string{}
+		}
+	}
+	return resume
 }
