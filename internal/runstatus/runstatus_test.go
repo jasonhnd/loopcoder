@@ -63,6 +63,43 @@ func TestRenderTotalOnlyTokensAsNotReportedSplit(t *testing.T) {
 	}
 }
 
+func TestRenderInterruptedChildRunStatus(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-interrupted"
+	errText := "parent run timed out before child dispatch"
+	_, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:             1,
+		JobID:               "job-801-abandoned",
+		Issue:               801,
+		Attempt:             1,
+		Provider:            "codex",
+		PID:                 0,
+		Phase:               "parent_stopped_before_dispatch",
+		Status:              state.StatusTimedOut,
+		Branch:              "loop/issue-801",
+		RecoveryContextPath: state.RecoveryBriefPath(repo, runID, "job-801-abandoned"),
+		StartedAt:           "2026-07-09T00:00:00Z",
+		HeartbeatAt:         "2026-07-09T00:00:00Z",
+		LastProgressAt:      "2026-07-09T00:00:00Z",
+		LogBytes:            0,
+		Error:               &errText,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt returned error: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+
+	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
+	if !strings.Contains(got, want) {
+		t.Fatalf("rendered status missing timed out child row %q:\n%s", want, got)
+	}
+}
+
 func TestLoadMissingAndEmptyRunReturnClearErrors(t *testing.T) {
 	repo := t.TempDir()
 	if _, err := Load(Options{RepoPath: repo, RunID: "run-missing"}); err == nil || !strings.Contains(err.Error(), `run "run-missing" not found`) {

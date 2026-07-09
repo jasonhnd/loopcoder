@@ -3,7 +3,9 @@ package state
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +21,20 @@ import (
 const runIDTimeLayout = "20060102T150405Z"
 
 var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
+
+const (
+	StatusPlanned    = "planned"
+	StatusQueued     = "queued"
+	StatusRunning    = "running"
+	StatusWaiting    = "waiting"
+	StatusSucceeded  = "succeeded"
+	StatusFailed     = "failed"
+	StatusCancelled  = "cancelled"
+	StatusTimedOut   = "timed_out"
+	StatusAbandoned  = "abandoned"
+	StatusNeedsHuman = "needs-human"
+	StatusHung       = "hung"
+)
 
 type Attempt struct {
 	Version             int              `json:"version,omitempty"`
@@ -81,6 +97,46 @@ type Event struct {
 	MergeCommit       string  `json:"merge_commit,omitempty"`
 	PriorStableCommit string  `json:"prior_stable_commit,omitempty"`
 	Details           any     `json:"details,omitempty"`
+}
+
+// FailureStatus maps context-driven failures to explicit durable statuses.
+// Non-context failures remain failed so callers can preserve their existing
+// error paths while still distinguishing parent cancellation and timeout.
+func FailureStatus(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return StatusCancelled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return StatusTimedOut
+	}
+	return StatusFailed
+}
+
+func IsTerminalStatus(status string) bool {
+	switch NormalizeStatus(status) {
+	case StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusAbandoned, StatusNeedsHuman, StatusHung:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "completed", "complete", "done":
+		return StatusSucceeded
+	case "failure", "error":
+		return StatusFailed
+	case "canceled":
+		return StatusCancelled
+	case "timeout", "timed-out":
+		return StatusTimedOut
+	default:
+		return strings.ToLower(strings.TrimSpace(status))
+	}
 }
 
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.

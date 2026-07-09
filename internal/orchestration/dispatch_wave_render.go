@@ -114,7 +114,11 @@ func formatDispatchWaveToken(value *int64) string {
 
 func DispatchWaveHasFailures(report DispatchWaveReport) bool {
 	for _, result := range report.Results {
-		if result.Status == DispatchWaveStatusFailed || result.Status == DispatchWaveStatusNeedsHuman {
+		if result.Status == DispatchWaveStatusFailed ||
+			result.Status == DispatchWaveStatusNeedsHuman ||
+			result.Status == DispatchWaveStatusCancelled ||
+			result.Status == DispatchWaveStatusTimedOut ||
+			result.Status == DispatchWaveStatusAbandoned {
 			return true
 		}
 	}
@@ -126,7 +130,7 @@ func dispatchWaveCounts(results []DispatchWaveIssueResult) (succeeded, failed, s
 		switch result.Status {
 		case DispatchWaveStatusSucceeded:
 			succeeded++
-		case DispatchWaveStatusFailed:
+		case DispatchWaveStatusFailed, DispatchWaveStatusCancelled, DispatchWaveStatusTimedOut, DispatchWaveStatusAbandoned:
 			failed++
 		case DispatchWaveStatusSkipped:
 			skipped++

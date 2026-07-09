@@ -633,10 +633,15 @@ func localAttemptDisposition(attempt state.Attempt, thresholds config.Resilience
 	pidAlive := attempt.PID != nil && alive(*attempt.PID)
 
 	switch status {
-	case "failed", "failure", "error", "canceled", "cancelled", "timeout", "timed_out":
+	case "failed", "failure", "error", "canceled", "cancelled", "timeout", "timed_out", "timed-out", "abandoned":
 		return &attemptDisposition{
 			Classification: "recovery-needed",
 			Reason:         fmt.Sprintf("latest attempt %s failed with status '%s'", attempt.JobID, attempt.Status),
+		}
+	case "needs-human":
+		return &attemptDisposition{
+			Classification: "needs-human",
+			Reason:         fmt.Sprintf("latest attempt %s needs human review", attempt.JobID),
 		}
 	case "succeeded", "success", "completed", "complete", "done":
 		return &attemptDisposition{

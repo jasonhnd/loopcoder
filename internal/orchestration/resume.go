@@ -303,6 +303,23 @@ func classifyResumeAttempt(
 	alive ProcessAliveFunc,
 	now time.Time,
 ) resumeAction {
+	switch state.NormalizeStatus(attempt.Status) {
+	case state.StatusFailed, state.StatusCancelled, state.StatusTimedOut, state.StatusAbandoned:
+		return resumeAction{
+			Classification: "recovery-needed",
+			ActionKind:     "ready",
+			Action:         fmt.Sprintf("recover or mark needs-human; latest attempt ended with status %s", state.NormalizeStatus(attempt.Status)),
+			PIDEvidence:    resumePIDEvidence(attempt.PID, false),
+		}
+	case state.StatusNeedsHuman:
+		return resumeAction{
+			Classification: "needs-human",
+			ActionKind:     "blocked",
+			Action:         "human review required before retrying or dispatching dependents",
+			PIDEvidence:    resumePIDEvidence(attempt.PID, false),
+		}
+	}
+
 	heartbeatAge, hasHeartbeatAge := ageSeconds(now, attempt.HeartbeatAt)
 	progressAge, hasProgressAge := ageSeconds(now, attempt.LastProgressAt)
 	heartbeatFreshSeconds := float64(thresholds.HeartbeatIntervalSeconds * 2)
