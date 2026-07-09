@@ -32,6 +32,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
@@ -100,6 +101,7 @@ type Report struct {
 	Commit                string
 	Date                  string
 	HostProfile           HostProfile
+	Runtime               RuntimeHealth
 	ProviderCompatibility []ProviderCompatibility
 	Checks                []Check
 }
@@ -125,6 +127,46 @@ type ProviderCompatibility struct {
 	RequiredCapabilities []string
 	MissingCapabilities  []string
 	KnownLimitations     []string
+}
+
+type RuntimeHealth struct {
+	HomeDir         string
+	Database        RuntimeDatabase
+	ProjectRegistry RuntimeProjectRegistry
+	Migration       RuntimeMigration
+	NestedRuns      RuntimeNestedRuns
+}
+
+type RuntimeDatabase struct {
+	Path          string
+	Exists        bool
+	SchemaVersion int
+	Status        Status
+	Message       string
+}
+
+type RuntimeProjectRegistry struct {
+	Status         Status
+	Registered     bool
+	ProjectID      string
+	IdentitySource string
+	ConflictCount  int
+	Message        string
+}
+
+type RuntimeMigration struct {
+	Status         Status
+	LegacySurfaces int
+	Message        string
+}
+
+type RuntimeNestedRuns struct {
+	Status       Status
+	RunCount     int
+	ParentEdges  int
+	ChildEdges   int
+	ProblemCount int
+	Message      string
 }
 
 func (r Report) ExitCode() int {
@@ -184,6 +226,37 @@ func RenderJSON(w io.Writer, report Report) error {
 		MissingCapabilities  []string `json:"missing_capabilities,omitempty"`
 		KnownLimitations     []string `json:"known_limitations,omitempty"`
 	}
+	type renderedRuntime struct {
+		HomeDir  string `json:"home_dir,omitempty"`
+		Database struct {
+			Path          string `json:"path,omitempty"`
+			Exists        bool   `json:"exists"`
+			SchemaVersion int    `json:"schema_version"`
+			Status        Status `json:"status"`
+			Message       string `json:"message"`
+		} `json:"database"`
+		ProjectRegistry struct {
+			Status         Status `json:"status"`
+			Registered     bool   `json:"registered"`
+			ProjectID      string `json:"project_id,omitempty"`
+			IdentitySource string `json:"identity_source,omitempty"`
+			ConflictCount  int    `json:"conflict_count"`
+			Message        string `json:"message"`
+		} `json:"project_registry"`
+		Migration struct {
+			Status         Status `json:"status"`
+			LegacySurfaces int    `json:"legacy_surfaces"`
+			Message        string `json:"message"`
+		} `json:"migration"`
+		NestedRuns struct {
+			Status       Status `json:"status"`
+			RunCount     int    `json:"run_count"`
+			ParentEdges  int    `json:"parent_edges"`
+			ChildEdges   int    `json:"child_edges"`
+			ProblemCount int    `json:"problem_count"`
+			Message      string `json:"message"`
+		} `json:"nested_runs"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		checks = append(checks, renderedCheck{
@@ -216,6 +289,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		Date                  string                          `json:"date"`
 		ExitCode              int                             `json:"exit_code"`
 		Host                  renderedHostProfile             `json:"host_profile"`
+		Runtime               renderedRuntime                 `json:"runtime"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
 		Checks                []renderedCheck                 `json:"checks"`
 	}{
@@ -237,6 +311,27 @@ func RenderJSON(w io.Writer, report Report) error {
 		ProviderCompatibility: compatibility,
 		Checks:                checks,
 	}
+	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
+	payload.Runtime.Database.Path = filepath.ToSlash(report.Runtime.Database.Path)
+	payload.Runtime.Database.Exists = report.Runtime.Database.Exists
+	payload.Runtime.Database.SchemaVersion = report.Runtime.Database.SchemaVersion
+	payload.Runtime.Database.Status = report.Runtime.Database.Status
+	payload.Runtime.Database.Message = report.Runtime.Database.Message
+	payload.Runtime.ProjectRegistry.Status = report.Runtime.ProjectRegistry.Status
+	payload.Runtime.ProjectRegistry.Registered = report.Runtime.ProjectRegistry.Registered
+	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
+	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
+	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
+	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
+	payload.Runtime.Migration.Status = report.Runtime.Migration.Status
+	payload.Runtime.Migration.LegacySurfaces = report.Runtime.Migration.LegacySurfaces
+	payload.Runtime.Migration.Message = report.Runtime.Migration.Message
+	payload.Runtime.NestedRuns.Status = report.Runtime.NestedRuns.Status
+	payload.Runtime.NestedRuns.RunCount = report.Runtime.NestedRuns.RunCount
+	payload.Runtime.NestedRuns.ParentEdges = report.Runtime.NestedRuns.ParentEdges
+	payload.Runtime.NestedRuns.ChildEdges = report.Runtime.NestedRuns.ChildEdges
+	payload.Runtime.NestedRuns.ProblemCount = report.Runtime.NestedRuns.ProblemCount
+	payload.Runtime.NestedRuns.Message = report.Runtime.NestedRuns.Message
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
@@ -336,6 +431,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
 	checks = append(checks, checkLocalStateImport(ctx, repoPath, deps))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
+	checks = append(checks, checkNestedRunHealth(repoPath))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
@@ -345,6 +441,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	return WithMetadata(Report{
 		HostProfile:           host,
+		Runtime:               runtimeHealth(ctx, repoPath, deps),
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
 		Checks:                checks,
 	}, repoPath, build)
@@ -380,7 +477,12 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		BuildInfo:  build,
 	}, deps)
 	checks = append(checks, readOnly.Checks...)
-	return WithMetadata(Report{Checks: checks}, repoPath, build)
+	return WithMetadata(Report{
+		Runtime:               readOnly.Runtime,
+		HostProfile:           readOnly.HostProfile,
+		ProviderCompatibility: readOnly.ProviderCompatibility,
+		Checks:                checks,
+	}, repoPath, build)
 }
 
 func fixDeliveryConfig(repoPath string, deps Deps) Check {
@@ -1013,6 +1115,244 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 		Name:    "project registry",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("registered project_id=%s identity=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, result.Project.LocalPath),
+	}
+}
+
+func runtimeHealth(ctx context.Context, repoPath string, deps Deps) RuntimeHealth {
+	deps = normalizeDeps(deps)
+	runtime := RuntimeHealth{
+		Migration:  runtimeMigration(repoPath, deps),
+		NestedRuns: runtimeNestedRuns(repoPath),
+	}
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		runtime.Database = RuntimeDatabase{
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home: %v", err),
+		}
+		runtime.ProjectRegistry = RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home: %v", err),
+		}
+		return runtime
+	}
+	runtime.HomeDir = layout.HomeDir
+	runtime.Database = runtimeDatabase(ctx, layout.DatabasePath(), deps)
+	runtime.ProjectRegistry = runtimeProjectRegistry(ctx, repoPath, layout.DatabasePath(), runtime.Database, deps)
+	return runtime
+}
+
+func runtimeDatabase(ctx context.Context, path string, deps Deps) RuntimeDatabase {
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil {
+		return RuntimeDatabase{
+			Path:          path,
+			Exists:        health.Exists,
+			SchemaVersion: health.SchemaVersion,
+			Status:        StatusFail,
+			Message:       err.Error(),
+		}
+	}
+	if !health.Exists {
+		return RuntimeDatabase{
+			Path:    path,
+			Status:  StatusInfo,
+			Message: firstNonEmpty(health.Message, "database has not been created"),
+		}
+	}
+	if !health.OK {
+		return RuntimeDatabase{
+			Path:          path,
+			Exists:        true,
+			SchemaVersion: health.SchemaVersion,
+			Status:        StatusFail,
+			Message:       firstNonEmpty(health.Message, "unhealthy"),
+		}
+	}
+	return RuntimeDatabase{
+		Path:          path,
+		Exists:        true,
+		SchemaVersion: health.SchemaVersion,
+		Status:        StatusOK,
+		Message:       firstNonEmpty(health.Message, "storage database is healthy"),
+	}
+}
+
+func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, database RuntimeDatabase, deps Deps) RuntimeProjectRegistry {
+	if database.Status == StatusInfo && !database.Exists {
+		return RuntimeProjectRegistry{
+			Status:  StatusInfo,
+			Message: "global registry database has not been created",
+		}
+	}
+	if database.Status == StatusFail {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: "storage is unhealthy; registry could not be inspected",
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
+	if err != nil {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: err.Error(),
+		}
+	}
+	registry := RuntimeProjectRegistry{
+		Registered:     result.Registered,
+		ProjectID:      result.Project.ProjectID,
+		IdentitySource: string(result.Project.IdentitySource),
+		ConflictCount:  len(result.Conflicts),
+	}
+	switch {
+	case len(result.Conflicts) > 0:
+		registry.Status = StatusWarn
+		registry.Message = "project identity is ambiguous"
+	case !result.Registered:
+		registry.Status = StatusInfo
+		registry.Message = "project is not registered"
+	default:
+		registry.Status = StatusOK
+		registry.Message = "project registry identity is registered"
+	}
+	return registry
+}
+
+func runtimeMigration(repoPath string, deps Deps) RuntimeMigration {
+	status := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(status)
+	if legacyCount > 0 {
+		return RuntimeMigration{
+			Status:         StatusWarn,
+			LegacySurfaces: legacyCount,
+			Message:        "legacy surfaces require explicit doctor --fix migration",
+		}
+	}
+	if strings.TrimSpace(status.ScanWarning) != "" {
+		return RuntimeMigration{
+			Status:  StatusWarn,
+			Message: status.ScanWarning,
+		}
+	}
+	return RuntimeMigration{
+		Status:  StatusOK,
+		Message: "no legacy surfaces found",
+	}
+}
+
+func checkNestedRunHealth(repoPath string) Check {
+	health := runtimeNestedRuns(repoPath)
+	return Check{
+		Name:    "nested runs",
+		Status:  health.Status,
+		Message: health.Message,
+	}
+}
+
+func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
+	runsRoot := state.RunsRoot(repoPath)
+	entries, err := os.ReadDir(runsRoot)
+	if err != nil {
+		if isNotExist(err) {
+			return RuntimeNestedRuns{
+				Status:  StatusOK,
+				Message: "no repo-local run tree state found",
+			}
+		}
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			ProblemCount: 1,
+			Message:      fmt.Sprintf("could not inspect run tree state: %v", err),
+		}
+	}
+	if len(entries) > lcdefaults.RunStatusMaxDirectoryEntries {
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			ProblemCount: 1,
+			Message:      fmt.Sprintf("run directory entry limit exceeded (%d > %d)", len(entries), lcdefaults.RunStatusMaxDirectoryEntries),
+		}
+	}
+
+	runIDs := map[string]bool{}
+	lifecycles := map[string]state.Lifecycle{}
+	var problems []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		runID := strings.TrimSpace(entry.Name())
+		if !state.IsRunID(runID) {
+			problems = append(problems, fmt.Sprintf("%s is not a valid run id", runID))
+			continue
+		}
+		runIDs[runID] = true
+		lifecycle, err := state.LoadLifecycle(repoPath, runID)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s lifecycle unreadable: %v", runID, err))
+			continue
+		}
+		lifecycles[runID] = lifecycle
+	}
+
+	parentEdges := 0
+	childEdges := 0
+	for runID, lifecycle := range lifecycles {
+		parent := strings.TrimSpace(lifecycle.ParentRunID)
+		if parent != "" {
+			parentEdges++
+			if parent == runID {
+				problems = append(problems, fmt.Sprintf("%s references itself as parent", runID))
+			} else if !runIDs[parent] {
+				problems = append(problems, fmt.Sprintf("%s references missing parent %s", runID, parent))
+			}
+		}
+		for _, child := range lifecycle.ChildRunIDs {
+			child = strings.TrimSpace(child)
+			if child == "" {
+				continue
+			}
+			childEdges++
+			if child == runID {
+				problems = append(problems, fmt.Sprintf("%s references itself as child", runID))
+			} else if !runIDs[child] {
+				problems = append(problems, fmt.Sprintf("%s references missing child %s", runID, child))
+			}
+		}
+	}
+
+	runCount := len(runIDs)
+	if len(problems) > 0 {
+		detail := strings.Join(problems, "; ")
+		if len(problems) > 3 {
+			detail = strings.Join(problems[:3], "; ") + fmt.Sprintf("; plus %d more", len(problems)-3)
+		}
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			RunCount:     runCount,
+			ParentEdges:  parentEdges,
+			ChildEdges:   childEdges,
+			ProblemCount: len(problems),
+			Message:      fmt.Sprintf("run tree has %d problem(s): %s; inspect with: loopcoder status --repo . --format json", len(problems), detail),
+		}
+	}
+	if parentEdges == 0 && childEdges == 0 {
+		return RuntimeNestedRuns{
+			Status:      StatusOK,
+			RunCount:    runCount,
+			ParentEdges: parentEdges,
+			ChildEdges:  childEdges,
+			Message:     fmt.Sprintf("run tree readable; %d run(s), no nested edges", runCount),
+		}
+	}
+	return RuntimeNestedRuns{
+		Status:      StatusOK,
+		RunCount:    runCount,
+		ParentEdges: parentEdges,
+		ChildEdges:  childEdges,
+		Message:     fmt.Sprintf("run tree readable; %d run(s), %d parent edge(s), %d child edge(s)", runCount, parentEdges, childEdges),
 	}
 }
 

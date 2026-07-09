@@ -516,7 +516,7 @@ loopcoder doctor --repo . --format text
 loopcoder doctor --repo . --format json
 ```
 
-It reports `[ok]`, `[warn]`, or `[fail]` checks for:
+It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 
 - `git` on `PATH`;
 - `gh` on `PATH` and `gh auth status`;
@@ -537,6 +537,7 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
 - reportquery readability for local report/run/relay records;
 - storage health and the current checkout's machine-local project registry
   identity, including ambiguity warnings;
+- migration status and nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -565,6 +566,37 @@ probe.
     "invocation_style": "interactive Codex CLI conductor session calls loopcoder as a local subprocess",
     "supports_hooks": false,
     "supports_json_output": true
+  },
+  "runtime": {
+    "home_dir": "/home/user/.loopcoder",
+    "database": {
+      "path": "/home/user/.loopcoder/data/loopcoder.db",
+      "exists": true,
+      "schema_version": 3,
+      "status": "ok",
+      "message": "storage database is healthy"
+    },
+    "project_registry": {
+      "status": "ok",
+      "registered": true,
+      "project_id": "proj_abc123",
+      "identity_source": "github",
+      "conflict_count": 0,
+      "message": "project registry identity is registered"
+    },
+    "migration": {
+      "status": "ok",
+      "legacy_surfaces": 0,
+      "message": "no legacy surfaces found"
+    },
+    "nested_runs": {
+      "status": "ok",
+      "run_count": 1,
+      "parent_edges": 0,
+      "child_edges": 0,
+      "problem_count": 0,
+      "message": "run tree readable; 1 run(s), no nested edges"
+    }
   },
   "checks": [
     {
