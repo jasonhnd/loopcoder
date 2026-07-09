@@ -80,6 +80,12 @@ func TestLayoutPaths(t *testing.T) {
 	if got, want := layout.BinDir(), filepath.Join(root, "bin"); got != want {
 		t.Fatalf("BinDir() = %q, want %q", got, want)
 	}
+	if got, want := layout.DataDir(), filepath.Join(root, "data"); got != want {
+		t.Fatalf("DataDir() = %q, want %q", got, want)
+	}
+	if got, want := layout.DatabasePath(), filepath.Join(root, "data", "loopcoder.db"); got != want {
+		t.Fatalf("DatabasePath() = %q, want %q", got, want)
+	}
 	if got, want := layout.VersionsDir(), filepath.Join(root, "versions"); got != want {
 		t.Fatalf("VersionsDir() = %q, want %q", got, want)
 	}
