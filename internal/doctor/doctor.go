@@ -21,10 +21,12 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	"gopkg.in/yaml.v3"
@@ -67,6 +69,7 @@ type Deps struct {
 	SkillMarkdown  func() ([]byte, error)
 	AgentsMarkdown func() ([]byte, error)
 	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
+	StorageHealth  func(context.Context, string) (storage.Health, error)
 }
 
 type CommandResult struct {
@@ -185,6 +188,7 @@ func DefaultDeps() Deps {
 		SkillMarkdown:  loopcoder.SkillMarkdown,
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
 		CleanupPlan:    localcleanup.Plan,
+		StorageHealth:  storage.CheckHealth,
 	}
 }
 
@@ -234,6 +238,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, checkReportQuery(repoPath))
+	checks = append(checks, checkStorageHealth(ctx, deps))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
@@ -579,6 +584,9 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.CleanupPlan == nil {
 		deps.CleanupPlan = defaults.CleanupPlan
 	}
+	if deps.StorageHealth == nil {
+		deps.StorageHealth = defaults.StorageHealth
+	}
 	return deps
 }
 
@@ -792,6 +800,53 @@ func checkReportQuery(repoPath string) Check {
 		Name:    "report query",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("local report records are readable (%d diagnostic sample record(s))", len(records)),
+	}
+}
+
+func checkStorageHealth(ctx context.Context, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "storage",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for storage health: %v", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil {
+		return Check{
+			Name:    "storage",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s health=fail: %v", path, err),
+		}
+	}
+	if !health.Exists {
+		return Check{
+			Name:    "storage",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("path=%s schema_version=0 health=not-created", path),
+		}
+	}
+	if !health.OK {
+		message := strings.TrimSpace(health.Message)
+		if message == "" {
+			message = "unhealthy"
+		}
+		return Check{
+			Name:    "storage",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s schema_version=%d health=%s", path, health.SchemaVersion, message),
+		}
+	}
+	return Check{
+		Name:    "storage",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("path=%s schema_version=%d health=ok", path, health.SchemaVersion),
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestRunReportsHealthyPreflight(t *testing.T) {
@@ -57,6 +58,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"loopcoder skill",
 		"conductor hooks",
 		"report query",
+		"storage",
 		"migration status",
 		"stale local state",
 		"conductor runtime",
@@ -781,6 +783,79 @@ func TestCheckMigrationStatusWarnsForLegacySurfaces(t *testing.T) {
 	}
 }
 
+func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			if path != dbPath {
+				t.Fatalf("storage path = %q, want %q", path, dbPath)
+			}
+			return storage.Health{
+				Path:          path,
+				Exists:        true,
+				SchemaVersion: storage.CurrentSchemaVersion,
+				OK:            true,
+				Message:       "healthy",
+			}, nil
+		},
+	})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"loopcoder.db", "schema_version=1", "health=ok"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStorageHealthReportsMissingDatabaseAsInfo(t *testing.T) {
+	homeDir := t.TempDir()
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{Path: path, Message: "database has not been created"}, nil
+		},
+	})
+
+	if check.Status != StatusInfo {
+		t.Fatalf("status = %s, want info (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"schema_version=0", "health=not-created"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStorageHealthFailsUnsupportedDatabase(t *testing.T) {
+	homeDir := t.TempDir()
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{Path: path, Exists: true, SchemaVersion: 999}, errors.New("unsupported storage schema version 999")
+		},
+	})
+
+	if check.Status != StatusFail {
+		t.Fatalf("status = %s, want fail (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"health=fail", "unsupported storage schema version 999"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
 func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
 	t.Setenv(migration.LegacyReporterScopeEnv, "auto")
 	repo := t.TempDir()
@@ -1265,6 +1340,15 @@ func (f *fakeDoctorEnv) deps() Deps {
 		},
 		AgentsMarkdown: func() ([]byte, error) {
 			return []byte("agents content\n"), nil
+		},
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{
+				Path:          path,
+				Exists:        true,
+				SchemaVersion: storage.CurrentSchemaVersion,
+				OK:            true,
+				Message:       "healthy",
+			}, nil
 		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
