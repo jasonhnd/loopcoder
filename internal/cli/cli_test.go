@@ -1393,7 +1393,7 @@ func TestUpgradeRunsWithInjectedDepsAndAliases(t *testing.T) {
 		"Resolved target version: v0.3.3",
 		"Before: path=/old/loopcoder version=v0.3.2",
 		"After: path=/home/.loopcoder/bin/loopcoder version=v0.3.3",
-		"Skill refresh: /home/.loopcoder/bin/loopcoder skill install",
+		"Skill refresh: /home/.loopcoder/bin/loopcoder skill install --global-only",
 		"updated /home/.claude/skills/loopcoder/SKILL.md",
 		"unchanged /home/.claude/skills/loopcoder/AGENTS.md",
 		"Run: loopcoder doctor",
@@ -1430,10 +1430,10 @@ func TestUpgradeRendersSkillRefreshWarning(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Skill refresh: /home/.loopcoder/bin/loopcoder skill install") {
+	if !strings.Contains(stdout.String(), "Skill refresh: /home/.loopcoder/bin/loopcoder skill install --global-only") {
 		t.Fatalf("stdout missing skill refresh line:\n%s", stdout.String())
 	}
-	for _, want := range []string{"[loopcoder] warning: skill refresh failed after upgrade", "permission denied", "run: loopcoder skill install"} {
+	for _, want := range []string{"[loopcoder] warning: skill refresh failed after upgrade", "permission denied", "run: loopcoder skill install --global-only"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
 		}
