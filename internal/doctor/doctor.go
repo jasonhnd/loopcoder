@@ -481,7 +481,7 @@ func rewriteLegacyStateKeyFile(path string) (bool, error) {
 				rendered[i] = line
 				continue
 			}
-			lineData, didChange, err := rewriteLegacyStateKeyJSON([]byte(line))
+			lineData, didChange, err := rewriteLegacyStateKeyJSON([]byte(line), true)
 			if err != nil {
 				return false, err
 			}
@@ -494,7 +494,7 @@ func rewriteLegacyStateKeyFile(path string) (bool, error) {
 		out = []byte(strings.Join(rendered, "\n"))
 	} else {
 		var changed bool
-		out, changed, err = rewriteLegacyStateKeyJSON(data)
+		out, changed, err = rewriteLegacyStateKeyJSON(data, false)
 		if err != nil || !changed {
 			return false, err
 		}
@@ -502,7 +502,7 @@ func rewriteLegacyStateKeyFile(path string) (bool, error) {
 	return true, writeFileAtomic(path, out, 0o644)
 }
 
-func rewriteLegacyStateKeyJSON(data []byte) ([]byte, bool, error) {
+func rewriteLegacyStateKeyJSON(data []byte, compact bool) ([]byte, bool, error) {
 	var object map[string]any
 	if err := json.Unmarshal(data, &object); err != nil {
 		return nil, false, err
@@ -515,7 +515,13 @@ func rewriteLegacyStateKeyJSON(data []byte) ([]byte, bool, error) {
 		object[migration.ReportStateKey] = legacy
 	}
 	delete(object, migration.LegacyReportStateKey)
-	out, err := json.MarshalIndent(object, "", "  ")
+	var out []byte
+	var err error
+	if compact {
+		out, err = json.Marshal(object)
+	} else {
+		out, err = json.MarshalIndent(object, "", "  ")
+	}
 	if err != nil {
 		return nil, false, err
 	}

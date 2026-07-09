@@ -971,6 +971,51 @@ func TestFixLegacyStateKeysRewritesLocalJSON(t *testing.T) {
 	}
 }
 
+func TestFixLegacyStateKeysKeepsJSONLOneRecordPerLine(t *testing.T) {
+	repo := t.TempDir()
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-1", "events.jsonl")
+	writeDoctorTextFile(t, statePath, strings.Join([]string{
+		fmt.Sprintf(`{"status":"succeeded","%s":{"role":"worker"}}`, migration.LegacyReportStateKey),
+		`{"status":"ordinary","detail":"unchanged"}`,
+		"",
+	}, "\n"))
+
+	check := fixLegacyStateKeys(repo)
+	if check.Status != StatusOK || !strings.Contains(check.Message, "changed") {
+		t.Fatalf("check = %#v, want changed ok", check)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"`+migration.LegacyReportStateKey+`"`) {
+		t.Fatalf("state still contains legacy key:\n%s", text)
+	}
+
+	nonEmptyLines := 0
+	foundCurrentKey := false
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		nonEmptyLines++
+		var object map[string]any
+		if err := json.Unmarshal([]byte(line), &object); err != nil {
+			t.Fatalf("line is not a complete JSON object: %q: %v", line, err)
+		}
+		if _, ok := object[migration.ReportStateKey]; ok {
+			foundCurrentKey = true
+		}
+	}
+	if nonEmptyLines != 2 {
+		t.Fatalf("non-empty JSONL lines = %d, want 2; text:\n%s", nonEmptyLines, text)
+	}
+	if !foundCurrentKey {
+		t.Fatalf("state missing current key:\n%s", text)
+	}
+}
+
 func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	report := Report{Checks: []Check{
 		{Name: "git", Status: StatusOK, Message: "found"},
