@@ -108,6 +108,21 @@ func TestPushScrubsStateBeforeCommitAndKeepsRawLogsOut(t *testing.T) {
 	if !strings.Contains(all, "rejected log source outside allowed roots") {
 		t.Fatalf("log manifest missing rejected external source diagnostic:\n%s", all)
 	}
+	stateJSON, err := os.ReadFile(filepath.Join(worktree, "runs", runID, "state.json"))
+	if err != nil {
+		t.Fatalf("ReadFile state.json: %v", err)
+	}
+	var snapshot struct {
+		Lifecycle struct {
+			State string `json:"state"`
+		} `json:"lifecycle"`
+	}
+	if err := json.Unmarshal(stateJSON, &snapshot); err != nil {
+		t.Fatalf("Unmarshal state.json: %v", err)
+	}
+	if snapshot.Lifecycle.State != "planned" {
+		t.Fatalf("snapshot lifecycle state = %q, want planned", snapshot.Lifecycle.State)
+	}
 }
 
 func TestDiscoverLogSourcesConfinesToRunAndConfiguredScratchRoots(t *testing.T) {

@@ -38,12 +38,14 @@ type Options struct {
 }
 
 type Report struct {
-	RunID               string
-	RunNote             string
-	RunPath             string
-	EventCount          int
-	VerifierRecordCount int
-	Rows                []Row
+	RunID                string
+	RunNote              string
+	RunPath              string
+	EventCount           int
+	LifecycleState       string
+	LifecycleTransitions int
+	VerifierRecordCount  int
+	Rows                 []Row
 }
 
 type Row struct {
@@ -141,6 +143,10 @@ func Load(opts Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+	if err != nil {
+		return Report{}, err
+	}
 	jsonMetadata, jsonVerifiers, err := scanRunJSONRecords(runPath, now)
 	if err != nil {
 		return Report{}, err
@@ -164,12 +170,14 @@ func Load(opts Options) (Report, error) {
 	sortRows(rows)
 
 	return Report{
-		RunID:               runID,
-		RunNote:             runNote,
-		RunPath:             runPath,
-		EventCount:          eventCount,
-		VerifierRecordCount: len(verifiers),
-		Rows:                rows,
+		RunID:                runID,
+		RunNote:              runNote,
+		RunPath:              runPath,
+		EventCount:           eventCount,
+		LifecycleState:       string(lifecycle.State),
+		LifecycleTransitions: len(lifecycle.History),
+		VerifierRecordCount:  len(verifiers),
+		Rows:                 rows,
 	}, nil
 }
 
@@ -179,6 +187,8 @@ func Render(report Report) string {
 	fmt.Fprintf(&out, "RunId: %s (%s)\n", display(report.RunID), display(report.RunNote))
 	fmt.Fprintf(&out, "Source: %s\n", filepath.ToSlash(report.RunPath))
 	fmt.Fprintf(&out, "Events: %d\n", report.EventCount)
+	fmt.Fprintf(&out, "Lifecycle: %s\n", display(report.LifecycleState))
+	fmt.Fprintf(&out, "Lifecycle transitions: %d\n", report.LifecycleTransitions)
 	fmt.Fprintf(&out, "Verifier records: %d\n", report.VerifierRecordCount)
 	fmt.Fprintln(&out)
 

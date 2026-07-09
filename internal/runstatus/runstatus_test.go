@@ -36,6 +36,8 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 		"RUN STATUS",
 		"RunId: run-test (requested run)",
 		"Events: 1",
+		"Lifecycle: succeeded",
+		"Lifecycle transitions: 1",
 		"Verifier records: 1",
 		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
 		"status is read-only and local-only",

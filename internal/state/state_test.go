@@ -387,6 +387,136 @@ func TestEventPromotionCommitFieldsJSONCompatibility(t *testing.T) {
 	}
 }
 
+func TestLifecycleTransitionValidation(t *testing.T) {
+	if !ValidLifecycleTransition(LifecyclePlanned, LifecycleQueued) {
+		t.Fatal("planned -> queued should be valid")
+	}
+	if !ValidLifecycleTransition(LifecycleRunning, LifecycleSucceeded) {
+		t.Fatal("running -> succeeded should be valid")
+	}
+	if ValidLifecycleTransition(LifecycleSucceeded, LifecycleRunning) {
+		t.Fatal("succeeded -> running should be invalid")
+	}
+	if ValidLifecycleTransition(LifecycleQueued, LifecycleQueued) {
+		t.Fatal("same-state transition should be invalid")
+	}
+}
+
+func TestAppendLifecycleTransitionPersistsAndRejectsInvalidTransitions(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-test"
+
+	err := AppendLifecycleTransition(repo, runID, LifecycleTransition{
+		Timestamp: "2026-07-09T00:00:00Z",
+		To:        LifecycleQueued,
+		Reason:    "ready set selected",
+	})
+	if err != nil {
+		t.Fatalf("AppendLifecycleTransition planned->queued returned error: %v", err)
+	}
+	err = AppendLifecycleTransition(repo, runID, LifecycleTransition{
+		Timestamp: "2026-07-09T00:00:01Z",
+		To:        LifecyclePlanned,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid lifecycle transition") {
+		t.Fatalf("AppendLifecycleTransition queued->planned error = %v, want invalid transition", err)
+	}
+
+	lifecycle, err := LoadLifecycle(repo, runID)
+	if err != nil {
+		t.Fatalf("LoadLifecycle returned error: %v", err)
+	}
+	if lifecycle.State != LifecycleQueued {
+		t.Fatalf("lifecycle state = %s, want queued", lifecycle.State)
+	}
+	if len(lifecycle.History) != 1 {
+		t.Fatalf("history length = %d, want 1", len(lifecycle.History))
+	}
+	got := lifecycle.History[0]
+	if got.From != LifecyclePlanned || got.To != LifecycleQueued || got.Event != LifecycleTransitionEvent || got.Source != "explicit" {
+		t.Fatalf("transition = %#v, want explicit planned->queued", got)
+	}
+}
+
+func TestLoadLifecycleDerivesCurrentStateAfterRestart(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-restart"
+	for _, transition := range []LifecycleTransition{
+		{Timestamp: "2026-07-09T00:00:00Z", To: LifecycleQueued},
+		{Timestamp: "2026-07-09T00:00:01Z", To: LifecycleRunning},
+		{Timestamp: "2026-07-09T00:00:02Z", To: LifecycleSucceeded},
+	} {
+		if err := AppendLifecycleTransition(repo, runID, transition); err != nil {
+			t.Fatalf("AppendLifecycleTransition: %v", err)
+		}
+	}
+
+	reloaded, err := LoadLifecycle(repo, runID)
+	if err != nil {
+		t.Fatalf("LoadLifecycle returned error: %v", err)
+	}
+	if reloaded.State != LifecycleSucceeded {
+		t.Fatalf("state = %s, want succeeded", reloaded.State)
+	}
+	if len(reloaded.History) != 3 {
+		t.Fatalf("history length = %d, want 3", len(reloaded.History))
+	}
+}
+
+func TestLoadLifecycleMapsLegacyEventsConservatively(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-legacy"
+	lines := []string{
+		`{"ts":"2026-07-09T00:00:00Z","run_id":"run-legacy","job_id":"job-1","issue":647,"phase":"worktree_created","status":"running"}`,
+		`{"ts":"2026-07-09T00:00:01Z","run_id":"run-legacy","job_id":"job-1","issue":647,"phase":"cleanup","status":"succeeded"}`,
+		`{"ts":"2026-07-09T00:00:02Z","run_id":"run-legacy","job_id":"promote","status":"promoted"}`,
+	}
+	if err := os.MkdirAll(filepath.Dir(EventsPath(repo, runID)), 0o755); err != nil {
+		t.Fatalf("MkdirAll events: %v", err)
+	}
+	if err := os.WriteFile(EventsPath(repo, runID), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile events: %v", err)
+	}
+
+	lifecycle, err := LoadLifecycle(repo, runID)
+	if err != nil {
+		t.Fatalf("LoadLifecycle returned error: %v", err)
+	}
+	if lifecycle.State != LifecycleSucceeded {
+		t.Fatalf("state = %s, want succeeded", lifecycle.State)
+	}
+	if len(lifecycle.History) != 2 {
+		t.Fatalf("history length = %d, want 2: %#v", len(lifecycle.History), lifecycle.History)
+	}
+	if lifecycle.History[0].From != LifecyclePlanned || lifecycle.History[0].To != LifecycleRunning || lifecycle.History[0].Source != "legacy" {
+		t.Fatalf("first legacy transition = %#v, want planned->running", lifecycle.History[0])
+	}
+	if lifecycle.History[1].From != LifecycleRunning || lifecycle.History[1].To != LifecycleSucceeded {
+		t.Fatalf("second legacy transition = %#v, want running->succeeded", lifecycle.History[1])
+	}
+}
+
+func TestLifecycleRecordsParentChildRunMetadata(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-parent"
+	if err := AppendLifecycleTransition(repo, runID, LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		To:         LifecycleWaiting,
+		ChildRunID: "run-child",
+		Reason:     "child dispatched",
+	}); err != nil {
+		t.Fatalf("AppendLifecycleTransition: %v", err)
+	}
+
+	lifecycle, err := LoadLifecycle(repo, runID)
+	if err != nil {
+		t.Fatalf("LoadLifecycle returned error: %v", err)
+	}
+	if len(lifecycle.ChildRunIDs) != 1 || lifecycle.ChildRunIDs[0] != "run-child" {
+		t.Fatalf("child run ids = %#v, want run-child", lifecycle.ChildRunIDs)
+	}
+}
+
 func validAttemptReport(issue int, totalTokens int64) reporter.Report {
 	return reporter.Report{
 		Role:        reporter.RoleWorker,

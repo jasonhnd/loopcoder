@@ -124,6 +124,7 @@ type snapshot struct {
 	RunID      string          `json:"run_id"`
 	UpdatedAt  string          `json:"updated_at"`
 	EventCount int             `json:"event_count"`
+	Lifecycle  state.Lifecycle `json:"lifecycle"`
 	Attempts   []state.Attempt `json:"attempts,omitempty"`
 }
 
@@ -734,11 +735,16 @@ func synthesizeStateSnapshot(repoPath, runID string, now time.Time) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("count events: %w", err)
 	}
+	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load lifecycle: %w", err)
+	}
 	data, err := json.MarshalIndent(snapshot{
 		Version:    1,
 		RunID:      runID,
 		UpdatedAt:  state.FormatTimestamp(now),
 		EventCount: eventCount,
+		Lifecycle:  lifecycle,
 		Attempts:   attempts,
 	}, "", "  ")
 	if err != nil {
