@@ -42,4 +42,24 @@ verifies `SHA256SUMS` with cosign, checks the archive checksum, runs
 latest. It is verification-only and must not create tags, publish releases, or
 upload assets.
 
+## v0.7.0 Self-Bootstrap Acceptance
+
+Before tagging v0.7.0, run the self-bootstrap acceptance path in
+[`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
+include:
+
+- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1`;
+- project registry evidence for the loopcoder checkout;
+- proof that `$LOOPCODER_HOME/data/loopcoder.db` exists outside the repository;
+- doctor JSON showing storage, project registry, provider compatibility, and
+  nested-run health;
+- status and report JSON showing at least one parent/child run tree;
+- issue-to-PR evidence for the v0.7.0 implementation issues; and
+- the normal consumer artifact smoke,
+  `pwsh scripts/release-smoke.ps1 -Version 0.7.0`, after release assets exist.
+
+This acceptance path is verification-only. It must not force production
+auto-merge, fake success without PR evidence, or depend on paid provider
+services that are not available to the operator.
+
 Historical changelog entries and accepted specs are release history. Do not terminology-sweep old release entries or shipped specs merely because current naming changed.

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **v0.7.0 self-bootstrap acceptance** - added
+  `docs/reference/self-bootstrap.md` and
+  `scripts/self-bootstrap-smoke.ps1` so the release can prove loopcoder's own
+  registry, machine-local database, provider compatibility visibility, and
+  nested parent/child run-tree observability before tagging.
+
 ## [0.6.1] - 2026-07-08
 
 0.6.1 is the customer-ready bridge for the public 0.6 line. The latest public
