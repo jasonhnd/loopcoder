@@ -280,6 +280,7 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/reference/audit.md`](docs/reference/audit.md) -- read-only security audit command.
 - [`docs/reference/releasing.md`](docs/reference/releasing.md) -- release documentation rule.
 - [`docs/reference/self-bootstrap.md`](docs/reference/self-bootstrap.md) -- v0.7.0 self-bootstrap acceptance checklist.
+- [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md) -- v0.7.0 release readiness report template.
 - [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) -- dependency-aware scheduling.
 - [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md) -- required checks and verifier verdicts.
@@ -295,6 +296,8 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 ## Status
 
 v0.6.1 is the current customer-ready bridge release for the public 0.6 line. It adds the 0.6 capabilities plus first-run repo safety: `init --repo/--gate` defaults new scaffolds to `human-merge`, `init` and `skill install` protect `.loopcoder/` through local `.git/info/exclude`, `doctor --format json` exposes machine-readable checks, and `report --format json` includes both `reports` and `records` with source/run/path context. The repository remains self-hosted with `gate: human-merge` for loopcoder-core safety; consumer projects can opt into automatic production promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
+
+v0.7.0 release-readiness docs and smoke scripts are prepared, but v0.7.0 is not the customer install target until the human release gate publishes the tag, signed checksums, and platform assets. The final readiness path is `pwsh scripts/self-bootstrap-smoke.ps1`, then `pwsh scripts/release-smoke.ps1 -Version 0.7.0` after assets exist, with the completed go/no-go report attached from [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md).
 
 ## License
 
