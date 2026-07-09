@@ -186,6 +186,26 @@ deterministic and in the conductor's hands:
 | `--pretty` | No | false | Forces the human-readable pretty report block to stderr in emoji form, even on non-TTY output; absent still uses the default pretty behavior. |
 | `--no-pretty` | No | false | Suppresses the human-readable pretty report block. This wins over `--pretty` and `LOOPCODER_PRETTY`. |
 
+## Failure Semantics
+
+Worker attempt state uses distinct terminal statuses so nested runs can be
+recovered safely:
+
+- `failed`: the worker or adapter returned a non-context error.
+- `cancelled`: the parent context was cancelled and the child stopped through
+  normal supervision.
+- `timed_out`: the parent context deadline elapsed before or during child work.
+- `abandoned`: a queued child was selected for a parent wave but never launched
+  because the parent stopped first.
+- `needs-human`: partial or ambiguous work was preserved and requires human
+  review before retrying or dispatching dependents.
+
+Every failed, cancelled, timed-out, hung, or abandoned attempt must remain
+visible in local state and must point at a recovery brief when loopcoder can
+write one. `dispatch-wave` passes the parent context to all launched children;
+when the parent stops before a queued child starts, it writes a synthetic child
+attempt and recovery brief instead of treating that child as success.
+
 ## Model And Depth
 
 `--model` and `--effort` are optional knobs, but the runtime selection passed to

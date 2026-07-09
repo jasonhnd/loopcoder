@@ -260,6 +260,107 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 }
 
+func TestDispatchRecordsCancelledFailureState(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := Dispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 110,
+		IssueTitle:  "Cancelled worker",
+		RunID:       "run-cancelled",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: &workerFakeGit{status: " M file.go\n"},
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return workerContextErrAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Dispatch error = %v, want context.Canceled", err)
+	}
+	attempts, err := state.LoadAttempts(repo, "run-cancelled")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != state.StatusCancelled {
+		t.Fatalf("cancelled attempt = %#v", attempts)
+	}
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-cancelled", "job-110-4321"))
+	if err != nil {
+		t.Fatalf("read recovery brief: %v", err)
+	}
+	if !strings.Contains(string(brief), "- Status: cancelled") || !strings.Contains(string(brief), "context canceled") {
+		t.Fatalf("cancelled recovery brief missing status/error:\n%s", string(brief))
+	}
+}
+
+func TestDispatchRecordsTimedOutFailureState(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	_, err := Dispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 111,
+		IssueTitle:  "Timed out worker",
+		RunID:       "run-timeout",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: &workerFakeGit{status: " M file.go\n"},
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return workerContextErrAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Dispatch error = %v, want context deadline exceeded", err)
+	}
+	attempts, err := state.LoadAttempts(repo, "run-timeout")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != state.StatusTimedOut {
+		t.Fatalf("timed out attempt = %#v", attempts)
+	}
+}
+
 func TestDispatchInjectsRepoSkillsFromWorktree(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()
@@ -1918,6 +2019,16 @@ func (f *workerFakeAgent) Run(_ context.Context, invocation agent.Invocation) (a
 		return f.result, nil
 	}
 	return agent.Result{ExitCode: f.exitCode, Summary: f.summary}, nil
+}
+
+type workerContextErrAgent struct{}
+
+func (workerContextErrAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
+	_ = os.WriteFile(invocation.LogPath, []byte("parent context stopped\n"), 0o644)
+	if ctx.Err() != nil {
+		return agent.Result{ExitCode: -1}, ctx.Err()
+	}
+	return agent.Result{ExitCode: -1}, context.Canceled
 }
 
 type workerFakeLock struct {

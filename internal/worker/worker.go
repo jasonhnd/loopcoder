@@ -549,6 +549,9 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	if failure == nil {
 		return
 	}
+	if dispatch.failureStatus == state.StatusFailed {
+		dispatch.failureStatus = state.FailureStatus(failure)
+	}
 	writeRecovery(ctx, dispatch, failure)
 }
 

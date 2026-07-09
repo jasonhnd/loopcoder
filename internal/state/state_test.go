@@ -1,7 +1,9 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -47,6 +49,37 @@ func TestTimestampFormatParseRoundTrip(t *testing.T) {
 	if !parsed.Equal(input.UTC()) {
 		t.Fatalf("parsed timestamp = %s, want %s", parsed, input.UTC())
 	}
+}
+
+func TestFailureStatusDistinguishesContextCancellationAndTimeout(t *testing.T) {
+	if got := FailureStatus(context.Canceled); got != StatusCancelled {
+		t.Fatalf("FailureStatus(context.Canceled) = %q, want %q", got, StatusCancelled)
+	}
+	if got := FailureStatus(context.DeadlineExceeded); got != StatusTimedOut {
+		t.Fatalf("FailureStatus(context.DeadlineExceeded) = %q, want %q", got, StatusTimedOut)
+	}
+	if got := FailureStatus(fmtWrapped(context.Canceled)); got != StatusCancelled {
+		t.Fatalf("FailureStatus(wrapped canceled) = %q, want %q", got, StatusCancelled)
+	}
+	if got := FailureStatus(errors.New("boom")); got != StatusFailed {
+		t.Fatalf("FailureStatus(other) = %q, want %q", got, StatusFailed)
+	}
+}
+
+func fmtWrapped(err error) error {
+	return &wrapErr{err: err}
+}
+
+type wrapErr struct {
+	err error
+}
+
+func (e *wrapErr) Error() string {
+	return "wrapped: " + e.err.Error()
+}
+
+func (e *wrapErr) Unwrap() error {
+	return e.err
 }
 
 func TestRunIDForIssueUsesDocumentedShape(t *testing.T) {

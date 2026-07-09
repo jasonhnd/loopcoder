@@ -2,8 +2,10 @@ package orchestration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -23,6 +26,9 @@ const (
 	DispatchWaveStatusFailed     = "failed"
 	DispatchWaveStatusSkipped    = "skipped"
 	DispatchWaveStatusNeedsHuman = "needs-human"
+	DispatchWaveStatusCancelled  = "cancelled"
+	DispatchWaveStatusTimedOut   = "timed_out"
+	DispatchWaveStatusAbandoned  = "abandoned"
 )
 
 type ReadySetFunc func(ctx context.Context, opts Options) (report.ReadySetReport, error)
@@ -221,13 +227,13 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 	var completeErr error
 	sem := make(chan struct{}, opts.ThrottleLimit)
 	for _, index := range dispatchJobs {
+		if err := ctx.Err(); err != nil {
+			results[index] = recordAbandonedDispatchWaveChild(opts, selected[index], err, started)
+			continue
+		}
 		select {
 		case <-ctx.Done():
-			results[index] = DispatchWaveIssueResult{
-				Issue:  selected[index],
-				Status: DispatchWaveStatusFailed,
-				Error:  ctx.Err().Error(),
-			}
+			results[index] = recordAbandonedDispatchWaveChild(opts, selected[index], ctx.Err(), started)
 			continue
 		case sem <- struct{}{}:
 		}
@@ -376,7 +382,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	result := DispatchWaveIssueResult{Issue: issueNumber}
 	issue, err := opts.Reader.ViewIssue(ctx, issueNumber)
 	if err != nil {
-		result.Status = DispatchWaveStatusFailed
+		result.Status = dispatchWaveFailureStatus(err, worker.Result{})
 		result.Error = fmt.Sprintf("read issue #%d: %v", issueNumber, err)
 		return result
 	}
@@ -395,7 +401,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		Stderr:         opts.Stderr,
 	})
 	if err != nil {
-		result.Status = DispatchWaveStatusFailed
+		result.Status = dispatchWaveFailureStatus(err, dispatchResult)
 		result.Error = err.Error()
 		result.Report = dispatchResult.Report
 		enrichDispatchWaveFailure(&result, opts)
@@ -407,6 +413,104 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	result.AttemptPath = dispatchResult.AttemptPath
 	result.Report = dispatchResult.Report
 	return result
+}
+
+func dispatchWaveFailureStatus(err error, result worker.Result) string {
+	if mapped := state.FailureStatus(err); mapped != state.StatusFailed {
+		return mapped
+	}
+	status := state.NormalizeStatus(result.Status)
+	if status != "" && status != state.StatusSucceeded && state.IsTerminalStatus(status) {
+		return status
+	}
+	return state.StatusFailed
+}
+
+func recordAbandonedDispatchWaveChild(opts DispatchWaveOptions, issueNumber int, cause error, now time.Time) DispatchWaveIssueResult {
+	status := DispatchWaveStatusAbandoned
+	if errors.Is(cause, context.DeadlineExceeded) {
+		status = DispatchWaveStatusTimedOut
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	jobID := fmt.Sprintf("job-%d-abandoned", issueNumber)
+	branch := fmt.Sprintf("loop/issue-%d", issueNumber)
+	recoveryPath := state.RecoveryBriefPath(opts.RepoPath, opts.RunID, jobID)
+	errorText := dispatchWaveParentStopError(status, cause)
+	_ = writeDispatchWaveChildRecovery(recoveryPath, issueNumber, branch, status, errorText)
+	_, _ = state.WriteAttempt(opts.RepoPath, opts.RunID, state.AttemptRecord{
+		Version:             1,
+		JobID:               jobID,
+		Issue:               issueNumber,
+		Attempt:             1,
+		Provider:            firstNonEmpty(opts.Provider, "unknown"),
+		PID:                 0,
+		Phase:               "parent_stopped_before_dispatch",
+		Status:              status,
+		Branch:              branch,
+		RecoveryContextPath: recoveryPath,
+		StartedAt:           state.FormatTimestamp(now),
+		HeartbeatAt:         state.FormatTimestamp(now),
+		LastProgressAt:      state.FormatTimestamp(now),
+		LogBytes:            0,
+		Error:               &errorText,
+	})
+	_ = state.AppendEvent(opts.RepoPath, opts.RunID, state.Event{
+		Timestamp: state.FormatTimestamp(now),
+		RunID:     opts.RunID,
+		JobID:     jobID,
+		Issue:     issueNumber,
+		Phase:     "parent_stopped_before_dispatch",
+		Status:    status,
+		Error:     &errorText,
+		Event:     "child_abandoned",
+		Outcome:   status,
+		Details: map[string]string{
+			"recovery_context_path": filepath.ToSlash(recoveryPath),
+		},
+	})
+	return DispatchWaveIssueResult{
+		Issue:               issueNumber,
+		Status:              status,
+		Branch:              branch,
+		AttemptPath:         state.AttemptPath(opts.RepoPath, opts.RunID, jobID),
+		RecoveryContextPath: recoveryPath,
+		Error:               errorText,
+	}
+}
+
+func dispatchWaveParentStopError(status string, cause error) string {
+	causeText := "parent context stopped before this child was dispatched"
+	if cause != nil {
+		causeText = cause.Error()
+	}
+	if status == DispatchWaveStatusTimedOut {
+		return "parent run timed out before this child was dispatched; recover or mark needs-human: " + causeText
+	}
+	return "parent run stopped before this child was dispatched; child abandoned and must be recovered or marked needs-human: " + causeText
+}
+
+func writeDispatchWaveChildRecovery(path string, issueNumber int, branch, status, errorText string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	body := recovery.RenderBrief(recovery.BriefInput{
+		IssueNumber:    issueNumber,
+		IssueTitle:     "(not loaded; child did not start)",
+		Branch:         branch,
+		WorktreePath:   "(not created)",
+		LogPath:        "(not created)",
+		SummaryPath:    "(not created)",
+		AttemptNumber:  1,
+		LastPhase:      "parent_stopped_before_dispatch",
+		Status:         status,
+		Error:          errorText,
+		ChangedFiles:   "(none; child did not start)",
+		ExistingPRText: "unknown; child did not start",
+		LogTail:        "(no log; child did not start)",
+	})
+	return os.WriteFile(path, []byte(body), 0o600)
 }
 
 func enrichDispatchWaveFailure(result *DispatchWaveIssueResult, opts DispatchWaveOptions) {
