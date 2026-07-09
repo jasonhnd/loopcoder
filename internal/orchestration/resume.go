@@ -1,8 +1,11 @@
 package orchestration
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,12 +33,13 @@ type ResumeOptions struct {
 }
 
 type resumeAction struct {
-	Classification string
-	ActionKind     string
-	Action         string
-	HeartbeatAge   *float64
-	ProgressAge    *float64
-	PIDEvidence    string
+	Classification      string
+	ActionKind          string
+	Action              string
+	HeartbeatAge        *float64
+	ProgressAge         *float64
+	PIDEvidence         string
+	RecoveryContextPath string
 }
 
 func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport, error) {
@@ -144,10 +148,11 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 		)
 		if frozen, ok := frozenByIssue[number]; ok && action.Classification != "done" && primaryPR == nil {
 			action = resumeAction{
-				Classification: "guardrail-frozen",
-				ActionKind:     "blocked",
-				Action:         frozen.Message,
-				PIDEvidence:    "pid: n/a",
+				Classification:      "guardrail-frozen",
+				ActionKind:          "blocked",
+				Action:              frozen.Message,
+				PIDEvidence:         "pid: n/a",
+				RecoveryContextPath: frozen.RecoveryContextPath,
 			}
 			evidence = append(evidence,
 				fmt.Sprintf("guardrail: %s", frozen.Reason),
@@ -158,17 +163,20 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 				evidence = append(evidence, "recovery: "+filepath.ToSlash(frozen.RecoveryContextPath))
 			}
 		}
+		recoveryDecision := resumeIssueRecoveryDecision(opts.RepoPath, opts.RunID, number, latest, primaryPR, action)
 		issues = append(issues, report.ResumeIssue{
-			Issue:          number,
-			Title:          issue.Title,
-			State:          normalizeIssueState(issue.State),
-			Labels:         labels,
-			Classification: action.Classification,
-			ActionKind:     action.ActionKind,
-			Action:         action.Action,
-			Evidence:       evidence,
+			Issue:            number,
+			Title:            issue.Title,
+			State:            normalizeIssueState(issue.State),
+			Labels:           labels,
+			Classification:   action.Classification,
+			ActionKind:       action.ActionKind,
+			Action:           action.Action,
+			Evidence:         evidence,
+			RecoveryDecision: recoveryDecision,
 		})
 	}
+	runTree := loadResumeRunTree(opts.RepoPath, opts.RunID)
 
 	return report.ResumeReport{
 		Version:     1,
@@ -191,7 +199,8 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 			StaleAfterSeconds:     opts.Thresholds.StaleAfterSeconds,
 			HungAfterSeconds:      opts.Thresholds.HungAfterSeconds,
 		},
-		Issues: issues,
+		RunTree: runTree,
+		Issues:  issues,
 	}, nil
 }
 
@@ -538,4 +547,299 @@ func stringSliceContains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func resumeIssueRecoveryDecision(repoPath, runID string, issueNumber int, latest *state.Attempt, primaryPR *checkedPR, action resumeAction) *report.ResumeRecoveryDecision {
+	decision := &report.ResumeRecoveryDecision{
+		Issue:        issueNumber,
+		RunID:        runID,
+		Action:       action.Action,
+		Reason:       action.Classification,
+		ContextPaths: []string{},
+		PRLinks:      []string{},
+	}
+	if latest != nil {
+		decision.ContextPaths = appendNonEmptyString(decision.ContextPaths, repoRelativePath(repoPath, latest.Path))
+		recoveryPath := resumeAttemptRecoveryContextPath(repoPath, runID, *latest)
+		relativeRecoveryPath := repoRelativePath(repoPath, recoveryPath)
+		decision.ContextPaths = appendNonEmptyString(decision.ContextPaths, relativeRecoveryPath)
+		decision.RecoveryContextPath = relativeRecoveryPath
+	}
+	if strings.TrimSpace(action.RecoveryContextPath) != "" {
+		relativeRecoveryPath := resumeRecoveryContextReportPath(repoPath, action.RecoveryContextPath)
+		decision.ContextPaths = appendNonEmptyString(decision.ContextPaths, relativeRecoveryPath)
+		decision.RecoveryContextPath = relativeRecoveryPath
+	}
+	if primaryPR != nil {
+		decision.PRLinks = appendNonEmptyString(decision.PRLinks, primaryPR.PR.URL)
+		if strings.TrimSpace(primaryPR.PR.URL) == "" && primaryPR.PR.Number > 0 {
+			decision.PRLinks = appendNonEmptyString(decision.PRLinks, fmt.Sprintf("#%d", primaryPR.PR.Number))
+		}
+	}
+	switch action.Classification {
+	case "done":
+		decision.Outcome = "none"
+	case "ready":
+		decision.Outcome = "dispatch"
+		decision.SafeToResume = true
+	case "adopt-PR":
+		decision.Outcome = "adopt"
+		decision.SafeToResume = true
+	case "recovery-needed", "orphaned", "hung":
+		if action.ActionKind == "ready" {
+			decision.Outcome = "retry"
+			decision.SafeToResume = true
+			decision.RetryAllowed = true
+		} else {
+			decision.Outcome = "inspect"
+			decision.NeedsHuman = true
+		}
+	case "guardrail-frozen", "needs-human":
+		decision.Outcome = "needs-human"
+		decision.NeedsHuman = true
+	case "running", "stale":
+		decision.Outcome = "wait"
+	default:
+		if action.ActionKind == "blocked" {
+			decision.Outcome = "inspect"
+			decision.NeedsHuman = true
+		} else {
+			decision.Outcome = action.ActionKind
+		}
+	}
+	if decision.Outcome == "" {
+		decision.Outcome = "inspect"
+	}
+	return decision
+}
+
+func resumeAttemptRecoveryContextPath(repoPath, runID string, attempt state.Attempt) string {
+	if strings.TrimSpace(attempt.RecoveryContextPath) != "" {
+		if filepath.IsAbs(attempt.RecoveryContextPath) {
+			return filepath.Clean(attempt.RecoveryContextPath)
+		}
+		return filepath.Join(repoPath, attempt.RecoveryContextPath)
+	}
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(attempt.JobID) == "" {
+		return ""
+	}
+	return state.RecoveryBriefPath(repoPath, runID, attempt.JobID)
+}
+
+func resumeRecoveryContextReportPath(repoPath, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if filepath.IsAbs(path) {
+		return repoRelativePath(repoPath, path)
+	}
+	return filepath.ToSlash(path)
+}
+
+func appendNonEmptyString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func loadResumeRunTree(repoPath, runID string) report.ResumeRunTree {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return report.ResumeRunTree{Nodes: []report.ResumeRunTreeNode{}}
+	}
+	rootID := runID
+	if parent := resumeRunParentFromState(repoPath, runID); parent != "" {
+		rootID = parent
+	}
+	nodesByID := map[string]*report.ResumeRunTreeNode{}
+	visiting := map[string]bool{}
+	collectResumeRunNode(repoPath, rootID, "", 0, nodesByID, visiting)
+	nodes := make([]report.ResumeRunTreeNode, 0, len(nodesByID))
+	for _, node := range nodesByID {
+		sort.Strings(node.ChildRunIDs)
+		nodes = append(nodes, *node)
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].Depth != nodes[j].Depth {
+			return nodes[i].Depth < nodes[j].Depth
+		}
+		return nodes[i].RunID < nodes[j].RunID
+	})
+	return report.ResumeRunTree{
+		RootRunID: rootID,
+		Nodes:     nodes,
+	}
+}
+
+func collectResumeRunNode(repoPath, runID, parentRunID string, depth int, nodes map[string]*report.ResumeRunTreeNode, visiting map[string]bool) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" || visiting[runID] {
+		return
+	}
+	visiting[runID] = true
+	defer delete(visiting, runID)
+
+	lifecycle, lifecycleErr := state.LoadLifecycle(repoPath, runID)
+	eventChildren, eventParent := resumeRunEdgesFromEvents(repoPath, runID)
+	if strings.TrimSpace(parentRunID) == "" {
+		parentRunID = firstNonEmpty(lifecycle.ParentRunID, eventParent)
+	}
+	children := map[string]bool{}
+	for _, child := range lifecycle.ChildRunIDs {
+		if child != runID {
+			children[child] = true
+		}
+	}
+	for _, child := range eventChildren {
+		if child != runID {
+			children[child] = true
+		}
+	}
+
+	stateValue := strings.TrimSpace(string(lifecycle.State))
+	source := lifecycle.Source
+	if lifecycleErr != nil {
+		stateValue = "unknown"
+		source = "unreadable: " + lifecycleErr.Error()
+	} else if stateValue == "" {
+		stateValue = "unknown"
+		if source == "" {
+			source = "none"
+		}
+	}
+	childRunIDs := sortedStringSet(children)
+	node := &report.ResumeRunTreeNode{
+		RunID:            runID,
+		ParentRunID:      parentRunID,
+		ChildRunIDs:      childRunIDs,
+		Depth:            depth,
+		State:            stateValue,
+		Source:           source,
+		Interrupted:      resumeRunInterrupted(stateValue),
+		RecoveryDecision: resumeRunRecoveryDecision(runID, stateValue, lifecycleErr),
+	}
+	nodes[runID] = node
+	for _, child := range childRunIDs {
+		collectResumeRunNode(repoPath, child, runID, depth+1, nodes, visiting)
+	}
+}
+
+func resumeRunParentFromState(repoPath, runID string) string {
+	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+	if err == nil && strings.TrimSpace(lifecycle.ParentRunID) != "" {
+		return strings.TrimSpace(lifecycle.ParentRunID)
+	}
+	_, parent := resumeRunEdgesFromEvents(repoPath, runID)
+	return parent
+}
+
+func resumeRunEdgesFromEvents(repoPath, runID string) ([]string, string) {
+	path := state.EventsPath(repoPath, runID)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ""
+	}
+	defer file.Close()
+
+	children := map[string]bool{}
+	parent := ""
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Details json.RawMessage `json:"details"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		var details struct {
+			ParentRunID string `json:"parent_run_id"`
+			Child       struct {
+				RunID string `json:"run_id"`
+			} `json:"child"`
+			Result struct {
+				RunID string `json:"run_id"`
+			} `json:"result"`
+		}
+		if len(event.Details) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			continue
+		}
+		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
+			parent = strings.TrimSpace(details.ParentRunID)
+		}
+		children[details.Child.RunID] = true
+		children[details.Result.RunID] = true
+		delete(children, "")
+	}
+	return sortedStringSet(children), parent
+}
+
+func resumeRunInterrupted(stateValue string) bool {
+	switch state.LifecycleState(strings.ToLower(strings.TrimSpace(stateValue))) {
+	case state.StateSucceeded, state.StateFailed, state.StateCancelled, state.StateAbandoned, state.StateNeedsHuman:
+		return false
+	default:
+		return true
+	}
+}
+
+func resumeRunRecoveryDecision(runID, stateValue string, err error) *report.ResumeRecoveryDecision {
+	decision := &report.ResumeRecoveryDecision{
+		RunID:        runID,
+		Reason:       stateValue,
+		ContextPaths: []string{},
+		PRLinks:      []string{},
+	}
+	if err != nil {
+		decision.Outcome = "needs-human"
+		decision.Action = "inspect unreadable run lifecycle before resuming or retrying"
+		decision.Reason = err.Error()
+		decision.NeedsHuman = true
+		return decision
+	}
+	switch state.LifecycleState(strings.ToLower(strings.TrimSpace(stateValue))) {
+	case state.StateSucceeded:
+		decision.Outcome = "none"
+		decision.Action = "run already succeeded"
+	case state.StateFailed, state.StateCancelled, state.StateAbandoned:
+		decision.Outcome = "retry"
+		decision.Action = "inspect recovery context, then retry if still within budget and circuit-breaker policy"
+		decision.SafeToResume = true
+		decision.RetryAllowed = true
+	case state.StateNeedsHuman:
+		decision.Outcome = "needs-human"
+		decision.Action = "human review required before retrying or resuming child work"
+		decision.NeedsHuman = true
+	default:
+		decision.Outcome = "resume"
+		decision.Action = "inspect active run state and resume safe unfinished work"
+		decision.SafeToResume = true
+	}
+	return decision
+}
+
+func sortedStringSet(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, strings.TrimSpace(value))
+		}
+	}
+	sort.Strings(out)
+	return out
 }

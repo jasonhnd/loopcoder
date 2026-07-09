@@ -4515,6 +4515,77 @@ func TestResumeRunsWithInjectedReaderAndDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestResumeRendersJSONWithRunTreeAndRecoveryDecision(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      "run-parent",
+		State:      state.StateRunning,
+		ChildRunID: "run-child",
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		State:       state.StateFailed,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{"resume", "--repo", repo, "--run-id", "run-parent", "--format", "json"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				issues: []gh.Issue{{Number: 650, Title: "Interrupted child", State: "OPEN"}},
+			}
+		},
+		ProcessAlive: func(int) bool { return false },
+		Now: func() time.Time {
+			return time.Date(2026, 7, 9, 0, 1, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got struct {
+		RunTree struct {
+			Nodes []struct {
+				RunID            string `json:"run_id"`
+				RecoveryDecision struct {
+					Outcome      string `json:"outcome"`
+					RetryAllowed bool   `json:"retry_allowed"`
+				} `json:"recovery_decision"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+		Issues []struct {
+			RecoveryDecision struct {
+				Outcome      string `json:"outcome"`
+				SafeToResume bool   `json:"safe_to_resume"`
+			} `json:"recovery_decision"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("resume JSON did not unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree nodes = %#v, want parent and child", got.RunTree.Nodes)
+	}
+	childRetry := false
+	for _, node := range got.RunTree.Nodes {
+		if node.RunID == "run-child" && node.RecoveryDecision.Outcome == "retry" && node.RecoveryDecision.RetryAllowed {
+			childRetry = true
+		}
+	}
+	if !childRetry {
+		t.Fatalf("run tree missing retryable child decision: %#v", got.RunTree.Nodes)
+	}
+	if len(got.Issues) != 1 || got.Issues[0].RecoveryDecision.Outcome != "dispatch" || !got.Issues[0].RecoveryDecision.SafeToResume {
+		t.Fatalf("issue recovery decision = %#v", got.Issues)
+	}
+}
+
 func TestResumeRequiresRepo(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
