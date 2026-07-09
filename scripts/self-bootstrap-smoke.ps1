@@ -62,7 +62,13 @@ $binaryPath = $Binary
 if ([string]::IsNullOrWhiteSpace($binaryPath)) {
     $binaryPath = Join-Path $tmp ($(if ($IsWindows) { "loopcoder.exe" } else { "loopcoder" }))
     Invoke-Checked "build local loopcoder binary" {
-        go build -o $binaryPath ./cmd/loopcoder
+        Push-Location -LiteralPath $repoPath
+        try {
+            go build -o $binaryPath ./cmd/loopcoder
+        }
+        finally {
+            Pop-Location
+        }
     }
 }
 else {

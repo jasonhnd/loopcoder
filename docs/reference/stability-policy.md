@@ -10,6 +10,11 @@ customer install and upgrade target for the 0.6 capabilities; the latest public
 release before this bridge was v0.5.4, and customer docs should not direct
 users to install or upgrade to a nonexistent public v0.6.0 release.
 
+v0.7.0 release-readiness material may exist in `CHANGELOG.md`, release notes,
+smoke scripts, and reference docs before the release is published. That material
+is not a customer install promise until the v0.7.0 tag, signed checksums, and
+platform assets exist and the go/no-go report is completed.
+
 ## 0.x Stability Promise
 
 Within the 0.x release line, patch releases preserve compatibility for:
@@ -85,6 +90,13 @@ In v0.6.1, `doctor --format json` also exposes the ordered check list for host
 tools, including local `.loopcoder/` exclude protection, tracked local-state
 risk, reportquery readability, installed skill freshness, and project hook
 wiring.
+For v0.7.0, `doctor --format json` also exposes the machine-local runtime
+health surface used by release smoke: `runtime.database`,
+`runtime.project_registry`, `runtime.migration`, `runtime.nested_runs`,
+`host_profile`, and the `provider_compatibility[]` matrix. Release checks may
+accept `experimental` provider compatibility only for documented host-profile
+fallbacks such as `generic-local`; `unsupported` remains a release-blocking
+signal for selected Worker and Verifier roles.
 
 If the selected binary is too old, the schema version is unsupported, or a known
 field, flag, provider key, model/depth token, or label has been removed or
@@ -117,3 +129,5 @@ requirements must record that change in the changelog.
 - [`0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md):
   static model registry, `loopcoder models`, strict validation, and
   Antigravity provider setup.
+- [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md): release-readiness evidence and
+  human gate checklist for the v0.7.0 candidate.

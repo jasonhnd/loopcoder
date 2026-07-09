@@ -92,6 +92,9 @@ Acceptance requires all of the following evidence:
 10. Human audit evidence: a reviewer can follow every accepted item from
     GitHub issue, to PR, to checks/verifier result, to local report/status run
     evidence.
+11. Go/no-go evidence: the final release readiness PR or issue includes the
+    completed [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md) report, with unsigned
+    or missing assets recorded as NO-GO rather than inferred success.
 
 ## Non-Acceptance Cases
 
