@@ -70,6 +70,42 @@ Current host profiles:
 | `codex-cli` | Interactive Codex CLI conductor session calls `loopcoder` as a local subprocess. | best-effort/manual | Codex hook enforcement is best-effort unless manually wired. |
 | `claude-code` | Claude Code skill or conductor session calls `loopcoder` as a local subprocess. | supported | Project hook install writes conductor reporter and relay guard commands. |
 | `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | The host owns session lifetime and must keep stderr visible for relay obligations. |
+| `generic-local` | Unknown local agent host calls `loopcoder` as a subprocess. | unknown | Fallback when no explicit profile or known host signal is available. |
+
+## Host Profile Resolution
+
+Host profile selection is separate from provider and model selection. The
+resolution order is:
+
+1. `LOOPCODER_HOST`, when set.
+2. `.delivery.yml` `host.profile`, when set.
+3. Known host environment detection.
+4. `generic-local` fallback.
+
+Supported explicit values are the canonical profile names above plus common
+aliases such as `codex`, `claude`, `claudecode`, `paseo`, and `generic`.
+Unknown explicit values fail before host assumptions are used, and the error
+names the source (`LOOPCODER_HOST` or `host.profile`) plus the known profiles.
+
+Example explicit Codex-style invocation:
+
+```text
+LOOPCODER_HOST=codex-cli loopcoder doctor --repo . --format json
+```
+
+Example repository config:
+
+```yaml
+host:
+  profile: claude-code
+```
+
+Known host detection currently recognizes ordinary environment markers for the
+supported styles, including Codex CLI (`CODEX_CLI`, `CODEX_THREAD_ID`), Claude
+Code (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_CODE_ENTRYPOINT`), and paseo-style supervisors (`PASEO_AGENT_ID`,
+`PASEO_HOST`). Detection is best-effort; set `LOOPCODER_HOST` or
+`host.profile` when a wrapper exposes multiple host markers.
 
 ## Output Rules
 
@@ -83,6 +119,10 @@ Machine consumers should parse the documented stdout records, not stderr pretty
 text. Agent hosts must not suppress stderr for `dispatch`, `dispatch-wave`, or
 `loopreview`, because local relay obligations depend on those report blocks
 remaining visible.
+
+`doctor --format json` includes the resolved `host_profile` object at the JSON
+root. Human-readable doctor checks remain in `checks[]`; no pretty or prose
+host report is written to stdout in JSON mode.
 
 ## Cancellation And Timeout Behavior
 

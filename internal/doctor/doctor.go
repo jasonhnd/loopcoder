@@ -22,6 +22,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
@@ -87,11 +88,23 @@ type Check struct {
 }
 
 type Report struct {
-	RepoPath string
-	Version  string
-	Commit   string
-	Date     string
-	Checks   []Check
+	RepoPath    string
+	Version     string
+	Commit      string
+	Date        string
+	HostProfile HostProfile
+	Checks      []Check
+}
+
+type HostProfile struct {
+	Name               string
+	Source             string
+	Selector           string
+	InvocationStyle    string
+	SupportsHooks      bool
+	SupportsJSONOutput bool
+	DetectedBy         []string
+	KnownLimitations   []string
 }
 
 func (r Report) ExitCode() int {
@@ -129,6 +142,16 @@ func RenderJSON(w io.Writer, report Report) error {
 		Message    string `json:"message"`
 		FixCommand string `json:"fix_command"`
 	}
+	type renderedHostProfile struct {
+		Name               string   `json:"name"`
+		Source             string   `json:"source"`
+		Selector           string   `json:"selector,omitempty"`
+		InvocationStyle    string   `json:"invocation_style"`
+		SupportsHooks      bool     `json:"supports_hooks"`
+		SupportsJSONOutput bool     `json:"supports_json_output"`
+		DetectedBy         []string `json:"detected_by,omitempty"`
+		KnownLimitations   []string `json:"known_limitations,omitempty"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		checks = append(checks, renderedCheck{
@@ -140,19 +163,30 @@ func RenderJSON(w io.Writer, report Report) error {
 		})
 	}
 	payload := struct {
-		RepoPath string          `json:"repo_path"`
-		Version  string          `json:"version"`
-		Commit   string          `json:"commit"`
-		Date     string          `json:"date"`
-		ExitCode int             `json:"exit_code"`
-		Checks   []renderedCheck `json:"checks"`
+		RepoPath string              `json:"repo_path"`
+		Version  string              `json:"version"`
+		Commit   string              `json:"commit"`
+		Date     string              `json:"date"`
+		ExitCode int                 `json:"exit_code"`
+		Host     renderedHostProfile `json:"host_profile"`
+		Checks   []renderedCheck     `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
 		Version:  report.Version,
 		Commit:   report.Commit,
 		Date:     report.Date,
 		ExitCode: report.ExitCode(),
-		Checks:   checks,
+		Host: renderedHostProfile{
+			Name:               report.HostProfile.Name,
+			Source:             report.HostProfile.Source,
+			Selector:           report.HostProfile.Selector,
+			InvocationStyle:    report.HostProfile.InvocationStyle,
+			SupportsHooks:      report.HostProfile.SupportsHooks,
+			SupportsJSONOutput: report.HostProfile.SupportsJSONOutput,
+			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
+			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
+		},
+		Checks: checks,
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
@@ -172,6 +206,11 @@ func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 	}
 	if strings.TrimSpace(report.Date) == "" {
 		report.Date = build.Date
+	}
+	if strings.TrimSpace(report.HostProfile.Name) == "" && strings.TrimSpace(report.HostProfile.Source) == "" {
+		if resolved, err := hostprofile.Resolve(hostprofile.Options{Getenv: func(string) string { return "" }}); err == nil {
+			report.HostProfile = renderHostProfile(resolved)
+		}
 	}
 	return report
 }
@@ -213,6 +252,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
 	checks := make([]Check, 0, 10)
+	host, hostCheck := resolveHostProfile(delivery, deps)
 
 	gitCheck, gitPresent := checkGit(deps)
 	checks = append(checks, gitCheck)
@@ -224,6 +264,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkTrackedLoopcoderState(ctx, repoPath, gitPresent, deps))
 
 	checks = append(checks, checkDeliveryConfig(delivery))
+	checks = append(checks, hostCheck)
 	checks = append(checks, checkModelSelections(delivery))
 	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
 
@@ -247,7 +288,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		Message: "user-provided by the active Claude Code or Codex host; loopcoder does not ship it",
 	})
 
-	return WithMetadata(Report{Checks: checks}, repoPath, build)
+	return WithMetadata(Report{HostProfile: host, Checks: checks}, repoPath, build)
 }
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
@@ -939,6 +980,62 @@ func checkDeliveryConfig(delivery deliveryState) Check {
 		Name:    ".delivery.yml",
 		Status:  StatusOK,
 		Message: "present and valid",
+	}
+}
+
+func resolveHostProfile(delivery deliveryState, deps Deps) (HostProfile, Check) {
+	configProfile := ""
+	if delivery.Valid || !delivery.Present {
+		configProfile = delivery.Config.Host.Profile
+	}
+	resolved, err := hostprofile.Resolve(hostprofile.Options{
+		Profile: configProfile,
+		Getenv:  deps.Getenv,
+	})
+	if err != nil {
+		selector := "host.profile"
+		if strings.TrimSpace(deps.Getenv(hostprofile.EnvName)) != "" {
+			selector = hostprofile.EnvName
+		}
+		return HostProfile{Source: "error", Selector: selector}, Check{
+			Name:    "host profile",
+			Status:  StatusFail,
+			Message: err.Error(),
+			Hard:    true,
+		}
+	}
+	profile := renderHostProfile(resolved)
+	status := StatusOK
+	if resolved.Source == hostprofile.SourceFallback {
+		status = StatusWarn
+	}
+	message := fmt.Sprintf("profile=%s source=%s", profile.Name, profile.Source)
+	if profile.Selector != "" {
+		message += " selector=" + profile.Selector
+	}
+	if profile.InvocationStyle != "" {
+		message += "; " + profile.InvocationStyle
+	}
+	if len(profile.KnownLimitations) > 0 {
+		message += "; limitations: " + strings.Join(profile.KnownLimitations, "; ")
+	}
+	return profile, Check{
+		Name:    "host profile",
+		Status:  status,
+		Message: message,
+	}
+}
+
+func renderHostProfile(resolved hostprofile.Resolved) HostProfile {
+	return HostProfile{
+		Name:               resolved.Name,
+		Source:             string(resolved.Source),
+		Selector:           resolved.Selector,
+		InvocationStyle:    resolved.Runtime.InvocationStyle,
+		SupportsHooks:      resolved.Runtime.SupportsHooks,
+		SupportsJSONOutput: resolved.Runtime.SupportsJSONOutput,
+		DetectedBy:         append([]string(nil), resolved.DetectedBy...),
+		KnownLimitations:   append([]string(nil), resolved.Runtime.KnownLimitations...),
 	}
 }
 

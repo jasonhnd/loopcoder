@@ -40,6 +40,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"local-state exclude",
 		"tracked .loopcoder",
 		".delivery.yml",
+		"host profile",
 		"model selection",
 		"provider codex",
 		"provider claude",
@@ -73,6 +74,9 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+	if check := requireCheck(t, report, "host profile"); !strings.Contains(check.Message, "profile=claude-code source=env") {
+		t.Fatalf("host profile message = %q", check.Message)
 	}
 }
 
@@ -184,7 +188,12 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 		Commit   string `json:"commit"`
 		Date     string `json:"date"`
 		ExitCode int    `json:"exit_code"`
-		Checks   []struct {
+		Host     struct {
+			Name               string `json:"name"`
+			Source             string `json:"source"`
+			SupportsJSONOutput bool   `json:"supports_json_output"`
+		} `json:"host_profile"`
+		Checks []struct {
 			Name       string `json:"name"`
 			Status     Status `json:"status"`
 			Hard       bool   `json:"hard"`
@@ -200,6 +209,9 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.ExitCode != 1 {
 		t.Fatalf("exit_code = %d, want 1", payload.ExitCode)
+	}
+	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
+		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
 	}
 	if len(payload.Checks) != 2 {
 		t.Fatalf("checks len = %d, want 2", len(payload.Checks))
@@ -631,6 +643,58 @@ func TestRunWarnsWhenDeliveryConfigAbsentAndUsesDefaultProviders(t *testing.T) {
 	}
 	if requireCheck(t, report, "model selection").Status != StatusOK {
 		t.Fatal("default model selection was not checked")
+	}
+}
+
+func TestRunResolvesHostProfileFromConfig(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{}
+	env.cfg.Host.Profile = "codex"
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if report.HostProfile.Name != "codex-cli" || report.HostProfile.Source != "config" || report.HostProfile.Selector != "host.profile" {
+		t.Fatalf("HostProfile = %#v, want codex-cli from config", report.HostProfile)
+	}
+}
+
+func TestRunWarnsForGenericHostFallback(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if report.HostProfile.Name != "generic-local" || report.HostProfile.Source != "fallback" {
+		t.Fatalf("HostProfile = %#v, want generic fallback", report.HostProfile)
+	}
+}
+
+func TestRunHardFailsUnknownHostEnv(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{"LOOPCODER_HOST": "unknown"}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusFail || !check.Hard {
+		t.Fatalf("check = %#v, want hard fail", check)
+	}
+	if report.HostProfile.Source != "error" || report.HostProfile.Selector != "LOOPCODER_HOST" {
+		t.Fatalf("HostProfile = %#v, want error from LOOPCODER_HOST", report.HostProfile)
+	}
+	if !strings.Contains(check.Message, "LOOPCODER_HOST") || !strings.Contains(check.Message, "unknown") {
+		t.Fatalf("message = %q, want env and profile", check.Message)
 	}
 }
 
@@ -1219,6 +1283,9 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			"govulncheck": "/bin/govulncheck",
 			"staticcheck": "/bin/staticcheck",
 			"gosec":       "/bin/gosec",
+		},
+		env: map[string]string{
+			"LOOPCODER_HOST": "claude-code",
 		},
 		commands: map[string]CommandResult{
 			cmdKey("gh", "auth", "status"): {

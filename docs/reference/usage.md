@@ -473,8 +473,9 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
-- conductor runtime responsibility, which remains user-provided by the active
-  host.
+- resolved host profile (`codex-cli`, `claude-code`, `paseo-style`, or
+  `generic-local`) and conductor runtime responsibility, which remains
+  user-provided by the active host.
 
 Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
@@ -490,6 +491,14 @@ probe.
   "commit": "abc123",
   "date": "2026-07-08T00:00:00Z",
   "exit_code": 0,
+  "host_profile": {
+    "name": "codex-cli",
+    "source": "env",
+    "selector": "LOOPCODER_HOST",
+    "invocation_style": "interactive Codex CLI conductor session calls loopcoder as a local subprocess",
+    "supports_hooks": false,
+    "supports_json_output": true
+  },
   "checks": [
     {
       "name": "local-state exclude",
