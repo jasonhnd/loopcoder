@@ -74,14 +74,7 @@ push access.
    loopcoder doctor --repo .
    ```
 
-6. Register the checkout in the machine-local project registry.
-
-   ```text
-   loopcoder projects register --repo .
-   loopcoder projects show --repo .
-   ```
-
-7. Confirm local report querying works. A fresh repository may have no reports
+6. Confirm local report querying works. A fresh repository may have no reports
    yet; the command is still read-only and should render a valid empty report
    list.
 
@@ -89,7 +82,7 @@ push access.
    loopcoder report --repo .
    ```
 
-8. Drive the loop from a conductor session in the repository.
+7. Drive the loop from a conductor session in the repository.
 
    ```text
    /loopcoder <your need>
@@ -107,12 +100,28 @@ Command side effects in the first-run path:
 | `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
-| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry. |
-| `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
 | `loopcoder promote --repo .` | May change the configured production branch, subject to `adapters.gate` and the human command that invokes promotion. |
+
+v0.7.0 candidate binaries add an optional registry and migration step after
+`doctor`, but those commands are not part of the v0.6.1 stable quickstart:
+
+```text
+loopcoder projects register --repo .
+loopcoder projects show --repo .
+loopcoder migrate local-state --repo . --dry-run
+```
+
+`loopcoder projects register --repo .` writes or refreshes this checkout's row
+in the machine-local project registry after sanitizing Git remote credentials
+from project metadata. `loopcoder projects remove --repo .` detaches this
+checkout from active registry listings while preserving the project row,
+identity links, run history, reports, legacy import records, and import status.
+`loopcoder migrate local-state --repo .` explicitly copies legacy repo-local
+`.loopcoder/` records into machine-local storage; it does not delete or rewrite
+those files.
 
 `.loopcoder/` is repo-local machine state. It is intentionally used for run
 state, relay ledgers, recovery, status, and report queries, but it must not be
@@ -120,8 +129,9 @@ committed to normal business branches. `init` and `skill install --repo`
 protect it with local `.git/info/exclude`; `loopcoder state push` is the
 explicit publishing path for state summaries. A machine can serve many
 projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
-the machine-level binary, bundled skill, and v0.7.0 SQLite project registry
-live under the user's machine-level loopcoder/agent directories.
+the machine-level binary and bundled skill live under the user's machine-level
+loopcoder/agent directories. In v0.7.0 candidate builds, the SQLite project
+registry and migrated runtime records also live under `$LOOPCODER_HOME`.
 
 ## Prerequisites
 
@@ -246,19 +256,25 @@ Report delivery run state with the program-rendered local status command:
 ```text
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
-loopcoder status --repo . --format json
-loopcoder status --repo . --run <run-id> --format json
 ```
 
 When `--run` is omitted, `status` selects the latest modified local run. The
-text output includes a readable run tree, and JSON output exposes the stable
-`run_tree` object for machine consumers. Each node includes `project_id`,
+text output includes a readable local run status. In the v0.7.0 candidate,
+`status --format json` also exposes the additive `run_tree` object for machine
+consumers. Each node includes `project_id`,
 `run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
 role, provider, model, effort, permission, lifecycle status/source, timestamps,
 last error, and report summary when those fields are present in local records.
 The output is read-only and local-only: it reads gitignored `.loopcoder/` state
 and must not be copied into PR bodies, issues, comments, commits, merge
 artifacts, docs, examples, fixtures, or tracked files.
+
+Candidate JSON examples:
+
+```text
+loopcoder status --repo . --format json
+loopcoder status --repo . --run <run-id> --format json
+```
 
 Example JSON shape:
 
@@ -535,8 +551,8 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
   whether `.loopcoder/` files are already tracked, and the exact safe fix
   command when local state is tracked;
 - reportquery readability for local report/run/relay records;
-- storage health and the current checkout's machine-local project registry
-  identity, including ambiguity warnings;
+- storage permissions, storage health, and the current checkout's
+  machine-local project registry identity, including ambiguity warnings;
 - migration status and nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
@@ -549,6 +565,20 @@ Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
 does not invent provider-authentication status when the provider has no stable
 probe.
+
+On Unix-like systems, v0.7.0 creates and tightens `$LOOPCODER_HOME` and
+`$LOOPCODER_HOME/data` with owner-only directory permissions, and
+`$LOOPCODER_HOME/data/loopcoder.db` plus SQLite `-wal` and `-shm` sidecars with
+owner-only file permissions. The storage layer refuses symlink and non-regular
+database paths before chmod or SQLite open. `doctor --repo .` reports insecure
+existing modes without repairing them; `doctor --repo . --fix` tightens those
+paths in place without deleting or recreating the database.
+
+On Windows, v0.7.0 does not implement owner-only DACL hardening. The storage
+path is still resolved under the user profile or `LOOPCODER_HOME`, and unsafe
+symlink/non-regular storage paths are refused, but `doctor` warns that
+owner-only ACL protection is not enforced and `doctor --fix` cannot repair it in
+this version.
 
 `doctor --format json` emits a stable support surface:
 
@@ -572,13 +602,14 @@ probe.
     "database": {
       "path": "/home/user/.loopcoder/data/loopcoder.db",
       "exists": true,
-      "schema_version": 3,
+      "schema_version": 5,
       "status": "ok",
       "message": "storage database is healthy"
     },
     "project_registry": {
       "status": "ok",
       "registered": true,
+      "detached": false,
       "project_id": "proj_abc123",
       "identity_source": "github",
       "conflict_count": 0,
@@ -739,7 +770,9 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 
 ## Binary Commands
 
-Use the native `loopcoder` commands as the helper interface:
+Use the native `loopcoder` commands as the helper interface. The stable
+inventory below matches the v0.6.1 binary installed by the current release
+commands:
 
 ```text
 loopcoder version
@@ -751,15 +784,6 @@ loopcoder doctor --repo . --format json
 
 loopcoder models
 loopcoder models --provider antigravity
-
-loopcoder projects register --repo .
-loopcoder projects list --format json
-loopcoder projects show --repo .
-loopcoder projects remove --repo .
-
-loopcoder migrate local-state --repo . --dry-run
-loopcoder migrate local-state --repo .
-loopcoder migrate local-state --repo . --format json
 
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
@@ -856,11 +880,65 @@ loopcoder kill --repo . --run <run-id>
 loopcoder kill --repo . --all
 ```
 
+The v0.7.0 candidate adds these commands and output forms. Use them only from a
+source build or staged v0.7.0 candidate binary until the signed v0.7.0 release
+is published:
+
+```text
+loopcoder projects register --repo .
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects remove --repo .
+
+loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate local-state --repo .
+loopcoder migrate local-state --repo . --format json
+
+loopcoder nested run --repo . --plan child-plan.json --provider codex --format json
+
+loopcoder status --repo . --format json
+loopcoder report --repo . --run <run-id> --format json
+```
+
 `hook` is for host hook integration rather than normal customer workflow.
-`discover`, `compile`, `trigger`, `state`, `lease`, `migrate`, `ps`, and
-`kill` are advanced/operator commands. `state push` is the explicit
+`discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
+advanced/operator commands in v0.6.1. `projects`, `migrate`, and `nested` are
+v0.7.0 candidate commands before the v0.7.0 release is published. `state push`
+is the explicit
 state-branch publish path; `kill` only targets loopcoder-managed processes for
 a run or repository and should not be used as a bare process-name terminator.
+
+### Nested Child Plans (v0.7.0 Candidate)
+
+`loopcoder nested run` is the supported boundary for v1 nested orchestration:
+
+```text
+loopcoder nested run --repo . --plan child-plan.json --provider codex
+loopcoder nested run --repo . --plan child-plan.json --provider claude --format json
+```
+
+The plan file must use `schema_version: "loopcoder.child_plan.v1"`. The command
+strictly validates child keys, dependencies, depth, fan-out, declared scope,
+permission, and aggregation policy before launching child work. It persists the
+accepted plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`,
+then schedules ready children with dependency-aware fan-out/fan-in. Re-running
+the same plan resumes from durable child attempt records and does not dispatch a
+child whose run already has a terminal attempt.
+
+For production providers, loopcoder launches write-capable child runs through
+the existing Worker dispatch adapter path. That means `codex` and `claude`
+children get normal worktrees, attempt records, reports, recovery briefs, and
+provider selection behavior; unsupported read-only child dispatch fails with an
+explicit error instead of silently using a mutating worker. Loopcoder remains the
+authority for child identity, permission ceilings, budget/circuit checks,
+persistence, cancellation, timeout, and recovery. Native provider sub-agent
+features are not a replacement for the child plan and are not allowed to create
+untracked children outside loopcoder.
+
+The reserved `test-subprocess` provider exists only for deterministic local and
+release smoke tests. It executes each child item's `scope.commands` as real local
+subprocesses and writes ordinary local attempt/report records without calling a
+remote provider.
 
 ## Exit Codes
 
@@ -931,7 +1009,7 @@ gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
-## Local State Migration
+## Local State Migration (v0.7.0 Candidate)
 
 `loopcoder migrate local-state --repo .` imports v0.6.x repo-local
 `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into
@@ -1074,37 +1152,49 @@ the payload also includes the same additive `run_tree` object exposed by
 }
 ```
 
-For every successful `loopcoder dispatch`, stdout contains three
-newline-terminated records in this order:
+Reporter-producing commands use explicit output modes:
 
-1. The stable Worker report header from `record.Header()`.
-2. The Worker report canonical JSON from `record.CanonicalJSON()`.
-3. The dispatch result JSON, whose `report` object is the same validated
-   Worker report.
+| Mode | Intended reader | Output |
+|---|---|---|
+| default text | people and merged-stream host integrations | concise receipt only, with no raw canonical JSON |
+| `--format json` | machines | one JSON value with no prefix, suffix, header, or receipt text |
+| `--verbose` | local debugging and compatibility inspection | canonical headers/records and diagnostic details in addition to the human receipt where supported |
 
-Example:
+The same contract applies to Worker (`dispatch` and `dispatch-wave`), Verifier
+(`loopreview`), audit Layer 2, and Conductor self-report (`attest`) receipts.
+During the 0.6.x transition window, readers accept legacy `[attestation]`
+headers and nested `attestation` objects from prior output, but newly emitted
+JSON uses `[reporter]` and `report` per
+[`../specs/0567-reporter.md`](../specs/0567-reporter.md).
 
-```text
-[reporter] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #218" exit=0 dur=42s tokens=2447/4461|6908 verified=true
-{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}
+Use `--format json` when a parent process needs the stable dispatch result
+schema:
+
+```json
 {"ok":true,"issue":218,"branch":"loop/issue-218","run_id":"run-218","pr":"https://github.com/owner/repo/pull/999","summary":"Worker summary","attempt_path":".loopcoder/runs/run-218/workers/job-218-1.attempt.json","status":"succeeded","exit_code":0,"log_bytes":12345,"report":{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}}
 ```
 
-The final non-empty stdout line remains the dispatch result JSON. Consumers
-that need only the summary should parse the last line; conductors that need
-Worker reports can read either the local header or the nested `report` object.
-During the 0.6.x transition window, readers accept legacy `[attestation]` headers and
-nested `attestation` objects from prior output, but newly emitted output uses
-`[reporter]` and `report` per
-[`../specs/0567-reporter.md`](../specs/0567-reporter.md). The canonical JSON
-line is the exact machine rendering of that same record and is not wrapped in
-Markdown on stdout.
+Use `--verbose` when you intentionally need the historical debugging records:
+the stable `[reporter]` header, canonical report JSON, and command result JSON.
 
-`loopcoder dispatch` and `loopcoder loopreview` emit a human-readable report
-receipt to stderr by default. Foreground `loopcoder dispatch-wave` streams one
-Worker receipt per dispatched issue to stdout as that Worker completes, before
-the final aggregate wave report. The default receipt uses emoji on an
-interactive TTY and plain ASCII on a non-TTY.
+Before this output contract, a merged verifier transcript could show
+`needs-human` while its receipt reason was a positive evidence sentence:
+
+```text
+- status: needs-human
+- reason: All five acceptance criteria satisfied and no regressions were found.
+```
+
+The receipt now separates decision reason from next action and chooses the
+escalating finding for `needs-human`:
+
+```text
+- status: needs-human
+- reason: docs/specs/merged-design.md: merged design/spec unavailable: origin/main does not contain the referenced file
+
+Next
+- human should decide whether the reported uncertainty is acceptable for this PR
+```
 
 The receipt is conclusion-first and always uses `Target`, `Verdict`, `Review
 summary`, `Run`, and `Next`. It displays provider vendor and provider key on
@@ -1123,37 +1213,27 @@ and wins over any force or default setting. When pretty output is shown,
 `NO_COLOR`, `LOOPCODER_PLAIN=1`, or `LOOPCODER_NO_EMOJI=1` forces the plain
 ASCII form.
 
-Pretty output is diagnostic local output only. It never appears between the
-three `dispatch` stdout records, and it does not change `loopreview` verdict
-JSON, canonical JSON, or the stable `Header()` / `[reporter] ...` contracts.
-Together with result JSON and gitignored `.loopcoder/` run records, it is a
+Pretty output is diagnostic local output only. Together with JSON mode,
+verbose mode, and gitignored `.loopcoder/` run records, it is a
 local reporter surface only. It is not copied into PR bodies, comments,
 commits, merge commit bodies, merge comments, or other repository-visible
-artifacts. The conductor must keep `dispatch` and `loopreview` stderr visible,
-keep foreground `dispatch-wave` stdout visible, and relay each Worker or
-Verifier pretty block verbatim for human reporting. The `relay` command group
-is the explicit recovery surface: `relay flush` prints pending blocks verbatim
-to stdout and clears them, while `relay list` inspects pending records without
-clearing. `conductor-relay-guard` locally backstops hidden or suppressed
-`dispatch`, `dispatch-wave`, and `loopreview` blocks where hooks are active.
-Machine consumers should continue to parse local canonical JSON or stable
-headers. For one release, relay and conductor hook matchers accept both
+artifacts. The `relay` command group is the explicit recovery surface:
+`relay flush` prints pending blocks verbatim to stdout and clears them, while
+`relay list` inspects pending records without clearing. `conductor-relay-guard`
+locally backstops hidden or suppressed `dispatch`, `dispatch-wave`, and
+`loopreview` blocks where hooks are active. Machine consumers should use
+`--format json`; local compatibility tools that inspect reporter headers should
+use `--verbose`. For one release, relay and conductor hook matchers accept both
 `[reporter]` and legacy `[attestation]` tokens.
 
 `loopcoder attest` is the one-version compatibility alias for Conductor
-self-reports. It emits canonical JSON followed by the one-line `[reporter] ...`
-header, forces `model_source` to
+self-reports. Default text mode emits the Conductor receipt. `--format json`
+emits the canonical report JSON only, while `--verbose` emits canonical JSON
+followed by the one-line `[reporter] ...` header. It forces `model_source` to
 `self-reported`, and forces `verified` to `false` even if flags try to set other
 values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
-
-Keep the default `loopcoder attest` output for local machine-readable
-Conductor reports. Use `loopcoder attest --pretty` only for direct human
-reading; it prints the pretty rendering to stdout instead of the canonical JSON
-plus header. Conductor recovery after compaction or same-host session transfer
-reads gitignored `.loopcoder/` run records and local command results, never
-GitHub artifacts.
 
 Pretty output uses emoji when the target is an interactive terminal, or when
 emoji is forced, and emoji is not disabled:

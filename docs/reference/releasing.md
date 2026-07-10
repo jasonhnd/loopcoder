@@ -28,14 +28,28 @@ Before tagging a release:
 4. Confirm the three surfaces agree on command names, config keys, compatibility aliases, breaking-change wording, and upgrade steps.
 5. Run the release's required local verification, including markdown well-formedness checks when available and `go build ./...` for loopcoder source releases.
 
-After publishing v0.7.0 or any later release, run the consumer artifact smoke:
+## Staged GitHub Release Flow
+
+The release workflow builds each advertised archive exactly once, generates and
+signs one `SHA256SUMS` manifest, uploads those artifacts to a draft GitHub
+Release, and runs native smoke jobs on Ubuntu, macOS, and Windows before the
+release is public. The final publication job does not rebuild or re-upload
+archives; it only promotes the already-smoked draft release after the protected
+`release-publication` environment grants approval.
+
+A failing smoke job must leave the release as a draft. The workflow appends the
+failed run URL to the draft notes so the candidate assets and diagnostic
+evidence remain available without presenting the release as final.
+
+The native smoke jobs run:
 
 ```powershell
 pwsh scripts/release-smoke.ps1 -Version 0.7.0
 ```
 
-The smoke script downloads the published archive for the current platform,
-verifies `SHA256SUMS` with cosign, checks the archive checksum, runs
+The smoke script targets the staged draft release. It downloads the current
+platform archive through `gh release download`, verifies `SHA256SUMS` with
+cosign, checks the archive checksum, runs
 `loopcoder version`, confirms the source checkout has no tracked `.loopcoder/`
 files, exercises a temporary-repository `init` / `skill install` / project
 registry / `doctor --format json` / `migrate local-state --dry-run` /
@@ -44,6 +58,72 @@ nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
 `-PreviousVersion` is set. It is verification-only and must not create tags,
 publish releases, or upload assets.
+
+## Required GitHub Repository Settings
+
+These settings require repository administration rights and are intentionally
+not mutated by workers. Apply them before tagging a public release and record
+the evidence in the go/no-go report.
+
+Create a protected publication environment with required reviewers:
+
+```bash
+REVIEWER_ID=123456
+gh api \
+  --method PUT \
+  "repos/OWNER/REPO/environments/release-publication" \
+  --input - <<JSON
+{
+  "wait_timer": 0,
+  "reviewers": [
+    {
+      "type": "User",
+      "id": ${REVIEWER_ID}
+    }
+  ]
+}
+JSON
+```
+
+Configure `main` to require pull requests and the documented checks. Adjust the
+check list to the exact check names shown by GitHub for the current workflow
+matrix:
+
+```bash
+gh api \
+  --method PUT \
+  "repos/OWNER/REPO/branches/main/protection" \
+  -H "Accept: application/vnd.github+json" \
+  --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "verify",
+      "go",
+      "staticcheck",
+      "govulncheck",
+      "audit",
+      "native (ubuntu-latest)",
+      "native (macos-latest)",
+      "native (windows-latest)"
+    ]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1
+  },
+  "restrictions": null
+}
+JSON
+```
+
+Verify the effective settings before GO:
+
+```bash
+gh api "repos/OWNER/REPO/branches/main/protection"
+gh api "repos/OWNER/REPO/environments/release-publication"
+```
 
 ## v0.7.0 Self-Bootstrap Acceptance
 

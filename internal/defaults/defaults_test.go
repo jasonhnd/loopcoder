@@ -25,6 +25,9 @@ func TestCurrentInventory(t *testing.T) {
 	if got.DispatchWaveThrottleLimit != 4 {
 		t.Fatalf("DispatchWaveThrottleLimit = %d, want 4", got.DispatchWaveThrottleLimit)
 	}
+	if got.NestedSchedulerMaxConcurrency != 3 {
+		t.Fatalf("NestedSchedulerMaxConcurrency = %d, want 3", got.NestedSchedulerMaxConcurrency)
+	}
 	if got.WorkerHardCap != 45*time.Minute || got.WorkerStallTimeout != 5*time.Minute {
 		t.Fatalf("worker watchdog defaults = %s/%s", got.WorkerHardCap, got.WorkerStallTimeout)
 	}

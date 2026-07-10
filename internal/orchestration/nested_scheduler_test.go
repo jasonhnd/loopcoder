@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestScheduleNestedRunsFansOutWithConcurrencyLimitAndDeterministicResults(t *testing.T) {
@@ -61,8 +65,8 @@ func TestScheduleNestedRunsFansOutWithConcurrencyLimitAndDeterministicResults(t 
 	for _, result := range report.Children {
 		gotIDs = append(gotIDs, result.ID)
 	}
-	if !reflect.DeepEqual(gotIDs, []string{"a", "b", "c"}) {
-		t.Fatalf("child result order = %#v, want sorted ids", gotIDs)
+	if !reflect.DeepEqual(gotIDs, []string{"c", "a", "b"}) {
+		t.Fatalf("child result order = %#v, want plan order", gotIDs)
 	}
 	if report.Summary.RequiredCount != 3 || report.Summary.SucceededCount != 3 {
 		t.Fatalf("summary = %#v", report.Summary)
@@ -457,7 +461,7 @@ func TestScheduleNestedRunsValidatesExplicitOptionalAndDepth(t *testing.T) {
 			return ChildRunResult{}, nil
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "exactly one of required or optional") {
+	if err == nil || !strings.Contains(err.Error(), "aggregation is required") {
 		t.Fatalf("implicit optional error = %v", err)
 	}
 
@@ -477,6 +481,269 @@ func TestScheduleNestedRunsValidatesExplicitOptionalAndDepth(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "exceeds max depth") {
 		t.Fatalf("depth error = %v", err)
+	}
+}
+
+func TestParseChildPlanJSONStrictGoldenV1(t *testing.T) {
+	raw := []byte(`{
+  "schema_version": "loopcoder.child_plan.v1",
+  "plan_id": "plan-run-20260709T000000Z-wave-001",
+  "parent_run_id": "run-20260709T000000Z-wave",
+  "root_run_id": "run-20260709T000000Z-wave",
+  "parent_depth": 0,
+  "max_depth": 2,
+  "max_concurrency": 2,
+  "created_at": "2026-07-09T00:00:00Z",
+  "items": [
+    {
+      "child_key": "docs-pass",
+      "title": "Review docs contract",
+      "role": "worker",
+      "scope": {
+        "repo": ".",
+        "paths": ["docs/specs/"],
+        "issues": [646],
+        "commands": ["go test ./internal/orchestration/..."]
+      },
+      "permission": "read-only",
+      "depends_on": [],
+      "aggregation": {
+        "mode": "collect",
+        "required": true,
+        "include_report": true
+      }
+    }
+  ]
+}`)
+	plan, err := ParseChildPlanJSON(raw)
+	if err != nil {
+		t.Fatalf("ParseChildPlanJSON returned error: %v", err)
+	}
+	if plan.SchemaVersion != ChildPlanSchemaVersionV1 || plan.PlanID != "plan-run-20260709T000000Z-wave-001" {
+		t.Fatalf("parsed plan identity = %s %s", plan.SchemaVersion, plan.PlanID)
+	}
+	if got := plan.Items[0].Ordinal; got != 0 {
+		t.Fatalf("child ordinal = %d, want 0", got)
+	}
+
+	var asMap map[string]any
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	asMap["unexpected"] = true
+	strictRaw, err := json.Marshal(asMap)
+	if err != nil {
+		t.Fatalf("marshal strict fixture: %v", err)
+	}
+	if _, err := ParseChildPlanJSON(strictRaw); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown-field error = %v", err)
+	}
+}
+
+func TestValidateChildPlanRejectsInvalidBoundedFields(t *testing.T) {
+	base := func() ChildPlan {
+		return ChildPlan{
+			SchemaVersion:  ChildPlanSchemaVersionV1,
+			PlanID:         "plan-run-20260709T000000Z-wave",
+			ParentRunID:    "run-20260709T000000Z-wave",
+			RootRunID:      "run-20260709T000000Z-wave",
+			ParentDepth:    0,
+			MaxDepth:       2,
+			MaxConcurrency: 2,
+			CreatedAt:      "2026-07-09T00:00:00Z",
+			Items: []ChildRunPlan{{
+				ChildKey:   "a",
+				Title:      "A",
+				Role:       "worker",
+				Scope:      ChildScope{Repo: ".", Issues: []int{689}},
+				Permission: "write",
+				DependsOn:  []string{},
+				Aggregation: ChildAggregation{
+					Mode:          ChildAggregationCollect,
+					Required:      true,
+					IncludeReport: true,
+				},
+			}},
+		}
+	}
+	tests := []struct {
+		name string
+		edit func(*ChildPlan)
+		want string
+	}{
+		{name: "invalid permission", edit: func(p *ChildPlan) { p.Items[0].Permission = "admin" }, want: "permission must be one of"},
+		{name: "duplicate child key", edit: func(p *ChildPlan) { p.Items = append(p.Items, p.Items[0]) }, want: "duplicate child_key"},
+		{name: "unknown dependency", edit: func(p *ChildPlan) { p.Items[0].DependsOn = []string{"missing"} }, want: "depends on unknown"},
+		{name: "cycle", edit: func(p *ChildPlan) {
+			p.Items = append(p.Items, ChildRunPlan{
+				ChildKey: "b", Title: "B", Role: "worker", Scope: ChildScope{Repo: ".", Issues: []int{690}},
+				Permission: "read-only", DependsOn: []string{"a"},
+				Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
+			})
+			p.Items[0].DependsOn = []string{"b"}
+		}, want: "cycle"},
+		{name: "hard depth cap", edit: func(p *ChildPlan) { p.MaxDepth = NestedHardMaxDepth + 1 }, want: "hard maximum"},
+		{name: "unbounded write scope", edit: func(p *ChildPlan) { p.Items[0].Scope = ChildScope{Repo: ".", Paths: []string{"**"}} }, want: "unbounded path scope"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := base()
+			tt.edit(&plan)
+			err := ValidateChildPlan(&plan)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateChildPlan error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateChildPlanDefaultsMaxConcurrencyToNestedSpec(t *testing.T) {
+	plan := ChildPlan{
+		SchemaVersion:  ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260709T000000Z-wave-001",
+		ParentRunID:    "run-20260709T000000Z-wave",
+		RootRunID:      "run-20260709T000000Z-wave",
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 0,
+		CreatedAt:      state.FormatTimestamp(nestedTestNow()),
+		Items: []ChildRunPlan{{
+			ChildKey:   "child-a",
+			Title:      "child-a",
+			Role:       "worker",
+			Permission: string(reporter.PermissionWrite),
+			Scope:      ChildScope{Repo: ".", Paths: []string{"internal/orchestration/nested_scheduler.go"}, Issues: []int{646}},
+			Aggregation: ChildAggregation{
+				Mode:          ChildAggregationCollect,
+				Required:      true,
+				IncludeReport: true,
+			},
+		}},
+	}
+	if err := ValidateChildPlan(&plan); err != nil {
+		t.Fatalf("ValidateChildPlan returned error: %v", err)
+	}
+	if plan.MaxConcurrency != 3 {
+		t.Fatalf("MaxConcurrency = %d, want nested default 3", plan.MaxConcurrency)
+	}
+}
+
+func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
+	repo := t.TempDir()
+	now := nestedTestNow()
+	var order []string
+	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+		RepoPath:         repo,
+		ParentRunID:      "run-20260709T000000Z-wave",
+		ConcurrencyLimit: 2,
+		MaxChildren:      2,
+		Now:              now,
+		Clock:            func() time.Time { return now },
+		Children: []ChildRunPlan{
+			{ID: "second", Issue: 2, Permission: "write", Required: true, DependsOn: []string{"first"}},
+			{ID: "first", Issue: 1, Permission: "write", Required: true},
+		},
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			order = append(order, child.ChildKey)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if report.Status != NestedStatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", report.Status)
+	}
+	if !reflect.DeepEqual(order, []string{"first", "second"}) {
+		t.Fatalf("execution order = %#v, want dependency order", order)
+	}
+}
+
+func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := ChildPlan{
+		SchemaVersion:  ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260709T000000Z-wave",
+		ParentRunID:    "run-20260709T000000Z-wave",
+		RootRunID:      "run-20260709T000000Z-wave",
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		CreatedAt:      "2026-07-09T00:00:00Z",
+		Items: []ChildRunPlan{{
+			ChildKey: "durable-child", Title: "Durable child", Role: "worker",
+			Scope: ChildScope{Repo: ".", Issues: []int{689}}, Permission: "write", DependsOn: []string{},
+			Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
+		}},
+	}
+	executions := 0
+	run := func() {
+		t.Helper()
+		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+			RepoPath:    repo,
+			MaxChildren: 1,
+			Now:         nestedTestNow(),
+			Clock:       func() time.Time { return nestedTestNow() },
+			Plan:        &plan,
+			Store:       store,
+			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				executions++
+				var count int
+				if err := store.WithTx(ctx, func(tx storage.Tx) error {
+					return tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans WHERE plan_id = ?`, plan.PlanID).Scan(&count)
+				}); err != nil {
+					t.Fatalf("query child_plans during execute: %v", err)
+				}
+				if count != 1 {
+					t.Fatalf("child plan count during execute = %d, want durable before launch", count)
+				}
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+		}
+		if report.Status != NestedStatusSucceeded {
+			t.Fatalf("status = %s, want succeeded", report.Status)
+		}
+	}
+	run()
+	run()
+	if executions != 2 {
+		t.Fatalf("executions = %d, want replay to execute same child twice without duplicating graph", executions)
+	}
+	var plans, runs, edges int
+	var edgeStatus string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans WHERE plan_id = ?`, plan.PlanID).Scan(&plans); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM runs WHERE root_run_id = ?`, plan.RootRunID).Scan(&runs); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_edges WHERE plan_id = ?`, plan.PlanID).Scan(&edges); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE plan_id = ? AND child_key = ?`, plan.PlanID, "durable-child").Scan(&edgeStatus)
+	}); err != nil {
+		t.Fatalf("query durable graph: %v", err)
+	}
+	if plans != 1 || runs != 2 || edges != 1 {
+		t.Fatalf("durable counts plans/runs/edges = %d/%d/%d, want 1/2/1", plans, runs, edges)
+	}
+	if edgeStatus != NestedStatusSucceeded {
+		t.Fatalf("edge status = %q, want succeeded", edgeStatus)
+	}
+	events := readNestedEvents(t, repo, plan.ParentRunID)
+	if !strings.Contains(events, NestedEventChildQueued) || !strings.Contains(events, NestedEventChildFinished) || !strings.Contains(events, `"status":"succeeded"`) {
+		t.Fatalf("compatibility events do not mirror durable success:\n%s", events)
 	}
 }
 

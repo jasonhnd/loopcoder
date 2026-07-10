@@ -7,8 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This section describes the v0.7.0 candidate on `main`/`pre-prod`. v0.7.0 is
+not the customer install target until the tag, signed checksums, platform
+assets, release smoke, and go/no-go report are complete.
+
 ### Added
 
+- **Machine-local runtime store** - v0.7.0 adds a SQLite-backed storage layer
+  under `$LOOPCODER_HOME/data/loopcoder.db` plus machine-local project, log,
+  and temporary directories. The store indexes projects, runs, reports, import
+  records, leases, and nested run graph metadata without turning local runtime
+  evidence into repository-visible state.
+- **Project registry** - `loopcoder projects register|list|show|remove`
+  manages stable local project identities across multiple checkouts. Identity
+  prefers normalized GitHub owner/name, then sanitized normalized git remote,
+  then canonical local path. `remove` detaches the active registry entry while
+  preserving the project row, run history, reports, import records, and
+  migration status for re-registration.
+- **Explicit v0.6.x local-state migration** - `loopcoder migrate local-state
+  --repo . --dry-run` previews compatible repo-local `.loopcoder/` imports, and
+  the non-dry-run path copies attempts, events, reports, recovery briefs, and
+  relay records into the machine-local store. Migration is idempotent,
+  source-hash tracked, and never deletes or rewrites the source `.loopcoder/`
+  files.
+- **Storage and registry diagnostics** - `loopcoder doctor --repo .` now
+  reports storage reachability, schema health, migration status, project
+  registry identity, detached/ambiguous project state, nested run graph health,
+  and safe `--fix` actions. JSON output adds `runtime`, `host_profile`, and
+  `provider_compatibility` fields for support tooling.
+- **Owner-only storage protection on Unix-like systems** - the storage layer
+  creates and tightens `$LOOPCODER_HOME`, `$LOOPCODER_HOME/data`, the SQLite
+  database, and SQLite sidecars to owner-only permissions, refuses symlink and
+  non-regular storage paths, and lets `doctor --fix` repair insecure existing
+  modes in place.
+- **Provider and host compatibility matrix** - `internal/runtimecap`,
+  `internal/hostprofile`, and `internal/provider` describe support levels for
+  worker, verifier, audit, nested, hook, and JSON-output modes across Codex,
+  Claude, Antigravity, and local host profiles. `doctor` exposes the matrix
+  without treating unsupported modes as silently usable.
+- **Nested orchestration runtime** - `loopcoder nested run --repo . --plan
+  child-plan.json --provider <provider>` validates the
+  `loopcoder.child_plan.v1` envelope, persists parent/child run graph data,
+  schedules dependency-aware child runs with max-depth and concurrency bounds,
+  supports cancellation/resume/failure propagation, and executes production
+  child work through the normal Worker dispatch path. The reserved
+  `test-subprocess` provider exists only for deterministic local and release
+  smoke tests.
+- **Run-tree observability** - `loopcoder status --format json` and
+  `loopcoder report --run <id> --format json` include an additive `run_tree`
+  object with root/parent/child IDs, lifecycle status, issue/PR metadata,
+  provider/model/effort, report summaries, and aggregate counts.
 - **Reporter receipt rendering** - Worker, Verifier, audit, and Conductor
   pretty output now uses compact `Target`, `Verdict`, `Review summary`, `Run`,
   and `Next` receipts; `loopcoder report --verbose` exposes raw canonical
@@ -23,16 +71,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/reference/v0.7.0-go-no-go.md` so the final release PR can attach a
   truthful go/no-go report without claiming v0.7.0 is installable before the
   tag and signed assets exist.
-- **Expanded v0.7.0 release smoke** - `scripts/release-smoke.ps1` now defaults
-  to the v0.7.0 candidate and verifies signed release assets, archive
-  extraction, `doctor --format json`, `report --format json`, project registry
-  registration/list/show, machine-local database placement outside the repo,
-  `migrate local-state --dry-run`, provider compatibility, self-bootstrap
-  nested run-tree observability, already-latest upgrade behavior, and upgrade
-  from v0.6.1.
+- **Expanded v0.7.0 release smoke and CI gates** - the release workflow stages
+  a signed draft release, runs native smoke on Ubuntu, macOS, and Windows, keeps
+  failed candidates draft-only, and requires the `release-publication`
+  environment before publishing. `scripts/release-smoke.ps1` verifies signed
+  release assets, archive extraction, `doctor --format json`,
+  `report --format json`, project registry registration/list/show,
+  machine-local database placement outside the repo, `migrate local-state
+  --dry-run`, provider compatibility, self-bootstrap nested run-tree
+  observability, already-latest upgrade behavior, and upgrade from v0.6.1.
+
+### Changed
+
+- **Runtime state location** - new v0.7.0 records prefer machine-local storage
+  after registration, while repo-local `.loopcoder/` remains the compatibility
+  fallback during migration. The explicit `state push` boundary remains the
+  only publishing path for local run summaries.
+- **Doctor repair boundary** - `doctor --fix` can tighten Unix storage
+  permissions, migrate legacy reporter config keys, refresh conductor hook
+  commands, rewrite eligible local report keys, and prune cleanup-eligible
+  gitignored repo-local state. It does not delete or recreate the SQLite
+  database, install provider CLIs, run provider login, flush relay records,
+  choose models, commit, push, or mutate GitHub.
+- **Nested execution authority** - provider-native sub-agent features are not
+  treated as authoritative orchestration. The accepted child plan, permission
+  ceiling, scope validation, persistence, cancellation, timeout, resume, and
+  aggregation rules belong to loopcoder.
+- **Release process** - v0.7.0 assets are created as a draft release first;
+  publication is a separate human-gated environment step after staged smoke
+  passes. README install and upgrade examples remain on v0.6.1 until that gate
+  publishes the final signed release.
+- **README and usage command inventory** - stable v0.6.1 commands and
+  unreleased v0.7.0 preview commands are documented separately so users
+  following stable install instructions do not encounter unknown commands.
 
 ### Fixed
 
+- **Reporter output modes** - `dispatch`, `dispatch-wave`, `loopreview`,
+  `audit`, and `attest` now default to concise human receipts for merged-stream
+  host integrations; `--format json` emits JSON only, and `--verbose` is the
+  opt-in compatibility/debug path for canonical reporter records.
+- **Remote credential redaction** - project identity and diagnostics sanitize
+  git remotes before persistence or output, dropping URL userinfo, tokens,
+  credential-like query strings, fragments, and unsafe raw remote strings.
+- **Project identity stability on macOS** - path canonicalization accounts for
+  aliased temporary directories and physical paths so the same checkout does
+  not fragment into duplicate project identities.
+- **Nested scheduler reliability** - child run IDs remain unique, terminal
+  events are mirrored consistently, required skipped children propagate
+  correctly, and project list JSON remains stable for smoke automation.
 - **Release smoke already-latest assertion** - joined native command output
   before matching so multi-line PowerShell arrays no longer produce a false
   negative for a good already-latest upgrade.
@@ -43,6 +130,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Self-bootstrap build path** - `scripts/self-bootstrap-smoke.ps1 -Repo
   <path>` now builds `./cmd/loopcoder` from the supplied repo path instead of
   the caller's current working directory.
+
+### Security
+
+- **Machine-local database permission hardening** - Unix-like storage paths are
+  created and repaired as owner-only, SQLite sidecars inherit owner-only file
+  modes, and symlink/non-regular storage targets are refused before chmod or
+  open. Windows reports the current DACL-hardening limitation explicitly rather
+  than claiming POSIX-style protection.
+- **Credential-safe registry metadata** - remote URL credentials and
+  credential-like query material are removed before registry persistence,
+  project display output, doctor output, or migration diagnostics.
+
+### Deprecated
+
+- **Repo-local runtime state as the primary store** - `.loopcoder/` remains
+  readable and is not deleted, but v0.7.0 moves the authoritative local runtime
+  index for registered projects to `$LOOPCODER_HOME/data/loopcoder.db`.
+- **Raw reporter records in default text output** - default text output is now
+  the compact receipt. Use `--verbose` for local compatibility/debug inspection
+  of canonical headers and records, or `--format json` for machines.
+
+### Compatibility
+
+- v0.7.0 is a pre-release candidate until signed assets and the go/no-go report
+  exist. Stable install and upgrade examples must continue to target v0.6.1
+  before publication.
+- Existing repo-local `.loopcoder/` state remains readable during the
+  compatibility window. `migrate local-state` copies compatible records into
+  machine-local storage and leaves the source files in place.
+- SQLite storage is machine-local and not a cloud sync surface. Back up
+  `$LOOPCODER_HOME/data/loopcoder.db` plus `$LOOPCODER_HOME/projects/`,
+  `$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/` when present and no
+  loopcoder command is running.
+- `audit --format both` has been removed. `loopcoder audit` now accepts
+  `--format text` or `--format json`; use separate invocations when both human
+  and machine outputs are required.
+- Windows does not enforce owner-only DACL hardening for the v0.7.0 storage
+  directory. `doctor` reports that limitation and `doctor --fix` cannot repair
+  it in this version.
+
+### Upgrade
+
+After v0.7.0 is published, upgrade from v0.6.1 with
+`loopcoder upgrade --version 0.7.0`, run `loopcoder skill install --repo .`,
+register each checkout with `loopcoder projects register --repo .`, inspect
+`loopcoder migrate local-state --repo . --dry-run`, and run the non-dry-run
+migration only after reviewing the copied record set. Roll back by selecting a
+prior released binary such as v0.6.1 and keeping or backing up
+`$LOOPCODER_HOME`; do not delete repo-local `.loopcoder/` history unless the
+operator explicitly chooses to.
 
 ## [0.6.1] - 2026-07-08
 

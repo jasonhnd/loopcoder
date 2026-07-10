@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -629,13 +631,140 @@ func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
 	}
 	var removed struct {
 		Removed           bool `json:"removed"`
+		Detached          bool `json:"detached"`
+		ProjectDeleted    bool `json:"project_deleted"`
 		RunHistoryDeleted bool `json:"run_history_deleted"`
+		Preserved         struct {
+			Runs                int `json:"runs"`
+			RunEvents           int `json:"run_events"`
+			RunEdges            int `json:"run_edges"`
+			Reports             int `json:"reports"`
+			LegacyImportRecords int `json:"legacy_import_records"`
+			LegacyImportStatus  int `json:"legacy_import_status"`
+		} `json:"preserved"`
+		Deleted struct {
+			Runs                int `json:"runs"`
+			RunEvents           int `json:"run_events"`
+			RunEdges            int `json:"run_edges"`
+			Reports             int `json:"reports"`
+			LegacyImportRecords int `json:"legacy_import_records"`
+			LegacyImportStatus  int `json:"legacy_import_status"`
+		} `json:"deleted"`
 	}
 	if err := json.Unmarshal(removeOut.Bytes(), &removed); err != nil {
 		t.Fatalf("remove JSON: %v\n%s", err, removeOut.String())
 	}
-	if !removed.Removed || removed.RunHistoryDeleted {
-		t.Fatalf("removed = %#v, want removed without run history deletion", removed)
+	if !removed.Removed || !removed.Detached || removed.ProjectDeleted || removed.RunHistoryDeleted {
+		t.Fatalf("removed = %#v, want detached without history deletion", removed)
+	}
+	if removed.Deleted != (struct {
+		Runs                int `json:"runs"`
+		RunEvents           int `json:"run_events"`
+		RunEdges            int `json:"run_edges"`
+		Reports             int `json:"reports"`
+		LegacyImportRecords int `json:"legacy_import_records"`
+		LegacyImportStatus  int `json:"legacy_import_status"`
+	}{}) {
+		t.Fatalf("removed deleted counts = %#v, want zero", removed.Deleted)
+	}
+
+	var listAfterRemoveOut, listAfterRemoveErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "list", "--format", "json"}, &listAfterRemoveOut, &listAfterRemoveErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list after remove exit = %d stderr=%q", exitCode, listAfterRemoveErr.String())
+	}
+	var listAfterRemove struct {
+		Projects []struct {
+			ProjectID string `json:"project_id"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(listAfterRemoveOut.Bytes(), &listAfterRemove); err != nil {
+		t.Fatalf("list after remove JSON: %v\n%s", err, listAfterRemoveOut.String())
+	}
+	if len(listAfterRemove.Projects) != 0 {
+		t.Fatalf("list after remove = %#v, want no active projects", listAfterRemove)
+	}
+
+	var showAfterRemoveOut, showAfterRemoveErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &showAfterRemoveOut, &showAfterRemoveErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show after remove exit = %d stderr=%q", exitCode, showAfterRemoveErr.String())
+	}
+	var showAfterRemove struct {
+		Registered bool `json:"registered"`
+		Detached   bool `json:"detached"`
+		Project    struct {
+			ProjectID  string `json:"project_id"`
+			DetachedAt string `json:"detached_at"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(showAfterRemoveOut.Bytes(), &showAfterRemove); err != nil {
+		t.Fatalf("show after remove JSON: %v\n%s", err, showAfterRemoveOut.String())
+	}
+	if showAfterRemove.Registered || !showAfterRemove.Detached || showAfterRemove.Project.ProjectID != registered.Project.ProjectID || showAfterRemove.Project.DetachedAt == "" {
+		t.Fatalf("show after remove = %#v, want detached preserved project", showAfterRemove)
+	}
+
+	var reactivateOut, reactivateErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &reactivateOut, &reactivateErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("reactivate exit = %d stderr=%q", exitCode, reactivateErr.String())
+	}
+	var reactivated struct {
+		Updated     bool `json:"updated"`
+		Reactivated bool `json:"reactivated"`
+		Project     struct {
+			ProjectID  string `json:"project_id"`
+			DetachedAt string `json:"detached_at"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(reactivateOut.Bytes(), &reactivated); err != nil {
+		t.Fatalf("reactivate JSON: %v\n%s", err, reactivateOut.String())
+	}
+	if !reactivated.Updated || !reactivated.Reactivated || reactivated.Project.ProjectID != registered.Project.ProjectID || reactivated.Project.DetachedAt != "" {
+		t.Fatalf("reactivated = %#v, want same active project", reactivated)
+	}
+}
+
+func TestProjectsCommandNeverEmitsOrPersistsRemoteCredentialSentinel(t *testing.T) {
+	secret := "loopcoder-sentinel-secret-687"
+	remote := "https://alice:" + secret + "@github.com/owner/private.git?access_token=" + secret + "&X-Amz-Signature=" + secret + "#token=" + secret
+	repo := initProjectRegistryCLITestRepo(t, remote)
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+
+	var combined bytes.Buffer
+	runProjectsJSONForSecretTest := func(args ...string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := RunWithDeps(args, &stdout, &stderr, Deps{Now: fixedCLINow})
+		combined.Write(stdout.Bytes())
+		combined.Write(stderr.Bytes())
+		if exitCode != 0 {
+			t.Fatalf("%v exit = %d stderr=%q", args, exitCode, stderr.String())
+		}
+		if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) {
+			t.Fatalf("%v leaked secret\nstdout:\n%s\nstderr:\n%s", args, stdout.String(), stderr.String())
+		}
+	}
+
+	runProjectsJSONForSecretTest("projects", "register", "--repo", repo, "--format", "json")
+	runProjectsJSONForSecretTest("projects", "list", "--format", "json")
+	runProjectsJSONForSecretTest("projects", "show", "--repo", repo, "--format", "json")
+
+	dbText := readAllSQLiteText(t, filepath.Join(homeDir, "data", "loopcoder.db"))
+	if strings.Contains(dbText, secret) {
+		t.Fatalf("SQLite text fields leaked secret:\n%s", dbText)
+	}
+	if !strings.Contains(dbText, "https://github.com/owner/private") {
+		t.Fatalf("SQLite text fields missing sanitized remote:\n%s", dbText)
+	}
+
+	runProjectsJSONForSecretTest("projects", "remove", "--repo", repo, "--format", "json")
+	if strings.Contains(combined.String(), secret) {
+		t.Fatalf("combined command output leaked secret:\n%s", combined.String())
 	}
 }
 
@@ -1432,7 +1561,7 @@ func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
+	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--format", "--verbose", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -2016,6 +2145,7 @@ func TestAttestSuccessPaths(t *testing.T) {
 			name: "duration total tokens and forced trust markers",
 			args: []string{
 				"attest",
+				"--verbose",
 				"--provider", "codex-cli",
 				"--model", "gpt-5",
 				"--effort", "high",
@@ -2034,6 +2164,7 @@ func TestAttestSuccessPaths(t *testing.T) {
 			name: "timestamp pair split tokens and aliases",
 			args: []string{
 				"attest",
+				"--verbose",
 				"-Role", "conductor",
 				"-Provider", "claude-code",
 				"-Model", "opus",
@@ -2096,6 +2227,40 @@ func TestAttestSuccessPaths(t *testing.T) {
 				t.Fatalf("header line = %q, want %q", lines[1], record.Header())
 			}
 		})
+	}
+}
+
+func TestAttestJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{
+		"attest",
+		"--format", "json",
+		"--provider", "codex-cli",
+		"--model", "gpt-5",
+		"--action", "merge PR #214",
+		"--duration-ms", "72000",
+		"--total-tokens", "18266",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time {
+			return time.Date(2026, 6, 28, 0, 1, 12, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var record reporter.Report
+	assertSingleJSONValue(t, stdout.String(), &record)
+	if record.Role != reporter.RoleConductor || record.Provider != "codex-cli" {
+		t.Fatalf("report JSON = %#v", record)
+	}
+	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
+		if strings.Contains(stdout.String(), disallowed) {
+			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
+		}
 	}
 }
 
@@ -2252,6 +2417,7 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 
 	exitCode := RunWithDeps([]string{
 		"loopreview",
+		"--format", "json",
 		"-Repo", repo,
 		"-PrNumber", "152",
 		"-Provider", "claude",
@@ -2293,9 +2459,7 @@ func TestLoopreviewRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
-	}
+	assertSingleJSONValue(t, stdout.String(), &got)
 	if got["verdict"] != "pass" || got["spec_conformance"] != "pass" {
 		t.Fatalf("stdout JSON has wrong verdict fields: %#v", got)
 	}
@@ -2316,8 +2480,6 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 		},
 		ExitCode: 0,
 	}
-	wantStdout := expectedLoopreviewStdout(t, result)
-
 	exitCode := RunWithDeps([]string{
 		"loopreview",
 		"--repo", repo,
@@ -2334,10 +2496,11 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	gotStderr := stderr.String()
+	merged := stdout.String() + gotStderr
 	for _, want := range []string{
 		"loopcoder report: verifier pass",
 		"- verifier: Anthropic / claude / gpt-5.5 (high) (parsed) / high",
@@ -2346,6 +2509,11 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"[reporter]", `"verdict":"pass"`, `"role":"verifier"`} {
+		if strings.Contains(merged, disallowed) {
+			t.Fatalf("merged default output contains raw protocol marker %q:\n%s", disallowed, merged)
 		}
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0"} {
@@ -2432,8 +2600,6 @@ func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing
 		},
 		ExitCode: 0,
 	}
-	wantStdout := expectedLoopreviewStdout(t, result)
-
 	exitCode := RunWithDeps([]string{
 		"loopreview",
 		"--pretty",
@@ -2451,8 +2617,8 @@ func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
@@ -2482,8 +2648,6 @@ func TestLoopreviewNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
 		},
 		ExitCode: 0,
 	}
-	wantStdout := expectedLoopreviewStdout(t, result)
-
 	exitCode := RunWithDeps([]string{
 		"loopreview",
 		"--no-pretty",
@@ -2501,8 +2665,8 @@ func TestLoopreviewNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -2557,6 +2721,7 @@ func TestLoopreviewSurfacesNeedsHumanExitCode(t *testing.T) {
 
 	exitCode := RunWithDeps([]string{
 		"loopreview",
+		"--format", "json",
 		"--repo", repo,
 		"--pr-number", "152",
 		"--provider", "codex",
@@ -2588,6 +2753,35 @@ func TestLoopreviewSurfacesNeedsHumanExitCode(t *testing.T) {
 	}
 }
 
+func TestLoopreviewNeedsHumanReasonUsesWarningBeforePositiveEvidence(t *testing.T) {
+	record := validLoopreviewReport()
+	verdict := loopreview.Verdict{
+		Verdict: loopreview.VerdictNeedsHuman,
+		Findings: []loopreview.Finding{
+			{
+				Severity: "warning",
+				File:     "docs/specs/merged-design.md",
+				Note:     "merged design/spec unavailable: origin/main does not contain the referenced file",
+			},
+		},
+		Evidence:        "All five acceptance criteria satisfied and no regressions were found.",
+		SpecConformance: loopreview.SpecConformanceNotApplicable,
+		Report:          &record,
+	}
+
+	got := loopreviewPrettyBlock(verdict, reporter.PrettyModePlain)
+	wantReason := "- reason: docs/specs/merged-design.md: merged design/spec unavailable: origin/main does not contain the referenced file"
+	if !strings.Contains(got, wantReason) {
+		t.Fatalf("pretty block missing warning reason %q:\n%s", wantReason, got)
+	}
+	if strings.Contains(got, "- reason: All five acceptance criteria satisfied") {
+		t.Fatalf("pretty block used positive evidence as needs-human reason:\n%s", got)
+	}
+	if !strings.Contains(got, "- human should decide whether the reported uncertainty is acceptable for this PR") {
+		t.Fatalf("pretty block missing next action:\n%s", got)
+	}
+}
+
 func TestLoopreviewReturnsCleanVerdictExitCodes(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -2606,6 +2800,7 @@ func TestLoopreviewReturnsCleanVerdictExitCodes(t *testing.T) {
 
 			exitCode := RunWithDeps([]string{
 				"loopreview",
+				"--format", "json",
 				"--repo", repo,
 				"--pr-number", "152",
 				"--provider", "codex",
@@ -3853,6 +4048,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--verbose",
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
@@ -3963,13 +4159,278 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	}
 }
 
+func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var got worker.Result
+	assertSingleJSONValue(t, stdout.String(), &got)
+	if !got.OK || got.Status != "succeeded" || got.Report == nil {
+		t.Fatalf("dispatch JSON = %#v", got)
+	}
+	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
+		if strings.Contains(stdout.String(), disallowed) {
+			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
+		}
+	}
+}
+
+func TestNestedRunDispatchesThreeChildrenConcurrentlyAndHonorsDependencies(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+		nestedPlanItem("beta", 702, nil, true, "write", nil),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
+	}, 2)
+
+	startedAlpha := make(chan struct{})
+	startedBeta := make(chan struct{})
+	var onceAlpha sync.Once
+	var onceBeta sync.Once
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+	completed := map[string]bool{}
+	var calls []worker.Options
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", "claude",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
+			key := strings.ToLower(strings.TrimSpace(opts.IssueTitle))
+			mu.Lock()
+			calls = append(calls, opts)
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			if key == "gamma" && !completed["alpha"] {
+				mu.Unlock()
+				return worker.Result{}, errors.New("dependent child gamma started before alpha completed")
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				active--
+				mu.Unlock()
+			}()
+
+			switch key {
+			case "alpha":
+				onceAlpha.Do(func() { close(startedAlpha) })
+				select {
+				case <-startedBeta:
+				case <-ctx.Done():
+					return worker.Result{}, ctx.Err()
+				case <-time.After(2 * time.Second):
+					return worker.Result{}, errors.New("beta did not start concurrently with alpha")
+				}
+			case "beta":
+				onceBeta.Do(func() { close(startedBeta) })
+				select {
+				case <-startedAlpha:
+				case <-ctx.Done():
+					return worker.Result{}, ctx.Err()
+				case <-time.After(2 * time.Second):
+					return worker.Result{}, errors.New("alpha did not start concurrently with beta")
+				}
+			}
+
+			mu.Lock()
+			completed[key] = true
+			mu.Unlock()
+			record := validDispatchReport()
+			record.Provider = opts.Provider
+			record.WorkID = opts.RunID
+			record.Issue = opts.IssueNumber
+			record.Action = "nested child " + key
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/" + strconv.Itoa(opts.IssueNumber),
+				Summary:     "nested " + key,
+				AttemptPath: filepath.Join(repo, ".loopcoder", "runs", opts.RunID, "workers", "job.attempt.json"),
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    1,
+				Report:      &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	if report.Status != orchestration.NestedStatusSucceeded || len(report.Children) != 3 {
+		t.Fatalf("nested report = %#v", report)
+	}
+	if maxActive < 2 {
+		t.Fatalf("max concurrent dispatches = %d, want at least 2", maxActive)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("dispatch calls = %d, want 3", len(calls))
+	}
+	for _, call := range calls {
+		if call.Provider != "claude" {
+			t.Fatalf("nested dispatch provider = %q, want claude", call.Provider)
+		}
+		if call.RunID == "" || !strings.Contains(call.Branch, strings.ToLower(call.IssueTitle)) {
+			t.Fatalf("nested dispatch did not propagate run/branch context: %#v", call)
+		}
+	}
+}
+
+func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+	}, 1)
+
+	var got worker.Options
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			got = opts
+			record := validDispatchReport()
+			record.Provider = opts.Provider
+			record.WorkID = opts.RunID
+			record.Issue = opts.IssueNumber
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				Summary:     "nested alpha",
+				AttemptPath: filepath.Join(repo, ".loopcoder", "runs", opts.RunID, "workers", "job.attempt.json"),
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    1,
+				Report:      &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if got.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", got.Provider)
+	}
+}
+
+func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("admin", 701, nil, true, "orchestrate", nil),
+	}, 1)
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--parent-permission", "write",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if called {
+		t.Fatal("dispatch was called despite permission escalation")
+	}
+	if !strings.Contains(stderr.String(), "exceeds parent permission") {
+		t.Fatalf("stderr missing permission diagnostic: %q", stderr.String())
+	}
+}
+
+func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
+		nestedPlanItem("beta", 702, nil, true, "read-only", []string{"go env GOARCH"}),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, false, "read-only", []string{"go env GOVERSION"}),
+	}, 2)
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", nestedTestSubprocessProvider,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	if report.Status != orchestration.NestedStatusSucceeded || len(report.Children) != 3 {
+		t.Fatalf("nested subprocess report = %#v", report)
+	}
+	attempts, err := state.LoadAttempts(repo, report.Children[0].RunID)
+	if err != nil {
+		t.Fatalf("LoadAttempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
+		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
+	}
+}
+
 func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
 	record := validDispatchReport()
 	result := validDispatchResult(record)
-	wantStdout := expectedDispatchStdout(t, result)
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
@@ -3987,10 +4448,11 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	gotStderr := stderr.String()
+	merged := stdout.String() + gotStderr
 	for _, want := range []string{
 		"loopcoder report: worker succeeded",
 		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
@@ -3998,6 +4460,11 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
+		}
+	}
+	for _, disallowed := range []string{"[reporter]", `"role":"worker"`, `"ok":true`} {
+		if strings.Contains(merged, disallowed) {
+			t.Fatalf("merged default output contains raw protocol marker %q:\n%s", disallowed, merged)
 		}
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0"} {
@@ -4079,8 +4546,6 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 		LogBytes:    12,
 		Report:      &record,
 	}
-	wantStdout := expectedDispatchStdout(t, result)
-
 	exitCode := RunWithDeps([]string{
 		"dispatch",
 		"--repo", repo,
@@ -4097,8 +4562,8 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	for _, want := range []string{
 		"\u2705 loopcoder report: worker succeeded",
@@ -4131,8 +4596,6 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 		LogBytes:    12,
 		Report:      &record,
 	}
-	wantStdout := expectedDispatchStdout(t, result)
-
 	exitCode := RunWithDeps([]string{
 		"dispatch",
 		"--repo", repo,
@@ -4149,8 +4612,8 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	for _, want := range []string{
 		"\u2705 loopcoder report: worker succeeded",
@@ -4215,7 +4678,6 @@ func TestDispatchNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
 	result := validDispatchResult(record)
-	wantStdout := expectedDispatchStdout(t, result)
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
@@ -4234,8 +4696,8 @@ func TestDispatchNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -4250,7 +4712,6 @@ func TestDispatchNoPrettyEnvSuppressesStderrWithoutChangingStdout(t *testing.T) 
 	repo := t.TempDir()
 	record := validDispatchReport()
 	result := validDispatchResult(record)
-	wantStdout := expectedDispatchStdout(t, result)
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
@@ -4268,8 +4729,8 @@ func TestDispatchNoPrettyEnvSuppressesStderrWithoutChangingStdout(t *testing.T) 
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -4282,7 +4743,6 @@ func TestDispatchNoPrettyFlagBeatsPrettyFlag(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
 	result := validDispatchResult(record)
-	wantStdout := expectedDispatchStdout(t, result)
 
 	exitCode := RunWithDeps([]string{
 		"dispatch",
@@ -4302,8 +4762,8 @@ func TestDispatchNoPrettyFlagBeatsPrettyFlag(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if stdout.String() != wantStdout {
-		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
@@ -4580,6 +5040,66 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	for _, want := range []string{"DISPATCH WAVE", "RunId: run-test-wave", "- #201 succeeded", "Verify successful PRs"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestDispatchWaveJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--format", "json",
+		"--repo", repo,
+		"--from-ready-set",
+		"--run-id", "run-test-wave",
+	}, &stdout, &stderr, Deps{
+		Stdin: strings.NewReader(`{"ready":[{"issue":201,"title":"Wave","reason":"ready"}]}`),
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				views: map[int]gh.Issue{
+					201: {Number: 201, Title: "Wave", Body: "Body"},
+				},
+			}
+		},
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			return report.ReadySetReport{
+				Repo:       "owner/repo",
+				BaseBranch: "main",
+				Ready: []report.ReadyIssue{{
+					Issue:  201,
+					Title:  "Wave",
+					Reason: "ready",
+				}},
+			}, nil
+		},
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      "loop/issue-201",
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/201",
+				AttemptPath: "/repo/.loopcoder/runs/run-test-wave/workers/job-201.attempt.json",
+				Status:      "succeeded",
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var got orchestration.DispatchWaveReport
+	assertSingleJSONValue(t, stdout.String(), &got)
+	if got.RunID != "run-test-wave" || len(got.Results) != 1 || got.Results[0].Status != orchestration.DispatchWaveStatusSucceeded {
+		t.Fatalf("dispatch-wave JSON = %#v", got)
+	}
+	for _, disallowed := range []string{"DISPATCH WAVE", "loopcoder report:", "[reporter]"} {
+		if strings.Contains(stdout.String(), disallowed) {
+			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
 		}
 	}
 }
@@ -5029,31 +5549,6 @@ func clearPrettyEnv(t *testing.T) {
 	}
 }
 
-func expectedDispatchStdout(t *testing.T, result worker.Result) string {
-	t.Helper()
-	if result.Report == nil {
-		t.Fatal("expected dispatch result report")
-	}
-	canonical, err := result.Report.CanonicalJSON()
-	if err != nil {
-		t.Fatalf("CanonicalJSON returned error: %v", err)
-	}
-	data, err := worker.MarshalResult(result)
-	if err != nil {
-		t.Fatalf("MarshalResult returned error: %v", err)
-	}
-	return result.Report.Header() + "\n" + string(canonical) + "\n" + string(data) + "\n"
-}
-
-func expectedLoopreviewStdout(t *testing.T, result loopreview.Result) string {
-	t.Helper()
-	data, err := json.Marshal(result.Verdict)
-	if err != nil {
-		t.Fatalf("Marshal verdict returned error: %v", err)
-	}
-	return string(data) + "\n"
-}
-
 func assertOptionalInt64(t *testing.T, name string, got, want *int64) {
 	t.Helper()
 	if got == nil || want == nil {
@@ -5076,6 +5571,18 @@ func nonEmptyLines(output string) []string {
 		}
 	}
 	return lines
+}
+
+func assertSingleJSONValue(t *testing.T, output string, target any) {
+	t.Helper()
+	decoder := json.NewDecoder(strings.NewReader(output))
+	if err := decoder.Decode(target); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, output)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("stdout has prefix/suffix or multiple JSON values: %v\n%s", err, output)
+	}
 }
 
 func readSingleFile(t *testing.T, pattern string) string {
@@ -5106,6 +5613,51 @@ func readRepoFile(t *testing.T, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(data)
+}
+
+func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.ChildRunPlan, maxConcurrency int) string {
+	t.Helper()
+	for i := range items {
+		items[i].RunID = state.RunIDForChild(items[i].ChildKey, i, fixedCLINow())
+		items[i].Ordinal = i
+	}
+	plan := orchestration.ChildPlan{
+		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260102T030405Z-wave",
+		ParentRunID:    state.RunIDForWave(fixedCLINow()),
+		RootRunID:      state.RunIDForWave(fixedCLINow()),
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: maxConcurrency,
+		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
+		Items:          items,
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal child plan: %v", err)
+	}
+	path := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write child plan: %v", err)
+	}
+	return path
+}
+
+func nestedPlanItem(key string, issue int, dependsOn []string, required bool, permission string, commands []string) orchestration.ChildRunPlan {
+	return orchestration.ChildRunPlan{
+		ChildKey:   key,
+		Title:      key,
+		Role:       string(reporter.RoleWorker),
+		Issue:      issue,
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{"internal/cli/nested.go"}, Issues: []int{issue}, Commands: commands},
+		Permission: permission,
+		DependsOn:  append([]string(nil), dependsOn...),
+		Aggregation: orchestration.ChildAggregation{
+			Mode:          orchestration.ChildAggregationCollect,
+			Required:      required,
+			IncludeReport: true,
+		},
+	}
 }
 
 func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {
@@ -5166,6 +5718,88 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(cmdArgs, " "), err, string(output))
 	}
+}
+
+func readAllSQLiteText(t *testing.T, dbPath string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	tables, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query sqlite tables: %v", err)
+	}
+	defer tables.Close()
+	var out strings.Builder
+	for tables.Next() {
+		var table string
+		if err := tables.Scan(&table); err != nil {
+			t.Fatalf("scan table: %v", err)
+		}
+		columns := sqliteTextColumns(t, db, table)
+		for _, column := range columns {
+			rows, err := db.Query(`SELECT ` + quoteSQLiteIdentifier(column) + ` FROM ` + quoteSQLiteIdentifier(table))
+			if err != nil {
+				t.Fatalf("query %s.%s: %v", table, column, err)
+			}
+			for rows.Next() {
+				var value sql.NullString
+				if err := rows.Scan(&value); err != nil {
+					rows.Close()
+					t.Fatalf("scan %s.%s: %v", table, column, err)
+				}
+				if value.Valid {
+					out.WriteString(table)
+					out.WriteByte('.')
+					out.WriteString(column)
+					out.WriteByte('=')
+					out.WriteString(value.String)
+					out.WriteByte('\n')
+				}
+			}
+			if err := rows.Close(); err != nil {
+				t.Fatalf("close %s.%s rows: %v", table, column, err)
+			}
+		}
+	}
+	if err := tables.Err(); err != nil {
+		t.Fatalf("iterate sqlite tables: %v", err)
+	}
+	return out.String()
+}
+
+func sqliteTextColumns(t *testing.T, db *sql.DB, table string) []string {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + quoteSQLiteIdentifier(table) + `)`)
+	if err != nil {
+		t.Fatalf("pragma table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		if strings.Contains(strings.ToUpper(typ), "TEXT") {
+			columns = append(columns, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
+	return columns
+}
+
+func quoteSQLiteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func cliPendingPrettyBlock(role string) string {

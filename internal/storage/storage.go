@@ -9,15 +9,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/gitremote"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 
 	_ "modernc.org/sqlite"
 )
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 3
+	CurrentSchemaVersion = 7
 
 	driverName = "sqlite"
 )
@@ -151,7 +155,7 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_reports_source_hash ON reports(source_hash)`,
 			`CREATE TABLE IF NOT EXISTS legacy_import_records (
 				id TEXT PRIMARY KEY,
-				project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				project_id TEXT NOT NULL REFERENCES projects(id),
 				run_id TEXT,
 				record_type TEXT NOT NULL,
 				source_path TEXT NOT NULL,
@@ -163,7 +167,7 @@ var migrations = []migration{
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
 			`CREATE INDEX IF NOT EXISTS idx_legacy_import_records_project ON legacy_import_records(project_id)`,
 			`CREATE TABLE IF NOT EXISTS legacy_import_status (
-				project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+				project_id TEXT PRIMARY KEY REFERENCES projects(id),
 				repo_path TEXT NOT NULL,
 				started_at TEXT NOT NULL,
 				completed_at TEXT NOT NULL,
@@ -176,14 +180,74 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: 4,
+		name:    "scrub project remote urls",
+		apply:   scrubProjectRemoteURLs,
+	},
+	{
+		version: 5,
+		name:    "preserve project history on registry removal",
+		statements: []string{
+			`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
+		},
+		apply: rebuildLegacyImportTablesWithoutCascade,
+	},
+	{
+		version: 6,
+		name:    "reconcile physical project identities",
+		apply:   reconcilePhysicalProjectIdentities,
+	},
+	{
+		version: 7,
+		name:    "nested child plans and durable run graph",
+		statements: []string{
+			`ALTER TABLE runs ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE runs ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE runs ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
+			`UPDATE runs SET root_run_id = CASE WHEN parent_run_id IS NULL OR parent_run_id = '' THEN id ELSE parent_run_id END WHERE root_run_id = ''`,
+			`UPDATE runs SET created_at = COALESCE(NULLIF(started_at, ''), updated_at) WHERE created_at = ''`,
+			`CREATE INDEX IF NOT EXISTS idx_runs_root_run_id ON runs(root_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_runs_depth ON runs(depth)`,
+			`CREATE TABLE IF NOT EXISTS child_plans (
+				plan_id TEXT PRIMARY KEY,
+				parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				root_run_id TEXT NOT NULL,
+				schema_version TEXT NOT NULL,
+				max_depth INTEGER NOT NULL,
+				max_concurrency INTEGER NOT NULL,
+				plan_json TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_child_plans_parent_run_id ON child_plans(parent_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_child_plans_root_run_id ON child_plans(root_run_id)`,
+			`ALTER TABLE run_edges ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN child_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE run_edges ADD COLUMN ordinal INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE run_edges ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN permission TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN aggregation_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN status TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+			`UPDATE run_edges SET updated_at = created_at WHERE updated_at = ''`,
+			`CREATE INDEX IF NOT EXISTS idx_run_edges_root_run_id ON run_edges(root_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_edges_plan_id ON run_edges(plan_id)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_plan_child_key ON run_edges(plan_id, child_key) WHERE plan_id <> '' AND child_key <> ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
+		},
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "legacy_import_records", "legacy_import_status"}
 
 type migration struct {
 	version    int
 	name       string
 	statements []string
+	apply      func(context.Context, *sql.Tx) error
 }
 
 // Open opens or creates the SQLite-backed store and applies supported migrations.
@@ -196,22 +260,34 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, errors.New("open storage: path is required")
 	}
 	path = filepath.Clean(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("open storage: create data directory: %w", err)
-	}
 
-	db, err := sql.Open(driverName, path)
+	var store *sqliteStore
+	err := withOwnerOnlyUmask(func() error {
+		if err := ensurePermissionsForOpen(path); err != nil {
+			return fmt.Errorf("open storage: secure permissions for %s: %w", path, err)
+		}
+		db, err := sql.Open(driverName, path)
+		if err != nil {
+			return fmt.Errorf("open storage %s: %w", path, err)
+		}
+		db.SetMaxOpenConns(1)
+		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
+		if err := opened.configure(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := opened.migrate(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := hardenSQLiteSidecars(path); err != nil {
+			_ = db.Close()
+			return fmt.Errorf("open storage: secure sqlite sidecars for %s: %w", path, err)
+		}
+		store = opened
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("open storage %s: %w", path, err)
-	}
-	db.SetMaxOpenConns(1)
-	store := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
-	if err := store.configure(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := store.migrate(ctx); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
@@ -235,6 +311,13 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 		return health, fmt.Errorf("storage health: inspect %s: %w", path, err)
 	}
 	health.Exists = true
+	permissions, err := CheckPermissions(path)
+	if err != nil {
+		return health, fmt.Errorf("storage health: inspect permissions for %s: %w", path, err)
+	}
+	if unsafe := firstUnsafePermissionItem(permissions); unsafe != nil {
+		return health, fmt.Errorf("storage health: unsafe storage path %s: %s", unsafe.Path, unsafe.Message)
+	}
 
 	db, err := sql.Open(driverName, path)
 	if err != nil {
@@ -361,6 +444,11 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
 			}
 		}
+		if migration.apply != nil {
+			if err := migration.apply(ctx, tx); err != nil {
+				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO migrations(version, name, applied_at) VALUES (?, ?, ?)`,
 			migration.version, migration.name, formatTimestamp(s.now())); err != nil {
 			return fmt.Errorf("record storage migration %d: %w", migration.version, err)
@@ -375,6 +463,228 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 	return nil
 }
 
+func scrubProjectRemoteURLs(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, remote_url, remote_url_normalized FROM projects`)
+	if err != nil {
+		return err
+	}
+	type projectRemote struct {
+		id         string
+		display    string
+		normalized string
+	}
+	var updates []projectRemote
+	for rows.Next() {
+		var current projectRemote
+		if err := rows.Scan(&current.id, &current.display, &current.normalized); err != nil {
+			rows.Close()
+			return err
+		}
+		nextDisplay, _ := gitremote.SanitizeDisplayURL(current.display)
+		nextNormalized, _, _, normalizedOK := gitremote.NormalizeURL(current.normalized)
+		if !normalizedOK {
+			nextNormalized, _, _, normalizedOK = gitremote.NormalizeURL(nextDisplay)
+		}
+		if !normalizedOK {
+			nextNormalized = ""
+		}
+		if current.display != nextDisplay || current.normalized != nextNormalized {
+			updates = append(updates, projectRemote{
+				id:         current.id,
+				display:    nextDisplay,
+				normalized: nextNormalized,
+			})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET remote_url = ?, remote_url_normalized = ? WHERE id = ?`, update.display, update.normalized, update.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rebuildLegacyImportTablesWithoutCascade(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range []string{
+		`CREATE TABLE legacy_import_records_v5 (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL REFERENCES projects(id),
+			run_id TEXT,
+			record_type TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			source_line INTEGER NOT NULL DEFAULT 0,
+			source_hash TEXT NOT NULL,
+			payload_json TEXT NOT NULL DEFAULT '{}',
+			imported_at TEXT NOT NULL
+		)`,
+		`INSERT INTO legacy_import_records_v5(id, project_id, run_id, record_type, source_path, source_line, source_hash, payload_json, imported_at)
+			SELECT id, project_id, run_id, record_type, source_path, source_line, source_hash, payload_json, imported_at FROM legacy_import_records`,
+		`DROP TABLE legacy_import_records`,
+		`ALTER TABLE legacy_import_records_v5 RENAME TO legacy_import_records`,
+		`CREATE UNIQUE INDEX idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
+		`CREATE INDEX idx_legacy_import_records_project ON legacy_import_records(project_id)`,
+		`CREATE TABLE legacy_import_status_v5 (
+			project_id TEXT PRIMARY KEY REFERENCES projects(id),
+			repo_path TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			completed_at TEXT NOT NULL,
+			status TEXT NOT NULL,
+			scanned_count INTEGER NOT NULL DEFAULT 0,
+			imported_count INTEGER NOT NULL DEFAULT 0,
+			skipped_count INTEGER NOT NULL DEFAULT 0,
+			malformed_count INTEGER NOT NULL DEFAULT 0,
+			message TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO legacy_import_status_v5(project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count, skipped_count, malformed_count, message)
+			SELECT project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count, skipped_count, malformed_count, message FROM legacy_import_status`,
+		`DROP TABLE legacy_import_status`,
+		`ALTER TABLE legacy_import_status_v5 RENAME TO legacy_import_status`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type storedProjectIdentity struct {
+	id         string
+	canonical  string
+	localPath  string
+	gitRoot    string
+	createdAt  string
+	detachedAt string
+}
+
+func reconcilePhysicalProjectIdentities(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, local_path_canonical, local_path, git_root, created_at, detached_at FROM projects ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var projects []storedProjectIdentity
+	for rows.Next() {
+		var project storedProjectIdentity
+		if err := rows.Scan(&project.id, &project.canonical, &project.localPath, &project.gitRoot, &project.createdAt, &project.detachedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		physical := physicalProjectCanonical(firstNonEmpty(project.gitRoot, project.canonical, project.localPath))
+		if physical != "" {
+			project.canonical = physical
+			projects = append(projects, project)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	byCanonical := map[string][]storedProjectIdentity{}
+	for _, project := range projects {
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET local_path_canonical = ? WHERE id = ?`, project.canonical, project.id); err != nil {
+			return err
+		}
+		byCanonical[project.canonical] = append(byCanonical[project.canonical], project)
+	}
+	for canonical, group := range byCanonical {
+		if len(group) < 2 {
+			continue
+		}
+		sortStoredProjects(group)
+		survivor := group[0]
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET local_path_canonical = ?, detached_at = '' WHERE id = ?`, canonical, survivor.id); err != nil {
+			return err
+		}
+		for _, duplicate := range group[1:] {
+			if err := mergeStoredProjectHistory(ctx, tx, duplicate.id, survivor.id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func physicalProjectCanonical(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	identity, err := pathid.Identity(path)
+	if err != nil {
+		clean := filepath.Clean(path)
+		if abs, absErr := filepath.Abs(clean); absErr == nil {
+			clean = filepath.Clean(abs)
+		}
+		return clean
+	}
+	return identity
+}
+
+func sortStoredProjects(projects []storedProjectIdentity) {
+	sort.Slice(projects, func(i, j int) bool {
+		leftDetached := strings.TrimSpace(projects[i].detachedAt) != ""
+		rightDetached := strings.TrimSpace(projects[j].detachedAt) != ""
+		if leftDetached != rightDetached {
+			return !leftDetached
+		}
+		if projects[i].createdAt != projects[j].createdAt {
+			return projects[i].createdAt < projects[j].createdAt
+		}
+		return projects[i].id < projects[j].id
+	})
+}
+
+func mergeStoredProjectHistory(ctx context.Context, tx *sql.Tx, fromID, toID string) error {
+	if fromID == toID {
+		return nil
+	}
+	for _, statement := range []string{
+		`UPDATE runs SET project_id = ? WHERE project_id = ?`,
+		`UPDATE reports SET project_id = ? WHERE project_id = ?`,
+		`UPDATE OR IGNORE legacy_import_records SET project_id = ? WHERE project_id = ?`,
+		`DELETE FROM legacy_import_records WHERE project_id = ?`,
+	} {
+		args := []any{toID, fromID}
+		if strings.HasPrefix(statement, `DELETE`) {
+			args = []any{fromID}
+		}
+		if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+			return err
+		}
+	}
+	if err := mergeStoredLegacyImportStatus(ctx, tx, fromID, toID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, fromID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func mergeStoredLegacyImportStatus(ctx context.Context, tx *sql.Tx, fromID, toID string) error {
+	var survivorCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`, toID).Scan(&survivorCount); err != nil {
+		return err
+	}
+	if survivorCount == 0 {
+		_, err := tx.ExecContext(ctx, `UPDATE legacy_import_status SET project_id = ? WHERE project_id = ?`, toID, fromID)
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE legacy_import_status SET
+		scanned_count = scanned_count + COALESCE((SELECT scanned_count FROM legacy_import_status WHERE project_id = ?), 0),
+		imported_count = imported_count + COALESCE((SELECT imported_count FROM legacy_import_status WHERE project_id = ?), 0),
+		skipped_count = skipped_count + COALESCE((SELECT skipped_count FROM legacy_import_status WHERE project_id = ?), 0),
+		malformed_count = malformed_count + COALESCE((SELECT malformed_count FROM legacy_import_status WHERE project_id = ?), 0),
+		message = CASE WHEN message = '' THEN 'reconciled duplicate physical project identity' ELSE message || '; reconciled duplicate physical project identity' END
+		WHERE project_id = ?`, fromID, fromID, fromID, fromID, toID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM legacy_import_status WHERE project_id = ?`, fromID)
+	return err
+}
+
 func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 	var exists int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migrations'`).Scan(&exists); err != nil {
@@ -384,6 +694,15 @@ func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 		return 0, nil
 	}
 	return querySchemaVersion(ctx, db)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func txSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
@@ -428,6 +747,15 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 
 func unsupportedVersionError(version int) error {
 	return fmt.Errorf("unsupported storage schema version %d; selected loopcoder supports schema version %d", version, CurrentSchemaVersion)
+}
+
+func firstUnsafePermissionItem(report PermissionReport) *PermissionItem {
+	for i := range report.Items {
+		if report.Items[i].Unsafe {
+			return &report.Items[i]
+		}
+	}
+	return nil
 }
 
 func normalizeNow(now func() time.Time) func() time.Time {

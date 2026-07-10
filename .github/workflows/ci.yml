@@ -10,6 +10,12 @@ defaults:
   run:
     shell: bash
 
+env:
+  GO_VERSION: '1.26.5'
+  STATICCHECK_VERSION: 'v0.7.0'
+  GOVULNCHECK_VERSION: 'v1.6.0'
+  GOSEC_VERSION: 'v2.27.1'
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -112,8 +118,8 @@ jobs:
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
-          check-latest: true
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
           cache: true
 
       - name: Go build
@@ -122,11 +128,42 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+      - name: Markdown internal links
+        run: go test . -run TestMarkdownInternalLinks -count=1
+
       - name: Go test
         run: go test ./...
 
       - name: Go test (race detector)
         run: go test -race ./...
+
+  native:
+    name: native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Native Go environment
+        run: |
+          go version
+          go env GOVERSION GOOS GOARCH
+
+      - name: Native Go test
+        run: go test ./...
 
   staticcheck:
     runs-on: ubuntu-latest
@@ -135,12 +172,14 @@ jobs:
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
-          check-latest: true
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
           cache: true
 
       - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: |
+          echo "staticcheck ${STATICCHECK_VERSION}"
+          go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
 
   govulncheck:
     runs-on: ubuntu-latest
@@ -149,12 +188,14 @@ jobs:
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
-          check-latest: true
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
           cache: true
 
       - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: |
+          echo "govulncheck ${GOVULNCHECK_VERSION}"
+          go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
 
   audit:
     runs-on: ubuntu-latest
@@ -163,17 +204,20 @@ jobs:
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
-          check-latest: true
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
           cache: true
 
       - name: Install audit tools
         run: |
           set -euo pipefail
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          echo "govulncheck ${GOVULNCHECK_VERSION}"
+          go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
+          echo "staticcheck ${STATICCHECK_VERSION}"
+          go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}
+          echo "gosec ${GOSEC_VERSION}"
+          go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}
 
       - name: Build loopcoder
         run: go build -o ./bin/loopcoder ./cmd/loopcoder

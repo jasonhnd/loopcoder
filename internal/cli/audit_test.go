@@ -50,7 +50,7 @@ func TestAuditLLMRelayWriteFailureReturnsNeedsHuman(t *testing.T) {
 	}
 }
 
-func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
+func TestAuditLLMJSONModeWritesRelayWithoutPrettyNoise(t *testing.T) {
 	repo := t.TempDir()
 	writeCLIAuditConfig(t, repo)
 	record := validCLIAuditReport()
@@ -73,11 +73,16 @@ func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stdout=%s stderr=%s", exitCode, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "loopcoder report: verifier succeeded") {
-		t.Fatalf("stderr missing pretty report:\n%s", stderr.String())
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty JSON mode stderr", stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {
 		t.Fatalf("audit JSON serialized local-only report:\n%s", stdout.String())
+	}
+	var got map[string]any
+	assertSingleJSONValue(t, stdout.String(), &got)
+	if got["verdict"] != "clean" {
+		t.Fatalf("stdout JSON verdict = %#v, want clean", got["verdict"])
 	}
 	if _, err := os.Stat(filepath.Join(repo, ".loopcoder", "relay")); err != nil {
 		t.Fatalf("relay state was not written locally: %v", err)

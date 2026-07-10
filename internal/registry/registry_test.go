@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +106,84 @@ func TestRegisterIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRegisterSanitizesRemoteURLBeforePersistence(t *testing.T) {
+	ctx := context.Background()
+	secret := "loopcoder-sentinel-secret-687"
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, dbPath := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://alice:" + secret + "@github.com/Owner/Repo.git?access_token=" + secret + "#token=" + secret + "\n",
+	})
+
+	result, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if result.Project.RemoteURL != "https://github.com/Owner/Repo" || result.Project.RemoteURLNormalized != "https://github.com/Owner/Repo" {
+		t.Fatalf("project remote urls = %q %q, want sanitized display and normalized", result.Project.RemoteURL, result.Project.RemoteURLNormalized)
+	}
+	if strings.Contains(result.Project.RemoteURL, secret) || strings.Contains(result.Project.RemoteURLNormalized, secret) {
+		t.Fatalf("project contains secret: %#v", result.Project)
+	}
+
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	var remoteURL, normalized string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT remote_url, remote_url_normalized FROM projects WHERE id = ?`, result.Project.ProjectID).Scan(&remoteURL, &normalized)
+	}); err != nil {
+		t.Fatalf("query project remote urls: %v", err)
+	}
+	if remoteURL != "https://github.com/Owner/Repo" || normalized != "https://github.com/Owner/Repo" {
+		t.Fatalf("stored remote urls = %q %q, want sanitized", remoteURL, normalized)
+	}
+}
+
+func TestCredentialRotationKeepsNormalizedIdentityStable(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, dbPath := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://alice:first-token@github.com/Owner/Repo.git\n",
+	})
+
+	first, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	deps.git["remote\x00get-url\x00origin"] = "https://alice:second-token@github.com/Owner/Repo.git\n"
+	second, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register second: %v", err)
+	}
+	if first.Project.ProjectID != second.Project.ProjectID || !second.Updated {
+		t.Fatalf("identity changed across credential rotation: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestResolveMalformedRemoteFailsClosedForDisplay(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, _ := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://github.com/Owner/%zz.git\n",
+	})
+
+	project, err := Resolve(ctx, Options{RepoPath: repo}, deps.deps())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if project.RemoteURL != "" || project.RemoteURLNormalized != "" || project.IdentitySource != IdentityLocalPath {
+		t.Fatalf("project = %#v, want malformed remote omitted and local-path identity", project)
+	}
+}
+
 func TestSameFolderNameDifferentRemotesRemainDistinct(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -173,7 +252,7 @@ func TestShowWorksWhenUnregistered(t *testing.T) {
 	}
 }
 
-func TestRemoveLeavesRunHistory(t *testing.T) {
+func TestRemoveDetachesProjectAndPreservesHistory(t *testing.T) {
 	ctx := context.Background()
 	repo := filepath.Join(t.TempDir(), "repo")
 	makeDir(t, repo)
@@ -190,11 +269,27 @@ func TestRemoveLeavesRunHistory(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `INSERT INTO runs(id, project_id, status, updated_at) VALUES (?, ?, ?, ?)`, "run-1", registered.Project.ProjectID, "done", "2026-01-01T00:00:00Z")
-		return err
+		statements := []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run-1', ?, 'done', '2026-01-01T00:00:00Z')`, []any{registered.Project.ProjectID}},
+			{`INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run-2', ?, 'done', '2026-01-01T00:00:00Z')`, []any{registered.Project.ProjectID}},
+			{`INSERT INTO run_events(id, run_id, sequence, ts, event_type) VALUES ('event-1', 'run-1', 1, '2026-01-01T00:00:00Z', 'started')`, nil},
+			{`INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at) VALUES ('run-1', 'run-2', 'child', '2026-01-01T00:00:00Z')`, nil},
+			{`INSERT INTO reports(id, project_id, run_id, role, provider, model, payload_json, created_at) VALUES ('report-1', ?, 'run-1', 'worker', 'codex', 'gpt-test', '{}', '2026-01-01T00:00:00Z')`, []any{registered.Project.ProjectID}},
+			{`INSERT INTO legacy_import_records(id, project_id, run_id, record_type, source_path, source_hash, imported_at) VALUES ('legacy-1', ?, 'run-1', 'event', '.loopcoder/runs/run-1/events.jsonl', 'hash', '2026-01-01T00:00:00Z')`, []any{registered.Project.ProjectID}},
+			{`INSERT INTO legacy_import_status(project_id, repo_path, started_at, completed_at, status) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'completed')`, []any{registered.Project.ProjectID, repo}},
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
-		t.Fatalf("insert run: %v", err)
+		t.Fatalf("seed history: %v", err)
 	}
 	store.Close()
 
@@ -202,22 +297,129 @@ func TestRemoveLeavesRunHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
-	if !removed.Removed || removed.RunHistoryDeleted {
-		t.Fatalf("Remove result = %#v, want removed without history deletion", removed)
+	if !removed.Removed || !removed.Detached || removed.ProjectDeleted || removed.RunHistoryDeleted {
+		t.Fatalf("Remove result = %#v, want detached without deletion", removed)
+	}
+	wantPreserved := HistoryCounts{Runs: 2, RunEvents: 1, RunEdges: 1, Reports: 1, LegacyImportRecords: 1, LegacyImportStatus: 1}
+	if removed.Preserved != wantPreserved || removed.Deleted != (HistoryCounts{}) {
+		t.Fatalf("history counts = preserved:%#v deleted:%#v, want preserved:%#v deleted zero", removed.Preserved, removed.Deleted, wantPreserved)
+	}
+	if strings.TrimSpace(removed.Project.DetachedAt) == "" {
+		t.Fatalf("DetachedAt empty in removed project: %#v", removed.Project)
+	}
+	projects, err := List(ctx, Options{DatabasePath: dbPath}, deps.deps())
+	if err != nil {
+		t.Fatalf("List after remove: %v", err)
+	}
+	if len(projects) != 0 {
+		t.Fatalf("active project list after remove = %#v, want empty", projects)
+	}
+	show, err := Show(ctx, Options{RepoPath: repo, DatabasePath: dbPath}, deps.deps())
+	if err != nil {
+		t.Fatalf("Show after remove: %v", err)
+	}
+	if show.Registered || !show.Detached || show.Project.ProjectID != registered.Project.ProjectID {
+		t.Fatalf("Show after remove = %#v, want detached preserved identity", show)
 	}
 	store, err = storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
 	if err != nil {
 		t.Fatalf("Open after remove: %v", err)
 	}
-	defer store.Close()
-	var projectID string
-	if err := store.WithTx(ctx, func(tx storage.Tx) error {
-		return tx.QueryRow(ctx, `SELECT COALESCE(project_id, '') FROM runs WHERE id = ?`, "run-1").Scan(&projectID)
-	}); err != nil {
-		t.Fatalf("query run: %v", err)
+	assertHistory := func(label string) {
+		t.Helper()
+		expected := map[string]int{
+			"projects":              1,
+			"runs":                  2,
+			"run_events":            1,
+			"run_edges":             1,
+			"reports":               1,
+			"legacy_import_records": 1,
+			"legacy_import_status":  1,
+		}
+		for table, want := range expected {
+			got := registryTestCount(t, store, `SELECT COUNT(*) FROM `+table)
+			if got != want {
+				t.Fatalf("%s: %s count = %d, want %d", label, table, got, want)
+			}
+		}
+		for _, query := range []string{
+			`SELECT COUNT(*) FROM runs WHERE project_id = ?`,
+			`SELECT COUNT(*) FROM reports WHERE project_id = ?`,
+			`SELECT COUNT(*) FROM legacy_import_records WHERE project_id = ?`,
+			`SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`,
+		} {
+			if got := registryTestCount(t, store, query, registered.Project.ProjectID); got == 0 {
+				t.Fatalf("%s: query %q lost project links", label, query)
+			}
+		}
 	}
-	if projectID != "" {
-		t.Fatalf("run project_id = %q, want null/empty after project delete", projectID)
+	assertHistory("after remove")
+	store.Close()
+
+	reactivated, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register after remove: %v", err)
+	}
+	if !reactivated.Updated || !reactivated.Reactivated || reactivated.Project.ProjectID != registered.Project.ProjectID {
+		t.Fatalf("Register after remove = %#v, want reactivated same identity", reactivated)
+	}
+	store, err = storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open after re-register: %v", err)
+	}
+	defer store.Close()
+	assertHistory("after re-register")
+	var detachedAt string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT detached_at FROM projects WHERE id = ?`, registered.Project.ProjectID).Scan(&detachedAt)
+	}); err != nil {
+		t.Fatalf("query project detached_at: %v", err)
+	}
+	if detachedAt != "" {
+		t.Fatalf("detached_at after re-register = %q, want empty", detachedAt)
+	}
+}
+
+func TestRemoveRollsBackWhenDetachFails(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, dbPath := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://github.com/owner/repo.git\n",
+	})
+	registered, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `CREATE TRIGGER fail_project_detach BEFORE UPDATE OF detached_at ON projects BEGIN SELECT RAISE(FAIL, 'detach blocked'); END`)
+		return err
+	}); err != nil {
+		t.Fatalf("create failing trigger: %v", err)
+	}
+	store.Close()
+
+	if _, err := Remove(ctx, Options{RepoPath: repo, DatabasePath: dbPath}, deps.deps()); err == nil || !strings.Contains(err.Error(), "detach blocked") {
+		t.Fatalf("Remove error = %v, want trigger failure", err)
+	}
+	store, err = storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open after failed remove: %v", err)
+	}
+	defer store.Close()
+	var detachedAt string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT detached_at FROM projects WHERE id = ?`, registered.Project.ProjectID).Scan(&detachedAt)
+	}); err != nil {
+		t.Fatalf("query project: %v", err)
+	}
+	if detachedAt != "" {
+		t.Fatalf("detached_at after failed remove = %q, want rollback to active", detachedAt)
 	}
 }
 
@@ -243,6 +445,111 @@ func TestRegisterFailsOnPathAmbiguity(t *testing.T) {
 	}
 	if len(show.Conflicts) != 1 {
 		t.Fatalf("conflicts = %#v, want one", show.Conflicts)
+	}
+}
+
+func TestRegisterSymlinkAliasUsesSameLocalProjectIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical", "repo")
+	makeDir(t, physical)
+	aliasRoot := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "physical"), aliasRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliasRepo := filepath.Join(aliasRoot, "repo")
+	deps, dbPath := testDeps(t, nil)
+
+	first, err := Register(ctx, Options{RepoPath: physical, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register physical: %v", err)
+	}
+	second, err := Register(ctx, Options{RepoPath: aliasRepo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register alias: %v", err)
+	}
+	if first.Project.ProjectID != second.Project.ProjectID {
+		t.Fatalf("project IDs physical=%s alias=%s, want equal", first.Project.ProjectID, second.Project.ProjectID)
+	}
+	if first.Project.LocalPathCanonical != second.Project.LocalPathCanonical {
+		t.Fatalf("canonical paths physical=%q alias=%q, want equal", first.Project.LocalPathCanonical, second.Project.LocalPathCanonical)
+	}
+	projects, err := List(ctx, Options{DatabasePath: dbPath}, deps.deps())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("project count = %d, want 1: %#v", len(projects), projects)
+	}
+}
+
+func TestRegisterRepairsExistingLexicalLocalPathIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical", "repo")
+	makeDir(t, physical)
+	aliasRoot := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "physical"), aliasRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliasRepo := filepath.Join(aliasRoot, "repo")
+	oldID := projectID("local-path:" + aliasRepo)
+	deps, dbPath := testDeps(t, nil)
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		for _, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO projects(id, display_name, local_path, local_path_canonical, identity_source, created_at, updated_at, detached_at) VALUES (?, 'repo', ?, ?, 'local-path', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '')`, []any{oldID, aliasRepo, aliasRepo}},
+			{`INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run-1', ?, 'done', '2026-01-01T00:00:00Z')`, []any{oldID}},
+			{`INSERT INTO reports(id, project_id, run_id, role, provider, model, payload_json, created_at) VALUES ('report-1', ?, 'run-1', 'worker', 'codex', 'gpt-test', '{}', '2026-01-01T00:00:00Z')`, []any{oldID}},
+			{`INSERT INTO legacy_import_records(id, project_id, run_id, record_type, source_path, source_hash, imported_at) VALUES ('legacy-1', ?, 'run-1', 'event', '.loopcoder/runs/run-1/events.jsonl', 'hash', '2026-01-01T00:00:00Z')`, []any{oldID}},
+			{`INSERT INTO legacy_import_status(project_id, repo_path, started_at, completed_at, status) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'completed')`, []any{oldID, aliasRepo}},
+		} {
+			if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old project: %v", err)
+	}
+	store.Close()
+
+	result, err := Register(ctx, Options{RepoPath: physical, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register physical: %v", err)
+	}
+	if result.Project.ProjectID == oldID {
+		t.Fatalf("project ID = old lexical ID %s, want physical ID", oldID)
+	}
+	store, err = storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open repaired: %v", err)
+	}
+	defer store.Close()
+	if got := registryTestCount(t, store, `SELECT COUNT(*) FROM projects WHERE id = ?`, oldID); got != 0 {
+		t.Fatalf("old project row count = %d, want 0", got)
+	}
+	for _, query := range []string{
+		`SELECT COUNT(*) FROM runs WHERE project_id = ?`,
+		`SELECT COUNT(*) FROM reports WHERE project_id = ?`,
+		`SELECT COUNT(*) FROM legacy_import_records WHERE project_id = ?`,
+		`SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`,
+	} {
+		if got := registryTestCount(t, store, query, result.Project.ProjectID); got != 1 {
+			t.Fatalf("history query %q count = %d, want 1", query, got)
+		}
 	}
 }
 
@@ -278,6 +585,17 @@ func makeDir(t *testing.T, path string) {
 	if err := osMkdirAll(path); err != nil {
 		t.Fatalf("mkdir %s: %v", path, err)
 	}
+}
+
+func registryTestCount(t *testing.T, store storage.Store, query string, args ...any) int {
+	t.Helper()
+	var count int
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), query, args...).Scan(&count)
+	}); err != nil {
+		t.Fatalf("count query %q: %v", query, err)
+	}
+	return count
 }
 
 var osMkdirAll = func(path string) error {

@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -52,6 +53,9 @@ func ExtractGoListBackbone(ctx context.Context, repoPath string) (GoListBackbone
 	if err != nil {
 		return backbone, nil
 	}
+	if parsed.Available && len(parsed.Packages) == 0 && repoHasGoSource(repoPath) {
+		return backbone, nil
+	}
 	return parsed, nil
 }
 
@@ -73,7 +77,7 @@ type goListPackageJSON struct {
 }
 
 func parseGoListBackbone(repoPath string, data []byte) (GoListBackbone, error) {
-	absRepo, err := filepath.Abs(repoPath)
+	repoIdentity, err := pathid.Identity(repoPath)
 	if err != nil {
 		return GoListBackbone{}, fmt.Errorf("resolve repo path for go list backbone: %w", err)
 	}
@@ -96,7 +100,7 @@ func parseGoListBackbone(repoPath string, data []byte) (GoListBackbone, error) {
 	local := map[string]goListPackageJSON{}
 	packages := make([]GoListPackage, 0, len(raw))
 	for _, pkg := range raw {
-		rel, ok := repoRelativeDir(absRepo, pkg.Dir)
+		rel, ok := repoRelativeDir(repoIdentity, pkg.Dir)
 		if !ok {
 			continue
 		}
@@ -135,6 +139,9 @@ func parseGoListBackbone(repoPath string, data []byte) (GoListBackbone, error) {
 		}
 		return edges[i].From < edges[j].From
 	})
+	if len(raw) > 0 && len(packages) == 0 {
+		return GoListBackbone{}, fmt.Errorf("go list returned %d package(s), but none resolved under repository %s", len(raw), repoIdentity)
+	}
 
 	return GoListBackbone{
 		Tool:      "go list",
@@ -145,15 +152,15 @@ func parseGoListBackbone(repoPath string, data []byte) (GoListBackbone, error) {
 	}, nil
 }
 
-func repoRelativeDir(absRepo, dir string) (string, bool) {
+func repoRelativeDir(repoIdentity, dir string) (string, bool) {
 	if strings.TrimSpace(dir) == "" {
 		return "", false
 	}
-	absDir, err := filepath.Abs(dir)
+	dirIdentity, err := pathid.Identity(dir)
 	if err != nil {
 		return "", false
 	}
-	rel, err := filepath.Rel(absRepo, absDir)
+	rel, err := filepath.Rel(repoIdentity, dirIdentity)
 	if err != nil {
 		return "", false
 	}
@@ -164,6 +171,29 @@ func repoRelativeDir(absRepo, dir string) (string, bool) {
 		return "", false
 	}
 	return filepath.ToSlash(rel), true
+}
+
+func repoHasGoSource(repoPath string) bool {
+	found := false
+	_ = filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".loopcoder", "vendor":
+				if path != repoPath {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if strings.HasSuffix(entry.Name(), ".go") && !strings.HasSuffix(entry.Name(), "_test.go") {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 type EpicDAGArtifactFile struct {

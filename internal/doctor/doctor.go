@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -66,18 +67,21 @@ type Options struct {
 }
 
 type Deps struct {
-	LookPath       func(file string) (string, error)
-	RunCommand     func(ctx context.Context, dir string, name string, args ...string) (CommandResult, error)
-	LoadConfig     func(path string) (config.Config, error)
-	Getenv         func(string) string
-	ReadFile       func(path string) ([]byte, error)
-	ExecutablePath func() (string, error)
-	UserHomeDir    func() (string, error)
-	SkillMarkdown  func() ([]byte, error)
-	AgentsMarkdown func() ([]byte, error)
-	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
-	StorageHealth  func(context.Context, string) (storage.Health, error)
-	ProjectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
+	LookPath           func(file string) (string, error)
+	RunCommand         func(ctx context.Context, dir string, name string, args ...string) (CommandResult, error)
+	LoadConfig         func(path string) (config.Config, error)
+	Getenv             func(string) string
+	ReadFile           func(path string) ([]byte, error)
+	ExecutablePath     func() (string, error)
+	UserHomeDir        func() (string, error)
+	SkillMarkdown      func() ([]byte, error)
+	AgentsMarkdown     func() ([]byte, error)
+	CleanupPlan        func(localcleanup.Options) (localcleanup.Result, error)
+	StorageHealth      func(context.Context, string) (storage.Health, error)
+	StoragePermissions func(path string, fix bool) (storage.PermissionReport, error)
+	ProjectShow        func(context.Context, registry.Options) (registry.ShowResult, error)
+	ProjectDuplicates  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	ProjectRepair      func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 }
 
 type CommandResult struct {
@@ -148,6 +152,7 @@ type RuntimeDatabase struct {
 type RuntimeProjectRegistry struct {
 	Status         Status
 	Registered     bool
+	Detached       bool
 	ProjectID      string
 	IdentitySource string
 	ConflictCount  int
@@ -238,6 +243,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		ProjectRegistry struct {
 			Status         Status `json:"status"`
 			Registered     bool   `json:"registered"`
+			Detached       bool   `json:"detached"`
 			ProjectID      string `json:"project_id,omitempty"`
 			IdentitySource string `json:"identity_source,omitempty"`
 			ConflictCount  int    `json:"conflict_count"`
@@ -319,6 +325,7 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.Database.Message = report.Runtime.Database.Message
 	payload.Runtime.ProjectRegistry.Status = report.Runtime.ProjectRegistry.Status
 	payload.Runtime.ProjectRegistry.Registered = report.Runtime.ProjectRegistry.Registered
+	payload.Runtime.ProjectRegistry.Detached = report.Runtime.ProjectRegistry.Detached
 	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
 	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
 	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
@@ -372,8 +379,20 @@ func DefaultDeps() Deps {
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
 		CleanupPlan:    localcleanup.Plan,
 		StorageHealth:  storage.CheckHealth,
+		StoragePermissions: func(path string, fix bool) (storage.PermissionReport, error) {
+			if fix {
+				return storage.RepairPermissions(path)
+			}
+			return storage.CheckPermissions(path)
+		},
 		ProjectShow: func(ctx context.Context, opts registry.Options) (registry.ShowResult, error) {
 			return registry.Show(ctx, opts, registry.DefaultDeps())
+		},
+		ProjectDuplicates: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			return registry.DuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
+		},
+		ProjectRepair: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			return registry.RepairDuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
 		},
 	}
 }
@@ -427,6 +446,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, checkReportQuery(repoPath))
+	checks = append(checks, checkStoragePermissions(deps))
 	checks = append(checks, checkStorageHealth(ctx, deps))
 	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
 	checks = append(checks, checkLocalStateImport(ctx, repoPath, deps))
@@ -449,6 +469,8 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
 	checks := []Check{
+		fixStoragePermissions(deps),
+		fixProjectRegistryDuplicates(ctx, repoPath, deps),
 		fixDeliveryConfig(repoPath, deps),
 		fixConductorHookSettings(repoPath, deps),
 		fixConductorHookState(repoPath),
@@ -789,8 +811,17 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.StorageHealth == nil {
 		deps.StorageHealth = defaults.StorageHealth
 	}
+	if deps.StoragePermissions == nil {
+		deps.StoragePermissions = defaults.StoragePermissions
+	}
 	if deps.ProjectShow == nil {
 		deps.ProjectShow = defaults.ProjectShow
+	}
+	if deps.ProjectDuplicates == nil {
+		deps.ProjectDuplicates = defaults.ProjectDuplicates
+	}
+	if deps.ProjectRepair == nil {
+		deps.ProjectRepair = defaults.ProjectRepair
 	}
 	return deps
 }
@@ -1008,12 +1039,51 @@ func checkReportQuery(repoPath string) Check {
 	}
 }
 
+func checkStoragePermissions(deps Deps) Check {
+	deps = normalizeDeps(deps)
+	path, err := resolvedStoragePath(deps)
+	if err != nil {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for storage permissions: %v", err),
+		}
+	}
+	report, err := deps.StoragePermissions(path, false)
+	if err != nil {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s permissions=fail: %v", path, err),
+			Hard:    true,
+		}
+	}
+	if !report.Supported {
+		return Check{
+			Name:       "storage permissions",
+			Status:     StatusWarn,
+			Message:    fmt.Sprintf("path=%s permissions=unsupported platform=%s: %s", path, report.Platform, firstNonEmpty(report.Message, "owner-only ACL hardening is not implemented")),
+			FixCommand: "loopcoder doctor --repo . --fix",
+		}
+	}
+	if report.Secure {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("path=%s permissions=owner-only: %s", path, firstNonEmpty(report.Message, "ok")),
+		}
+	}
+	return Check{
+		Name:       "storage permissions",
+		Status:     StatusWarn,
+		Message:    fmt.Sprintf("path=%s permissions=insecure: %s", path, storagePermissionDetails(report)),
+		FixCommand: "loopcoder doctor --repo . --fix",
+	}
+}
+
 func checkStorageHealth(ctx context.Context, deps Deps) Check {
 	deps = normalizeDeps(deps)
-	layout, err := home.Resolve(home.Deps{
-		Getenv:      deps.Getenv,
-		UserHomeDir: deps.UserHomeDir,
-	})
+	path, err := resolvedStoragePath(deps)
 	if err != nil {
 		return Check{
 			Name:    "storage",
@@ -1021,7 +1091,6 @@ func checkStorageHealth(ctx context.Context, deps Deps) Check {
 			Message: fmt.Sprintf("could not resolve loopcoder home for storage health: %v", err),
 		}
 	}
-	path := layout.DatabasePath()
 	health, err := deps.StorageHealth(ctx, path)
 	if err != nil {
 		return Check{
@@ -1055,6 +1124,82 @@ func checkStorageHealth(ctx context.Context, deps Deps) Check {
 	}
 }
 
+func fixStoragePermissions(deps Deps) Check {
+	deps = normalizeDeps(deps)
+	path, err := resolvedStoragePath(deps)
+	if err != nil {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for storage permissions: %v", err),
+		}
+	}
+	before, beforeErr := deps.StoragePermissions(path, false)
+	if beforeErr != nil {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s before=unreadable: %v", path, beforeErr),
+			Hard:    true,
+		}
+	}
+	after, err := deps.StoragePermissions(path, true)
+	if err != nil {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s repair=failed: %v", path, err),
+			Hard:    true,
+		}
+	}
+	if !after.Supported {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("path=%s unchanged: %s", path, firstNonEmpty(after.Message, "owner-only ACL hardening is not implemented on this platform")),
+		}
+	}
+	if !after.Secure {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("path=%s repair incomplete; before=%s after=%s", path, storagePermissionDetails(before), storagePermissionDetails(after)),
+		}
+	}
+	if after.Repaired {
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("path=%s changed; before=%s after=%s", path, storagePermissionDetails(before), storagePermissionDetails(after)),
+		}
+	}
+	return Check{
+		Name:    "fix storage permissions",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("path=%s unchanged; %s", path, firstNonEmpty(after.Message, "storage permissions are owner-only")),
+	}
+}
+
+func fixProjectRegistryDuplicates(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	path, err := resolvedStoragePath(deps)
+	if err != nil {
+		return Check{Name: "fix project registry duplicates", Status: StatusWarn, Message: fmt.Sprintf("could not resolve storage path: %v", err)}
+	}
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists || !health.OK {
+		return Check{Name: "fix project registry duplicates", Status: StatusInfo, Message: "skipped; healthy project registry storage is not available"}
+	}
+	repaired, err := deps.ProjectRepair(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{Name: "fix project registry duplicates", Status: StatusWarn, Message: fmt.Sprintf("could not repair duplicate physical project identities: %v", err)}
+	}
+	if len(repaired) == 0 {
+		return Check{Name: "fix project registry duplicates", Status: StatusOK, Message: "no duplicate physical project identities found"}
+	}
+	return Check{Name: "fix project registry duplicates", Status: StatusOK, Message: fmt.Sprintf("reconciled %d duplicate physical project identity group(s)", len(repaired))}
+}
+
 func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check {
 	deps = normalizeDeps(deps)
 	layout, err := home.Resolve(home.Deps{
@@ -1070,7 +1215,14 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 	}
 	path := layout.DatabasePath()
 	health, err := deps.StorageHealth(ctx, path)
-	if err != nil || !health.Exists {
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect project registry because storage health failed: %v", err),
+		}
+	}
+	if !health.Exists {
 		return Check{
 			Name:    "project registry",
 			Status:  StatusInfo,
@@ -1082,6 +1234,21 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 			Name:    "project registry",
 			Status:  StatusWarn,
 			Message: fmt.Sprintf("could not inspect project registry because storage is unhealthy: %s", firstNonEmpty(health.Message, "unhealthy")),
+		}
+	}
+	duplicates, err := deps.ProjectDuplicates(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect duplicate physical project identities: %v", err),
+		}
+	}
+	if len(duplicates) > 0 {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("found %d duplicate physical project identity group(s); run: loopcoder doctor --repo . --fix", len(duplicates)),
 		}
 	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
@@ -1105,6 +1272,13 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 		}
 	}
 	if !result.Registered {
+		if result.Detached {
+			return Check{
+				Name:    "project registry",
+				Status:  StatusInfo,
+				Message: fmt.Sprintf("project is detached; preserved project_id=%s identity=%s; run: loopcoder projects register --repo . to reactivate", result.Project.ProjectID, result.Project.IdentitySource),
+			}
+		}
 		return Check{
 			Name:    "project registry",
 			Status:  StatusInfo,
@@ -1143,6 +1317,38 @@ func runtimeHealth(ctx context.Context, repoPath string, deps Deps) RuntimeHealt
 	runtime.Database = runtimeDatabase(ctx, layout.DatabasePath(), deps)
 	runtime.ProjectRegistry = runtimeProjectRegistry(ctx, repoPath, layout.DatabasePath(), runtime.Database, deps)
 	return runtime
+}
+
+func resolvedStoragePath(deps Deps) (string, error) {
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return "", err
+	}
+	return layout.DatabasePath(), nil
+}
+
+func storagePermissionDetails(report storage.PermissionReport) string {
+	var details []string
+	for _, item := range report.Items {
+		if !item.Exists || item.Secure && !item.Repaired {
+			continue
+		}
+		switch {
+		case item.Repaired:
+			details = append(details, fmt.Sprintf("%s %s %04o->%04o", item.Kind, item.Path, item.BeforeMode, item.AfterMode))
+		case item.Unsafe:
+			details = append(details, fmt.Sprintf("%s %s unsafe=%s", item.Kind, item.Path, item.Message))
+		default:
+			details = append(details, fmt.Sprintf("%s %s %s", item.Kind, item.Path, item.Message))
+		}
+	}
+	if len(details) == 0 {
+		return firstNonEmpty(report.Message, "none")
+	}
+	return strings.Join(details, "; ")
 }
 
 func runtimeDatabase(ctx context.Context, path string, deps Deps) RuntimeDatabase {
@@ -1194,6 +1400,20 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 			Message: "storage is unhealthy; registry could not be inspected",
 		}
 	}
+	duplicates, err := deps.ProjectDuplicates(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
+	if err != nil {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: err.Error(),
+		}
+	}
+	if len(duplicates) > 0 {
+		return RuntimeProjectRegistry{
+			Status:        StatusWarn,
+			ConflictCount: len(duplicates),
+			Message:       "duplicate physical project identities found",
+		}
+	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
 	if err != nil {
 		return RuntimeProjectRegistry{
@@ -1203,6 +1423,7 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 	}
 	registry := RuntimeProjectRegistry{
 		Registered:     result.Registered,
+		Detached:       result.Detached,
 		ProjectID:      result.Project.ProjectID,
 		IdentitySource: string(result.Project.IdentitySource),
 		ConflictCount:  len(result.Conflicts),
@@ -1211,6 +1432,9 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 	case len(result.Conflicts) > 0:
 		registry.Status = StatusWarn
 		registry.Message = "project identity is ambiguous"
+	case result.Detached:
+		registry.Status = StatusInfo
+		registry.Message = "project registry identity is detached"
 	case !result.Registered:
 		registry.Status = StatusInfo
 		registry.Message = "project is not registered"
@@ -1300,7 +1524,8 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 	parentEdges := 0
 	childEdges := 0
 	for runID, lifecycle := range lifecycles {
-		parent := strings.TrimSpace(lifecycle.ParentRunID)
+		eventChildren, eventParent := doctorRunEdgesFromEvents(repoPath, runID)
+		parent := strings.TrimSpace(firstNonEmptyDoctor(lifecycle.ParentRunID, eventParent))
 		if parent != "" {
 			parentEdges++
 			if parent == runID {
@@ -1309,7 +1534,15 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 				problems = append(problems, fmt.Sprintf("%s references missing parent %s", runID, parent))
 			}
 		}
+		children := map[string]bool{}
 		for _, child := range lifecycle.ChildRunIDs {
+			children[strings.TrimSpace(child)] = true
+		}
+		for _, child := range eventChildren {
+			children[strings.TrimSpace(child)] = true
+		}
+		delete(children, "")
+		for child := range children {
 			child = strings.TrimSpace(child)
 			if child == "" {
 				continue
@@ -1356,6 +1589,72 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 	}
 }
 
+func doctorRunEdgesFromEvents(repoPath, runID string) ([]string, string) {
+	path := state.EventsPath(repoPath, runID)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() > lcdefaults.RunStatusMaxEventBytes {
+		return nil, ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ""
+	}
+	defer file.Close()
+
+	children := map[string]bool{}
+	parent := ""
+	limited := &io.LimitedReader{R: file, N: lcdefaults.RunStatusMaxEventBytes + 1}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 1024), lcdefaults.RunStatusMaxEventLineBytes)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Details json.RawMessage `json:"details"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil || len(event.Details) == 0 {
+			continue
+		}
+		var details struct {
+			ParentRunID string `json:"parent_run_id"`
+			Child       struct {
+				RunID string `json:"run_id"`
+			} `json:"child"`
+			Result struct {
+				RunID string `json:"run_id"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			continue
+		}
+		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
+			parent = strings.TrimSpace(details.ParentRunID)
+		}
+		if strings.TrimSpace(details.ParentRunID) == "" || strings.TrimSpace(details.ParentRunID) == runID {
+			children[strings.TrimSpace(details.Child.RunID)] = true
+			children[strings.TrimSpace(details.Result.RunID)] = true
+			delete(children, "")
+		}
+	}
+	out := make([]string, 0, len(children))
+	for child := range children {
+		out = append(out, child)
+	}
+	sort.Strings(out)
+	return out, parent
+}
+
+func firstNonEmptyDoctor(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Check {
 	deps = normalizeDeps(deps)
 	if !legacyLocalStatePresent(repoPath) {
@@ -1386,7 +1685,21 @@ func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Chec
 		}
 	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
-	if err != nil || !result.Registered {
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but this project has no import status; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	if result.Detached {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("repo-local .loopcoder history import status is preserved for detached project_id=%s; run: loopcoder projects register --repo . to reactivate", result.Project.ProjectID),
+		}
+	}
+	if !result.Registered {
 		return Check{
 			Name:    "local state import",
 			Status:  StatusWarn,

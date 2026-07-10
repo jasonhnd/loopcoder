@@ -103,6 +103,7 @@ var commands = []Command{
 	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
+	{Name: "nested", Summary: "submit and execute a nested child plan"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
@@ -312,6 +313,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "dispatch" {
 		return runDispatch(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "nested" {
+		return runNested(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "relay" {
 		return runRelay(args[1:], stdout, stderr)
 	}
@@ -381,6 +385,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		printProjectsHelp(w)
 		return
 	}
+	if command.Name == "nested" {
+		printNestedHelp(w)
+		return
+	}
 	if command.Name == "migrate" {
 		printMigrateHelp(w)
 		return
@@ -405,6 +413,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                 suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -424,13 +434,15 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --total-tokens int       total token count")
 		fmt.Fprintln(w, "  --model-source string    ignored; forced to self-reported")
 		fmt.Fprintln(w, "  --verified               ignored; forced to false")
-		fmt.Fprintln(w, "  --pretty                 render human-readable report instead of durable output")
+		fmt.Fprintln(w, "  --format string          output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose                include raw canonical records in text output")
+		fmt.Fprintln(w, "  --pretty                 compatibility alias for text receipt output")
 	}
 	if command.Name == "doctor" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
 		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
-		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
+		fmt.Fprintln(w, "  --fix                  apply explicit storage permission repair, migrations, and stale local state cleanup")
 	}
 	if command.Name == "status" {
 		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
@@ -453,7 +465,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "audit" {
 		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
-		fmt.Fprintln(w, "  --format string               output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --format string               output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose                     include raw audit details in text output")
 		fmt.Fprintln(w, "  --layer string                audit layer to run; repeatable or comma-separated (default \"sast\")")
 		fmt.Fprintln(w, "  --layers string               alias for --layer")
 		fmt.Fprintln(w, "  --severity-threshold string   one-run severity threshold override")
@@ -584,6 +597,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict               reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --timeout duration     verifier timeout (default 10m0s)")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose              include raw verifier JSON and report header")
 		fmt.Fprintln(w, "  --pretty               force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty            suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
 		fmt.Fprintln(w)
@@ -613,6 +628,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
+		fmt.Fprintln(w, "  --format string            output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose                  include raw wave report details in text output")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty reports on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty reports on stdout (LOOPCODER_NO_PRETTY)")
 	}
@@ -827,7 +844,7 @@ func printProjectsHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Register, inspect, list, and remove projects from the machine-local registry.")
+	fmt.Fprintln(w, "Register, inspect, list active projects, and detach projects from the machine-local registry.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
@@ -906,6 +923,8 @@ func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
 	status := "not registered"
 	if result.Registered {
 		status = "registered"
+	} else if result.Detached {
+		status = "detached"
 	}
 	fmt.Fprintf(stdout, "status: %s\n", status)
 	fmt.Fprintf(stdout, "project_id: %s\n", result.Project.ProjectID)
@@ -938,11 +957,14 @@ func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return writeProjectJSON(stdout, stderr, "projects remove", result)
 	}
 	if result.Removed {
-		fmt.Fprintf(stdout, "removed project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+		fmt.Fprintf(stdout, "detached project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+	} else if result.Detached {
+		fmt.Fprintf(stdout, "project %s is already detached\n", result.Project.ProjectID)
 	} else {
 		fmt.Fprintf(stdout, "project %s is not registered\n", result.Project.ProjectID)
 	}
 	fmt.Fprintln(stdout, "run_history_deleted: false")
+	fmt.Fprintln(stdout, "project_deleted: false")
 	return 0
 }
 
@@ -1248,7 +1270,7 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&outputFormat, "format", "text", "output format: text or json")
-	fs.BoolVar(&fix, "fix", false, "apply explicit upgrade migrations and stale local state cleanup")
+	fs.BoolVar(&fix, "fix", false, "apply explicit storage permission repair, upgrade migrations, and stale local state cleanup")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3160,6 +3182,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	format := "text"
+	var formatAlias string
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -3195,6 +3221,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include raw canonical records in text output")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw canonical records in text output")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3240,7 +3270,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	verbose = verbose || verboseAlias
+	outputMode, ok := normalizeCommandOutputMode("dispatch", format, verbose, stderr)
+	if !ok {
+		return 2
+	}
 	opts.Stderr = stderr
+	if outputMode.Format == "json" {
+		opts.Stderr = io.Discard
+	}
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "dispatch: --repo is required")
@@ -3265,7 +3306,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return exitCode
 	}
 
-	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
+	cfg, err := loadDeliveryConfigWithOptions(resolvedRepo, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       auditStderr(outputMode, stderr),
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
@@ -3279,7 +3324,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ConfigModel:    cfg.Worker.Model,
 		ConfigEffort:   cfg.Worker.ReasoningEffort,
 		Strict:         cfg.Models.Strict || strict,
-		Warnings:       stderr,
+		Warnings:       commandWarningsWriter(outputMode, stderr),
 	})
 	if !ok {
 		return 1
@@ -3293,8 +3338,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	if err := renderDispatch(stdout, result); err != nil {
-		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+	if result.Report == nil {
+		fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
 		return 1
 	}
 	if result.Report != nil {
@@ -3303,7 +3348,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "dispatch: write relay ledger: %v\n", err)
 			return 1
 		}
-		if shouldRenderPretty(noPretty) {
+		if outputMode.Format == "text" && shouldRenderPretty(noPretty) {
 			if err := renderPrettyReportWithOptions(stderr, *result.Report, reporter.PrettyOptions{
 				Mode:   mode,
 				Status: result.Status,
@@ -3312,6 +3357,19 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
 			}
+		}
+	}
+	if outputMode.Format == "json" {
+		if err := renderDispatchJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if outputMode.Verbose {
+		if err := renderDispatch(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
 		}
 	}
 	return 0
@@ -3444,6 +3502,21 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 	return nil
 }
 
+func renderDispatchJSON(w io.Writer, result worker.Result) error {
+	if result.Report == nil {
+		return errors.New("dispatch report is missing")
+	}
+	if err := result.Report.Validate(); err != nil {
+		return fmt.Errorf("validate dispatch report: %w", err)
+	}
+	data, err := worker.MarshalResult(result)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(data, '\n'))
+	return err
+}
+
 func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Now == nil {
 		deps.Now = DefaultDeps().Now
@@ -3484,6 +3557,10 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var ignoredVerifiedAlias bool
 	var pretty bool
 	var prettyAlias bool
+	format := "text"
+	var formatAlias string
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&role, "role", role, "role")
 	fs.StringVar(&roleAlias, "Role", "", "role")
@@ -3517,6 +3594,10 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&ignoredVerifiedAlias, "Verified", false, "verified")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable report")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include raw canonical records in text output")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw canonical records in text output")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3549,6 +3630,17 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		endedAt = endedAtAlias
 	}
 	pretty = pretty || prettyAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	verbose = verbose || verboseAlias
+	outputMode, ok := normalizeCommandOutputMode("attest", format, verbose, stderr)
+	if !ok {
+		return 2
+	}
+	if pretty {
+		outputMode.Format = "text"
+	}
 
 	durationSet := flagWasSet(fs, "duration-ms")
 	if flagWasSet(fs, "DurationMs") {
@@ -3637,7 +3729,14 @@ func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "attest: %v\n", err)
 		return 1
 	}
-	if pretty {
+	if outputMode.Format == "json" {
+		if _, err := stdout.Write(append(canonical, '\n')); err != nil {
+			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if !outputMode.Verbose {
 		if err := renderPrettyReport(stdout, record, prettyModeForTarget(stdout, deps, false)); err != nil {
 			fmt.Fprintf(stderr, "attest: write output: %v\n", err)
 			return 1
@@ -3831,6 +3930,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	format := "text"
+	var formatAlias string
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -3860,6 +3963,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include raw verifier JSON and report header")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw verifier JSON and report header")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -3896,6 +4003,14 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	verbose = verbose || verboseAlias
+	outputMode, ok := normalizeCommandOutputMode("dispatch-wave", format, verbose, stderr)
+	if !ok {
+		return 2
+	}
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "dispatch-wave: --repo is required")
@@ -3961,7 +4076,11 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return exitCode
 	}
 
-	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
+	cfg, err := loadDeliveryConfigWithOptions(resolvedRepo, config.LoadOptions{
+		BaseBranch:     baseBranch,
+		ConfigFromBase: configFromBase,
+		Warnings:       auditStderr(outputMode, stderr),
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
 		return 1
@@ -3975,7 +4094,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ConfigModel:    cfg.Worker.Model,
 		ConfigEffort:   cfg.Worker.ReasoningEffort,
 		Strict:         cfg.Models.Strict || strict,
-		Warnings:       stderr,
+		Warnings:       commandWarningsWriter(outputMode, stderr),
 	})
 	if !ok {
 		return 1
@@ -3985,7 +4104,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	effort = selection.Effort
 
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
-	renderPretty := shouldRenderPretty(noPretty)
+	renderPretty := outputMode.Format == "text" && shouldRenderPretty(noPretty)
 	writeWaveRelayRecord := func(runID string, result orchestration.DispatchWaveIssueResult) error {
 		if result.Report == nil {
 			return nil
@@ -4058,13 +4177,19 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
 		ProcessAlive:    deps.ProcessAlive,
 		Now:             deps.Now(),
-		Stderr:          stderr,
+		Stderr:          auditStderr(outputMode, stderr),
 		ComputeReadySet: deps.ComputeReadySet,
 		Dispatch:        deps.Dispatch,
 		OnIssueComplete: streamWaveCompletion,
 	})
 	if dispatchWaveReportHasContent(waveReport) {
-		if _, writeErr := stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); writeErr != nil {
+		var writeErr error
+		if outputMode.Format == "json" {
+			writeErr = writeJSONLine(stdout, waveReport)
+		} else {
+			_, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport)))
+		}
+		if writeErr != nil {
 			fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", writeErr)
 			return 1
 		}
@@ -4341,6 +4466,10 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	format := "text"
+	var formatAlias string
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4364,6 +4493,10 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include raw verifier JSON and report header")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw verifier JSON and report header")
 
 	if err := fs.Parse(args); err != nil {
 		return loopreviewCommandFailureExitCode
@@ -4393,6 +4526,14 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	verbose = verbose || verboseAlias
+	outputMode, ok := normalizeCommandOutputMode("loopreview", format, verbose, stderr)
+	if !ok {
+		return loopreviewCommandFailureExitCode
+	}
 
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "loopreview: --repo is required")
@@ -4413,12 +4554,19 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return loopreviewCommandFailureExitCode
 	}
 	opts.RepoPath = resolvedRepo
-	opts.Stderr = stderr
+	opts.Stderr = io.Discard
+	if outputMode.Verbose {
+		opts.Stderr = stderr
+	}
 	if exitCode, blocked := checkRelayGate(resolvedRepo, stdout, stderr); blocked {
 		return exitCode
 	}
 
-	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
+	cfg, err := loadDeliveryConfigWithOptions(resolvedRepo, config.LoadOptions{
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Warnings:       auditStderr(outputMode, stderr),
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return loopreviewCommandFailureExitCode
@@ -4432,7 +4580,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ConfigModel:    cfg.Verifier.Model,
 		ConfigEffort:   cfg.Verifier.ReasoningEffort,
 		Strict:         cfg.Models.Strict || strict,
-		Warnings:       stderr,
+		Warnings:       commandWarningsWriter(outputMode, stderr),
 	})
 	if !ok {
 		return loopreviewCommandFailureExitCode
@@ -4444,7 +4592,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   workerProvider,
 		Verifier: opts.Provider,
-	}); warning != "" {
+	}); warning != "" && outputMode.Format != "json" {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
 
@@ -4453,21 +4601,39 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	if err := loopreview.Render(stdout, result); err != nil {
-		fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
-		return loopreviewCommandFailureExitCode
-	}
+	result.Verdict = loopreview.NormalizeVerdict(result.Verdict)
 	if result.Verdict.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
 		if err := writeLoopreviewRelayLedger(opts, result.Verdict, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
 			return loopreviewCommandFailureExitCode
 		}
-		if shouldRenderPretty(noPretty) {
+		if outputMode.Format == "text" && shouldRenderPretty(noPretty) {
 			if err := renderLoopreviewPrettyReport(stderr, result.Verdict, mode); err != nil {
 				fmt.Fprintf(stderr, "loopreview: write pretty report: %v\n", err)
 				return loopreviewCommandFailureExitCode
 			}
+		}
+	}
+	if outputMode.Format == "json" || outputMode.Verbose {
+		if err := loopreview.Render(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
+			return loopreviewCommandFailureExitCode
+		}
+	}
+	if outputMode.Verbose && result.Verdict.Report != nil {
+		canonical, err := result.Verdict.Report.CanonicalJSON()
+		if err != nil {
+			fmt.Fprintf(stderr, "loopreview: render report JSON: %v\n", err)
+			return loopreviewCommandFailureExitCode
+		}
+		if _, err := fmt.Fprintln(stdout, result.Verdict.Report.Header()); err != nil {
+			fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
+			return loopreviewCommandFailureExitCode
+		}
+		if _, err := stdout.Write(append(canonical, '\n')); err != nil {
+			fmt.Fprintf(stderr, "loopreview: write output: %v\n", err)
+			return loopreviewCommandFailureExitCode
 		}
 	}
 	return loopreview.ExitCodeForVerdict(result.Verdict.Verdict)

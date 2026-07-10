@@ -47,7 +47,7 @@ headless invocation, timeout enforcement, structured verdicts, and attestation.
 This spec keeps that stance and adds only user-stated persistent preferences
 and explicit one-run overrides.
 
-[`../BACKLOG.md`](../BACKLOG.md#b1--worker-model--speed-selection) B1 records
+[`../BACKLOG.md`](../BACKLOG.md#b1-worker-model-speed-selection) B1 records
 the original worker-only rule: absent model and effort means provider-global
 inheritance, while `dispatch --model`, `dispatch --effort`, and optional
 `.delivery.yml` worker keys exist only when the user explicitly asks for them.

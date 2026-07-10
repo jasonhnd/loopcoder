@@ -39,6 +39,8 @@ const (
 	EnvInstallRepo    = "LOOPCODER_INSTALL_REPO"
 	EnvAPIBaseURL     = "GITHUB_API_URL"
 	EnvBaseURL        = "GITHUB_BASE_URL"
+	EnvGitHubToken    = "GITHUB_TOKEN"
+	EnvGHToken        = "GH_TOKEN"
 	EnvCosignIdentity = "LOOPCODER_COSIGN_IDENTITY"
 	EnvCosignIssuer   = "LOOPCODER_COSIGN_ISSUER"
 
@@ -171,6 +173,7 @@ type releaseConfig struct {
 	Repo       string
 	APIBaseURL string
 	BaseURL    string
+	AuthToken  string
 }
 
 type release struct {
@@ -181,6 +184,7 @@ type release struct {
 }
 
 type releaseAsset struct {
+	URL                string `json:"url"`
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
@@ -210,8 +214,15 @@ func DefaultDeps() Deps {
 			if err != nil {
 				return nil, fmt.Errorf("create request: %w", err)
 			}
-			req.Header.Set("Accept", "application/vnd.github+json")
+			if isGitHubReleaseAssetAPIURL(rawURL) {
+				req.Header.Set("Accept", "application/octet-stream")
+			} else {
+				req.Header.Set("Accept", "application/vnd.github+json")
+			}
 			req.Header.Set("User-Agent", "loopcoder-upgrade")
+			if token := firstNonEmpty(os.Getenv(EnvGitHubToken), os.Getenv(EnvGHToken)); token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -771,10 +782,12 @@ func releaseConfigFromEnv(deps Deps) releaseConfig {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
+	authToken := firstNonEmpty(deps.Getenv(EnvGitHubToken), deps.Getenv(EnvGHToken))
 	return releaseConfig{
 		Repo:       repo,
 		APIBaseURL: apiBaseURL,
 		BaseURL:    baseURL,
+		AuthToken:  authToken,
 	}
 }
 
@@ -866,10 +879,21 @@ func findAsset(rel release, name string) (releaseAsset, bool) {
 }
 
 func assetURL(asset releaseAsset, cfg releaseConfig, tag string, name string) string {
+	if strings.TrimSpace(cfg.AuthToken) != "" && strings.TrimSpace(asset.URL) != "" {
+		return asset.URL
+	}
 	if strings.TrimSpace(asset.BrowserDownloadURL) != "" {
 		return asset.BrowserDownloadURL
 	}
 	return fmt.Sprintf("%s/%s/releases/download/%s/%s", cfg.BaseURL, cfg.Repo, url.PathEscape(tag), url.PathEscape(name))
+}
+
+func isGitHubReleaseAssetAPIURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(parsed.Path, "/releases/assets/")
 }
 
 func signatureTrust(deps Deps, cfg releaseConfig, tag string) (string, string) {
