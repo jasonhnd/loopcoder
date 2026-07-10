@@ -232,6 +232,15 @@ CREATE TABLE run_edges (
   UNIQUE (plan_id, child_key),
   UNIQUE (parent_run_id, ordinal)
 );
+
+CREATE TABLE run_claims (
+  run_id TEXT PRIMARY KEY,
+  executor_id TEXT NOT NULL,
+  claim_generation INTEGER NOT NULL,
+  claimed_at TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
 ```
 
 Required storage invariants:
@@ -245,6 +254,18 @@ Required storage invariants:
 - `ordinal` is assigned from the ordered child plan item list and is stable for
   deterministic report rendering.
 - The storage layer MUST reject cycles.
+- A child scheduler MUST acquire a durable execution claim before provider
+  launch. The claim transaction MUST update `run_claims`, child run status,
+  child edge status, and the transition event atomically.
+- Only the scheduler that receives a `claimed` claim result may call the
+  provider executor. A scheduler that observes another active claim must report
+  an in-progress observation and must not execute the child.
+- Claim completion MUST be fenced by `run_id`, `executor_id`, and
+  `claim_generation`. A stale owner from an older generation must not publish a
+  terminal result after takeover.
+- Active and expired claims are distinct durable states. An expired claim may be
+  taken over by a new generation, and reports must expose the owner,
+  generation, lease expiry, and replay action without local secrets.
 
 The v0.7 SQLite migration is additive over the existing storage schema: `runs`
 keeps its established primary key column name `id`, and v7 adds
@@ -392,6 +413,21 @@ PRs, checks, and explicit local run records are the source of truth.
 - A child can recover its parent from `runs.parent_run_id` and `run_edges`.
 - If a child run is interrupted, recovery is bounded by the same retry and
   liveness rules as normal runs.
+- If a scheduler crashes after claiming but before provider launch, the child
+  remains `running` with a lease. Replayers observe the owner until the lease
+  expires, then a recovery owner may take over with a higher generation.
+- If a scheduler crashes during provider execution, loopcoder does not claim
+  universal exactly-once external side effects. Recovery uses the durable owner,
+  generation fencing, provider idempotency keys or receipts where available,
+  and needs-human handling when completion cannot be proven.
+- If a scheduler crashes after external side effects but before terminal
+  persistence, a later recovery must not silently duplicate work. It must either
+  prove completion from receipts and publish through the current generation or
+  report needs-human.
+- Context cancellation while another scheduler owns the claim is an observation
+  result, not permission to execute. Cancellation during claim acquisition must
+  roll back the whole database transaction and surface a typed cancellation or
+  observation result rather than raw SQLite lock text.
 - Parent reports MUST surface child runs even when a child has no final report,
   so interrupted or hidden child work cannot disappear from the tree.
 - Local-only reporter and relay records remain local-only. Nested reports do not

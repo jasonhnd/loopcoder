@@ -585,6 +585,18 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 		if child.ReplayAction != "" {
 			line += " action=" + child.ReplayAction
 		}
+		if child.ExecutionClaim != "" {
+			line += " claim=" + child.ExecutionClaim
+		}
+		if child.ExecutionOwnerID != "" {
+			line += " owner=" + child.ExecutionOwnerID
+		}
+		if child.ClaimGeneration > 0 {
+			line += fmt.Sprintf(" generation=%d", child.ClaimGeneration)
+		}
+		if child.LeaseExpiresAt != "" {
+			line += " lease_expires_at=" + child.LeaseExpiresAt
+		}
 		if child.Error != "" {
 			line += " error=" + reporter.BoundDecisionText(child.Error)
 		}

@@ -33,7 +33,7 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
@@ -83,6 +83,9 @@ func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
 	}
 	if !tableExists(t, store, "child_plans") {
 		t.Fatalf("missing child_plans table")
+	}
+	if !tableExists(t, store, "run_claims") {
+		t.Fatalf("missing run_claims table")
 	}
 	var rootRunID string
 	if err := store.WithTx(ctx, func(tx Tx) error {
@@ -687,6 +690,68 @@ func TestTransitionRunStatusValidatesAndRecordsHistory(t *testing.T) {
 	}
 	if eventCount != 3 {
 		t.Fatalf("run_events count = %d, want 3", eventCount)
+	}
+}
+
+func TestClaimChildRunExecutionExcludesConcurrentOwnerAndFencesCompletion(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	childID := children[0].RunID
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	claimA, err := ClaimChildRunExecution(ctx, store, parent.RunID, childID, "executor-a", now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution A: %v", err)
+	}
+	if claimA.Outcome != ClaimOutcomeClaimed || claimA.ClaimGeneration != 1 {
+		t.Fatalf("claim A = %#v, want claimed generation 1", claimA)
+	}
+	claimB, err := ClaimChildRunExecution(ctx, store, parent.RunID, childID, "executor-b", now.Add(time.Minute), now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution B: %v", err)
+	}
+	if claimB.Outcome != ClaimOutcomeAlreadyRunning || claimB.ExecutorID != "executor-a" || claimB.ClaimGeneration != 1 {
+		t.Fatalf("claim B = %#v, want already-running owned by executor-a generation 1", claimB)
+	}
+	takeover, err := ClaimChildRunExecution(ctx, store, parent.RunID, childID, "executor-c", now.Add(2*time.Hour), now.Add(3*time.Hour))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution takeover: %v", err)
+	}
+	if takeover.Outcome != ClaimOutcomeClaimed || takeover.PreviousOutcome != ClaimOutcomeStaleClaim || takeover.ClaimGeneration != 2 {
+		t.Fatalf("takeover = %#v, want claimed from stale generation 2", takeover)
+	}
+	if err := CompleteClaimedChildRunExecution(ctx, store, parent.RunID, childID, claimA, "succeeded", "2026-07-10T02:00:01Z", "stale completion"); err != ErrStaleClaimGeneration {
+		t.Fatalf("stale completion error = %v, want ErrStaleClaimGeneration", err)
+	}
+	if err := CompleteClaimedChildRunExecution(ctx, store, parent.RunID, childID, takeover, "succeeded", "2026-07-10T02:00:02Z", "owner completion"); err != nil {
+		t.Fatalf("owner completion: %v", err)
+	}
+	var runStatus, edgeStatus string
+	var runningEvents int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, childID).Scan(&runStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, parent.RunID, childID).Scan(&edgeStatus); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id = ? AND payload_json LIKE '%"status":"running"%'`, childID).Scan(&runningEvents)
+	}); err != nil {
+		t.Fatalf("query claimed child state: %v", err)
+	}
+	if runStatus != "succeeded" || edgeStatus != "succeeded" {
+		t.Fatalf("child status = %s/%s, want succeeded/succeeded", runStatus, edgeStatus)
+	}
+	if runningEvents != 2 {
+		t.Fatalf("running transition events = %d, want initial claim plus stale takeover", runningEvents)
 	}
 }
 

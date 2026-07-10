@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -45,6 +47,8 @@ const (
 	ReplayActionBlocked = "blocked"
 )
 
+var nestedExecutorSequence atomic.Uint64
+
 type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
 
@@ -65,6 +69,7 @@ type NestedScheduleOptions struct {
 	Clock            func() time.Time
 	Plan             *ChildPlan
 	Store            storage.Store
+	ExecutorID       string
 
 	Execute     ChildRunExecutor
 	RecordEvent RecordNestedEventFunc
@@ -120,6 +125,10 @@ type ChildRunResult struct {
 	Depth               int              `json:"depth"`
 	Status              string           `json:"status"`
 	ReplayAction        string           `json:"replay_action,omitempty"`
+	ExecutionClaim      string           `json:"execution_claim,omitempty"`
+	ExecutionOwnerID    string           `json:"execution_owner_id,omitempty"`
+	ClaimGeneration     int              `json:"claim_generation,omitempty"`
+	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -168,6 +177,10 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	clock := opts.Clock
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
+	}
+	executorID := strings.TrimSpace(opts.ExecutorID)
+	if executorID == "" {
+		executorID = nestedExecutorID()
 	}
 	started := opts.Now
 	if started.IsZero() {
@@ -352,18 +365,45 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	runChild := func(index int) {
 		child := children[index]
 		result := childResultFromPlan(child)
-		result.Status = NestedStatusRunning
-		result.StartedAt = state.FormatTimestamp(clock())
-		if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, NestedStatusRunning, result.StartedAt, "child provider launching"); err != nil {
-			if reused, ok := durableChildResultAfterLaunchRace(ctx, opts.Store, plan, child, result); ok {
-				results[index] = reused
-				return
-			}
+		claimAt := clock().UTC()
+		claim, err := storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(30*time.Minute))
+		result = applyExecutionClaim(result, claim)
+		if err != nil {
 			setCompleteErr(err)
 			return
 		}
+		switch claim.Outcome {
+		case storage.ClaimOutcomeClaimed:
+		case storage.ClaimOutcomeAlreadyRunning:
+			result.Status = NestedStatusRunning
+			result.ReplayAction = ReplayActionResumed
+			result.Reason = "another scheduler owns the active child execution claim"
+			result.NextAction = "observe the durable owner or retry after the claim lease expires"
+			results[index] = result
+			return
+		case storage.ClaimOutcomeTerminalReused:
+			result.Status = normalizeNestedStatus(claim.Status)
+			result.StartedAt = claim.StartedAt
+			result.FinishedAt = claim.FinishedAt
+			result.ReplayAction = ReplayActionReused
+			results[index] = result
+			return
+		case storage.ClaimOutcomeBlocked, storage.ClaimOutcomeStaleClaim:
+			result.Status = NestedStatusNeedsHuman
+			result.ReplayAction = ReplayActionBlocked
+			result.Error = "child execution ownership is blocked or ambiguous in durable state"
+			result.Reason = "nested child execution claim is not safe to execute automatically"
+			result.NextAction = "inspect durable claim ownership and recover or abandon the child run"
+			result.FinishedAt = state.FormatTimestamp(claimAt)
+			results[index] = withNestedDecision(result)
+			return
+		}
+		result.Status = NestedStatusRunning
+		if result.StartedAt == "" {
+			result.StartedAt = state.FormatTimestamp(claimAt)
+		}
 		eventMu.Lock()
-		err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
+		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
 		eventMu.Unlock()
 		setCompleteErr(err)
 		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock)); err != nil {
@@ -387,7 +427,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		results[index] = result
 
 		finishedAt := parseOrClock(result.FinishedAt, clock)
-		setCompleteErr(storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "child provider finished"))
+		setCompleteErr(storage.CompleteClaimedChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, claim, result.Status, result.FinishedAt, "child provider finished"))
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
 		eventMu.Unlock()
@@ -779,6 +819,33 @@ func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 		Status:       NestedStatusQueued,
 		ReplayAction: child.ReplayAction,
 	}
+}
+
+func nestedExecutorID() string {
+	seq := nestedExecutorSequence.Add(1)
+	return fmt.Sprintf("nested-scheduler:%d:%d:%d", os.Getpid(), time.Now().UTC().UnixNano(), seq)
+}
+
+func applyExecutionClaim(result ChildRunResult, claim storage.ClaimResult) ChildRunResult {
+	if claim.Outcome != "" {
+		result.ExecutionClaim = string(claim.Outcome)
+	}
+	if strings.TrimSpace(claim.ExecutorID) != "" {
+		result.ExecutionOwnerID = strings.TrimSpace(claim.ExecutorID)
+	}
+	if claim.ClaimGeneration > 0 {
+		result.ClaimGeneration = claim.ClaimGeneration
+	}
+	if strings.TrimSpace(claim.LeaseExpiresAt) != "" {
+		result.LeaseExpiresAt = strings.TrimSpace(claim.LeaseExpiresAt)
+	}
+	if strings.TrimSpace(claim.StartedAt) != "" {
+		result.StartedAt = strings.TrimSpace(claim.StartedAt)
+	}
+	if strings.TrimSpace(claim.FinishedAt) != "" {
+		result.FinishedAt = strings.TrimSpace(claim.FinishedAt)
+	}
+	return result
 }
 
 func durableChildResultAfterLaunchRace(ctx context.Context, store storage.Store, plan *ChildPlan, child ChildRunPlan, fallback ChildRunResult) (ChildRunResult, bool) {

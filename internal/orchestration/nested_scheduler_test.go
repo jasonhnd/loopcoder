@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1018,9 +1020,9 @@ func TestScheduleNestedRunsReplayPolicyForDurableStatuses(t *testing.T) {
 		wantExecute   bool
 		wantStatus    string
 	}{
-		{name: "failed", durableStatus: NestedStatusFailed, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
-		{name: "cancelled", durableStatus: NestedStatusCancelled, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
-		{name: "timed_out", durableStatus: NestedStatusTimedOut, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
+		{name: "failed", durableStatus: NestedStatusFailed, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusFailed},
+		{name: "cancelled", durableStatus: NestedStatusCancelled, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusCancelled},
+		{name: "timed_out", durableStatus: NestedStatusTimedOut, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusTimedOut},
 		{name: "needs_human", durableStatus: NestedStatusNeedsHuman, wantAction: ReplayActionBlocked, wantExecute: false, wantStatus: NestedStatusNeedsHuman},
 		{name: "interrupted", durableStatus: "interrupted", wantAction: ReplayActionResumed, wantExecute: true, wantStatus: NestedStatusSucceeded},
 	}
@@ -1102,6 +1104,10 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	planB.Items[0].Title = "Race child"
 
 	start := make(chan struct{})
+	executeEntered := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount atomic.Int32
+	var executeEnteredOnce sync.Once
 	type outcome struct {
 		report NestedScheduleReport
 		err    error
@@ -1117,6 +1123,9 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 			Plan:        &plan,
 			Store:       store,
 			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				executeCount.Add(1)
+				executeEnteredOnce.Do(func() { close(executeEntered) })
+				<-releaseExecute
 				return ChildRunResult{Status: NestedStatusSucceeded}, nil
 			},
 		})
@@ -1125,7 +1134,13 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	go run(storeA, planA, nestedTestNow().Add(10*time.Hour))
 	go run(storeB, planB, nestedTestNow().Add(48*time.Hour))
 	close(start)
+	select {
+	case <-executeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for claim winner to enter Execute")
+	}
 	first := <-done
+	close(releaseExecute)
 	second := <-done
 	for i, result := range []outcome{first, second} {
 		if result.err != nil {
@@ -1135,9 +1150,23 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 			t.Fatalf("concurrent replay %d run_id = %q, want created_at-derived identity", i, got)
 		}
 	}
+	if got := executeCount.Load(); got != 1 {
+		t.Fatalf("Execute calls = %d, want exactly one active child execution", got)
+	}
+	claims := []string{first.report.Children[0].ExecutionClaim, second.report.Children[0].ExecutionClaim}
+	sort.Strings(claims)
+	if !reflect.DeepEqual(claims, []string{string(storage.ClaimOutcomeAlreadyRunning), string(storage.ClaimOutcomeClaimed)}) {
+		t.Fatalf("claim outcomes = %#v, want claimed and already-running", claims)
+	}
 	plans, runs, edges, orphans := countNestedDurableRows(t, ctx, storeA, planA.RootRunID, planA.PlanID)
 	if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
 		t.Fatalf("concurrent durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
+	}
+	if got := countRunClaims(t, ctx, storeA, "run-20260709T000000Z-child-0-race-child"); got != 1 {
+		t.Fatalf("run_claims rows = %d, want 1", got)
+	}
+	if got := countRunStatusTransitionEvents(t, ctx, storeA, "run-20260709T000000Z-child-0-race-child", NestedStatusRunning); got != 1 {
+		t.Fatalf("running transition events = %d, want 1", got)
 	}
 }
 
@@ -1214,6 +1243,42 @@ func countNestedDurableRows(t *testing.T, ctx context.Context, store storage.Sto
 		t.Fatalf("query durable rows: %v", err)
 	}
 	return plans, runs, edges, orphans
+}
+
+func countRunClaims(t *testing.T, ctx context.Context, store storage.Store, runID string) int {
+	t.Helper()
+	var count int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, runID).Scan(&count)
+	}); err != nil {
+		t.Fatalf("query run_claims: %v", err)
+	}
+	return count
+}
+
+func countRunStatusTransitionEvents(t *testing.T, ctx context.Context, store storage.Store, runID, status string) int {
+	t.Helper()
+	var count int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = 'run.status.transition'`, runID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				return err
+			}
+			if strings.Contains(payload, `"status":"`+status+`"`) {
+				count++
+			}
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("query run transition events: %v", err)
+	}
+	return count
 }
 
 func nestedTestNow() time.Time {

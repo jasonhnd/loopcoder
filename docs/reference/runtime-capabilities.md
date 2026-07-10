@@ -177,6 +177,40 @@ terminate the process it launches. It does not mean the provider can guarantee a
 remote model-side cancellation after the local process has already exited or
 lost connectivity.
 
+## Nested Execution Ownership
+
+Nested child execution uses durable storage ownership before provider launch.
+For each child run, `run_claims` records the current `executor_id`,
+`claim_generation`, `claimed_at`, `lease_expires_at`, and `heartbeat_at`.
+Claim acquisition, child run status, child edge status, and the transition event
+are written in one immediate SQLite write transaction with bounded whole
+transaction retry on lock contention.
+
+Only a `claimed` result may launch the provider. A scheduler that sees another
+active owner returns an in-progress observation with the owner, generation,
+lease expiry, and replay action in the child result. A terminal child is reused
+from durable state. Blocked or ambiguous ownership fails closed as needs-human.
+
+Terminal completion is fenced by `run_id`, `executor_id`, and
+`claim_generation`. If a stale worker finishes after a newer generation takes
+over, its terminal write is rejected instead of overwriting the newer owner.
+Lease expiry allows controlled takeover with a higher generation; it does not
+prove that external side effects did or did not happen.
+
+Crash behavior is intentionally conservative:
+
+- Crash after claim but before provider launch leaves a running child with a
+  lease for observers or later takeover.
+- Crash during provider execution leaves durable ownership evidence but no
+  exactly-once guarantee for external commands.
+- Crash after external side effects but before terminal persistence requires
+  receipts or other proof before publishing success; otherwise recovery reports
+  needs-human.
+- Cancellation while observing another owner does not grant execution rights.
+
+Runtime output must expose owner, generation, lease expiry, and replay action
+without including local secrets.
+
 ## Read-only Support
 
 Read-only support is required for Verifier and Layer 2 audit-review provider
