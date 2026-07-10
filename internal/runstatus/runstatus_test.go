@@ -84,6 +84,39 @@ func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
 	}
 }
 
+func TestRunTreeSurfacesSelfChildEventAsGraphInconsistency(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-20260710T120000Z-wave"
+	if err := state.AppendEvent(repo, runID, state.Event{
+		Timestamp: "2026-07-10T12:00:00Z",
+		RunID:     runID,
+		JobID:     "nested-scheduler",
+		Phase:     "nested-scheduler",
+		Status:    state.StatusSucceeded,
+		Event:     "nested.child.finished",
+		Outcome:   state.StatusSucceeded,
+		Details:   json.RawMessage(`{"parent_run_id":"run-20260710T120000Z-wave","child":{"run_id":"run-20260710T120000Z-wave"},"result":{"run_id":"run-20260710T120000Z-wave"}}`),
+	}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(report.RunTree.Nodes) != 1 {
+		t.Fatalf("run tree nodes = %#v, want self node visible once", report.RunTree.Nodes)
+	}
+	node := report.RunTree.Nodes[0]
+	if len(node.ChildRunIDs) != 1 || node.ChildRunIDs[0] != runID || !strings.Contains(node.LastError, "references itself as child") {
+		t.Fatalf("self-child edge was hidden or lacks diagnostic: %#v", node)
+	}
+	got := Render(report)
+	if !strings.Contains(got, "last_error: graph inconsistency: run references itself as child") {
+		t.Fatalf("rendered status missing graph inconsistency:\n%s", got)
+	}
+}
+
 func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	repo := t.TempDir()
 	parent := "run-parent"

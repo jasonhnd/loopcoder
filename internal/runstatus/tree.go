@@ -70,15 +70,27 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 	if strings.TrimSpace(parentRunID) == "" {
 		parentRunID = firstNonEmpty(lifecycle.ParentRunID, eventParent)
 	}
+	var nodeProblems []string
+	if strings.TrimSpace(parentRunID) == runID {
+		nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as parent")
+	}
 	children := map[string]bool{}
 	for _, child := range lifecycle.ChildRunIDs {
-		if strings.TrimSpace(child) != "" && child != runID {
+		child = strings.TrimSpace(child)
+		if child != "" {
 			children[child] = true
+			if child == runID {
+				nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as child")
+			}
 		}
 	}
 	for _, child := range eventChildren {
-		if strings.TrimSpace(child) != "" && child != runID {
+		child = strings.TrimSpace(child)
+		if child != "" {
 			children[child] = true
+			if child == runID {
+				nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as child")
+			}
 		}
 	}
 
@@ -103,6 +115,12 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 	}
 	applyLifecycleTimestamps(&node, lifecycle.History)
 	applyRunNodeDetails(repoPath, runID, now, &node)
+	if len(nodeProblems) > 0 {
+		if strings.TrimSpace(node.LastError) != "" {
+			nodeProblems = append(nodeProblems, node.LastError)
+		}
+		node.LastError = strings.Join(dedupeStrings(nodeProblems), "; ")
+	}
 	nodes[runID] = &node
 
 	for _, child := range node.ChildRunIDs {
@@ -355,5 +373,19 @@ func sortedStringSet(values map[string]bool) []string {
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
 	return out
 }

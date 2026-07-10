@@ -35,6 +35,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -4204,9 +4205,9 @@ func TestNestedRunDispatchesThreeChildrenConcurrentlyAndHonorsDependencies(t *te
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
-		nestedPlanItem("beta", 702, nil, true, "write", nil),
-		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
+		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+		nestedPlanItem("beta", 702, nil, true, "read-only", nil),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "read-only", nil),
 	}, 2)
 
 	startedAlpha := make(chan struct{})
@@ -4324,7 +4325,7 @@ func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
 	}, 1)
 
 	var got worker.Options
@@ -4355,6 +4356,138 @@ func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
 	}
 	if got.Provider != "codex" {
 		t.Fatalf("provider = %q, want codex", got.Provider)
+	}
+}
+
+func TestNestedRunRejectsWriteCapableWorkerBeforeDispatch(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+	}, 1)
+	called := false
+
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	if called {
+		t.Fatal("dispatch was called despite unsupported scoped write contract")
+	}
+	if !strings.Contains(stdout.String(), "cannot enforce scoped writes") {
+		t.Fatalf("stdout missing scoped-write diagnostic: %q", stdout.String())
+	}
+}
+
+func TestNestedRunRejectsInvalidChildRunIDBeforeDispatchAndLeavesNoPartialGraph(t *testing.T) {
+	loopHome := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", loopHome)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	parentRunID := "run-20260710T120000Z-wave"
+	item := nestedPlanItem("alpha", 701, nil, true, "read-only", nil)
+	item.RunID = parentRunID
+	planPath := writeNestedPlanFixtureWithIDs(t, repo, parentRunID, parentRunID, 0, []orchestration.ChildRunPlan{item}, 1)
+	called := false
+
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	if called {
+		t.Fatal("dispatch was called despite invalid child run id")
+	}
+	if !strings.Contains(stderr.String(), "cannot reuse parent run id") {
+		t.Fatalf("stderr missing run-id diagnostic: %q", stderr.String())
+	}
+	assertStorageCounts(t, filepath.Join(loopHome, "data", "loopcoder.db"), 0, 0)
+}
+
+func TestEnforceNestedPlanScopeRejectsPhysicalEscapes(t *testing.T) {
+	repo := t.TempDir()
+	outside := t.TempDir()
+	absOutside := filepath.Join(outside, "outside.txt")
+	planForPath := func(path string) orchestration.ChildPlan {
+		return orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+			ChildKey:   "alpha",
+			Permission: "write",
+			Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{path}},
+		}}}
+	}
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "relative traversal", path: filepath.Join("..", "outside"), want: "escapes approved repo scope"},
+		{name: "absolute outside", path: absOutside, want: "escapes approved repo scope"},
+	}
+	if runtime.GOOS == "windows" {
+		tests = append(tests, struct {
+			name string
+			path string
+			want string
+		}{name: "windows volume escape", path: `Z:\loopcoder-outside`, want: "escapes approved repo scope"})
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := planForPath(tt.path)
+			err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &plan)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("enforceNestedPlanScope error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnforceNestedPlanScopeUsesPhysicalPathIdentity(t *testing.T) {
+	repo := t.TempDir()
+	inRepoDir := filepath.Join(repo, "src")
+	if err := os.MkdirAll(inRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir in-repo dir: %v", err)
+	}
+	alias := filepath.Join(repo, "alias-src")
+	if err := os.Symlink(inRepoDir, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	validAliasPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "alias",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("alias-src", "new.txt")}},
+	}}}
+	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &validAliasPlan); err != nil {
+		t.Fatalf("in-repo symlink alias rejected: %v", err)
+	}
+
+	outside := t.TempDir()
+	escape := filepath.Join(repo, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("second symlink unavailable: %v", err)
+	}
+	escapePlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "escape",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("escape", "owned.txt")}},
+	}}}
+	err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &escapePlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes approved repo scope") {
+		t.Fatalf("symlink escape error = %v, want escape diagnostic", err)
 	}
 }
 
@@ -5641,6 +5774,57 @@ func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.Chi
 		t.Fatalf("write child plan: %v", err)
 	}
 	return path
+}
+
+func writeNestedPlanFixtureWithIDs(t *testing.T, repo, parentRunID, rootRunID string, parentDepth int, items []orchestration.ChildRunPlan, maxConcurrency int) string {
+	t.Helper()
+	for i := range items {
+		if strings.TrimSpace(items[i].RunID) == "" {
+			items[i].RunID = state.RunIDForChild(items[i].ChildKey, i, fixedCLINow())
+		}
+		items[i].Ordinal = i
+	}
+	plan := orchestration.ChildPlan{
+		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
+		PlanID:         "plan-" + parentRunID,
+		ParentRunID:    parentRunID,
+		RootRunID:      rootRunID,
+		ParentDepth:    parentDepth,
+		MaxDepth:       2,
+		MaxConcurrency: maxConcurrency,
+		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
+		Items:          items,
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal child plan: %v", err)
+	}
+	path := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write child plan: %v", err)
+	}
+	return path
+}
+
+func assertStorageCounts(t *testing.T, path string, wantPlans, wantEdges int) {
+	t.Helper()
+	store, err := storage.Open(context.Background(), storage.Options{Path: path, Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	var plans, edges int
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		if err := tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM child_plans`).Scan(&plans); err != nil {
+			return err
+		}
+		return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM run_edges`).Scan(&edges)
+	}); err != nil {
+		t.Fatalf("query storage counts: %v", err)
+	}
+	if plans != wantPlans || edges != wantEdges {
+		t.Fatalf("storage counts plans/edges = %d/%d, want %d/%d", plans, edges, wantPlans, wantEdges)
+	}
 }
 
 func nestedPlanItem(key string, issue int, dependsOn []string, required bool, permission string, commands []string) orchestration.ChildRunPlan {

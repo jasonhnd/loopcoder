@@ -427,6 +427,12 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 		if !state.IsRunID(child.RunID) {
 			return nil, fmt.Errorf("child %q run id %q is invalid", child.ChildKey, child.RunID)
 		}
+		if child.RunID == opts.ParentRunID {
+			return nil, fmt.Errorf("child %q run id %q cannot reuse parent run id", child.ChildKey, child.RunID)
+		}
+		if child.RunID == opts.RootRunID {
+			return nil, fmt.Errorf("child %q run id %q cannot reuse root run id", child.ChildKey, child.RunID)
+		}
 		if seenRunIDs[child.RunID] {
 			return nil, fmt.Errorf("duplicate child run id %q", child.RunID)
 		}
