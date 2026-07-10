@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
@@ -39,8 +41,150 @@ func prettyModeForTarget(w io.Writer, deps Deps, forceEmoji bool) reporter.Prett
 }
 
 func renderPrettyReport(w io.Writer, record reporter.Report, mode reporter.PrettyMode) error {
-	_, err := fmt.Fprintln(w, record.Pretty(reporter.PrettyOptions{Mode: mode}))
+	return renderPrettyReportWithOptions(w, record, reporter.PrettyOptions{Mode: mode})
+}
+
+func renderPrettyReportWithOptions(w io.Writer, record reporter.Report, options reporter.PrettyOptions) error {
+	if strings.TrimSpace(options.DetailCommand) == "" {
+		options.DetailCommand = detailReportCommand(record)
+	}
+	if strings.TrimSpace(options.RawJSONCommand) == "" {
+		options.RawJSONCommand = rawJSONReportCommand(record)
+	}
+	_, err := fmt.Fprintln(w, record.Pretty(options))
 	return err
+}
+
+func prettyReport(record reporter.Report, options reporter.PrettyOptions) string {
+	if strings.TrimSpace(options.DetailCommand) == "" {
+		options.DetailCommand = detailReportCommand(record)
+	}
+	if strings.TrimSpace(options.RawJSONCommand) == "" {
+		options.RawJSONCommand = rawJSONReportCommand(record)
+	}
+	return record.Pretty(options)
+}
+
+func renderLoopreviewPrettyReport(w io.Writer, verdict loopreview.Verdict, mode reporter.PrettyMode) error {
+	if verdict.Report == nil {
+		return nil
+	}
+	_, err := fmt.Fprintln(w, loopreviewPrettyBlock(verdict, mode))
+	return err
+}
+
+func loopreviewPrettyBlock(verdict loopreview.Verdict, mode reporter.PrettyMode) string {
+	record := *verdict.Report
+	blocking := blockingFindingCount(verdict.Findings)
+	reason := firstReceiptLine(verdict.Evidence)
+	if reason == "" && len(verdict.Findings) > 0 {
+		reason = firstReceiptLine(verdict.Findings[0].Note)
+	}
+	next := []string{}
+	if verdict.Verdict == loopreview.VerdictNeedsHuman {
+		next = append(next, "human should decide whether the reported uncertainty is acceptable for this PR")
+	}
+	return prettyReport(record, reporter.PrettyOptions{
+		Mode:            mode,
+		Status:          verdict.Verdict,
+		PR:              prFromReport(record),
+		BlockingDefects: &blocking,
+		Reason:          reason,
+		SpecConformance: verdict.SpecConformance,
+		Findings:        prettyFindings(verdict.Findings),
+		Next:            next,
+	})
+}
+
+func dispatchPrettyBlock(record reporter.Report, status, pr, reason string, mode reporter.PrettyMode) string {
+	return prettyReport(record, reporter.PrettyOptions{
+		Mode:   mode,
+		Status: status,
+		PR:     firstNonEmptyString(pr, prFromReport(record)),
+		Reason: reason,
+	})
+}
+
+func prettyFindings(findings []loopreview.Finding) []reporter.PrettyFinding {
+	out := make([]reporter.PrettyFinding, 0, len(findings))
+	for _, finding := range findings {
+		out = append(out, reporter.PrettyFinding{
+			Severity: finding.Severity,
+			File:     finding.File,
+			Note:     finding.Note,
+		})
+	}
+	return out
+}
+
+func blockingFindingCount(findings []loopreview.Finding) int {
+	count := 0
+	for _, finding := range findings {
+		switch strings.ToLower(strings.TrimSpace(finding.Severity)) {
+		case "critical", "error", "high", "blocking":
+			count++
+		}
+	}
+	return count
+}
+
+func prFromReport(record reporter.Report) string {
+	action := strings.TrimSpace(record.Action)
+	index := strings.LastIndex(action, "#")
+	if index < 0 {
+		return ""
+	}
+	numberText := strings.TrimSpace(action[index+1:])
+	var digits strings.Builder
+	for _, r := range numberText {
+		if r < '0' || r > '9' {
+			break
+		}
+		digits.WriteRune(r)
+	}
+	if digits.Len() == 0 {
+		return ""
+	}
+	return "#" + digits.String()
+}
+
+func detailReportCommand(record reporter.Report) string {
+	if strings.TrimSpace(record.WorkID) == "" {
+		return "loopcoder report --verbose"
+	}
+	return "loopcoder report --work-id " + record.WorkID + " --verbose"
+}
+
+func rawJSONReportCommand(record reporter.Report) string {
+	if strings.TrimSpace(record.WorkID) == "" {
+		return "loopcoder report --format json"
+	}
+	return "loopcoder report --work-id " + record.WorkID + " --format json"
+}
+
+func firstReceiptLine(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	line, _, _ := strings.Cut(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
+	return line
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func formatPRNumber(number int) string {
+	if number <= 0 {
+		return ""
+	}
+	return "#" + strconv.Itoa(number)
 }
 
 func prettyTargetInteractive(w io.Writer, deps Deps) bool {

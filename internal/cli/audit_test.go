@@ -73,7 +73,7 @@ func TestAuditLLMRelayWritesLocalPrettyBlock(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stdout=%s stderr=%s", exitCode, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "report verified") {
+	if !strings.Contains(stderr.String(), "loopcoder report: verifier succeeded") {
 		t.Fatalf("stderr missing pretty report:\n%s", stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"attestation"`) {

@@ -79,17 +79,32 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 	text := RenderText(records)
 	for _, want := range []string{
 		"REPORTS",
-		"work_id: loopreview-99",
-		"source: relay-pending",
-		"run_id: loopreview-pr-99",
-		"source: attempt",
-		"run_id: run-test",
-		"model: claude-opus-4-8[1m] (max)",
-		"issue: #575",
-		"round: 2",
+		"loopcoder report: verifier succeeded",
+		"- work ID: loopreview-99",
+		"- source: relay-pending",
+		"- run ID: loopreview-pr-99",
+		"loopcoder report: worker succeeded",
+		"- source: attempt",
+		"- run ID: run-test",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
+		"- issue: #575",
+		"- round: 2",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("RenderText missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "canonical JSON") || strings.Contains(text, `"role":"worker"`) {
+		t.Fatalf("default RenderText included raw JSON:\n%s", text)
+	}
+	verboseText := RenderTextWithOptions(records, RenderOptions{Verbose: true})
+	for _, want := range []string{
+		"Raw record",
+		"- header: [reporter] role=worker",
+		"- canonical JSON: {\"work_id\":\"run-test\"",
+	} {
+		if !strings.Contains(verboseText, want) {
+			t.Fatalf("verbose RenderText missing %q:\n%s", want, verboseText)
 		}
 	}
 

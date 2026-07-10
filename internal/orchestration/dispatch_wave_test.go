@@ -464,9 +464,10 @@ func TestDispatchWaveStreamsWorkerCompletionBlocksAsWorkersFinish(t *testing.T) 
 	text := out.String()
 	for _, want := range []string{
 		"DISPATCH WAVE WORKER #2 succeeded",
-		"  action      \"implement issue #2\"",
+		"loopcoder report: worker succeeded",
+		"- action: \"implement issue #2\"",
 		"DISPATCH WAVE WORKER #1 succeeded",
-		"  action      \"implement issue #1\"",
+		"- action: \"implement issue #1\"",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("streamed output missing %q:\n%s", want, text)

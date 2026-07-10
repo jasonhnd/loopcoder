@@ -10,22 +10,30 @@ func TestPrettyVerifiedEmoji(t *testing.T) {
 	setPrettyTestLocalTime(t)
 	record := validRecord()
 
-	const want = "\u2705 report verified\n" +
-		"who\n" +
-		"  role        worker\n" +
-		"  provider    OpenAI Codex / codex\n" +
-		"  model       gpt-5.5 (xhigh) (parsed)\n" +
-		"  permission  write\n" +
-		"what\n" +
-		"  action      \"implement issue #172\"\n" +
-		"result\n" +
-		"  exit        0\n" +
-		"  duration    42.0s (42.0 s)\n" +
-		"  started     2026-06-28 09:00:00 JST\n" +
-		"  ended       2026-06-28 09:00:42 JST\n" +
-		"  verified    true\n" +
-		"cost\n" +
-		"  tokens      input=120  output=34  total=154"
+	const want = "\u2705 loopcoder report: worker succeeded\n\n" +
+		"Target\n" +
+		"- work ID: unset\n" +
+		"- issue: unset\n\n" +
+		"Verdict\n" +
+		"- status: succeeded\n" +
+		"- blocking defects: 0\n" +
+		"- reason: completed without a blocking report signal\n\n" +
+		"Review summary\n" +
+		"- acceptance criteria: not reviewed\n" +
+		"- regressions found: none reported\n" +
+		"- findings: none\n\n" +
+		"Run\n" +
+		"- worker: OpenAI Codex / codex / gpt-5.5 (xhigh) (parsed) / xhigh\n" +
+		"- permission: write\n" +
+		"- action: \"implement issue #172\"\n" +
+		"- exit: 0\n" +
+		"- duration: 42.0s\n" +
+		"- tokens: input=120  output=34  total=154\n" +
+		"- started: 2026-06-28 09:00:00 JST\n" +
+		"- ended: 2026-06-28 09:00:42 JST\n" +
+		"- verified: true\n\n" +
+		"Next\n" +
+		"- run verifier review before calling the PR merge-eligible"
 	if got := record.Pretty(PrettyOptions{}); got != want {
 		t.Fatalf("Pretty() = %q, want %q", got, want)
 	}
@@ -50,17 +58,15 @@ func TestPrettyFailedStatusHasPriority(t *testing.T) {
 	record.Verified = true
 
 	got := record.Pretty(PrettyOptions{})
-	if !strings.HasPrefix(got, "\u274c report failed\n") {
-		t.Fatalf("Pretty() status = %q, want failed", firstLine(got))
-	}
 	for _, want := range []string{
-		"  provider    Anthropic / claude",
-		"  model       claude-haiku-4-5-20251001 (parsed)",
-		"  exit        1",
-		"  ended       2026-06-28 09:00:03 JST",
-		"  duration    3.2s (3.2 s)",
-		"  tokens      input=2,447  output=4,947  total=7,394",
-		"  verified    true",
+		"\u274c loopcoder report: verifier failed",
+		"- verifier: Anthropic / claude / claude-haiku-4-5-20251001 (parsed) / unset",
+		"- status: failed",
+		"- exit: 1",
+		"- ended: 2026-06-28 09:00:03 JST",
+		"- duration: 3.2s",
+		"- tokens: input=2,447  output=4,947  total=7,394",
+		"- verified: true",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty() missing %q:\n%s", want, got)
@@ -84,22 +90,35 @@ func TestPrettySelfReportedPlainTotalOnly(t *testing.T) {
 	}
 	record.Verified = false
 
-	const want = `report: self-reported
-who
-  role        conductor
-  provider    codex-cli
-  model       gpt-5 (xhigh) (self-reported)
-  permission  orchestrate
-what
-  action      "merge PR #214"
-result
-  exit        0
-  duration    1m12.0s (72.0 s)
-  started     2026-06-28 09:00:00 JST
-  ended       2026-06-28 09:01:12 JST
-  verified    false
-cost
-  tokens      total=18,266`
+	const want = `loopcoder report: conductor self reported
+
+Target
+- work ID: unset
+- issue: unset
+
+Verdict
+- status: self-reported
+- blocking defects: 0
+- reason: record was self-reported and not independently verified
+
+Review summary
+- acceptance criteria: not reviewed
+- regressions found: none reported
+- findings: none
+
+Run
+- conductor: codex-cli / gpt-5 (xhigh) (self-reported) / xhigh
+- permission: orchestrate
+- action: "merge PR #214"
+- exit: 0
+- duration: 1m12.0s
+- tokens: total=18,266
+- started: 2026-06-28 09:00:00 JST
+- ended: 2026-06-28 09:01:12 JST
+- verified: false
+
+Next
+- inspect the report before continuing`
 	if got := record.Pretty(PrettyOptions{Mode: PrettyModePlain}); got != want {
 		t.Fatalf("Pretty(plain) = %q, want %q", got, want)
 	}
@@ -124,12 +143,8 @@ func TestPrettyProviderDisplay(t *testing.T) {
 			record.Provider = tt.provider
 
 			got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-			for _, want := range []string{
-				"  provider    " + tt.display,
-			} {
-				if !strings.Contains(got, want) {
-					t.Fatalf("Pretty() missing %q:\n%s", want, got)
-				}
+			if !strings.Contains(got, "- worker: "+tt.display+" /") {
+				t.Fatalf("Pretty() missing provider display %q:\n%s", tt.display, got)
 			}
 		})
 	}
@@ -140,7 +155,7 @@ func TestPrettyTimestampFallbackKeepsRawValue(t *testing.T) {
 	record.StartedAt = "not-rfc3339"
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-	if !strings.Contains(got, "  started     not-rfc3339") {
+	if !strings.Contains(got, "- started: not-rfc3339") {
 		t.Fatalf("Pretty() missing raw fallback timestamp:\n%s", got)
 	}
 }
@@ -158,12 +173,12 @@ func TestPrettyContextAndModelDepthDisplay(t *testing.T) {
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
 	for _, want := range []string{
-		"  model       Gemini 3.1 Pro (High) (self-reported)",
-		"  work_id     run-20260707-issue-567",
-		"  issue       #567",
-		"  branch      loop/issue-567",
-		`  worktree    C:\repo\.worktrees\issue-567`,
-		"  round       2",
+		"- worker: OpenAI Codex / codex / Gemini 3.1 Pro (High) (self-reported) / High",
+		"- work ID: run-20260707-issue-567",
+		"- issue: #567",
+		"- branch: loop/issue-567",
+		`- worktree: C:\repo\.worktrees\issue-567`,
+		"- round: 2",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty() missing %q:\n%s", want, got)
@@ -180,15 +195,89 @@ func TestPrettyEscapesActionControlCharacters(t *testing.T) {
 	record.Action = "first line\nsecond line\t\"quoted\"\x00done"
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-	const wantAction = `  action      "first line\nsecond line\t\"quoted\"\x00done"`
+	const wantAction = `- action: "first line\nsecond line\t\"quoted\"\x00done"`
 	if !strings.Contains(got, wantAction) {
 		t.Fatalf("Pretty() missing escaped action %q:\n%s", wantAction, got)
 	}
-	if lineCount(got) != 16 {
-		t.Fatalf("Pretty() rendered %d lines, want 16:\n%s", lineCount(got), got)
-	}
 	if strings.Contains(got, "second line\t") {
 		t.Fatalf("Pretty() contains an unescaped tab/newline action fragment:\n%s", got)
+	}
+}
+
+func TestPrettyFindingsAreSummarizedBeforeDetails(t *testing.T) {
+	record := validRecord()
+	blocking := 1
+
+	got := record.Pretty(PrettyOptions{
+		Mode:               PrettyModePlain,
+		Status:             "needs-human",
+		BlockingDefects:    &blocking,
+		Reason:             "merged design/spec evidence was not found\nextra detail",
+		SpecConformance:    "not-applicable",
+		ShowFindingDetails: true,
+		Findings: []PrettyFinding{
+			{Severity: "warning", File: "docs/specs/design.md", Note: "missing evidence"},
+			{Severity: "low", File: "README.md", Note: "minor ambiguity"},
+			{Severity: "error", File: "main.go", Note: "blocking defect"},
+		},
+	})
+
+	assertOrder(t, got,
+		"- findings: 1 error, 1 warning, 1 low",
+		"- finding details:",
+		"  - warning: docs/specs/design.md - missing evidence",
+	)
+	for _, want := range []string{
+		"loopcoder report: worker needs human",
+		"- status: needs-human",
+		"- blocking defects: 1",
+		"- reason: merged design/spec evidence was not found",
+		"- acceptance criteria: not applicable",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Pretty() missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPrettyStableStatusFixtures(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		reason string
+		want   []string
+	}{
+		{
+			name:   "timeout",
+			status: "timed_out",
+			want:   []string{"loopcoder report: worker timed out", "- status: timed_out", "- reason: command timed out"},
+		},
+		{
+			name:   "cancelled",
+			status: "cancelled",
+			want:   []string{"loopcoder report: worker cancelled", "- status: cancelled", "- reason: command was cancelled"},
+		},
+		{
+			name:   "partial child failure",
+			status: "needs-human",
+			reason: "child run failed after partial completion",
+			want:   []string{"loopcoder report: worker needs human", "- status: needs-human", "- reason: child run failed after partial completion"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validRecord().Pretty(PrettyOptions{
+				Mode:   PrettyModePlain,
+				Status: tt.status,
+				Reason: tt.reason,
+			})
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("Pretty() missing %q:\n%s", want, got)
+				}
+			}
+		})
 	}
 }
 
@@ -203,22 +292,24 @@ func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"report: verified",
-		"who",
-		"  role        worker",
-		"  provider    OpenAI Codex / codex",
-		"  model       gpt-5.5 (xhigh) (parsed)",
-		"  permission  write",
-		"what",
-		"  action      \"implement issue #172\"",
-		"result",
-		"  exit        0",
-		"  duration    42.0s (42.0 s)",
-		"  started     2026-06-28 09:00:00 JST",
-		"  ended       2026-06-28 09:00:42 JST",
-		"  verified    true",
-		"cost",
-		"  tokens      input=120  output=34  total=154",
+		"loopcoder report: worker succeeded",
+		"Target",
+		"- work ID: unset",
+		"Verdict",
+		"- status: succeeded",
+		"Review summary",
+		"- findings: none",
+		"Run",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (xhigh) (parsed) / xhigh",
+		"- permission: write",
+		"- action: \"implement issue #172\"",
+		"- exit: 0",
+		"- duration: 42.0s",
+		"- tokens: input=120  output=34  total=154",
+		"- started: 2026-06-28 09:00:00 JST",
+		"- ended: 2026-06-28 09:00:42 JST",
+		"- verified: true",
+		"Next",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty(plain) missing %q:\n%s", want, got)
@@ -258,14 +349,17 @@ func setPrettyTestLocalTime(t *testing.T) {
 	})
 }
 
-func firstLine(value string) string {
-	line, _, _ := strings.Cut(value, "\n")
-	return line
-}
-
-func lineCount(value string) int {
-	if value == "" {
-		return 0
+func assertOrder(t *testing.T, text string, values ...string) {
+	t.Helper()
+	previous := -1
+	for _, value := range values {
+		index := strings.Index(text, value)
+		if index < 0 {
+			t.Fatalf("missing %q:\n%s", value, text)
+		}
+		if index <= previous {
+			t.Fatalf("%q appeared out of order:\n%s", value, text)
+		}
+		previous = index
 	}
-	return strings.Count(value, "\n") + 1
 }

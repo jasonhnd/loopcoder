@@ -446,6 +446,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
 		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose          include raw canonical records in text output")
 	}
 	if command.Name == "models" {
 		fmt.Fprintln(w, "  --provider string   registry provider key to render")
@@ -2209,7 +2210,7 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 }
 
 func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record reporter.Report, mode reporter.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
-	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
+	pretty := prettyReport(record, reporter.PrettyOptions{Mode: mode, PR: formatPRNumber(prNumber)})
 	nonce := relaygate.Nonce(runID, prNumber, role)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
@@ -2361,7 +2362,12 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 			if result.Report == nil {
 				continue
 			}
-			if err := renderPrettyReport(w, *result.Report, mode); err != nil {
+			if err := renderPrettyReportWithOptions(w, *result.Report, reporter.PrettyOptions{
+				Mode:   mode,
+				Status: result.Status,
+				PR:     result.PR,
+				Reason: result.Error,
+			}); err != nil {
 				return err
 			}
 		}
@@ -2370,7 +2376,16 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 		if review.Report == nil {
 			continue
 		}
-		if err := renderPrettyReport(w, *review.Report, mode); err != nil {
+		blocking := blockingFindingCount(review.Findings)
+		if err := renderPrettyReportWithOptions(w, *review.Report, reporter.PrettyOptions{
+			Mode:            mode,
+			Status:          review.Verdict,
+			PR:              firstNonEmptyString(formatPRNumber(review.PRNumber), review.PR),
+			BlockingDefects: &blocking,
+			Reason:          firstNonEmptyString(firstReceiptLine(review.Evidence), firstReceiptLine(review.Error)),
+			SpecConformance: review.SpecConformance,
+			Findings:        prettyFindings(review.Findings),
+		}); err != nil {
 			return err
 		}
 	}
@@ -3289,7 +3304,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return 1
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
+			if err := renderPrettyReportWithOptions(stderr, *result.Report, reporter.PrettyOptions{
+				Mode:   mode,
+				Status: result.Status,
+				PR:     result.PR,
+			}); err != nil {
 				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
 			}
@@ -3303,7 +3322,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 	if invocationID == "" {
 		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
 	}
-	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
+	pretty := dispatchPrettyBlock(record, result.Status, result.PR, "", mode)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        result.RunID,
@@ -3339,8 +3358,12 @@ func relayInvocationIDFromAttemptPath(attemptPath string) string {
 	return strings.TrimSuffix(base, ".attempt.json")
 }
 
-func writeLoopreviewRelayLedger(opts loopreview.Options, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
-	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
+func writeLoopreviewRelayLedger(opts loopreview.Options, verdict loopreview.Verdict, mode reporter.PrettyMode, now time.Time) error {
+	if verdict.Report == nil {
+		return nil
+	}
+	record := *verdict.Report
+	pretty := loopreviewPrettyBlock(verdict, mode)
 	runID := fmt.Sprintf("loopreview-pr-%d", opts.PRNumber)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
@@ -3971,7 +3994,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if invocationID == "" {
 			invocationID = fmt.Sprintf("dispatch-wave-issue-%d-%d", result.Issue, deps.Now().UTC().UnixNano())
 		}
-		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
+		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Error, prettyMode)
 		if _, err := relay.Write(relay.Entry{
 			RepoPath:     resolvedRepo,
 			RunID:        runID,
@@ -4010,7 +4033,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if !renderPretty {
 			return nil
 		}
-		prettyBlock := result.Report.Pretty(reporter.PrettyOptions{Mode: prettyMode})
+		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Error, prettyMode)
 		text := orchestration.RenderDispatchWaveIssueCompletion(result, prettyBlock)
 		if _, err := stdout.Write([]byte(text)); err != nil {
 			return fmt.Errorf("write worker #%d completion: %w", result.Issue, err)
@@ -4436,12 +4459,12 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if result.Verdict.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeLoopreviewRelayLedger(opts, *result.Verdict.Report, mode, deps.Now()); err != nil {
+		if err := writeLoopreviewRelayLedger(opts, result.Verdict, mode, deps.Now()); err != nil {
 			fmt.Fprintf(stderr, "loopreview: write relay ledger: %v\n", err)
 			return loopreviewCommandFailureExitCode
 		}
 		if shouldRenderPretty(noPretty) {
-			if err := renderPrettyReport(stderr, *result.Verdict.Report, mode); err != nil {
+			if err := renderLoopreviewPrettyReport(stderr, result.Verdict, mode); err != nil {
 				fmt.Fprintf(stderr, "loopreview: write pretty report: %v\n", err)
 				return loopreviewCommandFailureExitCode
 			}
@@ -4700,6 +4723,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	var limitAlias int
 	format := "text"
 	var formatAlias string
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4717,6 +4742,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&limitAlias, "Limit", 0, "limit")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include raw canonical records in text output")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw canonical records in text output")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -4745,6 +4772,7 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	verbose = verbose || verboseAlias
 	switch format {
 	case "text", "json":
 	default:
@@ -4805,7 +4833,7 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	if _, err := stdout.Write([]byte(reportquery.RenderText(records))); err != nil {
+	if _, err := stdout.Write([]byte(reportquery.RenderTextWithOptions(records, reportquery.RenderOptions{Verbose: verbose}))); err != nil {
 		fmt.Fprintf(stderr, "report: write output: %v\n", err)
 		return 1
 	}

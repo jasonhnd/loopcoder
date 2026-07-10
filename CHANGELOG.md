@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reporter receipt rendering** - Worker, Verifier, audit, and Conductor
+  pretty output now uses compact `Target`, `Verdict`, `Review summary`, `Run`,
+  and `Next` receipts; `loopcoder report --verbose` exposes raw canonical
+  records in text mode while `--format json` remains JSON-only.
 - **v0.7.0 self-bootstrap acceptance** - added
   `docs/reference/self-bootstrap.md` and
   `scripts/self-bootstrap-smoke.ps1` so the release can prove loopcoder's own
