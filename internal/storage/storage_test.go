@@ -469,6 +469,257 @@ func TestWithTxCommitsOnSuccess(t *testing.T) {
 	}
 }
 
+func TestPersistChildPlanGraphRejectsCyclesAndInconsistentRunGraph(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(context.Context, Store)
+		edit func(*RunNode, []RunNode, *ChildPlanRecord, []RunEdgeRecord)
+		want string
+	}{
+		{
+			name: "parent_child_self_cycle",
+			edit: func(parent *RunNode, children []RunNode, plan *ChildPlanRecord, edges []RunEdgeRecord) {
+				children[0].RunID = parent.RunID
+				children[0].ParentRunID = parent.RunID
+				edges[0].ChildRunID = parent.RunID
+			},
+			want: "cannot reuse parent run id",
+		},
+		{
+			name: "child_reuses_root_ancestor",
+			seed: func(ctx context.Context, store Store) {
+				seedRunGraphRows(t, ctx, store, []RunNode{
+					{RunID: "run-root", RootRunID: "run-root", Depth: 0, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+					{RunID: "run-parent", ParentRunID: "run-root", RootRunID: "run-root", Depth: 1, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				}, []RunEdgeRecord{
+					{ParentRunID: "run-root", ChildRunID: "run-parent", RootRunID: "run-root", Depth: 1, PlanID: "seed-plan", ChildKey: "parent", Ordinal: 0, ScopeJSON: "{}", AggregationJSON: "{}", Permission: "write", Status: "succeeded", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				})
+			},
+			edit: func(parent *RunNode, children []RunNode, plan *ChildPlanRecord, edges []RunEdgeRecord) {
+				parent.RunID = "run-parent"
+				parent.ParentRunID = "run-root"
+				parent.RootRunID = "run-root"
+				parent.Depth = 1
+				plan.ParentRunID = "run-parent"
+				plan.RootRunID = "run-root"
+				children[0].RunID = "run-root"
+				children[0].ParentRunID = "run-parent"
+				children[0].RootRunID = "run-root"
+				children[0].Depth = 2
+				edges[0].ParentRunID = "run-parent"
+				edges[0].ChildRunID = "run-root"
+				edges[0].RootRunID = "run-root"
+				edges[0].Depth = 2
+			},
+			want: "cannot reuse root run id",
+		},
+		{
+			name: "multi_level_cycle",
+			seed: func(ctx context.Context, store Store) {
+				seedRunGraphRows(t, ctx, store, []RunNode{
+					{RunID: "run-root", RootRunID: "run-root", Depth: 0, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+					{RunID: "run-a", ParentRunID: "run-root", RootRunID: "run-root", Depth: 1, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+					{RunID: "run-b", ParentRunID: "run-a", RootRunID: "run-root", Depth: 2, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				}, []RunEdgeRecord{
+					{ParentRunID: "run-root", ChildRunID: "run-a", RootRunID: "run-root", Depth: 1, PlanID: "seed-plan-a", ChildKey: "a", Ordinal: 0, ScopeJSON: "{}", AggregationJSON: "{}", Permission: "write", Status: "succeeded", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+					{ParentRunID: "run-a", ChildRunID: "run-b", RootRunID: "run-root", Depth: 2, PlanID: "seed-plan-b", ChildKey: "b", Ordinal: 0, ScopeJSON: "{}", AggregationJSON: "{}", Permission: "write", Status: "succeeded", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				})
+			},
+			edit: func(parent *RunNode, children []RunNode, plan *ChildPlanRecord, edges []RunEdgeRecord) {
+				parent.RunID = "run-b"
+				parent.ParentRunID = "run-a"
+				parent.RootRunID = "run-root"
+				parent.Depth = 2
+				plan.ParentRunID = "run-b"
+				plan.RootRunID = "run-root"
+				children[0].RunID = "run-a"
+				children[0].ParentRunID = "run-b"
+				children[0].RootRunID = "run-root"
+				children[0].Depth = 3
+				edges[0].ParentRunID = "run-b"
+				edges[0].ChildRunID = "run-a"
+				edges[0].RootRunID = "run-root"
+				edges[0].Depth = 3
+			},
+			want: "cannot reuse ancestor run id",
+		},
+		{
+			name: "root_mismatch",
+			seed: func(ctx context.Context, store Store) {
+				seedRunGraphRows(t, ctx, store, []RunNode{
+					{RunID: "run-parent", RootRunID: "run-parent", Depth: 0, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				}, nil)
+			},
+			edit: func(parent *RunNode, children []RunNode, plan *ChildPlanRecord, edges []RunEdgeRecord) {
+				parent.RootRunID = "run-other-root"
+				plan.RootRunID = "run-other-root"
+				children[0].RootRunID = "run-other-root"
+				edges[0].RootRunID = "run-other-root"
+			},
+			want: "root mismatch",
+		},
+		{
+			name: "depth_mismatch",
+			seed: func(ctx context.Context, store Store) {
+				seedRunGraphRows(t, ctx, store, []RunNode{
+					{RunID: "run-parent", RootRunID: "run-parent", Depth: 1, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				}, nil)
+			},
+			want: "depth mismatch",
+		},
+		{
+			name: "existing_child_belongs_to_another_parent",
+			seed: func(ctx context.Context, store Store) {
+				seedRunGraphRows(t, ctx, store, []RunNode{
+					{RunID: "run-other-parent", RootRunID: "run-other-parent", Depth: 0, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+					{RunID: "run-child", ParentRunID: "run-other-parent", RootRunID: "run-other-parent", Depth: 1, Status: "queued", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				}, []RunEdgeRecord{
+					{ParentRunID: "run-other-parent", ChildRunID: "run-child", RootRunID: "run-other-parent", Depth: 1, PlanID: "seed-plan", ChildKey: "seed-child", Ordinal: 0, ScopeJSON: "{}", AggregationJSON: "{}", Permission: "write", Status: "queued", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+				})
+			},
+			want: "parent mismatch",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open returned error: %v", err)
+			}
+			defer store.Close()
+			if tt.seed != nil {
+				tt.seed(ctx, store)
+			}
+			parent, children, plan, edges := validChildPlanGraphFixture()
+			if tt.edit != nil {
+				tt.edit(&parent, children, &plan, edges)
+			}
+			err = PersistChildPlanGraph(ctx, store, parent, children, plan, edges)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("PersistChildPlanGraph error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPersistChildPlanGraphRejectsInvalidGraphWithoutPartialRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	children[0].RunID = parent.RunID
+	edges[0].ChildRunID = parent.RunID
+	err = PersistChildPlanGraph(ctx, store, parent, children, plan, edges)
+	if err == nil {
+		t.Fatal("PersistChildPlanGraph returned nil error, want self-cycle rejection")
+	}
+	var planCount, edgeCount, runCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans`).Scan(&planCount); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_edges`).Scan(&edgeCount); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM runs`).Scan(&runCount)
+	}); err != nil {
+		t.Fatalf("query counts: %v", err)
+	}
+	if planCount != 0 || edgeCount != 0 || runCount != 0 {
+		t.Fatalf("partial rows plans/edges/runs = %d/%d/%d, want 0/0/0", planCount, edgeCount, runCount)
+	}
+}
+
+func TestTransitionRunStatusValidatesAndRecordsHistory(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+
+	if err := TransitionChildRunStatus(ctx, store, parent.RunID, children[0].RunID, "running", "2026-07-10T00:00:01Z", "launch"); err != nil {
+		t.Fatalf("TransitionChildRunStatus running: %v", err)
+	}
+	if err := TransitionChildRunStatus(ctx, store, parent.RunID, children[0].RunID, "succeeded", "2026-07-10T00:00:02Z", "finished"); err != nil {
+		t.Fatalf("TransitionChildRunStatus succeeded: %v", err)
+	}
+	if err := TransitionParentRunStatus(ctx, store, parent.RunID, "succeeded_with_optional_failures", "2026-07-10T00:00:03Z", "aggregate"); err != nil {
+		t.Fatalf("TransitionParentRunStatus optional failures: %v", err)
+	}
+	err = TransitionRunStatus(ctx, store, RunStatusTransition{RunID: parent.RunID, Status: "running", UpdatedAt: "2026-07-10T00:00:04Z"})
+	if err == nil || !strings.Contains(err.Error(), "succeeded_with_optional_failures -> running") {
+		t.Fatalf("terminal transition error = %v, want invalid optional-failures -> running", err)
+	}
+
+	var childStatus, edgeStatus, parentStatus, parentEndedAt string
+	var eventCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, children[0].RunID).Scan(&childStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, parent.RunID, children[0].RunID).Scan(&edgeStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(ended_at, '') FROM runs WHERE id = ?`, parent.RunID).Scan(&parentStatus, &parentEndedAt); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id IN (?, ?)`, parent.RunID, children[0].RunID).Scan(&eventCount)
+	}); err != nil {
+		t.Fatalf("query transition state: %v", err)
+	}
+	if childStatus != "succeeded" || edgeStatus != "succeeded" {
+		t.Fatalf("child/edge status = %q/%q, want succeeded/succeeded", childStatus, edgeStatus)
+	}
+	if parentStatus != "succeeded_with_optional_failures" || parentEndedAt == "" {
+		t.Fatalf("parent status/ended_at = %q/%q, want optional-failures with ended_at", parentStatus, parentEndedAt)
+	}
+	if eventCount != 3 {
+		t.Fatalf("run_events count = %d, want 3", eventCount)
+	}
+}
+
+func TestCheckHealthRejectsCorruptDurableRunGraph(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	seedRunGraphRows(t, ctx, store, []RunNode{
+		{RunID: "run-a", RootRunID: "run-a", Depth: 0, Status: "running", CreatedAt: "2026-07-10T00:00:00Z", UpdatedAt: "2026-07-10T00:00:00Z"},
+	}, nil)
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at, root_run_id, plan_id, child_key, depth, ordinal, scope_json, permission, aggregation_json, status, updated_at)
+			VALUES ('run-a', 'run-a', 'child', '2026-07-10T00:00:00Z', 'run-a', 'corrupt-plan', 'self', 0, 0, '{}', 'write', '{}', 'queued', '2026-07-10T00:00:00Z')`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed corrupt self-edge: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	health, err := CheckHealth(ctx, path)
+	if err == nil {
+		t.Fatalf("CheckHealth returned nil error, health=%#v", health)
+	}
+	if !strings.Contains(err.Error(), "self-edge") {
+		t.Fatalf("CheckHealth error = %v, want self-edge diagnostic", err)
+	}
+}
+
 func TestCheckHealthReportsMissingDatabaseWithoutCreatingIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
 
@@ -603,6 +854,74 @@ func createV3Schema(t *testing.T, db *sql.DB) {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("exec v3 fixture statement: %v\n%s", err, statement)
 		}
+	}
+}
+
+func validChildPlanGraphFixture() (RunNode, []RunNode, ChildPlanRecord, []RunEdgeRecord) {
+	at := "2026-07-10T00:00:00Z"
+	parent := RunNode{
+		RunID:     "run-parent",
+		RootRunID: "run-parent",
+		Depth:     0,
+		Origin:    "nested_parent",
+		Status:    "running",
+		CreatedAt: at,
+		UpdatedAt: at,
+	}
+	children := []RunNode{{
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		RootRunID:   "run-parent",
+		Depth:       1,
+		Origin:      "sub_agent",
+		Status:      "queued",
+		CreatedAt:   at,
+		UpdatedAt:   at,
+	}}
+	plan := ChildPlanRecord{
+		PlanID:         "plan-run-parent",
+		ParentRunID:    "run-parent",
+		RootRunID:      "run-parent",
+		SchemaVersion:  "loopcoder.child_plan.v1",
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		PlanJSON:       `{"schema_version":"loopcoder.child_plan.v1"}`,
+		CreatedAt:      at,
+	}
+	edges := []RunEdgeRecord{{
+		ParentRunID:     "run-parent",
+		ChildRunID:      "run-child",
+		RootRunID:       "run-parent",
+		PlanID:          "plan-run-parent",
+		ChildKey:        "child",
+		Depth:           1,
+		Ordinal:         0,
+		ScopeJSON:       "{}",
+		Permission:      "write",
+		AggregationJSON: "{}",
+		Status:          "queued",
+		CreatedAt:       at,
+		UpdatedAt:       at,
+	}}
+	return parent, children, plan, edges
+}
+
+func seedRunGraphRows(t *testing.T, ctx context.Context, store Store, runs []RunNode, edges []RunEdgeRecord) {
+	t.Helper()
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		for _, run := range runs {
+			if err := upsertRunNode(ctx, tx, run); err != nil {
+				return err
+			}
+		}
+		for _, edge := range edges {
+			if err := upsertRunEdge(ctx, tx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed run graph rows: %v", err)
 	}
 }
 

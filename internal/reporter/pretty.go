@@ -29,6 +29,7 @@ type PrettyOptions struct {
 	ShowFindingDetails bool
 	DetailCommand      string
 	RawJSONCommand     string
+	NextAction         string
 	Next               []string
 }
 
@@ -262,28 +263,11 @@ func formatBlockingDefects(r Report, options PrettyOptions) string {
 }
 
 func prettyReason(r Report, options PrettyOptions, status prettyReceiptStatus) string {
-	if reason := strings.TrimSpace(options.Reason); reason != "" {
-		return firstPrettyLine(reason)
-	}
-	switch status.value {
-	case "pass", "succeeded":
-		return "completed without a blocking report signal"
-	case "needs-human":
-		return "human judgment is required before continuing"
-	case "fail", "failed":
-		return "command exited non-zero or reported failure"
-	case "timed_out":
-		return "command timed out"
-	case "cancelled":
-		return "command was cancelled"
-	case "self-reported":
-		return "record was self-reported and not independently verified"
-	default:
-		if r.ExitCode != 0 {
-			return "command exited with code " + strconv.Itoa(r.ExitCode)
-		}
-		return "no additional reason reported"
-	}
+	return NormalizeDecision(DecisionInput{
+		Status:         status.value,
+		ExplicitReason: options.Reason,
+		ConcreteError:  exitCodeReason(r),
+	}).Reason
 }
 
 func formatAcceptanceCriteria(specConformance string) string {
@@ -361,6 +345,12 @@ func nextLines(r Report, status prettyReceiptStatus, options PrettyOptions) []st
 	if len(options.Next) > 0 {
 		return prefixBullets(options.Next)
 	}
+	if next := strings.TrimSpace(options.NextAction); next != "" {
+		return prefixBullets([]string{NormalizeDecision(DecisionInput{
+			Status:             status.value,
+			ExplicitNextAction: next,
+		}).NextAction})
+	}
 	var lines []string
 	switch status.value {
 	case "pass":
@@ -385,6 +375,13 @@ func nextLines(r Report, status prettyReceiptStatus, options PrettyOptions) []st
 		lines = append(lines, "raw JSON: "+options.RawJSONCommand)
 	}
 	return prefixBullets(lines)
+}
+
+func exitCodeReason(r Report) string {
+	if r.ExitCode == 0 {
+		return ""
+	}
+	return "command exited with code " + strconv.Itoa(r.ExitCode)
 }
 
 func prefixBullets(values []string) []string {

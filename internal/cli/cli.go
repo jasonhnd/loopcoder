@@ -2202,7 +2202,13 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			if result.Report == nil {
 				continue
 			}
-			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Report.Role), prNumberFromPR(result.PR), *result.Report, mode, preExisting)
+			rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(result.Report.Role), prNumberFromPR(result.PR), *result.Report, reporter.PrettyOptions{
+				Mode:       mode,
+				Status:     result.Status,
+				PR:         result.PR,
+				Reason:     result.Reason,
+				NextAction: result.NextAction,
+			}, preExisting)
 			if err != nil {
 				return records, err
 			}
@@ -2220,7 +2226,16 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 			prNumber = prNumberFromPR(review.PR)
 		}
 		runID := fmt.Sprintf("loopreview-pr-%d", prNumber)
-		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Report.Role), prNumber, *review.Report, mode, preExisting)
+		rec, ok, err := writeAutonomousRelayRecord(repoPath, runID, string(review.Report.Role), prNumber, *review.Report, reporter.PrettyOptions{
+			Mode:            mode,
+			Status:          review.Verdict,
+			PR:              firstNonEmptyString(formatPRNumber(prNumber), review.PR),
+			BlockingDefects: intPtr(blockingFindingCount(review.Findings)),
+			Reason:          review.Reason,
+			SpecConformance: review.SpecConformance,
+			Findings:        prettyFindings(review.Findings),
+			NextAction:      review.NextAction,
+		}, preExisting)
 		if err != nil {
 			return records, err
 		}
@@ -2231,8 +2246,11 @@ func writeTickRelayRecords(repoPath string, report orchestration.TickReport, mod
 	return records, nil
 }
 
-func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record reporter.Report, mode reporter.PrettyMode, preExisting map[string]bool) (relaygate.Record, bool, error) {
-	pretty := prettyReport(record, reporter.PrettyOptions{Mode: mode, PR: formatPRNumber(prNumber)})
+func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, record reporter.Report, options reporter.PrettyOptions, preExisting map[string]bool) (relaygate.Record, bool, error) {
+	if strings.TrimSpace(options.PR) == "" {
+		options.PR = formatPRNumber(prNumber)
+	}
+	pretty := prettyReport(record, options)
 	nonce := relaygate.Nonce(runID, prNumber, role)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
@@ -2385,10 +2403,11 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 				continue
 			}
 			if err := renderPrettyReportWithOptions(w, *result.Report, reporter.PrettyOptions{
-				Mode:   mode,
-				Status: result.Status,
-				PR:     result.PR,
-				Reason: result.Error,
+				Mode:       mode,
+				Status:     result.Status,
+				PR:         result.PR,
+				Reason:     result.Reason,
+				NextAction: result.NextAction,
 			}); err != nil {
 				return err
 			}
@@ -2404,9 +2423,10 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 			Status:          review.Verdict,
 			PR:              firstNonEmptyString(formatPRNumber(review.PRNumber), review.PR),
 			BlockingDefects: &blocking,
-			Reason:          firstNonEmptyString(firstReceiptLine(review.Evidence), firstReceiptLine(review.Error)),
+			Reason:          firstNonEmptyString(review.Reason, firstReceiptLine(review.Error)),
 			SpecConformance: review.SpecConformance,
 			Findings:        prettyFindings(review.Findings),
+			NextAction:      review.NextAction,
 		}); err != nil {
 			return err
 		}
@@ -3350,9 +3370,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		if outputMode.Format == "text" && shouldRenderPretty(noPretty) {
 			if err := renderPrettyReportWithOptions(stderr, *result.Report, reporter.PrettyOptions{
-				Mode:   mode,
-				Status: result.Status,
-				PR:     result.PR,
+				Mode:       mode,
+				Status:     result.Status,
+				PR:         result.PR,
+				Reason:     result.Reason,
+				NextAction: result.NextAction,
 			}); err != nil {
 				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
@@ -3364,7 +3386,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "dispatch: %v\n", err)
 			return 1
 		}
-		return 0
+		return dispatchResultExitCode(result)
 	}
 	if outputMode.Verbose {
 		if err := renderDispatch(stdout, result); err != nil {
@@ -3372,7 +3394,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return 1
 		}
 	}
-	return 0
+	return dispatchResultExitCode(result)
 }
 
 func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
@@ -3380,7 +3402,7 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 	if invocationID == "" {
 		invocationID = fmt.Sprintf("dispatch-issue-%d-%d", result.Issue, now.UTC().UnixNano())
 	}
-	pretty := dispatchPrettyBlock(record, result.Status, result.PR, "", mode)
+	pretty := dispatchPrettyBlock(record, result.Status, result.PR, result.Reason, mode)
 	_, err := relay.Write(relay.Entry{
 		RepoPath:     opts.RepoPath,
 		RunID:        result.RunID,
@@ -3406,6 +3428,17 @@ func writeDispatchRelayLedger(opts worker.Options, result worker.Result, record 
 		Report:   &record,
 	})
 	return err
+}
+
+func dispatchResultExitCode(result worker.Result) int {
+	switch strings.ToLower(strings.TrimSpace(result.Status)) {
+	case "", "succeeded", "success":
+		return 0
+	case "needs-human":
+		return 2
+	default:
+		return 1
+	}
 }
 
 func relayInvocationIDFromAttemptPath(attemptPath string) string {
@@ -4113,7 +4146,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if invocationID == "" {
 			invocationID = fmt.Sprintf("dispatch-wave-issue-%d-%d", result.Issue, deps.Now().UTC().UnixNano())
 		}
-		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Error, prettyMode)
+		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Reason, prettyMode)
 		if _, err := relay.Write(relay.Entry{
 			RepoPath:     resolvedRepo,
 			RunID:        runID,
@@ -4152,7 +4185,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if !renderPretty {
 			return nil
 		}
-		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Error, prettyMode)
+		prettyBlock := dispatchPrettyBlock(*result.Report, result.Status, result.PR, result.Reason, prettyMode)
 		text := orchestration.RenderDispatchWaveIssueCompletion(result, prettyBlock)
 		if _, err := stdout.Write([]byte(text)); err != nil {
 			return fmt.Errorf("write worker #%d completion: %w", result.Issue, err)
@@ -4738,6 +4771,8 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 				Status:      result.Status,
 				ExitCode:    result.ExitCode,
 				LogBytes:    result.LogBytes,
+				Reason:      result.Reason,
+				NextAction:  result.NextAction,
 				Report:      result.Report,
 			}, err
 		}
@@ -4772,6 +4807,10 @@ func csvInts(values []int) string {
 		parts = append(parts, strconv.Itoa(value))
 	}
 	return strings.Join(parts, ",")
+}
+
+func intPtr(value int) *int {
+	return &value
 }
 
 func parseIssueNumbers(value string) ([]int, error) {
@@ -5149,16 +5188,24 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 }
 
 func latestRunIDWithNote(repoPath string) (string, string, error) {
-	runsRoot := state.RunsRoot(repoPath)
-	info, err := os.Stat(runsRoot)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", ".loopcoder/runs not found", nil
+	roots := state.RunsRootsForRead(repoPath)
+	foundRoot := false
+	for _, runsRoot := range roots {
+		info, err := os.Stat(runsRoot)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", "", fmt.Errorf("read runs directory: %w", err)
 		}
-		return "", "", fmt.Errorf("read runs directory: %w", err)
+		if !info.IsDir() {
+			return "", "", fmt.Errorf("runs path is not a directory: %s", runsRoot)
+		}
+		foundRoot = true
+		break
 	}
-	if !info.IsDir() {
-		return "", "", fmt.Errorf("runs path is not a directory: %s", runsRoot)
+	if !foundRoot {
+		return "", ".loopcoder/runs not found", nil
 	}
 
 	runID, err := state.LatestRunID(repoPath)

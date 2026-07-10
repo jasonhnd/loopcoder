@@ -13,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -568,6 +569,67 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		result.DispatchResult.Report.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Report.Usage.TotalTokens != 321 {
 		t.Fatalf("retry report not preserved: %#v", result.DispatchResult.Report)
+	}
+}
+
+func TestRecoverReadsLegacyRecoveryBriefForRegisteredProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", home)
+	repo := t.TempDir()
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("register project: %v", err)
+	}
+	legacyBrief := filepath.Join(repo, ".loopcoder", "runs", "run-test", "recovery", "job-103-2-context.md")
+	if err := os.MkdirAll(filepath.Dir(legacyBrief), 0o755); err != nil {
+		t.Fatalf("MkdirAll legacy brief dir: %v", err)
+	}
+	if err := os.WriteFile(legacyBrief, []byte("legacy retry context"), 0o644); err != nil {
+		t.Fatalf("WriteFile legacy brief: %v", err)
+	}
+
+	var gotDispatch DispatchOptions
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		IssueBody:      "issue body",
+		RunID:          "run-test",
+		MaxAttempts:    3,
+		BackoffSeconds: []int{0},
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return []state.Attempt{
+				recoverAttempt(repo, 1, "job-103-1", "failed", "first error"),
+				recoverAttempt(repo, 2, "job-103-2", "failed", "second error"),
+			}, nil
+		},
+		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			gotDispatch = opts
+			return DispatchResult{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/103",
+				Summary:     "retried",
+				AttemptPath: state.AttemptPath(repo, opts.RunID, "job-103-3"),
+				Status:      "succeeded",
+				ExitCode:    0,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionRetry {
+		t.Fatalf("Action = %q, want %q", result.Action, ActionRetry)
+	}
+	if gotDispatch.RecoveryContext != "legacy retry context" {
+		t.Fatalf("dispatch recovery context = %q, want legacy retry context", gotDispatch.RecoveryContext)
+	}
+	if !strings.Contains(result.Report, "Latest recovery brief: "+legacyBrief) {
+		t.Fatalf("report did not surface legacy brief path %s:\n%s", legacyBrief, result.Report)
 	}
 }
 

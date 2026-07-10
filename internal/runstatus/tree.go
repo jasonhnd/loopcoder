@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,15 +70,27 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 	if strings.TrimSpace(parentRunID) == "" {
 		parentRunID = firstNonEmpty(lifecycle.ParentRunID, eventParent)
 	}
+	var nodeProblems []string
+	if strings.TrimSpace(parentRunID) == runID {
+		nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as parent")
+	}
 	children := map[string]bool{}
 	for _, child := range lifecycle.ChildRunIDs {
-		if strings.TrimSpace(child) != "" && child != runID {
+		child = strings.TrimSpace(child)
+		if child != "" {
 			children[child] = true
+			if child == runID {
+				nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as child")
+			}
 		}
 	}
 	for _, child := range eventChildren {
-		if strings.TrimSpace(child) != "" && child != runID {
+		child = strings.TrimSpace(child)
+		if child != "" {
 			children[child] = true
+			if child == runID {
+				nodeProblems = append(nodeProblems, "graph inconsistency: run references itself as child")
+			}
 		}
 	}
 
@@ -102,6 +115,12 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 	}
 	applyLifecycleTimestamps(&node, lifecycle.History)
 	applyRunNodeDetails(repoPath, runID, now, &node)
+	if len(nodeProblems) > 0 {
+		if strings.TrimSpace(node.LastError) != "" {
+			nodeProblems = append(nodeProblems, node.LastError)
+		}
+		node.LastError = strings.Join(dedupeStrings(nodeProblems), "; ")
+	}
 	nodes[runID] = &node
 
 	for _, child := range node.ChildRunIDs {
@@ -119,7 +138,7 @@ func runParent(repoPath, runID string) string {
 }
 
 func runEdgesFromEvents(repoPath, runID string) ([]string, string) {
-	path := state.EventsPath(repoPath, runID)
+	path := filepath.Join(state.RunPathForRead(repoPath, runID), "events.jsonl")
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || info.Size() > maxRunStatusEventBytes {
 		return nil, ""
@@ -188,7 +207,7 @@ func applyLifecycleTimestamps(node *RunTreeNode, history []state.LifecycleTransi
 }
 
 func applyRunNodeDetails(repoPath, runID string, now time.Time, node *RunTreeNode) {
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	if info, err := os.Stat(runPath); err != nil || !info.IsDir() {
 		return
 	}
@@ -237,7 +256,7 @@ func runNodeMetadata(repoPath, runID string, now time.Time) ([]metadataRecord, [
 	if err != nil {
 		return nil, nil
 	}
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	jsonMetadata, jsonVerifiers, err := scanRunJSONRecords(runPath, now)
 	if err != nil {
 		return eventMetadata, dedupeVerifierRecords(eventVerifiers)
@@ -354,5 +373,19 @@ func sortedStringSet(values map[string]bool) []string {
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
 	return out
 }

@@ -47,6 +47,12 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 			if strings.TrimSpace(result.RecoveryContextPath) != "" {
 				fmt.Fprintf(&out, "  recovery: %s\n", filepath.ToSlash(result.RecoveryContextPath))
 			}
+			if strings.TrimSpace(result.Reason) != "" {
+				fmt.Fprintf(&out, "  reason: %s\n", result.Reason)
+			}
+			if strings.TrimSpace(result.NextAction) != "" {
+				fmt.Fprintf(&out, "  next_action: %s\n", result.NextAction)
+			}
 			if strings.TrimSpace(result.Error) != "" {
 				fmt.Fprintf(&out, "  error: %s\n", result.Error)
 			}
@@ -74,6 +80,12 @@ func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty st
 	}
 	if strings.TrimSpace(result.RecoveryContextPath) != "" {
 		fmt.Fprintf(&out, "recovery: %s\n", filepath.ToSlash(result.RecoveryContextPath))
+	}
+	if strings.TrimSpace(result.Reason) != "" {
+		fmt.Fprintf(&out, "reason: %s\n", result.Reason)
+	}
+	if strings.TrimSpace(result.NextAction) != "" {
+		fmt.Fprintf(&out, "next_action: %s\n", result.NextAction)
 	}
 	if strings.TrimSpace(result.Error) != "" {
 		fmt.Fprintf(&out, "error: %s\n", result.Error)

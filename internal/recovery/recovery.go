@@ -118,6 +118,8 @@ type DispatchResult struct {
 	Status      string           `json:"status"`
 	ExitCode    int              `json:"exit_code"`
 	LogBytes    int64            `json:"log_bytes"`
+	Reason      string           `json:"reason,omitempty"`
+	NextAction  string           `json:"next_action,omitempty"`
 	Report      *reporter.Report `json:"report,omitempty"`
 }
 
@@ -669,7 +671,7 @@ func attemptHistory(repoPath, runID string, issueNumber int, attempts []state.At
 		}
 		briefPath := resolveStatePath(repoPath, attempt.RecoveryContextPath)
 		if strings.TrimSpace(briefPath) == "" {
-			briefPath = state.RecoveryBriefPath(repoPath, runID, attempt.JobID)
+			briefPath = state.RecoveryBriefPathForRead(repoPath, runID, attempt.JobID)
 		}
 		history = append(history, attemptHistoryEntry{
 			Record:              attempt,

@@ -802,91 +802,81 @@ func NormalizeVerdict(verdict Verdict) Verdict {
 }
 
 func DecisionReason(verdict Verdict) string {
-	if reason := strings.TrimSpace(verdict.Reason); reason != "" {
-		return reason
-	}
 	switch verdict.Verdict {
 	case VerdictNeedsHuman:
-		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
-			return findingReason(finding)
-		}
-		return firstNonEmpty(verdict.Evidence, "human judgment is required before continuing")
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:         verdict.Verdict,
+			ExplicitReason: verdict.Reason,
+			Findings:       reporterDecisionFindings(verdict.Findings, true),
+			FallbackReason: "human judgment is required before continuing",
+		}).Reason
 	case VerdictFail:
-		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
-			return findingReason(finding)
-		}
+		fallback := firstNonEmpty(verdict.Evidence, "verifier reported a failing verdict")
 		if verdict.SpecConformance == SpecConformanceFail {
-			return "spec conformance failed"
+			fallback = "spec conformance failed"
 		}
-		return firstNonEmpty(verdict.Evidence, "verifier reported a failing verdict")
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:         verdict.Verdict,
+			ExplicitReason: verdict.Reason,
+			Findings:       reporterDecisionFindings(verdict.Findings, true),
+			FallbackReason: fallback,
+		}).Reason
 	case VerdictPass:
-		return firstNonEmpty(verdict.Evidence, "acceptance criteria satisfied")
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:         verdict.Verdict,
+			ExplicitReason: verdict.Reason,
+			FallbackReason: firstNonEmpty(verdict.Evidence, "acceptance criteria satisfied"),
+		}).Reason
 	default:
-		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
-			return findingReason(finding)
-		}
-		return firstNonEmpty(verdict.Evidence, "verifier returned an unrecognized verdict")
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:         verdict.Verdict,
+			ExplicitReason: verdict.Reason,
+			Findings:       reporterDecisionFindings(verdict.Findings, true),
+			FallbackReason: firstNonEmpty(verdict.Evidence, "verifier returned an unrecognized verdict"),
+		}).Reason
 	}
 }
 
 func DecisionNextAction(verdict Verdict) string {
-	if next := strings.TrimSpace(verdict.NextAction); next != "" {
-		return next
-	}
 	switch verdict.Verdict {
 	case VerdictNeedsHuman:
-		return "human should decide whether the reported uncertainty is acceptable for this PR"
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             verdict.Verdict,
+			ExplicitNextAction: verdict.NextAction,
+			FallbackNextAction: "human should decide whether the reported uncertainty is acceptable for this PR",
+		}).NextAction
 	case VerdictFail:
-		return "fix the failed gate or regression before continuing"
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             verdict.Verdict,
+			ExplicitNextAction: verdict.NextAction,
+			FallbackNextAction: "fix the failed gate or regression before continuing",
+		}).NextAction
 	case VerdictPass:
-		return "continue with the configured merge or promotion gate"
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             verdict.Verdict,
+			ExplicitNextAction: verdict.NextAction,
+			FallbackNextAction: "continue with the configured merge or promotion gate",
+		}).NextAction
 	default:
-		return "inspect the verifier result before continuing"
+		return reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             verdict.Verdict,
+			ExplicitNextAction: verdict.NextAction,
+			FallbackNextAction: "inspect the verifier result before continuing",
+		}).NextAction
 	}
 }
 
-func highestSeverityFinding(findings []Finding) (Finding, bool) {
-	bestIndex := -1
-	bestRank := 999
-	for index, finding := range findings {
-		if strings.TrimSpace(finding.Note) == "" {
-			continue
-		}
-		rank := loopreviewSeverityRank(finding.Severity)
-		if bestIndex < 0 || rank < bestRank {
-			bestIndex = index
-			bestRank = rank
-		}
+func reporterDecisionFindings(findings []Finding, blocking bool) []reporter.DecisionFinding {
+	out := make([]reporter.DecisionFinding, 0, len(findings))
+	for _, finding := range findings {
+		out = append(out, reporter.DecisionFinding{
+			Severity: finding.Severity,
+			File:     finding.File,
+			Message:  finding.Note,
+			Blocking: blocking,
+		})
 	}
-	if bestIndex < 0 {
-		return Finding{}, false
-	}
-	return findings[bestIndex], true
-}
-
-func loopreviewSeverityRank(severity string) int {
-	switch strings.ToLower(strings.TrimSpace(severity)) {
-	case "critical", "blocking":
-		return 0
-	case "error", "high":
-		return 1
-	case "warning", "medium":
-		return 2
-	case "low":
-		return 3
-	case "info", "note":
-		return 4
-	default:
-		return 5
-	}
-}
-
-func findingReason(finding Finding) string {
-	note := strings.TrimSpace(finding.Note)
-	if strings.TrimSpace(finding.File) == "" {
-		return note
-	}
-	return strings.TrimSpace(finding.File) + ": " + note
+	return out
 }
 
 func stringValue(value *string) string {

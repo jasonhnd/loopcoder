@@ -17,6 +17,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -189,6 +190,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text or json\n", opts.Format)
 		return 2
 	}
+	warnings := stderr
+	if opts.Format == "json" {
+		warnings = io.Discard
+	}
 	parentPermission := normalizeNestedPermission(opts.ParentPermission)
 	if !validNestedParentPermission(parentPermission) {
 		fmt.Fprintf(stderr, "nested run: invalid --parent-permission %q; want read-only, write, or orchestrate\n", opts.ParentPermission)
@@ -236,7 +241,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ConfigModel:    cfg.Worker.Model,
 			ConfigEffort:   cfg.Worker.ReasoningEffort,
 			Strict:         cfg.Models.Strict || opts.Strict,
-			Warnings:       stderr,
+			Warnings:       warnings,
 		})
 		if !ok {
 			return 1
@@ -268,9 +273,9 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	defer cancel()
 
-	executor := nestedDispatchExecutor(opts, deps, stderr)
+	executor := nestedDispatchExecutor(opts, deps, warnings)
 	if opts.Provider == nestedTestSubprocessProvider {
-		executor = nestedSubprocessExecutor(opts, deps, stderr)
+		executor = nestedSubprocessExecutor(opts, deps, warnings)
 	}
 
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
@@ -285,10 +290,14 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Execute:          executor,
 	})
 	if err != nil {
-		if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
-			fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
+		if nestedReportHasContent(report) {
+			if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
+				fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
+			}
 		}
-		fmt.Fprintf(stderr, "nested run: %v\n", err)
+		if opts.Format != "json" || !nestedReportHasContent(report) {
+			fmt.Fprintf(stderr, "nested run: %v\n", err)
+		}
 		return 1
 	}
 	if err := renderNestedRun(stdout, opts.Format, report); err != nil {
@@ -301,6 +310,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
+func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
+	return report.Version != 0 || strings.TrimSpace(report.ParentRunID) != "" || len(report.Children) > 0
+}
+
 func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
 	return func(ctx context.Context, child orchestration.ChildRunPlan) (orchestration.ChildRunResult, error) {
 		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child); err != nil {
@@ -308,8 +321,8 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		} else if ok {
 			return existing, nil
 		}
-		if child.Permission == string(reporter.PermissionReadOnly) {
-			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot run read-only child %q through write-capable worker dispatch", child.ChildKey)
+		if child.Permission == string(reporter.PermissionWrite) || child.Permission == string(reporter.PermissionOrchestrate) {
+			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot enforce scoped writes for child %q with permission %q", child.ChildKey, child.Permission)
 		}
 		if child.Issue <= 0 {
 			return orchestration.ChildRunResult{}, fmt.Errorf("child %q requires a positive issue or scope issue for worker dispatch", child.ChildKey)
@@ -429,28 +442,31 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 			fmt.Fprintf(stderr, "[loopcoder] warning: failed to write nested subprocess attempt: %v\n", writeErr)
 		}
 		result := orchestration.ChildRunResult{
-			ID:          child.ID,
-			ChildKey:    child.ChildKey,
-			Title:       child.Title,
-			Role:        child.Role,
-			RunID:       child.RunID,
-			Issue:       child.Issue,
-			Scope:       child.Scope,
-			Permission:  child.Permission,
-			DependsOn:   append([]string(nil), child.DependsOn...),
-			Aggregation: child.Aggregation,
-			Required:    child.Required,
-			Optional:    child.Optional,
-			Ordinal:     child.Ordinal,
-			Depth:       child.Depth,
-			Status:      status,
-			StartedAt:   reportRecord.StartedAt,
-			FinishedAt:  reportRecord.EndedAt,
-			AttemptPath: attemptPath,
-			Report:      &reportRecord,
+			ID:           child.ID,
+			ChildKey:     child.ChildKey,
+			Title:        child.Title,
+			Role:         child.Role,
+			RunID:        child.RunID,
+			Issue:        child.Issue,
+			Scope:        child.Scope,
+			Permission:   child.Permission,
+			DependsOn:    append([]string(nil), child.DependsOn...),
+			Aggregation:  child.Aggregation,
+			Required:     child.Required,
+			Optional:     child.Optional,
+			Ordinal:      child.Ordinal,
+			Depth:        child.Depth,
+			Status:       status,
+			ReplayAction: child.ReplayAction,
+			StartedAt:    reportRecord.StartedAt,
+			FinishedAt:   reportRecord.EndedAt,
+			AttemptPath:  attemptPath,
+			Report:       &reportRecord,
 		}
 		if status != orchestration.NestedStatusSucceeded {
 			result.Error = summary
+			result.Reason = summary
+			result.NextAction = "inspect the failed nested child and rerun the same plan after recovery"
 			return result, errors.New(summary)
 		}
 		return result, nil
@@ -465,7 +481,7 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 	for i := len(attempts) - 1; i >= 0; i-- {
 		attempt := attempts[i]
 		status := state.NormalizeStatus(attempt.Status)
-		if !state.IsTerminalStatus(status) {
+		if status != state.StatusSucceeded {
 			continue
 		}
 		result := orchestration.ChildRunResult{
@@ -484,9 +500,11 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 			Ordinal:             child.Ordinal,
 			Depth:               child.Depth,
 			Status:              normalizeExecutorStatus(status),
+			ReplayAction:        child.ReplayAction,
 			StartedAt:           attempt.StartedAt,
 			FinishedAt:          attempt.HeartbeatAt,
 			Error:               attempt.Error,
+			Reason:              attempt.Error,
 			AttemptPath:         attempt.Path,
 			RecoveryContextPath: attempt.RecoveryContextPath,
 			Report:              attempt.Report,
@@ -497,17 +515,38 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 }
 
 func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestration.ChildPlan) error {
+	parentRepo, err := pathid.Canonicalize(repoPath)
+	if err != nil {
+		return fmt.Errorf("parent repo: %w", err)
+	}
 	for i := range plan.Items {
 		child := &plan.Items[i]
 		if !permissionWithin(parentPermission, child.Permission) {
 			return fmt.Errorf("child %q permission %q exceeds parent permission %q", child.ChildKey, child.Permission, parentPermission)
 		}
-		childRepo, err := resolveNestedChildRepo(repoPath, child.Scope.Repo)
+		childRepo, err := resolveNestedChildRepo(parentRepo.Display, child.Scope.Repo)
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
 		}
-		if !pathWithin(repoPath, childRepo) {
+		childRepoID, err := pathid.Canonicalize(childRepo)
+		if err != nil {
+			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
+		}
+		if !pathWithin(parentRepo.Identity, childRepoID.Identity) {
 			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+		}
+		for _, scopedPath := range child.Scope.Paths {
+			resolvedPath, err := resolveNestedScopedPath(childRepoID.Display, scopedPath)
+			if err != nil {
+				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			scopedID, err := pathid.Canonicalize(resolvedPath)
+			if err != nil {
+				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			if !pathWithin(childRepoID.Identity, scopedID.Identity) || !pathWithin(parentRepo.Identity, scopedID.Identity) {
+				return fmt.Errorf("child %q scope.paths %q escapes approved repo scope", child.ChildKey, scopedPath)
+			}
 		}
 	}
 	return nil
@@ -543,8 +582,17 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	)
 	for _, child := range report.Children {
 		line := fmt.Sprintf("- %s %s %s", child.ChildKey, child.RunID, child.Status)
+		if child.ReplayAction != "" {
+			line += " action=" + child.ReplayAction
+		}
 		if child.Error != "" {
-			line += " error=" + child.Error
+			line += " error=" + reporter.BoundDecisionText(child.Error)
+		}
+		if child.Reason != "" {
+			line += " reason=" + reporter.BoundDecisionText(child.Reason)
+		}
+		if child.NextAction != "" {
+			line += " next_action=" + reporter.BoundDecisionText(child.NextAction)
 		}
 		fmt.Fprintln(&b, line)
 	}
@@ -554,7 +602,7 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	case orchestration.NestedStatusNeedsHuman:
 		fmt.Fprintln(&b, "Next: inspect needs-human child records before resuming the parent.")
 	default:
-		fmt.Fprintln(&b, "Next: inspect failed child records, then rerun the same plan to resume completed children without duplicating them.")
+		fmt.Fprintln(&b, "Next: inspect failed child records, then rerun the same plan_id to reuse succeeded children and resume/retry durable children without duplicating them.")
 	}
 	return b.String()
 }
@@ -569,26 +617,40 @@ func childResultFromWorker(child orchestration.ChildRunPlan, result worker.Resul
 		}
 	}
 	runID := firstNonEmptyNested(result.RunID, child.RunID)
-	return orchestration.ChildRunResult{
-		ID:          child.ID,
-		ChildKey:    child.ChildKey,
-		Title:       child.Title,
-		Role:        child.Role,
-		RunID:       runID,
-		Issue:       result.Issue,
-		Scope:       child.Scope,
-		Permission:  child.Permission,
-		DependsOn:   append([]string(nil), child.DependsOn...),
-		Aggregation: child.Aggregation,
-		Required:    child.Required,
-		Optional:    child.Optional,
-		Ordinal:     child.Ordinal,
-		Depth:       child.Depth,
-		Status:      status,
-		Error:       "",
-		AttemptPath: result.AttemptPath,
-		Report:      result.Report,
+	childResult := orchestration.ChildRunResult{
+		ID:           child.ID,
+		ChildKey:     child.ChildKey,
+		Title:        child.Title,
+		Role:         child.Role,
+		RunID:        runID,
+		Issue:        result.Issue,
+		Scope:        child.Scope,
+		Permission:   child.Permission,
+		DependsOn:    append([]string(nil), child.DependsOn...),
+		Aggregation:  child.Aggregation,
+		Required:     child.Required,
+		Optional:     child.Optional,
+		Ordinal:      child.Ordinal,
+		Depth:        child.Depth,
+		Status:       status,
+		ReplayAction: child.ReplayAction,
+		Error:        "",
+		Reason:       result.Reason,
+		NextAction:   result.NextAction,
+		AttemptPath:  result.AttemptPath,
+		Report:       result.Report,
 	}
+	if status != orchestration.NestedStatusSucceeded {
+		receipt := reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             status,
+			ExplicitReason:     childResult.Reason,
+			ConcreteError:      result.Summary,
+			ExplicitNextAction: childResult.NextAction,
+		})
+		childResult.Reason = receipt.Reason
+		childResult.NextAction = receipt.NextAction
+	}
+	return childResult
 }
 
 func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, record reporter.Report, status string, exitCode int, summary, errText string, now func() time.Time) (string, error) {
@@ -755,6 +817,17 @@ func resolveNestedChildRepo(repoPath, childRepo string) (string, error) {
 		return filepath.Abs(childRepo)
 	}
 	return filepath.Abs(filepath.Join(repoPath, childRepo))
+}
+
+func resolveNestedScopedPath(childRepo, scopedPath string) (string, error) {
+	scopedPath = strings.TrimSpace(scopedPath)
+	if scopedPath == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	if filepath.IsAbs(scopedPath) {
+		return filepath.Abs(scopedPath)
+	}
+	return filepath.Abs(filepath.Join(childRepo, scopedPath))
 }
 
 func pathWithin(parent, child string) bool {

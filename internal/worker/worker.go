@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -59,6 +60,8 @@ type Result struct {
 	Status      string           `json:"status"`
 	ExitCode    int              `json:"exit_code"`
 	LogBytes    int64            `json:"log_bytes"`
+	Reason      string           `json:"reason,omitempty"`
+	NextAction  string           `json:"next_action,omitempty"`
 	Report      *reporter.Report `json:"report,omitempty"`
 }
 
@@ -136,6 +139,7 @@ type dispatchContext struct {
 	promptPath   string
 	summaryPath  string
 	logPath      string
+	runtimeRoots runtimepath.Roots
 	jobID        string
 	attemptPath  string
 	tracker      *attemptTracker
@@ -218,6 +222,10 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 	if strings.TrimSpace(opts.RunID) == "" {
 		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
 	}
+	runtimeRoots, err := runtimepath.Resolve(ctx, repoPath)
+	if err != nil {
+		return nil, err
+	}
 
 	github := deps.GitHub(repoPath)
 	if github == nil {
@@ -230,17 +238,28 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 	}
 
 	return &dispatchContext{
-		opts:     opts,
-		deps:     deps,
-		warnings: warnings,
-		repoPath: repoPath,
-		github:   github,
-		agentRun: agentRunner,
+		opts:         opts,
+		deps:         deps,
+		warnings:     warnings,
+		repoPath:     repoPath,
+		runtimeRoots: runtimeRoots,
+		github:       github,
+		agentRun:     agentRunner,
 	}, nil
 }
 
 func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
-	scratch, err := dispatch.deps.MkdirTemp("", "loopcoder-*")
+	tempRoot := ""
+	if dispatch.runtimeRoots.Registered {
+		tempRoot = dispatch.runtimeRoots.TmpRoot
+		if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+			return fmt.Errorf("create registered temp root: %w", err)
+		}
+	}
+	// Unregistered projects intentionally keep the legacy fallback behavior:
+	// use the OS temp directory, outside the repo, until the user registers the
+	// project and opts into the v0.7 home-scoped runtime contract.
+	scratch, err := dispatch.deps.MkdirTemp(tempRoot, "loopcoder-*")
 	if err != nil {
 		return fmt.Errorf("create scratch directory: %w", err)
 	}
@@ -250,6 +269,13 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
 	dispatch.logPath = filepath.Join(scratch, "codex.log")
 	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	if dispatch.runtimeRoots.Registered {
+		logDir := filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID)
+		if err := os.MkdirAll(logDir, 0o700); err != nil {
+			return fmt.Errorf("create registered log root: %w", err)
+		}
+		dispatch.logPath = filepath.Join(logDir, dispatch.jobID+".log")
+	}
 	dispatch.attemptPath = state.AttemptPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
 	dispatch.tracker = newAttemptTracker(attemptTrackerOptions{
 		repoPath:    dispatch.repoPath,
@@ -413,6 +439,8 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			Status:      "needs-human",
 			ExitCode:    exitCode,
 			LogBytes:    fileSize(dispatch.logPath),
+			Reason:      harvest.Summary,
+			NextAction:  "human should review the harvested partial work before continuing",
 			Report:      &harvest.Report,
 		}, nil
 	}
@@ -556,6 +584,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 }
 
 func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
+	reason := workerHungError(dispatch.opts.Provider, agentResult.HungReason, dispatch.logPath)
 	return Result{
 		OK:          false,
 		Issue:       dispatch.opts.IssueNumber,
@@ -565,6 +594,8 @@ func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
 		Status:      "hung",
 		ExitCode:    agentResult.ExitCode,
 		LogBytes:    fileSize(dispatch.logPath),
+		Reason:      reason,
+		NextAction:  "inspect the hung worker log and recover or retry before continuing",
 	}
 }
 

@@ -142,6 +142,8 @@ type TickReviewResult struct {
 	Verdict            string                        `json:"verdict"`
 	SpecConformance    string                        `json:"spec_conformance,omitempty"`
 	Evidence           string                        `json:"evidence,omitempty"`
+	Reason             string                        `json:"reason,omitempty"`
+	NextAction         string                        `json:"next_action,omitempty"`
 	ConfiguredEvidence []config.EvidenceArtifact     `json:"configured_evidence,omitempty"`
 	RenderedArtifacts  []loopreview.RenderedArtifact `json:"rendered_artifacts,omitempty"`
 	Findings           []loopreview.Finding          `json:"findings"`
@@ -505,7 +507,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 				Step:   "loopreview",
 				Issue:  item.Issue,
 				PR:     item.PR,
-				Detail: firstNonEmpty(result.Verdict.Evidence, "verifier returned needs-human"),
+				Detail: firstNonEmpty(result.Verdict.Reason, result.Verdict.Evidence, "verifier returned needs-human"),
 			})
 		}
 	}
@@ -581,6 +583,8 @@ func withTickDefaults(opts TickOptions) TickOptions {
 					Status:      result.Status,
 					ExitCode:    result.ExitCode,
 					LogBytes:    result.LogBytes,
+					Reason:      result.Reason,
+					NextAction:  result.NextAction,
 					Report:      result.Report,
 				}, err
 			}
@@ -647,7 +651,7 @@ func runTickRecoverReviewFailure(ctx context.Context, opts TickOptions, tickRepo
 		IssueBody:      issue.Body,
 		TriggerStep:    "loopreview",
 		PR:             item.PR,
-		Detail:         firstNonEmpty(review.Verdict.Evidence, "verifier returned fail"),
+		Detail:         firstNonEmpty(review.Verdict.Reason, review.Verdict.Evidence, "verifier returned fail"),
 		FailureContext: renderTickReviewRecoveryContext(item, review),
 		SkipAdoptPR:    true,
 	})
@@ -782,7 +786,7 @@ func runTickRecoveredPR(ctx context.Context, opts TickOptions, tickReport *TickR
 			Step:   "recover",
 			Issue:  issueNumber,
 			PR:     dispatchResult.PR,
-			Detail: firstNonEmpty(review.Evidence, review.Error, "recovered PR did not pass loopreview"),
+			Detail: firstNonEmpty(review.Reason, review.Evidence, review.Error, "recovered PR did not pass loopreview"),
 		})
 		return
 	}
@@ -826,7 +830,7 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 			Step:   "recover",
 			Issue:  issueNumber,
 			PR:     pr,
-			Detail: firstNonEmpty(review.Evidence, review.Error, "adopted PR did not pass loopreview"),
+			Detail: firstNonEmpty(review.Reason, review.Evidence, review.Error, "adopted PR did not pass loopreview"),
 		})
 		return
 	}
@@ -834,16 +838,19 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 }
 
 func tickReviewResultFromLoopreview(issueNumber int, pr string, prNumber int, result loopreview.Result) TickReviewResult {
+	verdict := loopreview.NormalizeVerdict(result.Verdict)
 	return TickReviewResult{
 		Issue:             issueNumber,
 		PR:                pr,
 		PRNumber:          prNumber,
-		Verdict:           result.Verdict.Verdict,
-		SpecConformance:   result.Verdict.SpecConformance,
-		Evidence:          result.Verdict.Evidence,
-		RenderedArtifacts: copyRenderedArtifacts(result.Verdict.RenderedArtifacts),
-		Findings:          append([]loopreview.Finding(nil), result.Verdict.Findings...),
-		Report:            result.Verdict.Report,
+		Verdict:           verdict.Verdict,
+		SpecConformance:   verdict.SpecConformance,
+		Evidence:          verdict.Evidence,
+		Reason:            verdict.Reason,
+		NextAction:        verdict.NextAction,
+		RenderedArtifacts: copyRenderedArtifacts(verdict.RenderedArtifacts),
+		Findings:          append([]loopreview.Finding(nil), verdict.Findings...),
+		Report:            verdict.Report,
 	}
 }
 
