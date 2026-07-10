@@ -107,7 +107,7 @@ Command side effects in the first-run path:
 | `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
-| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry. |
+| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry after sanitizing Git remote credentials from project metadata. |
 | `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |

@@ -105,6 +105,84 @@ func TestRegisterIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRegisterSanitizesRemoteURLBeforePersistence(t *testing.T) {
+	ctx := context.Background()
+	secret := "loopcoder-sentinel-secret-687"
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, dbPath := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://alice:" + secret + "@github.com/Owner/Repo.git?access_token=" + secret + "#token=" + secret + "\n",
+	})
+
+	result, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if result.Project.RemoteURL != "https://github.com/Owner/Repo" || result.Project.RemoteURLNormalized != "https://github.com/Owner/Repo" {
+		t.Fatalf("project remote urls = %q %q, want sanitized display and normalized", result.Project.RemoteURL, result.Project.RemoteURLNormalized)
+	}
+	if strings.Contains(result.Project.RemoteURL, secret) || strings.Contains(result.Project.RemoteURLNormalized, secret) {
+		t.Fatalf("project contains secret: %#v", result.Project)
+	}
+
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedRegistryNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	var remoteURL, normalized string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT remote_url, remote_url_normalized FROM projects WHERE id = ?`, result.Project.ProjectID).Scan(&remoteURL, &normalized)
+	}); err != nil {
+		t.Fatalf("query project remote urls: %v", err)
+	}
+	if remoteURL != "https://github.com/Owner/Repo" || normalized != "https://github.com/Owner/Repo" {
+		t.Fatalf("stored remote urls = %q %q, want sanitized", remoteURL, normalized)
+	}
+}
+
+func TestCredentialRotationKeepsNormalizedIdentityStable(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, dbPath := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://alice:first-token@github.com/Owner/Repo.git\n",
+	})
+
+	first, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	deps.git["remote\x00get-url\x00origin"] = "https://alice:second-token@github.com/Owner/Repo.git\n"
+	second, err := Register(ctx, Options{RepoPath: repo, DatabasePath: dbPath, Now: fixedRegistryNow}, deps.deps())
+	if err != nil {
+		t.Fatalf("Register second: %v", err)
+	}
+	if first.Project.ProjectID != second.Project.ProjectID || !second.Updated {
+		t.Fatalf("identity changed across credential rotation: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestResolveMalformedRemoteFailsClosedForDisplay(t *testing.T) {
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	makeDir(t, repo)
+	deps, _ := testDeps(t, map[string]string{
+		"rev-parse\x00--show-toplevel": repo + "\n",
+		"remote\x00get-url\x00origin":  "https://github.com/Owner/%zz.git\n",
+	})
+
+	project, err := Resolve(ctx, Options{RepoPath: repo}, deps.deps())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if project.RemoteURL != "" || project.RemoteURLNormalized != "" || project.IdentitySource != IdentityLocalPath {
+		t.Fatalf("project = %#v, want malformed remote omitted and local-path identity", project)
+	}
+}
+
 func TestSameFolderNameDifferentRemotesRemainDistinct(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

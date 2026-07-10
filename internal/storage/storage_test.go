@@ -117,6 +117,61 @@ func TestOpenMigratesProjectIdentityColumns(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesCredentialBearingRemoteURLs(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	secret := "loopcoder-sentinel-secret-687"
+	raw := createRawDB(t, path)
+	createV3Schema(t, raw)
+	if _, err := raw.ExecContext(ctx, `INSERT INTO projects(id, remote_url, remote_url_normalized, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"project-1",
+		"https://alice:"+secret+"@github.com/Owner/Repo.git?access_token="+secret+"#token="+secret,
+		"https://alice:"+secret+"@github.com/Owner/Repo.git?access_token="+secret,
+		"/repo",
+		"/repo",
+		"Repo",
+		"github",
+		"2026-01-01T00:00:00Z",
+		"2026-01-01T00:00:00Z",
+	); err != nil {
+		t.Fatalf("insert project fixture: %v", err)
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	var remoteURL, normalized string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT remote_url, remote_url_normalized FROM projects WHERE id = ?`, "project-1").Scan(&remoteURL, &normalized)
+	}); err != nil {
+		t.Fatalf("query migrated project: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	if remoteURL != "https://github.com/Owner/Repo" || normalized != "https://github.com/Owner/Repo" {
+		t.Fatalf("migrated remote urls = %q %q, want scrubbed", remoteURL, normalized)
+	}
+	if strings.Contains(remoteURL+normalized, secret) {
+		t.Fatalf("migrated remote urls contain secret: %q %q", remoteURL, normalized)
+	}
+
+	store, err = Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("second Open returned error: %v", err)
+	}
+	defer store.Close()
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	if !health.OK || health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("health = %#v, want idempotent migrated schema %d", health, CurrentSchemaVersion)
+	}
+}
+
 func TestOpenFailsForUnsupportedSchemaVersion(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -310,6 +365,53 @@ func closeRawDB(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if err := db.Close(); err != nil {
 		t.Fatalf("close raw database: %v", err)
+	}
+}
+
+func createV3Schema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	for _, statement := range []string{
+		`CREATE TABLE migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE projects (
+			id TEXT PRIMARY KEY,
+			remote_url TEXT NOT NULL DEFAULT '',
+			github_owner TEXT NOT NULL DEFAULT '',
+			github_name TEXT NOT NULL DEFAULT '',
+			local_path TEXT NOT NULL,
+			default_branch TEXT NOT NULL DEFAULT '',
+			display_name TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			local_path_canonical TEXT NOT NULL DEFAULT '',
+			git_root TEXT NOT NULL DEFAULT '',
+			remote_url_normalized TEXT NOT NULL DEFAULT '',
+			identity_source TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX idx_projects_local_path ON projects(local_path)`,
+		`CREATE INDEX idx_projects_local_path_canonical ON projects(local_path_canonical)`,
+		`CREATE INDEX idx_projects_remote_url_normalized ON projects(remote_url_normalized)`,
+		`CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE SET NULL, parent_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, issue_number INTEGER, status TEXT NOT NULL DEFAULT '', started_at TEXT, ended_at TEXT, updated_at TEXT NOT NULL)`,
+		`CREATE INDEX idx_runs_project_id ON runs(project_id)`,
+		`CREATE INDEX idx_runs_parent_run_id ON runs(parent_run_id)`,
+		`CREATE TABLE run_events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, sequence INTEGER NOT NULL, ts TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', UNIQUE(run_id, sequence))`,
+		`CREATE INDEX idx_run_events_run_id_sequence ON run_events(run_id, sequence)`,
+		`CREATE TABLE run_edges (parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, child_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, edge_type TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, PRIMARY KEY(parent_run_id, child_run_id))`,
+		`CREATE TABLE reports (id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id) ON DELETE SET NULL, role TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', started_at TEXT, ended_at TEXT, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, project_id TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_hash TEXT NOT NULL DEFAULT '', source_kind TEXT NOT NULL DEFAULT '')`,
+		`CREATE INDEX idx_reports_run_id ON reports(run_id)`,
+		`CREATE INDEX idx_reports_project_id ON reports(project_id)`,
+		`CREATE INDEX idx_reports_source_hash ON reports(source_hash)`,
+		`CREATE TABLE legacy_import_records (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, run_id TEXT, record_type TEXT NOT NULL, source_path TEXT NOT NULL, source_line INTEGER NOT NULL DEFAULT 0, source_hash TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', imported_at TEXT NOT NULL)`,
+		`CREATE UNIQUE INDEX idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
+		`CREATE INDEX idx_legacy_import_records_project ON legacy_import_records(project_id)`,
+		`CREATE TABLE legacy_import_status (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, repo_path TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, status TEXT NOT NULL, scanned_count INTEGER NOT NULL DEFAULT 0, imported_count INTEGER NOT NULL DEFAULT 0, skipped_count INTEGER NOT NULL DEFAULT 0, malformed_count INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (1, 'initial runtime schema', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (2, 'project identity fields', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (3, 'legacy local state import metadata', '2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec v3 fixture statement: %v\n%s", err, statement)
+		}
 	}
 }
 

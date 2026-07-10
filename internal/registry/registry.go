@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/gitremote"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
@@ -273,6 +273,7 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 	remoteURL, _ := gitOutput(ctx, deps, identityPath, "remote", "get-url", "origin")
 	remoteURL = strings.TrimSpace(remoteURL)
 	normalized, owner, name, _ := NormalizeRemoteURL(remoteURL)
+	remoteURLDisplay, _ := gitremote.SanitizeDisplayURL(remoteURL)
 
 	displayName := filepath.Base(identityPath)
 	source := IdentityLocalPath
@@ -295,7 +296,7 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 		LocalPathCanonical:  canonicalPath(identityPath),
 		GitRoot:             gitRoot,
 		DefaultBranch:       defaultBranch(ctx, deps, identityPath),
-		RemoteURL:           remoteURL,
+		RemoteURL:           remoteURLDisplay,
 		RemoteURLNormalized: normalized,
 		GitHubOwner:         owner,
 		GitHubName:          name,
@@ -308,42 +309,7 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 }
 
 func NormalizeRemoteURL(raw string) (normalized string, githubOwner string, githubName string, ok bool) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", "", "", false
-	}
-	if strings.HasPrefix(raw, "git@") && strings.Contains(raw, ":") && !strings.Contains(raw, "://") {
-		parts := strings.SplitN(strings.TrimPrefix(raw, "git@"), ":", 2)
-		if len(parts) == 2 {
-			raw = "ssh://" + parts[0] + "/" + parts[1]
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return "", "", "", false
-	}
-	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Hostname())
-	if host == "" {
-		return "", "", "", false
-	}
-	port := u.Port()
-	if port != "" && !isDefaultPort(scheme, port) {
-		host = net.JoinHostPort(host, port)
-	}
-	path := cleanURLPath(u.EscapedPath())
-	if path == "" {
-		return "", "", "", false
-	}
-	normalized = scheme + "://" + host + "/" + path
-	if strings.EqualFold(host, "github.com") {
-		parts := strings.Split(path, "/")
-		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
-			githubOwner = strings.ToLower(parts[0])
-			githubName = strings.ToLower(parts[1])
-		}
-	}
-	return normalized, githubOwner, githubName, true
+	return gitremote.NormalizeURL(raw)
 }
 
 func openStore(ctx context.Context, opts Options, deps Deps) (storage.Store, error) {
@@ -398,6 +364,7 @@ func pathConflicts(ctx context.Context, tx storage.Tx, project Project) ([]Proje
 }
 
 func insertProject(ctx context.Context, tx storage.Tx, project Project) error {
+	project = sanitizeProject(project)
 	_, err := tx.Exec(ctx, `INSERT INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		project.ProjectID, project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.CreatedAt, project.UpdatedAt)
 	if err != nil {
@@ -407,6 +374,7 @@ func insertProject(ctx context.Context, tx storage.Tx, project Project) error {
 }
 
 func updateProject(ctx context.Context, tx storage.Tx, project Project) error {
+	project = sanitizeProject(project)
 	_, err := tx.Exec(ctx, `UPDATE projects SET display_name = ?, local_path = ?, local_path_canonical = ?, git_root = ?, default_branch = ?, remote_url = ?, remote_url_normalized = ?, github_owner = ?, github_name = ?, identity_source = ?, updated_at = ? WHERE id = ?`,
 		project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.UpdatedAt, project.ProjectID)
 	if err != nil {
@@ -440,7 +408,32 @@ func scanProject(scanner projectScanner) (Project, error) {
 		return Project{}, err
 	}
 	project.IdentitySource = IdentitySource(source)
+	project = sanitizeProject(project)
 	return project, nil
+}
+
+func sanitizeProject(project Project) Project {
+	if display, ok := gitremote.SanitizeDisplayURL(project.RemoteURL); ok {
+		project.RemoteURL = display
+	} else {
+		project.RemoteURL = ""
+	}
+	if normalized, owner, name, ok := gitremote.NormalizeURL(project.RemoteURLNormalized); ok {
+		project.RemoteURLNormalized = normalized
+		if owner != "" && name != "" {
+			project.GitHubOwner = owner
+			project.GitHubName = name
+		}
+	} else if normalized, owner, name, ok := gitremote.NormalizeURL(project.RemoteURL); ok {
+		project.RemoteURLNormalized = normalized
+		if owner != "" && name != "" {
+			project.GitHubOwner = owner
+			project.GitHubName = name
+		}
+	} else {
+		project.RemoteURLNormalized = ""
+	}
+	return project
 }
 
 func defaultBranch(ctx context.Context, deps Deps, repoPath string) string {
@@ -514,39 +507,6 @@ func runGit(ctx context.Context, repoPath string, args ...string) (string, error
 		return "", err
 	}
 	return string(out), nil
-}
-
-func cleanURLPath(path string) string {
-	path, _ = url.PathUnescape(path)
-	path = strings.ReplaceAll(path, `\`, "/")
-	parts := make([]string, 0)
-	for _, part := range strings.Split(path, "/") {
-		if part == "" || part == "." {
-			continue
-		}
-		parts = append(parts, part)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	last := parts[len(parts)-1]
-	if strings.HasSuffix(strings.ToLower(last), ".git") {
-		parts[len(parts)-1] = last[:len(last)-4]
-	}
-	return strings.Join(parts, "/")
-}
-
-func isDefaultPort(scheme, port string) bool {
-	switch strings.ToLower(scheme) {
-	case "http":
-		return port == "80"
-	case "https":
-		return port == "443"
-	case "ssh":
-		return port == "22"
-	default:
-		return false
-	}
 }
 
 func ambiguousProjectError(project Project, conflicts []Project) error {

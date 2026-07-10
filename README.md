@@ -206,7 +206,7 @@ The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity W
 
 ### Project Registry
 
-`loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects.
+`loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects. Git remote URLs are sanitized before output or persistence; loopcoder never stores URL credentials, tokens, credential-like query strings, or fragments in project metadata.
 
 ```text
 loopcoder projects register --repo .

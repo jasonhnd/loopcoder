@@ -106,7 +106,7 @@ A project record must have these fields:
 | `local_path_canonical` | yes | Cleaned, absolute, case-normalized path used for local comparison. |
 | `git_root` | when available | Absolute git worktree root when the path is inside a git repository. |
 | `default_branch` | when available | Current default/base branch detected from config, remote metadata, or `.delivery.yml`. |
-| `remote_url` | when available | Raw selected git remote URL for display and diagnostics. |
+| `remote_url` | when available | Sanitized selected git remote URL for display and diagnostics. URL userinfo, credentials, query strings, and fragments are never persisted. |
 | `remote_url_normalized` | when available | Normalized remote URL used for identity matching. |
 | `github_owner` | when available | GitHub owner parsed from a GitHub remote. |
 | `github_name` | when available | GitHub repository name parsed from a GitHub remote. |
@@ -136,8 +136,10 @@ Remote normalization must produce a comparison string with these rules:
 - For GitHub remotes, parse `github_owner` and `github_name` from the normalized
   owner/name path and compare those fields case-insensitively.
 
-The normalized remote is an identity input, not a display value. Commands should
-keep the raw remote URL for diagnostics when it is safe to show.
+The normalized remote is an identity input, not a display value. Commands must
+not persist or print raw Git remote output. Display metadata must use a
+sanitized URL, and ambiguous remotes must omit the display URL instead of
+preserving potentially sensitive input.
 
 If implementation introduces helper code for this normalization, that code must
 have unit tests for HTTPS remotes, SSH remotes, SCP-like GitHub remotes,
