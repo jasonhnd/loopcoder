@@ -2,6 +2,7 @@
 package relaygate
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 )
 
 const (
@@ -209,16 +211,41 @@ func Ack(cwd string, records []Record) error {
 		if strings.TrimSpace(rec.Nonce) == "" {
 			continue
 		}
-		path := filepath.Join(pendingDir(cwd), rec.Nonce+".json")
-		if err := removePendingRecord(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
+		for _, dir := range pendingDirs(cwd) {
+			path := filepath.Join(dir, rec.Nonce+".json")
+			if err := removePendingRecord(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
 }
 
 func readPending(cwd string) ([]Record, error) {
-	dir := pendingDir(cwd)
+	var all []Record
+	for _, dir := range pendingDirs(cwd) {
+		records, err := readPendingDir(dir)
+		if err != nil {
+			return all, err
+		}
+		all = append(all, records...)
+		if len(records) > 0 {
+			break
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Role != all[j].Role {
+			return all[i].Role < all[j].Role
+		}
+		if all[i].PRNumber != all[j].PRNumber {
+			return all[i].PRNumber < all[j].PRNumber
+		}
+		return all[i].Nonce < all[j].Nonce
+	})
+	return all, nil
+}
+
+func readPendingDir(dir string) ([]Record, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -263,20 +290,35 @@ func readPending(cwd string) ([]Record, error) {
 		}
 		records = append(records, rec)
 	}
-	sort.SliceStable(records, func(i, j int) bool {
-		if records[i].Role != records[j].Role {
-			return records[i].Role < records[j].Role
-		}
-		if records[i].PRNumber != records[j].PRNumber {
-			return records[i].PRNumber < records[j].PRNumber
-		}
-		return records[i].Nonce < records[j].Nonce
-	})
 	return records, nil
 }
 
 func pendingDir(cwd string) string {
-	return filepath.Join(cwd, ".loopcoder", "relay", "pending")
+	return filepath.Join(runtimeRoots(cwd).RelayRoot, "pending")
+}
+
+func pendingDirs(cwd string) []string {
+	roots := runtimeRoots(cwd)
+	out := []string{filepath.Join(roots.RelayRoot, "pending")}
+	if roots.Registered && roots.LegacyRelayRoot != "" && roots.LegacyRelayRoot != roots.RelayRoot {
+		out = append(out, filepath.Join(roots.LegacyRelayRoot, "pending"))
+	}
+	return out
+}
+
+func runtimeRoots(cwd string) runtimepath.Roots {
+	roots, err := runtimepath.Resolve(context.Background(), cwd)
+	if err == nil {
+		return roots
+	}
+	legacyRoot := filepath.Join(cwd, ".loopcoder")
+	return runtimepath.Roots{
+		RepoPath:        cwd,
+		FallbackMode:    "unregistered-repo-local",
+		RelayRoot:       filepath.Join(legacyRoot, "relay"),
+		LegacyRoot:      legacyRoot,
+		LegacyRelayRoot: filepath.Join(legacyRoot, "relay"),
+	}
 }
 
 func ensureTrailingNewline(s string) string {

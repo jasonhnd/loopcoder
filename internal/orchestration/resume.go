@@ -623,7 +623,7 @@ func resumeAttemptRecoveryContextPath(repoPath, runID string, attempt state.Atte
 	if strings.TrimSpace(runID) == "" || strings.TrimSpace(attempt.JobID) == "" {
 		return ""
 	}
-	return state.RecoveryBriefPath(repoPath, runID, attempt.JobID)
+	return state.RecoveryBriefPathForRead(repoPath, runID, attempt.JobID)
 }
 
 func resumeRecoveryContextReportPath(repoPath, path string) string {

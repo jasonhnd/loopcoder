@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -119,7 +120,7 @@ func runParent(repoPath, runID string) string {
 }
 
 func runEdgesFromEvents(repoPath, runID string) ([]string, string) {
-	path := state.EventsPath(repoPath, runID)
+	path := filepath.Join(state.RunPathForRead(repoPath, runID), "events.jsonl")
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || info.Size() > maxRunStatusEventBytes {
 		return nil, ""
@@ -188,7 +189,7 @@ func applyLifecycleTimestamps(node *RunTreeNode, history []state.LifecycleTransi
 }
 
 func applyRunNodeDetails(repoPath, runID string, now time.Time, node *RunTreeNode) {
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	if info, err := os.Stat(runPath); err != nil || !info.IsDir() {
 		return
 	}
@@ -237,7 +238,7 @@ func runNodeMetadata(repoPath, runID string, now time.Time) ([]metadataRecord, [
 	if err != nil {
 		return nil, nil
 	}
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	jsonMetadata, jsonVerifiers, err := scanRunJSONRecords(runPath, now)
 	if err != nil {
 		return eventMetadata, dedupeVerifierRecords(eventVerifiers)

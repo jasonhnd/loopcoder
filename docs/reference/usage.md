@@ -11,9 +11,10 @@ GitHub, git worktrees, worker providers, and PR review.
 ## Quickstart (new project)
 
 Use this flow to onboard an existing repository from zero to a driven
-loopcoder loop. One installed binary can serve many local repositories; each
-repository keeps its own `.delivery.yml` and repo-local `.loopcoder/` run
-state.
+loopcoder loop. One installed binary can serve many local repositories. Each
+repository keeps its own `.delivery.yml`; in v0.7.0 candidate builds,
+registered projects write new runtime payloads under `$LOOPCODER_HOME`
+instead of under the repository.
 
 Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
@@ -123,15 +124,15 @@ identity links, run history, reports, legacy import records, and import status.
 `.loopcoder/` records into machine-local storage; it does not delete or rewrite
 those files.
 
-`.loopcoder/` is repo-local machine state. It is intentionally used for run
-state, relay ledgers, recovery, status, and report queries, but it must not be
-committed to normal business branches. `init` and `skill install --repo`
-protect it with local `.git/info/exclude`; `loopcoder state push` is the
-explicit publishing path for state summaries. A machine can serve many
-projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
-the machine-level binary and bundled skill live under the user's machine-level
-loopcoder/agent directories. In v0.7.0 candidate builds, the SQLite project
-registry and migrated runtime records also live under `$LOOPCODER_HOME`.
+For registered v0.7.0 projects, new attempts, events, reports, relay records,
+recovery briefs, lifecycle records, logs, and temporary worker scratch space
+are machine-local under `$LOOPCODER_HOME/projects/<project_id>/`,
+`$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/`. Repo-local `.loopcoder/`
+remains an explicit unregistered fallback and a read-only compatibility source
+for legacy records. `init` and `skill install --repo` still protect
+`.loopcoder/` with local `.git/info/exclude` because unregistered and legacy
+state can exist, but registered runtime payloads are outside the repository by
+default.
 
 ## Prerequisites
 
@@ -265,9 +266,10 @@ consumers. Each node includes `project_id`,
 `run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
 role, provider, model, effort, permission, lifecycle status/source, timestamps,
 last error, and report summary when those fields are present in local records.
-The output is read-only and local-only: it reads gitignored `.loopcoder/` state
-and must not be copied into PR bodies, issues, comments, commits, merge
-artifacts, docs, examples, fixtures, or tracked files.
+The output is read-only and local-only: for registered projects it reads the
+global project payload root first, then legacy repo-local `.loopcoder/` only as
+a compatibility fallback. It must not be copied into PR bodies, issues,
+comments, commits, merge artifacts, docs, examples, fixtures, or tracked files.
 
 Candidate JSON examples:
 
@@ -1030,9 +1032,11 @@ compatibility window. After migration, `loopcoder report --repo . --format json`
 includes imported records with `source` values such as `imported:attempt` plus
 the original source path metadata.
 
-Audit logs remain file-only repo-local state. They are not imported by
-`migrate local-state`, and an audit-only `.loopcoder/audit/` directory does not
-make `loopcoder doctor --repo .` require a local-state migration.
+Registered projects write new audit/relay/runtime file payloads under the
+global project payload root. Legacy audit logs remain file-only repo-local
+state, are not imported by `migrate local-state`, and an audit-only
+`.loopcoder/audit/` directory does not make `loopcoder doctor --repo .` require
+a local-state migration.
 
 To back up the v0.7.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
 and, when present, `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and

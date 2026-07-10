@@ -214,7 +214,7 @@ func LocalState(ctx context.Context, opts Options, deps Deps) (Result, error) {
 }
 
 func (ic importContext) importRuns(ctx context.Context) error {
-	runsRoot := state.RunsRoot(ic.repo)
+	runsRoot := ic.legacyRunsRoot()
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -230,7 +230,7 @@ func (ic importContext) importRuns(ctx context.Context) error {
 		if err := ic.ensureRun(ctx, runID, 0, "", "", ""); err != nil {
 			return err
 		}
-		runPath := state.RunPath(ic.repo, runID)
+		runPath := ic.legacyRunPath(runID)
 		if err := ic.importAttemptFiles(ctx, runID); err != nil {
 			return err
 		}
@@ -248,7 +248,7 @@ func (ic importContext) importRuns(ctx context.Context) error {
 }
 
 func (ic importContext) importAttemptFiles(ctx context.Context, runID string) error {
-	workersDir := state.WorkersPath(ic.repo, runID)
+	workersDir := filepath.Join(ic.legacyRunPath(runID), "workers")
 	entries, err := os.ReadDir(workersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -282,7 +282,7 @@ func (ic importContext) importAttemptFiles(ctx context.Context, runID string) er
 }
 
 func (ic importContext) importEventFile(ctx context.Context, runID string) error {
-	path := state.EventsPath(ic.repo, runID)
+	path := filepath.Join(ic.legacyRunPath(runID), "events.jsonl")
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -323,7 +323,7 @@ func (ic importContext) importEventFile(ctx context.Context, runID string) error
 }
 
 func (ic importContext) importRecoveryBriefs(ctx context.Context, runID string) error {
-	recoveryDir := state.RecoveryPath(ic.repo, runID)
+	recoveryDir := filepath.Join(ic.legacyRunPath(runID), "recovery")
 	if info, err := os.Stat(recoveryDir); err != nil || !info.IsDir() {
 		return nil
 	}
@@ -388,6 +388,14 @@ func (ic importContext) importGenericRunFiles(ctx context.Context, runPath, runI
 		return fmt.Errorf("migrate local state: scan run files: %w", err)
 	}
 	return nil
+}
+
+func (ic importContext) legacyRunsRoot() string {
+	return filepath.Join(ic.repo, ".loopcoder", "runs")
+}
+
+func (ic importContext) legacyRunPath(runID string) string {
+	return filepath.Join(ic.legacyRunsRoot(), runID)
 }
 
 func (ic importContext) importRelayRecords(ctx context.Context) error {

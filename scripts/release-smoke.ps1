@@ -222,6 +222,21 @@ try {
         Fail "projects register did not create $dbPath"
     }
     Assert-OutsideRepo -Path $dbPath -RepoPath $repoTmp -Label "v0.7.0 database"
+    $projectRoot = Join-Path $loopcoderHome ("projects/" + $registered.project.project_id)
+    foreach ($payloadRel in @("runs", "relay", "recovery", "audit")) {
+        $payloadPath = Join-Path $projectRoot $payloadRel
+        if (-not (Test-Path -LiteralPath $payloadPath)) {
+            Fail "projects register did not create project payload directory $payloadPath"
+        }
+        Assert-OutsideRepo -Path $payloadPath -RepoPath $repoTmp -Label "v0.7.0 project payload $payloadRel"
+    }
+    foreach ($homeRel in @("logs", "tmp")) {
+        $homeRuntimePath = Join-Path $loopcoderHome $homeRel
+        if (-not (Test-Path -LiteralPath $homeRuntimePath)) {
+            Fail "projects register did not create home runtime directory $homeRuntimePath"
+        }
+        Assert-OutsideRepo -Path $homeRuntimePath -RepoPath $repoTmp -Label "v0.7.0 home runtime $homeRel"
+    }
 
     Invoke-Checked "loopcoder projects show" {
         $script:projectShowOutput = @(& $binary projects show --repo $repoTmp --format json)
@@ -294,6 +309,26 @@ try {
     }
     if (-not $doctorPayload.runtime.project_registry.registered -or $doctorPayload.runtime.project_registry.project_id -ne $registered.project.project_id) {
         Fail "doctor JSON did not report the registered smoke project"
+    }
+    if (-not $doctorPayload.runtime.project_registry.payload_root) {
+        Fail "doctor JSON did not report the registered project payload root"
+    }
+    foreach ($runtimePath in @(
+        $doctorPayload.runtime.project_registry.payload_root,
+        $doctorPayload.runtime.project_registry.runs_root,
+        $doctorPayload.runtime.project_registry.relay_root,
+        $doctorPayload.runtime.project_registry.recovery_root,
+        $doctorPayload.runtime.project_registry.audit_root,
+        $doctorPayload.runtime.project_registry.logs_root,
+        $doctorPayload.runtime.project_registry.tmp_root
+    )) {
+        if ([string]::IsNullOrWhiteSpace($runtimePath)) {
+            Fail "doctor JSON omitted a v0.7.0 runtime payload path"
+        }
+        Assert-OutsideRepo -Path $runtimePath -RepoPath $repoTmp -Label "doctor runtime payload path"
+    }
+    if ($doctorPayload.runtime.project_registry.fallback_mode -ne "registered-global") {
+        Fail "doctor JSON reported fallback_mode=$($doctorPayload.runtime.project_registry.fallback_mode), want registered-global"
     }
     $defaultWorkerSmoke = @($doctorPayload.provider_compatibility | Where-Object {
         $_.provider -eq "codex" -and $_.role -eq "worker"
