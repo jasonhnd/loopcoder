@@ -408,7 +408,13 @@ func firstPrettyLine(value string) string {
 		return ""
 	}
 	line, _, _ := strings.Cut(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
-	return line
+	line = strings.Join(strings.Fields(line), " ")
+	const maxPrettyLineRunes = 220
+	runes := []rune(line)
+	if len(runes) <= maxPrettyLineRunes {
+		return line
+	}
+	return strings.TrimSpace(string(runes[:maxPrettyLineRunes])) + " [truncated]"
 }
 
 func sortStrings(values []string) {

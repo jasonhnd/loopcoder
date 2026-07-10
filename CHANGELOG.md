@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reporter output modes** - `dispatch`, `dispatch-wave`, `loopreview`,
+  `audit`, and `attest` now default to concise human receipts for merged-stream
+  host integrations; `--format json` emits JSON only, and `--verbose` is the
+  opt-in compatibility/debug path for canonical reporter records.
 - **Release smoke already-latest assertion** - joined native command output
   before matching so multi-line PowerShell arrays no longer produce a false
   negative for a good already-latest upgrade.

@@ -90,6 +90,8 @@ type Verdict struct {
 	Findings          []Finding          `json:"findings"`
 	Evidence          string             `json:"evidence"`
 	SpecConformance   string             `json:"spec_conformance"`
+	Reason            string             `json:"reason,omitempty"`
+	NextAction        string             `json:"next_action,omitempty"`
 	RenderedArtifacts []RenderedArtifact `json:"rendered_artifacts,omitempty"`
 	Report            *reporter.Report   `json:"report,omitempty"`
 }
@@ -470,6 +472,7 @@ func resultWithReport(verdict Verdict, record reporter.Report) Result {
 		}
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
+	verdict = NormalizeVerdict(verdict)
 	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}
 }
 
@@ -716,6 +719,7 @@ func textualPRHeadBody(content string) bool {
 }
 
 func Render(w io.Writer, result Result) error {
+	result.Verdict = NormalizeVerdict(result.Verdict)
 	data, err := json.Marshal(result.Verdict)
 	if err != nil {
 		return err
@@ -732,6 +736,8 @@ func ParseVerdict(raw string) (Verdict, error) {
 		Findings        *[]Finding `json:"findings"`
 		Evidence        *string    `json:"evidence"`
 		SpecConformance *string    `json:"spec_conformance"`
+		Reason          *string    `json:"reason"`
+		NextAction      *string    `json:"next_action"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
 		return Verdict{}, fmt.Errorf("parse verdict JSON: %w", err)
@@ -780,7 +786,114 @@ func ParseVerdict(raw string) (Verdict, error) {
 		Findings:        findings,
 		Evidence:        evidence,
 		SpecConformance: specConformance,
+		Reason:          stringValue(payload.Reason),
+		NextAction:      stringValue(payload.NextAction),
 	}, nil
+}
+
+// NormalizeVerdict fills additive human-decision fields from the stable verdict,
+// finding, and evidence fields. It keeps negative/escalated reasons tied to the
+// finding that caused the decision instead of positive evidence prose.
+func NormalizeVerdict(verdict Verdict) Verdict {
+	verdict.Findings = nonNilFindings(verdict.Findings)
+	verdict.Reason = DecisionReason(verdict)
+	verdict.NextAction = DecisionNextAction(verdict)
+	return verdict
+}
+
+func DecisionReason(verdict Verdict) string {
+	if reason := strings.TrimSpace(verdict.Reason); reason != "" {
+		return reason
+	}
+	switch verdict.Verdict {
+	case VerdictNeedsHuman:
+		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
+			return findingReason(finding)
+		}
+		return firstNonEmpty(verdict.Evidence, "human judgment is required before continuing")
+	case VerdictFail:
+		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
+			return findingReason(finding)
+		}
+		if verdict.SpecConformance == SpecConformanceFail {
+			return "spec conformance failed"
+		}
+		return firstNonEmpty(verdict.Evidence, "verifier reported a failing verdict")
+	case VerdictPass:
+		return firstNonEmpty(verdict.Evidence, "acceptance criteria satisfied")
+	default:
+		if finding, ok := highestSeverityFinding(verdict.Findings); ok {
+			return findingReason(finding)
+		}
+		return firstNonEmpty(verdict.Evidence, "verifier returned an unrecognized verdict")
+	}
+}
+
+func DecisionNextAction(verdict Verdict) string {
+	if next := strings.TrimSpace(verdict.NextAction); next != "" {
+		return next
+	}
+	switch verdict.Verdict {
+	case VerdictNeedsHuman:
+		return "human should decide whether the reported uncertainty is acceptable for this PR"
+	case VerdictFail:
+		return "fix the failed gate or regression before continuing"
+	case VerdictPass:
+		return "continue with the configured merge or promotion gate"
+	default:
+		return "inspect the verifier result before continuing"
+	}
+}
+
+func highestSeverityFinding(findings []Finding) (Finding, bool) {
+	bestIndex := -1
+	bestRank := 999
+	for index, finding := range findings {
+		if strings.TrimSpace(finding.Note) == "" {
+			continue
+		}
+		rank := loopreviewSeverityRank(finding.Severity)
+		if bestIndex < 0 || rank < bestRank {
+			bestIndex = index
+			bestRank = rank
+		}
+	}
+	if bestIndex < 0 {
+		return Finding{}, false
+	}
+	return findings[bestIndex], true
+}
+
+func loopreviewSeverityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical", "blocking":
+		return 0
+	case "error", "high":
+		return 1
+	case "warning", "medium":
+		return 2
+	case "low":
+		return 3
+	case "info", "note":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func findingReason(finding Finding) string {
+	note := strings.TrimSpace(finding.Note)
+	if strings.TrimSpace(finding.File) == "" {
+		return note
+	}
+	return strings.TrimSpace(finding.File) + ": " + note
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func BuildPrompt(opts Options, inputs reviewInputs) string {
@@ -1001,7 +1114,7 @@ Return only JSON matching this schema:
 `, opts.PRNumber, VerdictJSONSchema, formatReviewPacket(packet))
 }
 
-const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
+const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]},"reason":{"type":"string"},"next_action":{"type":"string"}}}`
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{
