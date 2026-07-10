@@ -33,7 +33,7 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
@@ -83,6 +83,9 @@ func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
 	}
 	if !tableExists(t, store, "child_plans") {
 		t.Fatalf("missing child_plans table")
+	}
+	if !tableExists(t, store, "run_claims") {
+		t.Fatalf("missing run_claims table")
 	}
 	var rootRunID string
 	if err := store.WithTx(ctx, func(tx Tx) error {
@@ -687,6 +690,57 @@ func TestTransitionRunStatusValidatesAndRecordsHistory(t *testing.T) {
 	}
 	if eventCount != 3 {
 		t.Fatalf("run_events count = %d, want 3", eventCount)
+	}
+}
+
+func TestClaimChildRunExecutionClaimsObservesAndFencesCompletion(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	childRunID := children[0].RunID
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-a", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution winner: %v", err)
+	}
+	if claim.Outcome != ClaimOutcomeClaimed || claim.ClaimGeneration != 1 || claim.ExecutorID != "executor-a" {
+		t.Fatalf("claim = %#v, want claimed generation 1 by executor-a", claim)
+	}
+	loser, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-b", now.Add(time.Second), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution loser: %v", err)
+	}
+	if loser.Outcome != ClaimOutcomeAlreadyRunning || loser.ExecutorID != "executor-a" || loser.ClaimGeneration != 1 {
+		t.Fatalf("loser claim = %#v, want already-running owner executor-a generation 1", loser)
+	}
+	stale, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-c", now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution stale takeover: %v", err)
+	}
+	if stale.Outcome != ClaimOutcomeStaleClaim || stale.ClaimGeneration != 2 || stale.PreviousOwner != "executor-a" || stale.ExecutorID != "executor-c" {
+		t.Fatalf("stale claim = %#v, want takeover generation 2 from executor-a to executor-c", stale)
+	}
+	err = CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-a", 1, "succeeded", "2026-07-10T00:03:01Z", "stale completion")
+	if err == nil || !strings.Contains(err.Error(), "stale claim") {
+		t.Fatalf("stale completion error = %v, want stale claim rejection", err)
+	}
+	if err := CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-c", 2, "succeeded", "2026-07-10T00:03:02Z", "winner completion"); err != nil {
+		t.Fatalf("CompleteClaimedChildRun winner: %v", err)
+	}
+	reused, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-d", now.Add(4*time.Minute), now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution terminal: %v", err)
+	}
+	if reused.Outcome != ClaimOutcomeTerminalReused {
+		t.Fatalf("terminal claim = %#v, want terminal-reused", reused)
 	}
 }
 

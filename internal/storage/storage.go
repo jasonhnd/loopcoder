@@ -17,11 +17,13 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 
 	_ "modernc.org/sqlite"
+	moderncsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 7
+	CurrentSchemaVersion = 8
 
 	driverName = "sqlite"
 )
@@ -32,6 +34,7 @@ type Store interface {
 	Path() string
 	Health(context.Context) (Health, error)
 	WithTx(context.Context, func(Tx) error) error
+	WithWriteTx(context.Context, func(Tx) error) error
 }
 
 // Tx is the storage transaction boundary exposed to internal callers.
@@ -64,6 +67,10 @@ type sqliteStore struct {
 
 type sqlTx struct {
 	tx *sql.Tx
+}
+
+type sqlConnTx struct {
+	conn *sql.Conn
 }
 
 var migrations = []migration{
@@ -239,9 +246,25 @@ var migrations = []migration{
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
 		},
 	},
+	{
+		version: 8,
+		name:    "nested child execution claims",
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS run_claims (
+				run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+				executor_id TEXT NOT NULL,
+				claim_generation INTEGER NOT NULL,
+				claimed_at TEXT NOT NULL,
+				lease_expires_at TEXT NOT NULL,
+				heartbeat_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_claims_executor_id ON run_claims(executor_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_claims_lease_expires_at ON run_claims(lease_expires_at)`,
+		},
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "legacy_import_records", "legacy_import_status"}
 
 type migration struct {
 	version    int
@@ -392,6 +415,71 @@ func (s *sqliteStore) WithTx(ctx context.Context, fn func(Tx) error) error {
 	return nil
 }
 
+func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return errors.New("storage write transaction: callback is required")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("storage write transaction: connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("storage write transaction: begin immediate: %w", err)
+	}
+	wrapped := sqlConnTx{conn: conn}
+	if err := fn(wrapped); err != nil {
+		if rollbackErr := rollbackConnTx(ctx, conn); rollbackErr != nil {
+			return fmt.Errorf("storage write transaction: rollback after %v: %w", err, rollbackErr)
+		}
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		_ = rollbackConnTx(ctx, conn)
+		return fmt.Errorf("storage write transaction: commit: %w", err)
+	}
+	return nil
+}
+
+func rollbackConnTx(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, `ROLLBACK`)
+	return err
+}
+
+func withRetry(ctx context.Context, op func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		err = op()
+		if err == nil || !sqliteBusy(err) {
+			return err
+		}
+		delay := time.Duration(attempt+1) * 25 * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return err
+}
+
+func sqliteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+	}
+	return false
+}
+
 func (tx sqlTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return tx.tx.ExecContext(ctx, query, args...)
 }
@@ -402,6 +490,18 @@ func (tx sqlTx) Query(ctx context.Context, query string, args ...any) (*sql.Rows
 
 func (tx sqlTx) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
 	return tx.tx.QueryRowContext(ctx, query, args...)
+}
+
+func (tx sqlConnTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return tx.conn.ExecContext(ctx, query, args...)
+}
+
+func (tx sqlConnTx) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return tx.conn.QueryContext(ctx, query, args...)
+}
+
+func (tx sqlConnTx) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.conn.QueryRowContext(ctx, query, args...)
 }
 
 func (s *sqliteStore) configure(ctx context.Context) error {

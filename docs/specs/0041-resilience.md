@@ -455,6 +455,31 @@ survives because the issue graph, attempt ledger, progress facts, and recovery
 briefs are represented in files and git. A new session can start with fresh
 context, read the ledger, and continue.
 
+Nested child runs add a stricter local database ownership rule. Stable
+`run_id` replay is not enough to relaunch a child provider: the scheduler must
+own the current durable execution claim for the child. Claim acquisition,
+child/edge transition to `running`, and SQL transition event insertion happen
+inside one immediate write transaction. If two schedulers replay the same child,
+one receives `claimed` and may launch the provider; the other receives an
+active-owner observation with owner, generation, and lease metadata and must
+not execute.
+
+Crash handling for nested children is conservative:
+
+- Crash after claim but before provider launch: observers see the active lease.
+  After expiry, recovery may take over with a new generation; if absence of
+  side effects cannot be proven, recovery fails closed to `needs-human`.
+- Crash during provider execution: the active lease prevents duplicate launch
+  until expiry. A takeover increments `claim_generation`, and stale completion
+  from the older owner is rejected by owner/generation fencing.
+- Crash after external side effects but before terminal persistence: loopcoder
+  does not claim universal exactly-once effects. Recovery must use provider
+  idempotency keys, receipts, local attempt records, or human review to decide
+  whether to persist a terminal state or mark the child `needs-human`.
+- Cancellation while observing another owner is non-mutating. The observer may
+  return a running/blocked result, but it must not cancel the owner or publish a
+  terminal child status.
+
 ## Reconciliation Rules
 
 Reconciliation must be deterministic enough that two fresh sessions make the
