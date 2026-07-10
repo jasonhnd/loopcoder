@@ -21,16 +21,17 @@ import (
 )
 
 const (
-	NestedStatusSucceeded  = "succeeded"
-	NestedStatusFailed     = "failed"
-	NestedStatusNeedsHuman = "needs-human"
-	NestedStatusSkipped    = "skipped"
-	NestedStatusCancelled  = "cancelled"
-	NestedStatusTimedOut   = "timed_out"
-	NestedStatusAbandoned  = "abandoned"
-	NestedStatusQueued     = "queued"
-	NestedStatusRunning    = "running"
-	NestedStatusWaiting    = "waiting"
+	NestedStatusSucceeded                     = "succeeded"
+	NestedStatusSucceededWithOptionalFailures = "succeeded_with_optional_failures"
+	NestedStatusFailed                        = "failed"
+	NestedStatusNeedsHuman                    = "needs-human"
+	NestedStatusSkipped                       = "skipped"
+	NestedStatusCancelled                     = "cancelled"
+	NestedStatusTimedOut                      = "timed_out"
+	NestedStatusAbandoned                     = "abandoned"
+	NestedStatusQueued                        = "queued"
+	NestedStatusRunning                       = "running"
+	NestedStatusWaiting                       = "waiting"
 
 	NestedEventChildQueued   = "nested.child.queued"
 	NestedEventChildRunning  = "nested.child.running"
@@ -191,7 +192,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			Children:         []ChildRunResult{},
 			Summary:          NestedSummary{},
 		}
-		if err := recordNestedParentDone(opts, report, finished); err != nil {
+		if err := recordNestedParentDone(ctx, opts, report, finished); err != nil {
 			return report, err
 		}
 		return report, nil
@@ -284,7 +285,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = err.Error()
 			result.FinishedAt = state.FormatTimestamp(started)
-			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested budget preflight"); err != nil {
 				return NestedScheduleReport{}, err
 			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
@@ -296,7 +297,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = blocked
 			result.FinishedAt = state.FormatTimestamp(started)
-			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested budget preflight"); err != nil {
 				return NestedScheduleReport{}, err
 			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
@@ -310,7 +311,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = err.Error()
 			result.FinishedAt = state.FormatTimestamp(started)
-			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested circuit preflight"); err != nil {
 				return NestedScheduleReport{}, err
 			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
@@ -322,7 +323,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = blocked
 			result.FinishedAt = state.FormatTimestamp(started)
-			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested circuit preflight"); err != nil {
 				return NestedScheduleReport{}, err
 			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
@@ -349,8 +350,16 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	runChild := func(index int) {
 		child := children[index]
 		result := childResultFromPlan(child)
-		result.Status = NestedStatusFailed
+		result.Status = NestedStatusRunning
 		result.StartedAt = state.FormatTimestamp(clock())
+		if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, NestedStatusRunning, result.StartedAt, "child provider launching"); err != nil {
+			if reused, ok := durableChildResultAfterLaunchRace(ctx, opts.Store, plan, child, result); ok {
+				results[index] = reused
+				return
+			}
+			setCompleteErr(err)
+			return
+		}
 		eventMu.Lock()
 		err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
 		eventMu.Unlock()
@@ -360,6 +369,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		}
 
 		executed, err := opts.Execute(ctx, child)
+		if err == nil && strings.TrimSpace(executed.Status) == "" {
+			executed.Status = NestedStatusFailed
+		}
 		result = mergeChildResult(result, executed)
 		if err != nil {
 			result.Status = normalizeNestedStatus(state.FailureStatus(err))
@@ -373,7 +385,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		results[index] = result
 
 		finishedAt := parseOrClock(result.FinishedAt, clock)
-		setCompleteErr(storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt))
+		setCompleteErr(storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "child provider finished"))
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
 		eventMu.Unlock()
@@ -406,7 +418,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				finishedAt := clock().UTC()
 				result.FinishedAt = state.FormatTimestamp(finishedAt)
 				persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				setCompleteErr(storage.UpdateChildRunOutcome(persistCtx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt))
+				setCompleteErr(storage.TransitionChildRunStatus(persistCtx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt, "parent context stopped before child launch"))
 				cancel()
 				eventMu.Lock()
 				err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
@@ -442,7 +454,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	report.Summary = nestedSummary(results)
 	report.Status = nestedParentStatus(results)
-	if err := recordNestedParentDone(opts, report, finished); err != nil && completeErr == nil {
+	if err := recordNestedParentDone(ctx, opts, report, finished); err != nil && completeErr == nil {
 		completeErr = err
 	}
 	if completeErr != nil {
@@ -767,6 +779,32 @@ func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 	}
 }
 
+func durableChildResultAfterLaunchRace(ctx context.Context, store storage.Store, plan *ChildPlan, child ChildRunPlan, fallback ChildRunResult) (ChildRunResult, bool) {
+	if store == nil || plan == nil {
+		return ChildRunResult{}, false
+	}
+	replay, ok, err := storage.LoadChildPlanReplayRecord(ctx, store, plan.PlanID)
+	if err != nil || !ok {
+		return ChildRunResult{}, false
+	}
+	for _, durable := range replay.Children {
+		if strings.TrimSpace(durable.ChildKey) != child.ChildKey || strings.TrimSpace(durable.ChildRunID) != child.RunID {
+			continue
+		}
+		status := normalizeNestedStatus(firstNonEmptyChild(durable.RunStatus, durable.EdgeStatus))
+		if replayActionForStatus(status) != ReplayActionReused {
+			return ChildRunResult{}, false
+		}
+		fallback.Status = status
+		fallback.StartedAt = durable.StartedAt
+		fallback.FinishedAt = durable.FinishedAt
+		fallback.ReplayAction = ReplayActionReused
+		fallback.Error = ""
+		return fallback, true
+	}
+	return ChildRunResult{}, false
+}
+
 func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ID) != "" {
 		base.ID = strings.TrimSpace(result.ID)
@@ -938,6 +976,8 @@ func normalizeNestedStatus(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case NestedStatusSucceeded, "success", "completed", "complete", "done":
 		return NestedStatusSucceeded
+	case NestedStatusSucceededWithOptionalFailures, "succeeded-with-optional-failures", "succeeded with optional failures":
+		return NestedStatusSucceededWithOptionalFailures
 	case NestedStatusNeedsHuman, "needs_human", "needs human", "hung":
 		return NestedStatusNeedsHuman
 	case NestedStatusSkipped:
@@ -963,7 +1003,7 @@ func normalizeNestedStatus(status string) string {
 
 func replayActionForStatus(status string) string {
 	switch normalizeNestedStatus(status) {
-	case NestedStatusSucceeded:
+	case NestedStatusSucceeded, NestedStatusSucceededWithOptionalFailures:
 		return ReplayActionReused
 	case NestedStatusQueued, NestedStatusRunning, NestedStatusWaiting:
 		return ReplayActionResumed
@@ -978,21 +1018,50 @@ func replayActionForStatus(status string) string {
 
 func nestedParentStatus(results []ChildRunResult) string {
 	needsHuman := false
+	optionalFailures := false
 	for _, result := range results {
+		if result.Aggregation.Mode == ChildAggregationIgnore {
+			continue
+		}
+		if result.Aggregation.Mode == ChildAggregationGate {
+			switch result.Status {
+			case NestedStatusSucceeded:
+			case NestedStatusRunning, NestedStatusQueued, NestedStatusWaiting, "pending":
+				return NestedStatusRunning
+			default:
+				needsHuman = true
+			}
+			continue
+		}
 		if !result.Required {
+			if nestedOptionalFailureStatus(result.Status) {
+				optionalFailures = true
+			}
 			continue
 		}
 		switch result.Status {
-		case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusSkipped:
-			return NestedStatusFailed
-		case NestedStatusNeedsHuman:
+		case NestedStatusRunning, NestedStatusQueued, NestedStatusWaiting, "pending":
+			return NestedStatusRunning
+		case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusSkipped, NestedStatusNeedsHuman, "hung", "idle", "blocked":
 			needsHuman = true
 		}
 	}
 	if needsHuman {
 		return NestedStatusNeedsHuman
 	}
+	if optionalFailures {
+		return NestedStatusSucceededWithOptionalFailures
+	}
 	return NestedStatusSucceeded
+}
+
+func nestedOptionalFailureStatus(status string) bool {
+	switch normalizeNestedStatus(status) {
+	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusNeedsHuman:
+		return true
+	default:
+		return false
+	}
 }
 
 func nestedSummary(results []ChildRunResult) NestedSummary {
@@ -1055,7 +1124,10 @@ func nestedEventStatus(eventName, resultStatus string) string {
 	}
 }
 
-func recordNestedParentDone(opts NestedScheduleOptions, report NestedScheduleReport, at time.Time) error {
+func recordNestedParentDone(ctx context.Context, opts NestedScheduleOptions, report NestedScheduleReport, at time.Time) error {
+	if err := storage.TransitionParentRunStatus(ctx, opts.Store, opts.ParentRunID, report.Status, state.FormatTimestamp(at), "nested parent finished"); err != nil {
+		return err
+	}
 	details, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("marshal nested parent event details: %w", err)

@@ -24,17 +24,21 @@ const runIDTimeLayout = "20060102T150405Z"
 var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave|child-(?:[a-z0-9][a-z0-9-]{0,62}|\d+-[a-z0-9][a-z0-9-]{0,62}))$`)
 
 const (
-	StatusPlanned    = "planned"
-	StatusQueued     = "queued"
-	StatusRunning    = "running"
-	StatusWaiting    = "waiting"
-	StatusSucceeded  = "succeeded"
-	StatusFailed     = "failed"
-	StatusCancelled  = "cancelled"
-	StatusTimedOut   = "timed_out"
-	StatusAbandoned  = "abandoned"
-	StatusNeedsHuman = "needs-human"
-	StatusHung       = "hung"
+	StatusPlanned                       = "planned"
+	StatusQueued                        = "queued"
+	StatusLaunching                     = "launching"
+	StatusRunning                       = "running"
+	StatusFinishing                     = "finishing"
+	StatusWaiting                       = "waiting"
+	StatusSucceeded                     = "succeeded"
+	StatusSucceededWithOptionalFailures = "succeeded_with_optional_failures"
+	StatusFailed                        = "failed"
+	StatusCancelled                     = "cancelled"
+	StatusTimedOut                      = "timed_out"
+	StatusAbandoned                     = "abandoned"
+	StatusNeedsHuman                    = "needs-human"
+	StatusHung                          = "hung"
+	StatusSkipped                       = "skipped"
 )
 
 type Attempt struct {
@@ -118,7 +122,7 @@ func FailureStatus(err error) string {
 
 func IsTerminalStatus(status string) bool {
 	switch NormalizeStatus(status) {
-	case StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusAbandoned, StatusNeedsHuman, StatusHung:
+	case StatusSucceeded, StatusSucceededWithOptionalFailures, StatusFailed, StatusCancelled, StatusTimedOut, StatusAbandoned, StatusNeedsHuman, StatusHung, StatusSkipped:
 		return true
 	default:
 		return false

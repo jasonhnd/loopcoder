@@ -249,8 +249,8 @@ func TestScheduleNestedRunsRecordsFinishedEventForTerminalChildStatuses(t *testi
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
 	}
-	if report.Status != NestedStatusFailed {
-		t.Fatalf("parent status = %s, want failed", report.Status)
+	if report.Status != NestedStatusNeedsHuman {
+		t.Fatalf("parent status = %s, want needs-human", report.Status)
 	}
 	for _, child := range report.Children {
 		events := readNestedEvents(t, repo, child.RunID)
@@ -309,8 +309,8 @@ func TestScheduleNestedRunsAggregatesRequiredFailuresPredictably(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
 	}
-	if report.Status != NestedStatusFailed {
-		t.Fatalf("status = %s, want failed", report.Status)
+	if report.Status != NestedStatusNeedsHuman {
+		t.Fatalf("status = %s, want needs-human", report.Status)
 	}
 }
 
@@ -335,8 +335,8 @@ func TestScheduleNestedRunsRequiredSkippedBlocksParentSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
 	}
-	if report.Status != NestedStatusFailed {
-		t.Fatalf("required skipped parent status = %s, want failed", report.Status)
+	if report.Status != NestedStatusNeedsHuman {
+		t.Fatalf("required skipped parent status = %s, want needs-human", report.Status)
 	}
 
 	report, err = ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
@@ -362,6 +362,58 @@ func TestScheduleNestedRunsRequiredSkippedBlocksParentSuccess(t *testing.T) {
 	}
 	if report.Status != NestedStatusSucceeded {
 		t.Fatalf("optional skipped parent status = %s, want succeeded", report.Status)
+	}
+}
+
+func TestScheduleNestedRunsAggregationModes(t *testing.T) {
+	tests := []struct {
+		name        string
+		child       ChildRunPlan
+		childStatus string
+		wantStatus  string
+	}{
+		{
+			name: "gate optional failure blocks parent",
+			child: ChildRunPlan{
+				ID: "optional-gate-fail", Issue: 1, Permission: "read-only",
+				Aggregation: ChildAggregation{Mode: ChildAggregationGate, Required: false, IncludeReport: true},
+			},
+			childStatus: NestedStatusFailed,
+			wantStatus:  NestedStatusNeedsHuman,
+		},
+		{
+			name: "ignore required failure does not block parent",
+			child: ChildRunPlan{
+				ID: "ignored-required-fail", Issue: 2, Permission: "write",
+				Aggregation: ChildAggregation{Mode: ChildAggregationIgnore, Required: true, IncludeReport: true},
+			},
+			childStatus: NestedStatusFailed,
+			wantStatus:  NestedStatusSucceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			now := nestedTestNow()
+			report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+				RepoPath:         repo,
+				ParentRunID:      "run-20260709T000000Z-wave",
+				ConcurrencyLimit: 1,
+				MaxChildren:      1,
+				Now:              now,
+				Clock:            func() time.Time { return now },
+				Children:         []ChildRunPlan{tt.child},
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					return ChildRunResult{Status: tt.childStatus}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+			}
+			if report.Status != tt.wantStatus {
+				t.Fatalf("parent status = %s, want %s", report.Status, tt.wantStatus)
+			}
+		})
 	}
 }
 
@@ -749,6 +801,96 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
 	events := readNestedEvents(t, repo, plan.ParentRunID)
 	if !strings.Contains(events, NestedEventChildQueued) || !strings.Contains(events, NestedEventChildFinished) || !strings.Contains(events, `"status":"succeeded"`) {
 		t.Fatalf("compatibility events do not mirror durable success:\n%s", events)
+	}
+}
+
+func TestScheduleNestedRunsPersistsOptionalCollectFailureParentStatus(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := ChildPlan{
+		SchemaVersion:  ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260709T000000Z-wave-optional",
+		ParentRunID:    "run-20260709T000000Z-wave",
+		RootRunID:      "run-20260709T000000Z-wave",
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		CreatedAt:      "2026-07-09T00:00:00Z",
+		Items: []ChildRunPlan{
+			{
+				ChildKey: "required-ok", Title: "Required OK", Role: "worker",
+				Scope: ChildScope{Repo: ".", Issues: []int{710}}, Permission: "write", DependsOn: []string{},
+				Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
+			},
+			{
+				ChildKey: "optional-fail", Title: "Optional fail", Role: "worker",
+				Scope: ChildScope{Repo: ".", Issues: []int{710}}, Permission: "read-only", DependsOn: []string{},
+				Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: false, IncludeReport: true},
+			},
+		},
+	}
+	parentDoneSawDurableTerminal := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 2,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Plan:        &plan,
+		Store:       store,
+		RecordEvent: func(repoPath, runID string, event state.Event) error {
+			if event.Event == NestedEventParentDone {
+				var status, endedAt string
+				if err := store.WithTx(ctx, func(tx storage.Tx) error {
+					return tx.QueryRow(ctx, `SELECT status, COALESCE(ended_at, '') FROM runs WHERE id = ?`, plan.ParentRunID).Scan(&status, &endedAt)
+				}); err != nil {
+					t.Fatalf("query parent before compatibility event: %v", err)
+				}
+				parentDoneSawDurableTerminal = status == NestedStatusSucceededWithOptionalFailures && endedAt != ""
+			}
+			return state.AppendEvent(repoPath, runID, event)
+		},
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			var runStatus, edgeStatus string
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, child.RunID).Scan(&runStatus); err != nil {
+					return err
+				}
+				return tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, plan.ParentRunID, child.RunID).Scan(&edgeStatus)
+			}); err != nil {
+				t.Fatalf("query child before execute: %v", err)
+			}
+			if runStatus != NestedStatusRunning || edgeStatus != NestedStatusRunning {
+				t.Fatalf("child %s durable status before execute = %s/%s, want running/running", child.ChildKey, runStatus, edgeStatus)
+			}
+			if child.ChildKey == "optional-fail" {
+				return ChildRunResult{Status: NestedStatusFailed, Error: "optional child failed"}, nil
+			}
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if report.Status != NestedStatusSucceededWithOptionalFailures {
+		t.Fatalf("parent report status = %s, want %s", report.Status, NestedStatusSucceededWithOptionalFailures)
+	}
+	if !parentDoneSawDurableTerminal {
+		t.Fatal("parent finished compatibility event was emitted before durable terminal parent status")
+	}
+	var parentStatus, parentEndedAt string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status, COALESCE(ended_at, '') FROM runs WHERE id = ?`, plan.ParentRunID).Scan(&parentStatus, &parentEndedAt)
+	}); err != nil {
+		t.Fatalf("query durable parent: %v", err)
+	}
+	if parentStatus != NestedStatusSucceededWithOptionalFailures || parentEndedAt == "" {
+		t.Fatalf("durable parent status/ended_at = %q/%q, want optional-failures with ended_at", parentStatus, parentEndedAt)
 	}
 }
 
