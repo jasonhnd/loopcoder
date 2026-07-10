@@ -92,6 +92,10 @@ type RunTreeNode struct {
 	Model           string   `json:"model,omitempty"`
 	Effort          string   `json:"effort,omitempty"`
 	Permission      string   `json:"permission,omitempty"`
+	ClaimOutcome    string   `json:"claim_outcome,omitempty"`
+	ClaimOwner      string   `json:"claim_owner,omitempty"`
+	ClaimGeneration int64    `json:"claim_generation,omitempty"`
+	LeaseExpiresAt  string   `json:"lease_expires_at,omitempty"`
 	LifecycleStatus string   `json:"lifecycle_status"`
 	LifecycleSource string   `json:"lifecycle_source,omitempty"`
 	StartedAt       string   `json:"started_at,omitempty"`
@@ -304,6 +308,18 @@ func Render(report Report) string {
 			}
 			if strings.TrimSpace(node.Permission) != "" {
 				parts = append(parts, "permission="+node.Permission)
+			}
+			if strings.TrimSpace(node.ClaimOutcome) != "" {
+				parts = append(parts, "claim="+node.ClaimOutcome)
+			}
+			if strings.TrimSpace(node.ClaimOwner) != "" {
+				parts = append(parts, "owner="+node.ClaimOwner)
+			}
+			if node.ClaimGeneration > 0 {
+				parts = append(parts, "generation="+strconv.FormatInt(node.ClaimGeneration, 10))
+			}
+			if strings.TrimSpace(node.LeaseExpiresAt) != "" {
+				parts = append(parts, "lease_expires_at="+node.LeaseExpiresAt)
 			}
 			fmt.Fprintf(&out, "%s- %s (%s)\n", indent, node.RunID, strings.Join(parts, " "))
 			if strings.TrimSpace(node.ReportSummary) != "" {

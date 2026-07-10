@@ -180,9 +180,11 @@ func runEdgesFromEvents(repoPath, runID string) ([]string, string) {
 		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
 			parent = strings.TrimSpace(details.ParentRunID)
 		}
-		children[details.Child.RunID] = true
-		children[details.Result.RunID] = true
-		delete(children, "")
+		if strings.TrimSpace(details.ParentRunID) == runID {
+			children[details.Child.RunID] = true
+			children[details.Result.RunID] = true
+			delete(children, "")
+		}
 	}
 	return sortedStringSet(children), parent
 }
@@ -223,6 +225,7 @@ func applyRunNodeDetails(repoPath, runID string, now time.Time, node *RunTreeNod
 		return
 	}
 	metadata, verifiers := runNodeMetadata(repoPath, runID, now)
+	applyClaimMetadata(repoPath, runID, node)
 	var latest *state.Attempt
 	for i := range attempts {
 		if latest == nil || attemptAfter(attempts[i], *latest) {
@@ -247,6 +250,62 @@ func applyRunNodeDetails(repoPath, runID string, now time.Time, node *RunTreeNod
 				node.ReportSummary = strings.TrimSpace(record.Summary)
 				break
 			}
+		}
+	}
+}
+
+func applyClaimMetadata(repoPath, runID string, node *RunTreeNode) {
+	path := filepath.Join(state.RunPathForRead(repoPath, runID), "events.jsonl")
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() > maxRunStatusEventBytes {
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	limited := &io.LimitedReader{R: file, N: maxRunStatusEventBytes + 1}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 1024), maxRunStatusEventLineBytes)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Details json.RawMessage `json:"details"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil || len(event.Details) == 0 {
+			continue
+		}
+		var details struct {
+			Result struct {
+				RunID           string `json:"run_id"`
+				ClaimOutcome    string `json:"claim_outcome"`
+				ClaimOwner      string `json:"claim_owner"`
+				ClaimGeneration int64  `json:"claim_generation"`
+				LeaseExpiresAt  string `json:"lease_expires_at"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			continue
+		}
+		if strings.TrimSpace(details.Result.RunID) != runID {
+			continue
+		}
+		if strings.TrimSpace(details.Result.ClaimOutcome) != "" {
+			node.ClaimOutcome = strings.TrimSpace(details.Result.ClaimOutcome)
+		}
+		if strings.TrimSpace(details.Result.ClaimOwner) != "" {
+			node.ClaimOwner = strings.TrimSpace(details.Result.ClaimOwner)
+		}
+		if details.Result.ClaimGeneration > 0 {
+			node.ClaimGeneration = details.Result.ClaimGeneration
+		}
+		if strings.TrimSpace(details.Result.LeaseExpiresAt) != "" {
+			node.LeaseExpiresAt = strings.TrimSpace(details.Result.LeaseExpiresAt)
 		}
 	}
 }

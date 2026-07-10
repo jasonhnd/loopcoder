@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -43,7 +45,11 @@ const (
 	ReplayActionResumed = "resumed"
 	ReplayActionRetried = "retried"
 	ReplayActionBlocked = "blocked"
+
+	nestedClaimLeaseDuration = 30 * time.Minute
 )
+
+var nestedExecutorSequence uint64
 
 type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
@@ -120,6 +126,10 @@ type ChildRunResult struct {
 	Depth               int              `json:"depth"`
 	Status              string           `json:"status"`
 	ReplayAction        string           `json:"replay_action,omitempty"`
+	ClaimOutcome        string           `json:"claim_outcome,omitempty"`
+	ClaimOwner          string           `json:"claim_owner,omitempty"`
+	ClaimGeneration     int64            `json:"claim_generation,omitempty"`
+	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -353,17 +363,44 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		child := children[index]
 		result := childResultFromPlan(child)
 		result.Status = NestedStatusRunning
-		result.StartedAt = state.FormatTimestamp(clock())
-		if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, NestedStatusRunning, result.StartedAt, "child provider launching"); err != nil {
-			if reused, ok := durableChildResultAfterLaunchRace(ctx, opts.Store, plan, child, result); ok {
-				results[index] = reused
-				return
-			}
+		claimAt := time.Now().UTC()
+		claim, err := storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration))
+		if err != nil {
 			setCompleteErr(err)
 			return
 		}
+		result = applyClaimResult(result, claim)
+		switch claim.Outcome {
+		case storage.ClaimOutcomeClaimed, storage.ClaimOutcomeStaleClaim:
+			if claim.Outcome == storage.ClaimOutcomeStaleClaim {
+				result.ReplayAction = ReplayActionRetried
+				result.Reason = fmt.Sprintf("stale claim from %s expired at %s; claimed generation %d", claim.PreviousOwner, claim.PreviousLease, claim.ClaimGeneration)
+			}
+		case storage.ClaimOutcomeAlreadyRunning:
+			result.Status = NestedStatusRunning
+			result.ReplayAction = ReplayActionResumed
+			result.Reason = fmt.Sprintf("child execution is already owned by %s until %s", claim.ExecutorID, claim.LeaseExpiresAt)
+			result.NextAction = "observe the active durable child owner before replaying"
+			results[index] = result
+			return
+		case storage.ClaimOutcomeTerminalReused:
+			result.Status = normalizeNestedStatus(firstNonEmptyChild(claim.RunStatus, claim.EdgeStatus))
+			result.ReplayAction = ReplayActionReused
+			results[index] = result
+			return
+		case storage.ClaimOutcomeBlocked:
+			result.Status = NestedStatusNeedsHuman
+			result.ReplayAction = ReplayActionBlocked
+			result.Error = fmt.Sprintf("child %q is %s in durable state; human action is required before replay", child.ChildKey, normalizeNestedStatus(firstNonEmptyChild(claim.RunStatus, claim.EdgeStatus)))
+			result.FinishedAt = state.FormatTimestamp(clock().UTC())
+			results[index] = withNestedDecision(result)
+			return
+		default:
+			setCompleteErr(fmt.Errorf("claim child run %s returned unknown outcome %q", child.RunID, claim.Outcome))
+			return
+		}
 		eventMu.Lock()
-		err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
+		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
 		eventMu.Unlock()
 		setCompleteErr(err)
 		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock)); err != nil {
@@ -387,7 +424,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		results[index] = result
 
 		finishedAt := parseOrClock(result.FinishedAt, clock)
-		setCompleteErr(storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "child provider finished"))
+		setCompleteErr(storage.CompleteClaimedChildRun(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.Status, result.FinishedAt, "child provider finished"))
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
 		eventMu.Unlock()
@@ -781,32 +818,6 @@ func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 	}
 }
 
-func durableChildResultAfterLaunchRace(ctx context.Context, store storage.Store, plan *ChildPlan, child ChildRunPlan, fallback ChildRunResult) (ChildRunResult, bool) {
-	if store == nil || plan == nil {
-		return ChildRunResult{}, false
-	}
-	replay, ok, err := storage.LoadChildPlanReplayRecord(ctx, store, plan.PlanID)
-	if err != nil || !ok {
-		return ChildRunResult{}, false
-	}
-	for _, durable := range replay.Children {
-		if strings.TrimSpace(durable.ChildKey) != child.ChildKey || strings.TrimSpace(durable.ChildRunID) != child.RunID {
-			continue
-		}
-		status := normalizeNestedStatus(firstNonEmptyChild(durable.RunStatus, durable.EdgeStatus))
-		if replayActionForStatus(status) != ReplayActionReused {
-			return ChildRunResult{}, false
-		}
-		fallback.Status = status
-		fallback.StartedAt = durable.StartedAt
-		fallback.FinishedAt = durable.FinishedAt
-		fallback.ReplayAction = ReplayActionReused
-		fallback.Error = ""
-		return fallback, true
-	}
-	return ChildRunResult{}, false
-}
-
 func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ID) != "" {
 		base.ID = strings.TrimSpace(result.ID)
@@ -854,6 +865,18 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ReplayAction) != "" {
 		base.ReplayAction = strings.TrimSpace(result.ReplayAction)
 	}
+	if strings.TrimSpace(result.ClaimOutcome) != "" {
+		base.ClaimOutcome = strings.TrimSpace(result.ClaimOutcome)
+	}
+	if strings.TrimSpace(result.ClaimOwner) != "" {
+		base.ClaimOwner = strings.TrimSpace(result.ClaimOwner)
+	}
+	if result.ClaimGeneration > 0 {
+		base.ClaimGeneration = result.ClaimGeneration
+	}
+	if strings.TrimSpace(result.LeaseExpiresAt) != "" {
+		base.LeaseExpiresAt = strings.TrimSpace(result.LeaseExpiresAt)
+	}
 	base.Error = strings.TrimSpace(result.Error)
 	base.Reason = strings.TrimSpace(result.Reason)
 	base.NextAction = strings.TrimSpace(result.NextAction)
@@ -867,6 +890,22 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 		base.FinishedAt = strings.TrimSpace(result.FinishedAt)
 	}
 	return base
+}
+
+func nestedExecutorID(parentRunID string) string {
+	seq := atomic.AddUint64(&nestedExecutorSequence, 1)
+	return fmt.Sprintf("nested-scheduler:%s:%d:%d", strings.TrimSpace(parentRunID), os.Getpid(), seq)
+}
+
+func applyClaimResult(result ChildRunResult, claim storage.ClaimResult) ChildRunResult {
+	result.ClaimOutcome = claim.Outcome
+	result.ClaimOwner = claim.ExecutorID
+	result.ClaimGeneration = claim.ClaimGeneration
+	result.LeaseExpiresAt = claim.LeaseExpiresAt
+	if strings.TrimSpace(claim.ClaimedAt) != "" {
+		result.StartedAt = claim.ClaimedAt
+	}
+	return result
 }
 
 func evaluateNestedBudget(opts NestedScheduleOptions, child ChildRunPlan, plannedAttempts int, now time.Time) (string, bool, error) {
@@ -1036,7 +1075,7 @@ func replayActionForStatus(status string) string {
 	case NestedStatusQueued, NestedStatusRunning, NestedStatusWaiting:
 		return ReplayActionResumed
 	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut:
-		return ReplayActionRetried
+		return ReplayActionReused
 	case NestedStatusNeedsHuman, NestedStatusAbandoned, NestedStatusSkipped:
 		return ReplayActionBlocked
 	default:

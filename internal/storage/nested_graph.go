@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+const (
+	ClaimOutcomeClaimed        = "claimed"
+	ClaimOutcomeAlreadyRunning = "already-running"
+	ClaimOutcomeTerminalReused = "terminal-reused"
+	ClaimOutcomeBlocked        = "blocked"
+	ClaimOutcomeStaleClaim     = "stale-claim"
+)
+
 // RunNode describes the durable run graph metadata required for nested runs.
 type RunNode struct {
 	RunID       string
@@ -77,6 +85,11 @@ type ChildPlanReplayChild struct {
 	StartedAt       string
 	FinishedAt      string
 	UpdatedAt       string
+	ExecutorID      string
+	ClaimGeneration int64
+	ClaimedAt       string
+	LeaseExpiresAt  string
+	HeartbeatAt     string
 }
 
 // RunStatusTransition describes one authoritative durable status transition.
@@ -90,6 +103,20 @@ type RunStatusTransition struct {
 	UpdatedAt   string
 	Reason      string
 	Source      string
+}
+
+type ClaimResult struct {
+	Outcome         string
+	RunID           string
+	ExecutorID      string
+	ClaimGeneration int64
+	ClaimedAt       string
+	LeaseExpiresAt  string
+	HeartbeatAt     string
+	RunStatus       string
+	EdgeStatus      string
+	PreviousOwner   string
+	PreviousLease   string
 }
 
 // LoadChildPlanReplayRecord loads the authoritative durable child identity for
@@ -138,9 +165,15 @@ func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) 
 				COALESCE(r.status, ''),
 				COALESCE(r.started_at, ''),
 				COALESCE(r.ended_at, ''),
-				e.updated_at
+				e.updated_at,
+				COALESCE(c.executor_id, ''),
+				COALESCE(c.claim_generation, 0),
+				COALESCE(c.claimed_at, ''),
+				COALESCE(c.lease_expires_at, ''),
+				COALESCE(c.heartbeat_at, '')
 			FROM run_edges e
 			LEFT JOIN runs r ON r.id = e.child_run_id
+			LEFT JOIN run_claims c ON c.run_id = e.child_run_id
 			WHERE e.plan_id = ?
 			ORDER BY e.ordinal, e.child_key`, planID)
 		if err != nil {
@@ -165,6 +198,11 @@ func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) 
 				&child.StartedAt,
 				&child.FinishedAt,
 				&child.UpdatedAt,
+				&child.ExecutorID,
+				&child.ClaimGeneration,
+				&child.ClaimedAt,
+				&child.LeaseExpiresAt,
+				&child.HeartbeatAt,
 			); err != nil {
 				return fmt.Errorf("load child plan %s edge: %w", planID, err)
 			}
@@ -213,64 +251,10 @@ func TransitionRunStatus(ctx context.Context, store Store, transition RunStatusT
 		return fmt.Errorf("transition child run status: parent_run_id is required")
 	}
 
-	return store.WithTx(ctx, func(tx Tx) error {
-		previous, ok, err := currentRunStatus(ctx, tx, transition.RunID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("transition run status: run %q is missing", transition.RunID)
-		}
-		if err := validateDurableTransition(previous, transition.Status); err != nil {
-			return fmt.Errorf("transition run %s: %w", transition.RunID, err)
-		}
-
-		var previousEdge string
-		if transition.ChildRunID != "" {
-			previousEdge, ok, err = currentRunEdgeStatus(ctx, tx, transition.ParentRunID, transition.ChildRunID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return fmt.Errorf("transition child run status: edge %q/%q is missing", transition.ParentRunID, transition.ChildRunID)
-			}
-			if err := validateDurableTransition(previousEdge, transition.Status); err != nil {
-				return fmt.Errorf("transition run edge %s/%s: %w", transition.ParentRunID, transition.ChildRunID, err)
-			}
-		}
-
-		if _, err := tx.Exec(ctx, `UPDATE runs SET
-				status = ?,
-				started_at = CASE WHEN ? IN ('launching', 'running') AND (started_at IS NULL OR started_at = '') THEN ? ELSE started_at END,
-				ended_at = CASE WHEN ? IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked') THEN ? WHEN ? IN ('queued', 'launching', 'running', 'waiting', 'finishing') THEN NULL ELSE ended_at END,
-				updated_at = ?
-			WHERE id = ?`,
-			transition.Status, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.RunID); err != nil {
-			return fmt.Errorf("transition run status: %w", err)
-		}
-		if transition.ChildRunID != "" {
-			if _, err := tx.Exec(ctx, `UPDATE run_edges SET status = ?, updated_at = ? WHERE parent_run_id = ? AND child_run_id = ?`,
-				transition.Status, transition.UpdatedAt, transition.ParentRunID, transition.ChildRunID); err != nil {
-				return fmt.Errorf("transition run edge status: %w", err)
-			}
-		}
-		payload, err := json.Marshal(map[string]string{
-			"run_id":               transition.RunID,
-			"parent_run_id":        transition.ParentRunID,
-			"child_run_id":         transition.ChildRunID,
-			"previous_status":      previous,
-			"status":               transition.Status,
-			"previous_edge_status": previousEdge,
-			"reason":               transition.Reason,
-			"source":               transition.Source,
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			return transitionRunStatusTx(ctx, tx, transition)
 		})
-		if err != nil {
-			return fmt.Errorf("marshal run transition event: %w", err)
-		}
-		if err := appendRunTransitionEvent(ctx, tx, transition.RunID, transition.UpdatedAt, "run.status.transition", string(payload)); err != nil {
-			return err
-		}
-		return nil
 	})
 }
 
@@ -311,23 +295,13 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
 	if len(children) != len(edges) {
 		return fmt.Errorf("persist child plan graph: child/edge count mismatch")
 	}
-	var err error
-	for attempt := 0; attempt < 5; attempt++ {
-		err = persistChildPlanGraphOnce(ctx, store, parent, children, plan, edges)
-		if err == nil || !sqliteBusy(err) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(time.Duration(attempt+1) * 25 * time.Millisecond):
-		}
-	}
-	return err
+	return withRetry(ctx, func() error {
+		return persistChildPlanGraphOnce(ctx, store, parent, children, plan, edges)
+	})
 }
 
 func persistChildPlanGraphOnce(ctx context.Context, store Store, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
-	return store.WithTx(ctx, func(tx Tx) error {
+	return store.WithWriteTx(ctx, func(tx Tx) error {
 		if err := validateChildPlanGraph(ctx, tx, parent, children, plan, edges); err != nil {
 			return err
 		}
@@ -359,9 +333,226 @@ func persistChildPlanGraphOnce(ctx context.Context, store Store, parent RunNode,
 	})
 }
 
-func sqliteBusy(err error) bool {
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "database is locked") || strings.Contains(text, "sqlite_busy")
+func ClaimChildRunExecution(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time) (ClaimResult, error) {
+	if store == nil {
+		return ClaimResult{Outcome: ClaimOutcomeClaimed, RunID: strings.TrimSpace(childRunID), ExecutorID: strings.TrimSpace(executorID), ClaimGeneration: 1}, nil
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	if parentRunID == "" || childRunID == "" || executorID == "" {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: parent_run_id, child_run_id, and executor_id are required")
+	}
+	now = now.UTC()
+	leaseUntil = leaseUntil.UTC()
+	if now.IsZero() || leaseUntil.IsZero() || !leaseUntil.After(now) {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: valid now and future lease_until are required")
+	}
+	var result ClaimResult
+	err := withRetry(ctx, func() error {
+		var txResult ClaimResult
+		err := store.WithWriteTx(ctx, func(tx Tx) error {
+			claim, err := claimChildRunExecutionTx(ctx, tx, parentRunID, childRunID, executorID, formatTimestamp(now), formatTimestamp(leaseUntil))
+			if err != nil {
+				return err
+			}
+			txResult = claim
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		result = txResult
+		return nil
+	})
+	return result, err
+}
+
+func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, status, updatedAt, reason string) error {
+	if store == nil {
+		return nil
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	status = normalizeDurableStatus(status)
+	updatedAt = strings.TrimSpace(updatedAt)
+	reason = strings.TrimSpace(reason)
+	if parentRunID == "" || childRunID == "" || executorID == "" || claimGeneration <= 0 || status == "" || updatedAt == "" {
+		return fmt.Errorf("complete claimed child run: parent_run_id, child_run_id, executor_id, claim_generation, status, and updated_at are required")
+	}
+	if !validDurableStatus(status) {
+		return fmt.Errorf("complete claimed child run: invalid status %q", status)
+	}
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			var existing string
+			var existingGeneration int64
+			err := tx.QueryRow(ctx, `SELECT executor_id, claim_generation FROM run_claims WHERE run_id = ?`, childRunID).Scan(&existing, &existingGeneration)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					return fmt.Errorf("complete claimed child run: claim for run %q is missing", childRunID)
+				}
+				return fmt.Errorf("complete claimed child run: inspect claim: %w", err)
+			}
+			if existing != executorID || existingGeneration != claimGeneration {
+				return fmt.Errorf("complete claimed child run: stale claim for run %q; owner/generation is %s/%d", childRunID, existing, existingGeneration)
+			}
+			return transitionRunStatusTx(ctx, tx, RunStatusTransition{
+				RunID:       childRunID,
+				ParentRunID: parentRunID,
+				ChildRunID:  childRunID,
+				Status:      status,
+				UpdatedAt:   updatedAt,
+				Reason:      reason,
+				Source:      "nested-scheduler",
+			})
+		})
+	})
+}
+
+func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunID, executorID, now, leaseUntil string) (ClaimResult, error) {
+	runStatus, ok, err := currentRunStatus(ctx, tx, childRunID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	if !ok {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: run %q is missing", childRunID)
+	}
+	edgeStatus, ok, err := currentRunEdgeStatus(ctx, tx, parentRunID, childRunID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	if !ok {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: edge %q/%q is missing", parentRunID, childRunID)
+	}
+	status := normalizeDurableStatus(firstNonEmptyNestedGraph(runStatus, edgeStatus))
+	base := ClaimResult{RunID: childRunID, RunStatus: runStatus, EdgeStatus: edgeStatus}
+	if durableBlockedStatus(status) {
+		base.Outcome = ClaimOutcomeBlocked
+		return base, nil
+	}
+	if durableTerminalStatus(status) {
+		base.Outcome = ClaimOutcomeTerminalReused
+		return base, nil
+	}
+
+	claim, hasClaim, err := currentRunClaim(ctx, tx, childRunID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	if hasClaim && claimLeaseActive(claim.LeaseExpiresAt, now) {
+		claim.Outcome = ClaimOutcomeAlreadyRunning
+		claim.RunStatus = runStatus
+		claim.EdgeStatus = edgeStatus
+		return claim, nil
+	}
+
+	generation := int64(1)
+	outcome := ClaimOutcomeClaimed
+	previousOwner := ""
+	previousLease := ""
+	if hasClaim {
+		generation = claim.ClaimGeneration + 1
+		outcome = ClaimOutcomeStaleClaim
+		previousOwner = claim.ExecutorID
+		previousLease = claim.LeaseExpiresAt
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(run_id) DO UPDATE SET
+			executor_id = excluded.executor_id,
+			claim_generation = excluded.claim_generation,
+			claimed_at = excluded.claimed_at,
+			lease_expires_at = excluded.lease_expires_at,
+			heartbeat_at = excluded.heartbeat_at`,
+		childRunID, executorID, generation, now, leaseUntil, now); err != nil {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: persist claim: %w", err)
+	}
+	if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+		RunID:       childRunID,
+		ParentRunID: parentRunID,
+		ChildRunID:  childRunID,
+		Status:      "running",
+		UpdatedAt:   now,
+		Reason:      "child execution claimed",
+		Source:      "nested-scheduler",
+	}); err != nil {
+		return ClaimResult{}, err
+	}
+	return ClaimResult{
+		Outcome:         outcome,
+		RunID:           childRunID,
+		ExecutorID:      executorID,
+		ClaimGeneration: generation,
+		ClaimedAt:       now,
+		LeaseExpiresAt:  leaseUntil,
+		HeartbeatAt:     now,
+		RunStatus:       "running",
+		EdgeStatus:      "running",
+		PreviousOwner:   previousOwner,
+		PreviousLease:   previousLease,
+	}, nil
+}
+
+func transitionRunStatusTx(ctx context.Context, tx Tx, transition RunStatusTransition) error {
+	previous, ok, err := currentRunStatus(ctx, tx, transition.RunID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("transition run status: run %q is missing", transition.RunID)
+	}
+	if err := validateDurableTransition(previous, transition.Status); err != nil {
+		return fmt.Errorf("transition run %s: %w", transition.RunID, err)
+	}
+
+	var previousEdge string
+	if transition.ChildRunID != "" {
+		previousEdge, ok, err = currentRunEdgeStatus(ctx, tx, transition.ParentRunID, transition.ChildRunID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("transition child run status: edge %q/%q is missing", transition.ParentRunID, transition.ChildRunID)
+		}
+		if err := validateDurableTransition(previousEdge, transition.Status); err != nil {
+			return fmt.Errorf("transition run edge %s/%s: %w", transition.ParentRunID, transition.ChildRunID, err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE runs SET
+			status = ?,
+			started_at = CASE WHEN ? IN ('launching', 'running') AND (started_at IS NULL OR started_at = '') THEN ? ELSE started_at END,
+			ended_at = CASE WHEN ? IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked') THEN ? WHEN ? IN ('queued', 'launching', 'running', 'waiting', 'finishing') THEN NULL ELSE ended_at END,
+			updated_at = ?
+		WHERE id = ?`,
+		transition.Status, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.RunID); err != nil {
+		return fmt.Errorf("transition run status: %w", err)
+	}
+	if transition.ChildRunID != "" {
+		if _, err := tx.Exec(ctx, `UPDATE run_edges SET status = ?, updated_at = ? WHERE parent_run_id = ? AND child_run_id = ?`,
+			transition.Status, transition.UpdatedAt, transition.ParentRunID, transition.ChildRunID); err != nil {
+			return fmt.Errorf("transition run edge status: %w", err)
+		}
+	}
+	payload, err := json.Marshal(map[string]string{
+		"run_id":               transition.RunID,
+		"parent_run_id":        transition.ParentRunID,
+		"child_run_id":         transition.ChildRunID,
+		"previous_status":      previous,
+		"status":               transition.Status,
+		"previous_edge_status": previousEdge,
+		"reason":               transition.Reason,
+		"source":               transition.Source,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run transition event: %w", err)
+	}
+	if err := appendRunTransitionEvent(ctx, tx, transition.RunID, transition.UpdatedAt, "run.status.transition", string(payload)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateChildPlanGraph(ctx context.Context, tx Tx, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
@@ -519,6 +710,7 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 			parent_run_id = COALESCE(NULLIF(excluded.parent_run_id, ''), runs.parent_run_id),
 			status = CASE
 				WHEN runs.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN runs.status
+				WHEN runs.status <> '' THEN runs.status
 				WHEN excluded.status <> '' THEN excluded.status
 				ELSE runs.status
 			END,
@@ -640,6 +832,58 @@ func currentRunEdgeStatus(ctx context.Context, tx Tx, parentRunID, childRunID st
 		return "", false, fmt.Errorf("inspect run edge %q/%q status: %w", parentRunID, childRunID, err)
 	}
 	return normalizeDurableStatus(status), true, nil
+}
+
+func currentRunClaim(ctx context.Context, tx Tx, runID string) (ClaimResult, bool, error) {
+	var claim ClaimResult
+	err := tx.QueryRow(ctx, `SELECT run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at
+		FROM run_claims WHERE run_id = ?`, runID).Scan(
+		&claim.RunID,
+		&claim.ExecutorID,
+		&claim.ClaimGeneration,
+		&claim.ClaimedAt,
+		&claim.LeaseExpiresAt,
+		&claim.HeartbeatAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ClaimResult{}, false, nil
+		}
+		return ClaimResult{}, false, fmt.Errorf("inspect run claim %q: %w", runID, err)
+	}
+	return claim, true, nil
+}
+
+func claimLeaseActive(leaseExpiresAt, now string) bool {
+	leaseExpiresAt = strings.TrimSpace(leaseExpiresAt)
+	now = strings.TrimSpace(now)
+	if leaseExpiresAt == "" || now == "" {
+		return false
+	}
+	lease, leaseErr := time.Parse(time.RFC3339Nano, leaseExpiresAt)
+	current, nowErr := time.Parse(time.RFC3339Nano, now)
+	if leaseErr == nil && nowErr == nil {
+		return lease.After(current)
+	}
+	return leaseExpiresAt > now
+}
+
+func durableTerminalStatus(status string) bool {
+	switch normalizeDurableStatus(status) {
+	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+func durableBlockedStatus(status string) bool {
+	switch normalizeDurableStatus(status) {
+	case "needs-human", "abandoned", "skipped", "blocked":
+		return true
+	default:
+		return false
+	}
 }
 
 func appendRunTransitionEvent(ctx context.Context, tx Tx, runID, at, eventType, payloadJSON string) error {

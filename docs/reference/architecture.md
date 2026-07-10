@@ -236,6 +236,18 @@ decision. `statebranch` can publish scrubbed run snapshots, log tails, and a
 best-effort lease to `loopcoder/state`. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
+Nested child execution adds a SQLite-backed ownership layer for child provider
+launch. The scheduler persists the accepted child plan and run graph, then a
+claim transaction atomically records `run_claims.executor_id`,
+`claim_generation`, `claimed_at`, `lease_expires_at`, and `heartbeat_at` while
+moving the child run and parent edge to `running`. A scheduler that loses to an
+active claim reports the owner and lease as an observation and does not call the
+provider. Terminal completion is fenced by owner and generation, so a stale
+worker cannot overwrite the result from a later recovery owner. Expired leases
+allow controlled takeover by a new generation, but uncertain external side
+effects still route to receipts/idempotency checks or `needs-human`; loopcoder
+does not claim universal exactly-once side effects across crashes.
+
 ### Delivery Guardrails
 
 Current built guardrails include readiness checks, open-PR duplicate
