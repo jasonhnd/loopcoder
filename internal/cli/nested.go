@@ -430,25 +430,26 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 			fmt.Fprintf(stderr, "[loopcoder] warning: failed to write nested subprocess attempt: %v\n", writeErr)
 		}
 		result := orchestration.ChildRunResult{
-			ID:          child.ID,
-			ChildKey:    child.ChildKey,
-			Title:       child.Title,
-			Role:        child.Role,
-			RunID:       child.RunID,
-			Issue:       child.Issue,
-			Scope:       child.Scope,
-			Permission:  child.Permission,
-			DependsOn:   append([]string(nil), child.DependsOn...),
-			Aggregation: child.Aggregation,
-			Required:    child.Required,
-			Optional:    child.Optional,
-			Ordinal:     child.Ordinal,
-			Depth:       child.Depth,
-			Status:      status,
-			StartedAt:   reportRecord.StartedAt,
-			FinishedAt:  reportRecord.EndedAt,
-			AttemptPath: attemptPath,
-			Report:      &reportRecord,
+			ID:           child.ID,
+			ChildKey:     child.ChildKey,
+			Title:        child.Title,
+			Role:         child.Role,
+			RunID:        child.RunID,
+			Issue:        child.Issue,
+			Scope:        child.Scope,
+			Permission:   child.Permission,
+			DependsOn:    append([]string(nil), child.DependsOn...),
+			Aggregation:  child.Aggregation,
+			Required:     child.Required,
+			Optional:     child.Optional,
+			Ordinal:      child.Ordinal,
+			Depth:        child.Depth,
+			Status:       status,
+			ReplayAction: child.ReplayAction,
+			StartedAt:    reportRecord.StartedAt,
+			FinishedAt:   reportRecord.EndedAt,
+			AttemptPath:  attemptPath,
+			Report:       &reportRecord,
 		}
 		if status != orchestration.NestedStatusSucceeded {
 			result.Error = summary
@@ -466,7 +467,7 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 	for i := len(attempts) - 1; i >= 0; i-- {
 		attempt := attempts[i]
 		status := state.NormalizeStatus(attempt.Status)
-		if !state.IsTerminalStatus(status) {
+		if status != state.StatusSucceeded {
 			continue
 		}
 		result := orchestration.ChildRunResult{
@@ -485,6 +486,7 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 			Ordinal:             child.Ordinal,
 			Depth:               child.Depth,
 			Status:              normalizeExecutorStatus(status),
+			ReplayAction:        child.ReplayAction,
 			StartedAt:           attempt.StartedAt,
 			FinishedAt:          attempt.HeartbeatAt,
 			Error:               attempt.Error,
@@ -565,6 +567,9 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	)
 	for _, child := range report.Children {
 		line := fmt.Sprintf("- %s %s %s", child.ChildKey, child.RunID, child.Status)
+		if child.ReplayAction != "" {
+			line += " action=" + child.ReplayAction
+		}
 		if child.Error != "" {
 			line += " error=" + child.Error
 		}
@@ -576,7 +581,7 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	case orchestration.NestedStatusNeedsHuman:
 		fmt.Fprintln(&b, "Next: inspect needs-human child records before resuming the parent.")
 	default:
-		fmt.Fprintln(&b, "Next: inspect failed child records, then rerun the same plan to resume completed children without duplicating them.")
+		fmt.Fprintln(&b, "Next: inspect failed child records, then rerun the same plan_id to reuse succeeded children and resume/retry durable children without duplicating them.")
 	}
 	return b.String()
 }
@@ -592,24 +597,25 @@ func childResultFromWorker(child orchestration.ChildRunPlan, result worker.Resul
 	}
 	runID := firstNonEmptyNested(result.RunID, child.RunID)
 	return orchestration.ChildRunResult{
-		ID:          child.ID,
-		ChildKey:    child.ChildKey,
-		Title:       child.Title,
-		Role:        child.Role,
-		RunID:       runID,
-		Issue:       result.Issue,
-		Scope:       child.Scope,
-		Permission:  child.Permission,
-		DependsOn:   append([]string(nil), child.DependsOn...),
-		Aggregation: child.Aggregation,
-		Required:    child.Required,
-		Optional:    child.Optional,
-		Ordinal:     child.Ordinal,
-		Depth:       child.Depth,
-		Status:      status,
-		Error:       "",
-		AttemptPath: result.AttemptPath,
-		Report:      result.Report,
+		ID:           child.ID,
+		ChildKey:     child.ChildKey,
+		Title:        child.Title,
+		Role:         child.Role,
+		RunID:        runID,
+		Issue:        result.Issue,
+		Scope:        child.Scope,
+		Permission:   child.Permission,
+		DependsOn:    append([]string(nil), child.DependsOn...),
+		Aggregation:  child.Aggregation,
+		Required:     child.Required,
+		Optional:     child.Optional,
+		Ordinal:      child.Ordinal,
+		Depth:        child.Depth,
+		Status:       status,
+		ReplayAction: child.ReplayAction,
+		Error:        "",
+		AttemptPath:  result.AttemptPath,
+		Report:       result.Report,
 	}
 }
 

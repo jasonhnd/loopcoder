@@ -4558,6 +4558,69 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 	}
 }
 
+func TestNestedRunReplaysSamePlanFileWithOmittedChildRunIDsIdempotently(t *testing.T) {
+	loopHome := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", loopHome)
+	repo := t.TempDir()
+	plan := orchestration.ChildPlan{
+		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260102T030405Z-wave",
+		ParentRunID:    state.RunIDForWave(fixedCLINow()),
+		RootRunID:      state.RunIDForWave(fixedCLINow()),
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
+		Items: []orchestration.ChildRunPlan{
+			nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
+		},
+	}
+	planData, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal child plan: %v", err)
+	}
+	planPath := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(planPath, planData, 0o644); err != nil {
+		t.Fatalf("write child plan: %v", err)
+	}
+	runOnce := func(now time.Time) orchestration.NestedScheduleReport {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := RunWithDeps([]string{
+			"nested", "run",
+			"--repo", repo,
+			"--plan", planPath,
+			"--provider", nestedTestSubprocessProvider,
+			"--format", "json",
+		}, &stdout, &stderr, Deps{Now: func() time.Time { return now }})
+		if exitCode != 0 {
+			t.Fatalf("RunWithDeps returned exit code %d, stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+		}
+		var report orchestration.NestedScheduleReport
+		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+			t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+		}
+		return report
+	}
+
+	first := runOnce(fixedCLINow())
+	second := runOnce(fixedCLINow().Add(2 * time.Hour))
+	if first.Children[0].RunID != second.Children[0].RunID {
+		t.Fatalf("run_id changed across independent parses: %q != %q", first.Children[0].RunID, second.Children[0].RunID)
+	}
+	if got := second.Children[0].ReplayAction; got != orchestration.ReplayActionReused {
+		t.Fatalf("second replay action = %q, want reused", got)
+	}
+	attempts, err := state.LoadAttempts(repo, first.Children[0].RunID)
+	if err != nil {
+		t.Fatalf("LoadAttempts: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("attempt count = %d, want 1 reused succeeded child without re-execution", len(attempts))
+	}
+	assertStorageCounts(t, filepath.Join(loopHome, "data", "loopcoder.db"), 1, 1)
+}
+
 func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer

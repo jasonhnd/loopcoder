@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // RunNode describes the durable run graph metadata required for nested runs.
@@ -51,6 +52,122 @@ type RunEdgeRecord struct {
 	UpdatedAt       string
 }
 
+// ChildPlanReplayRecord is the durable state for a previously accepted child
+// plan, keyed by plan_id and child_key.
+type ChildPlanReplayRecord struct {
+	Plan     ChildPlanRecord
+	Children []ChildPlanReplayChild
+}
+
+// ChildPlanReplayChild is the persisted identity and recovery contract for one
+// child in an accepted plan.
+type ChildPlanReplayChild struct {
+	ParentRunID     string
+	ChildRunID      string
+	RootRunID       string
+	PlanID          string
+	ChildKey        string
+	Depth           int
+	Ordinal         int
+	ScopeJSON       string
+	Permission      string
+	AggregationJSON string
+	EdgeStatus      string
+	RunStatus       string
+	StartedAt       string
+	FinishedAt      string
+	UpdatedAt       string
+}
+
+// LoadChildPlanReplayRecord loads the authoritative durable child identity for
+// a plan_id. Missing records are reported with ok=false.
+func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) (ChildPlanReplayRecord, bool, error) {
+	if store == nil {
+		return ChildPlanReplayRecord{}, false, nil
+	}
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
+		return ChildPlanReplayRecord{}, false, fmt.Errorf("load child plan replay: plan_id is required")
+	}
+	var record ChildPlanReplayRecord
+	found := false
+	err := store.WithTx(ctx, func(tx Tx) error {
+		err := tx.QueryRow(ctx, `SELECT plan_id, parent_run_id, root_run_id, schema_version, max_depth, max_concurrency, plan_json, created_at
+			FROM child_plans WHERE plan_id = ?`, planID).Scan(
+			&record.Plan.PlanID,
+			&record.Plan.ParentRunID,
+			&record.Plan.RootRunID,
+			&record.Plan.SchemaVersion,
+			&record.Plan.MaxDepth,
+			&record.Plan.MaxConcurrency,
+			&record.Plan.PlanJSON,
+			&record.Plan.CreatedAt,
+		)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil
+			}
+			return fmt.Errorf("load child plan %s: %w", planID, err)
+		}
+		found = true
+		rows, err := tx.Query(ctx, `SELECT
+				e.parent_run_id,
+				e.child_run_id,
+				e.root_run_id,
+				e.plan_id,
+				e.child_key,
+				e.depth,
+				e.ordinal,
+				e.scope_json,
+				e.permission,
+				e.aggregation_json,
+				e.status,
+				COALESCE(r.status, ''),
+				COALESCE(r.started_at, ''),
+				COALESCE(r.ended_at, ''),
+				e.updated_at
+			FROM run_edges e
+			LEFT JOIN runs r ON r.id = e.child_run_id
+			WHERE e.plan_id = ?
+			ORDER BY e.ordinal, e.child_key`, planID)
+		if err != nil {
+			return fmt.Errorf("load child plan %s edges: %w", planID, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var child ChildPlanReplayChild
+			if err := rows.Scan(
+				&child.ParentRunID,
+				&child.ChildRunID,
+				&child.RootRunID,
+				&child.PlanID,
+				&child.ChildKey,
+				&child.Depth,
+				&child.Ordinal,
+				&child.ScopeJSON,
+				&child.Permission,
+				&child.AggregationJSON,
+				&child.EdgeStatus,
+				&child.RunStatus,
+				&child.StartedAt,
+				&child.FinishedAt,
+				&child.UpdatedAt,
+			); err != nil {
+				return fmt.Errorf("load child plan %s edge: %w", planID, err)
+			}
+			record.Children = append(record.Children, child)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("load child plan %s edges: %w", planID, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return ChildPlanReplayRecord{}, false, err
+	}
+	return record, found, nil
+}
+
 // PersistChildPlanGraph upserts the accepted plan, its child run nodes, and its
 // plan edges in one transaction. Replaying the same plan_id/child_key pair is
 // idempotent and keeps the original child_run_id.
@@ -64,6 +181,22 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
 	if len(children) != len(edges) {
 		return fmt.Errorf("persist child plan graph: child/edge count mismatch")
 	}
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		err = persistChildPlanGraphOnce(ctx, store, parent, children, plan, edges)
+		if err == nil || !sqliteBusy(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt+1) * 25 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+func persistChildPlanGraphOnce(ctx context.Context, store Store, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
 	return store.WithTx(ctx, func(tx Tx) error {
 		if err := validateChildPlanGraph(ctx, tx, parent, children, plan, edges); err != nil {
 			return err
@@ -94,6 +227,11 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
 		}
 		return nil
 	})
+}
+
+func sqliteBusy(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "database is locked") || strings.Contains(text, "sqlite_busy")
 }
 
 func validateChildPlanGraph(ctx context.Context, tx Tx, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
@@ -266,10 +404,14 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO runs(id, project_id, parent_run_id, status, started_at, updated_at, root_run_id, depth, origin, created_at)
 		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+			ON CONFLICT(id) DO UPDATE SET
 			project_id = COALESCE(NULLIF(excluded.project_id, ''), runs.project_id),
 			parent_run_id = COALESCE(NULLIF(excluded.parent_run_id, ''), runs.parent_run_id),
-			status = CASE WHEN excluded.status <> '' THEN excluded.status ELSE runs.status END,
+			status = CASE
+				WHEN runs.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung') THEN runs.status
+				WHEN excluded.status <> '' THEN excluded.status
+				ELSE runs.status
+			END,
 			started_at = COALESCE(NULLIF(runs.started_at, ''), NULLIF(excluded.started_at, '')),
 			updated_at = CASE WHEN excluded.updated_at <> '' THEN excluded.updated_at ELSE runs.updated_at END,
 			root_run_id = CASE WHEN excluded.root_run_id <> '' THEN excluded.root_run_id ELSE runs.root_run_id END,
@@ -313,7 +455,11 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
 			scope_json = excluded.scope_json,
 			permission = excluded.permission,
 			aggregation_json = excluded.aggregation_json,
-			status = excluded.status,
+			status = CASE
+				WHEN run_edges.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung') THEN run_edges.status
+				WHEN run_edges.status <> '' THEN run_edges.status
+				ELSE excluded.status
+			END,
 			updated_at = excluded.updated_at`,
 		edge.ParentRunID, edge.ChildRunID, edge.CreatedAt, edge.RootRunID, edge.PlanID, edge.ChildKey, edge.Depth, edge.Ordinal, edge.ScopeJSON, edge.Permission, edge.AggregationJSON, edge.Status, edge.UpdatedAt)
 	if err != nil {
