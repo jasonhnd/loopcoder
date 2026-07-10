@@ -16,6 +16,8 @@ const (
 	DispatchWaveThrottleLimit = 4
 	// NestedSchedulerMaxDepth is the default child-run depth cap.
 	NestedSchedulerMaxDepth = 2
+	// NestedSchedulerMaxConcurrency is the default child-run concurrency cap.
+	NestedSchedulerMaxConcurrency = 3
 	// NestedSchedulerMaxChildren is the default child-run fan-out cap.
 	NestedSchedulerMaxChildren = 16
 
@@ -115,6 +117,7 @@ type Values struct {
 	PreProdBranch                           string
 	DispatchWaveThrottleLimit               int
 	NestedSchedulerMaxDepth                 int
+	NestedSchedulerMaxConcurrency           int
 	NestedSchedulerMaxChildren              int
 	WorkerHardCap                           time.Duration
 	WorkerStallTimeout                      time.Duration
@@ -191,6 +194,7 @@ func Current() Values {
 		PreProdBranch:                           PreProdBranch,
 		DispatchWaveThrottleLimit:               DispatchWaveThrottleLimit,
 		NestedSchedulerMaxDepth:                 NestedSchedulerMaxDepth,
+		NestedSchedulerMaxConcurrency:           NestedSchedulerMaxConcurrency,
 		NestedSchedulerMaxChildren:              NestedSchedulerMaxChildren,
 		WorkerHardCap:                           WorkerHardCap,
 		WorkerStallTimeout:                      WorkerStallTimeout,

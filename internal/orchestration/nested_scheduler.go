@@ -136,7 +136,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		opts.BaseBranch = lcdefaults.BaseBranch
 	}
 	if opts.ConcurrencyLimit <= 0 {
-		opts.ConcurrencyLimit = lcdefaults.DispatchWaveThrottleLimit
+		opts.ConcurrencyLimit = lcdefaults.NestedSchedulerMaxConcurrency
 	}
 	if opts.MaxDepth <= 0 {
 		opts.MaxDepth = lcdefaults.NestedSchedulerMaxDepth
@@ -349,7 +349,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				result.Error = ctx.Err().Error()
 				finishedAt := clock().UTC()
 				result.FinishedAt = state.FormatTimestamp(finishedAt)
-				setCompleteErr(storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt))
+				persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				setCompleteErr(storage.UpdateChildRunOutcome(persistCtx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt))
+				cancel()
 				eventMu.Lock()
 				err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
 				eventMu.Unlock()
@@ -783,18 +785,30 @@ func recordNestedEvent(opts NestedScheduleOptions, runID string, child ChildRunP
 	if err != nil {
 		return fmt.Errorf("marshal nested child event details: %w", err)
 	}
+	eventStatus := nestedEventStatus(eventName, result.Status)
 	return opts.RecordEvent(opts.RepoPath, runID, state.Event{
 		Timestamp: state.FormatTimestamp(at),
 		RunID:     runID,
 		JobID:     "nested-scheduler",
 		Issue:     child.Issue,
 		Phase:     "nested-scheduler",
-		Status:    result.Status,
+		Status:    eventStatus,
 		LogBytes:  0,
 		Event:     eventName,
-		Outcome:   result.Status,
+		Outcome:   eventStatus,
 		Details:   json.RawMessage(details),
 	})
+}
+
+func nestedEventStatus(eventName, resultStatus string) string {
+	switch eventName {
+	case NestedEventChildQueued:
+		return state.StatusQueued
+	case NestedEventChildRunning:
+		return state.StatusRunning
+	default:
+		return resultStatus
+	}
 }
 
 func recordNestedParentDone(opts NestedScheduleOptions, report NestedScheduleReport, at time.Time) error {

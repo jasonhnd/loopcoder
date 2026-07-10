@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -4091,6 +4092,236 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	}
 }
 
+func TestNestedRunDispatchesThreeChildrenConcurrentlyAndHonorsDependencies(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+		nestedPlanItem("beta", 702, nil, true, "write", nil),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
+	}, 2)
+
+	startedAlpha := make(chan struct{})
+	startedBeta := make(chan struct{})
+	var onceAlpha sync.Once
+	var onceBeta sync.Once
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+	completed := map[string]bool{}
+	var calls []worker.Options
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", "claude",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
+			key := strings.ToLower(strings.TrimSpace(opts.IssueTitle))
+			mu.Lock()
+			calls = append(calls, opts)
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			if key == "gamma" && !completed["alpha"] {
+				mu.Unlock()
+				return worker.Result{}, errors.New("dependent child gamma started before alpha completed")
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				active--
+				mu.Unlock()
+			}()
+
+			switch key {
+			case "alpha":
+				onceAlpha.Do(func() { close(startedAlpha) })
+				select {
+				case <-startedBeta:
+				case <-ctx.Done():
+					return worker.Result{}, ctx.Err()
+				case <-time.After(2 * time.Second):
+					return worker.Result{}, errors.New("beta did not start concurrently with alpha")
+				}
+			case "beta":
+				onceBeta.Do(func() { close(startedBeta) })
+				select {
+				case <-startedAlpha:
+				case <-ctx.Done():
+					return worker.Result{}, ctx.Err()
+				case <-time.After(2 * time.Second):
+					return worker.Result{}, errors.New("alpha did not start concurrently with beta")
+				}
+			}
+
+			mu.Lock()
+			completed[key] = true
+			mu.Unlock()
+			record := validDispatchReport()
+			record.Provider = opts.Provider
+			record.WorkID = opts.RunID
+			record.Issue = opts.IssueNumber
+			record.Action = "nested child " + key
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				PR:          "https://github.com/owner/repo/pull/" + strconv.Itoa(opts.IssueNumber),
+				Summary:     "nested " + key,
+				AttemptPath: filepath.Join(repo, ".loopcoder", "runs", opts.RunID, "workers", "job.attempt.json"),
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    1,
+				Report:      &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	if report.Status != orchestration.NestedStatusSucceeded || len(report.Children) != 3 {
+		t.Fatalf("nested report = %#v", report)
+	}
+	if maxActive < 2 {
+		t.Fatalf("max concurrent dispatches = %d, want at least 2", maxActive)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("dispatch calls = %d, want 3", len(calls))
+	}
+	for _, call := range calls {
+		if call.Provider != "claude" {
+			t.Fatalf("nested dispatch provider = %q, want claude", call.Provider)
+		}
+		if call.RunID == "" || !strings.Contains(call.Branch, strings.ToLower(call.IssueTitle)) {
+			t.Fatalf("nested dispatch did not propagate run/branch context: %#v", call)
+		}
+	}
+}
+
+func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+	}, 1)
+
+	var got worker.Options
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			got = opts
+			record := validDispatchReport()
+			record.Provider = opts.Provider
+			record.WorkID = opts.RunID
+			record.Issue = opts.IssueNumber
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				Summary:     "nested alpha",
+				AttemptPath: filepath.Join(repo, ".loopcoder", "runs", opts.RunID, "workers", "job.attempt.json"),
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    1,
+				Report:      &record,
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if got.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", got.Provider)
+	}
+}
+
+func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("admin", 701, nil, true, "orchestrate", nil),
+	}, 1)
+	called := false
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--parent-permission", "write",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if called {
+		t.Fatal("dispatch was called despite permission escalation")
+	}
+	if !strings.Contains(stderr.String(), "exceeds parent permission") {
+		t.Fatalf("stderr missing permission diagnostic: %q", stderr.String())
+	}
+}
+
+func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
+		nestedPlanItem("beta", 702, nil, true, "read-only", []string{"go env GOARCH"}),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, false, "read-only", []string{"go env GOVERSION"}),
+	}, 2)
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", nestedTestSubprocessProvider,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	if report.Status != orchestration.NestedStatusSucceeded || len(report.Children) != 3 {
+		t.Fatalf("nested subprocess report = %#v", report)
+	}
+	attempts, err := state.LoadAttempts(repo, report.Children[0].RunID)
+	if err != nil {
+		t.Fatalf("LoadAttempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
+		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
+	}
+}
+
 func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingStdout(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -5234,6 +5465,51 @@ func readRepoFile(t *testing.T, rel string) string {
 		t.Fatalf("read %s: %v", rel, err)
 	}
 	return string(data)
+}
+
+func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.ChildRunPlan, maxConcurrency int) string {
+	t.Helper()
+	for i := range items {
+		items[i].RunID = state.RunIDForChild(items[i].ChildKey, i, fixedCLINow())
+		items[i].Ordinal = i
+	}
+	plan := orchestration.ChildPlan{
+		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260102T030405Z-wave",
+		ParentRunID:    state.RunIDForWave(fixedCLINow()),
+		RootRunID:      state.RunIDForWave(fixedCLINow()),
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: maxConcurrency,
+		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
+		Items:          items,
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal child plan: %v", err)
+	}
+	path := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write child plan: %v", err)
+	}
+	return path
+}
+
+func nestedPlanItem(key string, issue int, dependsOn []string, required bool, permission string, commands []string) orchestration.ChildRunPlan {
+	return orchestration.ChildRunPlan{
+		ChildKey:   key,
+		Title:      key,
+		Role:       string(reporter.RoleWorker),
+		Issue:      issue,
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{"internal/cli/nested.go"}, Issues: []int{issue}, Commands: commands},
+		Permission: permission,
+		DependsOn:  append([]string(nil), dependsOn...),
+		Aggregation: orchestration.ChildAggregation{
+			Mode:          orchestration.ChildAggregationCollect,
+			Required:      required,
+			IncludeReport: true,
+		},
+	}
 }
 
 func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {

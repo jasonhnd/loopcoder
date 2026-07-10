@@ -19,9 +19,10 @@ pwsh scripts/self-bootstrap-smoke.ps1
 
 The script builds the local `loopcoder` binary unless `-Binary <path>` is
 provided. It sets `LOOPCODER_HOME` to a temporary directory, registers the
-loopcoder checkout in the v0.7.0 project registry, creates a deterministic
-parent/child run fixture under gitignored `.loopcoder/`, and verifies the JSON
-surfaces exposed by `doctor`, `status`, and `report`.
+loopcoder checkout in the v0.7.0 project registry, submits a deterministic v1
+child plan through `loopcoder nested run --provider test-subprocess`, executes
+three local child subprocesses, and verifies the JSON surfaces exposed by
+`doctor`, `status`, and `report`.
 
 The smoke proves:
 
@@ -30,6 +31,8 @@ The smoke proves:
 - `$LOOPCODER_HOME/data/loopcoder.db` exists outside the repository.
 - `doctor --repo . --format json` exposes storage health, project registry
   health, provider compatibility, and nested-run health.
+- `nested run --repo . --plan <plan> --provider test-subprocess --format json`
+  executes three real local child subprocesses, including a dependent child.
 - `status --repo . --run <child> --format json` exposes a parent/child run
   tree with issue and worker report metadata.
 - `report --repo . --run <child> --format json` includes both the child worker
@@ -40,10 +43,11 @@ The smoke proves:
   view.
 
 The smoke does not require provider authentication, paid services, GitHub
-mutation, dispatch, review, merge, tags, or release assets. If `doctor` exits
-non-zero only because local `gh` or provider CLIs are missing or unauthenticated,
-the smoke still fails only when the v0.7.0 runtime assertions above are missing.
-Use `-KeepArtifacts` to retain the temporary `LOOPCODER_HOME` and JSON outputs.
+mutation, remote dispatch, review, merge, tags, or release assets. If `doctor`
+exits non-zero only because local `gh` or provider CLIs are missing or
+unauthenticated, the smoke still fails only when the v0.7.0 runtime assertions
+above are missing. Use `-KeepArtifacts` to retain the temporary `LOOPCODER_HOME`
+and JSON outputs.
 
 ## Manual Acceptance Checklist
 
@@ -66,14 +70,14 @@ Acceptance requires all of the following evidence:
 2. Nested run evidence: at least one parent run launched or recorded a child
    run, and both parent and child run IDs are visible in local `status` or
    `report` JSON.
-3. Recovery evidence: an interrupted, failed, or fixture child run is visible
+3. Recovery evidence: an interrupted, failed, or completed child run is visible
    enough for `resume`, `status`, or `doctor` to classify the next action
    without duplicate dispatch.
 4. Observability evidence: `loopcoder status --repo . --format json` and
    `loopcoder report --repo . --run <run-id> --format json` expose the run
    tree; `loopcoder report --repo .` is readable as compact receipts without
    embedded raw JSON; local report records stay out of PR bodies, issue
-   comments, commits, merge artifacts, docs, examples, and fixtures.
+   comments, commits, merge artifacts, docs, examples, and tracked fixtures.
 5. Registry evidence: `loopcoder projects show --repo . --format json` resolves
    the loopcoder repository and reports a stable `project_id` and
    `identity_source`.

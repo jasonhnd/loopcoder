@@ -103,6 +103,7 @@ var commands = []Command{
 	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
+	{Name: "nested", Summary: "submit and execute a nested child plan"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
@@ -312,6 +313,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "dispatch" {
 		return runDispatch(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "nested" {
+		return runNested(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "relay" {
 		return runRelay(args[1:], stdout, stderr)
 	}
@@ -379,6 +383,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "projects" {
 		printProjectsHelp(w)
+		return
+	}
+	if command.Name == "nested" {
+		printNestedHelp(w)
 		return
 	}
 	if command.Name == "migrate" {

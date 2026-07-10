@@ -104,7 +104,7 @@ func ValidateChildPlan(plan *ChildPlan) error {
 		return fmt.Errorf("child plan parent_depth %d cannot create children at max_depth %d", plan.ParentDepth, plan.MaxDepth)
 	}
 	if plan.MaxConcurrency <= 0 {
-		plan.MaxConcurrency = lcdefaults.DispatchWaveThrottleLimit
+		plan.MaxConcurrency = lcdefaults.NestedSchedulerMaxConcurrency
 	}
 	if strings.TrimSpace(plan.CreatedAt) == "" {
 		return fmt.Errorf("child plan created_at is required")
@@ -214,7 +214,7 @@ func BuildChildPlanFromLegacy(opts NestedScheduleOptions, started time.Time) (Ch
 	}
 	maxConcurrency := opts.ConcurrencyLimit
 	if maxConcurrency <= 0 {
-		maxConcurrency = lcdefaults.DispatchWaveThrottleLimit
+		maxConcurrency = lcdefaults.NestedSchedulerMaxConcurrency
 	}
 	plan := ChildPlan{
 		SchemaVersion:  ChildPlanSchemaVersionV1,

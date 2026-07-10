@@ -13,6 +13,8 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -592,6 +594,37 @@ func TestValidateChildPlanRejectsInvalidBoundedFields(t *testing.T) {
 				t.Fatalf("ValidateChildPlan error = %v, want containing %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateChildPlanDefaultsMaxConcurrencyToNestedSpec(t *testing.T) {
+	plan := ChildPlan{
+		SchemaVersion:  ChildPlanSchemaVersionV1,
+		PlanID:         "plan-run-20260709T000000Z-wave-001",
+		ParentRunID:    "run-20260709T000000Z-wave",
+		RootRunID:      "run-20260709T000000Z-wave",
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 0,
+		CreatedAt:      state.FormatTimestamp(nestedTestNow()),
+		Items: []ChildRunPlan{{
+			ChildKey:   "child-a",
+			Title:      "child-a",
+			Role:       "worker",
+			Permission: string(reporter.PermissionWrite),
+			Scope:      ChildScope{Repo: ".", Paths: []string{"internal/orchestration/nested_scheduler.go"}, Issues: []int{646}},
+			Aggregation: ChildAggregation{
+				Mode:          ChildAggregationCollect,
+				Required:      true,
+				IncludeReport: true,
+			},
+		}},
+	}
+	if err := ValidateChildPlan(&plan); err != nil {
+		t.Fatalf("ValidateChildPlan returned error: %v", err)
+	}
+	if plan.MaxConcurrency != 3 {
+		t.Fatalf("MaxConcurrency = %d, want nested default 3", plan.MaxConcurrency)
 	}
 }
 

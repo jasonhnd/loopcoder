@@ -76,11 +76,13 @@ else {
 }
 
 $parentRun = "run-20260709T000000Z-wave"
-$childRun = "run-20260709T000001Z-child-0-self-bootstrap"
+$childRun = "run-20260709T000001Z-child-0-self-bootstrap-alpha"
+$childRunBeta = "run-20260709T000001Z-child-1-self-bootstrap-beta"
+$childRunGamma = "run-20260709T000001Z-child-2-self-bootstrap-gamma"
 $runsRoot = Join-Path $repoPath ".loopcoder/runs"
 $parentDir = Join-Path $runsRoot $parentRun
 $childDir = Join-Path $runsRoot $childRun
-$workerDir = Join-Path $childDir "workers"
+$childDirs = @($childRun, $childRunBeta, $childRunGamma) | ForEach-Object { Join-Path $runsRoot $_ }
 
 try {
     Invoke-Checked "register loopcoder checkout in machine-local project registry" {
@@ -101,108 +103,106 @@ try {
     if (Test-Path -LiteralPath $parentDir) {
         Remove-Item -LiteralPath $parentDir -Recurse -Force
     }
-    if (Test-Path -LiteralPath $childDir) {
-        Remove-Item -LiteralPath $childDir -Recurse -Force
-    }
-    New-Item -ItemType Directory -Path $parentDir, $workerDir | Out-Null
-
-    @(
-        @{
-            version = 1
-            ts = "2026-07-09T00:00:00Z"
-            run_id = $parentRun
-            state = "planned"
-            child_run_id = $childRun
-            source = "self-bootstrap-smoke"
-        },
-        @{
-            version = 1
-            ts = "2026-07-09T00:00:01Z"
-            run_id = $parentRun
-            previous_state = "planned"
-            state = "running"
-            child_run_id = $childRun
-            source = "self-bootstrap-smoke"
+    foreach ($dir in $childDirs) {
+        if (Test-Path -LiteralPath $dir) {
+            Remove-Item -LiteralPath $dir -Recurse -Force
         }
-    ) | ForEach-Object {
-        ($_ | ConvertTo-Json -Compress) | Add-Content -LiteralPath (Join-Path $parentDir "lifecycle.jsonl") -Encoding utf8
     }
 
-    @(
-        @{
-            version = 1
-            ts = "2026-07-09T00:00:02Z"
-            run_id = $childRun
-            parent_run_id = $parentRun
-            state = "planned"
-            source = "self-bootstrap-smoke"
-        },
-        @{
-            version = 1
-            ts = "2026-07-09T00:00:03Z"
-            run_id = $childRun
-            parent_run_id = $parentRun
-            previous_state = "planned"
-            state = "running"
-            source = "self-bootstrap-smoke"
-        },
-        @{
-            version = 1
-            ts = "2026-07-09T00:00:04Z"
-            run_id = $childRun
-            parent_run_id = $parentRun
-            previous_state = "running"
-            state = "succeeded"
-            source = "self-bootstrap-smoke"
-        }
-    ) | ForEach-Object {
-        ($_ | ConvertTo-Json -Compress) | Add-Content -LiteralPath (Join-Path $childDir "lifecycle.jsonl") -Encoding utf8
-    }
-
-    $attempt = @{
-        version = 1
-        job_id = "job-654-1"
-        issue = 654
-        attempt = 1
-        provider = "codex"
-        pid = 0
-        phase = "self_bootstrap_fixture"
-        status = "succeeded"
-        branch = "loop/issue-654"
-        started_at = "2026-07-09T00:00:02Z"
-        heartbeat_at = "2026-07-09T00:00:04Z"
-        last_progress_at = "2026-07-09T00:00:04Z"
-        log_bytes = 0
-        exit_code = 0
-        report = @{
-            role = "worker"
-            provider = "codex"
-            model = "gpt-5.5"
-            model_source = "parsed"
-            effort = "high"
-            permission = "write"
-            action = "self-bootstrap fixture for issue #654"
-            exit_code = 0
-            started_at = "2026-07-09T00:00:02Z"
-            ended_at = "2026-07-09T00:00:04Z"
-            duration_ms = 2000
-            usage = @{
-                total_tokens = 6540
+    $planPath = Join-Path $artifactDir "child-plan.json"
+    $childPlan = @{
+        schema_version = "loopcoder.child_plan.v1"
+        plan_id = "plan-$parentRun-self-bootstrap"
+        parent_run_id = $parentRun
+        root_run_id = $parentRun
+        parent_depth = 0
+        max_depth = 2
+        max_concurrency = 2
+        created_at = "2026-07-09T00:00:00Z"
+        items = @(
+            @{
+                child_key = "self-bootstrap-alpha"
+                title = "self-bootstrap-alpha"
+                role = "worker"
+                run_id = $childRun
+                issue = 654
+                scope = @{
+                    repo = "."
+                    paths = @("scripts/self-bootstrap-smoke.ps1")
+                    issues = @(654)
+                    commands = @("git status --short")
+                }
+                permission = "read-only"
+                depends_on = @()
+                aggregation = @{
+                    mode = "collect"
+                    required = $true
+                    include_report = $true
+                }
+            },
+            @{
+                child_key = "self-bootstrap-beta"
+                title = "self-bootstrap-beta"
+                role = "worker"
+                run_id = $childRunBeta
+                issue = 655
+                scope = @{
+                    repo = "."
+                    paths = @("docs/reference/self-bootstrap.md")
+                    issues = @(655)
+                    commands = @("git status --short")
+                }
+                permission = "read-only"
+                depends_on = @()
+                aggregation = @{
+                    mode = "collect"
+                    required = $true
+                    include_report = $true
+                }
+            },
+            @{
+                child_key = "self-bootstrap-gamma"
+                title = "self-bootstrap-gamma"
+                role = "worker"
+                run_id = $childRunGamma
+                issue = 656
+                scope = @{
+                    repo = "."
+                    paths = @("docs/reference/usage.md")
+                    issues = @(656)
+                    commands = @("git status --short")
+                }
+                permission = "read-only"
+                depends_on = @("self-bootstrap-alpha", "self-bootstrap-beta")
+                aggregation = @{
+                    mode = "collect"
+                    required = $false
+                    include_report = $true
+                }
             }
-            verified = $true
-            work_id = $childRun
-            issue = 654
-            branch = "loop/issue-654"
-        }
+        )
     }
-    ($attempt | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $workerDir "job-654-1.attempt.json") -Encoding utf8
+    ($childPlan | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $planPath -Encoding utf8
+
+    Invoke-Checked "execute nested child plan with deterministic subprocess provider" {
+        $script:nestedOutput = @(& $binaryPath nested run --repo $repoPath --plan $planPath --provider test-subprocess --format json)
+        $script:nestedOutput | Set-Content -LiteralPath (Join-Path $artifactDir "nested-run.json") -Encoding utf8
+    }
+    $nested = ConvertFrom-JsonOutput $nestedOutput "nested run"
+    if ($nested.status -ne "succeeded" -or @($nested.children).Count -ne 3) {
+        Fail "nested run did not execute the expected three child processes: $($nestedOutput -join "`n")"
+    }
+    $alpha = @($nested.children | Where-Object { $_.run_id -eq $childRun }) | Select-Object -First 1
+    if (-not $alpha -or $alpha.status -ne "succeeded" -or -not $alpha.attempt_path) {
+        Fail "nested run did not produce a successful durable alpha child attempt"
+    }
 
     Invoke-Checked "render status run tree" {
         $script:statusOutput = @(& $binaryPath status --repo $repoPath --run $childRun --format json)
         $script:statusOutput | Set-Content -LiteralPath (Join-Path $artifactDir "status.json") -Encoding utf8
     }
     $status = ConvertFrom-JsonOutput $statusOutput "status"
-    if ($status.run_tree.root_run_id -ne $parentRun -or $status.run_tree.selected_run_id -ne $childRun -or $status.run_tree.summary.run_count -ne 2) {
+    if ($status.run_tree.root_run_id -ne $parentRun -or $status.run_tree.selected_run_id -ne $childRun -or $status.run_tree.summary.run_count -ne 4) {
         Fail "status JSON did not expose the expected parent/child run tree"
     }
     $childNode = @($status.run_tree.nodes | Where-Object { $_.run_id -eq $childRun }) | Select-Object -First 1
@@ -215,10 +215,10 @@ try {
         $script:reportOutput | Set-Content -LiteralPath (Join-Path $artifactDir "report.json") -Encoding utf8
     }
     $report = ConvertFrom-JsonOutput $reportOutput "report"
-    if ($report.run_tree.root_run_id -ne $parentRun -or $report.run_tree.nodes.Count -ne 2) {
+    if ($report.run_tree.root_run_id -ne $parentRun -or $report.run_tree.nodes.Count -ne 4) {
         Fail "report JSON did not include the parent/child run tree"
     }
-    if (@($report.records | Where-Object { $_.run_id -eq $childRun -and $_.report.role -eq "worker" }).Count -lt 1) {
+    if (@($report.records | Where-Object { ($_.run_id -eq $childRun -or $_.report.work_id -eq $childRun) -and $_.report.role -eq "worker" }).Count -lt 1) {
         Fail "report JSON did not include the child worker report record"
     }
 
@@ -258,7 +258,9 @@ finally {
     [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $oldHome, "Process")
     if (-not $KeepArtifacts) {
         Remove-Item -LiteralPath $parentDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $childDir -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($dir in $childDirs) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
