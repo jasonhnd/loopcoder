@@ -240,6 +240,26 @@ func TestPrettyFindingsAreSummarizedBeforeDetails(t *testing.T) {
 	}
 }
 
+func TestPrettyBoundsLongMultilineReason(t *testing.T) {
+	record := validRecord()
+	longReason := strings.Repeat("missing merged spec evidence ", 20) + "\nsecond line must not render"
+
+	got := record.Pretty(PrettyOptions{
+		Mode:   PrettyModePlain,
+		Status: "needs-human",
+		Reason: longReason,
+	})
+	if !strings.Contains(got, "- reason: missing merged spec evidence") {
+		t.Fatalf("Pretty() missing bounded reason:\n%s", got)
+	}
+	if strings.Contains(got, "second line must not render") {
+		t.Fatalf("Pretty() leaked multiline reason detail:\n%s", got)
+	}
+	if !strings.Contains(got, "[truncated]") {
+		t.Fatalf("Pretty() did not mark long reason as truncated:\n%s", got)
+	}
+}
+
 func TestPrettyStableStatusFixtures(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -110,7 +110,10 @@ and nondeterministic model output.
 ## Reporter
 
 Layer 2 uses verifier semantics: role `verifier`, permission `read-only`, and a
-validated local-only report. Pretty reports, canonical JSON, relay records, and
-audit logs are local machine surfaces only. Do not copy them
-into PR bodies, issue or PR comments, commits, merge comments, docs, examples,
-fixtures, or other tracked artifacts.
+validated local-only report. Default text mode is for people and emits the
+concise receipt only when the LLM layer produces a report; `--format json` is
+for machines and emits one audit result JSON value with no receipt or reporter
+header; `--verbose` is for local debugging and keeps raw audit details in text
+mode. Pretty reports, canonical JSON, relay records, and audit logs are local
+machine surfaces only. Do not copy them into PR bodies, issue or PR comments,
+commits, merge comments, docs, examples, fixtures, or other tracked artifacts.

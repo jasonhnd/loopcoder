@@ -1124,37 +1124,49 @@ the payload also includes the same additive `run_tree` object exposed by
 }
 ```
 
-For every successful `loopcoder dispatch`, stdout contains three
-newline-terminated records in this order:
+Reporter-producing commands use explicit output modes:
 
-1. The stable Worker report header from `record.Header()`.
-2. The Worker report canonical JSON from `record.CanonicalJSON()`.
-3. The dispatch result JSON, whose `report` object is the same validated
-   Worker report.
+| Mode | Intended reader | Output |
+|---|---|---|
+| default text | people and merged-stream host integrations | concise receipt only, with no raw canonical JSON |
+| `--format json` | machines | one JSON value with no prefix, suffix, header, or receipt text |
+| `--verbose` | local debugging and compatibility inspection | canonical headers/records and diagnostic details in addition to the human receipt where supported |
 
-Example:
+The same contract applies to Worker (`dispatch` and `dispatch-wave`), Verifier
+(`loopreview`), audit Layer 2, and Conductor self-report (`attest`) receipts.
+During the 0.6.x transition window, readers accept legacy `[attestation]`
+headers and nested `attestation` objects from prior output, but newly emitted
+JSON uses `[reporter]` and `report` per
+[`../specs/0567-reporter.md`](../specs/0567-reporter.md).
 
-```text
-[reporter] role=worker provider=codex model=gpt-5.5(parsed) effort=xhigh perm=write action="implement issue #218" exit=0 dur=42s tokens=2447/4461|6908 verified=true
-{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}
+Use `--format json` when a parent process needs the stable dispatch result
+schema:
+
+```json
 {"ok":true,"issue":218,"branch":"loop/issue-218","run_id":"run-218","pr":"https://github.com/owner/repo/pull/999","summary":"Worker summary","attempt_path":".loopcoder/runs/run-218/workers/job-218-1.attempt.json","status":"succeeded","exit_code":0,"log_bytes":12345,"report":{"role":"worker","provider":"codex","model":"gpt-5.5","model_source":"parsed","effort":"xhigh","permission":"write","action":"implement issue #218","exit_code":0,"started_at":"2026-06-29T00:00:00Z","ended_at":"2026-06-29T00:00:42Z","duration_ms":42000,"usage":{"input_tokens":2447,"output_tokens":4461,"total_tokens":6908},"verified":true}}
 ```
 
-The final non-empty stdout line remains the dispatch result JSON. Consumers
-that need only the summary should parse the last line; conductors that need
-Worker reports can read either the local header or the nested `report` object.
-During the 0.6.x transition window, readers accept legacy `[attestation]` headers and
-nested `attestation` objects from prior output, but newly emitted output uses
-`[reporter]` and `report` per
-[`../specs/0567-reporter.md`](../specs/0567-reporter.md). The canonical JSON
-line is the exact machine rendering of that same record and is not wrapped in
-Markdown on stdout.
+Use `--verbose` when you intentionally need the historical debugging records:
+the stable `[reporter]` header, canonical report JSON, and command result JSON.
 
-`loopcoder dispatch` and `loopcoder loopreview` emit a human-readable report
-receipt to stderr by default. Foreground `loopcoder dispatch-wave` streams one
-Worker receipt per dispatched issue to stdout as that Worker completes, before
-the final aggregate wave report. The default receipt uses emoji on an
-interactive TTY and plain ASCII on a non-TTY.
+Before this output contract, a merged verifier transcript could show
+`needs-human` while its receipt reason was a positive evidence sentence:
+
+```text
+- status: needs-human
+- reason: All five acceptance criteria satisfied and no regressions were found.
+```
+
+The receipt now separates decision reason from next action and chooses the
+escalating finding for `needs-human`:
+
+```text
+- status: needs-human
+- reason: docs/specs/merged-design.md: merged design/spec unavailable: origin/main does not contain the referenced file
+
+Next
+- human should decide whether the reported uncertainty is acceptable for this PR
+```
 
 The receipt is conclusion-first and always uses `Target`, `Verdict`, `Review
 summary`, `Run`, and `Next`. It displays provider vendor and provider key on
@@ -1173,37 +1185,27 @@ and wins over any force or default setting. When pretty output is shown,
 `NO_COLOR`, `LOOPCODER_PLAIN=1`, or `LOOPCODER_NO_EMOJI=1` forces the plain
 ASCII form.
 
-Pretty output is diagnostic local output only. It never appears between the
-three `dispatch` stdout records, and it does not change `loopreview` verdict
-JSON, canonical JSON, or the stable `Header()` / `[reporter] ...` contracts.
-Together with result JSON and gitignored `.loopcoder/` run records, it is a
+Pretty output is diagnostic local output only. Together with JSON mode,
+verbose mode, and gitignored `.loopcoder/` run records, it is a
 local reporter surface only. It is not copied into PR bodies, comments,
 commits, merge commit bodies, merge comments, or other repository-visible
-artifacts. The conductor must keep `dispatch` and `loopreview` stderr visible,
-keep foreground `dispatch-wave` stdout visible, and relay each Worker or
-Verifier pretty block verbatim for human reporting. The `relay` command group
-is the explicit recovery surface: `relay flush` prints pending blocks verbatim
-to stdout and clears them, while `relay list` inspects pending records without
-clearing. `conductor-relay-guard` locally backstops hidden or suppressed
-`dispatch`, `dispatch-wave`, and `loopreview` blocks where hooks are active.
-Machine consumers should continue to parse local canonical JSON or stable
-headers. For one release, relay and conductor hook matchers accept both
+artifacts. The `relay` command group is the explicit recovery surface:
+`relay flush` prints pending blocks verbatim to stdout and clears them, while
+`relay list` inspects pending records without clearing. `conductor-relay-guard`
+locally backstops hidden or suppressed `dispatch`, `dispatch-wave`, and
+`loopreview` blocks where hooks are active. Machine consumers should use
+`--format json`; local compatibility tools that inspect reporter headers should
+use `--verbose`. For one release, relay and conductor hook matchers accept both
 `[reporter]` and legacy `[attestation]` tokens.
 
 `loopcoder attest` is the one-version compatibility alias for Conductor
-self-reports. It emits canonical JSON followed by the one-line `[reporter] ...`
-header, forces `model_source` to
+self-reports. Default text mode emits the Conductor receipt. `--format json`
+emits the canonical report JSON only, while `--verbose` emits canonical JSON
+followed by the one-line `[reporter] ...` header. It forces `model_source` to
 `self-reported`, and forces `verified` to `false` even if flags try to set other
 values. It exits non-zero when required fields are missing or invalid,
 including provider, model, action, timing, and usage. Provide either
 `--total-tokens` or both `--input-tokens` and `--output-tokens`.
-
-Keep the default `loopcoder attest` output for local machine-readable
-Conductor reports. Use `loopcoder attest --pretty` only for direct human
-reading; it prints the pretty rendering to stdout instead of the canonical JSON
-plus header. Conductor recovery after compaction or same-host session transfer
-reads gitignored `.loopcoder/` run records and local command results, never
-GitHub artifacts.
 
 Pretty output uses emoji when the target is an interactive terminal, or when
 emoji is forced, and emoji is not disabled:

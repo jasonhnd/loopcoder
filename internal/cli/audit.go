@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
@@ -54,6 +55,8 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var verbose bool
+	var verboseAlias bool
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -84,6 +87,8 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable LLM review report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable LLM review report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable LLM review report on stderr")
+	fs.BoolVar(&verbose, "verbose", false, "include raw audit details in text output")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include raw audit details in text output")
 
 	if err := fs.Parse(args); err != nil {
 		return auditCommandFailureExitCode
@@ -122,15 +127,13 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	verbose = verbose || verboseAlias
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "audit: unexpected argument %q\n", fs.Arg(0))
 		return auditCommandFailureExitCode
 	}
-	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
-	switch outputFormat {
-	case "text", "json", "both":
-	default:
-		fmt.Fprintf(stderr, "audit: invalid --format %q; want text, json, or both\n", outputFormat)
+	outputMode, ok := normalizeCommandOutputMode("audit", outputFormat, verbose, stderr)
+	if !ok {
 		return auditCommandFailureExitCode
 	}
 
@@ -153,7 +156,11 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return exitCode
 	}
 	if auditSelectionIncludesLLM(layers) {
-		cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, configFromBase)
+		cfg, err := loadDeliveryConfigWithOptions(resolvedRepo, config.LoadOptions{
+			BaseBranch:     baseBranch,
+			ConfigFromBase: configFromBase,
+			Warnings:       auditStderr(outputMode, stderr),
+		})
 		if err != nil {
 			fmt.Fprintf(stderr, "audit: %v\n", err)
 			return auditCommandFailureExitCode
@@ -167,7 +174,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ConfigModel:    cfg.Verifier.Model,
 			ConfigEffort:   cfg.Verifier.ReasoningEffort,
 			Strict:         cfg.Models.Strict || strict,
-			Warnings:       stderr,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
 		})
 		if !ok {
 			return auditCommandFailureExitCode
@@ -187,7 +194,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Model:             model,
 		Effort:            effort,
 		Timeout:           timeout,
-		Stderr:            stderr,
+		Stderr:            auditStderr(outputMode, stderr),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "audit: %v\n", err)
@@ -204,18 +211,28 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 				Reason: "write audit review relay record: " + err.Error(),
 			})
 			result = audit.Finalize(result)
-		} else if shouldRenderPretty(noPretty) {
+		} else if outputMode.Format == "text" && shouldRenderPretty(noPretty) {
 			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
 				fmt.Fprintf(stderr, "audit: write pretty report: %v\n", err)
 				return auditCommandFailureExitCode
 			}
 		}
 	}
-	if err := renderAudit(stdout, result, outputFormat); err != nil {
+	if outputMode.Format == "text" && result.Report != nil && !outputMode.Verbose {
+		return audit.ExitCode(result)
+	}
+	if err := renderAudit(stdout, result, outputMode.Format); err != nil {
 		fmt.Fprintf(stderr, "audit: write output: %v\n", err)
 		return auditCommandFailureExitCode
 	}
 	return audit.ExitCode(result)
+}
+
+func auditStderr(mode commandOutputMode, stderr io.Writer) io.Writer {
+	if mode.Verbose {
+		return stderr
+	}
+	return io.Discard
 }
 
 func auditSelectionIncludesLLM(layers []string) bool {

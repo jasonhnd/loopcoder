@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,41 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
+
+type commandOutputMode struct {
+	Format  string
+	Verbose bool
+}
+
+func normalizeCommandOutputMode(command, format string, verbose bool, stderr io.Writer) (commandOutputMode, bool) {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	switch format {
+	case "text", "json":
+		return commandOutputMode{Format: format, Verbose: verbose}, true
+	default:
+		fmt.Fprintf(stderr, "%s: invalid --format %q; want text or json\n", command, format)
+		return commandOutputMode{}, false
+	}
+}
+
+func writeJSONLine(w io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(data, '\n'))
+	return err
+}
+
+func commandWarningsWriter(mode commandOutputMode, stderr io.Writer) io.Writer {
+	if mode.Format == "json" {
+		return io.Discard
+	}
+	return stderr
+}
 
 func isTerminalWriter(w io.Writer) bool {
 	file, ok := w.(*os.File)
@@ -74,22 +110,19 @@ func renderLoopreviewPrettyReport(w io.Writer, verdict loopreview.Verdict, mode 
 }
 
 func loopreviewPrettyBlock(verdict loopreview.Verdict, mode reporter.PrettyMode) string {
+	verdict = loopreview.NormalizeVerdict(verdict)
 	record := *verdict.Report
 	blocking := blockingFindingCount(verdict.Findings)
-	reason := firstReceiptLine(verdict.Evidence)
-	if reason == "" && len(verdict.Findings) > 0 {
-		reason = firstReceiptLine(verdict.Findings[0].Note)
-	}
 	next := []string{}
-	if verdict.Verdict == loopreview.VerdictNeedsHuman {
-		next = append(next, "human should decide whether the reported uncertainty is acceptable for this PR")
+	if verdict.Verdict == loopreview.VerdictNeedsHuman || verdict.Verdict == loopreview.VerdictFail {
+		next = append(next, verdict.NextAction)
 	}
 	return prettyReport(record, reporter.PrettyOptions{
 		Mode:            mode,
 		Status:          verdict.Verdict,
 		PR:              prFromReport(record),
 		BlockingDefects: &blocking,
-		Reason:          reason,
+		Reason:          verdict.Reason,
 		SpecConformance: verdict.SpecConformance,
 		Findings:        prettyFindings(verdict.Findings),
 		Next:            next,

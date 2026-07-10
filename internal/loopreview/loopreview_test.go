@@ -122,6 +122,32 @@ func TestVerdictJSONSchemaIsValidJSON(t *testing.T) {
 	}
 }
 
+func TestNormalizeVerdictNeedsHumanUsesFindingReasonBeforePositiveEvidence(t *testing.T) {
+	verdict := NormalizeVerdict(Verdict{
+		Verdict: VerdictNeedsHuman,
+		Findings: []Finding{
+			{
+				Severity: "warning",
+				File:     "docs/specs/merged-design.md",
+				Note:     "merged design/spec unavailable: origin/main does not contain the referenced file",
+			},
+		},
+		Evidence:        "All five acceptance criteria satisfied and no regressions were found.",
+		SpecConformance: SpecConformanceNotApplicable,
+	})
+
+	wantReason := "docs/specs/merged-design.md: merged design/spec unavailable: origin/main does not contain the referenced file"
+	if verdict.Reason != wantReason {
+		t.Fatalf("Reason = %q, want %q", verdict.Reason, wantReason)
+	}
+	if strings.Contains(verdict.Reason, "All five acceptance criteria") {
+		t.Fatalf("Reason used positive evidence: %q", verdict.Reason)
+	}
+	if verdict.NextAction == "" || verdict.NextAction == verdict.Reason {
+		t.Fatalf("NextAction = %q, want separate action", verdict.NextAction)
+	}
+}
+
 func TestParseVerdictRejectsInvalidJSONOrSchema(t *testing.T) {
 	tests := []string{
 		`not json`,

@@ -257,13 +257,14 @@ provider's static registry default model and then that model's default depth.
 
 ## Output
 
-On success, `loopcoder dispatch` prints three newline-terminated stdout records:
+`loopcoder dispatch` defaults to human text mode. On success it writes only the
+compact Worker receipt, so hosts that merge stdout and stderr still show a
+readable transcript rather than raw protocol JSON. The receipt is local-only
+operator output; do not copy it into PR bodies, comments, commits, merge
+comments, fixtures, or tracked artifacts.
 
-1. the stable Worker report header;
-2. the Worker report canonical JSON;
-3. the dispatch result JSON.
-
-The final non-empty stdout line is the dispatch result JSON:
+Use `--format json` when a parent process needs a machine contract. JSON mode
+emits one dispatch result JSON value and no decorative header or receipt text:
 
 ```json
 {"ok":true,"issue":24,"branch":"loop/issue-24","run_id":"run-24-20260627-120000","pr":"https://github.com/owner/repo/pull/123","summary":"Provider summary text","attempt_path":".loopcoder/runs/run-24-20260627-120000/workers/job-24-1234.attempt.json","status":"succeeded","exit_code":0,"log_bytes":1234,"report":{"role":"worker","provider":"codex","model":"gpt-5","model_source":"parsed","effort":"high","permission":"write","action":"implement issue #24","exit_code":0,"started_at":"...","ended_at":"...","duration_ms":120000,"usage":{"total_tokens":12345},"verified":true}}
@@ -282,26 +283,25 @@ The dispatch result fields are:
 - `status`: attempt status.
 - `exit_code`: provider exit code.
 - `log_bytes`: size of the provider log.
-- `report`: the same validated Worker `Report` emitted in the
-  first two stdout records.
+- `report`: the validated Worker `Report`.
 
 During the 0.6.x transition window, readers accept legacy dispatch result JSON with an
 `attestation` object and legacy `[attestation]` headers, but new output uses
 the `report` object and `[reporter]` header per
 [`../specs/0567-reporter.md`](../specs/0567-reporter.md).
 
-The default pretty behavior writes a human-readable report receipt to stderr by
-default. The default receipt uses emoji on an interactive TTY and plain ASCII on
-a non-TTY. It uses `Target`, `Verdict`, `Review summary`, `Run`, and `Next`;
+Use `--verbose` for the historical debugging stream. Verbose text mode emits
+the stable Worker report header, the Worker report canonical JSON, and the
+dispatch result JSON after the receipt.
+
+The default receipt uses emoji on an interactive TTY and plain ASCII on a
+non-TTY. It uses `Target`, `Verdict`, `Review summary`, `Run`, and `Next`;
 shows provider vendor and provider key on one combined line, such as
 `OpenAI Codex / codex`; renders the model and depth plus source as
 `gpt-5.5 (xhigh) (parsed)` or `Gemini 3.1 Pro (High) (self-reported)`; uses
 host-local timestamps to whole seconds; reports compact duration; and groups
 token counts with thousands separators. When input and output tokens are
-present without a total, the receipt derives a display-only total. This never
-changes or reorders the three stdout records, the stable `Header()` /
-`[reporter] ...` line, or the canonical JSON, and it never adds reports to PR
-bodies.
+present without a total, the receipt derives a display-only total.
 
 Example pretty block:
 
@@ -340,11 +340,14 @@ stderr. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses pretty output and
 wins over force. When pretty output is shown, `NO_COLOR`, `LOOPCODER_PLAIN=1`,
 or `LOOPCODER_NO_EMOJI=1` forces the plain ASCII form.
 
-The same default-on stderr pretty rule applies to `loopcoder loopreview` and
-`loopcoder dispatch-wave`: `loopreview` keeps verdict JSON on stdout, and
-`dispatch-wave` keeps its stdout text report while emitting one Worker pretty
-block per dispatched issue. Pretty output is for human diagnostics and
-conductor relay, not for machine parsing.
+The same mode contract applies to `loopcoder loopreview`, `loopcoder audit`,
+`loopcoder attest`, and `loopcoder dispatch-wave`: default text is for humans,
+`--format json` is a single JSON value with no prefix or suffix text, and
+`--verbose` is the opt-in debugging stream for raw canonical records where the
+command has them. `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even
+on non-TTY stderr. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses pretty
+output and wins over force. When pretty output is shown, `NO_COLOR`,
+`LOOPCODER_PLAIN=1`, or `LOOPCODER_NO_EMOJI=1` forces the plain ASCII form.
 
 Design rationale:
 [`../specs/0567-reporter.md`](../specs/0567-reporter.md),
