@@ -535,8 +535,8 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
   whether `.loopcoder/` files are already tracked, and the exact safe fix
   command when local state is tracked;
 - reportquery readability for local report/run/relay records;
-- storage health and the current checkout's machine-local project registry
-  identity, including ambiguity warnings;
+- storage permissions, storage health, and the current checkout's
+  machine-local project registry identity, including ambiguity warnings;
 - migration status and nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
@@ -549,6 +549,20 @@ Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
 does not invent provider-authentication status when the provider has no stable
 probe.
+
+On Unix-like systems, v0.7.0 creates and tightens `$LOOPCODER_HOME` and
+`$LOOPCODER_HOME/data` with owner-only directory permissions, and
+`$LOOPCODER_HOME/data/loopcoder.db` plus SQLite `-wal` and `-shm` sidecars with
+owner-only file permissions. The storage layer refuses symlink and non-regular
+database paths before chmod or SQLite open. `doctor --repo .` reports insecure
+existing modes without repairing them; `doctor --repo . --fix` tightens those
+paths in place without deleting or recreating the database.
+
+On Windows, v0.7.0 does not implement owner-only DACL hardening. The storage
+path is still resolved under the user profile or `LOOPCODER_HOME`, and unsafe
+symlink/non-regular storage paths are refused, but `doctor` warns that
+owner-only ACL protection is not enforced and `doctor --fix` cannot repair it in
+this version.
 
 `doctor --format json` emits a stable support surface:
 

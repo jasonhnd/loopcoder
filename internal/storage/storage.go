@@ -204,22 +204,34 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, errors.New("open storage: path is required")
 	}
 	path = filepath.Clean(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("open storage: create data directory: %w", err)
-	}
 
-	db, err := sql.Open(driverName, path)
+	var store *sqliteStore
+	err := withOwnerOnlyUmask(func() error {
+		if err := ensurePermissionsForOpen(path); err != nil {
+			return fmt.Errorf("open storage: secure permissions for %s: %w", path, err)
+		}
+		db, err := sql.Open(driverName, path)
+		if err != nil {
+			return fmt.Errorf("open storage %s: %w", path, err)
+		}
+		db.SetMaxOpenConns(1)
+		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
+		if err := opened.configure(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := opened.migrate(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := hardenSQLiteSidecars(path); err != nil {
+			_ = db.Close()
+			return fmt.Errorf("open storage: secure sqlite sidecars for %s: %w", path, err)
+		}
+		store = opened
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("open storage %s: %w", path, err)
-	}
-	db.SetMaxOpenConns(1)
-	store := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
-	if err := store.configure(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if err := store.migrate(ctx); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
@@ -243,6 +255,13 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 		return health, fmt.Errorf("storage health: inspect %s: %w", path, err)
 	}
 	health.Exists = true
+	permissions, err := CheckPermissions(path)
+	if err != nil {
+		return health, fmt.Errorf("storage health: inspect permissions for %s: %w", path, err)
+	}
+	if unsafe := firstUnsafePermissionItem(permissions); unsafe != nil {
+		return health, fmt.Errorf("storage health: unsafe storage path %s: %s", unsafe.Path, unsafe.Message)
+	}
 
 	db, err := sql.Open(driverName, path)
 	if err != nil {
@@ -485,6 +504,15 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 
 func unsupportedVersionError(version int) error {
 	return fmt.Errorf("unsupported storage schema version %d; selected loopcoder supports schema version %d", version, CurrentSchemaVersion)
+}
+
+func firstUnsafePermissionItem(report PermissionReport) *PermissionItem {
+	for i := range report.Items {
+		if report.Items[i].Unsafe {
+			return &report.Items[i]
+		}
+	}
+	return nil
 }
 
 func normalizeNow(now func() time.Time) func() time.Time {

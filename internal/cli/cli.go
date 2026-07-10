@@ -430,7 +430,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
 		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
-		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
+		fmt.Fprintln(w, "  --fix                  apply explicit storage permission repair, migrations, and stale local state cleanup")
 	}
 	if command.Name == "status" {
 		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
@@ -1248,7 +1248,7 @@ func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&outputFormat, "format", "text", "output format: text or json")
-	fs.BoolVar(&fix, "fix", false, "apply explicit upgrade migrations and stale local state cleanup")
+	fs.BoolVar(&fix, "fix", false, "apply explicit storage permission repair, upgrade migrations, and stale local state cleanup")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
