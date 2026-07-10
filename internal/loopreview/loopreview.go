@@ -434,6 +434,7 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 	return reporter.Report{
 		WorkID:      workID,
 		Issue:       issueNumber,
+		PR:          refs.PRNumber,
 		Branch:      refs.HeadBranch,
 		Worktree:    worktreePath,
 		Role:        reporter.RoleVerifier,
@@ -453,7 +454,10 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 }
 
 func resultWithReport(verdict Verdict, record reporter.Report) Result {
-	verdict.Report = &record
+	record.Status = verdict.Verdict
+	record.Reason = firstNonEmpty(firstLine(verdict.Evidence), firstFindingNote(verdict.Findings))
+	record.SpecStatus = verdict.SpecConformance
+	record.Findings = reporterFindings(verdict.Findings)
 	if err := record.Validate(); err != nil {
 		note := "incomplete verifier report: " + err.Error()
 		verdict.Verdict = VerdictNeedsHuman
@@ -470,7 +474,41 @@ func resultWithReport(verdict Verdict, record reporter.Report) Result {
 		}
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
+	record.Status = verdict.Verdict
+	record.Reason = firstNonEmpty(firstLine(verdict.Evidence), firstFindingNote(verdict.Findings))
+	record.SpecStatus = verdict.SpecConformance
+	record.Findings = reporterFindings(verdict.Findings)
+	verdict.Report = &record
 	return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}
+}
+
+func reporterFindings(findings []Finding) []reporter.Finding {
+	if len(findings) == 0 {
+		return nil
+	}
+	out := make([]reporter.Finding, 0, len(findings))
+	for _, finding := range findings {
+		out = append(out, reporter.Finding{
+			Severity: finding.Severity,
+			File:     finding.File,
+			Note:     finding.Note,
+		})
+	}
+	return out
+}
+
+func firstLine(value string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(value), "\n")
+	return line
+}
+
+func firstFindingNote(findings []Finding) string {
+	for _, finding := range findings {
+		if strings.TrimSpace(finding.Note) != "" {
+			return strings.TrimSpace(finding.Note)
+		}
+	}
+	return ""
 }
 
 func verifierHungVerdict(provider, logPath string, timeout time.Duration, reason string) Verdict {

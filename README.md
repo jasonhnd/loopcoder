@@ -132,6 +132,7 @@ loopcoder resume        --repo .              # reconcile a run after an interru
 loopcoder status        --repo .              # render local-only run status
 loopcoder status --repo . --format json       # inspect latest run tree as stable JSON
 loopcoder report        --repo .              # list recent local reporter records
+loopcoder report        --repo . --verbose    # include finding details and local source paths
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
 loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
@@ -149,7 +150,7 @@ loopcoder kill --repo . --all                 # terminate all loopcoder-managed 
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
-`dispatch` and `loopreview` emit local-only human-readable pretty report blocks to stderr by default, while foreground `dispatch-wave` streams each Worker pretty block to stdout as that Worker completes and still prints the aggregate wave report. The durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
+`dispatch` and `loopreview` emit local-only human-readable receipt blocks to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. The durable local machine surfaces are the `dispatch` / `loopreview` result JSON and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder report --verbose` shows detailed human findings and local source paths; `loopcoder report --format json` emits parseable JSON only. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
 
 ### Model And Depth
 
@@ -233,7 +234,7 @@ The stale-state cleanup policy retains active runs, recent runs, the newest reta
 
 ### Reporter Transition
 
-Worker, Verifier, audit, and Conductor invocations now produce validated local-only reports with `[reporter]` headers and result JSON `report` objects. Reports cover role, provider, model, model source, effort/depth, permission, action, exit code, timing, token usage when available, and verification status. Pretty output groups the same data for humans; machine consumers should parse stable headers, canonical JSON, or the nested `report` object.
+Worker, Verifier, audit, and Conductor invocations now produce validated local-only reports with `[reporter]` headers and result JSON `report` objects. Reports cover role, provider, model, model source, effort/depth, permission, action, exit code, timing, token usage when available, and verification status. Pretty output renders compact receipts in `Target`, `Verdict`, optional `Review summary`, `Run`, and `Next` order; machine consumers should parse stable headers, canonical JSON, or the nested `report` object.
 
 During the 0.6.x transition window, readers accept legacy `[attestation]` headers, legacy result JSON `attestation` objects, the old `loopcoder hook conductor-attest` command, old `.delivery.yml attestation` keys, and old `LOOPCODER_CONDUCTOR_ATTEST_*` env vars. New output and writes use `[reporter]`, `report`, `report.channel`, `conductor-reporter`, and `LOOPCODER_CONDUCTOR_REPORTER_*`. Frozen local machinery stays frozen: `.loopcoder/relay/*.attest` keeps its extension and canonical report JSON field names are unchanged.
 

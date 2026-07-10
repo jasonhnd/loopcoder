@@ -34,6 +34,9 @@ The smoke proves:
   tree with issue and worker report metadata.
 - `report --repo . --run <child> --format json` includes both the child worker
   report record and the same run tree.
+- `report --repo . --work-id <child>` renders the compact human receipt format
+  (`Target`, `Verdict`, `Review summary` when present, `Run`, and `Next`)
+  without embedding raw JSON in the chat-facing text.
 
 The smoke does not require provider authentication, paid services, GitHub
 mutation, dispatch, review, merge, tags, or release assets. If `doctor` exits
@@ -67,8 +70,9 @@ Acceptance requires all of the following evidence:
    without duplicate dispatch.
 4. Observability evidence: `loopcoder status --repo . --format json` and
    `loopcoder report --repo . --run <run-id> --format json` expose the run
-   tree; local report records stay out of PR bodies, issue comments, commits,
-   merge artifacts, docs, examples, and fixtures.
+   tree; `loopcoder report --repo . --work-id <id>` shows the compact receipt
+   for human review; local report records stay out of PR bodies, issue
+   comments, commits, merge artifacts, docs, examples, and fixtures.
 5. Registry evidence: `loopcoder projects show --repo . --format json` resolves
    the loopcoder repository and reports a stable `project_id` and
    `identity_source`.

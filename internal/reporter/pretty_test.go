@@ -6,130 +6,140 @@ import (
 	"time"
 )
 
-func TestPrettyVerifiedEmoji(t *testing.T) {
+func TestPrettyWorkerSuccessReceipt(t *testing.T) {
 	setPrettyTestLocalTime(t)
 	record := validRecord()
+	record.WorkID = "run-issue-172"
+	record.Issue = 172
+	record.PR = 314
+	record.Branch = "loop/issue-172"
+	record.Round = 1
+	record.Status = "success"
+	record.Reason = "worker completed successfully"
 
-	const want = "\u2705 report verified\n" +
-		"who\n" +
-		"  role        worker\n" +
-		"  provider    OpenAI Codex / codex\n" +
-		"  model       gpt-5.5 (xhigh) (parsed)\n" +
-		"  permission  write\n" +
-		"what\n" +
-		"  action      \"implement issue #172\"\n" +
-		"result\n" +
-		"  exit        0\n" +
-		"  duration    42.0s (42.0 s)\n" +
-		"  started     2026-06-28 09:00:00 JST\n" +
-		"  ended       2026-06-28 09:00:42 JST\n" +
-		"  verified    true\n" +
-		"cost\n" +
-		"  tokens      input=120  output=34  total=154"
+	const want = "\u2705 report verified - loopcoder report: worker success\n" +
+		"Target\n" +
+		"- work id: run-issue-172\n" +
+		"- issue: #172\n" +
+		"- PR: #314\n" +
+		"- branch: loop/issue-172\n" +
+		"- round: 1\n" +
+		"Verdict\n" +
+		"- status: success\n" +
+		"- blocking defects: 0\n" +
+		"- reason: worker completed successfully\n" +
+		"Run\n" +
+		"- worker: codex / gpt-5.5 (xhigh) / xhigh\n" +
+		"- permission: write\n" +
+		"- action: \"implement issue #172\"\n" +
+		"- exit: 0\n" +
+		"- duration: 42.0s (42.0 s)\n" +
+		"- started: 2026-06-28 09:00:00 JST\n" +
+		"- ended: 2026-06-28 09:00:42 JST\n" +
+		"- verified: true\n" +
+		"- tokens: input=120  output=34  total=154\n" +
+		"Next\n" +
+		"- action: run verifier review before merge consideration\n" +
+		"- details: loopcoder report --work-id run-issue-172 --verbose\n" +
+		"- raw JSON: loopcoder report --work-id run-issue-172 --format json"
 	if got := record.Pretty(PrettyOptions{}); got != want {
 		t.Fatalf("Pretty() = %q, want %q", got, want)
 	}
 }
 
-func TestPrettyFailedStatusHasPriority(t *testing.T) {
+func TestPrettyVerifierNeedsHumanSummarizesFindings(t *testing.T) {
 	setPrettyTestLocalTime(t)
 	record := validRecord()
 	record.Role = RoleVerifier
 	record.Provider = "claude"
-	record.Model = "claude-haiku-4-5-20251001"
-	record.Effort = ""
+	record.Model = "claude-opus-4-8[1m]"
+	record.Effort = "max"
 	record.Permission = PermissionReadOnly
-	record.Action = "review PR #214"
-	record.ExitCode = 1
-	record.DurationMS = 3200
-	record.EndedAt = "2026-06-28T00:00:03.2Z"
-	record.Usage = Usage{
-		InputTokens:  int64Ptr(2447),
-		OutputTokens: int64Ptr(4947),
+	record.WorkID = "loopreview-663"
+	record.Issue = 644
+	record.PR = 663
+	record.Branch = "loop/issue-644"
+	record.Action = "review PR #663"
+	record.Status = "needs-human"
+	record.Reason = "merged design/spec evidence was not found"
+	record.SpecStatus = "not-applicable"
+	record.Findings = []Finding{
+		{Severity: "warning", File: "docs/specs/0644.md", Note: "merged design/spec evidence was not found"},
+		{Severity: "low", File: "internal/reporter/pretty.go", Note: "minor wording is ambiguous"},
+		{Severity: "info", Note: "manual smoke not available"},
 	}
-	record.Verified = true
 
-	got := record.Pretty(PrettyOptions{})
-	if !strings.HasPrefix(got, "\u274c report failed\n") {
-		t.Fatalf("Pretty() status = %q, want failed", firstLine(got))
-	}
+	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
 	for _, want := range []string{
-		"  provider    Anthropic / claude",
-		"  model       claude-haiku-4-5-20251001 (parsed)",
-		"  exit        1",
-		"  ended       2026-06-28 09:00:03 JST",
-		"  duration    3.2s (3.2 s)",
-		"  tokens      input=2,447  output=4,947  total=7,394",
-		"  verified    true",
+		"report: verified - loopcoder report: verifier needs-human",
+		"Target\n- work id: loopreview-663\n- issue: #644\n- PR: #663\n- branch: loop/issue-644",
+		"Verdict\n- status: needs-human\n- blocking defects: 0\n- reason: merged design/spec evidence was not found",
+		"Review summary\n- acceptance criteria: not applicable\n- findings: 1 warning, 1 low, 1 info",
+		"Run\n- verifier: claude / claude-opus-4-8[1m] (max) / max",
+		"Next\n- action: human should decide whether the reported reason is acceptable",
+		"- raw JSON: loopcoder report --work-id loopreview-663 --format json",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty() missing %q:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "minor wording is ambiguous") {
+		t.Fatalf("Pretty() default included detailed finding text:\n%s", got)
+	}
 }
 
-func TestPrettySelfReportedPlainTotalOnly(t *testing.T) {
-	setPrettyTestLocalTime(t)
+func TestPrettyVerboseFindingDetails(t *testing.T) {
 	record := validRecord()
-	record.Role = RoleConductor
-	record.Provider = "codex-cli"
-	record.Model = "gpt-5"
-	record.ModelSource = ModelSourceSelfReported
-	record.Permission = PermissionOrchestrate
-	record.Action = "merge PR #214"
-	record.DurationMS = 72000
-	record.EndedAt = "2026-06-28T00:01:12Z"
-	record.Usage = Usage{
-		TotalTokens: int64Ptr(18266),
+	record.Role = RoleVerifier
+	record.Status = "fail"
+	record.SpecStatus = "fail"
+	record.Findings = []Finding{
+		{Severity: "error", File: "internal/cli/cli.go", Note: "json output mixed with human text"},
+		{Severity: "warning", Note: "missing smoke evidence"},
 	}
-	record.Verified = false
 
-	const want = `report: self-reported
-who
-  role        conductor
-  provider    codex-cli
-  model       gpt-5 (xhigh) (self-reported)
-  permission  orchestrate
-what
-  action      "merge PR #214"
-result
-  exit        0
-  duration    1m12.0s (72.0 s)
-  started     2026-06-28 09:00:00 JST
-  ended       2026-06-28 09:01:12 JST
-  verified    false
-cost
-  tokens      total=18,266`
-	if got := record.Pretty(PrettyOptions{Mode: PrettyModePlain}); got != want {
-		t.Fatalf("Pretty(plain) = %q, want %q", got, want)
+	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain, Verbose: true})
+	for _, want := range []string{
+		"- findings: 1 error, 1 warning",
+		"Findings",
+		"- error: internal/cli/cli.go: json output mixed with human text",
+		"- warning: missing smoke evidence",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Pretty(verbose) missing %q:\n%s", want, got)
+		}
 	}
 }
 
-func TestPrettyProviderDisplay(t *testing.T) {
-	setPrettyTestLocalTime(t)
+func TestPrettyStableStatuses(t *testing.T) {
 	tests := []struct {
-		provider string
-		display  string
+		name       string
+		role       Role
+		status     string
+		exitCode   int
+		wantLine   string
+		wantReason string
 	}{
-		{provider: "codex", display: "OpenAI Codex / codex"},
-		{provider: "claude", display: "Anthropic / claude"},
-		{provider: "gemini", display: "Google / gemini"},
-		{provider: "antigravity", display: "Google Antigravity / antigravity"},
-		{provider: "custom-cli", display: "custom-cli"},
+		{name: "fail", role: RoleWorker, status: "fail", exitCode: 1, wantLine: "report: failed - loopcoder report: worker fail", wantReason: "- reason: command exited with code 1"},
+		{name: "timeout", role: RoleWorker, status: "timeout", wantLine: "report: failed - loopcoder report: worker timeout", wantReason: "- reason: run timed out"},
+		{name: "cancelled", role: RoleWorker, status: "cancelled", wantLine: "report: failed - loopcoder report: worker cancelled", wantReason: "- reason: run was cancelled"},
+		{name: "partial child failure", role: RoleConductor, status: "partial-child-failure", wantLine: "report: failed - loopcoder report: conductor partial-child-failure", wantReason: "- reason: one or more child runs failed"},
+		{name: "verifier pass", role: RoleVerifier, status: "pass", wantLine: "report: verified - loopcoder report: verifier pass", wantReason: "- reason: verifier passed"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.provider, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			record := validRecord()
-			record.Provider = tt.provider
+			record.Role = tt.role
+			record.Status = tt.status
+			record.ExitCode = tt.exitCode
 
 			got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-			for _, want := range []string{
-				"  provider    " + tt.display,
-			} {
-				if !strings.Contains(got, want) {
-					t.Fatalf("Pretty() missing %q:\n%s", want, got)
-				}
+			if !strings.HasPrefix(got, tt.wantLine+"\n") {
+				t.Fatalf("Pretty() first line = %q, want %q", firstLine(got), tt.wantLine)
+			}
+			if !strings.Contains(got, tt.wantReason) {
+				t.Fatalf("Pretty() missing reason %q:\n%s", tt.wantReason, got)
 			}
 		})
 	}
@@ -140,7 +150,7 @@ func TestPrettyTimestampFallbackKeepsRawValue(t *testing.T) {
 	record.StartedAt = "not-rfc3339"
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-	if !strings.Contains(got, "  started     not-rfc3339") {
+	if !strings.Contains(got, "- started: not-rfc3339") {
 		t.Fatalf("Pretty() missing raw fallback timestamp:\n%s", got)
 	}
 }
@@ -158,12 +168,12 @@ func TestPrettyContextAndModelDepthDisplay(t *testing.T) {
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
 	for _, want := range []string{
-		"  model       Gemini 3.1 Pro (High) (self-reported)",
-		"  work_id     run-20260707-issue-567",
-		"  issue       #567",
-		"  branch      loop/issue-567",
-		`  worktree    C:\repo\.worktrees\issue-567`,
-		"  round       2",
+		"- worker: codex / Gemini 3.1 Pro (High) / High",
+		"- work id: run-20260707-issue-567",
+		"- issue: #567",
+		"- branch: loop/issue-567",
+		`- worktree: C:\repo\.worktrees\issue-567`,
+		"- round: 2",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Pretty() missing %q:\n%s", want, got)
@@ -175,25 +185,20 @@ func TestPrettyContextAndModelDepthDisplay(t *testing.T) {
 }
 
 func TestPrettyEscapesActionControlCharacters(t *testing.T) {
-	setPrettyTestLocalTime(t)
 	record := validRecord()
 	record.Action = "first line\nsecond line\t\"quoted\"\x00done"
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
-	const wantAction = `  action      "first line\nsecond line\t\"quoted\"\x00done"`
+	const wantAction = `- action: "first line\nsecond line\t\"quoted\"\x00done"`
 	if !strings.Contains(got, wantAction) {
 		t.Fatalf("Pretty() missing escaped action %q:\n%s", wantAction, got)
-	}
-	if lineCount(got) != 16 {
-		t.Fatalf("Pretty() rendered %d lines, want 16:\n%s", lineCount(got), got)
 	}
 	if strings.Contains(got, "second line\t") {
 		t.Fatalf("Pretty() contains an unescaped tab/newline action fragment:\n%s", got)
 	}
 }
 
-func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
-	setPrettyTestLocalTime(t)
+func TestPrettyPlainFallbackHasNoEmojiOrANSI(t *testing.T) {
 	record := validRecord()
 
 	got := record.Pretty(PrettyOptions{Mode: PrettyModePlain})
@@ -202,27 +207,8 @@ func TestPrettyPlainFallbackHasNoEmojiOrANSIAndPreservesFields(t *testing.T) {
 			t.Fatalf("Pretty(plain) contains %q:\n%s", disallowed, got)
 		}
 	}
-	for _, want := range []string{
-		"report: verified",
-		"who",
-		"  role        worker",
-		"  provider    OpenAI Codex / codex",
-		"  model       gpt-5.5 (xhigh) (parsed)",
-		"  permission  write",
-		"what",
-		"  action      \"implement issue #172\"",
-		"result",
-		"  exit        0",
-		"  duration    42.0s (42.0 s)",
-		"  started     2026-06-28 09:00:00 JST",
-		"  ended       2026-06-28 09:00:42 JST",
-		"  verified    true",
-		"cost",
-		"  tokens      input=120  output=34  total=154",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("Pretty(plain) missing %q:\n%s", want, got)
-		}
+	if !strings.HasPrefix(got, "report: verified - loopcoder report: worker success\n") {
+		t.Fatalf("Pretty(plain) first line = %q", firstLine(got))
 	}
 }
 
@@ -261,11 +247,4 @@ func setPrettyTestLocalTime(t *testing.T) {
 func firstLine(value string) string {
 	line, _, _ := strings.Cut(value, "\n")
 	return line
-}
-
-func lineCount(value string) int {
-	if value == "" {
-		return 0
-	}
-	return strings.Count(value, "\n") + 1
 }

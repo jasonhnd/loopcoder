@@ -803,6 +803,7 @@ loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
 loopcoder status --repo . --format json
 loopcoder report --repo .
+loopcoder report --repo . --verbose
 loopcoder report --repo . --format json
 
 loopcoder relay list --repo .
@@ -971,26 +972,48 @@ loopcoder report --repo . --work-id <run-id>
 loopcoder report --repo . --run <run-id> --format json
 loopcoder report --repo . --issue 218
 loopcoder report --repo . --role worker
+loopcoder report --repo . --work-id <run-id> --verbose
 loopcoder report --repo . --format json
 ```
 
-Text output includes enough local context to locate the record:
+Default text output is a compact human receipt. It is conclusion-first and does
+not embed raw report JSON:
 
 ```text
 REPORTS
-- work_id: run-218
-  source: attempt
-  run_id: run-218
-  path: .loopcoder/runs/run-218/workers/job-218-1.attempt.json
-  role: worker
-  provider: codex
-  model: gpt-5.5 (xhigh)
+report: verified - loopcoder report: worker success
+Target
+- work id: run-218
+- issue: #218
+- PR: #999
+- branch: loop/issue-218
+Verdict
+- status: success
+- blocking defects: 0
+- reason: worker completed successfully
+Run
+- worker: codex / gpt-5.5 (xhigh) / xhigh
+- permission: write
+- action: "implement issue #218"
+- exit: 0
+- duration: 42.0s (42.0 s)
+- started: 2026-06-29 09:00:00 JST
+- ended: 2026-06-29 09:00:42 JST
+- verified: true
+- tokens: input=2,447  output=4,461  total=6,908
+Next
+- action: run verifier review before merge consideration
+- details: loopcoder report --work-id run-218 --verbose
+- raw JSON: loopcoder report --work-id run-218 --format json
 ```
 
-JSON output keeps the compatibility `reports` array and adds `records` with
-source/run/path context. When `--run <run-id>` is provided with JSON output,
-the payload also includes the same additive `run_tree` object exposed by
-`loopcoder status --format json`:
+`--verbose` keeps the same receipt order, adds detailed finding lines for
+records that have findings, and includes local source/run/path context. Raw
+machine records remain available through `--format json`; that mode emits only
+parseable JSON and no human text. JSON output keeps the compatibility
+`reports` array and adds `records` with source/run/path context. When
+`--run <run-id>` is provided with JSON output, the payload also includes the
+same additive `run_tree` object exposed by `loopcoder status --format json`:
 
 ```json
 {
@@ -1068,21 +1091,19 @@ nested `attestation` objects from prior output, but newly emitted output uses
 line is the exact machine rendering of that same record and is not wrapped in
 Markdown on stdout.
 
-`loopcoder dispatch` and `loopcoder loopreview` emit the human-readable pretty
-report block to stderr by default. Foreground `loopcoder dispatch-wave`
-streams one Worker pretty block per dispatched issue to stdout as that Worker
-completes, before the final aggregate wave report. The default block uses emoji
-on an interactive TTY and plain ASCII on a non-TTY.
+`loopcoder dispatch` and `loopcoder loopreview` emit the human-readable receipt
+block to stderr by default. Foreground `loopcoder dispatch-wave` streams one
+Worker receipt per dispatched issue to stdout as that Worker completes, before
+the final aggregate wave report. The default block uses emoji on an interactive
+TTY and plain ASCII on a non-TTY.
 
-The pretty block displays provider vendor and provider key on one combined
-line, such as `OpenAI Codex / codex`, `Anthropic / claude`, or
-`Google Antigravity / antigravity`. It renders parsed model sources as
-`(parsed)` and self-reported sources as `(self-reported)`, displays `started`
-and `ended` in the host local timezone to whole seconds, reports duration as
-human seconds plus total seconds, and groups token counts with thousands
-separators. When input and output tokens are present without a total, the
-pretty display derives `total=<input+output>` for display only; canonical JSON
-and the stable `[reporter]` header are unchanged.
+The receipt preserves the local trust cue (`report: verified`,
+`report: self-reported`, or `report: failed`) and then renders the outcome as
+`loopcoder report: <role> <status>`. The section order is stable: `Target`,
+`Verdict`, optional `Review summary`, `Run`, and `Next`. Findings are summarized
+by severity count first; detailed finding text is shown by `loopcoder report
+--verbose`, not in default chat-facing output. `needs-human` receipts include a
+concise reason and an explicit next action for human judgment.
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces the emoji form even on non-TTY
 output. `--no-pretty` or `LOOPCODER_NO_PRETTY=1` suppresses the pretty block
@@ -1126,47 +1147,63 @@ Pretty output uses emoji when the target is an interactive terminal, or when
 emoji is forced, and emoji is not disabled:
 
 ```text
-✅ report verified
-who
-   role        worker
-   provider    OpenAI Codex / codex
-   model       gpt-5.5 (xhigh) (parsed)
-   permission  write
-what
-   work_id     run-218
-   issue       #218
-   branch      loop/issue-218
-   action      "implement issue #218"
-result
-   exit        0
-   duration    7m53.9s (473.9 s)
-   started     2026-06-30 14:25:21 JST
-   ended       2026-06-30 14:33:15 JST
-   verified    true
-cost
-   tokens      total=165,268
+✅ report verified - loopcoder report: worker success
+Target
+- work id: run-218
+- issue: #218
+- PR: #999
+- branch: loop/issue-218
+Verdict
+- status: success
+- blocking defects: 0
+- reason: worker completed successfully
+Run
+- worker: codex / gpt-5.5 (xhigh) / xhigh
+- permission: write
+- action: "implement issue #218"
+- exit: 0
+- duration: 7m53.9s (473.9 s)
+- started: 2026-06-30 14:25:21 JST
+- ended: 2026-06-30 14:33:15 JST
+- verified: true
+- tokens: total=165,268
+Next
+- action: run verifier review before merge consideration
+- details: loopcoder report --work-id run-218 --verbose
+- raw JSON: loopcoder report --work-id run-218 --format json
 ```
 
 Non-interactive default output, `NO_COLOR`, `LOOPCODER_NO_EMOJI=1`, or
 `LOOPCODER_PLAIN=1` uses the plain ASCII form with the same fields:
 
 ```text
-report: verified
-who
-  role        verifier
-  provider    Anthropic / claude
-  model       claude-opus-4-8[1m] (max) (parsed)
-  permission  read-only
-what
-  action      "review PR #295"
-result
-  exit        0
-  duration    2m7.0s (127.0 s)
-  started     2026-06-30 14:33:51 JST
-  ended       2026-06-30 14:35:58 JST
-  verified    true
-cost
-  tokens      input=2,447  output=9,844  total=12,291
+report: verified - loopcoder report: verifier needs-human
+Target
+- work id: loopreview-295
+- issue: #218
+- PR: #295
+- branch: loop/issue-218
+Verdict
+- status: needs-human
+- blocking defects: 0
+- reason: merged design/spec evidence was not found
+Review summary
+- acceptance criteria: not applicable
+- findings: 1 warning, 2 low, 2 info
+Run
+- verifier: claude / claude-opus-4-8[1m] (max) / max
+- permission: read-only
+- action: "review PR #295"
+- exit: 0
+- duration: 2m7.0s (127.0 s)
+- started: 2026-06-30 14:33:51 JST
+- ended: 2026-06-30 14:35:58 JST
+- verified: true
+- tokens: input=2,447  output=9,844  total=12,291
+Next
+- action: human should decide whether the reported reason is acceptable
+- details: loopcoder report --work-id loopreview-295 --verbose
+- raw JSON: loopcoder report --work-id loopreview-295 --format json
 ```
 
 Design rationale: [`../specs/0567-reporter.md`](../specs/0567-reporter.md),

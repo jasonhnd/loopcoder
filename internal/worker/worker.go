@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -469,6 +470,7 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	if err != nil {
 		return Result{}, fmt.Errorf("gh pr create: %w", err)
 	}
+	reportRecord.PR = prNumberFromURL(prURL)
 	dispatch.tracker.transition(dispatch.activePhase, "succeeded", dispatch.tracker.exitCode, nil)
 	dispatch.dispatchSucceeded = true
 
@@ -616,6 +618,8 @@ func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 		Issue:       opts.IssueNumber,
 		Branch:      opts.Branch,
 		Round:       opts.Attempt,
+		Status:      "success",
+		Reason:      "worker completed successfully",
 		Role:        reporter.RoleWorker,
 		Provider:    opts.Provider,
 		Model:       firstNonEmpty(opts.Model, result.Model),
@@ -844,6 +848,8 @@ func buildHarvestConductorReport(opts Options, branch, worktreePath string, star
 		Branch:      firstNonEmpty(branch, opts.Branch),
 		Worktree:    worktreePath,
 		Round:       opts.Attempt,
+		Status:      "needs-human",
+		Reason:      "hung worker harvest requires human review",
 		Role:        reporter.RoleConductor,
 		Provider:    firstNonEmpty(opts.Provider, "loopcoder"),
 		Model:       firstNonEmpty(opts.Model, "loopcoder-harvest"),
@@ -860,6 +866,22 @@ func buildHarvestConductorReport(opts Options, branch, worktreePath string, star
 		},
 		Verified: false,
 	}
+}
+
+func prNumberFromURL(value string) int {
+	value = strings.TrimRight(strings.TrimSpace(value), "/")
+	if value == "" {
+		return 0
+	}
+	index := strings.LastIndex(value, "/")
+	if index >= 0 {
+		value = value[index+1:]
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
 }
 
 func findOpenHarvestPR(ctx context.Context, github GitHubClient, issueNumber int, currentHarvestBranch string, warnings io.Writer) *gh.PullRequest {

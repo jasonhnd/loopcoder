@@ -446,6 +446,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
 		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --verbose          include detailed human findings and local source paths in text output")
 	}
 	if command.Name == "models" {
 		fmt.Fprintln(w, "  --provider string   registry provider key to render")
@@ -4700,6 +4701,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	var limitAlias int
 	format := "text"
 	var formatAlias string
+	verbose := false
+	var verboseAlias bool
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4717,6 +4720,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&limitAlias, "Limit", 0, "limit")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&verbose, "verbose", false, "include detailed human findings and local source paths")
+	fs.BoolVar(&verboseAlias, "Verbose", false, "include detailed human findings and local source paths")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -4745,6 +4750,7 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	verbose = verbose || verboseAlias
 	switch format {
 	case "text", "json":
 	default:
@@ -4805,7 +4811,7 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	if _, err := stdout.Write([]byte(reportquery.RenderText(records))); err != nil {
+	if _, err := stdout.Write([]byte(reportquery.RenderTextWithOptions(records, reportquery.RenderOptions{Verbose: verbose}))); err != nil {
 		fmt.Fprintf(stderr, "report: write output: %v\n", err)
 		return 1
 	}

@@ -2099,10 +2099,9 @@ func TestAttestPrettyRendersEmojiWhenInteractive(t *testing.T) {
 	got := stdout.String()
 	for _, want := range []string{
 		"\u26a0\ufe0f report self-reported",
-		"  role        conductor",
-		"  model       gpt-5 (xhigh) (self-reported)",
-		"  tokens      total=18,266",
-		"  verified    false",
+		"- conductor: codex-cli / gpt-5 (xhigh) / xhigh",
+		"- tokens: total=18,266",
+		"- verified: false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, got)
@@ -2142,10 +2141,9 @@ func TestAttestPrettyRendersPlainWhenNonInteractive(t *testing.T) {
 	got := stdout.String()
 	for _, want := range []string{
 		"report: self-reported",
-		"  role        conductor",
-		"  model       gpt-5 (self-reported)",
-		"  tokens      total=12,345",
-		"  verified    false",
+		"- conductor: codex-cli / gpt-5 / not reported",
+		"- tokens: total=12,345",
+		"- verified: false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, got)
@@ -2312,9 +2310,9 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	gotStderr := stderr.String()
 	for _, want := range []string{
 		"report: verified",
-		"  role        verifier",
-		"  permission  read-only",
-		"  action      \"review PR #152\"",
+		"- verifier: claude / gpt-5.5 (high) / high",
+		"- permission: read-only",
+		"- action: \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -2429,9 +2427,9 @@ func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing
 	gotStderr := stderr.String()
 	for _, want := range []string{
 		"\u2705 report verified",
-		"  role        verifier",
-		"  permission  read-only",
-		"  action      \"review PR #152\"",
+		"- verifier: claude / gpt-5.5 (high) / high",
+		"- permission: read-only",
+		"- action: \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -3594,7 +3592,7 @@ func TestTickSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "loopcoder report: worker success") {
 		t.Fatalf("tick stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3727,7 +3725,7 @@ func TestTriggerSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "loopcoder report: worker success") {
 		t.Fatalf("trigger stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3866,9 +3864,9 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	gotStderr := stderr.String()
 	for _, want := range []string{
 		"report: verified",
-		"  role        worker",
-		"  permission  write",
-		"  action      \"implement issue #101\"",
+		"- worker: codex / gpt-5.5 (high) / high",
+		"- permission: write",
+		"- action: \"implement issue #101\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -3965,8 +3963,8 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	gotStderr := stderr.String()
 	for _, want := range []string{
 		"report: verified",
-		"  role        worker",
-		"  tokens      input=120  output=34  total=154",
+		"- worker: codex / gpt-5.5 (high) / high",
+		"- tokens: input=120  output=34  total=154",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -4074,9 +4072,9 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"\u2705 report verified",
-		"  role        worker",
-		"  permission  write",
-		"  action      \"implement issue #101\"",
+		"- worker: codex / gpt-5.5 (high) / high",
+		"- permission: write",
+		"- action: \"implement issue #101\"",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -4126,8 +4124,8 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 	}
 	for _, want := range []string{
 		"\u2705 report verified",
-		"  role        worker",
-		"  tokens      input=120  output=34  total=154",
+		"- worker: codex / gpt-5.5 (high) / high",
+		"- tokens: input=120  output=34  total=154",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -4671,8 +4669,8 @@ func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *te
 		t.Fatalf("stdout pretty block count = %d, want 2:\n%s", count, gotStdout)
 	}
 	for _, want := range []string{
-		"  action      \"implement issue #201\"",
-		"  action      \"implement issue #202\"",
+		"- action: \"implement issue #201\"",
+		"- action: \"implement issue #202\"",
 	} {
 		if !strings.Contains(gotStdout, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, gotStdout)

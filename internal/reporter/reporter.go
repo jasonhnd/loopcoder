@@ -36,9 +36,14 @@ const (
 type Report struct {
 	WorkID      string      `json:"work_id,omitempty"`
 	Issue       int         `json:"issue,omitempty"`
+	PR          int         `json:"pr,omitempty"`
 	Branch      string      `json:"branch,omitempty"`
 	Worktree    string      `json:"worktree,omitempty"`
 	Round       int         `json:"round,omitempty"`
+	Status      string      `json:"status,omitempty"`
+	Reason      string      `json:"reason,omitempty"`
+	Findings    []Finding   `json:"findings,omitempty"`
+	SpecStatus  string      `json:"spec_status,omitempty"`
 	Role        Role        `json:"role"`
 	Provider    string      `json:"provider"`
 	Model       string      `json:"model"`
@@ -54,6 +59,13 @@ type Report struct {
 	Verified    bool        `json:"verified"`
 
 	presence reportPresence
+}
+
+// Finding is the human receipt subset of verifier or gate findings.
+type Finding struct {
+	Severity string `json:"severity"`
+	File     string `json:"file,omitempty"`
+	Note     string `json:"note"`
 }
 
 type reportPresence struct {

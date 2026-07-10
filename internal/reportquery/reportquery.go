@@ -51,6 +51,10 @@ type Record struct {
 	modTime time.Time
 }
 
+type RenderOptions struct {
+	Verbose bool
+}
+
 func List(opts Options) ([]Record, error) {
 	repoPath := strings.TrimSpace(opts.RepoPath)
 	if repoPath == "" {
@@ -154,36 +158,27 @@ func importedSource(sourceKind string) string {
 }
 
 func RenderText(records []Record) string {
+	return RenderTextWithOptions(records, RenderOptions{})
+}
+
+func RenderTextWithOptions(records []Record, opts RenderOptions) string {
 	var out strings.Builder
 	fmt.Fprintln(&out, "REPORTS")
 	if len(records) == 0 {
 		fmt.Fprintln(&out, "- none")
 		return out.String()
 	}
-	for _, record := range records {
-		r := record.Report
-		fmt.Fprintf(&out, "- work_id: %s\n", display(r.WorkID))
-		fmt.Fprintf(&out, "  source: %s\n", display(record.Source))
-		fmt.Fprintf(&out, "  run_id: %s\n", display(record.RunID))
-		fmt.Fprintf(&out, "  path: %s\n", display(record.Path))
-		fmt.Fprintf(&out, "  role: %s\n", display(string(r.Role)))
-		fmt.Fprintf(&out, "  provider: %s\n", display(r.Provider))
-		fmt.Fprintf(&out, "  model: %s\n", display(reporter.ModelDepthDisplay(r.Model, r.Effort)))
-		if r.Issue > 0 {
-			fmt.Fprintf(&out, "  issue: #%d\n", r.Issue)
+	for index, record := range records {
+		if index > 0 {
+			fmt.Fprintln(&out)
 		}
-		if strings.TrimSpace(r.Branch) != "" {
-			fmt.Fprintf(&out, "  branch: %s\n", r.Branch)
+		fmt.Fprintln(&out, record.Report.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain, Verbose: opts.Verbose}))
+		if opts.Verbose {
+			fmt.Fprintln(&out, "Source")
+			fmt.Fprintf(&out, "- source: %s\n", display(record.Source))
+			fmt.Fprintf(&out, "- run id: %s\n", display(record.RunID))
+			fmt.Fprintf(&out, "- path: %s\n", display(record.Path))
 		}
-		if r.Round > 0 {
-			fmt.Fprintf(&out, "  round: %d\n", r.Round)
-		}
-		fmt.Fprintf(&out, "  result: %s\n", resultStatus(r))
-		fmt.Fprintf(&out, "  exit: %d\n", r.ExitCode)
-		fmt.Fprintf(&out, "  duration: %s\n", formatDuration(r))
-		fmt.Fprintf(&out, "  started: %s\n", display(r.StartedAt))
-		fmt.Fprintf(&out, "  ended: %s\n", display(r.EndedAt))
-		fmt.Fprintf(&out, "  tokens: %s\n", formatUsage(r.Usage))
 	}
 	return out.String()
 }
@@ -792,37 +787,6 @@ func parseTime(value string) time.Time {
 		return time.Time{}
 	}
 	return parsed.UTC()
-}
-
-func resultStatus(report reporter.Report) string {
-	if report.ExitCode == 0 {
-		return "ok"
-	}
-	return "failed"
-}
-
-func formatDuration(report reporter.Report) string {
-	if !report.HasDurationMS() {
-		return notReported
-	}
-	return (time.Duration(report.DurationMS) * time.Millisecond).String()
-}
-
-func formatUsage(usage reporter.Usage) string {
-	var parts []string
-	if usage.InputTokens != nil {
-		parts = append(parts, "input="+strconv.FormatInt(*usage.InputTokens, 10))
-	}
-	if usage.OutputTokens != nil {
-		parts = append(parts, "output="+strconv.FormatInt(*usage.OutputTokens, 10))
-	}
-	if usage.TotalTokens != nil {
-		parts = append(parts, "total="+strconv.FormatInt(*usage.TotalTokens, 10))
-	}
-	if len(parts) == 0 {
-		return notReported
-	}
-	return strings.Join(parts, " ")
 }
 
 func display(value string) string {

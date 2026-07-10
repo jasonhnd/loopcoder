@@ -2,6 +2,7 @@ package reporter
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +20,8 @@ const (
 
 // PrettyOptions configures human-oriented report rendering.
 type PrettyOptions struct {
-	Mode PrettyMode
+	Mode    PrettyMode
+	Verbose bool
 }
 
 // Pretty renders a human-oriented, multi-line report summary.
@@ -27,83 +29,322 @@ type PrettyOptions struct {
 // Pretty output is not a machine parse target. Use CanonicalJSON or Header for
 // durable machine or greppable output.
 func (r Report) Pretty(options PrettyOptions) string {
-	status := r.prettyStatus()
-	prefix := "  "
-	statusLine := status.emojiLine
+	receipt := r.prettyReceipt()
+	statusLine := receipt.statusLine
 	if options.Mode == PrettyModePlain {
-		statusLine = status.plainLine
+		statusLine = strings.TrimLeft(statusLine, "\u2705\u274c\u26a0\ufe0f ")
+		statusLine = strings.Replace(statusLine, "report verified", "report: verified", 1)
+		statusLine = strings.Replace(statusLine, "report failed", "report: failed", 1)
+		statusLine = strings.Replace(statusLine, "report self-reported", "report: self-reported", 1)
 	}
 
-	lines := []string{
-		statusLine,
-		"who",
-		prettyField(prefix, "role", prettyValue(string(r.Role))),
-		prettyField(prefix, "provider", prettyProviderDisplay(r.Provider)),
-		prettyField(prefix, "model", formatPrettyModel(r.Model, r.Effort, r.ModelSource)),
-		prettyField(prefix, "permission", prettyValue(string(r.Permission))),
-		"what",
+	lines := []string{statusLine}
+	lines = append(lines, "Target")
+	lines = appendReceiptSection(lines, receipt.target)
+	lines = append(lines, "Verdict")
+	lines = appendReceiptSection(lines, receipt.verdict)
+	if len(receipt.review) > 0 {
+		lines = append(lines, "Review summary")
+		lines = appendReceiptSection(lines, receipt.review)
+		if options.Verbose {
+			lines = appendVerboseFindings(lines, r.Findings)
+		}
 	}
-	lines = appendOptionalPrettyContext(lines, prefix, r)
-	lines = append(lines,
-		prettyField(prefix, "action", strconv.Quote(r.Action)),
-		"result",
-		prettyField(prefix, "exit", strconv.Itoa(r.ExitCode)),
-		prettyField(prefix, "duration", formatPrettyDuration(r.DurationMS)),
-		prettyField(prefix, "started", formatPrettyTimestamp(r.StartedAt)),
-		prettyField(prefix, "ended", formatPrettyTimestamp(r.EndedAt)),
-		prettyField(prefix, "verified", strconv.FormatBool(r.Verified)),
-		"cost",
-		prettyField(prefix, "tokens", formatPrettyUsage(r.Usage)),
-	)
+	lines = append(lines, "Run")
+	lines = appendReceiptSection(lines, receipt.run)
+	lines = append(lines, "Next")
+	lines = appendReceiptSection(lines, receipt.next)
 
 	return strings.Join(lines, "\n")
 }
 
-type prettyStatus struct {
-	emojiLine string
-	plainLine string
+type prettyReceipt struct {
+	statusLine string
+	target     []receiptField
+	verdict    []receiptField
+	review     []receiptField
+	run        []receiptField
+	next       []receiptField
 }
 
-func (r Report) prettyStatus() prettyStatus {
-	if r.ExitCode != 0 {
-		return prettyStatus{
-			emojiLine: "\u274c report failed",
-			plainLine: "report: failed",
-		}
-	}
-	if r.Verified {
-		return prettyStatus{
-			emojiLine: "\u2705 report verified",
-			plainLine: "report: verified",
-		}
-	}
-	return prettyStatus{
-		emojiLine: "\u26a0\ufe0f report self-reported",
-		plainLine: "report: self-reported",
-	}
+type receiptField struct {
+	Label string
+	Value string
 }
 
-func prettyField(prefix, label, value string) string {
-	return fmt.Sprintf("%s%-10s  %s", prefix, label, value)
-}
-
-func appendOptionalPrettyContext(lines []string, prefix string, r Report) []string {
-	if strings.TrimSpace(r.WorkID) != "" {
-		lines = append(lines, prettyField(prefix, "work_id", r.WorkID))
+func (r Report) prettyReceipt() prettyReceipt {
+	status := r.prettyStatus()
+	receipt := prettyReceipt{
+		statusLine: statusLine(status, string(r.Role), r.Verified, r.ExitCode),
+		target: []receiptField{
+			{Label: "work id", Value: displayPretty(r.WorkID)},
+		},
+		verdict: []receiptField{
+			{Label: "status", Value: status},
+			{Label: "blocking defects", Value: strconv.Itoa(r.blockingDefects(status))},
+			{Label: "reason", Value: r.prettyReason(status)},
+		},
+		run: []receiptField{
+			{Label: string(r.Role), Value: prettyRunAgent(r)},
+			{Label: "permission", Value: displayPretty(string(r.Permission))},
+			{Label: "action", Value: strconv.Quote(r.Action)},
+			{Label: "exit", Value: strconv.Itoa(r.ExitCode)},
+			{Label: "duration", Value: formatPrettyDuration(r.DurationMS)},
+			{Label: "started", Value: formatPrettyTimestamp(r.StartedAt)},
+			{Label: "ended", Value: formatPrettyTimestamp(r.EndedAt)},
+			{Label: "verified", Value: strconv.FormatBool(r.Verified)},
+			{Label: "tokens", Value: formatPrettyUsage(r.Usage)},
+		},
+		next: r.prettyNext(status),
 	}
+
 	if r.Issue > 0 {
-		lines = append(lines, prettyField(prefix, "issue", "#"+strconv.Itoa(r.Issue)))
+		receipt.target = append(receipt.target, receiptField{Label: "issue", Value: "#" + strconv.Itoa(r.Issue)})
+	}
+	if r.PR > 0 {
+		receipt.target = append(receipt.target, receiptField{Label: "PR", Value: "#" + strconv.Itoa(r.PR)})
+	} else if pr := prFromAction(r.Action); pr > 0 {
+		receipt.target = append(receipt.target, receiptField{Label: "PR", Value: "#" + strconv.Itoa(pr)})
 	}
 	if strings.TrimSpace(r.Branch) != "" {
-		lines = append(lines, prettyField(prefix, "branch", r.Branch))
+		receipt.target = append(receipt.target, receiptField{Label: "branch", Value: r.Branch})
 	}
 	if strings.TrimSpace(r.Worktree) != "" {
-		lines = append(lines, prettyField(prefix, "worktree", r.Worktree))
+		receipt.target = append(receipt.target, receiptField{Label: "worktree", Value: r.Worktree})
 	}
 	if r.Round > 0 {
-		lines = append(lines, prettyField(prefix, "round", strconv.Itoa(r.Round)))
+		receipt.target = append(receipt.target, receiptField{Label: "round", Value: strconv.Itoa(r.Round)})
+	}
+	if r.Role == RoleVerifier || len(r.Findings) > 0 || strings.TrimSpace(r.SpecStatus) != "" {
+		receipt.review = []receiptField{
+			{Label: "acceptance criteria", Value: prettySpecStatus(r.SpecStatus)},
+			{Label: "findings", Value: formatFindingsSummary(r.Findings)},
+		}
+	}
+	return receipt
+}
+
+func (r Report) prettyStatus() string {
+	status := strings.TrimSpace(r.Status)
+	if status != "" {
+		return status
+	}
+	if r.Role == RoleVerifier {
+		if r.ExitCode == 0 {
+			return "pass"
+		}
+		return "fail"
+	}
+	if strings.Contains(strings.ToLower(r.Action), "harvest hung worker") {
+		return "needs-human"
+	}
+	if r.ExitCode != 0 {
+		return "fail"
+	}
+	return "success"
+}
+
+func statusLine(status, role string, verified bool, exitCode int) string {
+	trust := "report verified"
+	icon := "\u2705"
+	if exitCode != 0 || status == "fail" || status == "failed" || status == "timeout" || status == "cancelled" || status == "partial-child-failure" {
+		trust = "report failed"
+		icon = "\u274c"
+	} else if !verified {
+		trust = "report self-reported"
+		icon = "\u26a0\ufe0f"
+	}
+	return fmt.Sprintf("%s %s - loopcoder report: %s %s", icon, trust, displayPretty(role), displayPretty(status))
+}
+
+func (r Report) prettyReason(status string) string {
+	if strings.TrimSpace(r.Reason) != "" {
+		return strings.TrimSpace(r.Reason)
+	}
+	switch status {
+	case "success":
+		if r.Role == RoleWorker {
+			return "worker completed successfully"
+		}
+		return "command completed successfully"
+	case "pass":
+		return "verifier passed"
+	case "fail", "failed":
+		if r.ExitCode != 0 {
+			return fmt.Sprintf("command exited with code %d", r.ExitCode)
+		}
+		return "blocking defects reported"
+	case "needs-human":
+		return firstFindingNote(r.Findings, "human judgment required")
+	case "timeout":
+		return "run timed out"
+	case "cancelled":
+		return "run was cancelled"
+	case "partial-child-failure":
+		return "one or more child runs failed"
+	default:
+		return displayPretty("")
+	}
+}
+
+func appendReceiptSection(lines []string, fields []receiptField) []string {
+	for _, field := range fields {
+		lines = append(lines, fmt.Sprintf("- %s: %s", field.Label, displayPretty(field.Value)))
 	}
 	return lines
+}
+
+func appendVerboseFindings(lines []string, findings []Finding) []string {
+	if len(findings) == 0 {
+		return lines
+	}
+	lines = append(lines, "Findings")
+	for _, finding := range findings {
+		file := strings.TrimSpace(finding.File)
+		location := ""
+		if file != "" {
+			location = " " + file + ":"
+		}
+		lines = append(lines, fmt.Sprintf("- %s:%s %s", displayPretty(finding.Severity), location, displayPretty(finding.Note)))
+	}
+	return lines
+}
+
+func prettyRunAgent(r Report) string {
+	return strings.Join([]string{
+		displayPretty(r.Provider),
+		displayPretty(reporterModelDepth(r.Model, r.Effort)),
+		displayPretty(r.Effort),
+	}, " / ")
+}
+
+func reporterModelDepth(model, effort string) string {
+	return ModelDepthDisplay(model, effort)
+}
+
+func prettySpecStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "pass":
+		return "satisfied"
+	case "fail":
+		return "not satisfied"
+	case "not-applicable":
+		return "not applicable"
+	case "":
+		return "not reported"
+	default:
+		return status
+	}
+}
+
+func formatFindingsSummary(findings []Finding) string {
+	if len(findings) == 0 {
+		return "none"
+	}
+	counts := map[string]int{}
+	for _, finding := range findings {
+		severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+		if severity == "" {
+			severity = "unspecified"
+		}
+		counts[severity]++
+	}
+	order := []string{"critical", "blocker", "error", "warning", "medium", "low", "info", "unspecified"}
+	var parts []string
+	seen := map[string]bool{}
+	for _, severity := range order {
+		if count := counts[severity]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", count, severity))
+			seen[severity] = true
+		}
+	}
+	var remaining []string
+	for severity := range counts {
+		if !seen[severity] {
+			remaining = append(remaining, severity)
+		}
+	}
+	sort.Strings(remaining)
+	for _, severity := range remaining {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[severity], severity))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (r Report) blockingDefects(status string) int {
+	count := 0
+	for _, finding := range r.Findings {
+		switch strings.ToLower(strings.TrimSpace(finding.Severity)) {
+		case "critical", "blocker", "error":
+			count++
+		}
+	}
+	if count == 0 && (status == "fail" || status == "failed") && r.ExitCode != 0 {
+		return 1
+	}
+	return count
+}
+
+func firstFindingNote(findings []Finding, fallback string) string {
+	for _, finding := range findings {
+		if strings.TrimSpace(finding.Note) != "" {
+			return strings.TrimSpace(finding.Note)
+		}
+	}
+	return fallback
+}
+
+func (r Report) prettyNext(status string) []receiptField {
+	workID := strings.TrimSpace(r.WorkID)
+	if workID == "" {
+		workID = "<work-id>"
+	}
+	action := "continue with the next loopcoder gate"
+	switch status {
+	case "success":
+		if r.Role == RoleWorker {
+			action = "run verifier review before merge consideration"
+		}
+	case "pass":
+		action = "human may decide whether to merge through the configured gate"
+	case "fail", "failed":
+		action = "fix the blocking defects, then rerun verification"
+	case "needs-human":
+		action = "human should decide whether the reported reason is acceptable"
+	case "timeout":
+		action = "inspect timeout evidence, then retry or escalate"
+	case "cancelled":
+		action = "confirm cancellation was intentional before retrying"
+	case "partial-child-failure":
+		action = "inspect failed child runs before continuing"
+	}
+	return []receiptField{
+		{Label: "action", Value: action},
+		{Label: "details", Value: "loopcoder report --work-id " + workID + " --verbose"},
+		{Label: "raw JSON", Value: "loopcoder report --work-id " + workID + " --format json"},
+	}
+}
+
+func prFromAction(action string) int {
+	fields := strings.Fields(strings.ReplaceAll(action, "#", " #"))
+	for i, field := range fields {
+		if strings.EqualFold(field, "PR") && i+1 < len(fields) {
+			if number := parseHashNumber(fields[i+1]); number > 0 {
+				return number
+			}
+		}
+	}
+	return 0
+}
+
+func parseHashNumber(value string) int {
+	value = strings.Trim(strings.TrimSpace(value), ".,;:)]}")
+	value = strings.TrimPrefix(value, "#")
+	number, err := strconv.Atoi(value)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number
 }
 
 func prettyValue(value string) string {
@@ -113,25 +354,11 @@ func prettyValue(value string) string {
 	return value
 }
 
-func prettyProviderDisplay(provider string) string {
-	provider = strings.TrimSpace(provider)
-	switch provider {
-	case "codex":
-		return "OpenAI Codex / codex"
-	case "claude":
-		return "Anthropic / claude"
-	case "gemini":
-		return "Google / gemini"
-	case "antigravity":
-		return "Google Antigravity / antigravity"
-	default:
-		return prettyValue(provider)
+func displayPretty(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "not reported"
 	}
-}
-
-func formatPrettyModel(model, effort string, source ModelSource) string {
-	suffix := prettyValue(string(source))
-	return fmt.Sprintf("%s (%s)", prettyValue(ModelDepthDisplay(model, effort)), suffix)
+	return strings.TrimSpace(value)
 }
 
 func formatPrettyTimestamp(value string) string {

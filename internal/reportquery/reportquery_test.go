@@ -79,17 +79,34 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 	text := RenderText(records)
 	for _, want := range []string{
 		"REPORTS",
-		"work_id: loopreview-99",
-		"source: relay-pending",
-		"run_id: loopreview-pr-99",
-		"source: attempt",
-		"run_id: run-test",
-		"model: claude-opus-4-8[1m] (max)",
-		"issue: #575",
-		"round: 2",
+		"loopcoder report: verifier pass",
+		"- work id: loopreview-99",
+		"- PR: #99",
+		"- verifier: claude / claude-opus-4-8[1m] (max) / max",
+		"loopcoder report: worker success",
+		"- work id: run-test",
+		"- issue: #575",
+		"- branch: loop/issue-575",
+		"- round: 2",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("RenderText missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "source: relay-pending") {
+		t.Fatalf("RenderText default leaked source details:\n%s", text)
+	}
+
+	verboseText := RenderTextWithOptions(records, RenderOptions{Verbose: true})
+	for _, want := range []string{
+		"Source",
+		"- source: relay-pending",
+		"- run id: loopreview-pr-99",
+		"- source: attempt",
+		"- run id: run-test",
+	} {
+		if !strings.Contains(verboseText, want) {
+			t.Fatalf("RenderText verbose missing %q:\n%s", want, verboseText)
 		}
 	}
 
