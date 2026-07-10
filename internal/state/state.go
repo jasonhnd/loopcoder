@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 )
 
 const runIDTimeLayout = "20060102T150405Z"
@@ -208,13 +209,26 @@ func normalizeChildRunSlug(value string) string {
 
 // LatestRunID selects the newest local run directory by modification time.
 func LatestRunID(repoPath string) (string, error) {
-	runsRoot := RunsRoot(repoPath)
+	roots := RunsRootsForRead(repoPath)
+	for _, runsRoot := range roots {
+		latest, ok, err := latestRunIDInRoot(runsRoot)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return latest, nil
+		}
+	}
+	return "", nil
+}
+
+func latestRunIDInRoot(runsRoot string) (string, bool, error) {
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", fmt.Errorf("read runs directory: %w", err)
+		return "", false, fmt.Errorf("read runs directory: %w", err)
 	}
 
 	var latestName string
@@ -233,15 +247,39 @@ func LatestRunID(repoPath string) (string, error) {
 			latestMod = mod
 		}
 	}
-	return latestName, nil
+	return latestName, latestName != "", nil
 }
 
 func RunsRoot(repoPath string) string {
-	return filepath.Join(repoPath, ".loopcoder", "runs")
+	return runtimeRoots(repoPath).RunsRoot
+}
+
+func RunsRootsForRead(repoPath string) []string {
+	roots := runtimeRoots(repoPath)
+	out := []string{roots.RunsRoot}
+	if roots.Registered && roots.LegacyRunsRoot != "" && roots.LegacyRunsRoot != roots.RunsRoot {
+		out = append(out, roots.LegacyRunsRoot)
+	}
+	return out
 }
 
 func RunPath(repoPath, runID string) string {
 	return filepath.Join(RunsRoot(repoPath), runID)
+}
+
+func RunPathForRead(repoPath, runID string) string {
+	global := RunPath(repoPath, runID)
+	if _, err := os.Stat(global); err == nil {
+		return global
+	}
+	roots := runtimeRoots(repoPath)
+	if roots.Registered && roots.LegacyRunsRoot != "" {
+		legacy := filepath.Join(roots.LegacyRunsRoot, runID)
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
+	}
+	return global
 }
 
 func WorkersPath(repoPath, runID string) string {
@@ -306,14 +344,29 @@ func LoadAttempts(repoPath, runID string) ([]Attempt, error) {
 	if strings.TrimSpace(runID) == "" {
 		return nil, nil
 	}
-	return LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+	attempts, err := LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+	if err != nil || len(attempts) > 0 {
+		return attempts, err
+	}
+	roots := runtimeRoots(repoPath)
+	if roots.Registered && roots.LegacyRunsRoot != "" {
+		return LoadAttemptsFromWorkersDir(filepath.Join(roots.LegacyRunsRoot, runID, "workers"))
+	}
+	return attempts, nil
 }
 
 func CountEvents(repoPath, runID string) (int, error) {
 	if strings.TrimSpace(runID) == "" {
 		return 0, nil
 	}
-	file, err := os.Open(EventsPath(repoPath, runID))
+	path := EventsPath(repoPath, runID)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		legacy := legacyEventsPath(repoPath, runID)
+		if legacy != "" {
+			file, err = os.Open(legacy)
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
@@ -370,6 +423,33 @@ func LoadAttemptsFromWorkersDir(workersDir string) ([]Attempt, error) {
 		return attempts[i].JobID < attempts[j].JobID
 	})
 	return attempts, nil
+}
+
+func runtimeRoots(repoPath string) runtimepath.Roots {
+	roots, err := runtimepath.Resolve(context.Background(), repoPath)
+	if err == nil {
+		return roots
+	}
+	legacyRoot := filepath.Join(repoPath, ".loopcoder")
+	return runtimepath.Roots{
+		RepoPath:        repoPath,
+		FallbackMode:    "unregistered-repo-local",
+		RunsRoot:        filepath.Join(legacyRoot, "runs"),
+		RelayRoot:       filepath.Join(legacyRoot, "relay"),
+		RecoveryRoot:    filepath.Join(legacyRoot, "recovery"),
+		AuditRoot:       filepath.Join(legacyRoot, "audit"),
+		LegacyRoot:      legacyRoot,
+		LegacyRunsRoot:  filepath.Join(legacyRoot, "runs"),
+		LegacyRelayRoot: filepath.Join(legacyRoot, "relay"),
+	}
+}
+
+func legacyEventsPath(repoPath, runID string) string {
+	roots := runtimeRoots(repoPath)
+	if !roots.Registered || roots.LegacyRunsRoot == "" {
+		return ""
+	}
+	return filepath.Join(roots.LegacyRunsRoot, runID, "events.jsonl")
 }
 
 type attemptJSON struct {

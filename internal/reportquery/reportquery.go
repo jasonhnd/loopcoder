@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
@@ -225,7 +226,21 @@ type jsonRecord struct {
 }
 
 func loadRunReports(repoPath string) ([]Record, error) {
-	runsRoot := state.RunsRoot(repoPath)
+	var records []Record
+	for _, runsRoot := range state.RunsRootsForRead(repoPath) {
+		found, err := loadRunReportsFromRoot(repoPath, runsRoot)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, found...)
+		if len(found) > 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
+func loadRunReportsFromRoot(repoPath, runsRoot string) ([]Record, error) {
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -243,7 +258,7 @@ func loadRunReports(repoPath string) ([]Record, error) {
 			continue
 		}
 		runID := entry.Name()
-		attempts, err := state.LoadAttempts(repoPath, runID)
+		attempts, err := state.LoadAttemptsFromWorkersDir(filepath.Join(runsRoot, runID, "workers"))
 		if err != nil {
 			return nil, err
 		}
@@ -262,7 +277,7 @@ func loadRunReports(repoPath string) ([]Record, error) {
 			})
 		}
 
-		generic, err := scanRunJSONReports(state.RunPath(repoPath, runID), runID)
+		generic, err := scanRunJSONReports(filepath.Join(runsRoot, runID), runID)
 		if err != nil {
 			return nil, err
 		}
@@ -431,8 +446,22 @@ func loadRelayReports(repoPath string) ([]Record, error) {
 	}
 	records = append(records, pending...)
 
-	relayRoot := filepath.Join(repoPath, ".loopcoder", "relay")
-	err = filepath.WalkDir(relayRoot, func(path string, entry os.DirEntry, err error) error {
+	for _, relayRoot := range relayRootsForRead(repoPath) {
+		found, err := loadRelayLedgerReportsFromRoot(relayRoot)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, found...)
+		if len(found) > 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
+func loadRelayLedgerReportsFromRoot(relayRoot string) ([]Record, error) {
+	var records []Record
+	err := filepath.WalkDir(relayRoot, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -450,8 +479,7 @@ func loadRelayReports(repoPath string) ([]Record, error) {
 		if err != nil {
 			return err
 		}
-		found := collectRelayLedgerReports(data, path, info.ModTime().UTC())
-		records = append(records, found...)
+		records = append(records, collectRelayLedgerReports(data, path, info.ModTime().UTC())...)
 		return nil
 	})
 	if err != nil {
@@ -464,7 +492,21 @@ func loadRelayReports(repoPath string) ([]Record, error) {
 }
 
 func loadPendingRelayReports(repoPath string) ([]Record, error) {
-	dir := filepath.Join(repoPath, ".loopcoder", "relay", "pending")
+	var records []Record
+	for _, relayRoot := range relayRootsForRead(repoPath) {
+		found, err := loadPendingRelayReportsFromDir(filepath.Join(relayRoot, "pending"))
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, found...)
+		if len(found) > 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
+func loadPendingRelayReportsFromDir(dir string) ([]Record, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -511,6 +553,18 @@ func loadPendingRelayReports(repoPath string) ([]Record, error) {
 		}
 	}
 	return records, nil
+}
+
+func relayRootsForRead(repoPath string) []string {
+	roots, err := runtimepath.Resolve(context.Background(), repoPath)
+	if err != nil {
+		return []string{filepath.Join(repoPath, ".loopcoder", "relay")}
+	}
+	out := []string{roots.RelayRoot}
+	if roots.Registered && roots.LegacyRelayRoot != "" && roots.LegacyRelayRoot != roots.RelayRoot {
+		out = append(out, roots.LegacyRelayRoot)
+	}
+	return out
 }
 
 func collectRelayLedgerReports(data []byte, path string, modTime time.Time) []Record {

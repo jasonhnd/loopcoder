@@ -165,17 +165,17 @@ func Load(opts Options) (Report, error) {
 			return Report{}, err
 		}
 		if strings.TrimSpace(latest) == "" {
-			return Report{}, fmt.Errorf("no local run found under %s", filepath.ToSlash(state.RunsRoot(repoPath)))
+			return Report{}, fmt.Errorf("no local run found under %s", filepath.ToSlash(strings.Join(state.RunsRootsForRead(repoPath), string(os.PathListSeparator))))
 		}
 		runID = latest
 		runNote = "latest modified run selected"
 	}
 
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	info, err := os.Stat(runPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Report{}, fmt.Errorf("run %q not found under %s", runID, filepath.ToSlash(state.RunsRoot(repoPath)))
+			return Report{}, fmt.Errorf("run %q not found under %s", runID, filepath.ToSlash(strings.Join(state.RunsRootsForRead(repoPath), string(os.PathListSeparator))))
 		}
 		return Report{}, fmt.Errorf("read run %q: %w", runID, err)
 	}
@@ -499,7 +499,7 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 }
 
 func loadEventRecords(repoPath, runID string, now time.Time) ([]metadataRecord, []verifierRecord, int, error) {
-	path := state.EventsPath(repoPath, runID)
+	path := filepath.Join(state.RunPathForRead(repoPath, runID), "events.jsonl")
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

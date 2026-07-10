@@ -145,6 +145,11 @@ func LoadLifecycle(repoPath, runID string) (Lifecycle, error) {
 func LoadLifecycleHistory(repoPath, runID string) ([]LifecycleTransition, error) {
 	path := LifecyclePath(repoPath, runID)
 	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		if legacy := legacyLifecyclePath(repoPath, runID); legacy != "" {
+			file, err = os.Open(legacy)
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -374,6 +379,11 @@ func conservativeLegacyState(previous, candidate LifecycleState) LifecycleState 
 func loadLegacyEvents(repoPath, runID string) ([]Event, error) {
 	path := EventsPath(repoPath, runID)
 	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		if legacy := legacyEventsPath(repoPath, runID); legacy != "" {
+			file, err = os.Open(legacy)
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -411,4 +421,12 @@ func firstNonEmptyLifecycle(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func legacyLifecyclePath(repoPath, runID string) string {
+	roots := runtimeRoots(repoPath)
+	if !roots.Registered || roots.LegacyRunsRoot == "" {
+		return ""
+	}
+	return filepath.Join(roots.LegacyRunsRoot, runID, "lifecycle.jsonl")
 }

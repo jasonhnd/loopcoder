@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -136,6 +137,7 @@ type dispatchContext struct {
 	promptPath   string
 	summaryPath  string
 	logPath      string
+	runtimeRoots runtimepath.Roots
 	jobID        string
 	attemptPath  string
 	tracker      *attemptTracker
@@ -218,6 +220,10 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 	if strings.TrimSpace(opts.RunID) == "" {
 		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
 	}
+	runtimeRoots, err := runtimepath.Resolve(ctx, repoPath)
+	if err != nil {
+		return nil, err
+	}
 
 	github := deps.GitHub(repoPath)
 	if github == nil {
@@ -230,17 +236,28 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 	}
 
 	return &dispatchContext{
-		opts:     opts,
-		deps:     deps,
-		warnings: warnings,
-		repoPath: repoPath,
-		github:   github,
-		agentRun: agentRunner,
+		opts:         opts,
+		deps:         deps,
+		warnings:     warnings,
+		repoPath:     repoPath,
+		runtimeRoots: runtimeRoots,
+		github:       github,
+		agentRun:     agentRunner,
 	}, nil
 }
 
 func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
-	scratch, err := dispatch.deps.MkdirTemp("", "loopcoder-*")
+	tempRoot := ""
+	if dispatch.runtimeRoots.Registered {
+		tempRoot = dispatch.runtimeRoots.TmpRoot
+		if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+			return fmt.Errorf("create registered temp root: %w", err)
+		}
+	}
+	// Unregistered projects intentionally keep the legacy fallback behavior:
+	// use the OS temp directory, outside the repo, until the user registers the
+	// project and opts into the v0.7 home-scoped runtime contract.
+	scratch, err := dispatch.deps.MkdirTemp(tempRoot, "loopcoder-*")
 	if err != nil {
 		return fmt.Errorf("create scratch directory: %w", err)
 	}
@@ -250,6 +267,13 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
 	dispatch.logPath = filepath.Join(scratch, "codex.log")
 	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	if dispatch.runtimeRoots.Registered {
+		logDir := filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID)
+		if err := os.MkdirAll(logDir, 0o700); err != nil {
+			return fmt.Errorf("create registered log root: %w", err)
+		}
+		dispatch.logPath = filepath.Join(logDir, dispatch.jobID+".log")
+	}
 	dispatch.attemptPath = state.AttemptPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
 	dispatch.tracker = newAttemptTracker(attemptTrackerOptions{
 		repoPath:    dispatch.repoPath,
