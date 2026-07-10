@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +162,79 @@ func TestOpenMigratesLegacyImportForeignKeysWithoutCascades(t *testing.T) {
 	}
 	if tableSQLContains(t, store, "legacy_import_records", "ON DELETE CASCADE") || tableSQLContains(t, store, "legacy_import_status", "ON DELETE CASCADE") {
 		t.Fatalf("legacy import schema still contains ON DELETE CASCADE")
+	}
+}
+
+func TestOpenMigratesDuplicatePhysicalProjectIdentities(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical", "repo")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatalf("mkdir physical: %v", err)
+	}
+	aliasRoot := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "physical"), aliasRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliasRepo := filepath.Join(aliasRoot, "repo")
+
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV3Schema(t, raw)
+	for _, statement := range []string{
+		`INSERT INTO migrations(version, name, applied_at) VALUES (4, 'scrub project remote urls', '2026-01-01T00:00:00Z')`,
+		`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (5, 'preserve project history on registry removal', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at, detached_at) VALUES ('proj_alias', '` + aliasRepo + `', '` + aliasRepo + `', 'repo', 'local-path', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '')`,
+		`INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at, detached_at) VALUES ('proj_physical', '` + physical + `', '` + physical + `', 'repo', 'local-path', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '')`,
+		`INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run-alias', 'proj_alias', 'done', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run-physical', 'proj_physical', 'done', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO reports(id, project_id, run_id, role, provider, model, payload_json, created_at) VALUES ('report-alias', 'proj_alias', 'run-alias', 'worker', 'codex', 'gpt-test', '{}', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO reports(id, project_id, run_id, role, provider, model, payload_json, created_at) VALUES ('report-physical', 'proj_physical', 'run-physical', 'worker', 'codex', 'gpt-test', '{}', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO legacy_import_records(id, project_id, record_type, source_path, source_hash, imported_at) VALUES ('legacy-alias', 'proj_alias', 'event', '.loopcoder/runs/a/events.jsonl', 'hash-a', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO legacy_import_records(id, project_id, record_type, source_path, source_hash, imported_at) VALUES ('legacy-physical', 'proj_physical', 'event', '.loopcoder/runs/b/events.jsonl', 'hash-b', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO legacy_import_status(project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count) VALUES ('proj_alias', '` + aliasRepo + `', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'completed', 1, 1)`,
+		`INSERT INTO legacy_import_status(project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count) VALUES ('proj_physical', '` + physical + `', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'completed', 1, 1)`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec duplicate fixture statement: %v\n%s", err, statement)
+		}
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	assertCount := func(query string, args ...any) int {
+		t.Helper()
+		var count int
+		if err := store.WithTx(ctx, func(tx Tx) error {
+			return tx.QueryRow(ctx, query, args...).Scan(&count)
+		}); err != nil {
+			t.Fatalf("count query %q: %v", query, err)
+		}
+		return count
+	}
+	if got := assertCount(`SELECT COUNT(*) FROM projects`); got != 1 {
+		t.Fatalf("project count = %d, want 1", got)
+	}
+	if got := assertCount(`SELECT COUNT(*) FROM runs WHERE project_id = 'proj_alias'`); got != 2 {
+		t.Fatalf("merged run count = %d, want 2", got)
+	}
+	if got := assertCount(`SELECT COUNT(*) FROM reports WHERE project_id = 'proj_alias'`); got != 2 {
+		t.Fatalf("merged report count = %d, want 2", got)
+	}
+	if got := assertCount(`SELECT COUNT(*) FROM legacy_import_records WHERE project_id = 'proj_alias'`); got != 2 {
+		t.Fatalf("merged legacy record count = %d, want 2", got)
+	}
+	if got := assertCount(`SELECT scanned_count FROM legacy_import_status WHERE project_id = 'proj_alias'`); got != 2 {
+		t.Fatalf("merged import status scanned_count = %d, want 2", got)
 	}
 }
 

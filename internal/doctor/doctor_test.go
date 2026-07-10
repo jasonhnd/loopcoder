@@ -426,6 +426,53 @@ func TestRunWarnsForAmbiguousProjectRegistryIdentity(t *testing.T) {
 	}
 }
 
+func TestRunWarnsForDuplicatePhysicalProjectIdentities(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.projectDupes = func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+		return []registry.DuplicatePhysicalIdentity{{
+			Canonical: "/repo",
+			Projects: []registry.Project{
+				{ProjectID: "proj_one"},
+				{ProjectID: "proj_two"},
+			},
+		}}, nil
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "project registry")
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"duplicate physical project identity", "loopcoder doctor --repo . --fix"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+	if report.Runtime.ProjectRegistry.Status != StatusWarn || report.Runtime.ProjectRegistry.ConflictCount != 1 {
+		t.Fatalf("runtime project registry = %#v, want duplicate warning", report.Runtime.ProjectRegistry)
+	}
+}
+
+func TestRunFixRepairsDuplicatePhysicalProjectIdentities(t *testing.T) {
+	env := healthyDoctorEnv()
+	called := false
+	env.projectRepair = func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+		called = true
+		return []registry.DuplicatePhysicalIdentity{{Canonical: "/repo"}}, nil
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo", Fix: true}, env.deps())
+
+	if !called {
+		t.Fatal("ProjectRepair was not called")
+	}
+	check := requireCheck(t, report, "fix project registry duplicates")
+	if check.Status != StatusOK || !strings.Contains(check.Message, "reconciled 1") {
+		t.Fatalf("repair check = %#v, want reconciled OK", check)
+	}
+}
+
 func TestRenderJSONIncludesProjectRegistryCheck(t *testing.T) {
 	report := WithMetadata(Report{Checks: []Check{
 		{Name: "project registry", Status: StatusWarn, Message: "project identity is ambiguous"},
@@ -1765,6 +1812,8 @@ type fakeDoctorEnv struct {
 	skillFiles     map[string][]byte
 	files          map[string][]byte
 	projectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
+	projectDupes   func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	projectRepair  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -1842,6 +1891,18 @@ func (f *fakeDoctorEnv) deps() Deps {
 					IdentitySource: registry.IdentityGitHub,
 				},
 			}, nil
+		},
+		ProjectDuplicates: func(_ context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			if f.projectDupes != nil {
+				return f.projectDupes(context.Background(), opts)
+			}
+			return nil, nil
+		},
+		ProjectRepair: func(_ context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			if f.projectRepair != nil {
+				return f.projectRepair(context.Background(), opts)
+			}
+			return nil, nil
 		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
