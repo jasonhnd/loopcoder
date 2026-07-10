@@ -118,6 +118,8 @@ type DispatchResult struct {
 	Status      string           `json:"status"`
 	ExitCode    int              `json:"exit_code"`
 	LogBytes    int64            `json:"log_bytes"`
+	Reason      string           `json:"reason,omitempty"`
+	NextAction  string           `json:"next_action,omitempty"`
 	Report      *reporter.Report `json:"report,omitempty"`
 }
 
