@@ -636,6 +636,60 @@ func TestPersistChildPlanGraphRejectsInvalidGraphWithoutPartialRows(t *testing.T
 	}
 }
 
+func TestTransitionRunStatusValidatesAndRecordsHistory(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+
+	if err := TransitionChildRunStatus(ctx, store, parent.RunID, children[0].RunID, "running", "2026-07-10T00:00:01Z", "launch"); err != nil {
+		t.Fatalf("TransitionChildRunStatus running: %v", err)
+	}
+	if err := TransitionChildRunStatus(ctx, store, parent.RunID, children[0].RunID, "succeeded", "2026-07-10T00:00:02Z", "finished"); err != nil {
+		t.Fatalf("TransitionChildRunStatus succeeded: %v", err)
+	}
+	if err := TransitionParentRunStatus(ctx, store, parent.RunID, "succeeded_with_optional_failures", "2026-07-10T00:00:03Z", "aggregate"); err != nil {
+		t.Fatalf("TransitionParentRunStatus optional failures: %v", err)
+	}
+	err = TransitionRunStatus(ctx, store, RunStatusTransition{RunID: parent.RunID, Status: "running", UpdatedAt: "2026-07-10T00:00:04Z"})
+	if err == nil || !strings.Contains(err.Error(), "succeeded_with_optional_failures -> running") {
+		t.Fatalf("terminal transition error = %v, want invalid optional-failures -> running", err)
+	}
+
+	var childStatus, edgeStatus, parentStatus, parentEndedAt string
+	var eventCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, children[0].RunID).Scan(&childStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, parent.RunID, children[0].RunID).Scan(&edgeStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(ended_at, '') FROM runs WHERE id = ?`, parent.RunID).Scan(&parentStatus, &parentEndedAt); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id IN (?, ?)`, parent.RunID, children[0].RunID).Scan(&eventCount)
+	}); err != nil {
+		t.Fatalf("query transition state: %v", err)
+	}
+	if childStatus != "succeeded" || edgeStatus != "succeeded" {
+		t.Fatalf("child/edge status = %q/%q, want succeeded/succeeded", childStatus, edgeStatus)
+	}
+	if parentStatus != "succeeded_with_optional_failures" || parentEndedAt == "" {
+		t.Fatalf("parent status/ended_at = %q/%q, want optional-failures with ended_at", parentStatus, parentEndedAt)
+	}
+	if eventCount != 3 {
+		t.Fatalf("run_events count = %d, want 3", eventCount)
+	}
+}
+
 func TestCheckHealthRejectsCorruptDurableRunGraph(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")

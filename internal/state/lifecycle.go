@@ -16,15 +16,20 @@ const LifecycleVersion = 1
 type LifecycleState string
 
 const (
-	StatePlanned    LifecycleState = "planned"
-	StateQueued     LifecycleState = "queued"
-	StateRunning    LifecycleState = "running"
-	StateWaiting    LifecycleState = "waiting"
-	StateSucceeded  LifecycleState = "succeeded"
-	StateFailed     LifecycleState = "failed"
-	StateCancelled  LifecycleState = "cancelled"
-	StateAbandoned  LifecycleState = "abandoned"
-	StateNeedsHuman LifecycleState = "needs-human"
+	StatePlanned                       LifecycleState = "planned"
+	StateQueued                        LifecycleState = "queued"
+	StateLaunching                     LifecycleState = "launching"
+	StateRunning                       LifecycleState = "running"
+	StateFinishing                     LifecycleState = "finishing"
+	StateWaiting                       LifecycleState = "waiting"
+	StateSucceeded                     LifecycleState = "succeeded"
+	StateSucceededWithOptionalFailures LifecycleState = "succeeded_with_optional_failures"
+	StateFailed                        LifecycleState = "failed"
+	StateCancelled                     LifecycleState = "cancelled"
+	StateTimedOut                      LifecycleState = "timed_out"
+	StateAbandoned                     LifecycleState = "abandoned"
+	StateNeedsHuman                    LifecycleState = "needs-human"
+	StateSkipped                       LifecycleState = "skipped"
 )
 
 type LifecycleTransition struct {
@@ -269,9 +274,10 @@ func LegacyLifecycleState(status, phase string, exitCode *int) (LifecycleState, 
 	status = strings.ToLower(strings.TrimSpace(status))
 	phase = strings.ToLower(strings.TrimSpace(phase))
 	switch status {
-	case string(StatePlanned), string(StateQueued), string(StateRunning), string(StateWaiting),
-		string(StateSucceeded), string(StateFailed), string(StateCancelled), string(StateAbandoned),
-		string(StateNeedsHuman):
+	case string(StatePlanned), string(StateQueued), string(StateLaunching), string(StateRunning),
+		string(StateFinishing), string(StateWaiting), string(StateSucceeded),
+		string(StateSucceededWithOptionalFailures), string(StateFailed), string(StateCancelled),
+		string(StateTimedOut), string(StateAbandoned), string(StateNeedsHuman), string(StateSkipped):
 		return LifecycleState(status), true
 	case "success", "passed", "pass", "done", "completed", "promoted":
 		return StateSucceeded, true
@@ -296,15 +302,20 @@ func LegacyLifecycleState(status, phase string, exitCode *int) (LifecycleState, 
 }
 
 var allowedLifecycleTransitions = map[LifecycleState][]LifecycleState{
-	StatePlanned:    {StateQueued, StateRunning, StateWaiting, StateCancelled, StateAbandoned, StateNeedsHuman},
-	StateQueued:     {StateRunning, StateWaiting, StateCancelled, StateAbandoned, StateNeedsHuman},
-	StateRunning:    {StateWaiting, StateSucceeded, StateFailed, StateCancelled, StateAbandoned, StateNeedsHuman},
-	StateWaiting:    {StateQueued, StateRunning, StateSucceeded, StateFailed, StateCancelled, StateAbandoned, StateNeedsHuman},
-	StateSucceeded:  nil,
-	StateFailed:     nil,
-	StateCancelled:  nil,
-	StateAbandoned:  nil,
-	StateNeedsHuman: nil,
+	StatePlanned:                       {StateQueued, StateLaunching, StateRunning, StateWaiting, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateQueued:                        {StateLaunching, StateRunning, StateWaiting, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateLaunching:                     {StateRunning, StateWaiting, StateFinishing, StateSucceeded, StateSucceededWithOptionalFailures, StateFailed, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateRunning:                       {StateWaiting, StateFinishing, StateSucceeded, StateSucceededWithOptionalFailures, StateFailed, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateWaiting:                       {StateQueued, StateLaunching, StateRunning, StateFinishing, StateSucceeded, StateSucceededWithOptionalFailures, StateFailed, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateFinishing:                     {StateSucceeded, StateSucceededWithOptionalFailures, StateFailed, StateCancelled, StateTimedOut, StateAbandoned, StateNeedsHuman, StateSkipped},
+	StateSucceeded:                     nil,
+	StateSucceededWithOptionalFailures: nil,
+	StateFailed:                        {StateQueued, StateLaunching, StateRunning, StateWaiting, StateNeedsHuman, StateAbandoned},
+	StateCancelled:                     {StateQueued, StateLaunching, StateRunning, StateWaiting, StateNeedsHuman, StateAbandoned},
+	StateTimedOut:                      {StateQueued, StateLaunching, StateRunning, StateWaiting, StateNeedsHuman, StateAbandoned},
+	StateAbandoned:                     nil,
+	StateNeedsHuman:                    nil,
+	StateSkipped:                       nil,
 }
 
 func validLifecycleState(state LifecycleState) bool {
