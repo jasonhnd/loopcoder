@@ -526,7 +526,7 @@ func enrichDispatchWaveFailure(result *DispatchWaveIssueResult, opts DispatchWav
 	result.AttemptPath = firstNonEmpty(result.AttemptPath, latest.Path)
 	result.RecoveryContextPath = firstNonEmpty(result.RecoveryContextPath, latest.RecoveryContextPath)
 	if result.RecoveryContextPath == "" && latest.JobID != "" {
-		recoveryPath := state.RecoveryBriefPath(opts.RepoPath, opts.RunID, latest.JobID)
+		recoveryPath := state.RecoveryBriefPathForRead(opts.RepoPath, opts.RunID, latest.JobID)
 		if info, err := filepath.Abs(recoveryPath); err == nil {
 			result.RecoveryContextPath = info
 		} else {

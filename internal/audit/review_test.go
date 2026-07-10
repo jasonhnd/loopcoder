@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
@@ -122,6 +123,32 @@ mcp:
 	}
 	if result.Report.Role != reporter.RoleVerifier || result.Report.Permission != reporter.PermissionReadOnly || !result.Report.Verified {
 		t.Fatalf("report semantics = %#v", result.Report)
+	}
+}
+
+func TestRegisteredAuditReviewLogPathUsesGlobalProjectRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", home)
+	repo := t.TempDir()
+
+	registered, err := registry.Register(context.Background(), registry.Options{RepoPath: repo}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("register project: %v", err)
+	}
+
+	path, err := prepareAuditReviewLogPath(repo)
+	if err != nil {
+		t.Fatalf("prepare audit review log path: %v", err)
+	}
+	wantDir := filepath.Join(home, "projects", registered.Project.ProjectID, "audit")
+	if filepath.Dir(path) != wantDir {
+		t.Fatalf("audit log dir = %s, want %s", filepath.Dir(path), wantDir)
+	}
+	if strings.HasPrefix(filepath.Clean(path), filepath.Clean(repo)+string(filepath.Separator)) {
+		t.Fatalf("registered audit log path stayed under repo: %s", path)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".loopcoder")); !os.IsNotExist(err) {
+		t.Fatalf("registered audit log created repo-local .loopcoder: %v", err)
 	}
 }
 

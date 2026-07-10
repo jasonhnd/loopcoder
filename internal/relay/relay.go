@@ -2,6 +2,7 @@
 package relay
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 )
 
 // Entry describes one local report block that a conductor must be able to
@@ -30,7 +32,7 @@ type Entry struct {
 	Report       *reporter.Report
 }
 
-// Write appends one relay entry under .loopcoder/relay/<run>/<invocation>.attest.
+// Write appends one relay entry under the selected runtime relay root.
 func Write(entry Entry) (string, error) {
 	repoPath := strings.TrimSpace(entry.RepoPath)
 	if repoPath == "" {
@@ -48,7 +50,7 @@ func Write(entry Entry) (string, error) {
 		entry.CreatedAt = time.Now().UTC()
 	}
 
-	dir := filepath.Join(repoPath, ".loopcoder", "relay", runID)
+	dir := filepath.Join(relayRoot(repoPath), runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create relay directory: %w", err)
 	}
@@ -68,6 +70,14 @@ func Write(entry Entry) (string, error) {
 		return path, fmt.Errorf("write relay ledger: %w", err)
 	}
 	return path, nil
+}
+
+func relayRoot(repoPath string) string {
+	roots, err := runtimepath.Resolve(context.Background(), repoPath)
+	if err == nil {
+		return roots.RelayRoot
+	}
+	return filepath.Join(repoPath, ".loopcoder", "relay")
 }
 
 func render(entry Entry) string {

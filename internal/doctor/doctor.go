@@ -33,6 +33,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -155,6 +156,14 @@ type RuntimeProjectRegistry struct {
 	Detached       bool
 	ProjectID      string
 	IdentitySource string
+	PayloadRoot    string
+	RunsRoot       string
+	RelayRoot      string
+	RecoveryRoot   string
+	AuditRoot      string
+	LogsRoot       string
+	TmpRoot        string
+	FallbackMode   string
 	ConflictCount  int
 	Message        string
 }
@@ -246,6 +255,14 @@ func RenderJSON(w io.Writer, report Report) error {
 			Detached       bool   `json:"detached"`
 			ProjectID      string `json:"project_id,omitempty"`
 			IdentitySource string `json:"identity_source,omitempty"`
+			PayloadRoot    string `json:"payload_root,omitempty"`
+			RunsRoot       string `json:"runs_root,omitempty"`
+			RelayRoot      string `json:"relay_root,omitempty"`
+			RecoveryRoot   string `json:"recovery_root,omitempty"`
+			AuditRoot      string `json:"audit_root,omitempty"`
+			LogsRoot       string `json:"logs_root,omitempty"`
+			TmpRoot        string `json:"tmp_root,omitempty"`
+			FallbackMode   string `json:"fallback_mode,omitempty"`
 			ConflictCount  int    `json:"conflict_count"`
 			Message        string `json:"message"`
 		} `json:"project_registry"`
@@ -328,6 +345,14 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.ProjectRegistry.Detached = report.Runtime.ProjectRegistry.Detached
 	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
 	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
+	payload.Runtime.ProjectRegistry.PayloadRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.PayloadRoot)
+	payload.Runtime.ProjectRegistry.RunsRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.RunsRoot)
+	payload.Runtime.ProjectRegistry.RelayRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.RelayRoot)
+	payload.Runtime.ProjectRegistry.RecoveryRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.RecoveryRoot)
+	payload.Runtime.ProjectRegistry.AuditRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.AuditRoot)
+	payload.Runtime.ProjectRegistry.LogsRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.LogsRoot)
+	payload.Runtime.ProjectRegistry.TmpRoot = filepath.ToSlash(report.Runtime.ProjectRegistry.TmpRoot)
+	payload.Runtime.ProjectRegistry.FallbackMode = report.Runtime.ProjectRegistry.FallbackMode
 	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
 	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
 	payload.Runtime.Migration.Status = report.Runtime.Migration.Status
@@ -1282,13 +1307,14 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 		return Check{
 			Name:    "project registry",
 			Status:  StatusInfo,
-			Message: fmt.Sprintf("project is not registered; resolved candidate %s from %s; run: loopcoder projects register --repo .", result.Project.ProjectID, result.Project.IdentitySource),
+			Message: fmt.Sprintf("project is not registered; fallback=unregistered-repo-local candidate=%s identity=%s; run: loopcoder projects register --repo .", result.Project.ProjectID, result.Project.IdentitySource),
 		}
 	}
+	roots, _ := runtimepath.Resolve(ctx, repoPath)
 	return Check{
 		Name:    "project registry",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("registered project_id=%s identity=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, result.Project.LocalPath),
+		Message: fmt.Sprintf("registered project_id=%s identity=%s payload_root=%s fallback=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, filepath.ToSlash(roots.ProjectRoot), roots.FallbackMode, result.Project.LocalPath),
 	}
 }
 
@@ -1428,6 +1454,16 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 		IdentitySource: string(result.Project.IdentitySource),
 		ConflictCount:  len(result.Conflicts),
 	}
+	if roots, err := runtimepath.Resolve(ctx, repoPath); err == nil {
+		registry.PayloadRoot = roots.ProjectRoot
+		registry.RunsRoot = roots.RunsRoot
+		registry.RelayRoot = roots.RelayRoot
+		registry.RecoveryRoot = roots.RecoveryRoot
+		registry.AuditRoot = roots.AuditRoot
+		registry.LogsRoot = roots.LogsRoot
+		registry.TmpRoot = roots.TmpRoot
+		registry.FallbackMode = roots.FallbackMode
+	}
 	switch {
 	case len(result.Conflicts) > 0:
 		registry.Status = StatusWarn
@@ -1437,10 +1473,10 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 		registry.Message = "project registry identity is detached"
 	case !result.Registered:
 		registry.Status = StatusInfo
-		registry.Message = "project is not registered"
+		registry.Message = "project is not registered; runtime uses explicit repo-local fallback"
 	default:
 		registry.Status = StatusOK
-		registry.Message = "project registry identity is registered"
+		registry.Message = "project registry identity is registered; runtime payloads use global project root"
 	}
 	return registry
 }
@@ -1477,19 +1513,30 @@ func checkNestedRunHealth(repoPath string) Check {
 }
 
 func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
-	runsRoot := state.RunsRoot(repoPath)
-	entries, err := os.ReadDir(runsRoot)
-	if err != nil {
-		if isNotExist(err) {
+	var entries []os.DirEntry
+	foundRoot := ""
+	for _, runsRoot := range state.RunsRootsForRead(repoPath) {
+		readEntries, err := os.ReadDir(runsRoot)
+		if err != nil {
+			if isNotExist(err) {
+				continue
+			}
 			return RuntimeNestedRuns{
-				Status:  StatusOK,
-				Message: "no repo-local run tree state found",
+				Status:       StatusWarn,
+				ProblemCount: 1,
+				Message:      fmt.Sprintf("could not inspect run tree state: %v", err),
 			}
 		}
+		entries = readEntries
+		foundRoot = runsRoot
+		if len(entries) > 0 {
+			break
+		}
+	}
+	if foundRoot == "" {
 		return RuntimeNestedRuns{
-			Status:       StatusWarn,
-			ProblemCount: 1,
-			Message:      fmt.Sprintf("could not inspect run tree state: %v", err),
+			Status:  StatusOK,
+			Message: "no runtime run tree state found",
 		}
 	}
 	if len(entries) > lcdefaults.RunStatusMaxDirectoryEntries {
@@ -1590,7 +1637,7 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 }
 
 func doctorRunEdgesFromEvents(repoPath, runID string) ([]string, string) {
-	path := state.EventsPath(repoPath, runID)
+	path := filepath.Join(state.RunPathForRead(repoPath, runID), "events.jsonl")
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || info.Size() > lcdefaults.RunStatusMaxEventBytes {
 		return nil, ""
