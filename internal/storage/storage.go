@@ -21,7 +21,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 6
+	CurrentSchemaVersion = 7
 
 	driverName = "sqlite"
 )
@@ -198,9 +198,50 @@ var migrations = []migration{
 		name:    "reconcile physical project identities",
 		apply:   reconcilePhysicalProjectIdentities,
 	},
+	{
+		version: 7,
+		name:    "nested child plans and durable run graph",
+		statements: []string{
+			`ALTER TABLE runs ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE runs ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE runs ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
+			`UPDATE runs SET root_run_id = CASE WHEN parent_run_id IS NULL OR parent_run_id = '' THEN id ELSE parent_run_id END WHERE root_run_id = ''`,
+			`UPDATE runs SET created_at = COALESCE(NULLIF(started_at, ''), updated_at) WHERE created_at = ''`,
+			`CREATE INDEX IF NOT EXISTS idx_runs_root_run_id ON runs(root_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_runs_depth ON runs(depth)`,
+			`CREATE TABLE IF NOT EXISTS child_plans (
+				plan_id TEXT PRIMARY KEY,
+				parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				root_run_id TEXT NOT NULL,
+				schema_version TEXT NOT NULL,
+				max_depth INTEGER NOT NULL,
+				max_concurrency INTEGER NOT NULL,
+				plan_json TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_child_plans_parent_run_id ON child_plans(parent_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_child_plans_root_run_id ON child_plans(root_run_id)`,
+			`ALTER TABLE run_edges ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN child_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE run_edges ADD COLUMN ordinal INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE run_edges ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN permission TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN aggregation_json TEXT NOT NULL DEFAULT '{}'`,
+			`ALTER TABLE run_edges ADD COLUMN status TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_edges ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+			`UPDATE run_edges SET updated_at = created_at WHERE updated_at = ''`,
+			`CREATE INDEX IF NOT EXISTS idx_run_edges_root_run_id ON run_edges(root_run_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_edges_plan_id ON run_edges(plan_id)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_plan_child_key ON run_edges(plan_id, child_key) WHERE plan_id <> '' AND child_key <> ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
+		},
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "legacy_import_records", "legacy_import_status"}
 
 type migration struct {
 	version    int

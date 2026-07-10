@@ -33,10 +33,65 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
+	}
+}
+
+func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV3Schema(t, raw)
+	for _, statement := range []string{
+		`INSERT INTO migrations(version, name, applied_at) VALUES (4, 'scrub project remote urls', '2026-01-01T00:00:00Z')`,
+		`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (5, 'preserve project history on registry removal', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (6, 'reconcile physical project identities', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO runs(id, status, started_at, updated_at) VALUES ('run-20260709T000000Z-wave', 'running', '2026-07-09T00:00:00Z', '2026-07-09T00:00:00Z')`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec v6 fixture statement: %v\n%s", err, statement)
+		}
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	if health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, CurrentSchemaVersion)
+	}
+	for _, column := range []string{"root_run_id", "depth", "origin", "created_at"} {
+		if !tableColumnExists(t, store, "runs", column) {
+			t.Fatalf("missing migrated runs column %s", column)
+		}
+	}
+	for _, column := range []string{"root_run_id", "plan_id", "child_key", "ordinal", "scope_json", "aggregation_json", "status", "updated_at"} {
+		if !tableColumnExists(t, store, "run_edges", column) {
+			t.Fatalf("missing migrated run_edges column %s", column)
+		}
+	}
+	if !tableExists(t, store, "child_plans") {
+		t.Fatalf("missing child_plans table")
+	}
+	var rootRunID string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT root_run_id FROM runs WHERE id = 'run-20260709T000000Z-wave'`).Scan(&rootRunID)
+	}); err != nil {
+		t.Fatalf("query migrated run: %v", err)
+	}
+	if rootRunID != "run-20260709T000000Z-wave" {
+		t.Fatalf("migrated root_run_id = %q, want self root", rootRunID)
 	}
 }
 
@@ -441,10 +496,14 @@ func tableExists(t *testing.T, store Store, table string) bool {
 }
 
 func projectColumnExists(t *testing.T, store Store, column string) bool {
+	return tableColumnExists(t, store, "projects", column)
+}
+
+func tableColumnExists(t *testing.T, store Store, table, column string) bool {
 	t.Helper()
 	found := false
 	if err := store.WithTx(context.Background(), func(tx Tx) error {
-		rows, err := tx.Query(context.Background(), `PRAGMA table_info(projects)`)
+		rows, err := tx.Query(context.Background(), `PRAGMA table_info(`+table+`)`)
 		if err != nil {
 			return err
 		}
@@ -465,7 +524,7 @@ func projectColumnExists(t *testing.T, store Store, column string) bool {
 		}
 		return rows.Err()
 	}); err != nil {
-		t.Fatalf("query projects columns: %v", err)
+		t.Fatalf("query %s columns: %v", table, err)
 	}
 	return found
 }

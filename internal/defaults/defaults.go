@@ -15,7 +15,7 @@ const (
 	// DispatchWaveThrottleLimit is the default concurrent dispatch cap.
 	DispatchWaveThrottleLimit = 4
 	// NestedSchedulerMaxDepth is the default child-run depth cap.
-	NestedSchedulerMaxDepth = 1
+	NestedSchedulerMaxDepth = 2
 	// NestedSchedulerMaxChildren is the default child-run fan-out cap.
 	NestedSchedulerMaxChildren = 16
 
