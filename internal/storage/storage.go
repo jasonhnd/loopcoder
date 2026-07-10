@@ -348,6 +348,9 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 	if err := integrityCheck(ctx, db); err != nil {
 		return health, fmt.Errorf("storage health: %w", err)
 	}
+	if err := checkDurableRunGraph(ctx, db); err != nil {
+		return health, fmt.Errorf("storage health: %w", err)
+	}
 	health.OK = true
 	health.Message = "storage database is healthy"
 	return health, nil
@@ -741,6 +744,60 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 	}
 	if result != "ok" {
 		return fmt.Errorf("integrity_check failed: %s", result)
+	}
+	return nil
+}
+
+func checkDurableRunGraph(ctx context.Context, db *sql.DB) error {
+	var selfEdges int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_edges WHERE parent_run_id = child_run_id`).Scan(&selfEdges); err != nil {
+		return fmt.Errorf("inspect durable run graph: %w", err)
+	}
+	if selfEdges > 0 {
+		return fmt.Errorf("durable run graph has %d self-edge(s)", selfEdges)
+	}
+
+	var cycleParent, cycleChild string
+	err := db.QueryRowContext(ctx, `WITH RECURSIVE walk(root_parent, current_child, path) AS (
+		SELECT parent_run_id, child_run_id, parent_run_id || char(0) || child_run_id FROM run_edges
+		UNION
+		SELECT walk.root_parent, run_edges.child_run_id, walk.path || char(0) || run_edges.child_run_id
+			FROM run_edges
+			JOIN walk ON run_edges.parent_run_id = walk.current_child
+			WHERE instr(walk.path || char(0), char(0) || run_edges.child_run_id || char(0)) = 0
+	) SELECT root_parent, current_child FROM walk WHERE root_parent = current_child LIMIT 1`).Scan(&cycleParent, &cycleChild)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("inspect durable run graph: %w", err)
+	}
+	if err == nil {
+		return fmt.Errorf("durable run graph contains a cycle involving %s and %s", cycleParent, cycleChild)
+	}
+
+	var mismatchCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM run_edges e
+		JOIN runs p ON p.id = e.parent_run_id
+		JOIN runs c ON c.id = e.child_run_id
+		WHERE e.root_run_id <> ''
+			AND (p.root_run_id <> e.root_run_id OR c.root_run_id <> e.root_run_id OR c.depth <> e.depth)`).Scan(&mismatchCount); err != nil {
+		return fmt.Errorf("inspect durable run graph: %w", err)
+	}
+	if mismatchCount > 0 {
+		return fmt.Errorf("durable run graph has %d root/depth mismatch(es)", mismatchCount)
+	}
+
+	var missingEdgeCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM runs r
+		WHERE r.parent_run_id IS NOT NULL AND r.parent_run_id <> ''
+			AND r.root_run_id <> ''
+			AND NOT EXISTS (
+				SELECT 1 FROM run_edges e WHERE e.parent_run_id = r.parent_run_id AND e.child_run_id = r.id
+			)`).Scan(&missingEdgeCount); err != nil {
+		return fmt.Errorf("inspect durable run graph: %w", err)
+	}
+	if missingEdgeCount > 0 {
+		return fmt.Errorf("durable run graph has %d child run(s) without matching edge", missingEdgeCount)
 	}
 	return nil
 }

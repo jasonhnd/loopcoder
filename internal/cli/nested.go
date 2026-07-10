@@ -17,6 +17,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -308,8 +309,8 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		} else if ok {
 			return existing, nil
 		}
-		if child.Permission == string(reporter.PermissionReadOnly) {
-			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot run read-only child %q through write-capable worker dispatch", child.ChildKey)
+		if child.Permission == string(reporter.PermissionWrite) || child.Permission == string(reporter.PermissionOrchestrate) {
+			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot enforce scoped writes for child %q with permission %q", child.ChildKey, child.Permission)
 		}
 		if child.Issue <= 0 {
 			return orchestration.ChildRunResult{}, fmt.Errorf("child %q requires a positive issue or scope issue for worker dispatch", child.ChildKey)
@@ -497,17 +498,38 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 }
 
 func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestration.ChildPlan) error {
+	parentRepo, err := pathid.Canonicalize(repoPath)
+	if err != nil {
+		return fmt.Errorf("parent repo: %w", err)
+	}
 	for i := range plan.Items {
 		child := &plan.Items[i]
 		if !permissionWithin(parentPermission, child.Permission) {
 			return fmt.Errorf("child %q permission %q exceeds parent permission %q", child.ChildKey, child.Permission, parentPermission)
 		}
-		childRepo, err := resolveNestedChildRepo(repoPath, child.Scope.Repo)
+		childRepo, err := resolveNestedChildRepo(parentRepo.Display, child.Scope.Repo)
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
 		}
-		if !pathWithin(repoPath, childRepo) {
+		childRepoID, err := pathid.Canonicalize(childRepo)
+		if err != nil {
+			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
+		}
+		if !pathWithin(parentRepo.Identity, childRepoID.Identity) {
 			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+		}
+		for _, scopedPath := range child.Scope.Paths {
+			resolvedPath, err := resolveNestedScopedPath(childRepoID.Display, scopedPath)
+			if err != nil {
+				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			scopedID, err := pathid.Canonicalize(resolvedPath)
+			if err != nil {
+				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			if !pathWithin(childRepoID.Identity, scopedID.Identity) || !pathWithin(parentRepo.Identity, scopedID.Identity) {
+				return fmt.Errorf("child %q scope.paths %q escapes approved repo scope", child.ChildKey, scopedPath)
+			}
 		}
 	}
 	return nil
@@ -755,6 +777,17 @@ func resolveNestedChildRepo(repoPath, childRepo string) (string, error) {
 		return filepath.Abs(childRepo)
 	}
 	return filepath.Abs(filepath.Join(repoPath, childRepo))
+}
+
+func resolveNestedScopedPath(childRepo, scopedPath string) (string, error) {
+	scopedPath = strings.TrimSpace(scopedPath)
+	if scopedPath == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	if filepath.IsAbs(scopedPath) {
+		return filepath.Abs(scopedPath)
+	}
+	return filepath.Abs(filepath.Join(childRepo, scopedPath))
 }
 
 func pathWithin(parent, child string) bool {
