@@ -68,6 +68,39 @@ func TestResolveReleaseLatestAndPinned(t *testing.T) {
 	}
 }
 
+func TestAssetURLPrefersAPIURLWhenAuthenticated(t *testing.T) {
+	asset := releaseAsset{
+		URL:                "https://api.github.com/repos/owner/repo/releases/assets/42",
+		BrowserDownloadURL: "https://github.com/owner/repo/releases/download/v0.7.0/loopcoder_0.7.0_linux_amd64.tar.gz",
+	}
+
+	unauthenticated := assetURL(asset, releaseConfig{
+		Repo:    "owner/repo",
+		BaseURL: "https://github.com",
+	}, "v0.7.0", "loopcoder_0.7.0_linux_amd64.tar.gz")
+	if unauthenticated != asset.BrowserDownloadURL {
+		t.Fatalf("unauthenticated asset URL = %q, want browser download URL", unauthenticated)
+	}
+
+	authenticated := assetURL(asset, releaseConfig{
+		Repo:      "owner/repo",
+		BaseURL:   "https://github.com",
+		AuthToken: "token",
+	}, "v0.7.0", "loopcoder_0.7.0_linux_amd64.tar.gz")
+	if authenticated != asset.URL {
+		t.Fatalf("authenticated asset URL = %q, want API asset URL", authenticated)
+	}
+}
+
+func TestIsGitHubReleaseAssetAPIURL(t *testing.T) {
+	if !isGitHubReleaseAssetAPIURL("https://api.github.com/repos/owner/repo/releases/assets/42") {
+		t.Fatal("release asset API URL was not detected")
+	}
+	if isGitHubReleaseAssetAPIURL("https://api.github.com/repos/owner/repo/releases/tags/v0.7.0") {
+		t.Fatal("release tag API URL was incorrectly detected as an asset URL")
+	}
+}
+
 func TestVerifyChecksumPassAndFail(t *testing.T) {
 	archiveName := "loopcoder_0.3.3_linux_amd64.tar.gz"
 	archive := []byte("archive bytes")

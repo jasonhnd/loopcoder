@@ -101,7 +101,6 @@ function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
     $selectedTag = if ($SelectedVersion.StartsWith("v")) { $SelectedVersion } else { "v$SelectedVersion" }
     $selectedPlainVersion = $selectedTag.TrimStart("v")
     $selectedAsset = Get-PlatformAssetName $selectedPlainVersion
-    $releaseUrl = "$GitHubBaseUrl/$Repo/releases/download/$selectedTag"
     $identity = "$GitHubBaseUrl/$Repo/.github/workflows/release.yml@refs/tags/$selectedTag"
     $issuer = "https://token.actions.githubusercontent.com"
     $releaseDir = Join-Path $tmp ("release-" + $selectedPlainVersion)
@@ -115,9 +114,14 @@ function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
     $sumsPath = Join-Path $releaseDir "SHA256SUMS"
     $signaturePath = Join-Path $releaseDir "SHA256SUMS.sigstore"
 
-    Invoke-WebRequest -Uri "$releaseUrl/$selectedAsset" -OutFile $archivePath
-    Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS" -OutFile $sumsPath
-    Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS.sigstore" -OutFile $signaturePath
+    Invoke-Checked "download $Label release assets" {
+        gh release download $selectedTag --repo $Repo --dir $releaseDir --clobber --pattern $selectedAsset --pattern "SHA256SUMS" --pattern "SHA256SUMS.sigstore" | Out-Host
+    }
+    foreach ($requiredPath in @($archivePath, $sumsPath, $signaturePath)) {
+        if (-not (Test-Path -LiteralPath $requiredPath)) {
+            Fail "downloaded $Label release did not include $(Split-Path -Leaf $requiredPath)"
+        }
+    }
 
     Invoke-Checked "verify $Label SHA256SUMS signature" {
         cosign verify-blob $sumsPath --bundle $signaturePath --certificate-identity $identity --certificate-oidc-issuer $issuer | Out-Host
