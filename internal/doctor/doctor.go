@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -1523,7 +1524,8 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 	parentEdges := 0
 	childEdges := 0
 	for runID, lifecycle := range lifecycles {
-		parent := strings.TrimSpace(lifecycle.ParentRunID)
+		eventChildren, eventParent := doctorRunEdgesFromEvents(repoPath, runID)
+		parent := strings.TrimSpace(firstNonEmptyDoctor(lifecycle.ParentRunID, eventParent))
 		if parent != "" {
 			parentEdges++
 			if parent == runID {
@@ -1532,7 +1534,15 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 				problems = append(problems, fmt.Sprintf("%s references missing parent %s", runID, parent))
 			}
 		}
+		children := map[string]bool{}
 		for _, child := range lifecycle.ChildRunIDs {
+			children[strings.TrimSpace(child)] = true
+		}
+		for _, child := range eventChildren {
+			children[strings.TrimSpace(child)] = true
+		}
+		delete(children, "")
+		for child := range children {
 			child = strings.TrimSpace(child)
 			if child == "" {
 				continue
@@ -1577,6 +1587,72 @@ func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
 		ChildEdges:  childEdges,
 		Message:     fmt.Sprintf("run tree readable; %d run(s), %d parent edge(s), %d child edge(s)", runCount, parentEdges, childEdges),
 	}
+}
+
+func doctorRunEdgesFromEvents(repoPath, runID string) ([]string, string) {
+	path := state.EventsPath(repoPath, runID)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() > lcdefaults.RunStatusMaxEventBytes {
+		return nil, ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ""
+	}
+	defer file.Close()
+
+	children := map[string]bool{}
+	parent := ""
+	limited := &io.LimitedReader{R: file, N: lcdefaults.RunStatusMaxEventBytes + 1}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 1024), lcdefaults.RunStatusMaxEventLineBytes)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Details json.RawMessage `json:"details"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil || len(event.Details) == 0 {
+			continue
+		}
+		var details struct {
+			ParentRunID string `json:"parent_run_id"`
+			Child       struct {
+				RunID string `json:"run_id"`
+			} `json:"child"`
+			Result struct {
+				RunID string `json:"run_id"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(event.Details, &details); err != nil {
+			continue
+		}
+		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
+			parent = strings.TrimSpace(details.ParentRunID)
+		}
+		if strings.TrimSpace(details.ParentRunID) == "" || strings.TrimSpace(details.ParentRunID) == runID {
+			children[strings.TrimSpace(details.Child.RunID)] = true
+			children[strings.TrimSpace(details.Result.RunID)] = true
+			delete(children, "")
+		}
+	}
+	out := make([]string, 0, len(children))
+	for child := range children {
+		out = append(out, child)
+	}
+	sort.Strings(out)
+	return out, parent
+}
+
+func firstNonEmptyDoctor(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Check {

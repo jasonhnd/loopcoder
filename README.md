@@ -126,6 +126,7 @@ loopcoder promote      --repo .               # may change production branch whe
 loopcoder upgrade --version 0.6.1             # signed self-upgrade from GitHub Releases
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
+loopcoder nested run   --repo . --plan child-plan.json --provider codex # execute a validated child plan
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
@@ -253,6 +254,7 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into `loopcoder status`, and reports progress. It never writes the code itself.
 - Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh git worktree, then opens a PR. The verified worker providers are `codex` and `claude`; `antigravity` is the `agy` provider path; direct `gemini` remains experimental/unverified.
+- Nested orchestration: `loopcoder nested run --plan <file.json>` accepts the v1 child-plan envelope, persists the parent/child run graph, schedules dependencies with bounded depth/fan-out/concurrency, and launches write-capable children through the same Worker dispatch adapter path. Loopcoder owns planning boundaries, child identity, permission checks, persistence, budget/circuit decisions, cancellation, and resume; provider-native sub-agent features are not treated as authoritative orchestration. The reserved `test-subprocess` provider is only for deterministic local smoke tests.
 - Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status. `codex` and `claude` have verifier smoke proof; `antigravity` fails closed for read-only review.
 - Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step follows `adapters.gate`: `gate: auto` auto-promotes to production only when CI is green, `loopreview` passed, configured evidence is present, and the red-line floor is clean; `gate: human-merge` requires an explicit human-directed production merge.
 - Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and production promotion gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, `verifier`, and `gate`.

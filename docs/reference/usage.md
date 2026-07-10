@@ -811,6 +811,8 @@ loopcoder dispatch \
 
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
 
+loopcoder nested run --repo . --plan child-plan.json --provider codex --format json
+
 loopcoder tick --repo . --strict
 loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
 loopcoder promote --repo .
@@ -877,6 +879,38 @@ loopcoder kill --repo . --all
 `kill` are advanced/operator commands. `state push` is the explicit
 state-branch publish path; `kill` only targets loopcoder-managed processes for
 a run or repository and should not be used as a bare process-name terminator.
+
+### Nested Child Plans
+
+`loopcoder nested run` is the supported boundary for v1 nested orchestration:
+
+```text
+loopcoder nested run --repo . --plan child-plan.json --provider codex
+loopcoder nested run --repo . --plan child-plan.json --provider claude --format json
+```
+
+The plan file must use `schema_version: "loopcoder.child_plan.v1"`. The command
+strictly validates child keys, dependencies, depth, fan-out, declared scope,
+permission, and aggregation policy before launching child work. It persists the
+accepted plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`,
+then schedules ready children with dependency-aware fan-out/fan-in. Re-running
+the same plan resumes from durable child attempt records and does not dispatch a
+child whose run already has a terminal attempt.
+
+For production providers, loopcoder launches write-capable child runs through
+the existing Worker dispatch adapter path. That means `codex` and `claude`
+children get normal worktrees, attempt records, reports, recovery briefs, and
+provider selection behavior; unsupported read-only child dispatch fails with an
+explicit error instead of silently using a mutating worker. Loopcoder remains the
+authority for child identity, permission ceilings, budget/circuit checks,
+persistence, cancellation, timeout, and recovery. Native provider sub-agent
+features are not a replacement for the child plan and are not allowed to create
+untracked children outside loopcoder.
+
+The reserved `test-subprocess` provider exists only for deterministic local and
+release smoke tests. It executes each child item's `scope.commands` as real local
+subprocesses and writes ordinary local attempt/report records without calling a
+remote provider.
 
 ## Exit Codes
 

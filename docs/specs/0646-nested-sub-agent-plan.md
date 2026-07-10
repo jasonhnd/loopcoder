@@ -1,10 +1,10 @@
 ---
 id: 646
 title: Nested Sub-Agent Plan Schema and Parent-Child Run IDs
-status: draft
+status: accepted
 date: 2026-07-09
 issue: 646
-pr: null
+pr: 689
 supersedes: []
 superseded_by: []
 ---

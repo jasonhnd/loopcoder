@@ -1355,6 +1355,43 @@ func TestCheckNestedRunHealthWarnsForMissingParent(t *testing.T) {
 	}
 }
 
+func TestCheckNestedRunHealthCountsEventEdges(t *testing.T) {
+	repo := t.TempDir()
+	parent := state.RunIDForWave(time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
+	child := state.RunIDForChild("docs-pass", 0, time.Date(2026, 7, 9, 0, 0, 1, 0, time.UTC))
+	if err := state.AppendEvent(repo, parent, state.Event{
+		Timestamp: "2026-07-09T00:00:00Z",
+		RunID:     parent,
+		JobID:     "nested-scheduler",
+		Issue:     690,
+		Phase:     "nested-scheduler",
+		Status:    state.StatusSucceeded,
+		Event:     "nested.child.finished",
+		Outcome:   state.StatusSucceeded,
+		Details:   json.RawMessage(fmt.Sprintf(`{"parent_run_id":%q,"child":{"run_id":%q},"result":{"run_id":%q}}`, parent, child, child)),
+	}); err != nil {
+		t.Fatalf("AppendEvent parent: %v", err)
+	}
+	if err := state.AppendEvent(repo, child, state.Event{
+		Timestamp: "2026-07-09T00:00:01Z",
+		RunID:     child,
+		JobID:     "nested-scheduler",
+		Issue:     690,
+		Phase:     "nested-scheduler",
+		Status:    state.StatusSucceeded,
+		Event:     "nested.child.finished",
+		Outcome:   state.StatusSucceeded,
+		Details:   json.RawMessage(fmt.Sprintf(`{"parent_run_id":%q,"child":{"run_id":%q},"result":{"run_id":%q}}`, parent, child, child)),
+	}); err != nil {
+		t.Fatalf("AppendEvent child: %v", err)
+	}
+
+	health := runtimeNestedRuns(repo)
+	if health.Status != StatusOK || health.ParentEdges != 1 || health.ChildEdges != 1 || health.ProblemCount != 0 {
+		t.Fatalf("nested health = %#v", health)
+	}
+}
+
 func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
 	t.Setenv(migration.LegacyReporterScopeEnv, "auto")
 	repo := t.TempDir()
