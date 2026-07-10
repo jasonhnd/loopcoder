@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -78,6 +80,27 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 
 	text := RenderText(records)
 	for _, want := range []string{
+		"loopcoder report: verifier success",
+		"Target",
+		"- PR: #99",
+		"Verdict",
+		"- status: success",
+		"Run",
+		"- run id: loopreview-pr-99",
+		"- verifier: claude / claude-opus-4-8[1m] (max) / write",
+		"loopcoder report: worker success",
+		"- issue: #575",
+		"- branch: loop/issue-575",
+		"- worker: codex / gpt-5.5 (high) / write",
+		"Next",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("RenderText missing %q:\n%s", want, text)
+		}
+	}
+
+	verbose := RenderVerboseText(records)
+	for _, want := range []string{
 		"REPORTS",
 		"work_id: loopreview-99",
 		"source: relay-pending",
@@ -88,8 +111,8 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 		"issue: #575",
 		"round: 2",
 	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("RenderText missing %q:\n%s", want, text)
+		if !strings.Contains(verbose, want) {
+			t.Fatalf("RenderVerboseText missing %q:\n%s", want, verbose)
 		}
 	}
 
@@ -123,6 +146,84 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 	}
 	if _, err := filepath.Rel(repo, records[1].Path); err != nil {
 		t.Fatalf("worker source path is not under repo: %v", err)
+	}
+}
+
+func TestRenderTextReceiptsForVerifierNeedsHumanAndTerminalWorkerStatuses(t *testing.T) {
+	verifier := testReport(reporter.RoleVerifier, "claude", "claude-opus-4-8[1m]", "max", "review PR #670", "2026-07-07T00:01:00Z")
+	verifier.WorkID = "loopreview-670"
+	verifier.Issue = 670
+	verifier.Permission = reporter.PermissionReadOnly
+
+	records := []Record{
+		{
+			Report:          verifier,
+			Source:          "run-json",
+			RunID:           "loopreview-pr-670",
+			Verdict:         "needs-human",
+			SpecConformance: "not-applicable",
+			Evidence:        "merged design/spec evidence was not found",
+			Findings: []loopreview.Finding{
+				{Severity: "warning", Note: "missing spec"},
+				{Severity: "low", Note: "non-blocking smoke gap"},
+				{Severity: "low", Note: "manual acceptance gap"},
+				{Severity: "info", Note: "context note"},
+			},
+		},
+		workerStatusRecord("run-fail", "failed", "worker failed", 1),
+		workerStatusRecord("run-timeout", "timed_out", "", 0),
+		workerStatusRecord("run-cancel", "cancelled", "", 0),
+		workerStatusRecord("run-child", "abandoned", "", 0),
+	}
+
+	text := RenderText(records)
+	for _, want := range []string{
+		"loopcoder report: verifier needs-human",
+		"- status: needs-human",
+		"- blocking: needs human",
+		"- reason: merged design/spec evidence was not found",
+		"- findings: 1 warning, 2 low, 1 info",
+		"- human should decide whether the unresolved evidence is acceptable",
+		"loopcoder report: worker fail",
+		"- reason: worker failed",
+		"loopcoder report: worker timeout",
+		"- reason: run timed out before completion",
+		"loopcoder report: worker cancelled",
+		"- reason: run was cancelled before completion",
+		"loopcoder report: worker partial-child-failure",
+		"- reason: one or more child runs did not complete successfully",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("RenderText missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestCollectReportRecordsEnrichesReviewContext(t *testing.T) {
+	report := testReport(reporter.RoleVerifier, "claude", "opus", "max", "review PR #701", "2026-07-07T00:01:00Z")
+	payload := map[string]any{
+		"verdict":          "needs-human",
+		"spec_conformance": "not-applicable",
+		"evidence":         "merged spec unavailable",
+		"pr_number":        701,
+		"findings": []map[string]any{{
+			"severity": "warning",
+			"file":     "docs/specs/0701.md",
+			"note":     "missing merged spec",
+		}},
+		"report": report,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	records := collectReportRecords(data, "run-json", "run-review", "review.json", testModTime())
+	if len(records) == 0 {
+		t.Fatal("collectReportRecords returned no records")
+	}
+	record := dedupe(records)[0]
+	if record.Verdict != "needs-human" || record.PRNumber != 701 || len(record.Findings) != 1 {
+		t.Fatalf("record context = %#v", record)
 	}
 }
 
@@ -192,4 +293,23 @@ func testReport(role reporter.Role, provider, model, effort, action, ended strin
 		},
 		Verified: true,
 	}
+}
+
+func workerStatusRecord(runID, status, errorText string, exitCode int) Record {
+	record := testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement issue #670", "2026-07-07T00:00:00Z")
+	record.WorkID = runID
+	record.Issue = 670
+	record.Branch = "loop/issue-670"
+	record.ExitCode = exitCode
+	return Record{
+		Report: record,
+		Source: "attempt",
+		RunID:  runID,
+		Status: status,
+		Error:  errorText,
+	}
+}
+
+func testModTime() time.Time {
+	return time.Date(2026, 7, 7, 0, 0, 0, 0, time.UTC)
 }

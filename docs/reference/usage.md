@@ -968,29 +968,52 @@ repo-local `.loopcoder/` is still a manual user action outside migration.
 ```text
 loopcoder report --repo .
 loopcoder report --repo . --work-id <run-id>
+loopcoder report --repo . --work-id <run-id> --verbose
 loopcoder report --repo . --run <run-id> --format json
 loopcoder report --repo . --issue 218
 loopcoder report --repo . --role worker
 loopcoder report --repo . --format json
 ```
 
-Text output includes enough local context to locate the record:
+Default text output is a compact human receipt with the conclusion first:
 
 ```text
-REPORTS
-- work_id: run-218
-  source: attempt
-  run_id: run-218
-  path: .loopcoder/runs/run-218/workers/job-218-1.attempt.json
-  role: worker
-  provider: codex
-  model: gpt-5.5 (xhigh)
+loopcoder report: verifier needs-human
+
+Target
+- issue: #218
+- PR: #663
+- branch: loop/issue-218
+
+Verdict
+- status: needs-human
+- blocking: needs human
+- reason: merged design/spec evidence was not found
+
+Review summary
+- spec conformance: not-applicable
+- findings: 1 warning, 2 low
+
+Run
+- work id: loopreview-663
+- source: run-json
+- run id: loopreview-pr-663
+- verifier: claude / claude-opus-4-8[1m] (max) / read-only
+- duration: 5m8s
+- tokens: total=23657
+
+Next
+- human should decide whether the unresolved evidence is acceptable
+- details: loopcoder report --run loopreview-pr-663 --verbose
+- raw JSON: loopcoder report --run loopreview-pr-663 --format json
 ```
 
-JSON output keeps the compatibility `reports` array and adds `records` with
-source/run/path context. When `--run <run-id>` is provided with JSON output,
-the payload also includes the same additive `run_tree` object exposed by
-`loopcoder status --format json`:
+Verbose text keeps the detailed local listing with source/run/path context.
+JSON output remains clean machine-readable output with no human receipt text; it
+keeps the compatibility `reports` array and adds `records` with source/run/path
+context. When `--run <run-id>` is provided with JSON output, the payload also
+includes the same additive `run_tree` object exposed by `loopcoder status
+--format json`:
 
 ```json
 {

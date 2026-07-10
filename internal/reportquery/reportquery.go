@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
@@ -44,11 +45,19 @@ type Options struct {
 }
 
 type Record struct {
-	Report  reporter.Report `json:"report"`
-	Source  string          `json:"source,omitempty"`
-	RunID   string          `json:"run_id,omitempty"`
-	Path    string          `json:"path,omitempty"`
-	modTime time.Time
+	Report          reporter.Report      `json:"report"`
+	Source          string               `json:"source,omitempty"`
+	RunID           string               `json:"run_id,omitempty"`
+	Path            string               `json:"path,omitempty"`
+	Status          string               `json:"status,omitempty"`
+	Error           string               `json:"error,omitempty"`
+	PR              string               `json:"pr,omitempty"`
+	PRNumber        int                  `json:"pr_number,omitempty"`
+	Verdict         string               `json:"verdict,omitempty"`
+	SpecConformance string               `json:"spec_conformance,omitempty"`
+	Evidence        string               `json:"evidence,omitempty"`
+	Findings        []loopreview.Finding `json:"findings,omitempty"`
+	modTime         time.Time
 }
 
 func List(opts Options) ([]Record, error) {
@@ -155,6 +164,24 @@ func importedSource(sourceKind string) string {
 
 func RenderText(records []Record) string {
 	var out strings.Builder
+	if len(records) == 0 {
+		fmt.Fprintln(&out, "loopcoder report: no records")
+		fmt.Fprintln(&out)
+		fmt.Fprintln(&out, "Next")
+		fmt.Fprintln(&out, "- run a worker, verifier, or conductor command to create local reporter records")
+		return out.String()
+	}
+	for i, record := range records {
+		if i > 0 {
+			fmt.Fprintln(&out)
+		}
+		renderReceipt(&out, record)
+	}
+	return out.String()
+}
+
+func RenderVerboseText(records []Record) string {
+	var out strings.Builder
 	fmt.Fprintln(&out, "REPORTS")
 	if len(records) == 0 {
 		fmt.Fprintln(&out, "- none")
@@ -166,6 +193,12 @@ func RenderText(records []Record) string {
 		fmt.Fprintf(&out, "  source: %s\n", display(record.Source))
 		fmt.Fprintf(&out, "  run_id: %s\n", display(record.RunID))
 		fmt.Fprintf(&out, "  path: %s\n", display(record.Path))
+		if strings.TrimSpace(record.Status) != "" {
+			fmt.Fprintf(&out, "  status: %s\n", record.Status)
+		}
+		if strings.TrimSpace(record.Error) != "" {
+			fmt.Fprintf(&out, "  error: %s\n", record.Error)
+		}
 		fmt.Fprintf(&out, "  role: %s\n", display(string(r.Role)))
 		fmt.Fprintf(&out, "  provider: %s\n", display(r.Provider))
 		fmt.Fprintf(&out, "  model: %s\n", display(reporter.ModelDepthDisplay(r.Model, r.Effort)))
@@ -178,6 +211,27 @@ func RenderText(records []Record) string {
 		if r.Round > 0 {
 			fmt.Fprintf(&out, "  round: %d\n", r.Round)
 		}
+		if record.PRNumber > 0 {
+			fmt.Fprintf(&out, "  pr_number: %d\n", record.PRNumber)
+		}
+		if strings.TrimSpace(record.PR) != "" {
+			fmt.Fprintf(&out, "  pr: %s\n", record.PR)
+		}
+		if strings.TrimSpace(record.Verdict) != "" {
+			fmt.Fprintf(&out, "  verdict: %s\n", record.Verdict)
+		}
+		if strings.TrimSpace(record.SpecConformance) != "" {
+			fmt.Fprintf(&out, "  spec_conformance: %s\n", record.SpecConformance)
+		}
+		if strings.TrimSpace(record.Evidence) != "" {
+			fmt.Fprintf(&out, "  evidence: %s\n", compactLine(record.Evidence))
+		}
+		if len(record.Findings) > 0 {
+			fmt.Fprintf(&out, "  findings: %s\n", formatFindingSummary(record.Findings))
+			for i, finding := range record.Findings {
+				fmt.Fprintf(&out, "    - %d: %s\n", i+1, formatFindingDetail(finding))
+			}
+		}
 		fmt.Fprintf(&out, "  result: %s\n", resultStatus(r))
 		fmt.Fprintf(&out, "  exit: %d\n", r.ExitCode)
 		fmt.Fprintf(&out, "  duration: %s\n", formatDuration(r))
@@ -186,6 +240,42 @@ func RenderText(records []Record) string {
 		fmt.Fprintf(&out, "  tokens: %s\n", formatUsage(r.Usage))
 	}
 	return out.String()
+}
+
+func renderReceipt(out *strings.Builder, record Record) {
+	r := record.Report
+	status := receiptStatus(record)
+	fmt.Fprintf(out, "loopcoder report: %s %s\n\n", display(string(r.Role)), status)
+	fmt.Fprintln(out, "Target")
+	fmt.Fprintf(out, "- issue: %s\n", displayIssue(r.Issue))
+	fmt.Fprintf(out, "- PR: %s\n", displayPR(record))
+	fmt.Fprintf(out, "- branch: %s\n", display(r.Branch))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Verdict")
+	fmt.Fprintf(out, "- status: %s\n", status)
+	fmt.Fprintf(out, "- blocking: %s\n", blockingStatus(status))
+	fmt.Fprintf(out, "- reason: %s\n", receiptReason(record))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Review summary")
+	if strings.TrimSpace(record.SpecConformance) != "" {
+		fmt.Fprintf(out, "- spec conformance: %s\n", record.SpecConformance)
+	} else {
+		fmt.Fprintln(out, "- spec conformance: not reported")
+	}
+	fmt.Fprintf(out, "- findings: %s\n", formatFindingSummary(record.Findings))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Run")
+	fmt.Fprintf(out, "- work id: %s\n", display(r.WorkID))
+	fmt.Fprintf(out, "- source: %s\n", display(record.Source))
+	fmt.Fprintf(out, "- run id: %s\n", display(record.RunID))
+	fmt.Fprintf(out, "- %s: %s / %s / %s\n", display(string(r.Role)), display(r.Provider), display(reporter.ModelDepthDisplay(r.Model, r.Effort)), display(string(r.Permission)))
+	fmt.Fprintf(out, "- duration: %s\n", formatDuration(r))
+	fmt.Fprintf(out, "- tokens: %s\n", formatUsage(r.Usage))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Next")
+	for _, line := range nextActions(record, status) {
+		fmt.Fprintf(out, "- %s\n", line)
+	}
 }
 
 func MarshalJSON(records []Record) ([]byte, error) {
@@ -198,10 +288,18 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 	for _, record := range records {
 		reports = append(reports, record.Report)
 		jsonRecords = append(jsonRecords, jsonRecord{
-			Report: record.Report,
-			Source: record.Source,
-			RunID:  record.RunID,
-			Path:   record.Path,
+			Report:          record.Report,
+			Source:          record.Source,
+			RunID:           record.RunID,
+			Path:            record.Path,
+			Status:          record.Status,
+			Error:           record.Error,
+			PR:              record.PR,
+			PRNumber:        record.PRNumber,
+			Verdict:         record.Verdict,
+			SpecConformance: record.SpecConformance,
+			Evidence:        record.Evidence,
+			Findings:        record.Findings,
 		})
 	}
 	payload := struct {
@@ -213,10 +311,18 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 }
 
 type jsonRecord struct {
-	Report reporter.Report `json:"report"`
-	Source string          `json:"source"`
-	RunID  string          `json:"run_id"`
-	Path   string          `json:"path"`
+	Report          reporter.Report      `json:"report"`
+	Source          string               `json:"source"`
+	RunID           string               `json:"run_id"`
+	Path            string               `json:"path"`
+	Status          string               `json:"status,omitempty"`
+	Error           string               `json:"error,omitempty"`
+	PR              string               `json:"pr,omitempty"`
+	PRNumber        int                  `json:"pr_number,omitempty"`
+	Verdict         string               `json:"verdict,omitempty"`
+	SpecConformance string               `json:"spec_conformance,omitempty"`
+	Evidence        string               `json:"evidence,omitempty"`
+	Findings        []loopreview.Finding `json:"findings,omitempty"`
 }
 
 func loadRunReports(repoPath string) ([]Record, error) {
@@ -253,6 +359,8 @@ func loadRunReports(repoPath string) ([]Record, error) {
 				Source:  "attempt",
 				RunID:   runID,
 				Path:    attempt.Path,
+				Status:  attempt.Status,
+				Error:   attempt.Error,
 				modTime: attempt.LastWriteUTC,
 			})
 		}
@@ -316,15 +424,7 @@ func scanRunJSONReports(runPath, runID string) ([]Record, error) {
 		if err != nil {
 			return err
 		}
-		for _, report := range collectReports(data) {
-			records = append(records, Record{
-				Report:  report,
-				Source:  "run-json",
-				RunID:   runID,
-				Path:    path,
-				modTime: info.ModTime().UTC(),
-			})
-		}
+		records = append(records, collectReportRecords(data, "run-json", runID, path, info.ModTime().UTC())...)
 		return nil
 	})
 	if err != nil {
@@ -344,15 +444,7 @@ func collectJSONLReports(path string, modTime time.Time, runID string) ([]Record
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024), maxReportLineBytes)
 	for scanner.Scan() {
-		for _, report := range collectReports(scanner.Bytes()) {
-			records = append(records, Record{
-				Report:  report,
-				Source:  "run-jsonl",
-				RunID:   runID,
-				Path:    path,
-				modTime: modTime,
-			})
-		}
+		records = append(records, collectReportRecords(scanner.Bytes(), "run-jsonl", runID, path, modTime)...)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -361,29 +453,38 @@ func collectJSONLReports(path string, modTime time.Time, runID string) ([]Record
 }
 
 func collectReports(data []byte) []reporter.Report {
+	records := collectReportRecords(data, "", "", "", time.Time{})
+	reports := make([]reporter.Report, 0, len(records))
+	for _, record := range records {
+		reports = append(reports, record.Report)
+	}
+	return reports
+}
+
+func collectReportRecords(data []byte, source, runID, path string, modTime time.Time) []Record {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
 		return nil
 	}
-	var records []reporter.Report
+	var records []Record
 	var walk func(any)
 	walk = func(current any) {
 		switch typed := current.(type) {
 		case map[string]any:
 			if looksLikeReport(typed) {
 				if report, ok := parseReportValue(typed); ok {
-					records = append(records, report)
+					records = append(records, recordFromContext(report, typed, source, runID, path, modTime))
 				}
 			}
 			if raw, ok := typed[migration.ReportStateKey]; ok {
 				if report, ok := parseReportValue(raw); ok {
-					records = append(records, report)
+					records = append(records, recordFromContext(report, typed, source, runID, path, modTime))
 				}
 			} else if raw, ok := typed[migration.LegacyReportStateKey]; ok {
 				if report, ok := parseReportValue(raw); ok {
-					records = append(records, report)
+					records = append(records, recordFromContext(report, typed, source, runID, path, modTime))
 				}
 			}
 			for _, child := range typed {
@@ -416,6 +517,110 @@ func parseReportValue(value any) (reporter.Report, bool) {
 		return reporter.Report{}, false
 	}
 	return report, true
+}
+
+func recordFromContext(report reporter.Report, context map[string]any, source, runID, path string, modTime time.Time) Record {
+	record := Record{
+		Report:          report,
+		Source:          source,
+		RunID:           firstNonEmptyString(runID, stringField(context, "run_id")),
+		Path:            path,
+		Status:          stringField(context, "status"),
+		Error:           stringField(context, "error"),
+		PR:              stringField(context, "pr"),
+		PRNumber:        intField(context, "pr_number"),
+		Verdict:         stringField(context, "verdict"),
+		SpecConformance: stringField(context, "spec_conformance"),
+		Evidence:        stringField(context, "evidence"),
+		Findings:        findingsField(context, "findings"),
+		modTime:         modTime,
+	}
+	if record.PRNumber == 0 {
+		record.PRNumber = prNumberFromAction(report.Action)
+	}
+	return record
+}
+
+func stringField(values map[string]any, name string) string {
+	value, ok := values[name]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func intField(values map[string]any, name string) int {
+	value, ok := values[name]
+	if !ok || value == nil {
+		return 0
+	}
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case string:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func findingsField(values map[string]any, name string) []loopreview.Finding {
+	value, ok := values[name]
+	if !ok || value == nil {
+		return nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var findings []loopreview.Finding
+	if err := json.Unmarshal(data, &findings); err != nil {
+		return nil
+	}
+	return findings
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func prNumberFromAction(action string) int {
+	action = strings.ToLower(action)
+	index := strings.Index(action, "pr #")
+	if index < 0 {
+		return 0
+	}
+	rest := action[index+len("pr #"):]
+	var digits strings.Builder
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			break
+		}
+		digits.WriteRune(r)
+	}
+	if digits.Len() == 0 {
+		return 0
+	}
+	parsed, _ := strconv.Atoi(digits.String())
+	return parsed
 }
 
 func loadRelayReports(repoPath string) ([]Record, error) {
@@ -792,6 +997,189 @@ func parseTime(value string) time.Time {
 		return time.Time{}
 	}
 	return parsed.UTC()
+}
+
+func receiptStatus(record Record) string {
+	if strings.TrimSpace(record.Verdict) != "" {
+		return strings.TrimSpace(record.Verdict)
+	}
+	switch state.NormalizeStatus(record.Status) {
+	case state.StatusSucceeded:
+		return "success"
+	case state.StatusFailed:
+		return "fail"
+	case state.StatusNeedsHuman:
+		return "needs-human"
+	case state.StatusTimedOut:
+		return "timeout"
+	case state.StatusCancelled:
+		return "cancelled"
+	case state.StatusAbandoned, state.StatusHung:
+		return "partial-child-failure"
+	}
+	if record.Report.ExitCode != 0 {
+		return "fail"
+	}
+	if record.Report.Verified {
+		return "success"
+	}
+	return "self-reported"
+}
+
+func blockingStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "success", "pass":
+		return "no"
+	case "needs-human", "self-reported":
+		return "needs human"
+	default:
+		return "yes"
+	}
+}
+
+func receiptReason(record Record) string {
+	if strings.TrimSpace(record.Evidence) != "" {
+		return compactLine(record.Evidence)
+	}
+	if strings.TrimSpace(record.Error) != "" {
+		return compactLine(record.Error)
+	}
+	status := receiptStatus(record)
+	switch status {
+	case "needs-human":
+		if len(record.Findings) == 0 {
+			return "no concrete blocking defect was reported; human judgment is needed"
+		}
+		return "human judgment is needed for the reported review finding"
+	case "timeout":
+		return "run timed out before completion"
+	case "cancelled":
+		return "run was cancelled before completion"
+	case "partial-child-failure":
+		return "one or more child runs did not complete successfully"
+	case "fail":
+		return fmt.Sprintf("process exited with code %d", record.Report.ExitCode)
+	case "self-reported":
+		return "report was self-reported and not binary verified"
+	default:
+		return "run completed successfully"
+	}
+}
+
+func displayIssue(issue int) string {
+	if issue <= 0 {
+		return notReported
+	}
+	return "#" + strconv.Itoa(issue)
+}
+
+func displayPR(record Record) string {
+	if strings.TrimSpace(record.PR) != "" {
+		return record.PR
+	}
+	if record.PRNumber > 0 {
+		return "#" + strconv.Itoa(record.PRNumber)
+	}
+	if parsed := prNumberFromAction(record.Report.Action); parsed > 0 {
+		return "#" + strconv.Itoa(parsed)
+	}
+	return notReported
+}
+
+func nextActions(record Record, status string) []string {
+	details := detailsHint(record)
+	raw := rawJSONHint(record)
+	switch status {
+	case "success", "pass":
+		if record.Report.Role == reporter.RoleVerifier {
+			return append([]string{"conductor may use this verifier result as one gate input"}, details, raw)
+		}
+		return append([]string{"verify the resulting PR before calling it merge-eligible"}, details, raw)
+	case "needs-human", "self-reported":
+		return append([]string{"human should decide whether the unresolved evidence is acceptable"}, details, raw)
+	case "timeout", "cancelled", "partial-child-failure":
+		return append([]string{"resume or recover the run before dispatching dependent work"}, details, raw)
+	default:
+		return append([]string{"recover or retry after reviewing the failure evidence"}, details, raw)
+	}
+}
+
+func detailsHint(record Record) string {
+	if strings.TrimSpace(record.RunID) != "" {
+		return "details: loopcoder report --run " + record.RunID + " --verbose"
+	}
+	if strings.TrimSpace(record.Report.WorkID) != "" {
+		return "details: loopcoder report --work-id " + record.Report.WorkID + " --verbose"
+	}
+	return "details: loopcoder report --verbose"
+}
+
+func rawJSONHint(record Record) string {
+	if strings.TrimSpace(record.RunID) != "" {
+		return "raw JSON: loopcoder report --run " + record.RunID + " --format json"
+	}
+	if strings.TrimSpace(record.Report.WorkID) != "" {
+		return "raw JSON: loopcoder report --work-id " + record.Report.WorkID + " --format json"
+	}
+	return "raw JSON: loopcoder report --format json"
+}
+
+func formatFindingSummary(findings []loopreview.Finding) string {
+	if len(findings) == 0 {
+		return "none"
+	}
+	order := []string{"error", "warning", "low", "info"}
+	counts := map[string]int{}
+	for _, finding := range findings {
+		severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+		if severity == "" {
+			severity = "unspecified"
+		}
+		counts[severity]++
+	}
+	var parts []string
+	for _, severity := range order {
+		if count := counts[severity]; count > 0 {
+			parts = append(parts, pluralCount(count, severity))
+			delete(counts, severity)
+		}
+	}
+	var extras []string
+	for severity := range counts {
+		extras = append(extras, severity)
+	}
+	sort.Strings(extras)
+	for _, severity := range extras {
+		parts = append(parts, pluralCount(counts[severity], severity))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatFindingDetail(finding loopreview.Finding) string {
+	severity := strings.TrimSpace(finding.Severity)
+	if severity == "" {
+		severity = "unspecified"
+	}
+	note := compactLine(finding.Note)
+	if strings.TrimSpace(finding.File) == "" {
+		return severity + ": " + note
+	}
+	return severity + " " + strings.TrimSpace(finding.File) + ": " + note
+}
+
+func pluralCount(count int, label string) string {
+	if count == 1 {
+		return "1 " + label
+	}
+	return strconv.Itoa(count) + " " + label
+}
+
+func compactLine(value string) string {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 0 {
+		return notReported
+	}
+	return strings.Join(fields, " ")
 }
 
 func resultStatus(report reporter.Report) string {
