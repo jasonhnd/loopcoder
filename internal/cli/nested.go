@@ -190,6 +190,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text or json\n", opts.Format)
 		return 2
 	}
+	warnings := stderr
+	if opts.Format == "json" {
+		warnings = io.Discard
+	}
 	parentPermission := normalizeNestedPermission(opts.ParentPermission)
 	if !validNestedParentPermission(parentPermission) {
 		fmt.Fprintf(stderr, "nested run: invalid --parent-permission %q; want read-only, write, or orchestrate\n", opts.ParentPermission)
@@ -237,7 +241,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ConfigModel:    cfg.Worker.Model,
 			ConfigEffort:   cfg.Worker.ReasoningEffort,
 			Strict:         cfg.Models.Strict || opts.Strict,
-			Warnings:       stderr,
+			Warnings:       warnings,
 		})
 		if !ok {
 			return 1
@@ -269,9 +273,9 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	defer cancel()
 
-	executor := nestedDispatchExecutor(opts, deps, stderr)
+	executor := nestedDispatchExecutor(opts, deps, warnings)
 	if opts.Provider == nestedTestSubprocessProvider {
-		executor = nestedSubprocessExecutor(opts, deps, stderr)
+		executor = nestedSubprocessExecutor(opts, deps, warnings)
 	}
 
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
@@ -286,10 +290,14 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Execute:          executor,
 	})
 	if err != nil {
-		if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
-			fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
+		if nestedReportHasContent(report) {
+			if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
+				fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
+			}
 		}
-		fmt.Fprintf(stderr, "nested run: %v\n", err)
+		if opts.Format != "json" || !nestedReportHasContent(report) {
+			fmt.Fprintf(stderr, "nested run: %v\n", err)
+		}
 		return 1
 	}
 	if err := renderNestedRun(stdout, opts.Format, report); err != nil {
@@ -300,6 +308,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	return 0
+}
+
+func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
+	return report.Version != 0 || strings.TrimSpace(report.ParentRunID) != "" || len(report.Children) > 0
 }
 
 func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
@@ -453,6 +465,8 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 		}
 		if status != orchestration.NestedStatusSucceeded {
 			result.Error = summary
+			result.Reason = summary
+			result.NextAction = "inspect the failed nested child and rerun the same plan after recovery"
 			return result, errors.New(summary)
 		}
 		return result, nil
@@ -490,6 +504,7 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 			StartedAt:           attempt.StartedAt,
 			FinishedAt:          attempt.HeartbeatAt,
 			Error:               attempt.Error,
+			Reason:              attempt.Error,
 			AttemptPath:         attempt.Path,
 			RecoveryContextPath: attempt.RecoveryContextPath,
 			Report:              attempt.Report,
@@ -571,7 +586,13 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 			line += " action=" + child.ReplayAction
 		}
 		if child.Error != "" {
-			line += " error=" + child.Error
+			line += " error=" + reporter.BoundDecisionText(child.Error)
+		}
+		if child.Reason != "" {
+			line += " reason=" + reporter.BoundDecisionText(child.Reason)
+		}
+		if child.NextAction != "" {
+			line += " next_action=" + reporter.BoundDecisionText(child.NextAction)
 		}
 		fmt.Fprintln(&b, line)
 	}
@@ -596,7 +617,7 @@ func childResultFromWorker(child orchestration.ChildRunPlan, result worker.Resul
 		}
 	}
 	runID := firstNonEmptyNested(result.RunID, child.RunID)
-	return orchestration.ChildRunResult{
+	childResult := orchestration.ChildRunResult{
 		ID:           child.ID,
 		ChildKey:     child.ChildKey,
 		Title:        child.Title,
@@ -614,9 +635,22 @@ func childResultFromWorker(child orchestration.ChildRunPlan, result worker.Resul
 		Status:       status,
 		ReplayAction: child.ReplayAction,
 		Error:        "",
+		Reason:       result.Reason,
+		NextAction:   result.NextAction,
 		AttemptPath:  result.AttemptPath,
 		Report:       result.Report,
 	}
+	if status != orchestration.NestedStatusSucceeded {
+		receipt := reporter.NormalizeDecision(reporter.DecisionInput{
+			Status:             status,
+			ExplicitReason:     childResult.Reason,
+			ConcreteError:      result.Summary,
+			ExplicitNextAction: childResult.NextAction,
+		})
+		childResult.Reason = receipt.Reason
+		childResult.NextAction = receipt.NextAction
+	}
+	return childResult
 }
 
 func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, record reporter.Report, status string, exitCode int, summary, errText string, now func() time.Time) (string, error) {

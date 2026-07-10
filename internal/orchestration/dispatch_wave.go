@@ -85,6 +85,8 @@ type DispatchWaveIssueResult struct {
 	AttemptPath         string
 	RecoveryContextPath string
 	Error               string
+	Reason              string                    `json:"reason,omitempty"`
+	NextAction          string                    `json:"next_action,omitempty"`
 	ConfiguredEvidence  []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 	Report              *reporter.Report          `json:"report,omitempty"`
 }
@@ -163,6 +165,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 					result.AttemptPath = latest.Path
 				}
 			}
+			result = withDispatchWaveDecision(result)
 			results[i] = result
 			continue
 		}
@@ -181,6 +184,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 			if _, err := guardrails.RecordDecision(opts.RepoPath, decision); err != nil {
 				result.Status = DispatchWaveStatusNeedsHuman
 				result.Error = fmt.Sprintf("needs-human: guardrails.budget ledger write failed: %v", err)
+				result = withDispatchWaveDecision(result)
 				results[i] = result
 				continue
 			}
@@ -189,6 +193,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 				result.Error = decision.Message
 				result.AttemptPath = decision.LatestAttemptPath
 				result.RecoveryContextPath = decision.RecoveryContextPath
+				result = withDispatchWaveDecision(result)
 				results[i] = result
 				continue
 			}
@@ -207,6 +212,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 			if _, err := guardrails.RecordDecision(opts.RepoPath, decision); err != nil {
 				result.Status = DispatchWaveStatusNeedsHuman
 				result.Error = fmt.Sprintf("needs-human: guardrails.circuit_breaker ledger write failed: %v", err)
+				result = withDispatchWaveDecision(result)
 				results[i] = result
 				continue
 			}
@@ -215,6 +221,7 @@ func DispatchWave(ctx context.Context, opts DispatchWaveOptions) (DispatchWaveRe
 				result.Error = decision.Message
 				result.AttemptPath = decision.LatestAttemptPath
 				result.RecoveryContextPath = decision.RecoveryContextPath
+				result = withDispatchWaveDecision(result)
 				results[i] = result
 				continue
 			}
@@ -308,6 +315,7 @@ func recordDispatchWaveCircuitOutcomes(opts DispatchWaveOptions, selected []int,
 			if result.Status != DispatchWaveStatusSucceeded {
 				result.Status = DispatchWaveStatusNeedsHuman
 				result.Error = fmt.Sprintf("needs-human: guardrails.circuit_breaker ledger write failed: %v", err)
+				*result = withDispatchWaveDecision(*result)
 			}
 			continue
 		}
@@ -316,6 +324,7 @@ func recordDispatchWaveCircuitOutcomes(opts DispatchWaveOptions, selected []int,
 			result.Error = decision.Message
 			result.AttemptPath = firstNonEmpty(result.AttemptPath, decision.LatestAttemptPath)
 			result.RecoveryContextPath = firstNonEmpty(result.RecoveryContextPath, decision.RecoveryContextPath)
+			*result = withDispatchWaveDecision(*result)
 		}
 	}
 }
@@ -384,7 +393,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	if err != nil {
 		result.Status = dispatchWaveFailureStatus(err, worker.Result{})
 		result.Error = fmt.Sprintf("read issue #%d: %v", issueNumber, err)
-		return result
+		return withDispatchWaveDecision(result)
 	}
 	dispatchResult, err := opts.Dispatch(ctx, worker.Options{
 		RepoPath:       opts.RepoPath,
@@ -403,16 +412,20 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 	if err != nil {
 		result.Status = dispatchWaveFailureStatus(err, dispatchResult)
 		result.Error = err.Error()
+		result.Reason = firstNonEmpty(dispatchResult.Reason, result.Error)
+		result.NextAction = dispatchResult.NextAction
 		result.Report = dispatchResult.Report
 		enrichDispatchWaveFailure(&result, opts)
-		return result
+		return withDispatchWaveDecision(result)
 	}
 	result.Status = firstNonEmpty(dispatchResult.Status, DispatchWaveStatusSucceeded)
 	result.Branch = dispatchResult.Branch
 	result.PR = dispatchResult.PR
 	result.AttemptPath = dispatchResult.AttemptPath
+	result.Reason = dispatchResult.Reason
+	result.NextAction = dispatchResult.NextAction
 	result.Report = dispatchResult.Report
-	return result
+	return withDispatchWaveDecision(result)
 }
 
 func dispatchWaveFailureStatus(err error, result worker.Result) string {
@@ -470,14 +483,14 @@ func recordAbandonedDispatchWaveChild(opts DispatchWaveOptions, issueNumber int,
 			"recovery_context_path": filepath.ToSlash(recoveryPath),
 		},
 	})
-	return DispatchWaveIssueResult{
+	return withDispatchWaveDecision(DispatchWaveIssueResult{
 		Issue:               issueNumber,
 		Status:              status,
 		Branch:              branch,
 		AttemptPath:         state.AttemptPath(opts.RepoPath, opts.RunID, jobID),
 		RecoveryContextPath: recoveryPath,
 		Error:               errorText,
-	}
+	})
 }
 
 func dispatchWaveParentStopError(status string, cause error) string {
@@ -532,6 +545,30 @@ func enrichDispatchWaveFailure(result *DispatchWaveIssueResult, opts DispatchWav
 		} else {
 			result.RecoveryContextPath = recoveryPath
 		}
+	}
+}
+
+func withDispatchWaveDecision(result DispatchWaveIssueResult) DispatchWaveIssueResult {
+	if !dispatchWaveActionableStatus(result.Status) && strings.TrimSpace(result.Reason) == "" && strings.TrimSpace(result.NextAction) == "" && strings.TrimSpace(result.Error) == "" {
+		return result
+	}
+	receipt := reporter.NormalizeDecision(reporter.DecisionInput{
+		Status:             result.Status,
+		ExplicitReason:     result.Reason,
+		ConcreteError:      result.Error,
+		ExplicitNextAction: result.NextAction,
+	})
+	result.Reason = receipt.Reason
+	result.NextAction = receipt.NextAction
+	return result
+}
+
+func dispatchWaveActionableStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", DispatchWaveStatusSucceeded:
+		return false
+	default:
+		return true
 	}
 }
 

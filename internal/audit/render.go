@@ -31,6 +31,13 @@ func RenderText(w io.Writer, result Result) error {
 	if _, err := fmt.Fprintf(w, "verdict: %s\n", result.Verdict); err != nil {
 		return err
 	}
+	receipt := DecisionReceipt(result)
+	if _, err := fmt.Fprintf(w, "reason: %s\n", receipt.Reason); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "next_action: %s\n", receipt.NextAction); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(w, "findings: %d\n", len(result.Findings)); err != nil {
 		return err
 	}

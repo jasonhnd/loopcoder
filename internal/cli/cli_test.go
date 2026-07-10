@@ -3858,6 +3858,60 @@ func TestTickNeedsHumanExitCode(t *testing.T) {
 	}
 }
 
+func TestTickPrettyReviewReceiptUsesReasonBeforePositiveEvidence(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validLoopreviewReport()
+
+	exitCode := RunWithDeps([]string{"tick", "--repo", repo}, &stdout, &stderr, Deps{
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			return orchestration.TickReport{
+				Version:    orchestration.TickReportVersion,
+				Repo:       "owner/repo",
+				RepoPath:   repo,
+				BaseBranch: "main",
+				RunID:      "run-test-wave",
+				Status:     orchestration.TickStatusNeedsHuman,
+				StopReason: orchestration.TickStopReviewNeedsHuman,
+				Reviews: []orchestration.TickReviewResult{{
+					Issue:           101,
+					PR:              "https://github.com/owner/repo/pull/101",
+					PRNumber:        101,
+					Verdict:         loopreview.VerdictNeedsHuman,
+					SpecConformance: loopreview.SpecConformanceNotApplicable,
+					Evidence:        "All five acceptance criteria satisfied and no regressions were found.",
+					Reason:          "docs/specs/design.md: merged design/spec unavailable",
+					NextAction:      "human should decide whether the missing spec is acceptable",
+					Findings: []loopreview.Finding{{
+						Severity: "warning",
+						File:     "docs/specs/design.md",
+						Note:     "merged design/spec unavailable",
+					}},
+					Report: &record,
+				}},
+				NeedsHuman: []orchestration.TickIssue{{
+					Step:   "loopreview",
+					Issue:  101,
+					PR:     "https://github.com/owner/repo/pull/101",
+					Detail: "docs/specs/design.md: merged design/spec unavailable",
+				}},
+				Failures: []orchestration.TickIssue{},
+			}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "- reason: docs/specs/design.md: merged design/spec unavailable") {
+		t.Fatalf("tick pretty receipt did not use normalized reason:\n%s", got)
+	}
+	if strings.Contains(got, "- reason: All five acceptance criteria satisfied") {
+		t.Fatalf("tick pretty receipt used positive evidence as reason:\n%s", got)
+	}
+}
+
 func TestTriggerCronRunsTickWithExplicitRepo(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -4193,6 +4247,86 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 		if strings.Contains(stdout.String(), disallowed) {
 			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
 		}
+	}
+}
+
+func TestDispatchNeedsHumanReceiptUsesDispatchReasonAndExitCode(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.Status = "needs-human"
+	result.Reason = "guardrails.budget.max_total_attempts"
+	result.NextAction = "human should approve another attempt"
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want needs-human 2; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty default text output", stdout.String())
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"loopcoder report: worker needs human",
+		"- status: needs-human",
+		"- reason: guardrails.budget.max_total_attempts",
+		"- human should approve another attempt",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestNestedRunJSONModeSuppressesSelectionWarnings(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+	}, 1)
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.Issue = 701
+	result.RunID = "run-alpha"
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--format", "json",
+		"--model", "not-a-registered-model",
+	}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want no JSON-mode warning noise", stderr.String())
+	}
+	var got orchestration.NestedScheduleReport
+	assertSingleJSONValue(t, stdout.String(), &got)
+	if got.Status != orchestration.NestedStatusSucceeded {
+		t.Fatalf("nested status = %q, want succeeded", got.Status)
 	}
 }
 

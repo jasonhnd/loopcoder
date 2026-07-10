@@ -205,21 +205,25 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 			deps.Now = DefaultDeps().Now
 		}
 		mode := prettyModeForTarget(stderr, deps, pretty)
-		if err := writeAuditRelayLedger(resolvedRepo, *result.Report, mode, deps.Now()); err != nil {
+		receipt := audit.DecisionReceipt(result)
+		if err := writeAuditRelayLedger(resolvedRepo, result, *result.Report, mode, deps.Now()); err != nil {
 			result.NeedsHuman = append(result.NeedsHuman, audit.NeedsHuman{
 				Layer:  audit.LayerLLM,
 				Reason: "write audit review relay record: " + err.Error(),
 			})
 			result = audit.Finalize(result)
+			receipt = audit.DecisionReceipt(result)
 		} else if outputMode.Format == "text" && shouldRenderPretty(noPretty) {
-			if err := renderPrettyReport(stderr, *result.Report, mode); err != nil {
+			if err := renderPrettyReportWithOptions(stderr, *result.Report, reporter.PrettyOptions{
+				Mode:       mode,
+				Status:     receipt.Status,
+				Reason:     receipt.Reason,
+				NextAction: receipt.NextAction,
+			}); err != nil {
 				fmt.Fprintf(stderr, "audit: write pretty report: %v\n", err)
 				return auditCommandFailureExitCode
 			}
 		}
-	}
-	if outputMode.Format == "text" && result.Report != nil && !outputMode.Verbose {
-		return audit.ExitCode(result)
 	}
 	if err := renderAudit(stdout, result, outputMode.Format); err != nil {
 		fmt.Fprintf(stderr, "audit: write output: %v\n", err)
@@ -247,8 +251,14 @@ func auditSelectionIncludesLLM(layers []string) bool {
 	return false
 }
 
-func writeAuditRelayLedger(repoPath string, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
-	pretty := record.Pretty(reporter.PrettyOptions{Mode: mode})
+func writeAuditRelayLedger(repoPath string, result audit.Result, record reporter.Report, mode reporter.PrettyMode, now time.Time) error {
+	receipt := audit.DecisionReceipt(result)
+	pretty := record.Pretty(reporter.PrettyOptions{
+		Mode:       mode,
+		Status:     receipt.Status,
+		Reason:     receipt.Reason,
+		NextAction: receipt.NextAction,
+	})
 	runID := "audit-llm"
 	invocationID := fmt.Sprintf("audit-llm-%d", now.UTC().UnixNano())
 	if _, err := relay.Write(relay.Entry{

@@ -123,6 +123,8 @@ type ChildRunResult struct {
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
+	Reason              string           `json:"reason,omitempty"`
+	NextAction          string           `json:"next_action,omitempty"`
 	AttemptPath         string           `json:"attempt_path,omitempty"`
 	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
 	Report              *reporter.Report `json:"report,omitempty"`
@@ -853,6 +855,8 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 		base.ReplayAction = strings.TrimSpace(result.ReplayAction)
 	}
 	base.Error = strings.TrimSpace(result.Error)
+	base.Reason = strings.TrimSpace(result.Reason)
+	base.NextAction = strings.TrimSpace(result.NextAction)
 	base.AttemptPath = strings.TrimSpace(result.AttemptPath)
 	base.RecoveryContextPath = strings.TrimSpace(result.RecoveryContextPath)
 	base.Report = result.Report
@@ -924,13 +928,37 @@ func applyNestedCircuitOutcome(opts NestedScheduleOptions, child ChildRunPlan, r
 	if err != nil {
 		result.Status = NestedStatusNeedsHuman
 		result.Error = err.Error()
-		return result
+		return withNestedDecision(result)
 	}
 	if blocked {
 		result.Status = NestedStatusNeedsHuman
 		result.Error = blockedMessage
 	}
+	return withNestedDecision(result)
+}
+
+func withNestedDecision(result ChildRunResult) ChildRunResult {
+	if !nestedActionableStatus(result.Status) && strings.TrimSpace(result.Reason) == "" && strings.TrimSpace(result.NextAction) == "" && strings.TrimSpace(result.Error) == "" {
+		return result
+	}
+	receipt := reporter.NormalizeDecision(reporter.DecisionInput{
+		Status:             result.Status,
+		ExplicitReason:     result.Reason,
+		ConcreteError:      result.Error,
+		ExplicitNextAction: result.NextAction,
+	})
+	result.Reason = receipt.Reason
+	result.NextAction = receipt.NextAction
 	return result
+}
+
+func nestedActionableStatus(status string) bool {
+	switch normalizeNestedStatus(status) {
+	case "", NestedStatusSucceeded, NestedStatusSucceededWithOptionalFailures, NestedStatusQueued, NestedStatusRunning, NestedStatusWaiting:
+		return false
+	default:
+		return true
+	}
 }
 
 func nestedResultMaterialProgress(result ChildRunResult) bool {

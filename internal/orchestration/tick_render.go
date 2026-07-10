@@ -142,6 +142,12 @@ func RenderTickText(report TickReport) string {
 			if strings.TrimSpace(review.SpecConformance) != "" {
 				fmt.Fprintf(&out, "  spec_conformance: %s\n", review.SpecConformance)
 			}
+			if strings.TrimSpace(review.Reason) != "" {
+				fmt.Fprintf(&out, "  reason: %s\n", review.Reason)
+			}
+			if strings.TrimSpace(review.NextAction) != "" {
+				fmt.Fprintf(&out, "  next_action: %s\n", review.NextAction)
+			}
 			if strings.TrimSpace(review.Evidence) != "" {
 				fmt.Fprintf(&out, "  evidence: %s\n", review.Evidence)
 			}

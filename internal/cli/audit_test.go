@@ -89,6 +89,56 @@ func TestAuditLLMJSONModeWritesRelayWithoutPrettyNoise(t *testing.T) {
 	}
 }
 
+func TestAuditTextModeShowsProductFailureDespiteSuccessfulInvocation(t *testing.T) {
+	repo := t.TempDir()
+	writeCLIAuditConfig(t, repo)
+	record := validCLIAuditReport()
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"audit",
+		"--repo", repo,
+		"--layer", "llm",
+		"--no-pretty",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 5, 1, 2, 3, 0, time.UTC) },
+		Audit: func(context.Context, audit.Options) (audit.Result, error) {
+			result := audit.NewResult(repo, []string{audit.LayerLLM}, audit.SeverityMedium)
+			result.Findings = []audit.Finding{{
+				Layer:    audit.LayerLLM,
+				Tool:     "llm-audit",
+				Severity: audit.SeverityHigh,
+				File:     "internal/secret.go",
+				Line:     12,
+				Rule:     "llm:secret",
+				Category: "security",
+				Message:  "hard-coded credential remains in source",
+				Evidence: "redacted evidence",
+			}}
+			result.Report = &record
+			return audit.Finalize(result), nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want audit findings failure; stdout=%s stderr=%s", exitCode, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"AUDIT RESULT",
+		"verdict: findings",
+		"reason: internal/secret.go:12: hard-coded credential remains in source",
+		"next_action: fix or waive the gate findings before continuing",
+		"- high llm-audit llm:secret internal/secret.go:12 hard-coded credential remains in source",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "succeeded") {
+		t.Fatalf("audit text reported invocation success instead of product verdict:\n%s", got)
+	}
+}
+
 func writeCLIAuditConfig(t *testing.T, repo string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte(`

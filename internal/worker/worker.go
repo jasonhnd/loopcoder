@@ -60,6 +60,8 @@ type Result struct {
 	Status      string           `json:"status"`
 	ExitCode    int              `json:"exit_code"`
 	LogBytes    int64            `json:"log_bytes"`
+	Reason      string           `json:"reason,omitempty"`
+	NextAction  string           `json:"next_action,omitempty"`
 	Report      *reporter.Report `json:"report,omitempty"`
 }
 
@@ -437,6 +439,8 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			Status:      "needs-human",
 			ExitCode:    exitCode,
 			LogBytes:    fileSize(dispatch.logPath),
+			Reason:      harvest.Summary,
+			NextAction:  "human should review the harvested partial work before continuing",
 			Report:      &harvest.Report,
 		}, nil
 	}
@@ -580,6 +584,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 }
 
 func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
+	reason := workerHungError(dispatch.opts.Provider, agentResult.HungReason, dispatch.logPath)
 	return Result{
 		OK:          false,
 		Issue:       dispatch.opts.IssueNumber,
@@ -589,6 +594,8 @@ func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
 		Status:      "hung",
 		ExitCode:    agentResult.ExitCode,
 		LogBytes:    fileSize(dispatch.logPath),
+		Reason:      reason,
+		NextAction:  "inspect the hung worker log and recover or retry before continuing",
 	}
 }
 
