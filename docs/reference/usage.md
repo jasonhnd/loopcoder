@@ -264,8 +264,9 @@ text output includes a readable local run status. In the v0.7.0 candidate,
 `status --format json` also exposes the additive `run_tree` object for machine
 consumers. Each node includes `project_id`,
 `run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
-role, provider, model, effort, permission, lifecycle status/source, timestamps,
-last error, and report summary when those fields are present in local records.
+role, provider, model, effort, permission, claim owner/lease fields, lifecycle
+status/source, timestamps, last error, and report summary when those fields are
+present in local records.
 The output is read-only and local-only: for registered projects it reads the
 global project payload root first, then legacy repo-local `.loopcoder/` only as
 a compatibility fallback. It must not be copied into PR bodies, issues,
@@ -310,6 +311,10 @@ Example JSON shape:
         "model": "gpt-5.5",
         "effort": "high",
         "permission": "write",
+        "claim_outcome": "claimed",
+        "claim_owner": "nested-scheduler:run-20260709T000000Z-wave:1234:1",
+        "claim_generation": 1,
+        "lease_expires_at": "2026-07-09T00:30:01Z",
         "lifecycle_status": "succeeded",
         "started_at": "2026-07-09T00:00:01Z",
         "updated_at": "2026-07-09T00:02:00Z",
@@ -925,11 +930,24 @@ permission, and aggregation policy before launching child work. It persists the
 accepted plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`,
 then schedules ready children with dependency-aware fan-out/fan-in. Re-running
 the same `plan_id` first resolves child identity from the durable SQL
-`(plan_id, child_key)` edge: succeeded children are reported as `reused`,
-queued/running/interrupted children are `resumed`, failed/cancelled/timed-out
-children are retried under the same child `run_id`, and `needs-human` children
+`(plan_id, child_key)` edge: terminal children are reported from durable state
+without relaunching the provider, queued/running/interrupted children are
+`resumed` only after acquiring an execution claim, and `needs-human` children
 are blocked for human action. A changed plan body under an existing `plan_id`
 fails closed; use a new `plan_id` for a real plan revision.
+
+Provider launch is guarded by a durable child execution claim. Claim, child run
+status, parent edge status, and the SQL transition event are updated in one
+immediate write transaction with bounded retry on SQLite busy errors. Only the
+claim owner for the current `claim_generation` may write terminal completion.
+If another scheduler already owns an active lease, replay returns a non-error
+observation with `claim_outcome`, `claim_owner`, `claim_generation`, and
+`lease_expires_at`; it does not execute the provider. Expired leases are
+recovered by a new generation, and stale owners are fenced from publishing
+terminal status. This prevents duplicate provider launch while a claim is
+active, but it does not promise universal exactly-once external side effects
+after a crash; ambiguous side effects must be resolved with receipts,
+idempotency keys, or `needs-human`.
 
 For production providers, loopcoder launches write-capable child runs through
 the existing Worker dispatch adapter path. That means `codex` and `claude`

@@ -53,6 +53,10 @@ landed through PRs #701 and #702.
 - **Child plan:** The parent-authored JSON document that declares candidate
   child runs, their scopes, permissions, dependency order, and aggregation
   behavior before scheduling.
+- **Execution claim:** A durable lease row granting one scheduler/executor
+  exclusive permission to launch a child provider for one `run_id` generation.
+  Stable child identity is not sufficient by itself; provider launch requires an
+  active claim owned by the launching executor.
 
 ## Run Tree Model
 
@@ -232,6 +236,15 @@ CREATE TABLE run_edges (
   UNIQUE (plan_id, child_key),
   UNIQUE (parent_run_id, ordinal)
 );
+
+CREATE TABLE run_claims (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  executor_id TEXT NOT NULL,
+  claim_generation INTEGER NOT NULL,
+  claimed_at TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
+);
 ```
 
 Required storage invariants:
@@ -245,6 +258,16 @@ Required storage invariants:
 - `ordinal` is assigned from the ordered child plan item list and is stable for
   deterministic report rendering.
 - The storage layer MUST reject cycles.
+- A child provider MUST NOT launch unless the scheduler atomically inserts or
+  takes over a `run_claims` row for that child and transitions the child run and
+  parent edge to `running` in the same write transaction.
+- Claim acquisition MUST distinguish `claimed`, `already-running`,
+  `terminal-reused`, `blocked`, and stale-claim takeover. Only the claim owner
+  for the current generation may write terminal completion.
+- Terminal completion MUST be fenced by `run_id`, `executor_id`, and
+  `claim_generation` so an older owner cannot overwrite a newer recovery owner.
+- Write-intent storage paths use an immediate SQLite write transaction with a
+  bounded retry around the full database-only transaction after `SQLITE_BUSY`.
 
 The v0.7 SQLite migration is additive over the existing storage schema: `runs`
 keeps its established primary key column name `id`, and v7 adds
@@ -392,6 +415,23 @@ PRs, checks, and explicit local run records are the source of truth.
 - A child can recover its parent from `runs.parent_run_id` and `run_edges`.
 - If a child run is interrupted, recovery is bounded by the same retry and
   liveness rules as normal runs.
+- If a scheduler observes another active claim, it must not execute the child.
+  It returns a non-error observation with the owner, generation, lease, and
+  replay action so the parent can observe or retry after the lease state changes.
+- If a process crashes after claiming but before provider launch, observers see
+  the active lease. After expiry, recovery may take over with a new generation;
+  if side effects cannot be proven absent, recovery must fail closed to
+  `needs-human`.
+- If a process crashes during provider execution, the active lease prevents a
+  duplicate launch until expiry. Takeover is fenced by generation; stale
+  completions are rejected.
+- If a process crashes after external side effects but before terminal
+  persistence, loopcoder does not claim universal exactly-once side effects.
+  Recovery uses durable ownership, fencing, provider idempotency keys or
+  receipts where available, and `needs-human` when completion cannot be proven.
+- Cancellation while another scheduler owns the claim is an observation path:
+  the cancelling scheduler must not cancel or overwrite the owner unless a
+  later explicit recovery policy takes over an expired lease.
 - Parent reports MUST surface child runs even when a child has no final report,
   so interrupted or hidden child work cannot disappear from the tree.
 - Local-only reporter and relay records remain local-only. Nested reports do not

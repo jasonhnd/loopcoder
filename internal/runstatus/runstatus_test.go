@@ -154,7 +154,7 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 		t.Fatalf("append child running lifecycle: %v", err)
 	}
 	writeAttempt(t, repo, child, 651, 1, "job-651-1", workerReport(651, usageTotal(6510)))
-	writeEventLine(t, repo, child, `{"ts":"2026-07-09T00:00:43Z","run_id":"run-child","job_id":"job-651-1","issue":651,"phase":"pr_created","status":"succeeded","pr":"https://github.com/owner/repo/pull/651","summary":"implemented run tree observability"}`)
+	writeEventLine(t, repo, child, `{"ts":"2026-07-09T00:00:44Z","run_id":"run-child","job_id":"job-651-1","issue":651,"phase":"nested-scheduler","status":"running","event":"nested.child.running","pr":"https://github.com/owner/repo/pull/651","summary":"implemented run tree observability","details":{"parent_run_id":"run-parent","child":{"run_id":"run-child"},"result":{"run_id":"run-child","claim_outcome":"claimed","claim_owner":"nested-scheduler:run-parent:123:1","claim_generation":2,"lease_expires_at":"2026-07-09T00:30:44Z"}}}`)
 
 	report, err := Load(Options{RepoPath: repo, RunID: child})
 	if err != nil {
@@ -205,6 +205,15 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	}
 	if childNode.PR != "https://github.com/owner/repo/pull/651" || childNode.ReportSummary == "" || childNode.StartedAt == "" || childNode.UpdatedAt == "" {
 		t.Fatalf("child node observability fields incomplete = %#v", *childNode)
+	}
+	if childNode.ClaimOutcome != "claimed" || childNode.ClaimOwner != "nested-scheduler:run-parent:123:1" || childNode.ClaimGeneration != 2 || childNode.LeaseExpiresAt != "2026-07-09T00:30:44Z" {
+		t.Fatalf("child node claim metadata = %#v", *childNode)
+	}
+	rendered := Render(report)
+	for _, want := range []string{"claim=claimed", "owner=nested-scheduler:run-parent:123:1", "generation=2", "lease_expires_at=2026-07-09T00:30:44Z"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, rendered)
+		}
 	}
 	if len(payload.Rows) != 1 || payload.Rows[0].Issue != "#651" {
 		t.Fatalf("rows = %#v, want issue #651", payload.Rows)

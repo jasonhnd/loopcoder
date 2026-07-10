@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1018,9 +1020,9 @@ func TestScheduleNestedRunsReplayPolicyForDurableStatuses(t *testing.T) {
 		wantExecute   bool
 		wantStatus    string
 	}{
-		{name: "failed", durableStatus: NestedStatusFailed, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
-		{name: "cancelled", durableStatus: NestedStatusCancelled, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
-		{name: "timed_out", durableStatus: NestedStatusTimedOut, wantAction: ReplayActionRetried, wantExecute: true, wantStatus: NestedStatusSucceeded},
+		{name: "failed", durableStatus: NestedStatusFailed, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusFailed},
+		{name: "cancelled", durableStatus: NestedStatusCancelled, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusCancelled},
+		{name: "timed_out", durableStatus: NestedStatusTimedOut, wantAction: ReplayActionReused, wantExecute: false, wantStatus: NestedStatusTimedOut},
 		{name: "needs_human", durableStatus: NestedStatusNeedsHuman, wantAction: ReplayActionBlocked, wantExecute: false, wantStatus: NestedStatusNeedsHuman},
 		{name: "interrupted", durableStatus: "interrupted", wantAction: ReplayActionResumed, wantExecute: true, wantStatus: NestedStatusSucceeded},
 	}
@@ -1102,6 +1104,10 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	planB.Items[0].Title = "Race child"
 
 	start := make(chan struct{})
+	executeStarted := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount int64
+	var startedOnce int32
 	type outcome struct {
 		report NestedScheduleReport
 		err    error
@@ -1117,6 +1123,11 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 			Plan:        &plan,
 			Store:       store,
 			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				atomic.AddInt64(&executeCount, 1)
+				if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
+					close(executeStarted)
+				}
+				<-releaseExecute
 				return ChildRunResult{Status: NestedStatusSucceeded}, nil
 			},
 		})
@@ -1125,7 +1136,27 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	go run(storeA, planA, nestedTestNow().Add(10*time.Hour))
 	go run(storeB, planB, nestedTestNow().Add(48*time.Hour))
 	close(start)
-	first := <-done
+	select {
+	case <-executeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first provider execution")
+	}
+	var first outcome
+	select {
+	case first = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active-owner observer")
+	}
+	if first.err != nil {
+		t.Fatalf("active-owner observer returned error before release: %v", first.err)
+	}
+	if got := first.report.Children[0].ClaimOutcome; got != storage.ClaimOutcomeAlreadyRunning {
+		t.Fatalf("first completed replay claim outcome = %q, want already-running", got)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count before release = %d, want 1", got)
+	}
+	close(releaseExecute)
 	second := <-done
 	for i, result := range []outcome{first, second} {
 		if result.err != nil {
@@ -1135,10 +1166,171 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 			t.Fatalf("concurrent replay %d run_id = %q, want created_at-derived identity", i, got)
 		}
 	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count = %d, want exactly one provider execution", got)
+	}
 	plans, runs, edges, orphans := countNestedDurableRows(t, ctx, storeA, planA.RootRunID, planA.PlanID)
 	if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
 		t.Fatalf("concurrent durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
 	}
+}
+
+func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "loopcoder.db")
+	activePath := filepath.Join(tmp, "active")
+	releasePath := filepath.Join(tmp, "release")
+	duplicatePath := filepath.Join(tmp, "duplicate")
+	reportAPath := filepath.Join(tmp, "a.json")
+	reportBPath := filepath.Join(tmp, "b.json")
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	startHelper := func(reportPath string, now string) *exec.Cmd {
+		cmd := exec.Command(exe, "-test.run", "^TestNestedReplayHelperProcess$", "-test.v=false")
+		cmd.Env = append(os.Environ(),
+			"LOOPCODER_NESTED_REPLAY_HELPER=1",
+			"LOOPCODER_NESTED_REPLAY_REPO="+repo,
+			"LOOPCODER_NESTED_REPLAY_DB="+dbPath,
+			"LOOPCODER_NESTED_REPLAY_ACTIVE="+activePath,
+			"LOOPCODER_NESTED_REPLAY_RELEASE="+releasePath,
+			"LOOPCODER_NESTED_REPLAY_DUPLICATE="+duplicatePath,
+			"LOOPCODER_NESTED_REPLAY_REPORT="+reportPath,
+			"LOOPCODER_NESTED_REPLAY_NOW="+now,
+		)
+		return cmd
+	}
+
+	cmdA := startHelper(reportAPath, nestedTestNow().Add(10*time.Hour).Format(time.RFC3339Nano))
+	var outA strings.Builder
+	cmdA.Stdout = &outA
+	cmdA.Stderr = &outA
+	if err := cmdA.Start(); err != nil {
+		t.Fatalf("start helper A: %v", err)
+	}
+	waitForFile(t, activePath, 3*time.Second)
+
+	cmdB := startHelper(reportBPath, nestedTestNow().Add(48*time.Hour).Format(time.RFC3339Nano))
+	outB, err := cmdB.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper B failed: %v\n%s", err, string(outB))
+	}
+	reportB := readNestedReportFile(t, reportBPath)
+	if got := reportB.Children[0].ClaimOutcome; got != storage.ClaimOutcomeAlreadyRunning {
+		t.Fatalf("helper B claim outcome = %q, want already-running", got)
+	}
+	if _, err := os.Stat(duplicatePath); err == nil {
+		t.Fatal("duplicate provider execution marker was created")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat duplicate marker: %v", err)
+	}
+
+	if err := os.WriteFile(releasePath, []byte("release"), 0o644); err != nil {
+		t.Fatalf("write release marker: %v", err)
+	}
+	if err := cmdA.Wait(); err != nil {
+		t.Fatalf("helper A failed: %v\n%s", err, outA.String())
+	}
+	reportA := readNestedReportFile(t, reportAPath)
+	if got := reportA.Children[0].ClaimOutcome; got != storage.ClaimOutcomeClaimed {
+		t.Fatalf("helper A claim outcome = %q, want claimed", got)
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-concurrent-replay"
+	plan.Items[0].ChildKey = "race-child"
+	plans, runs, edges, orphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
+	if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
+		t.Fatalf("two-process durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
+	}
+}
+
+func TestNestedReplayHelperProcess(t *testing.T) {
+	if os.Getenv("LOOPCODER_NESTED_REPLAY_HELPER") != "1" {
+		return
+	}
+	ctx := context.Background()
+	now, err := time.Parse(time.RFC3339Nano, os.Getenv("LOOPCODER_NESTED_REPLAY_NOW"))
+	if err != nil {
+		t.Fatalf("parse helper now: %v", err)
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: os.Getenv("LOOPCODER_NESTED_REPLAY_DB"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-concurrent-replay"
+	plan.Items[0].ChildKey = "race-child"
+	plan.Items[0].ID = ""
+	plan.Items[0].Title = "Race child"
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    os.Getenv("LOOPCODER_NESTED_REPLAY_REPO"),
+		MaxChildren: 1,
+		Now:         now,
+		Clock:       func() time.Time { return now },
+		Plan:        &plan,
+		Store:       store,
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			activePath := os.Getenv("LOOPCODER_NESTED_REPLAY_ACTIVE")
+			duplicatePath := os.Getenv("LOOPCODER_NESTED_REPLAY_DUPLICATE")
+			file, err := os.OpenFile(activePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+			if err != nil {
+				_ = os.WriteFile(duplicatePath, []byte(err.Error()), 0o644)
+				t.Fatalf("duplicate provider execution: %v", err)
+			}
+			_ = file.Close()
+			waitForFile(t, os.Getenv("LOOPCODER_NESTED_REPLAY_RELEASE"), 5*time.Second)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if err := os.WriteFile(os.Getenv("LOOPCODER_NESTED_REPLAY_REPORT"), data, 0o644); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func readNestedReportFile(t *testing.T, path string) NestedScheduleReport {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read report %s: %v", path, err)
+	}
+	var report NestedScheduleReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("unmarshal report %s: %v", path, err)
+	}
+	return report
 }
 
 func seedDurableReplayPlan(t *testing.T, ctx context.Context, store storage.Store, plan ChildPlan, childRunID, status string) {
