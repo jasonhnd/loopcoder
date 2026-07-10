@@ -349,7 +349,7 @@ func summarizeRunTree(nodes []RunTreeNode) RunTreeSummary {
 
 func isTerminalLifecycleState(value string) bool {
 	switch state.LifecycleState(strings.ToLower(strings.TrimSpace(value))) {
-	case state.StateSucceeded, state.StateFailed, state.StateCancelled, state.StateAbandoned, state.StateNeedsHuman:
+	case state.StateSucceeded, state.StateSucceededWithOptionalFailures, state.StateFailed, state.StateCancelled, state.StateTimedOut, state.StateAbandoned, state.StateNeedsHuman, state.StateSkipped:
 		return true
 	default:
 		return false
@@ -358,7 +358,7 @@ func isTerminalLifecycleState(value string) bool {
 
 func isProblemLifecycleState(value string) bool {
 	switch state.LifecycleState(strings.ToLower(strings.TrimSpace(value))) {
-	case state.StateFailed, state.StateCancelled, state.StateAbandoned, state.StateNeedsHuman:
+	case state.StateFailed, state.StateCancelled, state.StateTimedOut, state.StateAbandoned, state.StateNeedsHuman, state.StateSkipped:
 		return true
 	default:
 		return false

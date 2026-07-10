@@ -52,6 +52,21 @@ type RunEdgeRecord struct {
 	UpdatedAt       string
 }
 
+// RunLifecycleTransition is the durable status transition contract for nested
+// runs. When ParentRunID is set for a child run, the matching run_edges row is
+// transitioned in the same transaction as the child run and event history.
+type RunLifecycleTransition struct {
+	RunID       string
+	ParentRunID string
+	ChildRunID  string
+	Status      string
+	UpdatedAt   string
+	Source      string
+	EventType   string
+	Reason      string
+	PayloadJSON string
+}
+
 // ChildPlanReplayRecord is the durable state for a previously accepted child
 // plan, keyed by plan_id and child_key.
 type ChildPlanReplayRecord struct {
@@ -362,29 +377,107 @@ func validateChildPlanGraph(ctx context.Context, tx Tx, parent RunNode, children
 	return nil
 }
 
-// UpdateChildRunOutcome records a child edge and child run terminal status in
-// one transaction.
-func UpdateChildRunOutcome(ctx context.Context, store Store, parentRunID, childRunID, status, updatedAt string) error {
+// ApplyRunLifecycleTransition validates and records one authoritative status
+// transition. It updates the run row, the optional parent-child edge, and the
+// append-only transition history in one transaction.
+func ApplyRunLifecycleTransition(ctx context.Context, store Store, transition RunLifecycleTransition) error {
 	if store == nil {
 		return nil
 	}
-	parentRunID = strings.TrimSpace(parentRunID)
-	childRunID = strings.TrimSpace(childRunID)
-	status = strings.TrimSpace(status)
-	updatedAt = strings.TrimSpace(updatedAt)
-	if parentRunID == "" || childRunID == "" || status == "" || updatedAt == "" {
-		return fmt.Errorf("update child run outcome: parent_run_id, child_run_id, status, and updated_at are required")
+	transition.RunID = strings.TrimSpace(transition.RunID)
+	transition.ParentRunID = strings.TrimSpace(transition.ParentRunID)
+	transition.ChildRunID = strings.TrimSpace(transition.ChildRunID)
+	transition.Status = normalizeDurableStatus(transition.Status)
+	transition.UpdatedAt = strings.TrimSpace(transition.UpdatedAt)
+	transition.Source = strings.TrimSpace(transition.Source)
+	transition.EventType = strings.TrimSpace(transition.EventType)
+	transition.Reason = strings.TrimSpace(transition.Reason)
+	transition.PayloadJSON = strings.TrimSpace(transition.PayloadJSON)
+	if transition.RunID == "" || transition.Status == "" || transition.UpdatedAt == "" {
+		return fmt.Errorf("apply run lifecycle transition: run_id, status, and updated_at are required")
+	}
+	if transition.ChildRunID == "" && transition.ParentRunID != "" {
+		transition.ChildRunID = transition.RunID
+	}
+	if transition.ChildRunID != "" && transition.ChildRunID != transition.RunID {
+		return fmt.Errorf("apply run lifecycle transition: child_run_id %q must match run_id %q", transition.ChildRunID, transition.RunID)
+	}
+	if transition.PayloadJSON == "" {
+		transition.PayloadJSON = "{}"
+	}
+	if !json.Valid([]byte(transition.PayloadJSON)) {
+		return fmt.Errorf("apply run lifecycle transition %s: payload_json is invalid", transition.RunID)
 	}
 	return store.WithTx(ctx, func(tx Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE run_edges SET status = ?, updated_at = ? WHERE parent_run_id = ? AND child_run_id = ?`,
-			status, updatedAt, parentRunID, childRunID); err != nil {
-			return fmt.Errorf("update run edge outcome: %w", err)
+		current, ok, err := currentRunStatus(ctx, tx, transition.RunID)
+		if err != nil {
+			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE runs SET status = ?, ended_at = CASE WHEN ? IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human') THEN ? ELSE ended_at END, updated_at = ? WHERE id = ?`,
-			status, status, updatedAt, updatedAt, childRunID); err != nil {
-			return fmt.Errorf("update child run outcome: %w", err)
+		if !ok {
+			return fmt.Errorf("apply run lifecycle transition: run %q does not exist", transition.RunID)
+		}
+		if err := validateDurableStatusTransition(current, transition.Status); err != nil {
+			return fmt.Errorf("apply run lifecycle transition %s: %w", transition.RunID, err)
+		}
+		if transition.ParentRunID != "" {
+			edgeStatus, ok, err := currentRunEdgeStatus(ctx, tx, transition.ParentRunID, transition.RunID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("apply run lifecycle transition: edge %q/%q does not exist", transition.ParentRunID, transition.RunID)
+			}
+			if err := validateDurableStatusTransition(edgeStatus, transition.Status); err != nil {
+				return fmt.Errorf("apply run lifecycle transition edge %s/%s: %w", transition.ParentRunID, transition.RunID, err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE run_edges SET status = ?, updated_at = ? WHERE parent_run_id = ? AND child_run_id = ?`,
+				transition.Status, transition.UpdatedAt, transition.ParentRunID, transition.RunID); err != nil {
+				return fmt.Errorf("apply run lifecycle transition edge %s/%s: %w", transition.ParentRunID, transition.RunID, err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runs SET
+				status = ?,
+				started_at = CASE WHEN ? IN ('launching', 'running') THEN COALESCE(NULLIF(started_at, ''), ?) ELSE started_at END,
+				ended_at = CASE WHEN ? IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN ? ELSE NULL END,
+				updated_at = ?
+			WHERE id = ?`,
+			transition.Status, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.UpdatedAt, transition.RunID); err != nil {
+			return fmt.Errorf("apply run lifecycle transition run %s: %w", transition.RunID, err)
+		}
+		sequence, err := nextLifecycleSequence(ctx, tx, transition.RunID)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO run_lifecycle_events(run_id, parent_run_id, child_run_id, sequence, previous_status, status, source, event_type, reason, created_at, payload_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			transition.RunID,
+			transition.ParentRunID,
+			transition.ChildRunID,
+			sequence,
+			normalizeDurableStatus(current),
+			transition.Status,
+			transition.Source,
+			transition.EventType,
+			transition.Reason,
+			transition.UpdatedAt,
+			transition.PayloadJSON); err != nil {
+			return fmt.Errorf("record run lifecycle transition %s: %w", transition.RunID, err)
 		}
 		return nil
+	})
+}
+
+// UpdateChildRunOutcome records a child edge and child run terminal status in
+// one transaction.
+func UpdateChildRunOutcome(ctx context.Context, store Store, parentRunID, childRunID, status, updatedAt string) error {
+	return ApplyRunLifecycleTransition(ctx, store, RunLifecycleTransition{
+		RunID:       childRunID,
+		ParentRunID: parentRunID,
+		ChildRunID:  childRunID,
+		Status:      status,
+		UpdatedAt:   updatedAt,
+		Source:      "nested-scheduler",
+		EventType:   "nested.child.finished",
 	})
 }
 
@@ -396,6 +489,7 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 	if strings.TrimSpace(run.RootRunID) == "" {
 		run.RootRunID = run.RunID
 	}
+	run.Status = normalizeDurableStatus(run.Status)
 	if strings.TrimSpace(run.CreatedAt) == "" {
 		run.CreatedAt = run.UpdatedAt
 	}
@@ -408,7 +502,7 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 			project_id = COALESCE(NULLIF(excluded.project_id, ''), runs.project_id),
 			parent_run_id = COALESCE(NULLIF(excluded.parent_run_id, ''), runs.parent_run_id),
 			status = CASE
-				WHEN runs.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung') THEN runs.status
+				WHEN runs.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN runs.status
 				WHEN excluded.status <> '' THEN excluded.status
 				ELSE runs.status
 			END,
@@ -441,6 +535,7 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
 	if strings.TrimSpace(edge.AggregationJSON) == "" {
 		edge.AggregationJSON = "{}"
 	}
+	edge.Status = normalizeDurableStatus(edge.Status)
 	if !json.Valid([]byte(edge.AggregationJSON)) {
 		return fmt.Errorf("persist run edge %s/%s: aggregation_json is invalid", edge.ParentRunID, edge.ChildRunID)
 	}
@@ -456,7 +551,7 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
 			permission = excluded.permission,
 			aggregation_json = excluded.aggregation_json,
 			status = CASE
-				WHEN run_edges.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung') THEN run_edges.status
+				WHEN run_edges.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN run_edges.status
 				WHEN run_edges.status <> '' THEN run_edges.status
 				ELSE excluded.status
 			END,
@@ -571,4 +666,105 @@ func firstNonEmptyNestedGraph(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func currentRunStatus(ctx context.Context, tx Tx, runID string) (string, bool, error) {
+	var status string
+	err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("inspect run status %q: %w", runID, err)
+	}
+	return normalizeDurableStatus(status), true, nil
+}
+
+func currentRunEdgeStatus(ctx context.Context, tx Tx, parentRunID, childRunID string) (string, bool, error) {
+	var status string
+	err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, parentRunID, childRunID).Scan(&status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("inspect run edge status %q/%q: %w", parentRunID, childRunID, err)
+	}
+	return normalizeDurableStatus(status), true, nil
+}
+
+func nextLifecycleSequence(ctx context.Context, tx Tx, runID string) (int, error) {
+	var sequence int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_lifecycle_events WHERE run_id = ?`, runID).Scan(&sequence); err != nil {
+		return 0, fmt.Errorf("inspect run lifecycle sequence %q: %w", runID, err)
+	}
+	return sequence, nil
+}
+
+func validateDurableStatusTransition(from, to string) error {
+	from = normalizeDurableStatus(from)
+	to = normalizeDurableStatus(to)
+	if !validDurableLifecycleStatus(to) {
+		return fmt.Errorf("invalid lifecycle status %q", to)
+	}
+	if from == "" || from == to {
+		return nil
+	}
+	if !validDurableLifecycleStatus(from) {
+		return fmt.Errorf("invalid previous lifecycle status %q", from)
+	}
+	if durableTerminalStatus(from) {
+		return fmt.Errorf("invalid lifecycle transition %s -> %s", from, to)
+	}
+	for _, allowed := range durableAllowedTransitions[from] {
+		if allowed == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid lifecycle transition %s -> %s", from, to)
+}
+
+func normalizeDurableStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "completed", "complete", "done":
+		return "succeeded"
+	case "failure", "error":
+		return "failed"
+	case "canceled":
+		return "cancelled"
+	case "timeout", "timed-out":
+		return "timed_out"
+	case "needs_human", "needs human", "needs:human":
+		return "needs-human"
+	case "interrupted":
+		return "running"
+	default:
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
+func validDurableLifecycleStatus(status string) bool {
+	_, ok := durableAllowedTransitions[status]
+	return ok
+}
+
+func durableTerminalStatus(status string) bool {
+	return len(durableAllowedTransitions[status]) == 0
+}
+
+var durableAllowedTransitions = map[string][]string{
+	"planned":                          {"queued", "waiting", "cancelled", "abandoned", "needs-human"},
+	"queued":                           {"launching", "running", "waiting", "cancelled", "abandoned", "needs-human", "skipped"},
+	"launching":                        {"queued", "running", "waiting", "failed", "cancelled", "timed_out", "abandoned", "needs-human"},
+	"running":                          {"queued", "finishing", "waiting", "succeeded", "failed", "cancelled", "timed_out", "abandoned", "needs-human"},
+	"finishing":                        {"queued", "succeeded", "failed", "cancelled", "timed_out", "abandoned", "needs-human"},
+	"waiting":                          {"queued", "launching", "running", "succeeded", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped"},
+	"succeeded":                        nil,
+	"succeeded_with_optional_failures": nil,
+	"failed":                           {"queued"},
+	"cancelled":                        {"queued"},
+	"timed_out":                        {"queued"},
+	"abandoned":                        nil,
+	"needs-human":                      nil,
+	"hung":                             nil,
+	"skipped":                          nil,
 }

@@ -246,12 +246,13 @@ Required storage invariants:
   deterministic report rendering.
 - The storage layer MUST reject cycles.
 
-The v0.7 SQLite migration is additive over the existing storage schema: `runs`
+The v0.7 SQLite migrations are additive over the existing storage schema: `runs`
 keeps its established primary key column name `id`, and v7 adds
 `root_run_id`, `depth`, `origin`, and `created_at` rather than rebuilding the
 table. Existing minimal `run_edges` rows remain valid; v7 adds the enriched
 columns and enforces plan child-key and parent ordinal uniqueness only for
-enriched nested edges.
+enriched nested edges. v8 adds append-only durable lifecycle history so run and
+edge status updates can be validated and recorded transactionally.
 
 During the repo-local-state transition, the scheduler MUST keep the
 `.loopcoder/runs/` event mirror consistent with the SQL graph by writing the
@@ -351,11 +352,22 @@ Aggregation is deterministic and stable in JSON:
 
 - Parent aggregation walks direct children in `ordinal` order.
 - Recursive aggregation walks depth-first in `ordinal` order.
-- Required children affect parent status; optional children are reported but do
-  not fail the parent.
+- `collect` records the child result in the parent summary. Required `collect`
+  children affect parent status; optional `collect` failures are reported as
+  `succeeded_with_optional_failures` when every required child succeeded.
+- `gate` records the child result and treats any child failure as actionable
+  for the parent, even when the child is optional. A failed optional gate
+  therefore aggregates to `needs-human`.
+- `ignore` records the child result for visibility but never changes the parent
+  aggregate status.
+- Required children affect parent status unless their aggregation mode is
+  `ignore`. Optional `collect` children are reported but do not fail the
+  parent.
 - A required child with status `failed`, `needs-human`, `hung`, `idle`, or
   `blocked` makes the parent aggregate status `needs-human` unless a later
   scheduler-specific spec defines an automatic bounded recovery pass.
+- Required child statuses `cancelled`, `timed_out`, and `skipped` also make the
+  parent aggregate status `needs-human`.
 - A required child with status `running` or `pending` makes the parent aggregate
   status `running`.
 - If every required child is `succeeded` and at least one optional child failed,

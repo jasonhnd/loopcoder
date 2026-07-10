@@ -21,7 +21,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 7
+	CurrentSchemaVersion = 8
 
 	driverName = "sqlite"
 )
@@ -239,9 +239,32 @@ var migrations = []migration{
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
 		},
 	},
+	{
+		version: 8,
+		name:    "durable run lifecycle transitions",
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS run_lifecycle_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				parent_run_id TEXT NOT NULL DEFAULT '',
+				child_run_id TEXT NOT NULL DEFAULT '',
+				sequence INTEGER NOT NULL,
+				previous_status TEXT NOT NULL DEFAULT '',
+				status TEXT NOT NULL,
+				source TEXT NOT NULL DEFAULT '',
+				event_type TEXT NOT NULL DEFAULT '',
+				reason TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				payload_json TEXT NOT NULL DEFAULT '{}',
+				UNIQUE(run_id, sequence)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_lifecycle_events_run_id_sequence ON run_lifecycle_events(run_id, sequence)`,
+			`CREATE INDEX IF NOT EXISTS idx_run_lifecycle_events_parent_child ON run_lifecycle_events(parent_run_id, child_run_id)`,
+		},
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_lifecycle_events", "legacy_import_records", "legacy_import_status"}
 
 type migration struct {
 	version    int

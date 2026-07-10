@@ -636,6 +636,62 @@ func TestPersistChildPlanGraphRejectsInvalidGraphWithoutPartialRows(t *testing.T
 	}
 }
 
+func TestApplyRunLifecycleTransitionValidatesAndRecordsHistory(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	children[0].Status = "planned"
+	edges[0].Status = "planned"
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	at := "2026-07-10T00:01:00Z"
+	for _, status := range []string{"queued", "launching", "running", "finishing", "succeeded"} {
+		if err := ApplyRunLifecycleTransition(ctx, store, RunLifecycleTransition{
+			RunID:       "run-child",
+			ParentRunID: "run-parent",
+			ChildRunID:  "run-child",
+			Status:      status,
+			UpdatedAt:   at,
+			Source:      "test",
+			EventType:   "test." + status,
+		}); err != nil {
+			t.Fatalf("ApplyRunLifecycleTransition %s: %v", status, err)
+		}
+	}
+	var runStatus, edgeStatus, endedAt string
+	var eventCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(ended_at, '') FROM runs WHERE id = 'run-child'`).Scan(&runStatus, &endedAt); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = 'run-parent' AND child_run_id = 'run-child'`).Scan(&edgeStatus); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_lifecycle_events WHERE run_id = 'run-child'`).Scan(&eventCount)
+	}); err != nil {
+		t.Fatalf("query lifecycle state: %v", err)
+	}
+	if runStatus != "succeeded" || edgeStatus != "succeeded" || endedAt == "" || eventCount != 5 {
+		t.Fatalf("durable lifecycle run=%q edge=%q ended_at=%q events=%d", runStatus, edgeStatus, endedAt, eventCount)
+	}
+	err = ApplyRunLifecycleTransition(ctx, store, RunLifecycleTransition{
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		ChildRunID:  "run-child",
+		Status:      "running",
+		UpdatedAt:   at,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid lifecycle transition succeeded -> running") {
+		t.Fatalf("terminal transition error = %v", err)
+	}
+}
+
 func TestCheckHealthRejectsCorruptDurableRunGraph(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
