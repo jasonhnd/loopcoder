@@ -5149,16 +5149,24 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 }
 
 func latestRunIDWithNote(repoPath string) (string, string, error) {
-	runsRoot := state.RunsRoot(repoPath)
-	info, err := os.Stat(runsRoot)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", ".loopcoder/runs not found", nil
+	roots := state.RunsRootsForRead(repoPath)
+	foundRoot := false
+	for _, runsRoot := range roots {
+		info, err := os.Stat(runsRoot)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", "", fmt.Errorf("read runs directory: %w", err)
 		}
-		return "", "", fmt.Errorf("read runs directory: %w", err)
+		if !info.IsDir() {
+			return "", "", fmt.Errorf("runs path is not a directory: %s", runsRoot)
+		}
+		foundRoot = true
+		break
 	}
-	if !info.IsDir() {
-		return "", "", fmt.Errorf("runs path is not a directory: %s", runsRoot)
+	if !foundRoot {
+		return "", ".loopcoder/runs not found", nil
 	}
 
 	runID, err := state.LatestRunID(repoPath)

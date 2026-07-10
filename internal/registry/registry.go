@@ -159,6 +159,9 @@ func Register(ctx context.Context, opts Options, deps Deps) (RegisterResult, err
 	if err != nil {
 		return RegisterResult{}, err
 	}
+	if err := ensurePayloadDirs(result.Project.ProjectID, opts, deps); err != nil {
+		return RegisterResult{}, err
+	}
 	return result, nil
 }
 
@@ -371,6 +374,40 @@ func databasePath(opts Options, deps Deps) (string, error) {
 		return "", err
 	}
 	return layout.DatabasePath(), nil
+}
+
+func ensurePayloadDirs(projectID string, opts Options, deps Deps) error {
+	if strings.TrimSpace(projectID) == "" {
+		return nil
+	}
+	layout, err := layoutForPayloadDirs(opts, deps)
+	if err != nil {
+		return err
+	}
+	for _, dir := range []string{
+		filepath.Join(layout.ProjectDir(projectID), "runs"),
+		filepath.Join(layout.ProjectDir(projectID), "relay"),
+		filepath.Join(layout.ProjectDir(projectID), "recovery"),
+		filepath.Join(layout.ProjectDir(projectID), "audit"),
+		layout.LogsDir(),
+		layout.TmpDir(),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create project payload directory %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func layoutForPayloadDirs(opts Options, deps Deps) (home.Layout, error) {
+	if dbPath := strings.TrimSpace(opts.DatabasePath); dbPath != "" {
+		dbPath = filepath.Clean(dbPath)
+		dataDir := filepath.Dir(dbPath)
+		if filepath.Base(dbPath) == "loopcoder.db" && filepath.Base(dataDir) == "data" {
+			return home.New(filepath.Dir(dataDir)), nil
+		}
+	}
+	return home.Resolve(home.Deps{Getenv: deps.Getenv, UserHomeDir: deps.UserHomeDir})
 }
 
 const projectSelectColumns = `id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at`

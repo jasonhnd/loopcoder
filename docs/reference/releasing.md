@@ -133,7 +133,9 @@ include:
 
 - the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1`;
 - project registry evidence for the loopcoder checkout;
-- proof that `$LOOPCODER_HOME/data/loopcoder.db` exists outside the repository;
+- proof that `$LOOPCODER_HOME/data/loopcoder.db`,
+  `$LOOPCODER_HOME/projects/<project_id>/`, `$LOOPCODER_HOME/logs/`, and
+  `$LOOPCODER_HOME/tmp/` exist outside the repository;
 - doctor JSON showing storage, project registry, provider compatibility, and
   nested-run health;
 - status and report JSON showing at least one parent/child run tree;

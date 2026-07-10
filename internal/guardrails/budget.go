@@ -962,7 +962,7 @@ func recoveryContextPath(repoPath, runID string, attempt state.Attempt) string {
 	if strings.TrimSpace(attempt.JobID) == "" {
 		return ""
 	}
-	return state.RecoveryBriefPath(repoPath, runID, attempt.JobID)
+	return state.RecoveryBriefPathForRead(repoPath, runID, attempt.JobID)
 }
 
 func blockDecision(decision Decision, reason, detail string, cap *CapEvidence) Decision {

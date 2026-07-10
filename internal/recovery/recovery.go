@@ -669,7 +669,7 @@ func attemptHistory(repoPath, runID string, issueNumber int, attempts []state.At
 		}
 		briefPath := resolveStatePath(repoPath, attempt.RecoveryContextPath)
 		if strings.TrimSpace(briefPath) == "" {
-			briefPath = state.RecoveryBriefPath(repoPath, runID, attempt.JobID)
+			briefPath = state.RecoveryBriefPathForRead(repoPath, runID, attempt.JobID)
 		}
 		history = append(history, attemptHistoryEntry{
 			Record:              attempt,
