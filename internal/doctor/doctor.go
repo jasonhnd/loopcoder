@@ -149,6 +149,7 @@ type RuntimeDatabase struct {
 type RuntimeProjectRegistry struct {
 	Status         Status
 	Registered     bool
+	Detached       bool
 	ProjectID      string
 	IdentitySource string
 	ConflictCount  int
@@ -239,6 +240,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		ProjectRegistry struct {
 			Status         Status `json:"status"`
 			Registered     bool   `json:"registered"`
+			Detached       bool   `json:"detached"`
 			ProjectID      string `json:"project_id,omitempty"`
 			IdentitySource string `json:"identity_source,omitempty"`
 			ConflictCount  int    `json:"conflict_count"`
@@ -320,6 +322,7 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.Database.Message = report.Runtime.Database.Message
 	payload.Runtime.ProjectRegistry.Status = report.Runtime.ProjectRegistry.Status
 	payload.Runtime.ProjectRegistry.Registered = report.Runtime.ProjectRegistry.Registered
+	payload.Runtime.ProjectRegistry.Detached = report.Runtime.ProjectRegistry.Detached
 	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
 	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
 	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
@@ -1218,6 +1221,13 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 		}
 	}
 	if !result.Registered {
+		if result.Detached {
+			return Check{
+				Name:    "project registry",
+				Status:  StatusInfo,
+				Message: fmt.Sprintf("project is detached; preserved project_id=%s identity=%s; run: loopcoder projects register --repo . to reactivate", result.Project.ProjectID, result.Project.IdentitySource),
+			}
+		}
 		return Check{
 			Name:    "project registry",
 			Status:  StatusInfo,
@@ -1348,6 +1358,7 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 	}
 	registry := RuntimeProjectRegistry{
 		Registered:     result.Registered,
+		Detached:       result.Detached,
 		ProjectID:      result.Project.ProjectID,
 		IdentitySource: string(result.Project.IdentitySource),
 		ConflictCount:  len(result.Conflicts),
@@ -1356,6 +1367,9 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 	case len(result.Conflicts) > 0:
 		registry.Status = StatusWarn
 		registry.Message = "project identity is ambiguous"
+	case result.Detached:
+		registry.Status = StatusInfo
+		registry.Message = "project registry identity is detached"
 	case !result.Registered:
 		registry.Status = StatusInfo
 		registry.Message = "project is not registered"
@@ -1531,7 +1545,21 @@ func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Chec
 		}
 	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
-	if err != nil || !result.Registered {
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but this project has no import status; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	if result.Detached {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("repo-local .loopcoder history import status is preserved for detached project_id=%s; run: loopcoder projects register --repo . to reactivate", result.Project.ProjectID),
+		}
+	}
+	if !result.Registered {
 		return Check{
 			Name:    "local state import",
 			Status:  StatusWarn,

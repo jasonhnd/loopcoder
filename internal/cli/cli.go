@@ -827,7 +827,7 @@ func printProjectsHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Register, inspect, list, and remove projects from the machine-local registry.")
+	fmt.Fprintln(w, "Register, inspect, list active projects, and detach projects from the machine-local registry.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
@@ -906,6 +906,8 @@ func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
 	status := "not registered"
 	if result.Registered {
 		status = "registered"
+	} else if result.Detached {
+		status = "detached"
 	}
 	fmt.Fprintf(stdout, "status: %s\n", status)
 	fmt.Fprintf(stdout, "project_id: %s\n", result.Project.ProjectID)
@@ -938,11 +940,14 @@ func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return writeProjectJSON(stdout, stderr, "projects remove", result)
 	}
 	if result.Removed {
-		fmt.Fprintf(stdout, "removed project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+		fmt.Fprintf(stdout, "detached project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+	} else if result.Detached {
+		fmt.Fprintf(stdout, "project %s is already detached\n", result.Project.ProjectID)
 	} else {
 		fmt.Fprintf(stdout, "project %s is not registered\n", result.Project.ProjectID)
 	}
 	fmt.Fprintln(stdout, "run_history_deleted: false")
+	fmt.Fprintln(stdout, "project_deleted: false")
 	return 0
 }
 

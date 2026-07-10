@@ -108,6 +108,7 @@ Command side effects in the first-run path:
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry after sanitizing Git remote credentials from project metadata. |
+| `loopcoder projects remove --repo .` | Detaches this checkout from active registry listings while preserving the project row, identity links, run history, reports, legacy import records, and import status. |
 | `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
@@ -586,13 +587,14 @@ this version.
     "database": {
       "path": "/home/user/.loopcoder/data/loopcoder.db",
       "exists": true,
-      "schema_version": 3,
+      "schema_version": 5,
       "status": "ok",
       "message": "storage database is healthy"
     },
     "project_registry": {
       "status": "ok",
       "registered": true,
+      "detached": false,
       "project_id": "proj_abc123",
       "identity_source": "github",
       "conflict_count": 0,
