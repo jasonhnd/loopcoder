@@ -4,18 +4,18 @@ title: Nested Sub-Agent Plan Schema and Parent-Child Run IDs
 status: accepted
 date: 2026-07-09
 issue: 646
-pr: 689
+pr: 702
 supersedes: []
 superseded_by: []
 ---
 
 # Nested Sub-Agent Plan Schema and Parent-Child Run IDs
 
-This is a design-only spec for nested sub-agent orchestration. It defines the
-run tree model, child plan JSON contract, durable parent-child edges, report
-representation, max-depth defaults, and deterministic aggregation rules. It
-does not implement scheduling, provider-specific nested agents, or any runtime
-mutation behavior.
+This accepted spec defines the nested sub-agent orchestration contract shipped
+in the v0.7.0 candidate. It covers the run tree model, child plan JSON
+contract, durable parent-child edges, report representation, max-depth
+defaults, deterministic aggregation rules, and the implementation alignment
+landed through PRs #701 and #702.
 
 ## Goals
 

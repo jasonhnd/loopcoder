@@ -1,21 +1,21 @@
 ---
 id: 639
 title: v0.7.0 Global Data Layout And Project Identity Model
-status: draft
+status: accepted
 date: 2026-07-09
 issue: 639
-pr: null
+pr: 656
 supersedes: []
 superseded_by: []
 ---
 
 # v0.7.0 Global Data Layout And Project Identity Model
 
-This is a design-only spec for loopcoder v0.7.0. It defines the target
-machine-local storage layout and project identity model that later registry and
-database implementation work must follow. This PR adds only this document: no
-database implementation, no project registry CLI, no migration code, and no
-cloud identity.
+This accepted spec defines the loopcoder v0.7.0 machine-local storage layout
+and project identity model implemented by the storage, registry, migration,
+doctor, credential-sanitization, and permission-hardening follow-up work. The
+review for issue #694 confirmed the current implementation matches this
+contract after PRs #657, #674, #676, #678, #679, #696, #698, #699, and #700.
 
 ## Goals
 
