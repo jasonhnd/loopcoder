@@ -21,6 +21,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
 const (
@@ -451,6 +452,9 @@ func runGitMetadata(ctx context.Context, repoPath string, args ...string) (strin
 
 func prepareAuditReviewLogPath(repoPath string) (string, error) {
 	dir := filepath.Join(repoPath, ".loopcoder", "audit")
+	if layout, err := state.ResolveRuntimeLayout(repoPath); err == nil && strings.TrimSpace(layout.AuditRoot) != "" {
+		dir = layout.AuditRoot
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}

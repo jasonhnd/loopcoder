@@ -41,6 +41,7 @@ type Options struct {
 	Role         reporter.Role
 	Limit        int
 	SkipImported bool
+	RepoLocalOnly bool
 }
 
 type Record struct {
@@ -69,12 +70,12 @@ func List(opts Options) ([]Record, error) {
 		}
 		records = append(records, importedRecords...)
 	}
-	runRecords, err := loadRunReports(repoPath)
+	runRecords, err := loadRunReports(repoPath, opts.RepoLocalOnly)
 	if err != nil {
 		return nil, err
 	}
 	records = append(records, runRecords...)
-	relayRecords, err := loadRelayReports(repoPath)
+	relayRecords, err := loadRelayReports(repoPath, opts.RepoLocalOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -224,12 +225,13 @@ type jsonRecord struct {
 	Path   string          `json:"path"`
 }
 
-func loadRunReports(repoPath string) ([]Record, error) {
-	runsRoot := state.RunsRoot(repoPath)
+func loadRunReports(repoPath string, repoLocalOnly bool) ([]Record, error) {
+	var records []Record
+	for _, runsRoot := range runReportRoots(repoPath, repoLocalOnly) {
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			continue
 		}
 		return nil, fmt.Errorf("read runs directory: %w", err)
 	}
@@ -237,13 +239,13 @@ func loadRunReports(repoPath string) ([]Record, error) {
 		return nil, fmt.Errorf("too many run entries under %s", filepath.ToSlash(runsRoot))
 	}
 
-	var records []Record
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		runID := entry.Name()
-		attempts, err := state.LoadAttempts(repoPath, runID)
+		workersDir := filepath.Join(runsRoot, runID, "workers")
+		attempts, err := state.LoadAttemptsFromWorkersDir(workersDir)
 		if err != nil {
 			return nil, err
 		}
@@ -262,13 +264,26 @@ func loadRunReports(repoPath string) ([]Record, error) {
 			})
 		}
 
-		generic, err := scanRunJSONReports(state.RunPath(repoPath, runID), runID)
+		generic, err := scanRunJSONReports(filepath.Join(runsRoot, runID), runID)
 		if err != nil {
 			return nil, err
 		}
 		records = append(records, generic...)
 	}
+	}
 	return records, nil
+}
+
+func runReportRoots(repoPath string, repoLocalOnly bool) []string {
+	legacy := state.LegacyRunsRoot(repoPath)
+	if repoLocalOnly {
+		return []string{legacy}
+	}
+	roots := []string{state.RunsRoot(repoPath)}
+	if filepath.Clean(roots[0]) != filepath.Clean(legacy) {
+		roots = append(roots, legacy)
+	}
+	return roots
 }
 
 func enrichFromAttempt(record *reporter.Report, runID string, attempt state.Attempt) {
@@ -423,94 +438,113 @@ func parseReportValue(value any) (reporter.Report, bool) {
 	return report, true
 }
 
-func loadRelayReports(repoPath string) ([]Record, error) {
+func loadRelayReports(repoPath string, repoLocalOnly bool) ([]Record, error) {
 	var records []Record
-	pending, err := loadPendingRelayReports(repoPath)
+	pending, err := loadPendingRelayReports(repoPath, repoLocalOnly)
 	if err != nil {
 		return nil, err
 	}
 	records = append(records, pending...)
 
-	relayRoot := filepath.Join(repoPath, ".loopcoder", "relay")
-	err = filepath.WalkDir(relayRoot, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".attest") {
+	relayRoots := relayReportRoots(repoPath, repoLocalOnly)
+	for _, relayRoot := range relayRoots {
+		err = filepath.WalkDir(relayRoot, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".attest") {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return nil
+			}
+			if info.Size() > maxReportFileBytes {
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			found := collectRelayLedgerReports(data, path, info.ModTime().UTC())
+			records = append(records, found...)
 			return nil
-		}
-		info, err := entry.Info()
+		})
 		if err != nil {
-			return nil
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("scan relay reports: %w", err)
 		}
-		if info.Size() > maxReportFileBytes {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		found := collectRelayLedgerReports(data, path, info.ModTime().UTC())
-		records = append(records, found...)
-		return nil
-	})
-	if err != nil {
-		if os.IsNotExist(err) {
-			return records, nil
-		}
-		return nil, fmt.Errorf("scan relay reports: %w", err)
 	}
 	return records, nil
 }
 
-func loadPendingRelayReports(repoPath string) ([]Record, error) {
-	dir := filepath.Join(repoPath, ".loopcoder", "relay", "pending")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read pending relay reports: %w", err)
-	}
+func loadPendingRelayReports(repoPath string, repoLocalOnly bool) ([]Record, error) {
 	var records []Record
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		info, err := entry.Info()
-		if err != nil || info.Size() > maxReportFileBytes {
-			continue
-		}
-		data, err := os.ReadFile(path)
+	for _, root := range relayReportRoots(repoPath, repoLocalOnly) {
+		dir := filepath.Join(root, "pending")
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read pending relay reports: %w", err)
 		}
-		var pending relaygate.Record
-		if err := json.Unmarshal(data, &pending); err != nil {
-			continue
-		}
-		if pending.Report != nil {
-			records = append(records, Record{
-				Report:  *pending.Report,
-				Source:  "relay-pending",
-				RunID:   pending.RunID,
-				Path:    path,
-				modTime: info.ModTime().UTC(),
-			})
-			continue
-		}
-		if report, ok := parsePrettyHeaderBlock(pending.Block); ok {
-			records = append(records, Record{
-				Report:  report,
-				Source:  "relay-pending",
-				RunID:   pending.RunID,
-				Path:    path,
-				modTime: info.ModTime().UTC(),
-			})
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := entry.Info()
+			if err != nil || info.Size() > maxReportFileBytes {
+				continue
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			var pending relaygate.Record
+			if err := json.Unmarshal(data, &pending); err != nil {
+				continue
+			}
+			if pending.Report != nil {
+				records = append(records, Record{
+					Report:  *pending.Report,
+					Source:  "relay-pending",
+					RunID:   pending.RunID,
+					Path:    path,
+					modTime: info.ModTime().UTC(),
+				})
+				continue
+			}
+			if report, ok := parsePrettyHeaderBlock(pending.Block); ok {
+				records = append(records, Record{
+					Report:  report,
+					Source:  "relay-pending",
+					RunID:   pending.RunID,
+					Path:    path,
+					modTime: info.ModTime().UTC(),
+				})
+			}
 		}
 	}
 	return records, nil
+}
+
+func relayReportRoots(repoPath string, repoLocalOnly bool) []string {
+	legacy := filepath.Join(repoPath, ".loopcoder", "relay")
+	if repoLocalOnly {
+		return []string{legacy}
+	}
+	roots := []string{}
+	if layout, err := state.ResolveRuntimeLayout(repoPath); err == nil && strings.TrimSpace(layout.RelayRoot) != "" {
+		roots = append(roots, layout.RelayRoot)
+	}
+	if len(roots) == 0 || filepath.Clean(roots[0]) != filepath.Clean(legacy) {
+		roots = append(roots, legacy)
+	}
+	return roots
 }
 
 func collectRelayLedgerReports(data []byte, path string, modTime time.Time) []Record {

@@ -128,6 +128,7 @@ type dispatchContext struct {
 	deps     Deps
 	warnings io.Writer
 	repoPath string
+	runtimeLayout state.RuntimeLayout
 	github   GitHubClient
 	agentRun agent.Runner
 
@@ -218,6 +219,10 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 	if strings.TrimSpace(opts.RunID) == "" {
 		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
 	}
+	runtimeLayout, err := state.ResolveRuntimeLayout(repoPath)
+	if err != nil {
+		return nil, err
+	}
 
 	github := deps.GitHub(repoPath)
 	if github == nil {
@@ -234,13 +239,20 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 		deps:     deps,
 		warnings: warnings,
 		repoPath: repoPath,
+		runtimeLayout: runtimeLayout,
 		github:   github,
 		agentRun: agentRunner,
 	}, nil
 }
 
 func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
-	scratch, err := dispatch.deps.MkdirTemp("", "loopcoder-*")
+	tmpRoot := dispatch.runtimeLayout.TmpRoot
+	if strings.TrimSpace(tmpRoot) != "" {
+		if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+			return fmt.Errorf("create runtime temp directory: %w", err)
+		}
+	}
+	scratch, err := dispatch.deps.MkdirTemp(tmpRoot, "loopcoder-*")
 	if err != nil {
 		return fmt.Errorf("create scratch directory: %w", err)
 	}
@@ -248,8 +260,16 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.worktreePath = filepath.Join(scratch, "wt")
 	dispatch.promptPath = filepath.Join(scratch, "prompt.txt")
 	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
-	dispatch.logPath = filepath.Join(scratch, "codex.log")
 	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	logRoot := dispatch.runtimeLayout.LogsRoot
+	if strings.TrimSpace(logRoot) == "" {
+		logRoot = scratch
+	}
+	logDir := filepath.Join(logRoot, dispatch.opts.RunID)
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return fmt.Errorf("create runtime log directory: %w", err)
+	}
+	dispatch.logPath = filepath.Join(logDir, dispatch.jobID+".log")
 	dispatch.attemptPath = state.AttemptPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
 	dispatch.tracker = newAttemptTracker(attemptTrackerOptions{
 		repoPath:    dispatch.repoPath,

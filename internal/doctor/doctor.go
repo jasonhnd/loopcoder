@@ -154,6 +154,8 @@ type RuntimeProjectRegistry struct {
 	Registered     bool
 	Detached       bool
 	ProjectID      string
+	Mode           string
+	PayloadRoot    string
 	IdentitySource string
 	ConflictCount  int
 	Message        string
@@ -245,6 +247,8 @@ func RenderJSON(w io.Writer, report Report) error {
 			Registered     bool   `json:"registered"`
 			Detached       bool   `json:"detached"`
 			ProjectID      string `json:"project_id,omitempty"`
+			Mode           string `json:"mode,omitempty"`
+			PayloadRoot    string `json:"payload_root,omitempty"`
 			IdentitySource string `json:"identity_source,omitempty"`
 			ConflictCount  int    `json:"conflict_count"`
 			Message        string `json:"message"`
@@ -327,6 +331,8 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.ProjectRegistry.Registered = report.Runtime.ProjectRegistry.Registered
 	payload.Runtime.ProjectRegistry.Detached = report.Runtime.ProjectRegistry.Detached
 	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
+	payload.Runtime.ProjectRegistry.Mode = report.Runtime.ProjectRegistry.Mode
+	payload.Runtime.ProjectRegistry.PayloadRoot = report.Runtime.ProjectRegistry.PayloadRoot
 	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
 	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
 	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
@@ -1388,28 +1394,37 @@ func runtimeDatabase(ctx context.Context, path string, deps Deps) RuntimeDatabas
 }
 
 func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, database RuntimeDatabase, deps Deps) RuntimeProjectRegistry {
+	runtimeLayout, runtimeLayoutErr := state.ResolveRuntimeLayout(repoPath)
 	if database.Status == StatusInfo && !database.Exists {
 		return RuntimeProjectRegistry{
-			Status:  StatusInfo,
-			Message: "global registry database has not been created",
+			Status:      StatusInfo,
+			Mode:        string(runtimeLayout.Mode),
+			PayloadRoot: runtimeLayout.PayloadRoot,
+			Message:     "global registry database has not been created; runtime mode=" + string(runtimeLayout.Mode),
 		}
 	}
 	if database.Status == StatusFail {
 		return RuntimeProjectRegistry{
-			Status:  StatusWarn,
-			Message: "storage is unhealthy; registry could not be inspected",
+			Status:      StatusWarn,
+			Mode:        string(runtimeLayout.Mode),
+			PayloadRoot: runtimeLayout.PayloadRoot,
+			Message:     "storage is unhealthy; registry could not be inspected; runtime mode=" + string(runtimeLayout.Mode),
 		}
 	}
 	duplicates, err := deps.ProjectDuplicates(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
 	if err != nil {
 		return RuntimeProjectRegistry{
-			Status:  StatusWarn,
-			Message: err.Error(),
+			Status:      StatusWarn,
+			Mode:        string(runtimeLayout.Mode),
+			PayloadRoot: runtimeLayout.PayloadRoot,
+			Message:     err.Error(),
 		}
 	}
 	if len(duplicates) > 0 {
 		return RuntimeProjectRegistry{
 			Status:        StatusWarn,
+			Mode:          string(runtimeLayout.Mode),
+			PayloadRoot:   runtimeLayout.PayloadRoot,
 			ConflictCount: len(duplicates),
 			Message:       "duplicate physical project identities found",
 		}
@@ -1417,30 +1432,42 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
 	if err != nil {
 		return RuntimeProjectRegistry{
-			Status:  StatusWarn,
-			Message: err.Error(),
+			Status:      StatusWarn,
+			Mode:        string(runtimeLayout.Mode),
+			PayloadRoot: runtimeLayout.PayloadRoot,
+			Message:     err.Error(),
 		}
 	}
 	registry := RuntimeProjectRegistry{
 		Registered:     result.Registered,
 		Detached:       result.Detached,
 		ProjectID:      result.Project.ProjectID,
+		Mode:           string(runtimeLayout.Mode),
+		PayloadRoot:    runtimeLayout.PayloadRoot,
 		IdentitySource: string(result.Project.IdentitySource),
 		ConflictCount:  len(result.Conflicts),
+	}
+	if runtimeLayoutErr != nil {
+		registry.Status = StatusWarn
+		registry.Message = runtimeLayoutErr.Error()
+		return registry
 	}
 	switch {
 	case len(result.Conflicts) > 0:
 		registry.Status = StatusWarn
-		registry.Message = "project identity is ambiguous"
+		registry.Message = fmt.Sprintf("project identity is ambiguous; runtime mode=%s payload_root=%s", runtimeLayout.Mode, runtimeLayout.PayloadRoot)
 	case result.Detached:
 		registry.Status = StatusInfo
-		registry.Message = "project registry identity is detached"
+		registry.Message = fmt.Sprintf("project registry identity is detached; runtime mode=%s payload_root=%s", runtimeLayout.Mode, runtimeLayout.PayloadRoot)
 	case !result.Registered:
 		registry.Status = StatusInfo
-		registry.Message = "project is not registered"
+		registry.Message = fmt.Sprintf("project is not registered; runtime mode=%s payload_root=%s", runtimeLayout.Mode, runtimeLayout.PayloadRoot)
+	case runtimeLayout.Mode == state.RuntimeModeRegistryUnresolvedHome:
+		registry.Status = StatusWarn
+		registry.Message = fmt.Sprintf("registry unresolved; runtime mode=%s payload_root=%s reason=%s", runtimeLayout.Mode, runtimeLayout.PayloadRoot, runtimeLayout.FallbackReason)
 	default:
 		registry.Status = StatusOK
-		registry.Message = "project registry identity is registered"
+		registry.Message = fmt.Sprintf("project registry identity is registered; runtime mode=%s payload_root=%s", runtimeLayout.Mode, runtimeLayout.PayloadRoot)
 	}
 	return registry
 }

@@ -4,6 +4,8 @@ package state
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +15,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
@@ -208,17 +214,17 @@ func normalizeChildRunSlug(value string) string {
 
 // LatestRunID selects the newest local run directory by modification time.
 func LatestRunID(repoPath string) (string, error) {
-	runsRoot := RunsRoot(repoPath)
+	var latestName string
+	var latestMod time.Time
+	for _, runsRoot := range RunsRootsForRead(repoPath) {
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			continue
 		}
 		return "", fmt.Errorf("read runs directory: %w", err)
 	}
 
-	var latestName string
-	var latestMod time.Time
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -233,10 +239,162 @@ func LatestRunID(repoPath string) (string, error) {
 			latestMod = mod
 		}
 	}
+	}
 	return latestName, nil
 }
 
+type RuntimeMode string
+
+const (
+	RuntimeModeRegisteredGlobal       RuntimeMode = "registered-global"
+	RuntimeModeUnregisteredRepoLocal  RuntimeMode = "unregistered-repo-local"
+	RuntimeModeRegistryUnresolvedHome RuntimeMode = "registry-unresolved-home-local"
+)
+
+type RuntimeLayout struct {
+	Mode           RuntimeMode
+	RepoPath       string
+	HomeDir        string
+	DatabasePath   string
+	ProjectID      string
+	PayloadRoot    string
+	RunsRoot       string
+	RelayRoot      string
+	RecoveryRoot   string
+	AuditRoot      string
+	LogsRoot       string
+	TmpRoot        string
+	Registered     bool
+	FallbackReason string
+	Project        registry.Project
+}
+
+var runtimeLayoutCache sync.Map
+
+func ResolveRuntimeLayout(repoPath string) (RuntimeLayout, error) {
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath == "" {
+		repoPath = "."
+	}
+	canonicalRepo := canonicalRepoPath(repoPath)
+	layout, homeErr := home.Resolve(home.DefaultDeps())
+	if homeErr != nil {
+		return repoLocalRuntimeLayout(canonicalRepo, "", "", fmt.Sprintf("loopcoder home unresolved: %v", homeErr)), nil
+	}
+	dbPath := layout.DatabasePath()
+	cacheKey := canonicalRepo + "\x00" + dbPath
+	if cached, ok := runtimeLayoutCache.Load(cacheKey); ok {
+		return cached.(RuntimeLayout), nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return repoLocalRuntimeLayout(canonicalRepo, layout.HomeDir, dbPath, "project is not registered"), nil
+		}
+		return homeLocalFallbackLayout(canonicalRepo, layout, fmt.Sprintf("registry database cannot be inspected: %v", err)), nil
+	}
+	show, err := registry.Show(context.Background(), registry.Options{RepoPath: canonicalRepo, DatabasePath: dbPath}, registry.DefaultDeps())
+	if err != nil {
+		return homeLocalFallbackLayout(canonicalRepo, layout, fmt.Sprintf("registry resolution failed: %v", err)), nil
+	}
+	if !show.Registered {
+		reason := "project is not registered"
+		if show.Detached {
+			reason = "project registry identity is detached"
+		}
+		return repoLocalRuntimeLayout(canonicalRepo, layout.HomeDir, dbPath, reason), nil
+	}
+	resolved := registeredRuntimeLayout(canonicalRepo, layout, show.Project)
+	runtimeLayoutCache.Store(cacheKey, resolved)
+	return resolved, nil
+}
+
+func registeredRuntimeLayout(repoPath string, layout home.Layout, project registry.Project) RuntimeLayout {
+	payloadRoot := layout.ProjectDir(project.ProjectID)
+	return RuntimeLayout{
+		Mode:         RuntimeModeRegisteredGlobal,
+		RepoPath:     repoPath,
+		HomeDir:      layout.HomeDir,
+		DatabasePath: layout.DatabasePath(),
+		ProjectID:    project.ProjectID,
+		PayloadRoot:  payloadRoot,
+		RunsRoot:     filepath.Join(payloadRoot, "runs"),
+		RelayRoot:    filepath.Join(payloadRoot, "relay"),
+		RecoveryRoot: filepath.Join(payloadRoot, "recovery"),
+		AuditRoot:    filepath.Join(payloadRoot, "audit"),
+		LogsRoot:     layout.LogsDir(),
+		TmpRoot:      layout.TmpDir(),
+		Registered:   true,
+		Project:      project,
+	}
+}
+
+func repoLocalRuntimeLayout(repoPath, homeDir, dbPath, reason string) RuntimeLayout {
+	payloadRoot := filepath.Join(repoPath, ".loopcoder")
+	return RuntimeLayout{
+		Mode:           RuntimeModeUnregisteredRepoLocal,
+		RepoPath:       repoPath,
+		HomeDir:        homeDir,
+		DatabasePath:   dbPath,
+		PayloadRoot:    payloadRoot,
+		RunsRoot:       filepath.Join(payloadRoot, "runs"),
+		RelayRoot:      filepath.Join(payloadRoot, "relay"),
+		RecoveryRoot:   filepath.Join(payloadRoot, "recovery"),
+		AuditRoot:      filepath.Join(payloadRoot, "audit"),
+		LogsRoot:       filepath.Join(payloadRoot, "logs"),
+		TmpRoot:        filepath.Join(payloadRoot, "tmp"),
+		FallbackReason: reason,
+	}
+}
+
+func homeLocalFallbackLayout(repoPath string, layout home.Layout, reason string) RuntimeLayout {
+	projectID := "unresolved-" + shortHash(repoPath)
+	payloadRoot := layout.ProjectDir(projectID)
+	return RuntimeLayout{
+		Mode:           RuntimeModeRegistryUnresolvedHome,
+		RepoPath:       repoPath,
+		HomeDir:        layout.HomeDir,
+		DatabasePath:   layout.DatabasePath(),
+		ProjectID:      projectID,
+		PayloadRoot:    payloadRoot,
+		RunsRoot:       filepath.Join(payloadRoot, "runs"),
+		RelayRoot:      filepath.Join(payloadRoot, "relay"),
+		RecoveryRoot:   filepath.Join(payloadRoot, "recovery"),
+		AuditRoot:      filepath.Join(payloadRoot, "audit"),
+		LogsRoot:       layout.LogsDir(),
+		TmpRoot:        layout.TmpDir(),
+		FallbackReason: reason,
+	}
+}
+
+func canonicalRepoPath(repoPath string) string {
+	if canonical, err := pathid.Canonicalize(repoPath); err == nil && strings.TrimSpace(canonical.Display) != "" {
+		return canonical.Display
+	}
+	abs, err := filepath.Abs(repoPath)
+	if err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(repoPath)
+}
+
+func shortHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func runtimeRunsRoot(repoPath string) string {
+	layout, err := ResolveRuntimeLayout(repoPath)
+	if err != nil || strings.TrimSpace(layout.RunsRoot) == "" {
+		return LegacyRunsRoot(repoPath)
+	}
+	return layout.RunsRoot
+}
+
 func RunsRoot(repoPath string) string {
+	return runtimeRunsRoot(repoPath)
+}
+
+func LegacyRunsRoot(repoPath string) string {
 	return filepath.Join(repoPath, ".loopcoder", "runs")
 }
 
@@ -244,24 +402,74 @@ func RunPath(repoPath, runID string) string {
 	return filepath.Join(RunsRoot(repoPath), runID)
 }
 
+func RunPathForRead(repoPath, runID string) string {
+	for _, root := range RunsRootsForRead(repoPath) {
+		path := filepath.Join(root, runID)
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			return path
+		}
+	}
+	return RunPath(repoPath, runID)
+}
+
+func LegacyRunPath(repoPath, runID string) string {
+	return filepath.Join(LegacyRunsRoot(repoPath), runID)
+}
+
 func WorkersPath(repoPath, runID string) string {
 	return filepath.Join(RunPath(repoPath, runID), "workers")
+}
+
+func LegacyWorkersPath(repoPath, runID string) string {
+	return filepath.Join(LegacyRunPath(repoPath, runID), "workers")
 }
 
 func EventsPath(repoPath, runID string) string {
 	return filepath.Join(RunPath(repoPath, runID), "events.jsonl")
 }
 
+func EventsPathForRead(repoPath, runID string) string {
+	return filepath.Join(RunPathForRead(repoPath, runID), "events.jsonl")
+}
+
+func LegacyEventsPath(repoPath, runID string) string {
+	return filepath.Join(LegacyRunPath(repoPath, runID), "events.jsonl")
+}
+
 func RecoveryPath(repoPath, runID string) string {
+	if layout, err := ResolveRuntimeLayout(repoPath); err == nil && layout.Mode != RuntimeModeUnregisteredRepoLocal && strings.TrimSpace(layout.RecoveryRoot) != "" {
+		return filepath.Join(layout.RecoveryRoot, runID)
+	}
 	return filepath.Join(RunPath(repoPath, runID), "recovery")
+}
+
+func LegacyRecoveryPath(repoPath, runID string) string {
+	return filepath.Join(LegacyRunPath(repoPath, runID), "recovery")
 }
 
 func AttemptPath(repoPath, runID, jobID string) string {
 	return filepath.Join(WorkersPath(repoPath, runID), jobID+".attempt.json")
 }
 
+func LegacyAttemptPath(repoPath, runID, jobID string) string {
+	return filepath.Join(LegacyWorkersPath(repoPath, runID), jobID+".attempt.json")
+}
+
 func RecoveryBriefPath(repoPath, runID, jobID string) string {
 	return filepath.Join(RecoveryPath(repoPath, runID), jobID+"-context.md")
+}
+
+func LegacyRecoveryBriefPath(repoPath, runID, jobID string) string {
+	return filepath.Join(LegacyRecoveryPath(repoPath, runID), jobID+"-context.md")
+}
+
+func RunsRootsForRead(repoPath string) []string {
+	root := RunsRoot(repoPath)
+	legacy := LegacyRunsRoot(repoPath)
+	if filepath.Clean(root) == filepath.Clean(legacy) {
+		return []string{root}
+	}
+	return []string{root, legacy}
 }
 
 // WriteAttempt writes a compact attempt sidecar under workers/<job>.attempt.json.
@@ -306,14 +514,22 @@ func LoadAttempts(repoPath, runID string) ([]Attempt, error) {
 	if strings.TrimSpace(runID) == "" {
 		return nil, nil
 	}
-	return LoadAttemptsFromWorkersDir(WorkersPath(repoPath, runID))
+	attempts, err := LoadAttemptsFromWorkersDir(filepath.Join(RunPathForRead(repoPath, runID), "workers"))
+	if err != nil || len(attempts) > 0 {
+		return attempts, err
+	}
+	legacyWorkers := LegacyWorkersPath(repoPath, runID)
+	if filepath.Clean(legacyWorkers) == filepath.Clean(WorkersPath(repoPath, runID)) {
+		return attempts, nil
+	}
+	return LoadAttemptsFromWorkersDir(legacyWorkers)
 }
 
 func CountEvents(repoPath, runID string) (int, error) {
 	if strings.TrimSpace(runID) == "" {
 		return 0, nil
 	}
-	file, err := os.Open(EventsPath(repoPath, runID))
+	file, err := os.Open(EventsPathForRead(repoPath, runID))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil

@@ -222,7 +222,7 @@ func ImportLegacyLifecycle(repoPath, runID string) ([]LifecycleTransition, error
 		})
 	}
 
-	attempts, err := LoadAttempts(repoPath, runID)
+	attempts, err := LoadAttemptsFromWorkersDir(LegacyWorkersPath(repoPath, runID))
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +372,7 @@ func conservativeLegacyState(previous, candidate LifecycleState) LifecycleState 
 }
 
 func loadLegacyEvents(repoPath, runID string) ([]Event, error) {
-	path := EventsPath(repoPath, runID)
+	path := LegacyEventsPath(repoPath, runID)
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -16,6 +16,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
 const (
@@ -209,16 +210,49 @@ func Ack(cwd string, records []Record) error {
 		if strings.TrimSpace(rec.Nonce) == "" {
 			continue
 		}
-		path := filepath.Join(pendingDir(cwd), rec.Nonce+".json")
-		if err := removePendingRecord(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
+		dirs := []string{pendingDir(cwd)}
+		legacy := legacyPendingDir(cwd)
+		if filepath.Clean(legacy) != filepath.Clean(dirs[0]) {
+			dirs = append(dirs, legacy)
+		}
+		for _, dir := range dirs {
+			path := filepath.Join(dir, rec.Nonce+".json")
+			if err := removePendingRecord(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
 }
 
 func readPending(cwd string) ([]Record, error) {
-	dir := pendingDir(cwd)
+	dirs := []string{pendingDir(cwd)}
+	legacy := legacyPendingDir(cwd)
+	if filepath.Clean(legacy) != filepath.Clean(dirs[0]) {
+		dirs = append(dirs, legacy)
+	}
+	var all []Record
+	for _, dir := range dirs {
+		records, err := readPendingDir(dir)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, records...)
+	}
+	all = dedupePending(all)
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Role != all[j].Role {
+			return all[i].Role < all[j].Role
+		}
+		if all[i].PRNumber != all[j].PRNumber {
+			return all[i].PRNumber < all[j].PRNumber
+		}
+		return all[i].Nonce < all[j].Nonce
+	})
+	return all, nil
+}
+
+func readPendingDir(dir string) ([]Record, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -263,19 +297,37 @@ func readPending(cwd string) ([]Record, error) {
 		}
 		records = append(records, rec)
 	}
-	sort.SliceStable(records, func(i, j int) bool {
-		if records[i].Role != records[j].Role {
-			return records[i].Role < records[j].Role
-		}
-		if records[i].PRNumber != records[j].PRNumber {
-			return records[i].PRNumber < records[j].PRNumber
-		}
-		return records[i].Nonce < records[j].Nonce
-	})
 	return records, nil
 }
 
+func dedupePending(records []Record) []Record {
+	if len(records) < 2 {
+		return records
+	}
+	seen := map[string]bool{}
+	out := make([]Record, 0, len(records))
+	for _, rec := range records {
+		key := rec.Nonce
+		if key == "" {
+			key = rec.Role + "\x00" + strconv.Itoa(rec.PRNumber) + "\x00" + rec.RunID
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, rec)
+	}
+	return out
+}
+
 func pendingDir(cwd string) string {
+	if layout, err := state.ResolveRuntimeLayout(cwd); err == nil && strings.TrimSpace(layout.RelayRoot) != "" {
+		return filepath.Join(layout.RelayRoot, "pending")
+	}
+	return legacyPendingDir(cwd)
+}
+
+func legacyPendingDir(cwd string) string {
 	return filepath.Join(cwd, ".loopcoder", "relay", "pending")
 }
 

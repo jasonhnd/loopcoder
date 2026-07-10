@@ -171,7 +171,7 @@ func Load(opts Options) (Report, error) {
 		runNote = "latest modified run selected"
 	}
 
-	runPath := state.RunPath(repoPath, runID)
+	runPath := state.RunPathForRead(repoPath, runID)
 	info, err := os.Stat(runPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -499,7 +499,7 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 }
 
 func loadEventRecords(repoPath, runID string, now time.Time) ([]metadataRecord, []verifierRecord, int, error) {
-	path := state.EventsPath(repoPath, runID)
+	path := state.EventsPathForRead(repoPath, runID)
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

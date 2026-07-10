@@ -1030,16 +1030,24 @@ compatibility window. After migration, `loopcoder report --repo . --format json`
 includes imported records with `source` values such as `imported:attempt` plus
 the original source path metadata.
 
-Audit logs remain file-only repo-local state. They are not imported by
-`migrate local-state`, and an audit-only `.loopcoder/audit/` directory does not
-make `loopcoder doctor --repo .` require a local-state migration.
+For registered projects, new runtime payloads, relay records, recovery
+material, audit logs, process logs, and temp files are written under
+`$LOOPCODER_HOME/projects/<project_id>/`, `$LOOPCODER_HOME/logs/`, and
+`$LOOPCODER_HOME/tmp/` instead of the checkout. Unregistered projects use an
+explicit repo-local compatibility fallback under `.loopcoder/`; if the registry
+cannot be inspected, runtime payloads fall back to a home-local unresolved
+project root rather than silently writing into the repository. Legacy audit logs
+are not imported by `migrate local-state`, and an audit-only `.loopcoder/audit/`
+directory does not make `loopcoder doctor --repo .` require a local-state
+migration.
 
 To back up the v0.7.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
 and, when present, `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and
-`$LOOPCODER_HOME/tmp/` while no loopcoder command is running. To remove the
-machine-local runtime state completely, delete those same paths; the next
-loopcoder command recreates storage as needed. Removing machine-local runtime
-state does not delete repo-local `.loopcoder/` history, and deleting
+`$LOOPCODER_HOME/tmp/` while no loopcoder command is running. Rollback restores
+the database and those file-payload directories from the same backup set. To
+remove the machine-local runtime state completely, delete those same paths; the
+next loopcoder command recreates storage as needed. Removing machine-local
+runtime state does not delete repo-local `.loopcoder/` history, and deleting
 repo-local `.loopcoder/` is still a manual user action outside migration.
 
 `loopcoder report` is the read-only query surface for those local records:

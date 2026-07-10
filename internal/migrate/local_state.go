@@ -214,7 +214,7 @@ func LocalState(ctx context.Context, opts Options, deps Deps) (Result, error) {
 }
 
 func (ic importContext) importRuns(ctx context.Context) error {
-	runsRoot := state.RunsRoot(ic.repo)
+	runsRoot := state.LegacyRunsRoot(ic.repo)
 	entries, err := os.ReadDir(runsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -230,7 +230,7 @@ func (ic importContext) importRuns(ctx context.Context) error {
 		if err := ic.ensureRun(ctx, runID, 0, "", "", ""); err != nil {
 			return err
 		}
-		runPath := state.RunPath(ic.repo, runID)
+		runPath := state.LegacyRunPath(ic.repo, runID)
 		if err := ic.importAttemptFiles(ctx, runID); err != nil {
 			return err
 		}
@@ -248,7 +248,7 @@ func (ic importContext) importRuns(ctx context.Context) error {
 }
 
 func (ic importContext) importAttemptFiles(ctx context.Context, runID string) error {
-	workersDir := state.WorkersPath(ic.repo, runID)
+	workersDir := state.LegacyWorkersPath(ic.repo, runID)
 	entries, err := os.ReadDir(workersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -282,7 +282,7 @@ func (ic importContext) importAttemptFiles(ctx context.Context, runID string) er
 }
 
 func (ic importContext) importEventFile(ctx context.Context, runID string) error {
-	path := state.EventsPath(ic.repo, runID)
+	path := state.LegacyEventsPath(ic.repo, runID)
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -323,7 +323,7 @@ func (ic importContext) importEventFile(ctx context.Context, runID string) error
 }
 
 func (ic importContext) importRecoveryBriefs(ctx context.Context, runID string) error {
-	recoveryDir := state.RecoveryPath(ic.repo, runID)
+	recoveryDir := state.LegacyRecoveryPath(ic.repo, runID)
 	if info, err := os.Stat(recoveryDir); err != nil || !info.IsDir() {
 		return nil
 	}
@@ -472,7 +472,7 @@ func (ic importContext) scanJSONLLegacy(ctx context.Context, path, runID, record
 }
 
 func (ic importContext) importReports(ctx context.Context) error {
-	records, err := reportquery.List(reportquery.Options{RepoPath: ic.repo, Limit: math.MaxInt, SkipImported: true})
+	records, err := reportquery.List(reportquery.Options{RepoPath: ic.repo, Limit: math.MaxInt, SkipImported: true, RepoLocalOnly: true})
 	if err != nil {
 		return fmt.Errorf("migrate local state: list reports: %w", err)
 	}

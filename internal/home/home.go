@@ -20,6 +20,9 @@ const (
 	binDirName      = "bin"
 	dataDirName     = "data"
 	databaseName    = "loopcoder.db"
+	projectsDirName = "projects"
+	logsDirName     = "logs"
+	tmpDirName      = "tmp"
 	versionsDirName = "versions"
 	skillsDirName   = "skills"
 	playbookName    = "SKILL.md"
@@ -93,6 +96,26 @@ func (l Layout) DataDir() string {
 // DatabasePath returns the default SQLite database path.
 func (l Layout) DatabasePath() string {
 	return filepath.Join(l.DataDir(), databaseName)
+}
+
+// ProjectsDir returns the directory containing per-project runtime payloads.
+func (l Layout) ProjectsDir() string {
+	return filepath.Join(l.HomeDir, projectsDirName)
+}
+
+// ProjectDir returns the machine-local payload root for a registered project.
+func (l Layout) ProjectDir(projectID string) string {
+	return filepath.Join(l.ProjectsDir(), filepath.Clean(projectID))
+}
+
+// LogsDir returns the machine-local runtime log directory.
+func (l Layout) LogsDir() string {
+	return filepath.Join(l.HomeDir, logsDirName)
+}
+
+// TmpDir returns the machine-local runtime temporary directory.
+func (l Layout) TmpDir() string {
+	return filepath.Join(l.HomeDir, tmpDirName)
 }
 
 // VersionsDir returns the directory containing versioned binary installs.

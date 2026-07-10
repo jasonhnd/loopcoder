@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/state"
 )
 
 // Entry describes one local report block that a conductor must be able to
@@ -48,7 +49,11 @@ func Write(entry Entry) (string, error) {
 		entry.CreatedAt = time.Now().UTC()
 	}
 
-	dir := filepath.Join(repoPath, ".loopcoder", "relay", runID)
+	relayRoot := filepath.Join(repoPath, ".loopcoder", "relay")
+	if layout, err := state.ResolveRuntimeLayout(repoPath); err == nil && strings.TrimSpace(layout.RelayRoot) != "" {
+		relayRoot = layout.RelayRoot
+	}
+	dir := filepath.Join(relayRoot, runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create relay directory: %w", err)
 	}
