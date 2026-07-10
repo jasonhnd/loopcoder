@@ -14,6 +14,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/registry"
@@ -61,6 +62,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"loopcoder skill",
 		"conductor hooks",
 		"report query",
+		"storage permissions",
 		"storage",
 		"project registry",
 		"migration status",
@@ -1294,6 +1296,103 @@ func TestCheckStaleStateWarnsWhenCleanupPlanErrors(t *testing.T) {
 	}
 }
 
+func TestCheckStoragePermissionsWarnsWithFixCommand(t *testing.T) {
+	homeDir := t.TempDir()
+	check := checkStoragePermissions(Deps{
+		Getenv: func(key string) string {
+			if key == home.EnvHome {
+				return homeDir
+			}
+			return ""
+		},
+		StoragePerms: func(path string) (storage.PermissionsReport, error) {
+			return storage.PermissionsReport{
+				Path:       path,
+				OK:         false,
+				Repairable: true,
+				Message:    "storage permissions are broader than owner-only for " + path,
+				Issues: []storage.PermissionIssue{{
+					Path:    filepath.Dir(path),
+					Kind:    "storage data directory",
+					Mode:    os.FileMode(0o755),
+					Message: "mode 0755 is broader than owner-only 0700",
+				}},
+			}, nil
+		},
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if check.FixCommand != "loopcoder doctor --repo . --fix" {
+		t.Fatalf("FixCommand = %q", check.FixCommand)
+	}
+	for _, want := range []string{"broader than owner-only", "0755", filepath.Dir(home.New(homeDir).DatabasePath())} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestFixStoragePermissionsReportsBeforeAfter(t *testing.T) {
+	homeDir := t.TempDir()
+	check := fixStoragePermissions(Deps{
+		Getenv: func(key string) string {
+			if key == home.EnvHome {
+				return homeDir
+			}
+			return ""
+		},
+		RepairStorage: func(path string) (storage.PermissionsReport, error) {
+			return storage.PermissionsReport{
+				Path:    path,
+				OK:      true,
+				Changed: true,
+				Repairs: []storage.PermissionRepair{{
+					Path:   filepath.Dir(path),
+					Kind:   "storage data directory",
+					Before: os.FileMode(0o755),
+					After:  os.FileMode(0o700),
+				}},
+			}, nil
+		},
+	})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"changed", "storage data directory", "0755->0700"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStoragePermissionsWarnsForWindowsACLCeiling(t *testing.T) {
+	check := checkStoragePermissions(Deps{
+		Getenv: func(key string) string {
+			if key == home.EnvHome {
+				return filepath.Join("C:", "Users", "me", ".loopcoder")
+			}
+			return ""
+		},
+		StoragePerms: func(path string) (storage.PermissionsReport, error) {
+			return storage.PermissionsReport{
+				Path:        path,
+				Unsupported: true,
+				Message:     "owner-only ACL hardening is not implemented on Windows in this release",
+			}, nil
+		},
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if !strings.Contains(check.Message, "owner-only ACL hardening is not implemented") {
+		t.Fatalf("message = %q", check.Message)
+	}
+}
+
 func TestFixDeliveryConfigMigratesLegacyReportKeys(t *testing.T) {
 	repo := t.TempDir()
 	path := filepath.Join(repo, ".delivery.yml")
@@ -1711,6 +1810,20 @@ func (f *fakeDoctorEnv) deps() Deps {
 				SchemaVersion: storage.CurrentSchemaVersion,
 				OK:            true,
 				Message:       "healthy",
+			}, nil
+		},
+		StoragePerms: func(path string) (storage.PermissionsReport, error) {
+			return storage.PermissionsReport{
+				Path:    path,
+				OK:      true,
+				Message: "storage permissions are owner-only for " + path,
+			}, nil
+		},
+		RepairStorage: func(path string) (storage.PermissionsReport, error) {
+			return storage.PermissionsReport{
+				Path:    path,
+				OK:      true,
+				Message: "storage permissions are owner-only for " + path,
 			}, nil
 		},
 		ProjectShow: func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {

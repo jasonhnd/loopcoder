@@ -945,6 +945,19 @@ records already imported on prior runs. Malformed JSON or JSONL input is
 reported with a source path and line when available, but malformed records do
 not abort import of other valid records.
 
+On Unix-like systems, v0.7.0 creates `$LOOPCODER_HOME` and `data/` with modes
+no broader than `0700`, and creates or tightens `loopcoder.db` plus any
+SQLite `-wal` and `-shm` sidecars to modes no broader than `0600`. Existing
+broader modes are reported by `loopcoder doctor --repo .`; run
+`loopcoder doctor --repo . --fix` to tighten them in place without deleting or
+recreating the database. The permission repair refuses symlinks and
+non-regular database or sidecar paths instead of chmodding through them.
+
+On Windows, v0.7.0 does not implement owner-only ACL rewriting. The database is
+created under the selected user profile or `LOOPCODER_HOME` and inherits that
+directory's Windows ACLs; `doctor` reports this limitation explicitly instead
+of claiming Unix mode protection.
+
 The command copies state only. It does not delete `.loopcoder/`, rewrite legacy
 files, edit tracked repository files, mutate GitHub, or publish state to the
 state branch. Existing file readers remain the fallback during the

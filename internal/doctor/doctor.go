@@ -77,6 +77,8 @@ type Deps struct {
 	AgentsMarkdown func() ([]byte, error)
 	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
 	StorageHealth  func(context.Context, string) (storage.Health, error)
+	StoragePerms   func(string) (storage.PermissionsReport, error)
+	RepairStorage  func(string) (storage.PermissionsReport, error)
 	ProjectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 }
 
@@ -372,6 +374,8 @@ func DefaultDeps() Deps {
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
 		CleanupPlan:    localcleanup.Plan,
 		StorageHealth:  storage.CheckHealth,
+		StoragePerms:   storage.CheckPermissions,
+		RepairStorage:  storage.RepairPermissions,
 		ProjectShow: func(ctx context.Context, opts registry.Options) (registry.ShowResult, error) {
 			return registry.Show(ctx, opts, registry.DefaultDeps())
 		},
@@ -427,6 +431,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, checkReportQuery(repoPath))
+	checks = append(checks, checkStoragePermissions(deps))
 	checks = append(checks, checkStorageHealth(ctx, deps))
 	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
 	checks = append(checks, checkLocalStateImport(ctx, repoPath, deps))
@@ -453,6 +458,7 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		fixConductorHookSettings(repoPath, deps),
 		fixConductorHookState(repoPath),
 		fixLegacyStateKeys(repoPath),
+		fixStoragePermissions(deps),
 		fixStaleState(repoPath),
 	}
 	status := scanMigrationStatus(repoPath, deps)
@@ -789,6 +795,12 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.StorageHealth == nil {
 		deps.StorageHealth = defaults.StorageHealth
 	}
+	if deps.StoragePerms == nil {
+		deps.StoragePerms = defaults.StoragePerms
+	}
+	if deps.RepairStorage == nil {
+		deps.RepairStorage = defaults.RepairStorage
+	}
 	if deps.ProjectShow == nil {
 		deps.ProjectShow = defaults.ProjectShow
 	}
@@ -1053,6 +1065,111 @@ func checkStorageHealth(ctx context.Context, deps Deps) Check {
 		Status:  StatusOK,
 		Message: fmt.Sprintf("path=%s schema_version=%d health=ok", path, health.SchemaVersion),
 	}
+}
+
+func checkStoragePermissions(deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for storage permissions: %v", err),
+		}
+	}
+	path := layout.DatabasePath()
+	report, err := deps.StoragePerms(path)
+	if err != nil {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s permissions=fail: %v", path, err),
+		}
+	}
+	if report.Unsupported {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusWarn,
+			Message: report.Message,
+		}
+	}
+	if report.OK {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusOK,
+			Message: report.Message,
+		}
+	}
+	if report.Unsafe {
+		return Check{
+			Name:    "storage permissions",
+			Status:  StatusFail,
+			Message: storagePermissionsMessage(report),
+		}
+	}
+	return Check{
+		Name:       "storage permissions",
+		Status:     StatusWarn,
+		Message:    storagePermissionsMessage(report),
+		FixCommand: "loopcoder doctor --repo . --fix",
+	}
+}
+
+func fixStoragePermissions(deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{Name: "fix storage permissions", Status: StatusWarn, Message: fmt.Sprintf("could not resolve loopcoder home: %v", err)}
+	}
+	path := layout.DatabasePath()
+	report, err := deps.RepairStorage(path)
+	if err != nil {
+		return Check{Name: "fix storage permissions", Status: StatusFail, Message: fmt.Sprintf("path=%s repair failed: %v", path, err), Hard: true}
+	}
+	if report.Unsupported {
+		return Check{Name: "fix storage permissions", Status: StatusWarn, Message: report.Message}
+	}
+	if report.Unsafe {
+		return Check{Name: "fix storage permissions", Status: StatusFail, Message: storagePermissionsMessage(report), Hard: true}
+	}
+	if report.Changed {
+		parts := make([]string, 0, len(report.Repairs))
+		for _, repair := range report.Repairs {
+			parts = append(parts, fmt.Sprintf("%s %s %s->%s", repair.Kind, repair.Path, modeString(repair.Before), modeString(repair.After)))
+		}
+		return Check{
+			Name:    "fix storage permissions",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("changed; tightened %d storage path(s): %s", len(report.Repairs), strings.Join(parts, "; ")),
+		}
+	}
+	return Check{Name: "fix storage permissions", Status: StatusOK, Message: "unchanged; storage paths already owner-only or not yet created"}
+}
+
+func storagePermissionsMessage(report storage.PermissionsReport) string {
+	details := make([]string, 0, len(report.Issues))
+	for _, issue := range report.Issues {
+		mode := ""
+		if issue.Mode != 0 {
+			mode = " mode=" + modeString(issue.Mode)
+		}
+		details = append(details, fmt.Sprintf("%s %s%s: %s", issue.Kind, issue.Path, mode, issue.Message))
+	}
+	message := report.Message
+	if len(details) > 0 {
+		message += ": " + strings.Join(details, "; ")
+	}
+	return message
+}
+
+func modeString(mode fs.FileMode) string {
+	return fmt.Sprintf("%04o", mode.Perm())
 }
 
 func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check {

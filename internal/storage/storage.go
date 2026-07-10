@@ -204,22 +204,34 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, errors.New("open storage: path is required")
 	}
 	path = filepath.Clean(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("open storage: create data directory: %w", err)
-	}
-
-	db, err := sql.Open(driverName, path)
-	if err != nil {
-		return nil, fmt.Errorf("open storage %s: %w", path, err)
-	}
-	db.SetMaxOpenConns(1)
-	store := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
-	if err := store.configure(ctx); err != nil {
-		_ = db.Close()
+	if err := preparePathForOpen(path); err != nil {
 		return nil, err
 	}
-	if err := store.migrate(ctx); err != nil {
-		_ = db.Close()
+
+	var store *sqliteStore
+	err := withRestrictedFileCreation(func() error {
+		db, err := sql.Open(driverName, path)
+		if err != nil {
+			return fmt.Errorf("open storage %s: %w", path, err)
+		}
+		db.SetMaxOpenConns(1)
+		current := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
+		if err := current.configure(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := current.migrate(ctx); err != nil {
+			_ = db.Close()
+			return err
+		}
+		if err := hardenSQLiteFiles(path); err != nil {
+			_ = db.Close()
+			return err
+		}
+		store = current
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -234,6 +246,9 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 	health := Health{Path: path}
 	if path == "." || path == "" {
 		return health, errors.New("storage health: path is required")
+	}
+	if err := ensureSafeExistingDatabase(path); err != nil {
+		return health, fmt.Errorf("storage health: %w", err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -330,6 +345,7 @@ func (s *sqliteStore) configure(ctx context.Context) error {
 	for _, statement := range []string{
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA journal_mode = WAL`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("open storage %s: configure sqlite: %w", s.path, err)
