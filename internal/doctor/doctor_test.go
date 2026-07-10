@@ -61,6 +61,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"loopcoder skill",
 		"conductor hooks",
 		"report query",
+		"storage permissions",
 		"storage",
 		"project registry",
 		"migration status",
@@ -1136,6 +1137,112 @@ func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
 	}
 }
 
+func TestCheckStoragePermissionsReportsInsecurePath(t *testing.T) {
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+
+	check := checkStoragePermissions(Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StoragePermissions: func(path string, fix bool) (storage.PermissionReport, error) {
+			if path != dbPath {
+				t.Fatalf("storage path = %q, want %q", path, dbPath)
+			}
+			if fix {
+				t.Fatal("read-only check requested repair")
+			}
+			return storage.PermissionReport{
+				Path:      path,
+				Platform:  "linux",
+				Supported: true,
+				Secure:    false,
+				Items: []storage.PermissionItem{{
+					Path:       path,
+					Kind:       "database file",
+					Exists:     true,
+					BeforeMode: 0o644,
+					AfterMode:  0o644,
+					Message:    "mode 0644 is broader than 0600",
+				}},
+			}, nil
+		},
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if check.FixCommand != "loopcoder doctor --repo . --fix" {
+		t.Fatalf("FixCommand = %q", check.FixCommand)
+	}
+	for _, want := range []string{"permissions=insecure", "loopcoder.db", "0644"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestFixStoragePermissionsReportsBeforeAfter(t *testing.T) {
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	calls := 0
+
+	check := fixStoragePermissions(Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StoragePermissions: func(path string, fix bool) (storage.PermissionReport, error) {
+			if path != dbPath {
+				t.Fatalf("storage path = %q, want %q", path, dbPath)
+			}
+			calls++
+			if !fix {
+				return storage.PermissionReport{
+					Path:      path,
+					Platform:  "linux",
+					Supported: true,
+					Secure:    false,
+					Items: []storage.PermissionItem{{
+						Path:       path,
+						Kind:       "database file",
+						Exists:     true,
+						BeforeMode: 0o644,
+						AfterMode:  0o644,
+						Message:    "mode 0644 is broader than 0600",
+					}},
+				}, nil
+			}
+			return storage.PermissionReport{
+				Path:      path,
+				Platform:  "linux",
+				Supported: true,
+				Secure:    true,
+				Repaired:  true,
+				Items: []storage.PermissionItem{{
+					Path:       path,
+					Kind:       "database file",
+					Exists:     true,
+					BeforeMode: 0o644,
+					AfterMode:  0o600,
+					Secure:     true,
+					Repaired:   true,
+					Message:    "tightened from 0644 to 0600",
+				}},
+			}, nil
+		},
+	})
+
+	if calls != 2 {
+		t.Fatalf("permission calls = %d, want 2", calls)
+	}
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"changed", "0644->0600", "loopcoder.db"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
 func TestCheckStorageHealthReportsMissingDatabaseAsInfo(t *testing.T) {
 	homeDir := t.TempDir()
 
@@ -1711,6 +1818,15 @@ func (f *fakeDoctorEnv) deps() Deps {
 				SchemaVersion: storage.CurrentSchemaVersion,
 				OK:            true,
 				Message:       "healthy",
+			}, nil
+		},
+		StoragePermissions: func(path string, fix bool) (storage.PermissionReport, error) {
+			return storage.PermissionReport{
+				Path:      path,
+				Platform:  "test",
+				Supported: true,
+				Secure:    true,
+				Message:   "storage permissions are owner-only",
 			}, nil
 		},
 		ProjectShow: func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {
