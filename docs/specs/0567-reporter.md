@@ -64,8 +64,8 @@ The follow-on code issues must apply this map to live, non-frozen surfaces.
 | `cloneAttestation`, `parseAttestation`, `buildWorkerAttestation`, etc. | `cloneReport`, `parseReport`, `buildWorkerReport`, etc. | Every live Go identifier containing the noun `Attestation` or `attestation` must be renamed unless it is explicitly frozen below. |
 | `ValidationError` messages saying `invalid attestation record` | `invalid report` or `invalid reporter record` | Prefer `invalid report` in user-facing errors. |
 | `[attestation]` emitted header token | `[reporter]` | `Report.Header()` emits only `[reporter]` in this release. Matchers accept both during the transition window. |
-| Pretty status line `attestation: verified` | `report: verified` | Emoji mode keeps the status icon but changes wording from attestation to report. |
-| Pretty status line `attestation: self-reported` | `report: self-reported` | Preserve the trust distinction. |
+| Pretty status line `attestation: verified` | `loopcoder report: <role> <status>` | Emoji mode keeps the status icon and renders a conclusion-first receipt. |
+| Pretty status line `attestation: self-reported` | `loopcoder report: conductor self reported` | Preserve the trust distinction in the receipt verdict. |
 | Prose `attestation block` | `report block` | Apply to current `README.md`, `SKILL.md`, `AGENTS.md`, `GEMINI.md`, `hooks/*`, and `docs/reference/*`. |
 | Prose `attestation record` | `report` | Use `report` for the record and `reporter` for the subsystem. |
 | Result envelope key `attestation` on newly emitted command JSON | `report` | This is a BREAKING live command-output rename. Readers in this release must accept old `attestation` as a legacy input alias where they parse persisted or prior-run output. |
@@ -435,38 +435,56 @@ Rendering rules:
 - The canonical fields `model` and `effort` remain separately available for
   machine readers.
 
-## Pretty Grouping
+## Pretty Receipt
 
-The reporter pretty renderer replaces the current flat attestation wording with
-four groups: `who`, `what`, `result`, and `cost`.
+The reporter pretty renderer uses a compact conclusion-first receipt with the
+same section order for Worker, Verifier, audit, and Conductor records:
+`Target`, `Verdict`, `Review summary`, `Run`, and `Next`. Default human output
+does not embed raw JSON.
 
-Plain output shape:
+Plain Worker output shape:
 
 ```text
-report: verified
-who
-  role        worker
-  provider    OpenAI Codex / codex
-  model       gpt-5.5 (high) (parsed)
-what
-  work_id     run-20260707-issue-567
-  issue       #567
-  branch      loop/issue-567
-  worktree    C:\repo\.worktrees\issue-567
-  action      implement issue #567
-result
-  exit        0
-  duration    42s
-  started     2026-07-07T00:00:00Z
-  ended       2026-07-07T00:00:42Z
-cost
-  tokens      input=120 output=34 total=154
+loopcoder report: worker succeeded
+
+Target
+- work ID: run-20260707-issue-567
+- issue: #567
+- branch: loop/issue-567
+
+Verdict
+- status: succeeded
+- blocking defects: 0
+- reason: completed without a blocking report signal
+
+Review summary
+- acceptance criteria: not reviewed
+- regressions found: none reported
+- findings: none
+
+Run
+- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high
+- permission: write
+- action: "implement issue #567"
+- exit: 0
+- duration: 42.0s
+- tokens: input=120  output=34  total=154
+
+Next
+- run verifier review before calling the PR merge-eligible
+- details: loopcoder report --work-id run-20260707-issue-567 --verbose
+- raw JSON: loopcoder report --work-id run-20260707-issue-567 --format json
 ```
 
+Verifier receipts use the same order and set `Verdict.status` to `pass`,
+`fail`, or `needs-human`. `needs-human` receipts must include the concise reason
+and a next action explaining what a human must decide. Findings are grouped by
+severity count before any verbose finding details.
+
 Emoji output may keep the existing success/warning icon convention but must use
-the same group names and reporter wording. `cost` means measured usage facts.
-Only display currency cost when loopcoder has an exact observed value; do not
-estimate or infer prices in this unit.
+the same section names and reporter wording. Token usage means measured token
+facts. Only display currency cost when loopcoder has an exact observed value; do
+not estimate or infer prices in this unit.
 
 Pretty output is still local diagnostic output. It remains forbidden in PR
 bodies, issue comments, merge artifacts, commits, fixtures, and tracked docs
@@ -477,12 +495,18 @@ except for deliberate documentation examples.
 Unit B adds an on-demand, read-only command:
 
 ```text
-loopcoder report --repo <path> [--work-id <id>] [--issue <n>] [--role <role>] [--limit <n>] [--format text|json]
+loopcoder report --repo <path> [--work-id <id>] [--issue <n>] [--role <role>] [--limit <n>] [--verbose] [--format text|json]
 ```
 
 Behavior:
 
 - Read only local `.loopcoder/` report/run/relay state.
+- Default text output renders compact receipts and source context without raw
+  JSON.
+- `--verbose` appends the `[reporter]` header and canonical JSON record to text
+  output.
+- `--format json` emits parseable JSON only, with no human receipt text mixed
+  in.
 - Do not call provider CLIs.
 - Do not flush relay records.
 - Do not mutate hook state, run state, worktrees, git, GitHub, or config.
@@ -559,7 +583,7 @@ Each code issue must implement only its slice and reference this accepted spec.
   legacy `attestation` input where needed for transition.
 - `Report.Validate()` accepts Antigravity self-reported Worker/Verifier models
   and absent token usage without relaxing `codex` or `claude`.
-- Pretty output shows model+depth display and is grouped as who/what/result/cost.
+- Pretty output shows model+depth display and is grouped as Target/Verdict/Review summary/Run/Next.
 - Every newly written report carries `work_id` when loopcoder knows the
   invocation/run ID, and Worker reports use the Worker internal `RunID`.
 - `issue`, `branch`, `worktree`, and `round` are populated from dispatch/tick

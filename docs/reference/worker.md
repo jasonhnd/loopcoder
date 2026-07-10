@@ -290,38 +290,49 @@ During the 0.6.x transition window, readers accept legacy dispatch result JSON w
 the `report` object and `[reporter]` header per
 [`../specs/0567-reporter.md`](../specs/0567-reporter.md).
 
-The default pretty behavior writes the human-readable pretty report block to
-stderr by default with the polished display format. The default block uses
-emoji on an interactive TTY and plain ASCII on a non-TTY. It shows provider
-vendor and provider key on one combined line, such as `OpenAI Codex / codex`,
-renders the model and depth plus source as `gpt-5.5 (xhigh) (parsed)` or
-`Gemini 3.1 Pro (High) (self-reported)`, uses host-local timestamps to whole
-seconds, reports duration in seconds, and groups token counts with thousands
-separators. When input and output tokens are present without a total, the
-pretty block derives a display-only total. This never changes or reorders the
-three stdout records, the stable `Header()` / `[reporter] ...` line, or the
-canonical JSON, and it never adds reports to PR bodies.
+The default pretty behavior writes a human-readable report receipt to stderr by
+default. The default receipt uses emoji on an interactive TTY and plain ASCII on
+a non-TTY. It uses `Target`, `Verdict`, `Review summary`, `Run`, and `Next`;
+shows provider vendor and provider key on one combined line, such as
+`OpenAI Codex / codex`; renders the model and depth plus source as
+`gpt-5.5 (xhigh) (parsed)` or `Gemini 3.1 Pro (High) (self-reported)`; uses
+host-local timestamps to whole seconds; reports compact duration; and groups
+token counts with thousands separators. When input and output tokens are
+present without a total, the receipt derives a display-only total. This never
+changes or reorders the three stdout records, the stable `Header()` /
+`[reporter] ...` line, or the canonical JSON, and it never adds reports to PR
+bodies.
 
 Example pretty block:
 
 ```text
-report: verified
-who
-  role        worker
-  provider    OpenAI Codex / codex
-  model       gpt-5.5 (xhigh) (parsed)
-  permission  write
-what
-  issue       #293
-  action      "implement issue #293"
-result
-  exit        0
-  duration    7m53.9s (473.9 s)
-  started     2026-06-30 14:25:21 JST
-  ended       2026-06-30 14:33:15 JST
-  verified    true
-cost
-  tokens      total=165,268
+loopcoder report: worker succeeded
+
+Target
+- work ID: run-293
+- issue: #293
+- branch: loop/issue-293
+
+Verdict
+- status: succeeded
+- blocking defects: 0
+- reason: completed without a blocking report signal
+
+Review summary
+- acceptance criteria: not reviewed
+- regressions found: none reported
+- findings: none
+
+Run
+- worker: OpenAI Codex / codex / gpt-5.5 (xhigh) (parsed) / xhigh
+- permission: write
+- action: "implement issue #293"
+- exit: 0
+- duration: 7m53.9s
+- tokens: total=165,268
+
+Next
+- run verifier review before calling the PR merge-eligible
 ```
 
 `--pretty` or `LOOPCODER_PRETTY=1` forces emoji pretty output even on non-TTY

@@ -192,6 +192,36 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
+	stdout.Reset()
+	stderr.Reset()
+	exitCode = RunWithDeps([]string{
+		"report",
+		"--repo", repo,
+		"--work-id", "run-report-test",
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("text report returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "loopcoder report: worker succeeded") || !strings.Contains(stdout.String(), "Next") {
+		t.Fatalf("text report missing receipt:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "canonical JSON") || strings.Contains(stdout.String(), `"role":"worker"`) {
+		t.Fatalf("default text report included raw JSON:\n%s", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	exitCode = RunWithDeps([]string{
+		"report",
+		"--repo", repo,
+		"--work-id", "run-report-test",
+		"--verbose",
+	}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("verbose report returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Raw record") || !strings.Contains(stdout.String(), "- canonical JSON: {\"work_id\":\"run-report-test\"") {
+		t.Fatalf("verbose report missing raw canonical record:\n%s", stdout.String())
+	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
 		t.Fatalf("report command mutated relay state: %#v", pending)
 	}
@@ -2098,11 +2128,10 @@ func TestAttestPrettyRendersEmojiWhenInteractive(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"\u26a0\ufe0f report self-reported",
-		"  role        conductor",
-		"  model       gpt-5 (xhigh) (self-reported)",
-		"  tokens      total=18,266",
-		"  verified    false",
+		"\u26a0\ufe0f loopcoder report: conductor self reported",
+		"- conductor: codex-cli / gpt-5 (xhigh) (self-reported) / xhigh",
+		"- tokens: total=18,266",
+		"- verified: false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, got)
@@ -2141,11 +2170,10 @@ func TestAttestPrettyRendersPlainWhenNonInteractive(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"report: self-reported",
-		"  role        conductor",
-		"  model       gpt-5 (self-reported)",
-		"  tokens      total=12,345",
-		"  verified    false",
+		"loopcoder report: conductor self reported",
+		"- conductor: codex-cli / gpt-5 (self-reported) / unset",
+		"- tokens: total=12,345",
+		"- verified: false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, got)
@@ -2311,10 +2339,10 @@ func TestLoopreviewPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChanging
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"report: verified",
-		"  role        verifier",
-		"  permission  read-only",
-		"  action      \"review PR #152\"",
+		"loopcoder report: verifier pass",
+		"- verifier: Anthropic / claude / gpt-5.5 (high) (parsed) / high",
+		"- permission: read-only",
+		"- action: \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -2371,7 +2399,7 @@ func TestLoopreviewWritesRelayLedger(t *testing.T) {
 		"# role=verifier",
 		"# pr_number=152",
 		record.Header(),
-		record.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain}),
+		loopreviewPrettyBlock(result.Verdict, reporter.PrettyModePlain),
 	} {
 		if !strings.Contains(ledger, want) {
 			t.Fatalf("relay ledger missing %q:\n%s", want, ledger)
@@ -2384,7 +2412,7 @@ func TestLoopreviewWritesRelayLedger(t *testing.T) {
 	if pending[0].Role != "verifier" || pending[0].PRNumber != 152 || pending[0].Nonce != relaygate.Nonce("loopreview-pr-152", 152, "verifier") {
 		t.Fatalf("pending relay record = %#v, want verifier PR 152 deterministic nonce", pending[0])
 	}
-	if pending[0].Block != record.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain})+"\n" {
+	if pending[0].Block != loopreviewPrettyBlock(result.Verdict, reporter.PrettyModePlain)+"\n" {
 		t.Fatalf("pending relay block = %q, want plain pretty block", pending[0].Block)
 	}
 }
@@ -2428,10 +2456,10 @@ func TestLoopreviewPrettyFlagWritesEmojiToStderrWithoutChangingStdout(t *testing
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"\u2705 report verified",
-		"  role        verifier",
-		"  permission  read-only",
-		"  action      \"review PR #152\"",
+		"\u2705 loopcoder report: verifier pass",
+		"- verifier: Anthropic / claude / gpt-5.5 (high) (parsed) / high",
+		"- permission: read-only",
+		"- action: \"review PR #152\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -2513,7 +2541,7 @@ func TestLoopreviewPrettyInteractiveHonorsNoEmojiEnv(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "report: verified") {
+	if !strings.Contains(stderr.String(), "loopcoder report: verifier pass") {
 		t.Fatalf("stderr missing plain pretty report:\n%s", stderr.String())
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0"} {
@@ -3594,7 +3622,7 @@ func TestTickSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "loopcoder report: worker succeeded") || !strings.Contains(stderr.String(), "- worker: OpenAI Codex / codex") {
 		t.Fatalf("tick stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3727,7 +3755,7 @@ func TestTriggerSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
 	if !called {
 		t.Fatal("Tick dependency was not called")
 	}
-	if !strings.Contains(stderr.String(), "report: verified") || !strings.Contains(stderr.String(), "  role        worker") {
+	if !strings.Contains(stderr.String(), "loopcoder report: worker succeeded") || !strings.Contains(stderr.String(), "- worker: OpenAI Codex / codex") {
 		t.Fatalf("trigger stderr missing self-surfaced worker block:\n%s", stderr.String())
 	}
 	pending := relaygate.Check(repo)
@@ -3865,10 +3893,10 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"report: verified",
-		"  role        worker",
-		"  permission  write",
-		"  action      \"implement issue #101\"",
+		"loopcoder report: worker succeeded",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
+		"- permission: write",
+		"- action: \"implement issue #101\"",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -3964,9 +3992,9 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 	}
 	gotStderr := stderr.String()
 	for _, want := range []string{
-		"report: verified",
-		"  role        worker",
-		"  tokens      input=120  output=34  total=154",
+		"loopcoder report: worker succeeded",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
+		"- tokens: input=120  output=34  total=154",
 	} {
 		if !strings.Contains(gotStderr, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, gotStderr)
@@ -4015,7 +4043,7 @@ func TestDispatchWritesRelayLedger(t *testing.T) {
 		"# run_id=run-test",
 		"# issue=101",
 		record.Header(),
-		record.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain}),
+		dispatchPrettyBlock(record, result.Status, result.PR, "", reporter.PrettyModePlain),
 	} {
 		if !strings.Contains(ledger, want) {
 			t.Fatalf("relay ledger missing %q:\n%s", want, ledger)
@@ -4028,7 +4056,7 @@ func TestDispatchWritesRelayLedger(t *testing.T) {
 	if pending[0].Role != "worker" || pending[0].PRNumber != 101 || pending[0].Nonce != relaygate.Nonce("run-test", 101, "worker") {
 		t.Fatalf("pending relay record = %#v, want worker PR 101 deterministic nonce", pending[0])
 	}
-	if pending[0].Block != record.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain})+"\n" {
+	if pending[0].Block != dispatchPrettyBlock(record, result.Status, result.PR, "", reporter.PrettyModePlain)+"\n" {
 		t.Fatalf("pending relay block = %q, want plain pretty block", pending[0].Block)
 	}
 }
@@ -4073,10 +4101,10 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
 	for _, want := range []string{
-		"\u2705 report verified",
-		"  role        worker",
-		"  permission  write",
-		"  action      \"implement issue #101\"",
+		"\u2705 loopcoder report: worker succeeded",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
+		"- permission: write",
+		"- action: \"implement issue #101\"",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -4125,9 +4153,9 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 		t.Fatalf("stdout = %q, want %q", stdout.String(), wantStdout)
 	}
 	for _, want := range []string{
-		"\u2705 report verified",
-		"  role        worker",
-		"  tokens      input=120  output=34  total=154",
+		"\u2705 loopcoder report: worker succeeded",
+		"- worker: OpenAI Codex / codex / gpt-5.5 (high) (parsed) / high",
+		"- tokens: input=120  output=34  total=154",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
@@ -4171,7 +4199,7 @@ func TestDispatchPrettyFlagHonorsNoColorPlainFallback(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "report: verified") {
+	if !strings.Contains(stderr.String(), "loopcoder report: worker succeeded") {
 		t.Fatalf("stderr missing plain pretty report:\n%s", stderr.String())
 	}
 	for _, disallowed := range []string{"\u2705", "\u274c", "\u26a0", "\x1b["} {
@@ -4592,8 +4620,8 @@ func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *te
 			},
 		},
 	}
-	wantStdout := orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[0], record201.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain})) +
-		orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[1], record202.Pretty(reporter.PrettyOptions{Mode: reporter.PrettyModePlain})) +
+	wantStdout := orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[0], dispatchPrettyBlock(record201, expectedReport.Results[0].Status, expectedReport.Results[0].PR, expectedReport.Results[0].Error, reporter.PrettyModePlain)) +
+		orchestration.RenderDispatchWaveIssueCompletion(expectedReport.Results[1], dispatchPrettyBlock(record202, expectedReport.Results[1].Status, expectedReport.Results[1].PR, expectedReport.Results[1].Error, reporter.PrettyModePlain)) +
 		orchestration.RenderDispatchWaveText(expectedReport)
 
 	exitCode := RunWithDeps([]string{
@@ -4667,12 +4695,12 @@ func TestDispatchWavePrettyDefaultNonInteractiveStreamsPlainBlocksToStdout(t *te
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	gotStdout := stdout.String()
-	if count := strings.Count(gotStdout, "report: verified"); count != 2 {
+	if count := strings.Count(gotStdout, "loopcoder report: worker succeeded"); count != 2 {
 		t.Fatalf("stdout pretty block count = %d, want 2:\n%s", count, gotStdout)
 	}
 	for _, want := range []string{
-		"  action      \"implement issue #201\"",
-		"  action      \"implement issue #202\"",
+		"- action: \"implement issue #201\"",
+		"- action: \"implement issue #202\"",
 	} {
 		if !strings.Contains(gotStdout, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, gotStdout)
