@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -421,6 +422,42 @@ func TestExtractGoListBackboneCapturesOutput(t *testing.T) {
 	}
 	if len(backbone.Packages) != 1 || backbone.Packages[0].Dir != "." {
 		t.Fatalf("Packages = %#v, want one root package", backbone.Packages)
+	}
+}
+
+func TestParseGoListBackboneKeepsSymlinkAliasPackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical", "repo")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatalf("mkdir physical repo: %v", err)
+	}
+	aliasRoot := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "physical"), aliasRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliasRepo := filepath.Join(aliasRoot, "repo")
+	data := []byte(fmt.Sprintf("{\"ImportPath\":\"example.com/repo\",\"Dir\":%q,\"Name\":\"repo\"}\n", physical))
+
+	backbone, err := parseGoListBackbone(aliasRepo, data)
+	if err != nil {
+		t.Fatalf("parseGoListBackbone: %v", err)
+	}
+	if len(backbone.Packages) != 1 || backbone.Packages[0].Dir != "." {
+		t.Fatalf("packages = %#v, want physical package retained under alias repo", backbone.Packages)
+	}
+}
+
+func TestParseGoListBackboneFailsWhenAllPackagesFilterOut(t *testing.T) {
+	repo := t.TempDir()
+	outside := t.TempDir()
+	data := []byte(fmt.Sprintf("{\"ImportPath\":\"example.com/outside\",\"Dir\":%q,\"Name\":\"outside\"}\n", outside))
+
+	_, err := parseGoListBackbone(repo, data)
+	if err == nil || !strings.Contains(err.Error(), "none resolved under repository") {
+		t.Fatalf("parseGoListBackbone error = %v, want filtered-empty failure", err)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -113,10 +114,11 @@ func LocalState(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if repoPath == "" {
 		repoPath = "."
 	}
-	absRepo, err := filepath.Abs(repoPath)
+	canonicalRepo, err := pathid.Canonicalize(repoPath)
 	if err != nil {
 		return Result{}, fmt.Errorf("migrate local state: resolve repo: %w", err)
 	}
+	absRepo := canonicalRepo.Display
 	info, err := os.Stat(absRepo)
 	if err != nil {
 		return Result{}, fmt.Errorf("migrate local state: inspect repo: %w", err)
@@ -124,7 +126,6 @@ func LocalState(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if !info.IsDir() {
 		return Result{}, fmt.Errorf("migrate local state: repo path is not a directory: %s", absRepo)
 	}
-	absRepo = filepath.Clean(absRepo)
 	dbPath, err := databasePath(opts.DatabasePath, deps)
 	if err != nil {
 		return Result{}, fmt.Errorf("migrate local state: resolve storage: %w", err)
@@ -680,11 +681,16 @@ func (ic importContext) sourcePath(path string) string {
 	if path == "" {
 		return ""
 	}
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		if rel, relErr := filepath.Rel(ic.repo, abs); relErr == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+	repoIdentity, repoErr := pathid.Identity(ic.repo)
+	pathIdentity, pathErr := pathid.Identity(path)
+	if repoErr == nil && pathErr == nil {
+		if rel, relErr := filepath.Rel(repoIdentity, pathIdentity); relErr == nil && rel != "." && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
 		}
+		return filepath.ToSlash(filepath.Clean(pathIdentity))
+	}
+	abs, err := filepath.Abs(path)
+	if err == nil {
 		return filepath.ToSlash(filepath.Clean(abs))
 	}
 	return filepath.ToSlash(filepath.Clean(path))

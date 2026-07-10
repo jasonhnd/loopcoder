@@ -79,6 +79,8 @@ type Deps struct {
 	StorageHealth      func(context.Context, string) (storage.Health, error)
 	StoragePermissions func(path string, fix bool) (storage.PermissionReport, error)
 	ProjectShow        func(context.Context, registry.Options) (registry.ShowResult, error)
+	ProjectDuplicates  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	ProjectRepair      func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 }
 
 type CommandResult struct {
@@ -385,6 +387,12 @@ func DefaultDeps() Deps {
 		ProjectShow: func(ctx context.Context, opts registry.Options) (registry.ShowResult, error) {
 			return registry.Show(ctx, opts, registry.DefaultDeps())
 		},
+		ProjectDuplicates: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			return registry.DuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
+		},
+		ProjectRepair: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
+			return registry.RepairDuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
+		},
 	}
 }
 
@@ -461,6 +469,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
 	checks := []Check{
 		fixStoragePermissions(deps),
+		fixProjectRegistryDuplicates(ctx, repoPath, deps),
 		fixDeliveryConfig(repoPath, deps),
 		fixConductorHookSettings(repoPath, deps),
 		fixConductorHookState(repoPath),
@@ -806,6 +815,12 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ProjectShow == nil {
 		deps.ProjectShow = defaults.ProjectShow
+	}
+	if deps.ProjectDuplicates == nil {
+		deps.ProjectDuplicates = defaults.ProjectDuplicates
+	}
+	if deps.ProjectRepair == nil {
+		deps.ProjectRepair = defaults.ProjectRepair
 	}
 	return deps
 }
@@ -1164,6 +1179,26 @@ func fixStoragePermissions(deps Deps) Check {
 	}
 }
 
+func fixProjectRegistryDuplicates(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	path, err := resolvedStoragePath(deps)
+	if err != nil {
+		return Check{Name: "fix project registry duplicates", Status: StatusWarn, Message: fmt.Sprintf("could not resolve storage path: %v", err)}
+	}
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists || !health.OK {
+		return Check{Name: "fix project registry duplicates", Status: StatusInfo, Message: "skipped; healthy project registry storage is not available"}
+	}
+	repaired, err := deps.ProjectRepair(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{Name: "fix project registry duplicates", Status: StatusWarn, Message: fmt.Sprintf("could not repair duplicate physical project identities: %v", err)}
+	}
+	if len(repaired) == 0 {
+		return Check{Name: "fix project registry duplicates", Status: StatusOK, Message: "no duplicate physical project identities found"}
+	}
+	return Check{Name: "fix project registry duplicates", Status: StatusOK, Message: fmt.Sprintf("reconciled %d duplicate physical project identity group(s)", len(repaired))}
+}
+
 func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check {
 	deps = normalizeDeps(deps)
 	layout, err := home.Resolve(home.Deps{
@@ -1198,6 +1233,21 @@ func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check
 			Name:    "project registry",
 			Status:  StatusWarn,
 			Message: fmt.Sprintf("could not inspect project registry because storage is unhealthy: %s", firstNonEmpty(health.Message, "unhealthy")),
+		}
+	}
+	duplicates, err := deps.ProjectDuplicates(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect duplicate physical project identities: %v", err),
+		}
+	}
+	if len(duplicates) > 0 {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("found %d duplicate physical project identity group(s); run: loopcoder doctor --repo . --fix", len(duplicates)),
 		}
 	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
@@ -1347,6 +1397,20 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 		return RuntimeProjectRegistry{
 			Status:  StatusWarn,
 			Message: "storage is unhealthy; registry could not be inspected",
+		}
+	}
+	duplicates, err := deps.ProjectDuplicates(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
+	if err != nil {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: err.Error(),
+		}
+	}
+	if len(duplicates) > 0 {
+		return RuntimeProjectRegistry{
+			Status:        StatusWarn,
+			ConflictCount: len(duplicates),
+			Message:       "duplicate physical project identities found",
 		}
 	}
 	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})

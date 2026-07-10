@@ -9,17 +9,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/gitremote"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 
 	_ "modernc.org/sqlite"
 )
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 5
+	CurrentSchemaVersion = 6
 
 	driverName = "sqlite"
 )
@@ -190,6 +192,11 @@ var migrations = []migration{
 			`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
 		},
 		apply: rebuildLegacyImportTablesWithoutCascade,
+	},
+	{
+		version: 6,
+		name:    "reconcile physical project identities",
+		apply:   reconcilePhysicalProjectIdentities,
 	},
 }
 
@@ -502,6 +509,141 @@ func rebuildLegacyImportTablesWithoutCascade(ctx context.Context, tx *sql.Tx) er
 	return nil
 }
 
+type storedProjectIdentity struct {
+	id         string
+	canonical  string
+	localPath  string
+	gitRoot    string
+	createdAt  string
+	detachedAt string
+}
+
+func reconcilePhysicalProjectIdentities(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, local_path_canonical, local_path, git_root, created_at, detached_at FROM projects ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var projects []storedProjectIdentity
+	for rows.Next() {
+		var project storedProjectIdentity
+		if err := rows.Scan(&project.id, &project.canonical, &project.localPath, &project.gitRoot, &project.createdAt, &project.detachedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		physical := physicalProjectCanonical(firstNonEmpty(project.gitRoot, project.canonical, project.localPath))
+		if physical != "" {
+			project.canonical = physical
+			projects = append(projects, project)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	byCanonical := map[string][]storedProjectIdentity{}
+	for _, project := range projects {
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET local_path_canonical = ? WHERE id = ?`, project.canonical, project.id); err != nil {
+			return err
+		}
+		byCanonical[project.canonical] = append(byCanonical[project.canonical], project)
+	}
+	for canonical, group := range byCanonical {
+		if len(group) < 2 {
+			continue
+		}
+		sortStoredProjects(group)
+		survivor := group[0]
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET local_path_canonical = ?, detached_at = '' WHERE id = ?`, canonical, survivor.id); err != nil {
+			return err
+		}
+		for _, duplicate := range group[1:] {
+			if err := mergeStoredProjectHistory(ctx, tx, duplicate.id, survivor.id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func physicalProjectCanonical(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	identity, err := pathid.Identity(path)
+	if err != nil {
+		clean := filepath.Clean(path)
+		if abs, absErr := filepath.Abs(clean); absErr == nil {
+			clean = filepath.Clean(abs)
+		}
+		return clean
+	}
+	return identity
+}
+
+func sortStoredProjects(projects []storedProjectIdentity) {
+	sort.Slice(projects, func(i, j int) bool {
+		leftDetached := strings.TrimSpace(projects[i].detachedAt) != ""
+		rightDetached := strings.TrimSpace(projects[j].detachedAt) != ""
+		if leftDetached != rightDetached {
+			return !leftDetached
+		}
+		if projects[i].createdAt != projects[j].createdAt {
+			return projects[i].createdAt < projects[j].createdAt
+		}
+		return projects[i].id < projects[j].id
+	})
+}
+
+func mergeStoredProjectHistory(ctx context.Context, tx *sql.Tx, fromID, toID string) error {
+	if fromID == toID {
+		return nil
+	}
+	for _, statement := range []string{
+		`UPDATE runs SET project_id = ? WHERE project_id = ?`,
+		`UPDATE reports SET project_id = ? WHERE project_id = ?`,
+		`UPDATE OR IGNORE legacy_import_records SET project_id = ? WHERE project_id = ?`,
+		`DELETE FROM legacy_import_records WHERE project_id = ?`,
+	} {
+		args := []any{toID, fromID}
+		if strings.HasPrefix(statement, `DELETE`) {
+			args = []any{fromID}
+		}
+		if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+			return err
+		}
+	}
+	if err := mergeStoredLegacyImportStatus(ctx, tx, fromID, toID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, fromID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func mergeStoredLegacyImportStatus(ctx context.Context, tx *sql.Tx, fromID, toID string) error {
+	var survivorCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`, toID).Scan(&survivorCount); err != nil {
+		return err
+	}
+	if survivorCount == 0 {
+		_, err := tx.ExecContext(ctx, `UPDATE legacy_import_status SET project_id = ? WHERE project_id = ?`, toID, fromID)
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE legacy_import_status SET
+		scanned_count = scanned_count + COALESCE((SELECT scanned_count FROM legacy_import_status WHERE project_id = ?), 0),
+		imported_count = imported_count + COALESCE((SELECT imported_count FROM legacy_import_status WHERE project_id = ?), 0),
+		skipped_count = skipped_count + COALESCE((SELECT skipped_count FROM legacy_import_status WHERE project_id = ?), 0),
+		malformed_count = malformed_count + COALESCE((SELECT malformed_count FROM legacy_import_status WHERE project_id = ?), 0),
+		message = CASE WHEN message = '' THEN 'reconciled duplicate physical project identity' ELSE message || '; reconciled duplicate physical project identity' END
+		WHERE project_id = ?`, fromID, fromID, fromID, fromID, toID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM legacy_import_status WHERE project_id = ?`, fromID)
+	return err
+}
+
 func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 	var exists int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migrations'`).Scan(&exists); err != nil {
@@ -511,6 +653,15 @@ func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 		return 0, nil
 	}
 	return querySchemaVersion(ctx, db)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func txSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {

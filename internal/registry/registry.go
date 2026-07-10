@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitremote"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -121,6 +121,11 @@ func Register(ctx context.Context, opts Options, deps Deps) (RegisterResult, err
 	now := formatTimestamp(normalizeNow(opts.Now)())
 	var result RegisterResult
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
+		if project.IdentitySource == IdentityLocalPath {
+			if err := repairPhysicalIdentityForCanonical(ctx, tx, project.LocalPathCanonical, project.ProjectID); err != nil {
+				return err
+			}
+		}
 		conflicts, err := pathConflicts(ctx, tx, project)
 		if err != nil {
 			return err
@@ -281,10 +286,11 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 	if repoPath == "" {
 		repoPath = "."
 	}
-	absPath, err := filepath.Abs(repoPath)
+	canonical, err := pathid.Canonicalize(repoPath)
 	if err != nil {
 		return Project{}, fmt.Errorf("resolve project path: %w", err)
 	}
+	absPath := canonical.Display
 	info, err := os.Stat(absPath)
 	if err != nil {
 		return Project{}, fmt.Errorf("resolve project path: %w", err)
@@ -292,13 +298,12 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 	if !info.IsDir() {
 		return Project{}, fmt.Errorf("project path is not a directory: %s", absPath)
 	}
-	absPath = filepath.Clean(absPath)
 
 	gitRoot, _ := gitOutput(ctx, deps, absPath, "rev-parse", "--show-toplevel")
 	gitRoot = strings.TrimSpace(gitRoot)
 	if gitRoot != "" {
-		if root, err := filepath.Abs(gitRoot); err == nil {
-			gitRoot = filepath.Clean(root)
+		if root, err := pathid.Display(gitRoot); err == nil {
+			gitRoot = root
 		}
 	}
 	identityPath := absPath
@@ -313,7 +318,8 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 
 	displayName := filepath.Base(identityPath)
 	source := IdentityLocalPath
-	identityKey := "local-path:" + canonicalPath(identityPath)
+	identityCanonical := canonicalPath(identityPath)
+	identityKey := "local-path:" + identityCanonical
 	if normalized != "" {
 		source = IdentityGitRemote
 		identityKey = "git-remote:" + normalized
@@ -329,7 +335,7 @@ func Resolve(ctx context.Context, opts Options, deps Deps) (Project, error) {
 		ProjectID:           projectID(identityKey),
 		DisplayName:         displayName,
 		LocalPath:           absPath,
-		LocalPathCanonical:  canonicalPath(identityPath),
+		LocalPathCanonical:  identityCanonical,
 		GitRoot:             gitRoot,
 		DefaultBranch:       defaultBranch(ctx, deps, identityPath),
 		RemoteURL:           remoteURLDisplay,
@@ -552,14 +558,269 @@ func projectID(identityKey string) string {
 }
 
 func canonicalPath(path string) string {
-	clean := filepath.Clean(path)
-	if abs, err := filepath.Abs(clean); err == nil {
-		clean = filepath.Clean(abs)
+	identity, err := pathid.Identity(path)
+	if err != nil {
+		clean := filepath.Clean(path)
+		if abs, absErr := filepath.Abs(clean); absErr == nil {
+			clean = filepath.Clean(abs)
+		}
+		return clean
 	}
-	if runtime.GOOS == "windows" {
-		clean = strings.ToLower(clean)
+	return identity
+}
+
+// DuplicatePhysicalIdentity is a set of registry rows that resolve to one
+// physical local path identity.
+type DuplicatePhysicalIdentity struct {
+	Canonical string    `json:"canonical"`
+	Projects  []Project `json:"projects"`
+}
+
+// DuplicatePhysicalIdentities detects duplicate physical project identities.
+func DuplicatePhysicalIdentities(ctx context.Context, opts Options, deps Deps) ([]DuplicatePhysicalIdentity, error) {
+	deps = normalizeDeps(deps)
+	store, err := openStore(ctx, opts, deps)
+	if err != nil {
+		return nil, err
 	}
-	return clean
+	defer store.Close()
+
+	var groups []DuplicatePhysicalIdentity
+	err = store.WithTx(ctx, func(tx storage.Tx) error {
+		projects, err := allProjects(ctx, tx)
+		if err != nil {
+			return err
+		}
+		byCanonical := groupProjectsByPhysicalIdentity(projects)
+		for canonical, projects := range byCanonical {
+			if len(projects) < 2 {
+				continue
+			}
+			groups = append(groups, DuplicatePhysicalIdentity{Canonical: canonical, Projects: projects})
+		}
+		sort.Slice(groups, func(i, j int) bool {
+			return groups[i].Canonical < groups[j].Canonical
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
+// RepairDuplicatePhysicalIdentities reconciles duplicate physical identities
+// without deleting run, report, or import history.
+func RepairDuplicatePhysicalIdentities(ctx context.Context, opts Options, deps Deps) ([]DuplicatePhysicalIdentity, error) {
+	deps = normalizeDeps(deps)
+	store, err := openStore(ctx, opts, deps)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	var repaired []DuplicatePhysicalIdentity
+	err = store.WithTx(ctx, func(tx storage.Tx) error {
+		projects, err := allProjects(ctx, tx)
+		if err != nil {
+			return err
+		}
+		byCanonical := groupProjectsByPhysicalIdentity(projects)
+		for canonical, projects := range byCanonical {
+			if len(projects) < 2 {
+				continue
+			}
+			repaired = append(repaired, DuplicatePhysicalIdentity{Canonical: canonical, Projects: projects})
+			if err := repairProjectGroup(ctx, tx, canonical, projects, ""); err != nil {
+				return err
+			}
+		}
+		sort.Slice(repaired, func(i, j int) bool {
+			return repaired[i].Canonical < repaired[j].Canonical
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repaired, nil
+}
+
+func repairPhysicalIdentityForCanonical(ctx context.Context, tx storage.Tx, canonical, preferredID string) error {
+	canonical = strings.TrimSpace(canonical)
+	if canonical == "" {
+		return nil
+	}
+	projects, err := allProjects(ctx, tx)
+	if err != nil {
+		return err
+	}
+	byCanonical := groupProjectsByPhysicalIdentity(projects)
+	group := byCanonical[canonical]
+	if len(group) == 0 {
+		return nil
+	}
+	needsRepair := len(group) > 1
+	for _, project := range group {
+		if project.LocalPathCanonical != canonical || (preferredID != "" && project.ProjectID != preferredID) {
+			needsRepair = true
+			break
+		}
+	}
+	if !needsRepair {
+		return nil
+	}
+	return repairProjectGroup(ctx, tx, canonical, group, preferredID)
+}
+
+func allProjects(ctx context.Context, tx storage.Tx) ([]Project, error) {
+	rows, err := tx.Query(ctx, `SELECT `+projectSelectColumns+` FROM projects ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list registry projects for physical identity repair: %w", err)
+	}
+	defer rows.Close()
+	var projects []Project
+	for rows.Next() {
+		project, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	return projects, rows.Err()
+}
+
+func groupProjectsByPhysicalIdentity(projects []Project) map[string][]Project {
+	byCanonical := map[string][]Project{}
+	for _, project := range projects {
+		candidate := firstNonEmpty(project.GitRoot, project.LocalPathCanonical, project.LocalPath)
+		canonical := canonicalPath(candidate)
+		if strings.TrimSpace(canonical) == "" {
+			continue
+		}
+		project.LocalPathCanonical = canonical
+		byCanonical[canonical] = append(byCanonical[canonical], project)
+	}
+	for canonical := range byCanonical {
+		sortProjectsForRepair(byCanonical[canonical])
+	}
+	return byCanonical
+}
+
+func repairProjectGroup(ctx context.Context, tx storage.Tx, canonical string, projects []Project, preferredID string) error {
+	if len(projects) == 0 {
+		return nil
+	}
+	sortProjectsForRepair(projects)
+	survivor := projects[0]
+	if preferredID != "" {
+		for _, project := range projects {
+			if project.ProjectID == preferredID {
+				survivor = project
+				break
+			}
+		}
+	}
+	if preferredID != "" && survivor.ProjectID != preferredID {
+		if err := cloneProject(ctx, tx, survivor.ProjectID, preferredID); err != nil {
+			return err
+		}
+		oldID := survivor.ProjectID
+		survivor.ProjectID = preferredID
+		if err := mergeProjectHistory(ctx, tx, oldID, preferredID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE projects SET local_path_canonical = ?, detached_at = CASE WHEN id = ? THEN '' ELSE detached_at END WHERE id = ?`, canonical, survivor.ProjectID, survivor.ProjectID); err != nil {
+		return fmt.Errorf("update survivor project identity: %w", err)
+	}
+	for _, project := range projects {
+		if project.ProjectID == survivor.ProjectID {
+			continue
+		}
+		if err := mergeProjectHistory(ctx, tx, project.ProjectID, survivor.ProjectID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortProjectsForRepair(projects []Project) {
+	sort.Slice(projects, func(i, j int) bool {
+		leftDetached := strings.TrimSpace(projects[i].DetachedAt) != ""
+		rightDetached := strings.TrimSpace(projects[j].DetachedAt) != ""
+		if leftDetached != rightDetached {
+			return !leftDetached
+		}
+		if projects[i].CreatedAt != projects[j].CreatedAt {
+			return projects[i].CreatedAt < projects[j].CreatedAt
+		}
+		return projects[i].ProjectID < projects[j].ProjectID
+	})
+}
+
+func cloneProject(ctx context.Context, tx storage.Tx, fromID, toID string) error {
+	if fromID == toID {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at)
+		SELECT ?, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at FROM projects WHERE id = ?`, toID, fromID); err != nil {
+		return fmt.Errorf("clone project identity %s to %s: %w", fromID, toID, err)
+	}
+	return nil
+}
+
+func mergeProjectHistory(ctx context.Context, tx storage.Tx, fromID, toID string) error {
+	if fromID == toID {
+		return nil
+	}
+	for _, statement := range []string{
+		`UPDATE runs SET project_id = ? WHERE project_id = ?`,
+		`UPDATE reports SET project_id = ? WHERE project_id = ?`,
+		`UPDATE OR IGNORE legacy_import_records SET project_id = ? WHERE project_id = ?`,
+		`DELETE FROM legacy_import_records WHERE project_id = ?`,
+	} {
+		args := []any{toID, fromID}
+		if strings.HasPrefix(statement, `DELETE`) {
+			args = []any{fromID}
+		}
+		if _, err := tx.Exec(ctx, statement, args...); err != nil {
+			return fmt.Errorf("merge project history %s into %s: %w", fromID, toID, err)
+		}
+	}
+	if err := mergeLegacyImportStatus(ctx, tx, fromID, toID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM projects WHERE id = ?`, fromID); err != nil {
+		return fmt.Errorf("remove duplicate project %s after history merge: %w", fromID, err)
+	}
+	return nil
+}
+
+func mergeLegacyImportStatus(ctx context.Context, tx storage.Tx, fromID, toID string) error {
+	var survivorCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`, toID).Scan(&survivorCount); err != nil {
+		return err
+	}
+	if survivorCount == 0 {
+		if _, err := tx.Exec(ctx, `UPDATE legacy_import_status SET project_id = ? WHERE project_id = ?`, toID, fromID); err != nil {
+			return fmt.Errorf("reassign legacy import status %s into %s: %w", fromID, toID, err)
+		}
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE legacy_import_status SET
+		scanned_count = scanned_count + COALESCE((SELECT scanned_count FROM legacy_import_status WHERE project_id = ?), 0),
+		imported_count = imported_count + COALESCE((SELECT imported_count FROM legacy_import_status WHERE project_id = ?), 0),
+		skipped_count = skipped_count + COALESCE((SELECT skipped_count FROM legacy_import_status WHERE project_id = ?), 0),
+		malformed_count = malformed_count + COALESCE((SELECT malformed_count FROM legacy_import_status WHERE project_id = ?), 0),
+		message = CASE WHEN message = '' THEN 'reconciled duplicate physical project identity' ELSE message || '; reconciled duplicate physical project identity' END
+		WHERE project_id = ?`, fromID, fromID, fromID, fromID, toID); err != nil {
+		return fmt.Errorf("merge legacy import status %s into %s: %w", fromID, toID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM legacy_import_status WHERE project_id = ?`, fromID); err != nil {
+		return fmt.Errorf("remove duplicate legacy import status %s: %w", fromID, err)
+	}
+	return nil
 }
 
 func gitOutput(ctx context.Context, deps Deps, repoPath string, args ...string) (string, error) {
@@ -586,6 +847,15 @@ func ambiguousProjectError(project Project, conflicts []Project) error {
 	}
 	sort.Strings(ids)
 	return fmt.Errorf("project identity is ambiguous: local path %s is already registered to project(s) %s; remove or inspect the conflicting registry entry before registering %s", project.LocalPathCanonical, strings.Join(ids, ", "), project.ProjectID)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func normalizeDeps(deps Deps) Deps {
