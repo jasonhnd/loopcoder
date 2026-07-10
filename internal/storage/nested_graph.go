@@ -24,14 +24,15 @@ type RunNode struct {
 // ChildPlanRecord is the accepted child-plan envelope persisted before any
 // child run is launched.
 type ChildPlanRecord struct {
-	PlanID         string
-	ParentRunID    string
-	RootRunID      string
-	SchemaVersion  string
-	MaxDepth       int
-	MaxConcurrency int
-	PlanJSON       string
-	CreatedAt      string
+	PlanID          string
+	ParentRunID     string
+	RootRunID       string
+	SchemaVersion   string
+	MaxDepth        int
+	MaxConcurrency  int
+	PlanJSON        string
+	PlanFingerprint string
+	CreatedAt       string
 }
 
 // RunEdgeRecord describes one parent-child relationship created from a plan.
@@ -49,6 +50,101 @@ type RunEdgeRecord struct {
 	Status          string
 	CreatedAt       string
 	UpdatedAt       string
+}
+
+// ChildPlanSnapshot is the durable SQLite view of one accepted child plan.
+type ChildPlanSnapshot struct {
+	Plan  ChildPlanRecord
+	Edges []RunEdgeSnapshot
+}
+
+// RunEdgeSnapshot is one persisted child edge and the current child run state.
+type RunEdgeSnapshot struct {
+	RunEdgeRecord
+	RunStatus string
+	StartedAt string
+	EndedAt   string
+}
+
+// LoadChildPlanSnapshot returns the authoritative child-plan graph for planID.
+func LoadChildPlanSnapshot(ctx context.Context, store Store, planID string) (ChildPlanSnapshot, bool, error) {
+	if store == nil {
+		return ChildPlanSnapshot{}, false, nil
+	}
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
+		return ChildPlanSnapshot{}, false, fmt.Errorf("load child plan snapshot: plan_id is required")
+	}
+	var snapshot ChildPlanSnapshot
+	found := false
+	err := store.WithTx(ctx, func(tx Tx) error {
+		var fingerprint string
+		err := tx.QueryRow(ctx, `SELECT plan_id, parent_run_id, root_run_id, schema_version, max_depth, max_concurrency, plan_json, plan_fingerprint, created_at
+			FROM child_plans WHERE plan_id = ?`, planID).Scan(
+			&snapshot.Plan.PlanID,
+			&snapshot.Plan.ParentRunID,
+			&snapshot.Plan.RootRunID,
+			&snapshot.Plan.SchemaVersion,
+			&snapshot.Plan.MaxDepth,
+			&snapshot.Plan.MaxConcurrency,
+			&snapshot.Plan.PlanJSON,
+			&fingerprint,
+			&snapshot.Plan.CreatedAt,
+		)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load child plan %q: %w", planID, err)
+		}
+		found = true
+		snapshot.Plan.PlanFingerprint = strings.TrimSpace(fingerprint)
+
+		rows, err := tx.Query(ctx, `SELECT
+				e.parent_run_id, e.child_run_id, e.root_run_id, e.plan_id, e.child_key, e.depth, e.ordinal,
+				e.scope_json, e.permission, e.aggregation_json, e.status, e.created_at, e.updated_at,
+				r.status, COALESCE(r.started_at, ''), COALESCE(r.ended_at, '')
+			FROM run_edges e
+			JOIN runs r ON r.id = e.child_run_id
+			WHERE e.plan_id = ?
+			ORDER BY e.ordinal, e.child_key, e.child_run_id`, planID)
+		if err != nil {
+			return fmt.Errorf("load child plan %q edges: %w", planID, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var edge RunEdgeSnapshot
+			if err := rows.Scan(
+				&edge.ParentRunID,
+				&edge.ChildRunID,
+				&edge.RootRunID,
+				&edge.PlanID,
+				&edge.ChildKey,
+				&edge.Depth,
+				&edge.Ordinal,
+				&edge.ScopeJSON,
+				&edge.Permission,
+				&edge.AggregationJSON,
+				&edge.Status,
+				&edge.CreatedAt,
+				&edge.UpdatedAt,
+				&edge.RunStatus,
+				&edge.StartedAt,
+				&edge.EndedAt,
+			); err != nil {
+				return fmt.Errorf("load child plan %q edge: %w", planID, err)
+			}
+			snapshot.Edges = append(snapshot.Edges, edge)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("load child plan %q edges: %w", planID, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return ChildPlanSnapshot{}, false, err
+	}
+	return snapshot, found, nil
 }
 
 // PersistChildPlanGraph upserts the accepted plan, its child run nodes, and its
@@ -71,18 +167,8 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
 		if err := upsertRunNode(ctx, tx, parent); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO child_plans(plan_id, parent_run_id, root_run_id, schema_version, max_depth, max_concurrency, plan_json, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(plan_id) DO UPDATE SET
-				parent_run_id = excluded.parent_run_id,
-				root_run_id = excluded.root_run_id,
-				schema_version = excluded.schema_version,
-				max_depth = excluded.max_depth,
-				max_concurrency = excluded.max_concurrency,
-				plan_json = excluded.plan_json,
-				created_at = excluded.created_at`,
-			plan.PlanID, plan.ParentRunID, plan.RootRunID, plan.SchemaVersion, plan.MaxDepth, plan.MaxConcurrency, plan.PlanJSON, plan.CreatedAt); err != nil {
-			return fmt.Errorf("persist child plan %s: %w", plan.PlanID, err)
+		if err := persistChildPlanRecord(ctx, tx, plan); err != nil {
+			return err
 		}
 		for i, child := range children {
 			if err := upsertRunNode(ctx, tx, child); err != nil {
@@ -94,6 +180,30 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
 		}
 		return nil
 	})
+}
+
+func persistChildPlanRecord(ctx context.Context, tx Tx, plan ChildPlanRecord) error {
+	existing, ok, err := lookupChildPlanRecord(ctx, tx, plan.PlanID)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if err := validateExistingChildPlanRecord(plan, existing); err != nil {
+			return err
+		}
+		if existing.PlanFingerprint == "" && strings.TrimSpace(plan.PlanFingerprint) != "" {
+			if _, err := tx.Exec(ctx, `UPDATE child_plans SET plan_fingerprint = ? WHERE plan_id = ?`, plan.PlanFingerprint, plan.PlanID); err != nil {
+				return fmt.Errorf("persist child plan %s fingerprint: %w", plan.PlanID, err)
+			}
+		}
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO child_plans(plan_id, parent_run_id, root_run_id, schema_version, max_depth, max_concurrency, plan_json, plan_fingerprint, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		plan.PlanID, plan.ParentRunID, plan.RootRunID, plan.SchemaVersion, plan.MaxDepth, plan.MaxConcurrency, plan.PlanJSON, plan.PlanFingerprint, plan.CreatedAt); err != nil {
+		return fmt.Errorf("persist child plan %s: %w", plan.PlanID, err)
+	}
+	return nil
 }
 
 func validateChildPlanGraph(ctx context.Context, tx Tx, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
@@ -269,7 +379,11 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 		ON CONFLICT(id) DO UPDATE SET
 			project_id = COALESCE(NULLIF(excluded.project_id, ''), runs.project_id),
 			parent_run_id = COALESCE(NULLIF(excluded.parent_run_id, ''), runs.parent_run_id),
-			status = CASE WHEN excluded.status <> '' THEN excluded.status ELSE runs.status END,
+			status = CASE
+				WHEN runs.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human') THEN runs.status
+				WHEN excluded.status <> '' THEN excluded.status
+				ELSE runs.status
+			END,
 			started_at = COALESCE(NULLIF(runs.started_at, ''), NULLIF(excluded.started_at, '')),
 			updated_at = CASE WHEN excluded.updated_at <> '' THEN excluded.updated_at ELSE runs.updated_at END,
 			root_run_id = CASE WHEN excluded.root_run_id <> '' THEN excluded.root_run_id ELSE runs.root_run_id END,
@@ -313,7 +427,10 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
 			scope_json = excluded.scope_json,
 			permission = excluded.permission,
 			aggregation_json = excluded.aggregation_json,
-			status = excluded.status,
+			status = CASE
+				WHEN run_edges.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human') THEN run_edges.status
+				ELSE excluded.status
+			END,
 			updated_at = excluded.updated_at`,
 		edge.ParentRunID, edge.ChildRunID, edge.CreatedAt, edge.RootRunID, edge.PlanID, edge.ChildKey, edge.Depth, edge.Ordinal, edge.ScopeJSON, edge.Permission, edge.AggregationJSON, edge.Status, edge.UpdatedAt)
 	if err != nil {
@@ -334,6 +451,29 @@ type storedRunEdge struct {
 	ChildRunID  string
 	RootRunID   string
 	Depth       int
+}
+
+func lookupChildPlanRecord(ctx context.Context, tx Tx, planID string) (ChildPlanRecord, bool, error) {
+	var plan ChildPlanRecord
+	err := tx.QueryRow(ctx, `SELECT plan_id, parent_run_id, root_run_id, schema_version, max_depth, max_concurrency, plan_json, plan_fingerprint, created_at
+		FROM child_plans WHERE plan_id = ?`, planID).Scan(
+		&plan.PlanID,
+		&plan.ParentRunID,
+		&plan.RootRunID,
+		&plan.SchemaVersion,
+		&plan.MaxDepth,
+		&plan.MaxConcurrency,
+		&plan.PlanJSON,
+		&plan.PlanFingerprint,
+		&plan.CreatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ChildPlanRecord{}, false, nil
+		}
+		return ChildPlanRecord{}, false, fmt.Errorf("inspect child plan %q: %w", planID, err)
+	}
+	return plan, true, nil
 }
 
 func lookupRunNode(ctx context.Context, tx Tx, runID string) (storedRunNode, bool, error) {
@@ -360,6 +500,33 @@ func lookupRunEdge(ctx context.Context, tx Tx, parentRunID, childRunID string) (
 		return storedRunEdge{}, false, fmt.Errorf("inspect run edge %q/%q: %w", parentRunID, childRunID, err)
 	}
 	return edge, true, nil
+}
+
+func validateExistingChildPlanRecord(desired, existing ChildPlanRecord) error {
+	checks := []struct {
+		field string
+		want  string
+		got   string
+	}{
+		{"parent_run_id", desired.ParentRunID, existing.ParentRunID},
+		{"root_run_id", desired.RootRunID, existing.RootRunID},
+		{"schema_version", desired.SchemaVersion, existing.SchemaVersion},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.want) != strings.TrimSpace(check.got) {
+			return fmt.Errorf("persist child plan graph: plan_id %q already exists with different %s: %q != %q", desired.PlanID, check.field, check.got, check.want)
+		}
+	}
+	if desired.MaxDepth != existing.MaxDepth {
+		return fmt.Errorf("persist child plan graph: plan_id %q already exists with different max_depth: %d != %d", desired.PlanID, existing.MaxDepth, desired.MaxDepth)
+	}
+	if desired.MaxConcurrency != existing.MaxConcurrency {
+		return fmt.Errorf("persist child plan graph: plan_id %q already exists with different max_concurrency: %d != %d", desired.PlanID, existing.MaxConcurrency, desired.MaxConcurrency)
+	}
+	if strings.TrimSpace(existing.PlanFingerprint) != "" && strings.TrimSpace(desired.PlanFingerprint) != "" && existing.PlanFingerprint != desired.PlanFingerprint {
+		return fmt.Errorf("persist child plan graph: plan_id %q already exists with different plan_fingerprint; use a new plan_id for revised child plans", desired.PlanID)
+	}
+	return nil
 }
 
 func validateExistingRunCompatible(kind string, desired RunNode, existing storedRunNode) error {

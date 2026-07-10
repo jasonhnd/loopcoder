@@ -210,6 +210,7 @@ CREATE TABLE child_plans (
   max_depth INTEGER NOT NULL,
   max_concurrency INTEGER NOT NULL,
   plan_json TEXT NOT NULL,
+  plan_fingerprint TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 
@@ -245,6 +246,11 @@ Required storage invariants:
 - `ordinal` is assigned from the ordered child plan item list and is stable for
   deterministic report rendering.
 - The storage layer MUST reject cycles.
+- `plan_fingerprint` is immutable for a `plan_id`. It is computed from the
+  normalized child-plan contract excluding generated child `run_id` values. A
+  replay with the same `plan_id` and a different fingerprint MUST fail closed
+  with a diagnostic naming the first differing plan field and instructing the
+  caller to use a new `plan_id` for a revised plan.
 
 The v0.7 SQLite migration is additive over the existing storage schema: `runs`
 keeps its established primary key column name `id`, and v7 adds
@@ -260,6 +266,16 @@ events, and by writing terminal SQL edge/run status before emitting terminal
 compatibility events. Status/report tree renderers may continue to read the
 compatibility mirror until their storage read path is replaced, but the SQL
 graph is the authoritative recovery source for accepted plans and edges.
+
+Replay is also SQL-first. Before generating a missing child `run_id`, the
+scheduler MUST load existing edges by `(plan_id, child_key)` and reuse the
+persisted child run identity, ordinal, parent/root/depth, scope, permission, and
+aggregation contract. Succeeded children are reported as `reused` and are not
+executed again. Queued or running children are reported as `resumed` and continue
+with the persisted `run_id`. Failed, cancelled, timed-out, abandoned, and
+needs-human children are reported as `blocked`; they require an explicit recovery
+action or a revised plan with a new `plan_id` rather than unbounded automatic
+retry.
 
 ## Report JSON Contract
 

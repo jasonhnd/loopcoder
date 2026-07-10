@@ -4359,6 +4359,89 @@ func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
 	}
 }
 
+func TestNestedRunReplaysSamePlanFileWithoutChildRunIDs(t *testing.T) {
+	loopHome := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", loopHome)
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	plan := orchestration.ChildPlan{
+		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
+		PlanID:         "plan-cli-replay",
+		ParentRunID:    state.RunIDForWave(fixedCLINow()),
+		RootRunID:      state.RunIDForWave(fixedCLINow()),
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
+		Items: []orchestration.ChildRunPlan{
+			nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+		},
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planPath := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(planPath, data, 0o644); err != nil {
+		t.Fatalf("write plan: %v", err)
+	}
+
+	dispatches := 0
+	deps := Deps{
+		Now: fixedCLINow,
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatches++
+			record := validDispatchReport()
+			record.Provider = opts.Provider
+			record.WorkID = opts.RunID
+			record.Issue = opts.IssueNumber
+			return worker.Result{
+				OK:          true,
+				Issue:       opts.IssueNumber,
+				Branch:      opts.Branch,
+				RunID:       opts.RunID,
+				Summary:     "nested alpha",
+				AttemptPath: filepath.Join(repo, ".loopcoder", "runs", opts.RunID, "workers", "job.attempt.json"),
+				Status:      "succeeded",
+				ExitCode:    0,
+				LogBytes:    1,
+				Report:      &record,
+			}, nil
+		},
+	}
+
+	run := func() orchestration.NestedScheduleReport {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, deps)
+		if exitCode != 0 {
+			t.Fatalf("RunWithDeps returned exit code %d, stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+		}
+		var report orchestration.NestedScheduleReport
+		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+			t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+		}
+		return report
+	}
+	first := run()
+	second := run()
+	if dispatches != 1 {
+		t.Fatalf("dispatches = %d, want second invocation to reuse durable success", dispatches)
+	}
+	if len(first.Children) != 1 || len(second.Children) != 1 {
+		t.Fatalf("reports = %#v / %#v", first.Children, second.Children)
+	}
+	if first.Children[0].RunID == "" || first.Children[0].RunID != second.Children[0].RunID {
+		t.Fatalf("run IDs first/second = %q/%q, want stable", first.Children[0].RunID, second.Children[0].RunID)
+	}
+	if second.Children[0].ReplayAction != orchestration.NestedReplayReused {
+		t.Fatalf("second replay action = %q, want reused", second.Children[0].ReplayAction)
+	}
+	assertStorageCounts(t, filepath.Join(loopHome, "data", "loopcoder.db"), 1, 1)
+}
+
 func TestNestedRunRejectsWriteCapableWorkerBeforeDispatch(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer

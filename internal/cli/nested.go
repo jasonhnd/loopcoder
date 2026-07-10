@@ -565,6 +565,9 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	)
 	for _, child := range report.Children {
 		line := fmt.Sprintf("- %s %s %s", child.ChildKey, child.RunID, child.Status)
+		if child.ReplayAction != "" {
+			line += " action=" + child.ReplayAction
+		}
 		if child.Error != "" {
 			line += " error=" + child.Error
 		}
@@ -576,7 +579,7 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	case orchestration.NestedStatusNeedsHuman:
 		fmt.Fprintln(&b, "Next: inspect needs-human child records before resuming the parent.")
 	default:
-		fmt.Fprintln(&b, "Next: inspect failed child records, then rerun the same plan to resume completed children without duplicating them.")
+		fmt.Fprintln(&b, "Next: rerun the same plan to reuse succeeded children and resume queued/running children; failed, cancelled, timed-out, and needs-human children require explicit recovery or a new plan_id.")
 	}
 	return b.String()
 }

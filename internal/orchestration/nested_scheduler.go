@@ -32,6 +32,11 @@ const (
 	NestedEventChildRunning  = "nested.child.running"
 	NestedEventChildFinished = "nested.child.finished"
 	NestedEventParentDone    = "nested.parent.finished"
+
+	NestedReplayDispatched = "dispatched"
+	NestedReplayReused     = "reused"
+	NestedReplayResumed    = "resumed"
+	NestedReplayBlocked    = "blocked"
 )
 
 type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
@@ -113,6 +118,7 @@ type ChildRunResult struct {
 	AttemptPath         string           `json:"attempt_path,omitempty"`
 	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
 	Report              *reporter.Report `json:"report,omitempty"`
+	ReplayAction        string           `json:"replay_action,omitempty"`
 }
 
 type NestedSummary struct {
@@ -208,7 +214,15 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	if len(plan.Items) > opts.MaxChildren {
 		return NestedScheduleReport{}, fmt.Errorf("child run count %d exceeds max children %d", len(plan.Items), opts.MaxChildren)
 	}
-	children, err := normalizeChildRunPlans(plan.Items, opts, started)
+	preExistingChildren, err := applyPersistedChildPlanReplay(ctx, opts.Store, plan)
+	if err != nil {
+		return NestedScheduleReport{}, err
+	}
+	identityTime := started
+	if parsed, err := state.ParseTimestamp(plan.CreatedAt); err == nil {
+		identityTime = parsed
+	}
+	children, err := normalizeChildRunPlans(plan.Items, opts, identityTime)
 	if err != nil {
 		return NestedScheduleReport{}, err
 	}
@@ -216,13 +230,42 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	if err := persistAcceptedChildPlan(ctx, opts, *plan, started); err != nil {
 		return NestedScheduleReport{}, err
 	}
+	snapshotByKey, err := loadPersistedChildReplayState(ctx, opts.Store, plan.PlanID)
+	if err != nil {
+		return NestedScheduleReport{}, err
+	}
 	results := make([]ChildRunResult, len(children))
+	replayActions := make([]string, len(children))
 	dispatchJobs := make([]int, 0, len(children))
 	plannedAttempts := 0
 	for i, child := range children {
 		result := childResultFromPlan(child)
+		result.ReplayAction = NestedReplayDispatched
+		if replay, ok := snapshotByKey[child.ChildKey]; ok && preExistingChildren[child.ChildKey] {
+			result = applyChildReplayState(result, replay)
+		}
+		replayActions[i] = result.ReplayAction
 		if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildQueued, started); err != nil {
 			return NestedScheduleReport{}, err
+		}
+		switch result.ReplayAction {
+		case NestedReplayReused, NestedReplayBlocked:
+			if result.FinishedAt == "" {
+				result.FinishedAt = state.FormatTimestamp(started)
+			}
+			if result.ReplayAction == NestedReplayBlocked && result.Error == "" {
+				result.Error = fmt.Sprintf("blocked: previous child status %q requires human recovery or a new plan_id", result.Status)
+			}
+			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildFinished, started); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			results[i] = result
+			continue
+		case NestedReplayResumed:
+			// Continue through guardrails and executor using the durable child run id.
 		}
 		if blocked, ok, err := evaluateNestedBudget(opts, child, plannedAttempts, started); err != nil {
 			result.Status = NestedStatusNeedsHuman
@@ -293,6 +336,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	runChild := func(index int) {
 		child := children[index]
 		result := childResultFromPlan(child)
+		result.ReplayAction = replayActions[index]
 		result.Status = NestedStatusFailed
 		result.StartedAt = state.FormatTimestamp(clock())
 		eventMu.Lock()
@@ -442,6 +486,124 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 	return out, nil
 }
 
+func applyPersistedChildPlanReplay(ctx context.Context, store storage.Store, plan *ChildPlan) (map[string]bool, error) {
+	preExisting := map[string]bool{}
+	if store == nil || plan == nil {
+		return preExisting, nil
+	}
+	fingerprint, _, err := childPlanFingerprint(*plan)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, ok, err := storage.LoadChildPlanSnapshot(ctx, store, plan.PlanID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return preExisting, nil
+	}
+	existingFingerprint := strings.TrimSpace(snapshot.Plan.PlanFingerprint)
+	if existingFingerprint == "" {
+		existingFingerprint, _, err = fingerprintFromStoredChildPlan(snapshot.Plan.PlanJSON)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if existingFingerprint != fingerprint {
+		field, fieldErr := childPlanMutationField(snapshot.Plan.PlanJSON, *plan)
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		if field == "" {
+			field = "plan_fingerprint"
+		}
+		return nil, fmt.Errorf("child plan %q already exists with different %s; use a new plan_id for revised child plans", plan.PlanID, field)
+	}
+	edgeByKey := map[string]storage.RunEdgeSnapshot{}
+	for _, edge := range snapshot.Edges {
+		edgeByKey[edge.ChildKey] = edge
+		preExisting[edge.ChildKey] = true
+	}
+	for i := range plan.Items {
+		item := &plan.Items[i]
+		edge, ok := edgeByKey[item.ChildKey]
+		if !ok {
+			return nil, fmt.Errorf("child plan %q replay is missing persisted child_key %q", plan.PlanID, item.ChildKey)
+		}
+		if explicit := strings.TrimSpace(item.RunID); explicit != "" && explicit != edge.ChildRunID {
+			return nil, fmt.Errorf("child plan %q child_key %q already exists with run_id %q; supplied run_id %q is incompatible", plan.PlanID, item.ChildKey, edge.ChildRunID, explicit)
+		}
+		item.RunID = edge.ChildRunID
+		item.Ordinal = edge.Ordinal
+		item.Depth = edge.Depth
+		item.Permission = edge.Permission
+		if strings.TrimSpace(edge.ScopeJSON) != "" {
+			var scope ChildScope
+			if err := json.Unmarshal([]byte(edge.ScopeJSON), &scope); err != nil {
+				return nil, fmt.Errorf("decode persisted scope for child %q: %w", item.ChildKey, err)
+			}
+			item.Scope = scope
+			item.Issue = firstPositive(item.Issue, firstScopeIssue(scope))
+			item.ScopeIssues = append([]int(nil), scope.Issues...)
+		}
+		if strings.TrimSpace(edge.AggregationJSON) != "" {
+			var aggregation ChildAggregation
+			if err := json.Unmarshal([]byte(edge.AggregationJSON), &aggregation); err != nil {
+				return nil, fmt.Errorf("decode persisted aggregation for child %q: %w", item.ChildKey, err)
+			}
+			item.Aggregation = aggregation
+			item.Required = aggregation.Required
+			item.Optional = !aggregation.Required
+		}
+	}
+	return preExisting, nil
+}
+
+func fingerprintFromStoredChildPlan(planJSON string) (string, string, error) {
+	var plan ChildPlan
+	if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
+		return "", "", fmt.Errorf("decode persisted child plan: %w", err)
+	}
+	if err := ValidateChildPlan(&plan); err != nil {
+		return "", "", fmt.Errorf("validate persisted child plan: %w", err)
+	}
+	return childPlanFingerprint(plan)
+}
+
+func loadPersistedChildReplayState(ctx context.Context, store storage.Store, planID string) (map[string]storage.RunEdgeSnapshot, error) {
+	out := map[string]storage.RunEdgeSnapshot{}
+	if store == nil {
+		return out, nil
+	}
+	snapshot, ok, err := storage.LoadChildPlanSnapshot(ctx, store, planID)
+	if err != nil || !ok {
+		return out, err
+	}
+	for _, edge := range snapshot.Edges {
+		out[edge.ChildKey] = edge
+	}
+	return out, nil
+}
+
+func applyChildReplayState(result ChildRunResult, edge storage.RunEdgeSnapshot) ChildRunResult {
+	status := normalizeNestedStatus(firstNonEmptyChild(edge.RunStatus, edge.Status))
+	if status == "" {
+		status = NestedStatusQueued
+	}
+	result.Status = status
+	result.StartedAt = strings.TrimSpace(edge.StartedAt)
+	result.FinishedAt = strings.TrimSpace(edge.EndedAt)
+	switch status {
+	case NestedStatusSucceeded:
+		result.ReplayAction = NestedReplayReused
+	case NestedStatusNeedsHuman, NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned:
+		result.ReplayAction = NestedReplayBlocked
+	default:
+		result.ReplayAction = NestedReplayResumed
+	}
+	return result
+}
+
 func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, started time.Time) error {
 	if opts.Store == nil {
 		return nil
@@ -449,6 +611,10 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
 		return fmt.Errorf("marshal accepted child plan: %w", err)
+	}
+	fingerprint, _, err := childPlanFingerprint(plan)
+	if err != nil {
+		return err
 	}
 	createdAt := state.FormatTimestamp(started)
 	parent := storage.RunNode{
@@ -498,14 +664,15 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 		})
 	}
 	return storage.PersistChildPlanGraph(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
-		PlanID:         plan.PlanID,
-		ParentRunID:    plan.ParentRunID,
-		RootRunID:      plan.RootRunID,
-		SchemaVersion:  plan.SchemaVersion,
-		MaxDepth:       plan.MaxDepth,
-		MaxConcurrency: plan.MaxConcurrency,
-		PlanJSON:       string(planJSON),
-		CreatedAt:      createdAt,
+		PlanID:          plan.PlanID,
+		ParentRunID:     plan.ParentRunID,
+		RootRunID:       plan.RootRunID,
+		SchemaVersion:   plan.SchemaVersion,
+		MaxDepth:        plan.MaxDepth,
+		MaxConcurrency:  plan.MaxConcurrency,
+		PlanJSON:        string(planJSON),
+		PlanFingerprint: fingerprint,
+		CreatedAt:       createdAt,
 	}, edges)
 }
 

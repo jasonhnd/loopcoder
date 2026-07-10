@@ -84,6 +84,9 @@ func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
 	if !tableExists(t, store, "child_plans") {
 		t.Fatalf("missing child_plans table")
 	}
+	if !tableColumnExists(t, store, "child_plans", "plan_fingerprint") {
+		t.Fatal("missing migrated child_plans column plan_fingerprint")
+	}
 	var rootRunID string
 	if err := store.WithTx(ctx, func(tx Tx) error {
 		return tx.QueryRow(ctx, `SELECT root_run_id FROM runs WHERE id = 'run-20260709T000000Z-wave'`).Scan(&rootRunID)

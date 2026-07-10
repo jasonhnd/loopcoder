@@ -21,7 +21,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 7
+	CurrentSchemaVersion = 8
 
 	driverName = "sqlite"
 )
@@ -237,6 +237,14 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_run_edges_plan_id ON run_edges(plan_id)`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_plan_child_key ON run_edges(plan_id, child_key) WHERE plan_id <> '' AND child_key <> ''`,
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
+		},
+	},
+	{
+		version: 8,
+		name:    "nested child plan immutable fingerprint",
+		statements: []string{
+			`ALTER TABLE child_plans ADD COLUMN plan_fingerprint TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_child_plans_plan_fingerprint ON child_plans(plan_fingerprint)`,
 		},
 	},
 }

@@ -683,21 +683,33 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
 			Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
 		}},
 	}
+	planData, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
 	executions := 0
-	run := func() {
+	var firstRunID string
+	run := func() NestedScheduleReport {
 		t.Helper()
+		var parsed ChildPlan
+		if err := json.Unmarshal(planData, &parsed); err != nil {
+			t.Fatalf("unmarshal plan: %v", err)
+		}
+		if err := ValidateChildPlan(&parsed); err != nil {
+			t.Fatalf("ValidateChildPlan: %v", err)
+		}
 		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 			RepoPath:    repo,
 			MaxChildren: 1,
 			Now:         nestedTestNow(),
 			Clock:       func() time.Time { return nestedTestNow() },
-			Plan:        &plan,
+			Plan:        &parsed,
 			Store:       store,
 			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
 				executions++
 				var count int
 				if err := store.WithTx(ctx, func(tx storage.Tx) error {
-					return tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans WHERE plan_id = ?`, plan.PlanID).Scan(&count)
+					return tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans WHERE plan_id = ?`, parsed.PlanID).Scan(&count)
 				}); err != nil {
 					t.Fatalf("query child_plans during execute: %v", err)
 				}
@@ -713,11 +725,22 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
 		if report.Status != NestedStatusSucceeded {
 			t.Fatalf("status = %s, want succeeded", report.Status)
 		}
+		return report
 	}
-	run()
-	run()
-	if executions != 2 {
-		t.Fatalf("executions = %d, want replay to execute same child twice without duplicating graph", executions)
+	first := run()
+	if len(first.Children) != 1 || first.Children[0].ReplayAction != NestedReplayDispatched {
+		t.Fatalf("first child replay action = %#v, want dispatched", first.Children)
+	}
+	firstRunID = first.Children[0].RunID
+	second := run()
+	if len(second.Children) != 1 || second.Children[0].ReplayAction != NestedReplayReused {
+		t.Fatalf("second child replay action = %#v, want reused", second.Children)
+	}
+	if second.Children[0].RunID != firstRunID {
+		t.Fatalf("replayed run_id = %q, want original %q", second.Children[0].RunID, firstRunID)
+	}
+	if executions != 1 {
+		t.Fatalf("executions = %d, want replay to reuse succeeded child without re-executing", executions)
 	}
 	var plans, runs, edges int
 	var edgeStatus string
@@ -744,6 +767,176 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
 	events := readNestedEvents(t, repo, plan.ParentRunID)
 	if !strings.Contains(events, NestedEventChildQueued) || !strings.Contains(events, NestedEventChildFinished) || !strings.Contains(events, `"status":"succeeded"`) {
 		t.Fatalf("compatibility events do not mirror durable success:\n%s", events)
+	}
+}
+
+func TestScheduleNestedRunsRejectsPersistedPlanMutation(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := replayTestPlan("plan-mutation")
+	if _, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath: repo, MaxChildren: 1, Now: nestedTestNow(), Clock: func() time.Time { return nestedTestNow() },
+		Plan: &plan, Store: store,
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	}); err != nil {
+		t.Fatalf("initial ScheduleNestedRuns: %v", err)
+	}
+
+	mutated := replayTestPlan("plan-mutation")
+	mutated.Items[0].Title = "Changed title"
+	_, err = ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath: repo, MaxChildren: 1, Now: nestedTestNow(), Clock: func() time.Time { return nestedTestNow() },
+		Plan: &mutated, Store: store,
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			t.Fatal("mutated plan should fail before execution")
+			return ChildRunResult{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "different plan.items[0].title") || !strings.Contains(err.Error(), "new plan_id") {
+		t.Fatalf("mutation error = %v, want precise title diagnostic", err)
+	}
+}
+
+func TestScheduleNestedRunsReplayBlocksPriorTerminalFailures(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	statuses := []string{NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusNeedsHuman}
+	for _, status := range statuses {
+		t.Run(status, func(t *testing.T) {
+			store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+			if err != nil {
+				t.Fatalf("storage.Open: %v", err)
+			}
+			defer store.Close()
+			plan := replayTestPlan("plan-" + status)
+			executions := 0
+			if _, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath: repo, MaxChildren: 1, Now: nestedTestNow(), Clock: func() time.Time { return nestedTestNow() },
+				Plan: &plan, Store: store,
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					executions++
+					return ChildRunResult{Status: status, Error: "terminal"}, nil
+				},
+			}); err != nil {
+				t.Fatalf("initial ScheduleNestedRuns: %v", err)
+			}
+			reparsed := replayTestPlan("plan-" + status)
+			report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath: repo, MaxChildren: 1, Now: nestedTestNow(), Clock: func() time.Time { return nestedTestNow() },
+				Plan: &reparsed, Store: store,
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					executions++
+					return ChildRunResult{Status: NestedStatusSucceeded}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("replay ScheduleNestedRuns: %v", err)
+			}
+			if executions != 1 {
+				t.Fatalf("executions = %d, want terminal replay blocked without re-executing", executions)
+			}
+			if len(report.Children) != 1 || report.Children[0].ReplayAction != NestedReplayBlocked {
+				t.Fatalf("replay child = %#v, want blocked", report.Children)
+			}
+		})
+	}
+}
+
+func TestScheduleNestedRunsConcurrentReplayDoesNotDuplicateGraph(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	planData, err := json.Marshal(replayTestPlan("plan-concurrent"))
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	executions := 0
+	var mu sync.Mutex
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			var plan ChildPlan
+			if err := json.Unmarshal(planData, &plan); err != nil {
+				errs <- err
+				return
+			}
+			if err := ValidateChildPlan(&plan); err != nil {
+				errs <- err
+				return
+			}
+			_, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath: repo, MaxChildren: 1, Now: nestedTestNow(), Clock: func() time.Time { return nestedTestNow() },
+				Plan: &plan, Store: store,
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					mu.Lock()
+					executions++
+					mu.Unlock()
+					return ChildRunResult{Status: NestedStatusSucceeded}, nil
+				},
+			})
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent ScheduleNestedRuns error: %v", err)
+		}
+	}
+	var plans, runs, edges int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM child_plans WHERE plan_id = 'plan-concurrent'`).Scan(&plans); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM runs WHERE root_run_id = 'run-20260709T000000Z-wave'`).Scan(&runs); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_edges WHERE plan_id = 'plan-concurrent'`).Scan(&edges)
+	}); err != nil {
+		t.Fatalf("query graph: %v", err)
+	}
+	if plans != 1 || runs != 2 || edges != 1 {
+		t.Fatalf("graph counts plans/runs/edges = %d/%d/%d, want 1/2/1", plans, runs, edges)
+	}
+	if executions < 1 || executions > 2 {
+		t.Fatalf("executions = %d, want bounded concurrent execution", executions)
+	}
+}
+
+func replayTestPlan(planID string) ChildPlan {
+	return ChildPlan{
+		SchemaVersion:  ChildPlanSchemaVersionV1,
+		PlanID:         planID,
+		ParentRunID:    "run-20260709T000000Z-wave",
+		RootRunID:      "run-20260709T000000Z-wave",
+		ParentDepth:    0,
+		MaxDepth:       2,
+		MaxConcurrency: 1,
+		CreatedAt:      "2026-07-09T00:00:00Z",
+		Items: []ChildRunPlan{{
+			ChildKey: "durable-child", Title: "Durable child", Role: "worker",
+			Scope: ChildScope{Repo: ".", Issues: []int{689}}, Permission: "write", DependsOn: []string{},
+			Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
+		}},
 	}
 }
 
