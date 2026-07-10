@@ -71,12 +71,12 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 	}
 	children := map[string]bool{}
 	for _, child := range lifecycle.ChildRunIDs {
-		if strings.TrimSpace(child) != "" && child != runID {
+		if strings.TrimSpace(child) != "" {
 			children[child] = true
 		}
 	}
 	for _, child := range eventChildren {
-		if strings.TrimSpace(child) != "" && child != runID {
+		if strings.TrimSpace(child) != "" {
 			children[child] = true
 		}
 	}
@@ -94,6 +94,12 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
 		node.LifecycleStatus = "unknown"
 		node.LifecycleSource = "unreadable"
 		node.LastError = lifecycleErr.Error()
+	} else if node.ParentRunID == runID {
+		node.LifecycleStatus = "unknown"
+		node.LastError = "run graph inconsistency: run references itself as parent"
+	} else if children[runID] {
+		node.LifecycleStatus = "unknown"
+		node.LastError = "run graph inconsistency: run references itself as child"
 	} else if node.LifecycleStatus == "" {
 		node.LifecycleStatus = "unknown"
 		if node.LifecycleSource == "" {
@@ -158,7 +164,7 @@ func runEdgesFromEvents(repoPath, runID string) ([]string, string) {
 		if err := json.Unmarshal(event.Details, &details); err != nil {
 			continue
 		}
-		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
+		if strings.TrimSpace(details.ParentRunID) != "" {
 			parent = strings.TrimSpace(details.ParentRunID)
 		}
 		children[details.Child.RunID] = true

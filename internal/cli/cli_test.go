@@ -4204,9 +4204,9 @@ func TestNestedRunDispatchesThreeChildrenConcurrentlyAndHonorsDependencies(t *te
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
-		nestedPlanItem("beta", 702, nil, true, "write", nil),
-		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
+		nestedPlanItemWithoutPathScope("alpha", 701, nil, true, "write", nil),
+		nestedPlanItemWithoutPathScope("beta", 702, nil, true, "write", nil),
+		nestedPlanItemWithoutPathScope("gamma", 703, []string{"alpha"}, true, "write", nil),
 	}, 2)
 
 	startedAlpha := make(chan struct{})
@@ -4324,7 +4324,7 @@ func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+		nestedPlanItemWithoutPathScope("alpha", 701, nil, true, "write", nil),
 	}, 1)
 
 	var got worker.Options
@@ -4387,6 +4387,125 @@ func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 	if !strings.Contains(stderr.String(), "exceeds parent permission") {
 		t.Fatalf("stderr missing permission diagnostic: %q", stderr.String())
 	}
+}
+
+func TestNestedRunRejectsPathScopedWorkerDispatchBeforeProvider(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+	}, 1)
+	called := false
+
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return worker.Result{}, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	if called {
+		t.Fatal("dispatch was called for unsupported path-scoped write child")
+	}
+	if !strings.Contains(stderr.String(), "cannot technically constrain write scope") {
+		t.Fatalf("stderr missing scope contract diagnostic: %q", stderr.String())
+	}
+}
+
+func TestNestedRunRejectsTraversalAbsoluteAndSymlinkEscapesBeforeDispatch(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	cases := []struct {
+		name      string
+		path      string
+		wantError string
+	}{
+		{name: "parent traversal", path: "../outside", wantError: "parent traversal"},
+		{name: "absolute outside", path: filepath.Join(t.TempDir(), "outside.txt"), wantError: "escapes parent repo"},
+		{name: "windows volume", path: `Z:\outside`, wantError: "windows volume escape"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			repo := t.TempDir()
+			item := nestedPlanItem("alpha", 701, nil, true, "write", nil)
+			item.Scope.Paths = []string{tc.path}
+			planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{item}, 1)
+			called := false
+
+			exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath}, &stdout, &stderr, Deps{
+				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+					called = true
+					return worker.Result{}, nil
+				},
+			})
+			if exitCode != 2 {
+				t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q", exitCode, stderr.String())
+			}
+			if called {
+				t.Fatal("dispatch was called despite invalid scope path")
+			}
+			if !strings.Contains(stderr.String(), tc.wantError) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), tc.wantError)
+			}
+		})
+	}
+}
+
+func TestNestedRunRejectsSymlinkEscapeAndAcceptsPhysicalAlias(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "src", "file.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "escape")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(repo, alias); err != nil {
+		t.Skipf("symlink alias unavailable: %v", err)
+	}
+
+	t.Run("escape", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		item := nestedPlanItem("alpha", 701, nil, true, "write", nil)
+		item.Scope.Paths = []string{"escape/file.txt"}
+		planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{item}, 1)
+
+		exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath}, &stdout, &stderr, Deps{})
+		if exitCode != 2 || !strings.Contains(stderr.String(), "escapes parent repo") {
+			t.Fatalf("exit=%d stderr=%q, want symlink escape rejection", exitCode, stderr.String())
+		}
+	})
+	t.Run("alias", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		item := nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"})
+		item.Scope.Repo = alias
+		item.Scope.Paths = []string{filepath.Join(alias, "src", "file.txt")}
+		planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{item}, 1)
+
+		exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--provider", nestedTestSubprocessProvider}, &stdout, &stderr, Deps{Now: fixedCLINow})
+		if exitCode != 0 {
+			t.Fatalf("exit=%d stderr=%q stdout=%q, want physical alias accepted", exitCode, stderr.String(), stdout.String())
+		}
+	})
 }
 
 func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
@@ -5658,6 +5777,12 @@ func nestedPlanItem(key string, issue int, dependsOn []string, required bool, pe
 			IncludeReport: true,
 		},
 	}
+}
+
+func nestedPlanItemWithoutPathScope(key string, issue int, dependsOn []string, required bool, permission string, commands []string) orchestration.ChildRunPlan {
+	item := nestedPlanItem(key, issue, dependsOn, required, permission, commands)
+	item.Scope.Paths = nil
+	return item
 }
 
 func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {

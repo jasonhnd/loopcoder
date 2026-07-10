@@ -348,6 +348,9 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
 	if err := integrityCheck(ctx, db); err != nil {
 		return health, fmt.Errorf("storage health: %w", err)
 	}
+	if err := durableGraphConsistencyCheck(ctx, db); err != nil {
+		return health, fmt.Errorf("storage health: %w", err)
+	}
 	health.OK = true
 	health.Message = "storage database is healthy"
 	return health, nil
@@ -741,6 +744,116 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
 	}
 	if result != "ok" {
 		return fmt.Errorf("integrity_check failed: %s", result)
+	}
+	return nil
+}
+
+func durableGraphConsistencyCheck(ctx context.Context, db *sql.DB) error {
+	type node struct {
+		parent string
+		root   string
+		depth  int
+	}
+	type edge struct {
+		parent  string
+		child   string
+		root    string
+		depth   int
+		ordinal int
+		planID  string
+		key     string
+	}
+	nodes := map[string]node{}
+	rows, err := db.QueryContext(ctx, `SELECT id, COALESCE(parent_run_id, ''), root_run_id, depth FROM runs`)
+	if err != nil {
+		return fmt.Errorf("durable graph: read runs: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		var n node
+		if err := rows.Scan(&id, &n.parent, &n.root, &n.depth); err != nil {
+			rows.Close()
+			return fmt.Errorf("durable graph: scan run: %w", err)
+		}
+		nodes[id] = n
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("durable graph: read runs: %w", err)
+	}
+	var edges []edge
+	childrenByParent := map[string][]string{}
+	rows, err = db.QueryContext(ctx, `SELECT parent_run_id, child_run_id, root_run_id, depth, ordinal, plan_id, child_key FROM run_edges`)
+	if err != nil {
+		return fmt.Errorf("durable graph: read run_edges: %w", err)
+	}
+	for rows.Next() {
+		var e edge
+		if err := rows.Scan(&e.parent, &e.child, &e.root, &e.depth, &e.ordinal, &e.planID, &e.key); err != nil {
+			rows.Close()
+			return fmt.Errorf("durable graph: scan run edge: %w", err)
+		}
+		edges = append(edges, e)
+		childrenByParent[e.parent] = append(childrenByParent[e.parent], e.child)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("durable graph: read run_edges: %w", err)
+	}
+	for _, e := range edges {
+		if e.parent == e.child {
+			return fmt.Errorf("durable graph: self edge %s -> %s", e.parent, e.child)
+		}
+		parent, ok := nodes[e.parent]
+		if !ok {
+			return fmt.Errorf("durable graph: edge %s -> %s references missing parent run", e.parent, e.child)
+		}
+		child, ok := nodes[e.child]
+		if !ok {
+			return fmt.Errorf("durable graph: edge %s -> %s references missing child run", e.parent, e.child)
+		}
+		enriched := strings.TrimSpace(e.root) != "" || strings.TrimSpace(e.planID) != "" || strings.TrimSpace(e.key) != "" || e.ordinal >= 0
+		if !enriched {
+			continue
+		}
+		if strings.TrimSpace(child.parent) != "" && child.parent != e.parent {
+			return fmt.Errorf("durable graph: child run %s parent %s does not match edge parent %s", e.child, child.parent, e.parent)
+		}
+		if strings.TrimSpace(child.parent) == "" {
+			return fmt.Errorf("durable graph: child run %s is missing parent_run_id for enriched edge %s -> %s", e.child, e.parent, e.child)
+		}
+		if e.root != "" && parent.root != "" && e.root != parent.root {
+			return fmt.Errorf("durable graph: edge %s -> %s root %s does not match parent root %s", e.parent, e.child, e.root, parent.root)
+		}
+		if e.root != "" && child.root != "" && e.root != child.root {
+			return fmt.Errorf("durable graph: edge %s -> %s root %s does not match child root %s", e.parent, e.child, e.root, child.root)
+		}
+		if e.depth != child.depth {
+			return fmt.Errorf("durable graph: edge %s -> %s depth %d does not match child depth %d", e.parent, e.child, e.depth, child.depth)
+		}
+	}
+	visiting := map[string]bool{}
+	visited := map[string]bool{}
+	var visit func(string) error
+	visit = func(runID string) error {
+		if visiting[runID] {
+			return fmt.Errorf("durable graph: cycle detected at %s", runID)
+		}
+		if visited[runID] {
+			return nil
+		}
+		visiting[runID] = true
+		for _, child := range childrenByParent[runID] {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		delete(visiting, runID)
+		visited[runID] = true
+		return nil
+	}
+	for runID := range nodes {
+		if err := visit(runID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

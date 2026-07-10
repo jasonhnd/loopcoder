@@ -404,6 +404,8 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 	}
 	out := make([]ChildRunPlan, 0, len(children))
 	seenRunIDs := map[string]bool{}
+	parentRunID := strings.TrimSpace(opts.ParentRunID)
+	rootRunID := strings.TrimSpace(opts.RootRunID)
 	for index, child := range children {
 		child.ChildKey = strings.TrimSpace(child.ChildKey)
 		if child.ChildKey == "" {
@@ -426,6 +428,9 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 		}
 		if !state.IsRunID(child.RunID) {
 			return nil, fmt.Errorf("child %q run id %q is invalid", child.ChildKey, child.RunID)
+		}
+		if child.RunID == parentRunID || child.RunID == rootRunID {
+			return nil, fmt.Errorf("child %q run id %q reuses parent or root run id", child.ChildKey, child.RunID)
 		}
 		if seenRunIDs[child.RunID] {
 			return nil, fmt.Errorf("duplicate child run id %q", child.RunID)

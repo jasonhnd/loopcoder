@@ -84,12 +84,21 @@ func ValidateChildPlan(plan *ChildPlan) error {
 	if plan.ParentRunID == "" {
 		return fmt.Errorf("child plan parent_run_id is required")
 	}
+	if !state.IsRunID(plan.ParentRunID) {
+		return fmt.Errorf("child plan parent_run_id %q is invalid", plan.ParentRunID)
+	}
 	plan.RootRunID = strings.TrimSpace(plan.RootRunID)
 	if plan.RootRunID == "" {
 		return fmt.Errorf("child plan root_run_id is required")
 	}
+	if !state.IsRunID(plan.RootRunID) {
+		return fmt.Errorf("child plan root_run_id %q is invalid", plan.RootRunID)
+	}
 	if plan.ParentDepth < 0 {
 		return fmt.Errorf("child plan parent_depth must be non-negative")
+	}
+	if plan.ParentDepth == 0 && plan.RootRunID != plan.ParentRunID {
+		return fmt.Errorf("child plan depth-0 parent_run_id must equal root_run_id")
 	}
 	if plan.MaxDepth <= 0 {
 		plan.MaxDepth = lcdefaults.NestedSchedulerMaxDepth
@@ -181,6 +190,9 @@ func normalizeAndValidateChildItems(plan *ChildPlan) error {
 		}
 		if strings.TrimSpace(item.RunID) != "" && !state.IsRunID(item.RunID) {
 			return fmt.Errorf("child %q run id %q is invalid", item.ChildKey, item.RunID)
+		}
+		if strings.TrimSpace(item.RunID) == plan.ParentRunID || strings.TrimSpace(item.RunID) == plan.RootRunID {
+			return fmt.Errorf("child %q run id %q reuses parent or root run id", item.ChildKey, item.RunID)
 		}
 	}
 	for _, item := range plan.Items {

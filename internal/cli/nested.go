@@ -17,6 +17,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -248,6 +249,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
 		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
 	}
+	if err := enforceNestedWorkerScopeContract(opts.Provider, &plan); err != nil {
+		fmt.Fprintf(stderr, "nested run: %v\n", err)
+		return 2
+	}
 
 	layout, err := home.Resolve(home.DefaultDeps())
 	if err != nil {
@@ -308,6 +313,9 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		} else if ok {
 			return existing, nil
 		}
+		if child.Permission != string(reporter.PermissionReadOnly) && len(child.Scope.Paths) > 0 {
+			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot technically constrain write scope for child %q; path-scoped write children are unsupported", child.ChildKey)
+		}
 		if child.Permission == string(reporter.PermissionReadOnly) {
 			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot run read-only child %q through write-capable worker dispatch", child.ChildKey)
 		}
@@ -355,6 +363,9 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 			return orchestration.ChildRunResult{}, err
 		} else if ok {
 			return existing, nil
+		}
+		if child.Permission != string(reporter.PermissionReadOnly) {
+			return orchestration.ChildRunResult{}, fmt.Errorf("test-subprocess child %q must be read-only because subprocess commands are not write-scoped", child.ChildKey)
 		}
 		if len(child.Scope.Commands) == 0 {
 			return orchestration.ChildRunResult{}, fmt.Errorf("test-subprocess child %q requires at least one scope.commands entry", child.ChildKey)
@@ -497,6 +508,10 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 }
 
 func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestration.ChildPlan) error {
+	parentIdentity, err := pathid.Identity(repoPath)
+	if err != nil {
+		return fmt.Errorf("scope repo: canonicalize parent repo: %w", err)
+	}
 	for i := range plan.Items {
 		child := &plan.Items[i]
 		if !permissionWithin(parentPermission, child.Permission) {
@@ -506,8 +521,37 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
 		}
-		if !pathWithin(repoPath, childRepo) {
+		childRepoIdentity, err := pathid.Identity(childRepo)
+		if err != nil {
+			return fmt.Errorf("child %q scope.repo: canonicalize %q: %w", child.ChildKey, child.Scope.Repo, err)
+		}
+		if !pathWithin(parentIdentity, childRepoIdentity) {
 			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+		}
+		for _, scopedPath := range child.Scope.Paths {
+			physical, err := resolveNestedScopePath(childRepo, scopedPath)
+			if err != nil {
+				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			if !pathWithin(childRepoIdentity, physical) || !pathWithin(parentIdentity, physical) {
+				return fmt.Errorf("child %q scope.paths %q escapes parent repo %s", child.ChildKey, scopedPath, repoPath)
+			}
+		}
+	}
+	return nil
+}
+
+func enforceNestedWorkerScopeContract(provider string, plan *orchestration.ChildPlan) error {
+	for i := range plan.Items {
+		child := &plan.Items[i]
+		if provider == nestedTestSubprocessProvider {
+			if child.Permission != string(reporter.PermissionReadOnly) {
+				return fmt.Errorf("test-subprocess child %q must be read-only because subprocess commands are not write-scoped", child.ChildKey)
+			}
+			continue
+		}
+		if child.Permission != string(reporter.PermissionReadOnly) && len(child.Scope.Paths) > 0 {
+			return fmt.Errorf("provider dispatch executor cannot technically constrain write scope for child %q; path-scoped write children are unsupported", child.ChildKey)
 		}
 	}
 	return nil
@@ -751,10 +795,38 @@ func resolveNestedChildRepo(repoPath, childRepo string) (string, error) {
 	if childRepo == "" || childRepo == "." {
 		return filepath.Abs(repoPath)
 	}
+	if containsParentTraversal(childRepo) {
+		return "", fmt.Errorf("parent traversal is not allowed")
+	}
+	if hasWindowsVolumePath(childRepo) && !sameWindowsVolume(repoPath, childRepo) {
+		return "", fmt.Errorf("windows volume escape is not allowed")
+	}
 	if filepath.IsAbs(childRepo) {
 		return filepath.Abs(childRepo)
 	}
 	return filepath.Abs(filepath.Join(repoPath, childRepo))
+}
+
+func resolveNestedScopePath(childRepo, scopedPath string) (string, error) {
+	scopedPath = strings.TrimSpace(scopedPath)
+	if scopedPath == "" {
+		return "", fmt.Errorf("empty path is not allowed")
+	}
+	if containsParentTraversal(scopedPath) {
+		return "", fmt.Errorf("parent traversal is not allowed")
+	}
+	if hasWindowsVolumePath(scopedPath) && !sameWindowsVolume(childRepo, scopedPath) {
+		return "", fmt.Errorf("windows volume escape is not allowed")
+	}
+	path := scopedPath
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(childRepo, path)
+	}
+	identity, err := pathid.Identity(path)
+	if err != nil {
+		return "", err
+	}
+	return identity, nil
 }
 
 func pathWithin(parent, child string) bool {
@@ -768,6 +840,42 @@ func pathWithin(parent, child string) bool {
 		return true
 	}
 	return strings.HasPrefix(child, parent+string(filepath.Separator))
+}
+
+func containsParentTraversal(path string) bool {
+	path = strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	for _, part := range strings.Split(path, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWindowsVolumePath(path string) bool {
+	path = strings.TrimSpace(path)
+	if len(path) >= 2 && isASCIILetter(path[0]) && path[1] == ':' {
+		return true
+	}
+	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`)
+}
+
+func sameWindowsVolume(basePath, path string) bool {
+	baseVolume := windowsVolumeName(basePath)
+	pathVolume := windowsVolumeName(path)
+	return pathVolume == "" || (baseVolume != "" && strings.EqualFold(baseVolume, pathVolume))
+}
+
+func windowsVolumeName(path string) string {
+	path = strings.TrimSpace(path)
+	if len(path) >= 2 && isASCIILetter(path[0]) && path[1] == ':' {
+		return strings.ToUpper(path[:2])
+	}
+	return filepath.VolumeName(path)
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
 func shellCommand(ctx context.Context, command string) *exec.Cmd {

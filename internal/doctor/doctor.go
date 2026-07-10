@@ -1629,7 +1629,7 @@ func doctorRunEdgesFromEvents(repoPath, runID string) ([]string, string) {
 		if err := json.Unmarshal(event.Details, &details); err != nil {
 			continue
 		}
-		if strings.TrimSpace(details.ParentRunID) != "" && details.ParentRunID != runID {
+		if strings.TrimSpace(details.ParentRunID) != "" {
 			parent = strings.TrimSpace(details.ParentRunID)
 		}
 		if strings.TrimSpace(details.ParentRunID) == "" || strings.TrimSpace(details.ParentRunID) == runID {
