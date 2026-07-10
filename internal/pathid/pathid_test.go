@@ -58,7 +58,7 @@ func TestCanonicalizeResolvesNestedSymlinkAndMissingLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Canonicalize missing leaf: %v", err)
 	}
-	want := filepath.Join(physical, "future", "file.txt")
+	want := filepath.Join(canonicalTestIdentity(t, physical), "future", "file.txt")
 	if got.Identity != want {
 		t.Fatalf("identity = %q, want %q", got.Identity, want)
 	}
@@ -78,4 +78,13 @@ func TestCanonicalizeExistingPath(t *testing.T) {
 	if got.Display != want || got.Identity == "" {
 		t.Fatalf("canonical = %#v, want display %q and non-empty identity", got, want)
 	}
+}
+
+func canonicalTestIdentity(t *testing.T, path string) string {
+	t.Helper()
+	identity, err := Identity(path)
+	if err != nil {
+		t.Fatalf("Identity %q: %v", path, err)
+	}
+	return identity
 }
