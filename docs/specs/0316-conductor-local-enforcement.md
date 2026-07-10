@@ -29,9 +29,10 @@ This spec designs local code enforcement for those Conductor obligations:
 1. a Claude Code `conductor-relay-guard` hook that forces Worker and Verifier
    attestation blocks from `loopcoder dispatch` and `loopcoder loopreview` to
    appear verbatim in local visible command output;
-2. activation of the existing `hooks/conductor-attest.js` gate through the
-   install contract so Conductor self-attestation is actually enforced in the
-   active host settings;
+2. activation of the Conductor self-report gate, now implemented as the
+   embedded `loopcoder hook conductor-reporter` command, through the install
+   contract so Conductor self-reporting is actually enforced in the active host
+   settings;
 3. a read-only `loopcoder status [--run <id>]` command that renders the
    delivery run status from real local `.loopcoder/` state instead of
    Conductor narration;
@@ -79,8 +80,11 @@ artifacts, docs, or tracked files.
 ## Decision 1: `conductor-relay-guard`
 
 `conductor-relay-guard` is a Claude Code hook that mechanically enforces local
-verbatim relay of Worker and Verifier attestation output. It reuses the
-operational pattern from [`hooks/conductor-attest.js`](../../hooks/conductor-attest.js):
+verbatim relay of Worker and Verifier attestation output. The current
+implementation lives in the Go binary under
+[`internal/conductorhooks`](../../internal/conductorhooks) and is invoked as
+`loopcoder hook conductor-relay-guard`. The original design reused the
+operational pattern from the now-removed `hooks/conductor-attest.js` script:
 
 - process Claude Code `PostToolUse` events for shell tools;
 - process `Stop` events and block completion with exit code `2` when a local
@@ -106,8 +110,8 @@ If `dispatch-wave` emits per-Worker attestation blocks under the same local
 contracts, the implementation should route those blocks through the same guard
 instead of adding a parallel mechanism.
 
-The hook's command detection should mirror `conductor-attest.js` shell parsing:
-recognize `loopcoder` or `loopcoder.exe` tokens, tolerate an explicit
+The hook's command detection should mirror the Conductor self-report hook's
+shell parsing: recognize `loopcoder` or `loopcoder.exe` tokens, tolerate an explicit
 `LOOPCODER_BIN` path, and stop parsing the command at shell separators. It must
 not rely on brittle substring matches that would mark unrelated commands as
 enforced.
@@ -193,9 +197,10 @@ Code turns or non-loopcoder workspaces.
 
 ### Scope Control
 
-Auto-enforcement uses the same conductor workspace detection as
-`conductor-attest.js`: a workspace that contains the loopcoder Conductor
-playbook, the Codex loopcoder entrypoint, or equivalent loopcoder conductor
+Auto-enforcement uses the same conductor workspace detection as the
+Conductor self-report hook: a workspace that contains the loopcoder Conductor
+playbook, the Codex loopcoder entrypoint, the gitignored
+`.loopcoder/conductor-workspace` marker, or equivalent loopcoder conductor
 configuration.
 
 The hook must support:
@@ -217,12 +222,14 @@ delivery or merge turn, the Conductor must run:
 loopcoder attest --role conductor --provider <provider> --model <model> --permission orchestrate --action "<delivery action>" --duration-ms <ms> --total-tokens <tokens>
 ```
 
-The current enforcement hook is `hooks/conductor-attest.js`. This spec does
-not redesign the `attest` command, the `AttestationRecord` schema, the
-`verified: false` trust marker, or the hook's fail-open behavior.
+The current enforcement hook is embedded in the Go binary and invoked as
+`loopcoder hook conductor-reporter`; `loopcoder hook conductor-attest` remains
+a one-version compatibility alias. This spec does not redesign the `attest`
+command, the `AttestationRecord` schema, the `verified: false` trust marker, or
+the hook's fail-open behavior.
 
 The change specified here is activation: loopcoder's install path must wire
-the existing Conductor attestation hook into the active Claude Code
+the Conductor self-report hook command into the active Claude Code
 `.claude/settings.json` alongside the new relay guard. A hook file present in
 the repository is not enough; the hook only gates the Conductor session after
 it is registered in the active settings.
@@ -322,8 +329,8 @@ implementation must document why status hook coverage was deferred.
 loopcoder must provide an install path that wires both Conductor hooks into the
 active Claude Code project settings:
 
-- existing `hooks/conductor-attest.js`;
-- new `hooks/conductor-relay-guard.js`.
+- `loopcoder hook conductor-reporter`;
+- `loopcoder hook conductor-relay-guard`.
 
 The install surface may be `loopcoder skill install`, a dedicated
 `loopcoder hooks install`, or both. The command must default to project-scoped
@@ -336,12 +343,12 @@ explicitly opts into a global install target.
 The install command must structurally merge hook entries instead of replacing
 the whole settings file.
 
-For both hook scripts, project settings must include:
+For both embedded hook commands, project settings must include:
 
 - a `PostToolUse` hook entry with `matcher: "Bash"`;
 - a `Stop` hook entry;
 - command type `command`;
-- command value that runs the hook from the repo root with Node;
+- command value that invokes the embedded `loopcoder hook ...` command;
 - a bounded timeout consistent with the existing conductor hook guidance.
 
 The merge must be idempotent. Re-running the install command should not
@@ -412,7 +419,7 @@ After this spec merges, implementation should be split into separate code
 issues:
 
 1. **Relay ledger and hook:** add local relay ledger writes for `dispatch` and
-   `loopreview`, implement `hooks/conductor-relay-guard.js`, and test
+   `loopreview`, implement `loopcoder hook conductor-relay-guard`, and test
    PostToolUse surfacing, Stop blocking, fail-open behavior, scope overrides,
    and gitignored state.
 2. **Conductor hook installer:** add the project-scoped settings merge for both
@@ -445,8 +452,8 @@ issues:
 - `loopcoder dispatch` and `loopcoder loopreview` write the exact local header
   and pretty block to gitignored relay ledger files before returning whenever a
   complete Worker or Verifier attestation exists.
-- `hooks/conductor-attest.js` remains the Conductor self-attestation gate and
-  is installed into active project settings with the relay guard.
+- `loopcoder hook conductor-reporter` remains the Conductor self-report gate
+  and is installed into active project settings with the relay guard.
 - `loopcoder status [--run <id>]` reads `.loopcoder/runs/<id>/` local state and
   renders issue, provider, model, effort, permission, duration, token usage,
   `verified`, PR, phase, status, and verifier verdict without inventing missing

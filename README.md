@@ -98,18 +98,12 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 ## Usage
 
 - In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; production promotion follows `adapters.gate`. New scaffolds are human-directed by default, while legacy gate-less configs and explicit `gate: auto` configs use automatic production promotion when the gate passes.
-- The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too:
+- The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too. The stable command inventory below matches the v0.6.1 install commands in this README:
 
 ```bash
 loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
-loopcoder projects register --repo .          # add or refresh this checkout in the global project registry
-loopcoder projects list --format json         # list registered projects for machine use
-loopcoder projects show --repo .              # inspect this checkout's resolved registry identity
-loopcoder projects remove --repo .            # detach active registry entry while preserving history
-loopcoder migrate local-state --repo . --dry-run
-loopcoder migrate local-state --repo .        # copy legacy .loopcoder records into local storage
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -126,15 +120,12 @@ loopcoder promote      --repo .               # may change production branch whe
 loopcoder upgrade --version 0.6.1             # signed self-upgrade from GitHub Releases
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
-loopcoder nested run   --repo . --plan child-plan.json --provider codex # execute a validated child plan
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
-loopcoder status --repo . --format json       # inspect latest run tree as stable JSON
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
-loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
 loopcoder state pull    --repo .              # pull state branch summaries
 loopcoder lease acquire --repo . --run-id <id> # acquire conductor lease
@@ -148,6 +139,22 @@ loopcoder ps --repo .                         # list loopcoder-managed worker pr
 loopcoder kill --repo . --run <run-id>        # terminate loopcoder-managed processes for one run
 loopcoder kill --repo . --all                 # terminate all loopcoder-managed processes for this repo
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
+```
+
+The v0.7.0 candidate adds the following commands and output fields, but they
+are available only from a source build or a v0.7.0 candidate binary until the
+signed v0.7.0 release is published:
+
+```bash
+loopcoder projects register --repo .          # preview: add or refresh this checkout in the global project registry
+loopcoder projects list --format json         # preview: list registered projects for machine use
+loopcoder projects show --repo .              # preview: inspect this checkout's resolved registry identity
+loopcoder projects remove --repo .            # preview: detach active registry entry while preserving history
+loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate local-state --repo .        # preview: copy legacy .loopcoder records into local storage
+loopcoder nested run --repo . --plan child-plan.json --provider codex # preview: execute a validated child plan
+loopcoder status --repo . --format json       # preview: inspect latest run tree as stable JSON
+loopcoder report --repo . --run <id> --format json # preview: include run_tree in JSON
 ```
 
 `dispatch` and `loopreview` emit local-only human-readable report receipts to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. Receipts are conclusion-first and use the stable section order `Target`, `Verdict`, `Review summary`, `Run`, and `Next`; verifier receipts include verdict, finding counts, and needs-human reasons. The durable local machine surfaces are the `[reporter]` header, canonical report JSON, the `dispatch` / `loopreview` result JSON, and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
@@ -201,11 +208,23 @@ agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"
 
 The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity Worker reports use the selected model string, such as `Gemini 3.1 Pro (High)`, as `model_source: self-reported` and accept absent token usage because `agy` does not expose stable parseable usage in this path. Antigravity read-only mode is not available or verified, so `loopreview` and audit-review selections fail closed instead of launching a mutating review.
 
-### Doctor And Migration
+### Doctor And Migration Preview
 
-`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, resolved host profile, Worker and Verifier provider CLIs, provider auth probes where stable, provider/host compatibility, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, storage permissions, storage health, project registry identity, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile` object, `provider_compatibility[]` entries for the smoke matrix, and ordered `checks[]` objects with `name`, `code`, `status`, `hard`, `message`, and `fix_command`.
+The current v0.6.1 `loopcoder doctor --repo .` is a read-only operational
+health command for git, gh auth, `.delivery.yml`, provider CLIs, selected
+binary version, reporter/relay wiring, installed skill freshness, audit
+readiness, local-state exclude protection, tracked `.loopcoder/` files,
+reportquery readability, and stale local state counts.
 
-### Project Registry
+The v0.7.0 candidate expands `doctor` with resolved host profile,
+provider/host compatibility, storage permissions, storage health, project
+registry identity, and migration status. Candidate `--format json` emits
+`repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile`
+object, `provider_compatibility[]` entries for the smoke matrix, and ordered
+`checks[]` objects with `name`, `code`, `status`, `hard`, `message`, and
+`fix_command`.
+
+### Project Registry Preview
 
 `loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. On Unix-like systems, loopcoder creates and tightens `$LOOPCODER_HOME` and `data/` to owner-only directory permissions and the SQLite database plus `-wal`/`-shm` sidecars to owner-only file permissions. Existing broader modes are reported by `doctor` and repaired by `doctor --fix`; symlink and non-regular storage paths are refused. On Windows, v0.7.0 does not implement owner-only DACL hardening, and `doctor` reports that limitation explicitly instead of claiming POSIX mode protection. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects. Git remote URLs are sanitized before output or persistence; loopcoder never stores URL credentials, tokens, credential-like query strings, or fragments in project metadata.
 
@@ -220,7 +239,7 @@ loopcoder projects remove --repo .
 
 `list` shows active projects. `show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source; for a detached checkout it reports the preserved project identity with `detached: true`. `remove --repo .` detaches the active registry entry by setting `detached_at`; it does not delete the project row, runs, run events, run edges, reports, legacy import records, or import status. Re-running `register --repo .` for the same identity reactivates the preserved project row and reconnects the existing history. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
 
-### Local State Migration
+### Local State Migration Preview
 
 `loopcoder migrate local-state --repo .` explicitly imports v0.6.x repo-local `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into `$LOOPCODER_HOME/data/loopcoder.db`. Use `--dry-run` first to report import candidates without registering the project or writing storage. The real migration registers or refreshes the project identity, stores source-path and hash metadata for imported records, and is safe to re-run without duplicating imported reports. Malformed JSON or JSONL records are reported with their source path and line when available, but valid records from the same migration continue importing.
 
@@ -254,7 +273,7 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 
 - Conductor: a configured agent session. It plans issues, dispatches workers, folds verification results into `loopcoder status`, and reports progress. It never writes the code itself.
 - Worker: `loopcoder dispatch` runs one registered provider for one issue in a fresh git worktree, then opens a PR. The verified worker providers are `codex` and `claude`; `antigravity` is the `agy` provider path; direct `gemini` remains experimental/unverified.
-- Nested orchestration: `loopcoder nested run --plan <file.json>` accepts the v1 child-plan envelope, persists the parent/child run graph, schedules dependencies with bounded depth/fan-out/concurrency, and launches write-capable children through the same Worker dispatch adapter path. Loopcoder owns planning boundaries, child identity, permission checks, persistence, budget/circuit decisions, cancellation, and resume; provider-native sub-agent features are not treated as authoritative orchestration. The reserved `test-subprocess` provider is only for deterministic local smoke tests.
+- Nested orchestration preview: the v0.7.0 candidate `loopcoder nested run --plan <file.json>` accepts the v1 child-plan envelope, persists the parent/child run graph, schedules dependencies with bounded depth/fan-out/concurrency, and launches write-capable children through the same Worker dispatch adapter path. Loopcoder owns planning boundaries, child identity, permission checks, persistence, budget/circuit decisions, cancellation, and resume; provider-native sub-agent features are not treated as authoritative orchestration. The reserved `test-subprocess` provider is only for deterministic local smoke tests.
 - Verifier: `loopcoder loopreview` checks a PR branch in a read-only worktree and returns a structured `pass`, `fail`, or `needs-human` verdict with findings, evidence, and spec-conformance status. `codex` and `claude` have verifier smoke proof; `antigravity` fails closed for read-only review.
 - Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step follows `adapters.gate`: `gate: auto` auto-promotes to production only when CI is green, `loopreview` passed, configured evidence is present, and the red-line floor is clean; `gate: human-merge` requires an explicit human-directed production merge.
 - Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and production promotion gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, `verifier`, and `gate`.

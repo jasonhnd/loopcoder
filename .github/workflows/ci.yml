@@ -128,6 +128,9 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+      - name: Markdown internal links
+        run: go test . -run TestMarkdownInternalLinks -count=1
+
       - name: Go test
         run: go test ./...
 

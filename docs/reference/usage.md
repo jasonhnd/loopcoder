@@ -74,14 +74,7 @@ push access.
    loopcoder doctor --repo .
    ```
 
-6. Register the checkout in the machine-local project registry.
-
-   ```text
-   loopcoder projects register --repo .
-   loopcoder projects show --repo .
-   ```
-
-7. Confirm local report querying works. A fresh repository may have no reports
+6. Confirm local report querying works. A fresh repository may have no reports
    yet; the command is still read-only and should render a valid empty report
    list.
 
@@ -89,7 +82,7 @@ push access.
    loopcoder report --repo .
    ```
 
-8. Drive the loop from a conductor session in the repository.
+7. Drive the loop from a conductor session in the repository.
 
    ```text
    /loopcoder <your need>
@@ -107,13 +100,28 @@ Command side effects in the first-run path:
 | `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
-| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry after sanitizing Git remote credentials from project metadata. |
-| `loopcoder projects remove --repo .` | Detaches this checkout from active registry listings while preserving the project row, identity links, run history, reports, legacy import records, and import status. |
-| `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
 | `loopcoder promote --repo .` | May change the configured production branch, subject to `adapters.gate` and the human command that invokes promotion. |
+
+v0.7.0 candidate binaries add an optional registry and migration step after
+`doctor`, but those commands are not part of the v0.6.1 stable quickstart:
+
+```text
+loopcoder projects register --repo .
+loopcoder projects show --repo .
+loopcoder migrate local-state --repo . --dry-run
+```
+
+`loopcoder projects register --repo .` writes or refreshes this checkout's row
+in the machine-local project registry after sanitizing Git remote credentials
+from project metadata. `loopcoder projects remove --repo .` detaches this
+checkout from active registry listings while preserving the project row,
+identity links, run history, reports, legacy import records, and import status.
+`loopcoder migrate local-state --repo .` explicitly copies legacy repo-local
+`.loopcoder/` records into machine-local storage; it does not delete or rewrite
+those files.
 
 `.loopcoder/` is repo-local machine state. It is intentionally used for run
 state, relay ledgers, recovery, status, and report queries, but it must not be
@@ -121,8 +129,9 @@ committed to normal business branches. `init` and `skill install --repo`
 protect it with local `.git/info/exclude`; `loopcoder state push` is the
 explicit publishing path for state summaries. A machine can serve many
 projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
-the machine-level binary, bundled skill, and v0.7.0 SQLite project registry
-live under the user's machine-level loopcoder/agent directories.
+the machine-level binary and bundled skill live under the user's machine-level
+loopcoder/agent directories. In v0.7.0 candidate builds, the SQLite project
+registry and migrated runtime records also live under `$LOOPCODER_HOME`.
 
 ## Prerequisites
 
@@ -247,19 +256,25 @@ Report delivery run state with the program-rendered local status command:
 ```text
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
-loopcoder status --repo . --format json
-loopcoder status --repo . --run <run-id> --format json
 ```
 
 When `--run` is omitted, `status` selects the latest modified local run. The
-text output includes a readable run tree, and JSON output exposes the stable
-`run_tree` object for machine consumers. Each node includes `project_id`,
+text output includes a readable local run status. In the v0.7.0 candidate,
+`status --format json` also exposes the additive `run_tree` object for machine
+consumers. Each node includes `project_id`,
 `run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
 role, provider, model, effort, permission, lifecycle status/source, timestamps,
 last error, and report summary when those fields are present in local records.
 The output is read-only and local-only: it reads gitignored `.loopcoder/` state
 and must not be copied into PR bodies, issues, comments, commits, merge
 artifacts, docs, examples, fixtures, or tracked files.
+
+Candidate JSON examples:
+
+```text
+loopcoder status --repo . --format json
+loopcoder status --repo . --run <run-id> --format json
+```
 
 Example JSON shape:
 
@@ -755,7 +770,9 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 
 ## Binary Commands
 
-Use the native `loopcoder` commands as the helper interface:
+Use the native `loopcoder` commands as the helper interface. The stable
+inventory below matches the v0.6.1 binary installed by the current release
+commands:
 
 ```text
 loopcoder version
@@ -767,15 +784,6 @@ loopcoder doctor --repo . --format json
 
 loopcoder models
 loopcoder models --provider antigravity
-
-loopcoder projects register --repo .
-loopcoder projects list --format json
-loopcoder projects show --repo .
-loopcoder projects remove --repo .
-
-loopcoder migrate local-state --repo . --dry-run
-loopcoder migrate local-state --repo .
-loopcoder migrate local-state --repo . --format json
 
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
@@ -810,8 +818,6 @@ loopcoder dispatch \
   --pretty
 
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
-
-loopcoder nested run --repo . --plan child-plan.json --provider codex --format json
 
 loopcoder tick --repo . --strict
 loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
@@ -874,13 +880,35 @@ loopcoder kill --repo . --run <run-id>
 loopcoder kill --repo . --all
 ```
 
+The v0.7.0 candidate adds these commands and output forms. Use them only from a
+source build or staged v0.7.0 candidate binary until the signed v0.7.0 release
+is published:
+
+```text
+loopcoder projects register --repo .
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects remove --repo .
+
+loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate local-state --repo .
+loopcoder migrate local-state --repo . --format json
+
+loopcoder nested run --repo . --plan child-plan.json --provider codex --format json
+
+loopcoder status --repo . --format json
+loopcoder report --repo . --run <run-id> --format json
+```
+
 `hook` is for host hook integration rather than normal customer workflow.
-`discover`, `compile`, `trigger`, `state`, `lease`, `migrate`, `ps`, and
-`kill` are advanced/operator commands. `state push` is the explicit
+`discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
+advanced/operator commands in v0.6.1. `projects`, `migrate`, and `nested` are
+v0.7.0 candidate commands before the v0.7.0 release is published. `state push`
+is the explicit
 state-branch publish path; `kill` only targets loopcoder-managed processes for
 a run or repository and should not be used as a bare process-name terminator.
 
-### Nested Child Plans
+### Nested Child Plans (v0.7.0 Candidate)
 
 `loopcoder nested run` is the supported boundary for v1 nested orchestration:
 
@@ -981,7 +1009,7 @@ gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
-## Local State Migration
+## Local State Migration (v0.7.0 Candidate)
 
 `loopcoder migrate local-state --repo .` imports v0.6.x repo-local
 `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into
