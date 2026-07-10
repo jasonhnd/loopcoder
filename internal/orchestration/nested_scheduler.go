@@ -15,6 +15,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 const (
@@ -38,6 +39,8 @@ type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
 
 type NestedScheduleOptions struct {
 	RepoPath         string
+	PlanID           string
+	RootRunID        string
 	ParentRunID      string
 	BaseBranch       string
 	ParentDepth      int
@@ -49,21 +52,30 @@ type NestedScheduleOptions struct {
 	CircuitBreaker   config.GuardrailCircuitBreaker
 	Now              time.Time
 	Clock            func() time.Time
+	Plan             *ChildPlan
+	Store            storage.Store
 
 	Execute     ChildRunExecutor
 	RecordEvent RecordNestedEventFunc
 }
 
 type ChildRunPlan struct {
-	ID         string          `json:"id"`
-	RunID      string          `json:"run_id"`
-	Issue      int             `json:"issue,omitempty"`
-	Scope      []int           `json:"scope,omitempty"`
-	Permission string          `json:"permission"`
-	Required   bool            `json:"required,omitempty"`
-	Optional   bool            `json:"optional,omitempty"`
-	Depth      int             `json:"depth,omitempty"`
-	Metadata   json.RawMessage `json:"metadata,omitempty"`
+	ID          string           `json:"id,omitempty"`
+	ChildKey    string           `json:"child_key,omitempty"`
+	Title       string           `json:"title,omitempty"`
+	Role        string           `json:"role,omitempty"`
+	RunID       string           `json:"run_id,omitempty"`
+	Issue       int              `json:"issue,omitempty"`
+	ScopeIssues []int            `json:"scope_issues,omitempty"`
+	Scope       ChildScope       `json:"scope"`
+	Permission  string           `json:"permission"`
+	DependsOn   []string         `json:"depends_on"`
+	Aggregation ChildAggregation `json:"aggregation"`
+	Required    bool             `json:"required,omitempty"`
+	Optional    bool             `json:"optional,omitempty"`
+	Ordinal     int              `json:"ordinal,omitempty"`
+	Depth       int              `json:"depth,omitempty"`
+	Metadata    json.RawMessage  `json:"metadata,omitempty"`
 }
 
 type NestedScheduleReport struct {
@@ -81,12 +93,18 @@ type NestedScheduleReport struct {
 
 type ChildRunResult struct {
 	ID                  string           `json:"id"`
+	ChildKey            string           `json:"child_key,omitempty"`
+	Title               string           `json:"title,omitempty"`
+	Role                string           `json:"role,omitempty"`
 	RunID               string           `json:"run_id"`
 	Issue               int              `json:"issue,omitempty"`
-	Scope               []int            `json:"scope,omitempty"`
+	Scope               ChildScope       `json:"scope"`
 	Permission          string           `json:"permission"`
+	DependsOn           []string         `json:"depends_on,omitempty"`
+	Aggregation         ChildAggregation `json:"aggregation"`
 	Required            bool             `json:"required,omitempty"`
 	Optional            bool             `json:"optional,omitempty"`
+	Ordinal             int              `json:"ordinal"`
 	Depth               int              `json:"depth"`
 	Status              string           `json:"status"`
 	StartedAt           string           `json:"started_at,omitempty"`
@@ -126,6 +144,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	if opts.MaxChildren <= 0 {
 		opts.MaxChildren = lcdefaults.NestedSchedulerMaxChildren
 	}
+	if opts.MaxDepth > NestedHardMaxDepth {
+		return NestedScheduleReport{}, fmt.Errorf("max depth %d exceeds hard maximum %d", opts.MaxDepth, NestedHardMaxDepth)
+	}
 	if opts.RecordEvent == nil {
 		opts.RecordEvent = state.AppendEvent
 	}
@@ -141,9 +162,58 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	if strings.TrimSpace(opts.ParentRunID) == "" {
 		opts.ParentRunID = state.RunIDForWave(started)
 	}
+	if strings.TrimSpace(opts.RootRunID) == "" {
+		opts.RootRunID = opts.ParentRunID
+	}
+	if opts.Plan == nil && len(opts.Children) == 0 {
+		finished := clock().UTC()
+		report := NestedScheduleReport{
+			Version:          1,
+			RepoPath:         filepath.ToSlash(opts.RepoPath),
+			BaseBranch:       opts.BaseBranch,
+			ParentRunID:      opts.ParentRunID,
+			Status:           NestedStatusSucceeded,
+			StartedAt:        state.FormatTimestamp(started),
+			FinishedAt:       state.FormatTimestamp(finished),
+			ConcurrencyLimit: opts.ConcurrencyLimit,
+			Children:         []ChildRunResult{},
+			Summary:          NestedSummary{},
+		}
+		if err := recordNestedParentDone(opts, report, finished); err != nil {
+			return report, err
+		}
+		return report, nil
+	}
 
-	children, err := normalizeChildRunPlans(opts.Children, opts, started)
+	plan := opts.Plan
+	var builtPlan ChildPlan
+	var err error
+	if plan == nil {
+		builtPlan, err = BuildChildPlanFromLegacy(opts, started)
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
+		plan = &builtPlan
+	} else {
+		if err := ValidateChildPlan(plan); err != nil {
+			return NestedScheduleReport{}, err
+		}
+		opts.PlanID = plan.PlanID
+		opts.ParentRunID = plan.ParentRunID
+		opts.RootRunID = plan.RootRunID
+		opts.ParentDepth = plan.ParentDepth
+		opts.MaxDepth = plan.MaxDepth
+		opts.ConcurrencyLimit = plan.MaxConcurrency
+	}
+	if len(plan.Items) > opts.MaxChildren {
+		return NestedScheduleReport{}, fmt.Errorf("child run count %d exceeds max children %d", len(plan.Items), opts.MaxChildren)
+	}
+	children, err := normalizeChildRunPlans(plan.Items, opts, started)
 	if err != nil {
+		return NestedScheduleReport{}, err
+	}
+	plan.Items = children
+	if err := persistAcceptedChildPlan(ctx, opts, *plan, started); err != nil {
 		return NestedScheduleReport{}, err
 	}
 	results := make([]ChildRunResult, len(children))
@@ -158,6 +228,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = err.Error()
 			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+				return NestedScheduleReport{}, err
+			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
 				return NestedScheduleReport{}, err
 			}
@@ -167,6 +240,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = blocked
 			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+				return NestedScheduleReport{}, err
+			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
 				return NestedScheduleReport{}, err
 			}
@@ -178,6 +254,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = err.Error()
 			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+				return NestedScheduleReport{}, err
+			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
 				return NestedScheduleReport{}, err
 			}
@@ -187,6 +266,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.Status = NestedStatusNeedsHuman
 			result.Error = blocked
 			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt); err != nil {
+				return NestedScheduleReport{}, err
+			}
 			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
 				return NestedScheduleReport{}, err
 			}
@@ -196,7 +278,6 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		dispatchJobs = append(dispatchJobs, i)
 	}
 
-	var wg sync.WaitGroup
 	var eventMu sync.Mutex
 	var completeErr error
 	setCompleteErr := func(err error) {
@@ -209,69 +290,86 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			completeErr = err
 		}
 	}
-	sem := make(chan struct{}, opts.ConcurrencyLimit)
-	for _, index := range dispatchJobs {
-		select {
-		case <-ctx.Done():
-			result := childResultFromPlan(children[index])
-			result.Status = normalizeNestedStatus(state.FailureStatus(ctx.Err()))
-			if result.Status == "" {
-				result.Status = NestedStatusCancelled
-			}
-			result.Error = ctx.Err().Error()
-			finishedAt := clock().UTC()
-			result.FinishedAt = state.FormatTimestamp(finishedAt)
-			eventMu.Lock()
-			err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
-			eventMu.Unlock()
+	runChild := func(index int) {
+		child := children[index]
+		result := childResultFromPlan(child)
+		result.Status = NestedStatusFailed
+		result.StartedAt = state.FormatTimestamp(clock())
+		eventMu.Lock()
+		err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
+		eventMu.Unlock()
+		setCompleteErr(err)
+		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock)); err != nil {
 			setCompleteErr(err)
-			if err := recordNestedEvent(opts, children[index].RunID, children[index], result, NestedEventChildFinished, finishedAt); err != nil {
-				setCompleteErr(err)
-			}
-			results[index] = result
-			continue
-		case sem <- struct{}{}:
 		}
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			child := children[index]
-			result := childResultFromPlan(child)
-			result.Status = NestedStatusFailed
-			result.StartedAt = state.FormatTimestamp(clock())
-			eventMu.Lock()
-			err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
-			eventMu.Unlock()
-			setCompleteErr(err)
-			if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock)); err != nil {
-				setCompleteErr(err)
-			}
 
-			executed, err := opts.Execute(ctx, child)
-			result = mergeChildResult(result, executed)
-			if err != nil {
-				result.Status = normalizeNestedStatus(state.FailureStatus(err))
-				result.Error = err.Error()
-			}
-			result.Status = normalizeNestedStatus(result.Status)
-			if result.FinishedAt == "" {
-				result.FinishedAt = state.FormatTimestamp(clock())
-			}
-			result = applyNestedCircuitOutcome(opts, child, result, parseOrClock(result.FinishedAt, clock))
-			results[index] = result
+		executed, err := opts.Execute(ctx, child)
+		result = mergeChildResult(result, executed)
+		if err != nil {
+			result.Status = normalizeNestedStatus(state.FailureStatus(err))
+			result.Error = err.Error()
+		}
+		result.Status = normalizeNestedStatus(result.Status)
+		if result.FinishedAt == "" {
+			result.FinishedAt = state.FormatTimestamp(clock())
+		}
+		result = applyNestedCircuitOutcome(opts, child, result, parseOrClock(result.FinishedAt, clock))
+		results[index] = result
 
-			finishedAt := parseOrClock(result.FinishedAt, clock)
-			eventMu.Lock()
-			err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
-			eventMu.Unlock()
+		finishedAt := parseOrClock(result.FinishedAt, clock)
+		setCompleteErr(storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt))
+		eventMu.Lock()
+		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
+		eventMu.Unlock()
+		setCompleteErr(err)
+		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildFinished, finishedAt); err != nil {
 			setCompleteErr(err)
-			if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildFinished, finishedAt); err != nil {
-				setCompleteErr(err)
-			}
-		}(index)
+		}
 	}
-	wg.Wait()
+	pending := map[int]bool{}
+	for _, index := range dispatchJobs {
+		pending[index] = true
+	}
+	for len(pending) > 0 {
+		ready := readyNestedChildren(children, results, pending)
+		if len(ready) == 0 {
+			return NestedScheduleReport{}, fmt.Errorf("no ready nested children remain; dependency cycle or missing result escaped validation")
+		}
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, opts.ConcurrencyLimit)
+		for _, index := range ready {
+			delete(pending, index)
+			select {
+			case <-ctx.Done():
+				result := childResultFromPlan(children[index])
+				result.Status = normalizeNestedStatus(state.FailureStatus(ctx.Err()))
+				if result.Status == "" {
+					result.Status = NestedStatusCancelled
+				}
+				result.Error = ctx.Err().Error()
+				finishedAt := clock().UTC()
+				result.FinishedAt = state.FormatTimestamp(finishedAt)
+				setCompleteErr(storage.UpdateChildRunOutcome(ctx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt))
+				eventMu.Lock()
+				err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
+				eventMu.Unlock()
+				setCompleteErr(err)
+				if err := recordNestedEvent(opts, children[index].RunID, children[index], result, NestedEventChildFinished, finishedAt); err != nil {
+					setCompleteErr(err)
+				}
+				results[index] = result
+				continue
+			case sem <- struct{}{}:
+			}
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				runChild(index)
+			}(index)
+		}
+		wg.Wait()
+	}
 
 	finished := clock().UTC()
 	report := NestedScheduleReport{
@@ -305,29 +403,27 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 	out := make([]ChildRunPlan, 0, len(children))
 	seenRunIDs := map[string]bool{}
 	for index, child := range children {
-		child.ID = strings.TrimSpace(child.ID)
-		if child.ID == "" {
-			return nil, fmt.Errorf("child[%d].id is required", index)
+		child.ChildKey = strings.TrimSpace(child.ChildKey)
+		if child.ChildKey == "" {
+			child.ChildKey = strings.TrimSpace(child.ID)
 		}
-		if child.Required == child.Optional {
-			return nil, fmt.Errorf("child %q must set exactly one of required or optional", child.ID)
+		if child.ChildKey == "" {
+			return nil, fmt.Errorf("child[%d].child_key is required", index)
 		}
-		child.Permission = strings.TrimSpace(child.Permission)
-		if child.Permission == "" {
-			return nil, fmt.Errorf("child %q permission is required", child.ID)
-		}
-		if child.Depth <= 0 {
-			child.Depth = opts.ParentDepth + 1
-		}
+		child.ID = child.ChildKey
+		child.Permission = normalizeChildPermission(child.Permission)
+		child.Scope = normalizeStructuredScope(child.Scope, child.Issue, child.ScopeIssues)
+		child.Issue = firstPositive(child.Issue, firstScopeIssue(child.Scope))
+		child.ScopeIssues = append([]int(nil), child.Scope.Issues...)
+		child.Depth = opts.ParentDepth + 1
 		if child.Depth > opts.MaxDepth {
-			return nil, fmt.Errorf("child %q depth %d exceeds max depth %d", child.ID, child.Depth, opts.MaxDepth)
+			return nil, fmt.Errorf("child %q depth %d exceeds max depth %d", child.ChildKey, child.Depth, opts.MaxDepth)
 		}
-		child.Scope = normalizeChildScope(child.Scope)
 		if child.RunID == "" {
-			child.RunID = state.RunIDForChild(child.ID, index, started)
+			child.RunID = state.RunIDForChild(child.ChildKey, index, started)
 		}
 		if !state.IsRunID(child.RunID) {
-			return nil, fmt.Errorf("child %q run id %q is invalid", child.ID, child.RunID)
+			return nil, fmt.Errorf("child %q run id %q is invalid", child.ChildKey, child.RunID)
 		}
 		if seenRunIDs[child.RunID] {
 			return nil, fmt.Errorf("duplicate child run id %q", child.RunID)
@@ -335,23 +431,117 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
 		seenRunIDs[child.RunID] = true
 		out = append(out, child)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].ID < out[j].ID
-	})
 	return out, nil
+}
+
+func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, started time.Time) error {
+	if opts.Store == nil {
+		return nil
+	}
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("marshal accepted child plan: %w", err)
+	}
+	createdAt := state.FormatTimestamp(started)
+	parent := storage.RunNode{
+		RunID:     plan.ParentRunID,
+		RootRunID: plan.RootRunID,
+		Depth:     plan.ParentDepth,
+		Origin:    "nested_parent",
+		Status:    state.StatusRunning,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	children := make([]storage.RunNode, 0, len(plan.Items))
+	edges := make([]storage.RunEdgeRecord, 0, len(plan.Items))
+	for _, item := range plan.Items {
+		scopeJSON, err := json.Marshal(item.Scope)
+		if err != nil {
+			return fmt.Errorf("marshal child %q scope: %w", item.ChildKey, err)
+		}
+		aggregationJSON, err := json.Marshal(item.Aggregation)
+		if err != nil {
+			return fmt.Errorf("marshal child %q aggregation: %w", item.ChildKey, err)
+		}
+		children = append(children, storage.RunNode{
+			RunID:       item.RunID,
+			ParentRunID: plan.ParentRunID,
+			RootRunID:   plan.RootRunID,
+			Depth:       item.Depth,
+			Origin:      "sub_agent",
+			Status:      NestedStatusQueued,
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+		})
+		edges = append(edges, storage.RunEdgeRecord{
+			ParentRunID:     plan.ParentRunID,
+			ChildRunID:      item.RunID,
+			RootRunID:       plan.RootRunID,
+			PlanID:          plan.PlanID,
+			ChildKey:        item.ChildKey,
+			Depth:           item.Depth,
+			Ordinal:         item.Ordinal,
+			ScopeJSON:       string(scopeJSON),
+			Permission:      item.Permission,
+			AggregationJSON: string(aggregationJSON),
+			Status:          NestedStatusQueued,
+			CreatedAt:       createdAt,
+			UpdatedAt:       createdAt,
+		})
+	}
+	return storage.PersistChildPlanGraph(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
+		PlanID:         plan.PlanID,
+		ParentRunID:    plan.ParentRunID,
+		RootRunID:      plan.RootRunID,
+		SchemaVersion:  plan.SchemaVersion,
+		MaxDepth:       plan.MaxDepth,
+		MaxConcurrency: plan.MaxConcurrency,
+		PlanJSON:       string(planJSON),
+		CreatedAt:      createdAt,
+	}, edges)
+}
+
+func readyNestedChildren(children []ChildRunPlan, results []ChildRunResult, pending map[int]bool) []int {
+	indexByKey := map[string]int{}
+	for i, child := range children {
+		indexByKey[child.ChildKey] = i
+	}
+	ready := make([]int, 0, len(pending))
+	for index := range pending {
+		child := children[index]
+		depsReady := true
+		for _, dep := range child.DependsOn {
+			depIndex, ok := indexByKey[dep]
+			if !ok || strings.TrimSpace(results[depIndex].Status) == "" {
+				depsReady = false
+				break
+			}
+		}
+		if depsReady {
+			ready = append(ready, index)
+		}
+	}
+	sort.Ints(ready)
+	return ready
 }
 
 func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 	return ChildRunResult{
-		ID:         child.ID,
-		RunID:      child.RunID,
-		Issue:      child.Issue,
-		Scope:      append([]int(nil), child.Scope...),
-		Permission: child.Permission,
-		Required:   child.Required,
-		Optional:   child.Optional,
-		Depth:      child.Depth,
-		Status:     NestedStatusQueued,
+		ID:          child.ID,
+		ChildKey:    child.ChildKey,
+		Title:       child.Title,
+		Role:        child.Role,
+		RunID:       child.RunID,
+		Issue:       child.Issue,
+		Scope:       cloneChildScope(child.Scope),
+		Permission:  child.Permission,
+		DependsOn:   append([]string(nil), child.DependsOn...),
+		Aggregation: child.Aggregation,
+		Required:    child.Required,
+		Optional:    child.Optional,
+		Ordinal:     child.Ordinal,
+		Depth:       child.Depth,
+		Status:      NestedStatusQueued,
 	}
 }
 
@@ -359,21 +549,39 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ID) != "" {
 		base.ID = strings.TrimSpace(result.ID)
 	}
+	if strings.TrimSpace(result.ChildKey) != "" {
+		base.ChildKey = strings.TrimSpace(result.ChildKey)
+	}
+	if strings.TrimSpace(result.Title) != "" {
+		base.Title = strings.TrimSpace(result.Title)
+	}
+	if strings.TrimSpace(result.Role) != "" {
+		base.Role = strings.TrimSpace(result.Role)
+	}
 	if strings.TrimSpace(result.RunID) != "" {
 		base.RunID = strings.TrimSpace(result.RunID)
 	}
 	if result.Issue > 0 {
 		base.Issue = result.Issue
 	}
-	if len(result.Scope) > 0 {
-		base.Scope = normalizeChildScope(result.Scope)
+	if !childScopeEmpty(result.Scope) {
+		base.Scope = cloneChildScope(result.Scope)
 	}
 	if strings.TrimSpace(result.Permission) != "" {
-		base.Permission = strings.TrimSpace(result.Permission)
+		base.Permission = normalizeChildPermission(result.Permission)
+	}
+	if len(result.DependsOn) > 0 {
+		base.DependsOn = append([]string(nil), result.DependsOn...)
+	}
+	if strings.TrimSpace(result.Aggregation.Mode) != "" {
+		base.Aggregation = result.Aggregation
 	}
 	if result.Required || result.Optional {
 		base.Required = result.Required
 		base.Optional = result.Optional
+	}
+	if result.Ordinal > 0 {
+		base.Ordinal = result.Ordinal
 	}
 	if result.Depth > 0 {
 		base.Depth = result.Depth
@@ -480,7 +688,7 @@ func childGuardrailIssue(child ChildRunPlan) int {
 	if child.Issue > 0 {
 		return child.Issue
 	}
-	for _, issue := range child.Scope {
+	for _, issue := range child.Scope.Issues {
 		if issue > 0 {
 			return issue
 		}
@@ -489,8 +697,11 @@ func childGuardrailIssue(child ChildRunPlan) int {
 }
 
 func childGuardrailScope(child ChildRunPlan) []int {
-	if len(child.Scope) > 0 {
-		return append([]int(nil), child.Scope...)
+	if len(child.Scope.Issues) > 0 {
+		return append([]int(nil), child.Scope.Issues...)
+	}
+	if len(child.ScopeIssues) > 0 {
+		return append([]int(nil), child.ScopeIssues...)
 	}
 	if child.Issue > 0 {
 		return []int{child.Issue}
@@ -610,21 +821,13 @@ type nestedChildEventDetails struct {
 	Result      ChildRunResult `json:"result"`
 }
 
-func normalizeChildScope(scope []int) []int {
-	if len(scope) == 0 {
-		return nil
-	}
-	seen := map[int]bool{}
-	out := make([]int, 0, len(scope))
-	for _, issue := range scope {
-		if issue <= 0 || seen[issue] {
-			continue
-		}
-		seen[issue] = true
-		out = append(out, issue)
-	}
-	sort.Ints(out)
-	return out
+func childScopeEmpty(scope ChildScope) bool {
+	return strings.TrimSpace(scope.Repo) == "" &&
+		len(scope.Paths) == 0 &&
+		len(scope.Issues) == 0 &&
+		len(scope.PullRequests) == 0 &&
+		len(scope.Commands) == 0 &&
+		len(scope.Data) == 0
 }
 
 func parseOrClock(value string, clock func() time.Time) time.Time {

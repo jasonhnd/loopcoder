@@ -124,7 +124,7 @@ Child plans are versioned JSON documents. The first version is
         "issues": [646],
         "commands": ["go test ./..."]
       },
-      "permission": "read",
+      "permission": "read-only",
       "depends_on": [],
       "aggregation": {
         "mode": "collect",
@@ -158,7 +158,7 @@ Child plans are versioned JSON documents. The first version is
 | `title` | yes | Human-readable child work title. |
 | `role` | yes | Logical role such as `worker`, `verifier`, `auditor`, or `sub_agent`. |
 | `scope` | yes | The allowed repo, path, issue, PR, command, and data boundary. |
-| `permission` | yes | One of `read`, `write`, `review`, or `orchestrate`. |
+| `permission` | yes | One of `read-only`, `write`, or `orchestrate`. |
 | `depends_on` | yes | Ordered list of sibling `child_key` values that must finish first. |
 | `aggregation` | yes | How the parent consumes this child's result. |
 
@@ -168,13 +168,16 @@ An implementation MUST reject a write-capable child with an unbounded repository
 scope such as `"paths": ["**"]` unless a later accepted spec defines a safer
 escape hatch.
 
-`permission` is a maximum, not an instruction to mutate. The initial permission
-levels are:
+`permission` is a maximum, not an instruction to mutate. The implementation uses
+the repository's canonical reporter permission enum rather than introducing a
+second nested-only enum. Earlier draft examples used `read` and `review`; code
+MUST normalize legacy in-process `read` to `read-only` where compatibility is
+needed, and MUST fail closed on unknown persisted JSON values. The initial
+permission levels are:
 
 | Permission | Meaning |
 | --- | --- |
-| `read` | Inspect files, local state, and provider output only. |
-| `review` | Produce findings or verdicts; no repository mutation. |
+| `read-only` | Inspect files, local state, and provider output only. |
 | `write` | Mutate only resources declared in `scope`. |
 | `orchestrate` | Create child plans or child runs within the same max-depth and scope rules. |
 
@@ -185,12 +188,16 @@ denormalize for lookup speed, but the logical schema is:
 
 ```sql
 CREATE TABLE runs (
-  run_id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY,
+  project_id TEXT NULL,
   parent_run_id TEXT NULL,
+  issue_number INTEGER NULL,
   root_run_id TEXT NOT NULL,
   depth INTEGER NOT NULL,
   origin TEXT NOT NULL,
   status TEXT NOT NULL,
+  started_at TEXT NULL,
+  ended_at TEXT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -209,6 +216,7 @@ CREATE TABLE child_plans (
 CREATE TABLE run_edges (
   parent_run_id TEXT NOT NULL,
   child_run_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL DEFAULT 'child',
   root_run_id TEXT NOT NULL,
   plan_id TEXT NOT NULL,
   child_key TEXT NOT NULL,
@@ -238,9 +246,20 @@ Required storage invariants:
   deterministic report rendering.
 - The storage layer MUST reject cycles.
 
-During the repo-local-state transition, a backend that still writes JSON under
-`.loopcoder/runs/` MAY persist this logical schema as JSON files instead of SQL,
-but it MUST preserve the same field names, uniqueness, and ordering semantics.
+The v0.7 SQLite migration is additive over the existing storage schema: `runs`
+keeps its established primary key column name `id`, and v7 adds
+`root_run_id`, `depth`, `origin`, and `created_at` rather than rebuilding the
+table. Existing minimal `run_edges` rows remain valid; v7 adds the enriched
+columns and enforces plan child-key and parent ordinal uniqueness only for
+enriched nested edges.
+
+During the repo-local-state transition, the scheduler MUST keep the
+`.loopcoder/runs/` event mirror consistent with the SQL graph by writing the
+accepted child plan and queued SQL edges before emitting queued compatibility
+events, and by writing terminal SQL edge/run status before emitting terminal
+compatibility events. Status/report tree renderers may continue to read the
+compatibility mirror until their storage read path is replaced, but the SQL
+graph is the authoritative recovery source for accepted plans and edges.
 
 ## Report JSON Contract
 
@@ -267,7 +286,7 @@ optional parent and child fields:
       "root_run_id": "run-parent",
       "depth": 1,
       "child_key": "docs-pass",
-      "permission": "read",
+      "permission": "read-only",
       "scope": {
         "repo": ".",
         "paths": ["docs/specs/"]
