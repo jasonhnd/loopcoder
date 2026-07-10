@@ -1,7 +1,9 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,11 +51,53 @@ func TestTimestampFormatParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFailureStatusDistinguishesContextCancellationAndTimeout(t *testing.T) {
+	if got := FailureStatus(context.Canceled); got != StatusCancelled {
+		t.Fatalf("FailureStatus(context.Canceled) = %q, want %q", got, StatusCancelled)
+	}
+	if got := FailureStatus(context.DeadlineExceeded); got != StatusTimedOut {
+		t.Fatalf("FailureStatus(context.DeadlineExceeded) = %q, want %q", got, StatusTimedOut)
+	}
+	if got := FailureStatus(fmtWrapped(context.Canceled)); got != StatusCancelled {
+		t.Fatalf("FailureStatus(wrapped canceled) = %q, want %q", got, StatusCancelled)
+	}
+	if got := FailureStatus(errors.New("boom")); got != StatusFailed {
+		t.Fatalf("FailureStatus(other) = %q, want %q", got, StatusFailed)
+	}
+}
+
+func fmtWrapped(err error) error {
+	return &wrapErr{err: err}
+}
+
+type wrapErr struct {
+	err error
+}
+
+func (e *wrapErr) Error() string {
+	return "wrapped: " + e.err.Error()
+}
+
+func (e *wrapErr) Unwrap() error {
+	return e.err
+}
+
 func TestRunIDForIssueUsesDocumentedShape(t *testing.T) {
 	got := RunIDForIssue(91, time.Date(2026, 6, 26, 12, 0, 0, 0, time.FixedZone("JST", 9*60*60)))
 	want := "run-20260626T030000Z-issue-91"
 	if got != want {
 		t.Fatalf("RunIDForIssue() = %q, want %q", got, want)
+	}
+	if !IsRunID(got) {
+		t.Fatalf("IsRunID(%q) = false, want true", got)
+	}
+}
+
+func TestRunIDForChildUsesDocumentedShape(t *testing.T) {
+	got := RunIDForChild("Nested Scheduler!", 2, time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC))
+	want := "run-20260709T120000Z-child-2-nested-scheduler"
+	if got != want {
+		t.Fatalf("RunIDForChild() = %q, want %q", got, want)
 	}
 	if !IsRunID(got) {
 		t.Fatalf("IsRunID(%q) = false, want true", got)

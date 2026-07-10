@@ -184,6 +184,111 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 	}
 }
 
+func TestDispatchWaveMarksQueuedChildAbandonedWhenParentCancels(t *testing.T) {
+	repo := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	report, err := DispatchWave(ctx, DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			1: {Number: 1, Title: "One"},
+			2: {Number: 2, Title: "Two"},
+		}},
+		RepoPath:      repo,
+		RunID:         "run-test-wave",
+		IssueNumbers:  []int{1, 2},
+		ThrottleLimit: 1,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(1, 2), nil
+		},
+		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
+			cancel()
+			time.Sleep(25 * time.Millisecond)
+			return worker.Result{Issue: opts.IssueNumber, RunID: opts.RunID, Status: state.StatusCancelled}, ctx.Err()
+		},
+		LoadAttempts: state.LoadAttempts,
+		Now:          time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("result count = %d, want 2", len(report.Results))
+	}
+	if report.Results[0].Status != DispatchWaveStatusCancelled {
+		t.Fatalf("first result = %#v, want cancelled", report.Results[0])
+	}
+	if report.Results[1].Status != DispatchWaveStatusAbandoned {
+		t.Fatalf("second result = %#v, want abandoned", report.Results[1])
+	}
+	if !strings.Contains(report.Results[1].Error, "child abandoned") ||
+		!strings.Contains(report.Results[1].RecoveryContextPath, "job-2-abandoned-context.md") {
+		t.Fatalf("abandoned result missing recovery hint: %#v", report.Results[1])
+	}
+
+	attempts, err := state.LoadAttempts(repo, "run-test-wave")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Issue != 2 || attempts[0].Status != DispatchWaveStatusAbandoned {
+		t.Fatalf("abandoned synthetic attempt = %#v", attempts)
+	}
+	brief, err := os.ReadFile(state.RecoveryBriefPath(repo, "run-test-wave", "job-2-abandoned"))
+	if err != nil {
+		t.Fatalf("read recovery brief: %v", err)
+	}
+	if !strings.Contains(string(brief), "- Status: abandoned") || !strings.Contains(string(brief), "child abandoned") {
+		t.Fatalf("abandoned recovery brief missing status/error:\n%s", string(brief))
+	}
+	if !DispatchWaveHasFailures(report) {
+		t.Fatal("DispatchWaveHasFailures = false, want true for abandoned child")
+	}
+}
+
+func TestDispatchWaveRecordsParentTimeoutBeforeChildDispatch(t *testing.T) {
+	repo := t.TempDir()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	dispatchCalled := false
+
+	report, err := DispatchWave(ctx, DispatchWaveOptions{
+		Reader: fakeReader{views: map[int]gh.Issue{
+			3: {Number: 3, Title: "Three"},
+		}},
+		RepoPath:      repo,
+		RunID:         "run-test-timeout",
+		IssueNumbers:  []int{3},
+		ThrottleLimit: 1,
+		ComputeReadySet: func(context.Context, Options) (report.ReadySetReport, error) {
+			return readySetReport(3), nil
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			return worker.Result{}, nil
+		},
+		LoadAttempts: state.LoadAttempts,
+		Now:          time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("DispatchWave returned error: %v", err)
+	}
+	if dispatchCalled {
+		t.Fatal("dispatch was called despite expired parent context")
+	}
+	if len(report.Results) != 1 || report.Results[0].Status != DispatchWaveStatusTimedOut {
+		t.Fatalf("timeout result = %#v, want timed_out", report.Results)
+	}
+	if !strings.Contains(report.Results[0].Error, "parent run timed out") {
+		t.Fatalf("timeout error missing hint: %#v", report.Results[0])
+	}
+	attempts, err := state.LoadAttempts(repo, "run-test-timeout")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != DispatchWaveStatusTimedOut {
+		t.Fatalf("timeout synthetic attempt = %#v", attempts)
+	}
+}
+
 func TestDispatchWavePropagatesNeedsHumanDispatchResult(t *testing.T) {
 	report, err := DispatchWave(context.Background(), DispatchWaveOptions{
 		Reader: fakeReader{views: map[int]gh.Issue{

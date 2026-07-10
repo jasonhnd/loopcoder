@@ -74,7 +74,14 @@ push access.
    loopcoder doctor --repo .
    ```
 
-6. Confirm local report querying works. A fresh repository may have no reports
+6. Register the checkout in the machine-local project registry.
+
+   ```text
+   loopcoder projects register --repo .
+   loopcoder projects show --repo .
+   ```
+
+7. Confirm local report querying works. A fresh repository may have no reports
    yet; the command is still read-only and should render a valid empty report
    list.
 
@@ -82,7 +89,7 @@ push access.
    loopcoder report --repo .
    ```
 
-7. Drive the loop from a conductor session in the repository.
+8. Drive the loop from a conductor session in the repository.
 
    ```text
    /loopcoder <your need>
@@ -100,6 +107,8 @@ Command side effects in the first-run path:
 | `loopcoder init --repo .` | Writes `.delivery.yml`, `ROADMAP.md`, GitHub labels, and local `.git/info/exclude` protection for `.loopcoder/`. |
 | `loopcoder skill install --repo .` | Writes or refreshes the global skill files, project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection. |
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
+| `loopcoder projects register --repo .` | Writes or refreshes this checkout's row in the machine-local project registry. |
+| `loopcoder migrate local-state --repo .` | Explicitly copies legacy repo-local `.loopcoder/` records into machine-local storage; it does not delete or rewrite those files. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
@@ -111,9 +120,8 @@ committed to normal business branches. `init` and `skill install --repo`
 protect it with local `.git/info/exclude`; `loopcoder state push` is the
 explicit publishing path for state summaries. A machine can serve many
 projects: each project owns its own `.delivery.yml` and `.loopcoder/`, while
-the machine-level binary and bundled skill live under the user's machine-level
-loopcoder/agent directories. v0.6.1 introduces no SQLite database or global
-project registry.
+the machine-level binary, bundled skill, and v0.7.0 SQLite project registry
+live under the user's machine-level loopcoder/agent directories.
 
 ## Prerequisites
 
@@ -238,12 +246,69 @@ Report delivery run state with the program-rendered local status command:
 ```text
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
+loopcoder status --repo . --format json
+loopcoder status --repo . --run <run-id> --format json
 ```
 
 When `--run` is omitted, `status` selects the latest modified local run. The
-output is read-only and local-only: it reads gitignored `.loopcoder/` state and
-must not be copied into PR bodies, issues, comments, commits, merge artifacts,
-docs, examples, fixtures, or tracked files.
+text output includes a readable run tree, and JSON output exposes the stable
+`run_tree` object for machine consumers. Each node includes `project_id`,
+`run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
+role, provider, model, effort, permission, lifecycle status/source, timestamps,
+last error, and report summary when those fields are present in local records.
+The output is read-only and local-only: it reads gitignored `.loopcoder/` state
+and must not be copied into PR bodies, issues, comments, commits, merge
+artifacts, docs, examples, fixtures, or tracked files.
+
+Example JSON shape:
+
+```json
+{
+  "run_id": "run-20260709T000000Z-wave",
+  "project": {
+    "project_id": "proj_abc123"
+  },
+  "run_tree": {
+    "root_run_id": "run-20260709T000000Z-wave",
+    "selected_run_id": "run-20260709T000000Z-wave",
+    "nodes": [
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-20260709T000000Z-wave",
+        "child_run_ids": ["run-20260709T000001Z-child-worker"],
+        "depth": 0,
+        "lifecycle_status": "running"
+      },
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-20260709T000001Z-child-worker",
+        "parent_run_id": "run-20260709T000000Z-wave",
+        "child_run_ids": [],
+        "depth": 1,
+        "issue": 651,
+        "pr": "https://github.com/owner/repo/pull/651",
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "lifecycle_status": "succeeded",
+        "started_at": "2026-07-09T00:00:01Z",
+        "updated_at": "2026-07-09T00:02:00Z",
+        "ended_at": "2026-07-09T00:02:00Z",
+        "report_summary": "implement issue #651"
+      }
+    ],
+    "summary": {
+      "run_count": 2,
+      "terminal_runs": 1,
+      "interrupted_runs": 1,
+      "failed_runs": 0,
+      "needs_human_runs": 0
+    }
+  }
+}
+```
 
 ## Repository Initialization
 
@@ -451,7 +516,7 @@ loopcoder doctor --repo . --format text
 loopcoder doctor --repo . --format json
 ```
 
-It reports `[ok]`, `[warn]`, or `[fail]` checks for:
+It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 
 - `git` on `PATH`;
 - `gh` on `PATH` and `gh auth status`;
@@ -470,11 +535,15 @@ It reports `[ok]`, `[warn]`, or `[fail]` checks for:
   whether `.loopcoder/` files are already tracked, and the exact safe fix
   command when local state is tracked;
 - reportquery readability for local report/run/relay records;
+- storage health and the current checkout's machine-local project registry
+  identity, including ambiguity warnings;
+- migration status and nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
-- conductor runtime responsibility, which remains user-provided by the active
-  host.
+- resolved host profile (`codex-cli`, `claude-code`, `paseo-style`, or
+  `generic-local`) and conductor runtime responsibility, which remains
+  user-provided by the active host.
 
 Provider authentication is reported only where loopcoder has a stable cheap
 probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
@@ -490,6 +559,45 @@ probe.
   "commit": "abc123",
   "date": "2026-07-08T00:00:00Z",
   "exit_code": 0,
+  "host_profile": {
+    "name": "codex-cli",
+    "source": "env",
+    "selector": "LOOPCODER_HOST",
+    "invocation_style": "interactive Codex CLI conductor session calls loopcoder as a local subprocess",
+    "supports_hooks": false,
+    "supports_json_output": true
+  },
+  "runtime": {
+    "home_dir": "/home/user/.loopcoder",
+    "database": {
+      "path": "/home/user/.loopcoder/data/loopcoder.db",
+      "exists": true,
+      "schema_version": 3,
+      "status": "ok",
+      "message": "storage database is healthy"
+    },
+    "project_registry": {
+      "status": "ok",
+      "registered": true,
+      "project_id": "proj_abc123",
+      "identity_source": "github",
+      "conflict_count": 0,
+      "message": "project registry identity is registered"
+    },
+    "migration": {
+      "status": "ok",
+      "legacy_surfaces": 0,
+      "message": "no legacy surfaces found"
+    },
+    "nested_runs": {
+      "status": "ok",
+      "run_count": 1,
+      "parent_edges": 0,
+      "child_edges": 0,
+      "problem_count": 0,
+      "message": "run tree readable; 1 run(s), no nested edges"
+    }
+  },
   "checks": [
     {
       "name": "local-state exclude",
@@ -644,6 +752,15 @@ loopcoder doctor --repo . --format json
 loopcoder models
 loopcoder models --provider antigravity
 
+loopcoder projects register --repo .
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects remove --repo .
+
+loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate local-state --repo .
+loopcoder migrate local-state --repo . --format json
+
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
 
@@ -684,6 +801,7 @@ loopcoder promote --repo .
 
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
+loopcoder status --repo . --format json
 loopcoder report --repo .
 loopcoder report --repo . --format json
 
@@ -738,10 +856,10 @@ loopcoder kill --repo . --all
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
-`discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
-advanced/operator commands. `state push` is the explicit state-branch publish
-path; `kill` only targets loopcoder-managed processes for a run or repository
-and should not be used as a bare process-name terminator.
+`discover`, `compile`, `trigger`, `state`, `lease`, `migrate`, `ps`, and
+`kill` are advanced/operator commands. `state push` is the explicit
+state-branch publish path; `kill` only targets loopcoder-managed processes for
+a run or repository and should not be used as a bare process-name terminator.
 
 ## Exit Codes
 
@@ -812,11 +930,45 @@ gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
+## Local State Migration
+
+`loopcoder migrate local-state --repo .` imports v0.6.x repo-local
+`.loopcoder/` attempts, events, reports, recovery briefs, and relay records into
+the v0.7.0 machine-local SQLite store under `$LOOPCODER_HOME/data/loopcoder.db`.
+Use `--dry-run` first to scan the same sources and report the records that would
+be imported without registering the project or writing the database.
+
+The migration is explicit and idempotent. It registers or refreshes the current
+project identity, records source-path and content-hash metadata, and skips
+records already imported on prior runs. Malformed JSON or JSONL input is
+reported with a source path and line when available, but malformed records do
+not abort import of other valid records.
+
+The command copies state only. It does not delete `.loopcoder/`, rewrite legacy
+files, edit tracked repository files, mutate GitHub, or publish state to the
+state branch. Existing file readers remain the fallback during the
+compatibility window. After migration, `loopcoder report --repo . --format json`
+includes imported records with `source` values such as `imported:attempt` plus
+the original source path metadata.
+
+Audit logs remain file-only repo-local state. They are not imported by
+`migrate local-state`, and an audit-only `.loopcoder/audit/` directory does not
+make `loopcoder doctor --repo .` require a local-state migration.
+
+To back up the v0.7.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
+and, when present, `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and
+`$LOOPCODER_HOME/tmp/` while no loopcoder command is running. To remove the
+machine-local runtime state completely, delete those same paths; the next
+loopcoder command recreates storage as needed. Removing machine-local runtime
+state does not delete repo-local `.loopcoder/` history, and deleting
+repo-local `.loopcoder/` is still a manual user action outside migration.
+
 `loopcoder report` is the read-only query surface for those local records:
 
 ```text
 loopcoder report --repo .
 loopcoder report --repo . --work-id <run-id>
+loopcoder report --repo . --run <run-id> --format json
 loopcoder report --repo . --issue 218
 loopcoder report --repo . --role worker
 loopcoder report --repo . --format json
@@ -836,7 +988,9 @@ REPORTS
 ```
 
 JSON output keeps the compatibility `reports` array and adds `records` with
-source/run/path context:
+source/run/path context. When `--run <run-id>` is provided with JSON output,
+the payload also includes the same additive `run_tree` object exposed by
+`loopcoder status --format json`:
 
 ```json
 {
@@ -858,7 +1012,33 @@ source/run/path context:
       "run_id": "run-218",
       "path": ".loopcoder/runs/run-218/workers/job-218-1.attempt.json"
     }
-  ]
+  ],
+  "run_tree": {
+    "root_run_id": "run-218",
+    "selected_run_id": "run-218",
+    "nodes": [
+      {
+        "project_id": "proj_abc123",
+        "run_id": "run-218",
+        "child_run_ids": [],
+        "depth": 0,
+        "issue": 218,
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "xhigh",
+        "permission": "write",
+        "lifecycle_status": "succeeded"
+      }
+    ],
+    "summary": {
+      "run_count": 1,
+      "terminal_runs": 1,
+      "interrupted_runs": 0,
+      "failed_runs": 0,
+      "needs_human_runs": 0
+    }
+  }
 }
 ```
 

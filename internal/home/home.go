@@ -18,6 +18,8 @@ const (
 
 	homeDirName     = ".loopcoder"
 	binDirName      = "bin"
+	dataDirName     = "data"
+	databaseName    = "loopcoder.db"
 	versionsDirName = "versions"
 	skillsDirName   = "skills"
 	playbookName    = "SKILL.md"
@@ -81,6 +83,16 @@ func New(homeDir string) Layout {
 // BinDir returns the directory containing the stable selected binary.
 func (l Layout) BinDir() string {
 	return filepath.Join(l.HomeDir, binDirName)
+}
+
+// DataDir returns the directory containing machine-local runtime data.
+func (l Layout) DataDir() string {
+	return filepath.Join(l.HomeDir, dataDirName)
+}
+
+// DatabasePath returns the default SQLite database path.
+func (l Layout) DatabasePath() string {
+	return filepath.Join(l.DataDir(), databaseName)
 }
 
 // VersionsDir returns the directory containing versioned binary installs.

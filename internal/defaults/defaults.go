@@ -14,6 +14,10 @@ const (
 	PreProdBranch = "pre-prod"
 	// DispatchWaveThrottleLimit is the default concurrent dispatch cap.
 	DispatchWaveThrottleLimit = 4
+	// NestedSchedulerMaxDepth is the default child-run depth cap.
+	NestedSchedulerMaxDepth = 1
+	// NestedSchedulerMaxChildren is the default child-run fan-out cap.
+	NestedSchedulerMaxChildren = 16
 
 	// WorkerHardCap is the worker provider watchdog hard cap.
 	WorkerHardCap = 45 * time.Minute
@@ -110,6 +114,8 @@ type Values struct {
 	BaseBranch                              string
 	PreProdBranch                           string
 	DispatchWaveThrottleLimit               int
+	NestedSchedulerMaxDepth                 int
+	NestedSchedulerMaxChildren              int
 	WorkerHardCap                           time.Duration
 	WorkerStallTimeout                      time.Duration
 	WorkerHeartbeatIntervalSeconds          int
@@ -184,6 +190,8 @@ func Current() Values {
 		BaseBranch:                              BaseBranch,
 		PreProdBranch:                           PreProdBranch,
 		DispatchWaveThrottleLimit:               DispatchWaveThrottleLimit,
+		NestedSchedulerMaxDepth:                 NestedSchedulerMaxDepth,
+		NestedSchedulerMaxChildren:              NestedSchedulerMaxChildren,
 		WorkerHardCap:                           WorkerHardCap,
 		WorkerStallTimeout:                      WorkerStallTimeout,
 		WorkerHeartbeatIntervalSeconds:          WorkerHeartbeatIntervalSeconds,

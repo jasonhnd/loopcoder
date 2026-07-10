@@ -14,6 +14,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
@@ -29,6 +30,7 @@ type Config struct {
 	Guardrails   Guardrails   `yaml:"guardrails"`
 	Environment  Environment  `yaml:"environment"`
 	Evidence     Evidence     `yaml:"evidence"`
+	Host         Host         `yaml:"host,omitempty"`
 	Domain       Domain       `yaml:"domain,omitempty"`
 	MCP          MCP          `yaml:"mcp,omitempty"`
 	Audit        Audit        `yaml:"audit,omitempty"`
@@ -154,6 +156,12 @@ type EvidenceArtifact struct {
 	ExampleOutput string `yaml:"example_output" json:"example_output,omitempty"`
 	TestResults   string `yaml:"test_results" json:"test_results,omitempty"`
 	PreviewBuild  string `yaml:"preview_build" json:"preview_build,omitempty"`
+}
+
+// Host selects the local agent host profile. It is separate from provider,
+// model, and reasoning-depth selection.
+type Host struct {
+	Profile string `yaml:"profile,omitempty"`
 }
 
 // Domain is the optional 0.5.0 domain-profile schema. Runtime slices consume
@@ -418,6 +426,9 @@ func validateParsedConfig(cfg Config) error {
 		return err
 	}
 	if err := validateAudit(cfg.Audit); err != nil {
+		return err
+	}
+	if err := validateHost(cfg.Host); err != nil {
 		return err
 	}
 	return nil
@@ -829,6 +840,17 @@ func validateAudit(a Audit) error {
 		}
 	}
 	return nil
+}
+
+func validateHost(host Host) error {
+	profile := strings.TrimSpace(host.Profile)
+	if profile == "" {
+		return nil
+	}
+	if _, ok := hostprofile.NormalizeName(profile); ok {
+		return nil
+	}
+	return fmt.Errorf("invalid delivery config: host.profile %q is not one of %s", host.Profile, strings.Join(hostprofile.KnownNames(), ", "))
 }
 
 func validAuditSeverity(severity string) bool {

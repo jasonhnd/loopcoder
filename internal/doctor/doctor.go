@@ -3,6 +3,7 @@ package doctor
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,10 +23,17 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/provider"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	"gopkg.in/yaml.v3"
@@ -67,6 +76,8 @@ type Deps struct {
 	SkillMarkdown  func() ([]byte, error)
 	AgentsMarkdown func() ([]byte, error)
 	CleanupPlan    func(localcleanup.Options) (localcleanup.Result, error)
+	StorageHealth  func(context.Context, string) (storage.Health, error)
+	ProjectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 }
 
 type CommandResult struct {
@@ -77,6 +88,7 @@ type CommandResult struct {
 
 type Check struct {
 	Name       string
+	Code       string
 	Status     Status
 	Message    string
 	Hard       bool
@@ -84,11 +96,77 @@ type Check struct {
 }
 
 type Report struct {
-	RepoPath string
-	Version  string
-	Commit   string
-	Date     string
-	Checks   []Check
+	RepoPath              string
+	Version               string
+	Commit                string
+	Date                  string
+	HostProfile           HostProfile
+	Runtime               RuntimeHealth
+	ProviderCompatibility []ProviderCompatibility
+	Checks                []Check
+}
+
+type HostProfile struct {
+	Name               string
+	Source             string
+	Selector           string
+	InvocationStyle    string
+	SupportsHooks      bool
+	SupportsJSONOutput bool
+	DetectedBy         []string
+	KnownLimitations   []string
+}
+
+type ProviderCompatibility struct {
+	Provider             string
+	Host                 string
+	Role                 string
+	Support              string
+	Status               Status
+	Code                 string
+	RequiredCapabilities []string
+	MissingCapabilities  []string
+	KnownLimitations     []string
+}
+
+type RuntimeHealth struct {
+	HomeDir         string
+	Database        RuntimeDatabase
+	ProjectRegistry RuntimeProjectRegistry
+	Migration       RuntimeMigration
+	NestedRuns      RuntimeNestedRuns
+}
+
+type RuntimeDatabase struct {
+	Path          string
+	Exists        bool
+	SchemaVersion int
+	Status        Status
+	Message       string
+}
+
+type RuntimeProjectRegistry struct {
+	Status         Status
+	Registered     bool
+	ProjectID      string
+	IdentitySource string
+	ConflictCount  int
+	Message        string
+}
+
+type RuntimeMigration struct {
+	Status         Status
+	LegacySurfaces int
+	Message        string
+}
+
+type RuntimeNestedRuns struct {
+	Status       Status
+	RunCount     int
+	ParentEdges  int
+	ChildEdges   int
+	ProblemCount int
+	Message      string
 }
 
 func (r Report) ExitCode() int {
@@ -121,36 +199,139 @@ func Render(w io.Writer, report Report) error {
 func RenderJSON(w io.Writer, report Report) error {
 	type renderedCheck struct {
 		Name       string `json:"name"`
+		Code       string `json:"code,omitempty"`
 		Status     Status `json:"status"`
 		Hard       bool   `json:"hard"`
 		Message    string `json:"message"`
 		FixCommand string `json:"fix_command"`
 	}
+	type renderedHostProfile struct {
+		Name               string   `json:"name"`
+		Source             string   `json:"source"`
+		Selector           string   `json:"selector,omitempty"`
+		InvocationStyle    string   `json:"invocation_style"`
+		SupportsHooks      bool     `json:"supports_hooks"`
+		SupportsJSONOutput bool     `json:"supports_json_output"`
+		DetectedBy         []string `json:"detected_by,omitempty"`
+		KnownLimitations   []string `json:"known_limitations,omitempty"`
+	}
+	type renderedProviderCompatibility struct {
+		Provider             string   `json:"provider"`
+		Host                 string   `json:"host"`
+		Role                 string   `json:"role"`
+		Support              string   `json:"support"`
+		Status               Status   `json:"status"`
+		Code                 string   `json:"code"`
+		RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+		MissingCapabilities  []string `json:"missing_capabilities,omitempty"`
+		KnownLimitations     []string `json:"known_limitations,omitempty"`
+	}
+	type renderedRuntime struct {
+		HomeDir  string `json:"home_dir,omitempty"`
+		Database struct {
+			Path          string `json:"path,omitempty"`
+			Exists        bool   `json:"exists"`
+			SchemaVersion int    `json:"schema_version"`
+			Status        Status `json:"status"`
+			Message       string `json:"message"`
+		} `json:"database"`
+		ProjectRegistry struct {
+			Status         Status `json:"status"`
+			Registered     bool   `json:"registered"`
+			ProjectID      string `json:"project_id,omitempty"`
+			IdentitySource string `json:"identity_source,omitempty"`
+			ConflictCount  int    `json:"conflict_count"`
+			Message        string `json:"message"`
+		} `json:"project_registry"`
+		Migration struct {
+			Status         Status `json:"status"`
+			LegacySurfaces int    `json:"legacy_surfaces"`
+			Message        string `json:"message"`
+		} `json:"migration"`
+		NestedRuns struct {
+			Status       Status `json:"status"`
+			RunCount     int    `json:"run_count"`
+			ParentEdges  int    `json:"parent_edges"`
+			ChildEdges   int    `json:"child_edges"`
+			ProblemCount int    `json:"problem_count"`
+			Message      string `json:"message"`
+		} `json:"nested_runs"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		checks = append(checks, renderedCheck{
 			Name:       check.Name,
+			Code:       check.Code,
 			Status:     check.Status,
 			Hard:       check.Hard,
 			Message:    check.Message,
 			FixCommand: check.FixCommand,
 		})
 	}
+	compatibility := make([]renderedProviderCompatibility, 0, len(report.ProviderCompatibility))
+	for _, entry := range report.ProviderCompatibility {
+		compatibility = append(compatibility, renderedProviderCompatibility{
+			Provider:             entry.Provider,
+			Host:                 entry.Host,
+			Role:                 entry.Role,
+			Support:              entry.Support,
+			Status:               entry.Status,
+			Code:                 entry.Code,
+			RequiredCapabilities: append([]string(nil), entry.RequiredCapabilities...),
+			MissingCapabilities:  append([]string(nil), entry.MissingCapabilities...),
+			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
+		})
+	}
 	payload := struct {
-		RepoPath string          `json:"repo_path"`
-		Version  string          `json:"version"`
-		Commit   string          `json:"commit"`
-		Date     string          `json:"date"`
-		ExitCode int             `json:"exit_code"`
-		Checks   []renderedCheck `json:"checks"`
+		RepoPath              string                          `json:"repo_path"`
+		Version               string                          `json:"version"`
+		Commit                string                          `json:"commit"`
+		Date                  string                          `json:"date"`
+		ExitCode              int                             `json:"exit_code"`
+		Host                  renderedHostProfile             `json:"host_profile"`
+		Runtime               renderedRuntime                 `json:"runtime"`
+		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
+		Checks                []renderedCheck                 `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
 		Version:  report.Version,
 		Commit:   report.Commit,
 		Date:     report.Date,
 		ExitCode: report.ExitCode(),
-		Checks:   checks,
+		Host: renderedHostProfile{
+			Name:               report.HostProfile.Name,
+			Source:             report.HostProfile.Source,
+			Selector:           report.HostProfile.Selector,
+			InvocationStyle:    report.HostProfile.InvocationStyle,
+			SupportsHooks:      report.HostProfile.SupportsHooks,
+			SupportsJSONOutput: report.HostProfile.SupportsJSONOutput,
+			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
+			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
+		},
+		ProviderCompatibility: compatibility,
+		Checks:                checks,
 	}
+	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
+	payload.Runtime.Database.Path = filepath.ToSlash(report.Runtime.Database.Path)
+	payload.Runtime.Database.Exists = report.Runtime.Database.Exists
+	payload.Runtime.Database.SchemaVersion = report.Runtime.Database.SchemaVersion
+	payload.Runtime.Database.Status = report.Runtime.Database.Status
+	payload.Runtime.Database.Message = report.Runtime.Database.Message
+	payload.Runtime.ProjectRegistry.Status = report.Runtime.ProjectRegistry.Status
+	payload.Runtime.ProjectRegistry.Registered = report.Runtime.ProjectRegistry.Registered
+	payload.Runtime.ProjectRegistry.ProjectID = report.Runtime.ProjectRegistry.ProjectID
+	payload.Runtime.ProjectRegistry.IdentitySource = report.Runtime.ProjectRegistry.IdentitySource
+	payload.Runtime.ProjectRegistry.ConflictCount = report.Runtime.ProjectRegistry.ConflictCount
+	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
+	payload.Runtime.Migration.Status = report.Runtime.Migration.Status
+	payload.Runtime.Migration.LegacySurfaces = report.Runtime.Migration.LegacySurfaces
+	payload.Runtime.Migration.Message = report.Runtime.Migration.Message
+	payload.Runtime.NestedRuns.Status = report.Runtime.NestedRuns.Status
+	payload.Runtime.NestedRuns.RunCount = report.Runtime.NestedRuns.RunCount
+	payload.Runtime.NestedRuns.ParentEdges = report.Runtime.NestedRuns.ParentEdges
+	payload.Runtime.NestedRuns.ChildEdges = report.Runtime.NestedRuns.ChildEdges
+	payload.Runtime.NestedRuns.ProblemCount = report.Runtime.NestedRuns.ProblemCount
+	payload.Runtime.NestedRuns.Message = report.Runtime.NestedRuns.Message
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
@@ -170,6 +351,11 @@ func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 	if strings.TrimSpace(report.Date) == "" {
 		report.Date = build.Date
 	}
+	if strings.TrimSpace(report.HostProfile.Name) == "" && strings.TrimSpace(report.HostProfile.Source) == "" {
+		if resolved, err := hostprofile.Resolve(hostprofile.Options{Getenv: func(string) string { return "" }}); err == nil {
+			report.HostProfile = renderHostProfile(resolved)
+		}
+	}
 	return report
 }
 
@@ -185,6 +371,10 @@ func DefaultDeps() Deps {
 		SkillMarkdown:  loopcoder.SkillMarkdown,
 		AgentsMarkdown: loopcoder.AgentsMarkdown,
 		CleanupPlan:    localcleanup.Plan,
+		StorageHealth:  storage.CheckHealth,
+		ProjectShow: func(ctx context.Context, opts registry.Options) (registry.ShowResult, error) {
+			return registry.Show(ctx, opts, registry.DefaultDeps())
+		},
 	}
 }
 
@@ -209,6 +399,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
 	checks := make([]Check, 0, 10)
+	host, hostCheck := resolveHostProfile(delivery, deps)
 
 	gitCheck, gitPresent := checkGit(deps)
 	checks = append(checks, gitCheck)
@@ -220,8 +411,10 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkTrackedLoopcoderState(ctx, repoPath, gitPresent, deps))
 
 	checks = append(checks, checkDeliveryConfig(delivery))
+	checks = append(checks, hostCheck)
 	checks = append(checks, checkModelSelections(delivery))
 	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
+	checks = append(checks, checkProviderCompatibility(delivery.Config, host)...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
 	checks = append(checks, originCheck)
@@ -234,7 +427,11 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkInstalledSkill(deps))
 	checks = append(checks, checkConductorHooks(repoPath, deps))
 	checks = append(checks, checkReportQuery(repoPath))
+	checks = append(checks, checkStorageHealth(ctx, deps))
+	checks = append(checks, checkProjectRegistry(ctx, repoPath, deps))
+	checks = append(checks, checkLocalStateImport(ctx, repoPath, deps))
 	checks = append(checks, checkMigrationStatus(repoPath, deps))
+	checks = append(checks, checkNestedRunHealth(repoPath))
 	checks = append(checks, checkStaleState(repoPath, deps))
 	checks = append(checks, Check{
 		Name:    "conductor runtime",
@@ -242,7 +439,12 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		Message: "user-provided by the active Claude Code or Codex host; loopcoder does not ship it",
 	})
 
-	return WithMetadata(Report{Checks: checks}, repoPath, build)
+	return WithMetadata(Report{
+		HostProfile:           host,
+		Runtime:               runtimeHealth(ctx, repoPath, deps),
+		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
+		Checks:                checks,
+	}, repoPath, build)
 }
 
 func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, deps Deps) Report {
@@ -275,7 +477,12 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		BuildInfo:  build,
 	}, deps)
 	checks = append(checks, readOnly.Checks...)
-	return WithMetadata(Report{Checks: checks}, repoPath, build)
+	return WithMetadata(Report{
+		Runtime:               readOnly.Runtime,
+		HostProfile:           readOnly.HostProfile,
+		ProviderCompatibility: readOnly.ProviderCompatibility,
+		Checks:                checks,
+	}, repoPath, build)
 }
 
 func fixDeliveryConfig(repoPath string, deps Deps) Check {
@@ -579,6 +786,12 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.CleanupPlan == nil {
 		deps.CleanupPlan = defaults.CleanupPlan
 	}
+	if deps.StorageHealth == nil {
+		deps.StorageHealth = defaults.StorageHealth
+	}
+	if deps.ProjectShow == nil {
+		deps.ProjectShow = defaults.ProjectShow
+	}
 	return deps
 }
 
@@ -795,6 +1008,451 @@ func checkReportQuery(repoPath string) Check {
 	}
 }
 
+func checkStorageHealth(ctx context.Context, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "storage",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for storage health: %v", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil {
+		return Check{
+			Name:    "storage",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s health=fail: %v", path, err),
+		}
+	}
+	if !health.Exists {
+		return Check{
+			Name:    "storage",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("path=%s schema_version=0 health=not-created", path),
+		}
+	}
+	if !health.OK {
+		message := strings.TrimSpace(health.Message)
+		if message == "" {
+			message = "unhealthy"
+		}
+		return Check{
+			Name:    "storage",
+			Status:  StatusFail,
+			Message: fmt.Sprintf("path=%s schema_version=%d health=%s", path, health.SchemaVersion, message),
+		}
+	}
+	return Check{
+		Name:    "storage",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("path=%s schema_version=%d health=ok", path, health.SchemaVersion),
+	}
+}
+
+func checkProjectRegistry(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home for project registry: %v", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusInfo,
+			Message: "project is not registered; global registry database has not been created",
+		}
+	}
+	if !health.OK {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect project registry because storage is unhealthy: %s", firstNonEmpty(health.Message, "unhealthy")),
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect project registry: %v", err),
+		}
+	}
+	if len(result.Conflicts) > 0 {
+		ids := make([]string, 0, len(result.Conflicts))
+		for _, conflict := range result.Conflicts {
+			ids = append(ids, conflict.ProjectID)
+		}
+		sort.Strings(ids)
+		return Check{
+			Name:    "project registry",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("project identity is ambiguous; local path also matches registered project(s): %s; run: loopcoder projects show --repo .", strings.Join(ids, ", ")),
+		}
+	}
+	if !result.Registered {
+		return Check{
+			Name:    "project registry",
+			Status:  StatusInfo,
+			Message: fmt.Sprintf("project is not registered; resolved candidate %s from %s; run: loopcoder projects register --repo .", result.Project.ProjectID, result.Project.IdentitySource),
+		}
+	}
+	return Check{
+		Name:    "project registry",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("registered project_id=%s identity=%s path=%s", result.Project.ProjectID, result.Project.IdentitySource, result.Project.LocalPath),
+	}
+}
+
+func runtimeHealth(ctx context.Context, repoPath string, deps Deps) RuntimeHealth {
+	deps = normalizeDeps(deps)
+	runtime := RuntimeHealth{
+		Migration:  runtimeMigration(repoPath, deps),
+		NestedRuns: runtimeNestedRuns(repoPath),
+	}
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		runtime.Database = RuntimeDatabase{
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home: %v", err),
+		}
+		runtime.ProjectRegistry = RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not resolve loopcoder home: %v", err),
+		}
+		return runtime
+	}
+	runtime.HomeDir = layout.HomeDir
+	runtime.Database = runtimeDatabase(ctx, layout.DatabasePath(), deps)
+	runtime.ProjectRegistry = runtimeProjectRegistry(ctx, repoPath, layout.DatabasePath(), runtime.Database, deps)
+	return runtime
+}
+
+func runtimeDatabase(ctx context.Context, path string, deps Deps) RuntimeDatabase {
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil {
+		return RuntimeDatabase{
+			Path:          path,
+			Exists:        health.Exists,
+			SchemaVersion: health.SchemaVersion,
+			Status:        StatusFail,
+			Message:       err.Error(),
+		}
+	}
+	if !health.Exists {
+		return RuntimeDatabase{
+			Path:    path,
+			Status:  StatusInfo,
+			Message: firstNonEmpty(health.Message, "database has not been created"),
+		}
+	}
+	if !health.OK {
+		return RuntimeDatabase{
+			Path:          path,
+			Exists:        true,
+			SchemaVersion: health.SchemaVersion,
+			Status:        StatusFail,
+			Message:       firstNonEmpty(health.Message, "unhealthy"),
+		}
+	}
+	return RuntimeDatabase{
+		Path:          path,
+		Exists:        true,
+		SchemaVersion: health.SchemaVersion,
+		Status:        StatusOK,
+		Message:       firstNonEmpty(health.Message, "storage database is healthy"),
+	}
+}
+
+func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, database RuntimeDatabase, deps Deps) RuntimeProjectRegistry {
+	if database.Status == StatusInfo && !database.Exists {
+		return RuntimeProjectRegistry{
+			Status:  StatusInfo,
+			Message: "global registry database has not been created",
+		}
+	}
+	if database.Status == StatusFail {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: "storage is unhealthy; registry could not be inspected",
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
+	if err != nil {
+		return RuntimeProjectRegistry{
+			Status:  StatusWarn,
+			Message: err.Error(),
+		}
+	}
+	registry := RuntimeProjectRegistry{
+		Registered:     result.Registered,
+		ProjectID:      result.Project.ProjectID,
+		IdentitySource: string(result.Project.IdentitySource),
+		ConflictCount:  len(result.Conflicts),
+	}
+	switch {
+	case len(result.Conflicts) > 0:
+		registry.Status = StatusWarn
+		registry.Message = "project identity is ambiguous"
+	case !result.Registered:
+		registry.Status = StatusInfo
+		registry.Message = "project is not registered"
+	default:
+		registry.Status = StatusOK
+		registry.Message = "project registry identity is registered"
+	}
+	return registry
+}
+
+func runtimeMigration(repoPath string, deps Deps) RuntimeMigration {
+	status := scanMigrationStatus(repoPath, deps)
+	legacyCount := migrationLegacyCount(status)
+	if legacyCount > 0 {
+		return RuntimeMigration{
+			Status:         StatusWarn,
+			LegacySurfaces: legacyCount,
+			Message:        "legacy surfaces require explicit doctor --fix migration",
+		}
+	}
+	if strings.TrimSpace(status.ScanWarning) != "" {
+		return RuntimeMigration{
+			Status:  StatusWarn,
+			Message: status.ScanWarning,
+		}
+	}
+	return RuntimeMigration{
+		Status:  StatusOK,
+		Message: "no legacy surfaces found",
+	}
+}
+
+func checkNestedRunHealth(repoPath string) Check {
+	health := runtimeNestedRuns(repoPath)
+	return Check{
+		Name:    "nested runs",
+		Status:  health.Status,
+		Message: health.Message,
+	}
+}
+
+func runtimeNestedRuns(repoPath string) RuntimeNestedRuns {
+	runsRoot := state.RunsRoot(repoPath)
+	entries, err := os.ReadDir(runsRoot)
+	if err != nil {
+		if isNotExist(err) {
+			return RuntimeNestedRuns{
+				Status:  StatusOK,
+				Message: "no repo-local run tree state found",
+			}
+		}
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			ProblemCount: 1,
+			Message:      fmt.Sprintf("could not inspect run tree state: %v", err),
+		}
+	}
+	if len(entries) > lcdefaults.RunStatusMaxDirectoryEntries {
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			ProblemCount: 1,
+			Message:      fmt.Sprintf("run directory entry limit exceeded (%d > %d)", len(entries), lcdefaults.RunStatusMaxDirectoryEntries),
+		}
+	}
+
+	runIDs := map[string]bool{}
+	lifecycles := map[string]state.Lifecycle{}
+	var problems []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		runID := strings.TrimSpace(entry.Name())
+		if !state.IsRunID(runID) {
+			problems = append(problems, fmt.Sprintf("%s is not a valid run id", runID))
+			continue
+		}
+		runIDs[runID] = true
+		lifecycle, err := state.LoadLifecycle(repoPath, runID)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s lifecycle unreadable: %v", runID, err))
+			continue
+		}
+		lifecycles[runID] = lifecycle
+	}
+
+	parentEdges := 0
+	childEdges := 0
+	for runID, lifecycle := range lifecycles {
+		parent := strings.TrimSpace(lifecycle.ParentRunID)
+		if parent != "" {
+			parentEdges++
+			if parent == runID {
+				problems = append(problems, fmt.Sprintf("%s references itself as parent", runID))
+			} else if !runIDs[parent] {
+				problems = append(problems, fmt.Sprintf("%s references missing parent %s", runID, parent))
+			}
+		}
+		for _, child := range lifecycle.ChildRunIDs {
+			child = strings.TrimSpace(child)
+			if child == "" {
+				continue
+			}
+			childEdges++
+			if child == runID {
+				problems = append(problems, fmt.Sprintf("%s references itself as child", runID))
+			} else if !runIDs[child] {
+				problems = append(problems, fmt.Sprintf("%s references missing child %s", runID, child))
+			}
+		}
+	}
+
+	runCount := len(runIDs)
+	if len(problems) > 0 {
+		detail := strings.Join(problems, "; ")
+		if len(problems) > 3 {
+			detail = strings.Join(problems[:3], "; ") + fmt.Sprintf("; plus %d more", len(problems)-3)
+		}
+		return RuntimeNestedRuns{
+			Status:       StatusWarn,
+			RunCount:     runCount,
+			ParentEdges:  parentEdges,
+			ChildEdges:   childEdges,
+			ProblemCount: len(problems),
+			Message:      fmt.Sprintf("run tree has %d problem(s): %s; inspect with: loopcoder status --repo . --format json", len(problems), detail),
+		}
+	}
+	if parentEdges == 0 && childEdges == 0 {
+		return RuntimeNestedRuns{
+			Status:      StatusOK,
+			RunCount:    runCount,
+			ParentEdges: parentEdges,
+			ChildEdges:  childEdges,
+			Message:     fmt.Sprintf("run tree readable; %d run(s), no nested edges", runCount),
+		}
+	}
+	return RuntimeNestedRuns{
+		Status:      StatusOK,
+		RunCount:    runCount,
+		ParentEdges: parentEdges,
+		ChildEdges:  childEdges,
+		Message:     fmt.Sprintf("run tree readable; %d run(s), %d parent edge(s), %d child edge(s)", runCount, parentEdges, childEdges),
+	}
+}
+
+func checkLocalStateImport(ctx context.Context, repoPath string, deps Deps) Check {
+	deps = normalizeDeps(deps)
+	if !legacyLocalStatePresent(repoPath) {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusOK,
+			Message: "no repo-local .loopcoder history found for storage import",
+		}
+	}
+	layout, err := home.Resolve(home.Deps{
+		Getenv:      deps.Getenv,
+		UserHomeDir: deps.UserHomeDir,
+	})
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("repo-local .loopcoder history exists, but loopcoder home could not be resolved: %v; run: loopcoder migrate local-state --repo .", err),
+		}
+	}
+	path := layout.DatabasePath()
+	health, err := deps.StorageHealth(ctx, path)
+	if err != nil || !health.Exists || !health.OK {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists and has not been imported into healthy storage; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	result, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: path})
+	if err != nil || !result.Registered {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but this project has no import status; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	status, malformed, err := readLocalStateImportStatus(ctx, path, result.Project.ProjectID)
+	if err != nil {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not inspect local state import status: %v; run: loopcoder migrate local-state --repo .", err),
+		}
+	}
+	if strings.TrimSpace(status) == "" {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: "repo-local .loopcoder history exists but no import status is recorded for this project; run: loopcoder migrate local-state --repo .",
+		}
+	}
+	if malformed > 0 {
+		return Check{
+			Name:    "local state import",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("last local state import status=%s with %d malformed record(s); fix records or rerun: loopcoder migrate local-state --repo .", status, malformed),
+		}
+	}
+	return Check{
+		Name:    "local state import",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("repo-local .loopcoder history import recorded for project_id=%s status=%s", result.Project.ProjectID, status),
+	}
+}
+
+func legacyLocalStatePresent(repoPath string) bool {
+	for _, rel := range []string{
+		filepath.Join(".loopcoder", "runs"),
+		filepath.Join(".loopcoder", "relay"),
+	} {
+		info, err := os.Stat(filepath.Join(repoPath, rel))
+		if err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func readLocalStateImportStatus(ctx context.Context, dbPath, projectID string) (string, int, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer db.Close()
+	var status string
+	var malformed int
+	err = db.QueryRowContext(ctx, `SELECT status, malformed_count FROM legacy_import_status WHERE project_id = ?`, projectID).Scan(&status, &malformed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, nil
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	return status, malformed, nil
+}
+
 type deliveryState struct {
 	Path        string
 	Present     bool
@@ -884,6 +1542,62 @@ func checkDeliveryConfig(delivery deliveryState) Check {
 		Name:    ".delivery.yml",
 		Status:  StatusOK,
 		Message: "present and valid",
+	}
+}
+
+func resolveHostProfile(delivery deliveryState, deps Deps) (HostProfile, Check) {
+	configProfile := ""
+	if delivery.Valid || !delivery.Present {
+		configProfile = delivery.Config.Host.Profile
+	}
+	resolved, err := hostprofile.Resolve(hostprofile.Options{
+		Profile: configProfile,
+		Getenv:  deps.Getenv,
+	})
+	if err != nil {
+		selector := "host.profile"
+		if strings.TrimSpace(deps.Getenv(hostprofile.EnvName)) != "" {
+			selector = hostprofile.EnvName
+		}
+		return HostProfile{Source: "error", Selector: selector}, Check{
+			Name:    "host profile",
+			Status:  StatusFail,
+			Message: err.Error(),
+			Hard:    true,
+		}
+	}
+	profile := renderHostProfile(resolved)
+	status := StatusOK
+	if resolved.Source == hostprofile.SourceFallback {
+		status = StatusWarn
+	}
+	message := fmt.Sprintf("profile=%s source=%s", profile.Name, profile.Source)
+	if profile.Selector != "" {
+		message += " selector=" + profile.Selector
+	}
+	if profile.InvocationStyle != "" {
+		message += "; " + profile.InvocationStyle
+	}
+	if len(profile.KnownLimitations) > 0 {
+		message += "; limitations: " + strings.Join(profile.KnownLimitations, "; ")
+	}
+	return profile, Check{
+		Name:    "host profile",
+		Status:  status,
+		Message: message,
+	}
+}
+
+func renderHostProfile(resolved hostprofile.Resolved) HostProfile {
+	return HostProfile{
+		Name:               resolved.Name,
+		Source:             string(resolved.Source),
+		Selector:           resolved.Selector,
+		InvocationStyle:    resolved.Runtime.InvocationStyle,
+		SupportsHooks:      resolved.Runtime.SupportsHooks,
+		SupportsJSONOutput: resolved.Runtime.SupportsJSONOutput,
+		DetectedBy:         append([]string(nil), resolved.DetectedBy...),
+		KnownLimitations:   append([]string(nil), resolved.Runtime.KnownLimitations...),
 	}
 }
 
@@ -1003,6 +1717,7 @@ func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []
 			}
 			checks = append(checks, Check{
 				Name:    "provider " + provider.Name,
+				Code:    "missing_executable",
 				Status:  status,
 				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH%s", roleText, cliName, fix),
 				Hard:    hard,
@@ -1015,11 +1730,118 @@ func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []
 		}
 		checks = append(checks, Check{
 			Name:    "provider " + provider.Name,
+			Code:    "provider_ready",
 			Status:  StatusOK,
 			Message: fmt.Sprintf("configured for %s; CLI %q found at %s; authentication not checked by a stable cheap probe", roleText, cliName, path),
 		})
 	}
 	return checks
+}
+
+func checkProviderCompatibility(cfg config.Config, host HostProfile) []Check {
+	hostName := firstNonEmpty(host.Name, "generic-local")
+	configured := configuredProviders(cfg)
+	checks := make([]Check, 0, len(configured)*2)
+	for _, spec := range configured {
+		for _, role := range spec.Roles {
+			compatRole := runtimecap.RoleWorker
+			if role == "verifier" {
+				compatRole = runtimecap.RoleVerifier
+			}
+			entry := provider.Check(runtimecap.DefaultContract(), spec.Name, hostName, compatRole)
+			checks = append(checks, checkFromCompatibilityEntry(entry, true))
+		}
+	}
+
+	worker := strings.TrimSpace(cfg.Adapters.Worker)
+	if worker == "" {
+		worker = "codex"
+	}
+	nested := provider.Check(runtimecap.DefaultContract(), worker, hostName, runtimecap.RoleNestedSubagents)
+	nestedCheck := checkFromCompatibilityEntry(nested, false)
+	nestedCheck.Name = "provider compatibility " + worker + " nested-subagents"
+	checks = append(checks, nestedCheck)
+	return checks
+}
+
+func checkFromCompatibilityEntry(entry runtimecap.CompatibilityEntry, selected bool) Check {
+	status := compatibilityStatus(entry.Support)
+	hard := selected && entry.Support == runtimecap.SupportUnsupported
+	if !selected && entry.Support == runtimecap.SupportUnsupported {
+		status = StatusInfo
+	}
+	missing := formatCapabilities(entry.MissingCapabilities)
+	required := formatCapabilities(entry.RequiredCapabilities)
+	parts := []string{
+		fmt.Sprintf("provider=%s host=%s role=%s support=%s", entry.Provider, entry.Host, entry.Role, entry.Support),
+	}
+	if required != "" {
+		parts = append(parts, "requires="+required)
+	}
+	if missing != "" {
+		parts = append(parts, "missing="+missing)
+	}
+	if len(entry.KnownLimitations) > 0 {
+		parts = append(parts, "limitations: "+strings.Join(entry.KnownLimitations, "; "))
+	}
+	return Check{
+		Name:    fmt.Sprintf("provider compatibility %s %s", entry.Provider, entry.Role),
+		Code:    entry.Code,
+		Status:  status,
+		Message: strings.Join(parts, "; "),
+		Hard:    hard,
+	}
+}
+
+func compatibilityStatus(support runtimecap.SupportLevel) Status {
+	switch support {
+	case runtimecap.SupportSupported:
+		return StatusOK
+	case runtimecap.SupportExperimental:
+		return StatusWarn
+	default:
+		return StatusFail
+	}
+}
+
+func formatCapabilities(capabilities []runtimecap.ProviderCapability) string {
+	if len(capabilities) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		out = append(out, string(capability))
+	}
+	return strings.Join(out, ",")
+}
+
+func renderProviderCompatibility(entries []runtimecap.CompatibilityEntry) []ProviderCompatibility {
+	out := make([]ProviderCompatibility, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, ProviderCompatibility{
+			Provider:             entry.Provider,
+			Host:                 entry.Host,
+			Role:                 string(entry.Role),
+			Support:              string(entry.Support),
+			Status:               compatibilityStatus(entry.Support),
+			Code:                 entry.Code,
+			RequiredCapabilities: formatCompatibilityCapabilities(entry.RequiredCapabilities),
+			MissingCapabilities:  formatCompatibilityCapabilities(entry.MissingCapabilities),
+			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
+		})
+	}
+	return out
+}
+
+func formatCompatibilityCapabilities(capabilities []runtimecap.ProviderCapability) []string {
+	if len(capabilities) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		out = append(out, string(capability))
+	}
+	return out
 }
 
 func providerCLIName(provider string) string {
@@ -1039,6 +1861,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		}
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models could not run: %v%s; run: agy login", roleText, path, err, detail),
 			Hard:    true,
@@ -1051,6 +1874,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		}
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models failed: %s; run: agy login", roleText, path, detail),
 			Hard:    true,
@@ -1060,6 +1884,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 		detail := commandDetail(result)
 		return Check{
 			Name:    "provider antigravity",
+			Code:    "unauthenticated_provider",
 			Status:  StatusFail,
 			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models reported an authentication problem: %s; run: agy login", roleText, path, firstNonEmpty(detail, "authentication required")),
 			Hard:    true,
@@ -1067,6 +1892,7 @@ func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string
 	}
 	return Check{
 		Name:    "provider antigravity",
+		Code:    "provider_authenticated",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s; agy models OAuth probe succeeded", roleText, path),
 	}

@@ -4,6 +4,7 @@ package runstatus
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
@@ -38,41 +40,94 @@ type Options struct {
 }
 
 type Report struct {
-	RunID               string
-	RunNote             string
-	RunPath             string
-	EventCount          int
-	VerifierRecordCount int
-	Rows                []Row
+	RunID               string          `json:"run_id"`
+	RunNote             string          `json:"run_note"`
+	RunPath             string          `json:"run_path"`
+	Project             ProjectMetadata `json:"project"`
+	EventCount          int             `json:"event_count"`
+	VerifierRecordCount int             `json:"verifier_record_count"`
+	LifecycleState      string          `json:"lifecycle_state"`
+	LifecycleSource     string          `json:"lifecycle_source"`
+	LifecycleEvents     int             `json:"lifecycle_events"`
+	ParentRunID         string          `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string        `json:"child_run_ids"`
+	RunTree             RunTree         `json:"run_tree"`
+	Rows                []Row           `json:"rows"`
+}
+
+type ProjectMetadata struct {
+	ProjectID      string `json:"project_id"`
+	DisplayName    string `json:"display_name,omitempty"`
+	LocalPath      string `json:"local_path,omitempty"`
+	IdentitySource string `json:"identity_source,omitempty"`
+	GitHubOwner    string `json:"github_owner,omitempty"`
+	GitHubName     string `json:"github_name,omitempty"`
+}
+
+type RunTree struct {
+	RootRunID     string         `json:"root_run_id"`
+	SelectedRunID string         `json:"selected_run_id"`
+	Nodes         []RunTreeNode  `json:"nodes"`
+	Summary       RunTreeSummary `json:"summary"`
+}
+
+type RunTreeSummary struct {
+	RunCount        int `json:"run_count"`
+	TerminalRuns    int `json:"terminal_runs"`
+	InterruptedRuns int `json:"interrupted_runs"`
+	FailedRuns      int `json:"failed_runs"`
+	NeedsHumanRuns  int `json:"needs_human_runs"`
+}
+
+type RunTreeNode struct {
+	ProjectID       string   `json:"project_id"`
+	RunID           string   `json:"run_id"`
+	ParentRunID     string   `json:"parent_run_id,omitempty"`
+	ChildRunIDs     []string `json:"child_run_ids"`
+	Depth           int      `json:"depth"`
+	Issue           int      `json:"issue,omitempty"`
+	PR              string   `json:"pr,omitempty"`
+	Role            string   `json:"role,omitempty"`
+	Provider        string   `json:"provider,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	Effort          string   `json:"effort,omitempty"`
+	Permission      string   `json:"permission,omitempty"`
+	LifecycleStatus string   `json:"lifecycle_status"`
+	LifecycleSource string   `json:"lifecycle_source,omitempty"`
+	StartedAt       string   `json:"started_at,omitempty"`
+	UpdatedAt       string   `json:"updated_at,omitempty"`
+	EndedAt         string   `json:"ended_at,omitempty"`
+	LastError       string   `json:"last_error,omitempty"`
+	ReportSummary   string   `json:"report_summary,omitempty"`
 }
 
 type Row struct {
-	Issue                 string
-	WorkerJob             string
-	PR                    string
-	WorkerProvider        string
-	WorkerModel           string
-	WorkerModelSource     string
-	WorkerEffort          string
-	WorkerPermission      string
-	WorkerDuration        string
-	WorkerInputTokens     string
-	WorkerOutputTokens    string
-	WorkerTotalTokens     string
-	WorkerVerified        string
-	Phase                 string
-	Status                string
-	VerifierVerdict       string
-	VerifierProvider      string
-	VerifierModel         string
-	VerifierModelSource   string
-	VerifierEffort        string
-	VerifierPermission    string
-	VerifierDuration      string
-	VerifierInputTokens   string
-	VerifierOutputTokens  string
-	VerifierTotalTokens   string
-	VerifierVerified      string
+	Issue                 string `json:"issue"`
+	WorkerJob             string `json:"worker_job"`
+	PR                    string `json:"pr"`
+	WorkerProvider        string `json:"worker_provider"`
+	WorkerModel           string `json:"worker_model"`
+	WorkerModelSource     string `json:"worker_model_source"`
+	WorkerEffort          string `json:"worker_effort"`
+	WorkerPermission      string `json:"worker_permission"`
+	WorkerDuration        string `json:"worker_duration"`
+	WorkerInputTokens     string `json:"worker_input_tokens"`
+	WorkerOutputTokens    string `json:"worker_output_tokens"`
+	WorkerTotalTokens     string `json:"worker_total_tokens"`
+	WorkerVerified        string `json:"worker_verified"`
+	Phase                 string `json:"phase"`
+	Status                string `json:"status"`
+	VerifierVerdict       string `json:"verifier_verdict"`
+	VerifierProvider      string `json:"verifier_provider"`
+	VerifierModel         string `json:"verifier_model"`
+	VerifierModelSource   string `json:"verifier_model_source"`
+	VerifierEffort        string `json:"verifier_effort"`
+	VerifierPermission    string `json:"verifier_permission"`
+	VerifierDuration      string `json:"verifier_duration"`
+	VerifierInputTokens   string `json:"verifier_input_tokens"`
+	VerifierOutputTokens  string `json:"verifier_output_tokens"`
+	VerifierTotalTokens   string `json:"verifier_total_tokens"`
+	VerifierVerified      string `json:"verifier_verified"`
 	issueNumber           int
 	attemptNumber         int
 	workerJobSort         string
@@ -80,10 +135,11 @@ type Row struct {
 }
 
 type metadataRecord struct {
-	Issue int
-	JobID string
-	PR    string
-	Path  string
+	Issue   int
+	JobID   string
+	PR      string
+	Summary string
+	Path    string
 }
 
 type verifierRecord struct {
@@ -136,6 +192,10 @@ func Load(opts Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+	if err != nil {
+		return Report{}, err
+	}
 
 	eventMetadata, eventVerifiers, eventCount, err := loadEventRecords(repoPath, runID, now)
 	if err != nil {
@@ -151,7 +211,7 @@ func Load(opts Options) (Report, error) {
 	verifiers = dedupeVerifierRecords(verifiers)
 	sortVerifierRecords(verifiers)
 
-	if len(attempts) == 0 && eventCount == 0 && len(metadata) == 0 && len(verifiers) == 0 {
+	if len(attempts) == 0 && eventCount == 0 && len(metadata) == 0 && len(verifiers) == 0 && len(lifecycle.History) == 0 {
 		return Report{}, fmt.Errorf("run %q has no local status records under %s", runID, filepath.ToSlash(runPath))
 	}
 
@@ -162,24 +222,98 @@ func Load(opts Options) (Report, error) {
 		rows = append(rows, row)
 	}
 	sortRows(rows)
+	project := resolveProjectMetadata(repoPath)
+	runTree := loadRunTree(repoPath, runID, project.ProjectID, now)
 
 	return Report{
 		RunID:               runID,
 		RunNote:             runNote,
 		RunPath:             runPath,
+		Project:             project,
 		EventCount:          eventCount,
 		VerifierRecordCount: len(verifiers),
+		LifecycleState:      string(lifecycle.State),
+		LifecycleSource:     lifecycle.Source,
+		LifecycleEvents:     len(lifecycle.History),
+		ParentRunID:         lifecycle.ParentRunID,
+		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
+		RunTree:             runTree,
 		Rows:                rows,
 	}, nil
 }
 
+func MarshalJSON(report Report) ([]byte, error) {
+	report = normalizeReport(report)
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal status JSON: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
 func Render(report Report) string {
+	report = normalizeReport(report)
 	var out bytes.Buffer
 	fmt.Fprintln(&out, "RUN STATUS")
 	fmt.Fprintf(&out, "RunId: %s (%s)\n", display(report.RunID), display(report.RunNote))
 	fmt.Fprintf(&out, "Source: %s\n", filepath.ToSlash(report.RunPath))
+	if strings.TrimSpace(report.Project.ProjectID) != "" {
+		fmt.Fprintf(&out, "Project: %s", report.Project.ProjectID)
+		if strings.TrimSpace(report.Project.DisplayName) != "" {
+			fmt.Fprintf(&out, " (%s)", report.Project.DisplayName)
+		}
+		fmt.Fprintln(&out)
+	}
 	fmt.Fprintf(&out, "Events: %d\n", report.EventCount)
 	fmt.Fprintf(&out, "Verifier records: %d\n", report.VerifierRecordCount)
+	fmt.Fprintf(&out, "Lifecycle: %s", display(report.LifecycleState))
+	if strings.TrimSpace(report.LifecycleSource) != "" {
+		fmt.Fprintf(&out, " (source=%s entries=%d)", display(report.LifecycleSource), report.LifecycleEvents)
+	}
+	fmt.Fprintln(&out)
+	if strings.TrimSpace(report.ParentRunID) != "" {
+		fmt.Fprintf(&out, "ParentRunId: %s\n", display(report.ParentRunID))
+	}
+	if len(report.ChildRunIDs) > 0 {
+		fmt.Fprintf(&out, "ChildRunIds: %s\n", strings.Join(report.ChildRunIDs, ","))
+	}
+	fmt.Fprintln(&out)
+	fmt.Fprintln(&out, "Run tree")
+	if len(report.RunTree.Nodes) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		for _, node := range report.RunTree.Nodes {
+			indent := strings.Repeat("  ", node.Depth)
+			parts := []string{
+				"state=" + display(node.LifecycleStatus),
+			}
+			if node.Issue > 0 {
+				parts = append(parts, "issue=#"+strconv.Itoa(node.Issue))
+			}
+			if strings.TrimSpace(node.PR) != "" {
+				parts = append(parts, "pr="+node.PR)
+			}
+			if strings.TrimSpace(node.Role) != "" {
+				parts = append(parts, "role="+node.Role)
+			}
+			if strings.TrimSpace(node.Provider) != "" {
+				parts = append(parts, "provider="+node.Provider)
+			}
+			if strings.TrimSpace(node.Model) != "" {
+				parts = append(parts, "model="+reporter.ModelDepthDisplay(node.Model, node.Effort))
+			}
+			if strings.TrimSpace(node.Permission) != "" {
+				parts = append(parts, "permission="+node.Permission)
+			}
+			fmt.Fprintf(&out, "%s- %s (%s)\n", indent, node.RunID, strings.Join(parts, " "))
+			if strings.TrimSpace(node.ReportSummary) != "" {
+				fmt.Fprintf(&out, "%s  summary: %s\n", indent, node.ReportSummary)
+			}
+			if strings.TrimSpace(node.LastError) != "" {
+				fmt.Fprintf(&out, "%s  last_error: %s\n", indent, node.LastError)
+			}
+		}
+	}
 	fmt.Fprintln(&out)
 
 	headers := []string{
@@ -260,6 +394,38 @@ func Render(report Report) string {
 	fmt.Fprintln(&out, "Safety")
 	fmt.Fprintf(&out, "- status is read-only and local-only: read %s and wrote no repo, GitHub, PR, issue, commit, merge, doc, or tracked-file surface.\n", filepath.ToSlash(report.RunPath))
 	return out.String()
+}
+
+func normalizeReport(report Report) Report {
+	report.RunPath = filepath.ToSlash(report.RunPath)
+	if report.ChildRunIDs == nil {
+		report.ChildRunIDs = []string{}
+	}
+	if report.RunTree.Nodes == nil {
+		report.RunTree.Nodes = []RunTreeNode{}
+	}
+	for i := range report.RunTree.Nodes {
+		if report.RunTree.Nodes[i].ChildRunIDs == nil {
+			report.RunTree.Nodes[i].ChildRunIDs = []string{}
+		}
+	}
+	report.RunTree.Summary = summarizeRunTree(report.RunTree.Nodes)
+	return report
+}
+
+func resolveProjectMetadata(repoPath string) ProjectMetadata {
+	project, err := registry.Resolve(context.Background(), registry.Options{RepoPath: repoPath}, registry.DefaultDeps())
+	if err != nil {
+		return ProjectMetadata{}
+	}
+	return ProjectMetadata{
+		ProjectID:      project.ProjectID,
+		DisplayName:    project.DisplayName,
+		LocalPath:      filepath.ToSlash(project.LocalPath),
+		IdentitySource: string(project.IdentitySource),
+		GitHubOwner:    project.GitHubOwner,
+		GitHubName:     project.GitHubName,
+	}
 }
 
 func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *verifierRecord) Row {
@@ -577,10 +743,11 @@ func collectRecords(data []byte, path string) ([]metadataRecord, []verifierRecor
 
 func metadataFromMap(values map[string]any, path string) metadataRecord {
 	return metadataRecord{
-		Issue: firstInt(values, "issue", "issue_number"),
-		JobID: firstString(values, "job_id", "worker_job_id", "attempt_job_id"),
-		PR:    firstPR(values),
-		Path:  path,
+		Issue:   firstInt(values, "issue", "issue_number"),
+		JobID:   firstString(values, "job_id", "worker_job_id", "attempt_job_id"),
+		PR:      firstPR(values),
+		Summary: firstString(values, "summary", "report_summary"),
+		Path:    path,
 	}
 }
 

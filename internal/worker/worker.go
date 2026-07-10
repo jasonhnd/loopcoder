@@ -549,6 +549,9 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	if failure == nil {
 		return
 	}
+	if dispatch.failureStatus == state.StatusFailed {
+		dispatch.failureStatus = state.FailureStatus(failure)
+	}
 	writeRecovery(ctx, dispatch, failure)
 }
 
@@ -1156,6 +1159,7 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
 	}
+	t.appendLifecycle(now, "")
 }
 
 func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
@@ -1176,6 +1180,33 @@ func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
 	}
 	if err := state.AppendEvent(t.repoPath, t.runID, event); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
+	}
+	t.appendLifecycle(now, eventName)
+}
+
+func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
+	lifecycleState, ok := state.LegacyLifecycleState(t.status, t.phase, t.exitCode)
+	if !ok {
+		return
+	}
+	history, err := state.LoadLifecycleHistory(t.repoPath, t.runID)
+	if err != nil {
+		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to read lifecycle state %s: %v\n", state.LifecyclePath(t.repoPath, t.runID), err)
+		return
+	}
+	if len(history) > 0 && history[len(history)-1].State == lifecycleState {
+		return
+	}
+	if err := state.AppendLifecycleTransition(t.repoPath, state.LifecycleTransition{
+		Timestamp: timestamp,
+		RunID:     t.runID,
+		State:     lifecycleState,
+		Reason:    firstNonEmpty(eventName, "worker attempt transition"),
+		Source:    "worker",
+		Issue:     t.issue,
+		JobID:     t.jobID,
+	}); err != nil {
+		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append lifecycle state %s: %v\n", state.LifecyclePath(t.repoPath, t.runID), err)
 	}
 }
 

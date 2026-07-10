@@ -58,7 +58,9 @@ current worker provider registry supports `codex`, `claude`, `antigravity`,
 and experimental direct `gemini`, with `codex` as the default in the dispatch
 path. The static model registry used by `loopcoder models` covers `codex`,
 `claude`, and `antigravity`; the direct `gemini` adapter remains outside that
-registry. See [`worker.md`](worker.md) for provider details.
+registry. See [`worker.md`](worker.md) for provider details and
+[`runtime-capabilities.md`](runtime-capabilities.md) for the provider and host
+runtime capability contract.
 
 ### Verifier
 
@@ -147,11 +149,24 @@ The current state model has three layers:
 
 - GitHub is authoritative for issue state, `blocked-by:#N` labels, open PRs,
   PR branches, closing references, and hosted checks.
-- Local run state under `.loopcoder/runs/<RunId>/` records worker attempts,
-  event transitions, and recovery briefs for liveness and retry decisions.
+- Local run state under `.loopcoder/runs/<RunId>/` records the durable run
+  lifecycle, worker attempts, event transitions, and recovery briefs for
+  liveness and retry decisions.
 - `loopcoder state push`, `state pull`, `lease acquire`, and `lease release`
   publish scrubbed run snapshots and a best-effort conductor lease on the
   dedicated state branch when cross-session state is needed.
+
+Runs may carry an append-only lifecycle history at
+`.loopcoder/runs/<RunId>/lifecycle.jsonl`. Each compact JSON line records the
+run ID, optional parent run ID, optional child run ID, prior state, new state,
+timestamp, source, reason, and issue/job metadata. The lifecycle states are
+`planned`, `queued`, `running`, `waiting`, `succeeded`, `failed`, `cancelled`,
+`abandoned`, and `needs-human`; transitions are explicit and terminal states do
+not transition back to active states. When a v0.6.x run has no lifecycle file,
+readers conservatively derive the current lifecycle from `events.jsonl` and
+worker attempt sidecars without writing migrated state. `loopcoder status`
+shows the current lifecycle state and whether it came from explicit lifecycle
+records or legacy-derived state.
 
 A fresh conductor session should re-derive delivery state from GitHub first,
 then use local or pulled `.loopcoder` state only to classify same-host liveness,

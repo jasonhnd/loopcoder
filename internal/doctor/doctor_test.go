@@ -16,6 +16,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestRunReportsHealthyPreflight(t *testing.T) {
@@ -39,6 +42,7 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"local-state exclude",
 		"tracked .loopcoder",
 		".delivery.yml",
+		"host profile",
 		"model selection",
 		"provider codex",
 		"provider claude",
@@ -57,7 +61,10 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 		"loopcoder skill",
 		"conductor hooks",
 		"report query",
+		"storage",
+		"project registry",
 		"migration status",
+		"nested runs",
 		"stale local state",
 		"conductor runtime",
 	} {
@@ -71,6 +78,9 @@ func TestRunReportsHealthyPreflight(t *testing.T) {
 	}
 	if check := requireCheck(t, report, "version compatibility"); !strings.Contains(check.Message, "min_loopcoder_version=0.3.0 is satisfied") {
 		t.Fatalf("compatibility message = %q", check.Message)
+	}
+	if check := requireCheck(t, report, "host profile"); !strings.Contains(check.Message, "profile=claude-code source=env") {
+		t.Fatalf("host profile message = %q", check.Message)
 	}
 }
 
@@ -182,8 +192,36 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 		Commit   string `json:"commit"`
 		Date     string `json:"date"`
 		ExitCode int    `json:"exit_code"`
-		Checks   []struct {
+		Host     struct {
+			Name               string `json:"name"`
+			Source             string `json:"source"`
+			SupportsJSONOutput bool   `json:"supports_json_output"`
+		} `json:"host_profile"`
+		Runtime struct {
+			Database struct {
+				Status Status `json:"status"`
+			} `json:"database"`
+			ProjectRegistry struct {
+				Status Status `json:"status"`
+			} `json:"project_registry"`
+			Migration struct {
+				Status Status `json:"status"`
+			} `json:"migration"`
+			NestedRuns struct {
+				Status Status `json:"status"`
+			} `json:"nested_runs"`
+		} `json:"runtime"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+			Host     string `json:"host"`
+			Role     string `json:"role"`
+			Support  string `json:"support"`
+			Status   Status `json:"status"`
+			Code     string `json:"code"`
+		} `json:"provider_compatibility"`
+		Checks []struct {
 			Name       string `json:"name"`
+			Code       string `json:"code"`
 			Status     Status `json:"status"`
 			Hard       bool   `json:"hard"`
 			Message    string `json:"message"`
@@ -199,11 +237,215 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	if payload.ExitCode != 1 {
 		t.Fatalf("exit_code = %d, want 1", payload.ExitCode)
 	}
+	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
+		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
+	}
+	if payload.Runtime.Database.Status != "" || payload.Runtime.ProjectRegistry.Status != "" || payload.Runtime.Migration.Status != "" || payload.Runtime.NestedRuns.Status != "" {
+		t.Fatalf("runtime should be empty for manually constructed report: %#v", payload.Runtime)
+	}
+	if payload.ProviderCompatibility == nil {
+		t.Fatalf("provider_compatibility missing from payload: %s", out.String())
+	}
 	if len(payload.Checks) != 2 {
 		t.Fatalf("checks len = %d, want 2", len(payload.Checks))
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRunJSONIncludesV07RuntimeHealth(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		Runtime struct {
+			HomeDir  string `json:"home_dir"`
+			Database struct {
+				Path          string `json:"path"`
+				Exists        bool   `json:"exists"`
+				SchemaVersion int    `json:"schema_version"`
+				Status        Status `json:"status"`
+				Message       string `json:"message"`
+			} `json:"database"`
+			ProjectRegistry struct {
+				Status         Status `json:"status"`
+				Registered     bool   `json:"registered"`
+				ProjectID      string `json:"project_id"`
+				IdentitySource string `json:"identity_source"`
+				ConflictCount  int    `json:"conflict_count"`
+			} `json:"project_registry"`
+			Migration struct {
+				Status         Status `json:"status"`
+				LegacySurfaces int    `json:"legacy_surfaces"`
+			} `json:"migration"`
+			NestedRuns struct {
+				Status       Status `json:"status"`
+				RunCount     int    `json:"run_count"`
+				ProblemCount int    `json:"problem_count"`
+			} `json:"nested_runs"`
+		} `json:"runtime"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+		} `json:"provider_compatibility"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Status Status `json:"status"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.Runtime.HomeDir == "" || !strings.Contains(payload.Runtime.Database.Path, "loopcoder.db") {
+		t.Fatalf("runtime paths missing: %#v", payload.Runtime)
+	}
+	if !payload.Runtime.Database.Exists || payload.Runtime.Database.SchemaVersion != storage.CurrentSchemaVersion || payload.Runtime.Database.Status != StatusOK {
+		t.Fatalf("database runtime = %#v", payload.Runtime.Database)
+	}
+	if !payload.Runtime.ProjectRegistry.Registered || payload.Runtime.ProjectRegistry.ProjectID != "proj_test" || payload.Runtime.ProjectRegistry.IdentitySource != string(registry.IdentityGitHub) {
+		t.Fatalf("project registry runtime = %#v", payload.Runtime.ProjectRegistry)
+	}
+	if payload.Runtime.Migration.Status != StatusOK || payload.Runtime.Migration.LegacySurfaces != 0 {
+		t.Fatalf("migration runtime = %#v", payload.Runtime.Migration)
+	}
+	if payload.Runtime.NestedRuns.Status != StatusOK || payload.Runtime.NestedRuns.ProblemCount != 0 {
+		t.Fatalf("nested runs runtime = %#v", payload.Runtime.NestedRuns)
+	}
+	if len(payload.ProviderCompatibility) == 0 {
+		t.Fatalf("provider compatibility missing")
+	}
+	foundNestedCheck := false
+	for _, check := range payload.Checks {
+		if check.Name == "nested runs" {
+			foundNestedCheck = true
+			if check.Status != StatusOK {
+				t.Fatalf("nested runs check = %#v", check)
+			}
+		}
+	}
+	if !foundNestedCheck {
+		t.Fatalf("nested runs check missing")
+	}
+}
+
+func TestRunJSONIncludesProviderCompatibilityMatrix(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		ProviderCompatibility []struct {
+			Provider            string   `json:"provider"`
+			Host                string   `json:"host"`
+			Role                string   `json:"role"`
+			Support             string   `json:"support"`
+			Status              Status   `json:"status"`
+			Code                string   `json:"code"`
+			MissingCapabilities []string `json:"missing_capabilities"`
+		} `json:"provider_compatibility"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Code   string `json:"code"`
+			Status Status `json:"status"`
+			Hard   bool   `json:"hard"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.ProviderCompatibility) == 0 {
+		t.Fatalf("provider_compatibility is empty:\n%s", out.String())
+	}
+
+	foundMatrixEntry := false
+	for _, entry := range payload.ProviderCompatibility {
+		if entry.Provider == "antigravity" && entry.Host == "claude-code" && entry.Role == "verifier" {
+			foundMatrixEntry = true
+			if entry.Support != "unsupported" || entry.Status != StatusFail || entry.Code != "unsupported_read_only_mode" {
+				t.Fatalf("antigravity verifier matrix entry = %#v", entry)
+			}
+			if !containsString(entry.MissingCapabilities, "read-only") {
+				t.Fatalf("antigravity verifier missing capabilities = %#v, want read-only", entry.MissingCapabilities)
+			}
+		}
+	}
+	if !foundMatrixEntry {
+		t.Fatalf("provider_compatibility missing antigravity/claude-code/verifier entry")
+	}
+
+	foundSelectedWorker := false
+	for _, check := range payload.Checks {
+		if check.Name == "provider compatibility codex worker" {
+			foundSelectedWorker = true
+			if check.Status != StatusOK || check.Code != "supported" || check.Hard {
+				t.Fatalf("selected worker compatibility check = %#v", check)
+			}
+		}
+	}
+	if !foundSelectedWorker {
+		t.Fatalf("checks missing selected worker provider compatibility")
+	}
+}
+
+func TestRunWarnsForAmbiguousProjectRegistryIdentity(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.projectShow = func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {
+		return registry.ShowResult{
+			Project: registry.Project{
+				ProjectID:      "proj_current",
+				LocalPath:      opts.RepoPath,
+				IdentitySource: registry.IdentityGitHub,
+			},
+			Conflicts: []registry.Project{{
+				ProjectID:      "proj_conflict",
+				IdentitySource: registry.IdentityGitRemote,
+			}},
+		}, nil
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "project registry")
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"ambiguous", "proj_conflict", "loopcoder projects show --repo ."} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestRenderJSONIncludesProjectRegistryCheck(t *testing.T) {
+	report := WithMetadata(Report{Checks: []Check{
+		{Name: "project registry", Status: StatusWarn, Message: "project identity is ambiguous"},
+	}}, "/repo", BuildInfo{})
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		Checks []struct {
+			Name    string `json:"name"`
+			Status  Status `json:"status"`
+			Message string `json:"message"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.Checks) != 1 || payload.Checks[0].Name != "project registry" || payload.Checks[0].Status != StatusWarn {
+		t.Fatalf("payload checks = %#v", payload.Checks)
 	}
 }
 
@@ -520,6 +762,9 @@ func TestRunFailsAntigravityProviderWhenAgyMissing(t *testing.T) {
 	if check.Status != StatusFail || !check.Hard {
 		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
 	}
+	if check.Code != "missing_executable" {
+		t.Fatalf("provider antigravity code = %q, want missing_executable", check.Code)
+	}
 	for _, want := range []string{`CLI "agy" was not found on PATH`, "run: agy login"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
@@ -545,6 +790,9 @@ func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
 	if check.Status != StatusFail || !check.Hard {
 		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
 	}
+	if check.Code != "unauthenticated_provider" {
+		t.Fatalf("provider antigravity code = %q, want unauthenticated_provider", check.Code)
+	}
 	for _, want := range []string{"agy models failed", "OAuth login required", "run: agy login"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
@@ -553,6 +801,30 @@ func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
 	auditProvider := requireCheck(t, report, "audit llm provider")
 	if auditProvider.Status != StatusOK || !strings.Contains(auditProvider.Message, `CLI "agy" resolves`) {
 		t.Fatalf("audit llm provider check = %#v, want agy CLI resolution", auditProvider)
+	}
+}
+
+func TestRunFailsClosedForUnsupportedVerifierReadOnlyProvider(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Adapters.Verifier = "antigravity"
+	env.paths["agy"] = "/bin/agy"
+	env.commands[cmdKey("agy", "models")] = CommandResult{
+		Stdout: "Gemini 3.1 Pro\n",
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "provider compatibility antigravity verifier")
+	if check.Status != StatusFail || !check.Hard || check.Code != "unsupported_read_only_mode" {
+		t.Fatalf("compatibility check = %#v, want hard unsupported read-only fail", check)
+	}
+	for _, want := range []string{"role=verifier", "support=unsupported", "missing=read-only"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
 	}
 }
 
@@ -629,6 +901,58 @@ func TestRunWarnsWhenDeliveryConfigAbsentAndUsesDefaultProviders(t *testing.T) {
 	}
 	if requireCheck(t, report, "model selection").Status != StatusOK {
 		t.Fatal("default model selection was not checked")
+	}
+}
+
+func TestRunResolvesHostProfileFromConfig(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{}
+	env.cfg.Host.Profile = "codex"
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if report.HostProfile.Name != "codex-cli" || report.HostProfile.Source != "config" || report.HostProfile.Selector != "host.profile" {
+		t.Fatalf("HostProfile = %#v, want codex-cli from config", report.HostProfile)
+	}
+}
+
+func TestRunWarnsForGenericHostFallback(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if report.HostProfile.Name != "generic-local" || report.HostProfile.Source != "fallback" {
+		t.Fatalf("HostProfile = %#v, want generic fallback", report.HostProfile)
+	}
+}
+
+func TestRunHardFailsUnknownHostEnv(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.env = map[string]string{"LOOPCODER_HOST": "unknown"}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+
+	if got := report.ExitCode(); got != 1 {
+		t.Fatalf("ExitCode = %d, want 1", got)
+	}
+	check := requireCheck(t, report, "host profile")
+	if check.Status != StatusFail || !check.Hard {
+		t.Fatalf("check = %#v, want hard fail", check)
+	}
+	if report.HostProfile.Source != "error" || report.HostProfile.Selector != "LOOPCODER_HOST" {
+		t.Fatalf("HostProfile = %#v, want error from LOOPCODER_HOST", report.HostProfile)
+	}
+	if !strings.Contains(check.Message, "LOOPCODER_HOST") || !strings.Contains(check.Message, "unknown") {
+		t.Fatalf("message = %q, want env and profile", check.Message)
 	}
 }
 
@@ -781,6 +1105,102 @@ func TestCheckMigrationStatusWarnsForLegacySurfaces(t *testing.T) {
 	}
 }
 
+func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			if path != dbPath {
+				t.Fatalf("storage path = %q, want %q", path, dbPath)
+			}
+			return storage.Health{
+				Path:          path,
+				Exists:        true,
+				SchemaVersion: storage.CurrentSchemaVersion,
+				OK:            true,
+				Message:       "healthy",
+			}, nil
+		},
+	})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"loopcoder.db", fmt.Sprintf("schema_version=%d", storage.CurrentSchemaVersion), "health=ok"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStorageHealthReportsMissingDatabaseAsInfo(t *testing.T) {
+	homeDir := t.TempDir()
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{Path: path, Message: "database has not been created"}, nil
+		},
+	})
+
+	if check.Status != StatusInfo {
+		t.Fatalf("status = %s, want info (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"schema_version=0", "health=not-created"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckStorageHealthFailsUnsupportedDatabase(t *testing.T) {
+	homeDir := t.TempDir()
+
+	check := checkStorageHealth(context.Background(), Deps{
+		Getenv:      func(string) string { return homeDir },
+		UserHomeDir: func() (string, error) { return "unused", nil },
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{Path: path, Exists: true, SchemaVersion: 999}, errors.New("unsupported storage schema version 999")
+		},
+	})
+
+	if check.Status != StatusFail {
+		t.Fatalf("status = %s, want fail (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"health=fail", "unsupported storage schema version 999"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestCheckNestedRunHealthWarnsForMissingParent(t *testing.T) {
+	repo := t.TempDir()
+	child := state.RunIDForChild("docs-pass", 0, time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:00Z",
+		RunID:       child,
+		ParentRunID: "run-20260709T000000Z-wave",
+		State:       state.StateQueued,
+	}); err != nil {
+		t.Fatalf("AppendLifecycleTransition: %v", err)
+	}
+
+	check := checkNestedRunHealth(repo)
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	for _, want := range []string{"missing parent", "loopcoder status --repo . --format json"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
 func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
 	t.Setenv(migration.LegacyReporterScopeEnv, "auto")
 	repo := t.TempDir()
@@ -794,6 +1214,20 @@ func TestCheckMigrationStatusUsesInjectedEnv(t *testing.T) {
 
 	if check.Status != StatusOK {
 		t.Fatalf("status = %s, want ok when injected env is empty (%s)", check.Status, check.Message)
+	}
+}
+
+func TestCheckLocalStateImportIgnoresAuditOnlyState(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".loopcoder", "audit", "audit.jsonl"), `{"ok":true}`+"\n")
+
+	check := checkLocalStateImport(context.Background(), repo, Deps{})
+
+	if check.Status != StatusOK {
+		t.Fatalf("status = %s, want ok (%s)", check.Status, check.Message)
+	}
+	if !strings.Contains(check.Message, "no repo-local .loopcoder history found") {
+		t.Fatalf("message = %q, want no history message", check.Message)
 	}
 }
 
@@ -1145,6 +1579,9 @@ func healthyDoctorEnv() *fakeDoctorEnv {
 			"staticcheck": "/bin/staticcheck",
 			"gosec":       "/bin/gosec",
 		},
+		env: map[string]string{
+			"LOOPCODER_HOST": "claude-code",
+		},
 		commands: map[string]CommandResult{
 			cmdKey("gh", "auth", "status"): {
 				Stdout: "Logged in\n",
@@ -1220,6 +1657,7 @@ type fakeDoctorEnv struct {
 	userHome       string
 	skillFiles     map[string][]byte
 	files          map[string][]byte
+	projectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -1265,6 +1703,29 @@ func (f *fakeDoctorEnv) deps() Deps {
 		},
 		AgentsMarkdown: func() ([]byte, error) {
 			return []byte("agents content\n"), nil
+		},
+		StorageHealth: func(_ context.Context, path string) (storage.Health, error) {
+			return storage.Health{
+				Path:          path,
+				Exists:        true,
+				SchemaVersion: storage.CurrentSchemaVersion,
+				OK:            true,
+				Message:       "healthy",
+			}, nil
+		},
+		ProjectShow: func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {
+			if f.projectShow != nil {
+				return f.projectShow(context.Background(), opts)
+			}
+			return registry.ShowResult{
+				Registered: true,
+				Project: registry.Project{
+					ProjectID:      "proj_test",
+					DisplayName:    "repo",
+					LocalPath:      opts.RepoPath,
+					IdentitySource: registry.IdentityGitHub,
+				},
+			}, nil
 		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
@@ -1337,4 +1798,13 @@ func requireCheck(t *testing.T, report Report, name string) Check {
 		t.Fatalf("missing check %q in %#v", name, report.Checks)
 	}
 	return check
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

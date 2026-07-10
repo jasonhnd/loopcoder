@@ -104,6 +104,12 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
+loopcoder projects register --repo .          # add or refresh this checkout in the global project registry
+loopcoder projects list --format json         # list registered projects for machine use
+loopcoder projects show --repo .              # inspect this checkout's resolved registry identity
+loopcoder projects remove --repo .            # remove registry entry without deleting run history
+loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate local-state --repo .        # copy legacy .loopcoder records into local storage
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -124,8 +130,10 @@ loopcoder relay list    --repo .              # inspect pending local relay bloc
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder status --repo . --format json       # inspect latest run tree as stable JSON
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
+loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
 loopcoder state pull    --repo .              # pull state branch summaries
 loopcoder lease acquire --repo . --run-id <id> # acquire conductor lease
@@ -194,7 +202,30 @@ The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity W
 
 ### Doctor And Migration
 
-`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, Worker and Verifier provider CLIs, provider auth probes where stable, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, and ordered `checks[]` objects with `name`, `status`, `hard`, `message`, and `fix_command`.
+`loopcoder doctor --repo .` is a read-only operational health command. It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for git, gh auth, `.delivery.yml`, resolved host profile, Worker and Verifier provider CLIs, provider auth probes where stable, provider/host compatibility, origin/default branch, selected binary version/track, `min_loopcoder_version`, model/depth validity, reporter/relay wiring, installed skill freshness, audit readiness, local-state exclude protection, tracked `.loopcoder/` files, reportquery readability, storage health, project registry identity, migration status, and stale local state counts. `--format json` emits `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile` object, `provider_compatibility[]` entries for the smoke matrix, and ordered `checks[]` objects with `name`, `code`, `status`, `hard`, `message`, and `fix_command`.
+
+### Project Registry
+
+`loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects.
+
+```text
+loopcoder projects register --repo .
+loopcoder projects list
+loopcoder projects list --format json
+loopcoder projects show --repo .
+loopcoder projects show --repo . --format json
+loopcoder projects remove --repo .
+```
+
+`show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source. `remove --repo .` deletes only the project registry row; historical run records are left in the database and are not deleted by default. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
+
+### Local State Migration
+
+`loopcoder migrate local-state --repo .` explicitly imports v0.6.x repo-local `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into `$LOOPCODER_HOME/data/loopcoder.db`. Use `--dry-run` first to report import candidates without registering the project or writing storage. The real migration registers or refreshes the project identity, stores source-path and hash metadata for imported records, and is safe to re-run without duplicating imported reports. Malformed JSON or JSONL records are reported with their source path and line when available, but valid records from the same migration continue importing.
+
+The command copies local state into the machine-local store only. It does not delete `.loopcoder/`, rewrite local files, edit tracked repository files, mutate GitHub, or publish state. Existing file readers remain the compatibility fallback, and `loopcoder report --repo . --format json` includes imported records after migration.
+
+Audit logs remain file-only repo-local state: `migrate local-state` does not import `.loopcoder/audit/`, and an audit-only checkout does not require migration. Back up local runtime state by copying `$LOOPCODER_HOME/data/loopcoder.db` plus `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/` when present and no loopcoder command is running. To remove v0.7.0 machine-local runtime state, delete those same paths; repo-local `.loopcoder/` history is left untouched unless you delete it yourself.
 
 `loopcoder doctor --repo . --fix` performs only the 0.6.0 local repair actions: migrate legacy `.delivery.yml attestation` keys to `report`, refresh conductor hook settings to `loopcoder hook conductor-reporter`, move legacy hook state from `conductor-attest` to `conductor-reporter`, rewrite eligible local state keys from `attestation` to `report`, and prune cleanup-eligible gitignored `.loopcoder/` state. It does not install provider CLIs, run provider login, flush pending relay records, edit tracked docs, choose models, commit, push, or mutate GitHub.
 
@@ -248,6 +279,8 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/reference/architecture.md`](docs/reference/architecture.md) -- current architecture and limits.
 - [`docs/reference/audit.md`](docs/reference/audit.md) -- read-only security audit command.
 - [`docs/reference/releasing.md`](docs/reference/releasing.md) -- release documentation rule.
+- [`docs/reference/self-bootstrap.md`](docs/reference/self-bootstrap.md) -- v0.7.0 self-bootstrap acceptance checklist.
+- [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md) -- v0.7.0 release readiness report template.
 - [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) -- dependency-aware scheduling.
 - [`docs/specs/0039-verification.md`](docs/specs/0039-verification.md) -- required checks and verifier verdicts.
@@ -263,6 +296,8 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 ## Status
 
 v0.6.1 is the current customer-ready bridge release for the public 0.6 line. It adds the 0.6 capabilities plus first-run repo safety: `init --repo/--gate` defaults new scaffolds to `human-merge`, `init` and `skill install` protect `.loopcoder/` through local `.git/info/exclude`, `doctor --format json` exposes machine-readable checks, and `report --format json` includes both `reports` and `records` with source/run/path context. The repository remains self-hosted with `gate: human-merge` for loopcoder-core safety; consumer projects can opt into automatic production promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
+
+v0.7.0 release-readiness docs and smoke scripts are prepared, but v0.7.0 is not the customer install target until the human release gate publishes the tag, signed checksums, and platform assets. The final readiness path is `pwsh scripts/self-bootstrap-smoke.ps1`, then `pwsh scripts/release-smoke.ps1 -Version 0.7.0` after assets exist, with the completed go/no-go report attached from [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md).
 
 ## License
 

@@ -70,13 +70,35 @@ func TestParseAbsentDomainAndMCPKeepCurrentDefaults(t *testing.T) {
 	}
 }
 
+func TestParseReadsHostProfile(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nhost:\n  profile: codex\n"))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Host.Profile != "codex" {
+		t.Fatalf("Host.Profile = %q, want codex", cfg.Host.Profile)
+	}
+}
+
+func TestParseRejectsUnknownHostProfile(t *testing.T) {
+	_, err := Parse([]byte("version: 1\nhost:\n  profile: unknown-host\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want invalid host profile")
+	}
+	for _, want := range []string{"host.profile", "unknown-host", "codex-cli", "claude-code", "paseo-style"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+	}
+}
+
 func TestDefaultMarshalOmitsAbsentDomainAndMCP(t *testing.T) {
 	data, err := yaml.Marshal(Default())
 	if err != nil {
 		t.Fatalf("yaml.Marshal(Default()) returned error: %v", err)
 	}
 	text := string(data)
-	for _, notWant := range []string{"domain:", "mcp:", "audit:"} {
+	for _, notWant := range []string{"host:", "domain:", "mcp:", "audit:"} {
 		if strings.Contains(text, notWant) {
 			t.Fatalf("yaml.Marshal(Default()) contained %q:\n%s", notWant, text)
 		}

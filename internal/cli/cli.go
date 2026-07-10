@@ -21,12 +21,14 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -54,39 +56,41 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter   func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive     func(pid int) bool
-	Now              func() time.Time
-	IsTerminal       func(w io.Writer) bool
-	Stdin            io.Reader
-	BuildInfo        BuildInfo
-	ComputeReadySet  func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick             func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover         func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile          func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch         func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview       func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote          func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover          func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify           func(ctx context.Context, opts verify.Options) verify.Result
-	Audit            func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor           func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init             func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade          func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	SkillInstall     func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush        func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull        func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease     func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader   func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter    func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter  func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter  func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive      func(pid int) bool
+	Now               func() time.Time
+	IsTerminal        func(w io.Writer) bool
+	Stdin             io.Reader
+	BuildInfo         BuildInfo
+	ComputeReadySet   func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick              func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover          func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile           func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch          func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview        func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote           func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover           func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify            func(ctx context.Context, opts verify.Options) verify.Result
+	Audit             func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor            func(ctx context.Context, opts doctor.Options) doctor.Report
+	Init              func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade           func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall      func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush         func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull         func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
 	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
+	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -96,6 +100,7 @@ var commands = []Command{
 	{Name: "trigger", Summary: "run automation triggers for tick"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
+	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
@@ -192,6 +197,9 @@ func DefaultDeps() Deps {
 		Upgrade: func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error) {
 			return upgrade.Run(ctx, opts, upgrade.DefaultDeps())
 		},
+		MigrateLocalState: func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
+			return localmigrate.LocalState(ctx, opts, localmigrate.DefaultDeps())
+		},
 		SkillInstall: func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
 			return InstallSkill(ctx, opts, DefaultSkillInstallDeps())
 		},
@@ -256,6 +264,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "models" {
 		return runModels(args[1:], stdout, stderr)
 	}
+	if command.Name == "projects" {
+		return runProjects(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
 	}
@@ -282,6 +293,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "upgrade" {
 		return runUpgrade(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "migrate" {
+		return runMigrate(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "skill" {
 		return runSkill(args[1:], stdout, stderr, deps)
@@ -363,6 +377,14 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		printRelayHelp(w)
 		return
 	}
+	if command.Name == "projects" {
+		printProjectsHelp(w)
+		return
+	}
+	if command.Name == "migrate" {
+		printMigrateHelp(w)
+		return
+	}
 
 	fmt.Fprintf(w, "Usage:\n  loopcoder %s [flags]\n\n", command.Name)
 	fmt.Fprintf(w, "%s\n\n", sentenceCase(command.Summary))
@@ -409,6 +431,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --base-branch string   base branch to check for .delivery.yml mismatch (default \"main\")")
 		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --fix                  apply explicit migration and stale local state cleanup")
+	}
+	if command.Name == "status" {
+		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string      run id; omit to inspect the latest local run")
+		fmt.Fprintln(w, "  --run-id string   alias for --run")
+		fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+	}
+	if command.Name == "report" {
+		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
+		fmt.Fprintln(w, "  --work-id string   filter by report work id")
+		fmt.Fprintln(w, "  --run string       include run tree for a run id in JSON output")
+		fmt.Fprintln(w, "  --issue int        filter by issue number")
+		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
+		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
+		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
 	}
 	if command.Name == "models" {
 		fmt.Fprintln(w, "  --provider string   registry provider key to render")
@@ -512,6 +549,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
@@ -757,6 +795,337 @@ func renderModelProviders(w io.Writer, providers []models.Provider) error {
 		}
 	}
 	return nil
+}
+
+func runProjects(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		printProjectsHelp(stdout)
+		return 0
+	}
+	action := args[0]
+	switch action {
+	case "register":
+		return runProjectsRegister(args[1:], stdout, stderr, deps)
+	case "list":
+		return runProjectsList(args[1:], stdout, stderr, deps)
+	case "show":
+		return runProjectsShow(args[1:], stdout, stderr, deps)
+	case "remove":
+		return runProjectsRemove(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "projects: unknown subcommand %q\n\n", action)
+		printProjectsHelp(stderr)
+		return 2
+	}
+}
+
+func printProjectsHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder projects register --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects list [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Register, inspect, list, and remove projects from the machine-local registry.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
+	fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help            show command help")
+}
+
+func runProjectsRegister(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects register", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Register(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects register: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects register", result)
+	}
+	action := "registered"
+	if result.Updated {
+		action = "updated"
+	}
+	fmt.Fprintf(stdout, "%s project %s (%s)\n", action, result.Project.ProjectID, result.Project.DisplayName)
+	fmt.Fprintf(stdout, "path: %s\n", result.Project.LocalPath)
+	fmt.Fprintf(stdout, "identity: %s\n", result.Project.IdentitySource)
+	if result.Project.RemoteURLNormalized != "" {
+		fmt.Fprintf(stdout, "remote: %s\n", result.Project.RemoteURLNormalized)
+	}
+	return 0
+}
+
+func runProjectsList(args []string, stdout, stderr io.Writer, deps Deps) int {
+	_, format, ok := parseProjectsRepoFormat("projects list", args, stderr, false)
+	if !ok {
+		return 2
+	}
+	projects, err := registry.List(context.Background(), registry.Options{Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects list: %v\n", err)
+		return 1
+	}
+	if projects == nil {
+		projects = []registry.Project{}
+	}
+	payload := struct {
+		Projects []registry.Project `json:"projects"`
+	}{Projects: projects}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects list", payload)
+	}
+	if len(projects) == 0 {
+		fmt.Fprintln(stdout, "no registered projects")
+		return 0
+	}
+	for _, project := range projects {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", project.ProjectID, project.DisplayName, project.IdentitySource, project.LocalPath)
+	}
+	return 0
+}
+
+func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects show", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Show(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects show: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects show", result)
+	}
+	status := "not registered"
+	if result.Registered {
+		status = "registered"
+	}
+	fmt.Fprintf(stdout, "status: %s\n", status)
+	fmt.Fprintf(stdout, "project_id: %s\n", result.Project.ProjectID)
+	fmt.Fprintf(stdout, "display_name: %s\n", result.Project.DisplayName)
+	fmt.Fprintf(stdout, "path: %s\n", result.Project.LocalPath)
+	fmt.Fprintf(stdout, "identity: %s\n", result.Project.IdentitySource)
+	if result.Project.RemoteURLNormalized != "" {
+		fmt.Fprintf(stdout, "remote: %s\n", result.Project.RemoteURLNormalized)
+	}
+	if len(result.Conflicts) > 0 {
+		fmt.Fprintln(stdout, "conflicts:")
+		for _, conflict := range result.Conflicts {
+			fmt.Fprintf(stdout, "  - %s %s %s\n", conflict.ProjectID, conflict.IdentitySource, conflict.RemoteURLNormalized)
+		}
+	}
+	return 0
+}
+
+func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {
+	repoPath, format, ok := parseProjectsRepoFormat("projects remove", args, stderr, true)
+	if !ok {
+		return 2
+	}
+	result, err := registry.Remove(context.Background(), registry.Options{RepoPath: repoPath, Now: deps.Now}, registry.DefaultDeps())
+	if err != nil {
+		fmt.Fprintf(stderr, "projects remove: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects remove", result)
+	}
+	if result.Removed {
+		fmt.Fprintf(stdout, "removed project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+	} else {
+		fmt.Fprintf(stdout, "project %s is not registered\n", result.Project.ProjectID)
+	}
+	fmt.Fprintln(stdout, "run_history_deleted: false")
+	return 0
+}
+
+func parseProjectsRepoFormat(name string, args []string, stderr io.Writer, includeRepo bool) (string, string, bool) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	format := "text"
+	var formatAlias string
+	if includeRepo {
+		fs.StringVar(&repoPath, "repo", ".", "repository path")
+		fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	}
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	if err := fs.Parse(args); err != nil {
+		return "", "", false
+	}
+	if includeRepo && repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "%s: invalid --format %q; want text or json\n", name, format)
+		return "", "", false
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", name, fs.Arg(0))
+		return "", "", false
+	}
+	return repoPath, format, true
+}
+
+func writeProjectJSON(stdout, stderr io.Writer, prefix string, payload any) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(payload); err != nil {
+		fmt.Fprintf(stderr, "%s: write output: %v\n", prefix, err)
+		return 1
+	}
+	return 0
+}
+
+func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 || isHelp(args[0]) {
+		printMigrateHelp(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "local-state":
+		return runMigrateLocalState(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
+		printMigrateHelp(stderr)
+		return 2
+	}
+}
+
+func printMigrateHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Import legacy repo-local .loopcoder records into machine-local storage.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Subcommands:")
+	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
+	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
+	fmt.Fprintln(w, "  --format      output format for local-state: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help        show command help")
+}
+
+func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.MigrateLocalState == nil {
+		deps.MigrateLocalState = DefaultDeps().MigrateLocalState
+	}
+	fs := flag.NewFlagSet("migrate local-state", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	repoPath := "."
+	var repoAlias string
+	format := "text"
+	var formatAlias string
+	dryRun := false
+	var dryRunAlias bool
+
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&repoAlias, "Repo", "", "repository path")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&dryRun, "dry-run", false, "scan legacy records without writing machine-local storage")
+	fs.BoolVar(&dryRunAlias, "DryRun", false, "scan legacy records without writing machine-local storage")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if repoAlias != "" {
+		repoPath = repoAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	dryRun = dryRun || dryRunAlias
+	format = strings.ToLower(strings.TrimSpace(format))
+	switch format {
+	case "text", "json":
+	default:
+		fmt.Fprintf(stderr, "migrate local-state: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+		return 2
+	}
+	result, err := deps.MigrateLocalState(context.Background(), localmigrate.Options{
+		RepoPath: resolvedRepo,
+		DryRun:   dryRun,
+		Now:      deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		data, err := json.Marshal(result)
+		if err != nil {
+			fmt.Fprintf(stderr, "migrate local-state: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(append(data, '\n')); err != nil {
+			fmt.Fprintf(stderr, "migrate local-state: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if _, err := stdout.Write([]byte(renderMigrateLocalStateText(result))); err != nil {
+		fmt.Fprintf(stderr, "migrate local-state: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderMigrateLocalStateText(result localmigrate.Result) string {
+	var out strings.Builder
+	fmt.Fprintln(&out, "LOCAL STATE MIGRATION")
+	fmt.Fprintf(&out, "status: %s\n", result.Status)
+	fmt.Fprintf(&out, "project_id: %s\n", displayText(result.ProjectID))
+	fmt.Fprintf(&out, "database: %s\n", displayText(result.DatabasePath))
+	if result.DryRun {
+		fmt.Fprintln(&out, "dry_run: true")
+	}
+	fmt.Fprintf(&out, "scanned: %d\n", result.ScannedCount)
+	fmt.Fprintf(&out, "imported: %d\n", result.ImportedCount)
+	fmt.Fprintf(&out, "skipped: %d\n", result.SkippedCount)
+	fmt.Fprintf(&out, "reports: %d\n", result.ReportCount)
+	fmt.Fprintf(&out, "malformed: %d\n", result.MalformedCount)
+	if len(result.Diagnostics) > 0 {
+		fmt.Fprintln(&out, "diagnostics:")
+		for _, diagnostic := range result.Diagnostics {
+			if diagnostic.Line > 0 {
+				fmt.Fprintf(&out, "  - %s:%d: %s\n", diagnostic.SourcePath, diagnostic.Line, diagnostic.Message)
+			} else {
+				fmt.Fprintf(&out, "  - %s: %s\n", diagnostic.SourcePath, diagnostic.Message)
+			}
+		}
+	}
+	return out.String()
+}
+
+func displayText(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "not reported"
+	}
+	return value
 }
 
 func renderedDefaultDepth(depth string) string {
@@ -4249,6 +4618,8 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	var repoAlias string
 	var runID string
 	var runIDAlias string
+	format := "text"
+	var formatAlias string
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4256,6 +4627,8 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	fs.StringVar(&runIDAlias, "Run", "", "run id")
 	fs.StringVar(&runIDAlias, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -4265,6 +4638,15 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	}
 	if runIDAlias != "" {
 		runID = runIDAlias
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	switch format {
+	case "text", "json":
+	default:
+		fmt.Fprintf(stderr, "status: invalid --format %q; want text or json\n", format)
+		return 2
 	}
 
 	resolvedRepo, err := resolveRepo(repoPath)
@@ -4281,6 +4663,18 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 1
 	}
+	if format == "json" {
+		data, err := runstatus.MarshalJSON(report)
+		if err != nil {
+			fmt.Fprintf(stderr, "status: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
@@ -4296,6 +4690,8 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	var repoAlias string
 	var workID string
 	var workIDAlias string
+	var runID string
+	var runIDAlias string
 	var issue int
 	var issueAlias int
 	var role string
@@ -4309,6 +4705,10 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
 	fs.StringVar(&workID, "work-id", "", "work id")
 	fs.StringVar(&workIDAlias, "WorkId", "", "work id")
+	fs.StringVar(&runID, "run", "", "run id")
+	fs.StringVar(&runIDAlias, "Run", "", "run id")
+	fs.StringVar(&runIDAlias, "run-id", "", "run id")
+	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.IntVar(&issue, "issue", 0, "issue number")
 	fs.IntVar(&issueAlias, "Issue", 0, "issue number")
 	fs.StringVar(&role, "role", "", "role")
@@ -4326,6 +4726,12 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 	if workIDAlias != "" {
 		workID = workIDAlias
+	}
+	if runIDAlias != "" {
+		runID = runIDAlias
+	}
+	if strings.TrimSpace(runID) != "" && strings.TrimSpace(workID) == "" {
+		workID = runID
 	}
 	if issueAlias != 0 {
 		issue = issueAlias
@@ -4376,7 +4782,19 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if format == "json" {
-		data, err := reportquery.MarshalJSON(records)
+		var runTree any
+		if strings.TrimSpace(runID) != "" {
+			statusReport, err := runstatus.Load(runstatus.Options{
+				RepoPath: resolvedRepo,
+				RunID:    runID,
+			})
+			if err != nil {
+				fmt.Fprintf(stderr, "report: %v\n", err)
+				return 1
+			}
+			runTree = statusReport.RunTree
+		}
+		data, err := reportquery.MarshalJSONWithRunTree(records, runTree)
 		if err != nil {
 			fmt.Fprintf(stderr, "report: %v\n", err)
 			return 1
@@ -4423,6 +4841,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var baseBranchAlias string
 	var runID string
 	var runIDAlias string
+	var outputFormat string
+	var outputFormatAlias string
 	var configFromBase bool
 	var configFromBaseAlias bool
 
@@ -4432,6 +4852,8 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&runID, "run-id", "", "run id")
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
+	fs.StringVar(&outputFormat, "format", "text", "output format")
+	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 
@@ -4447,10 +4869,19 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if runIDAlias != "" {
 		runID = runIDAlias
 	}
+	if outputFormatAlias != "" {
+		outputFormat = outputFormatAlias
+	}
 	configFromBase = configFromBase || configFromBaseAlias
 
 	if strings.TrimSpace(repoPath) == "" {
 		fmt.Fprintln(stderr, "resume: --repo is required")
+		return 2
+	}
+	switch outputFormat {
+	case "text", "json", "both":
+	default:
+		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, or both\n", outputFormat)
 		return 2
 	}
 
@@ -4503,7 +4934,23 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 
-	fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+	if outputFormat == "text" || outputFormat == "both" {
+		fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+	}
+	if outputFormat == "both" {
+		fmt.Fprintln(stdout)
+	}
+	if outputFormat == "json" || outputFormat == "both" {
+		data, err := report.MarshalResumeJSON(resumeReport)
+		if err != nil {
+			fmt.Fprintf(stderr, "resume: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
+	}
 	return 0
 }
 

@@ -37,11 +37,176 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 		"RunId: run-test (requested run)",
 		"Events: 1",
 		"Verifier records: 1",
+		"Lifecycle: succeeded (source=legacy entries=1)",
 		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
 		"status is read-only and local-only",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-lifecycle"
+	writeAttempt(t, repo, runID, 103, 1, "job-103-1", workerReport(103, usageTotal(1030)))
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:00Z",
+		RunID:       runID,
+		ParentRunID: "run-parent",
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append planned lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:01Z",
+		RunID:      runID,
+		State:      state.StateQueued,
+		ChildRunID: "run-child",
+	}); err != nil {
+		t.Fatalf("append queued lifecycle: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+	for _, want := range []string{
+		"Lifecycle: queued (source=lifecycle entries=2)",
+		"ParentRunId: run-parent",
+		"ChildRunIds: run-child",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-parent"
+	child := "run-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StatePlanned,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent planned lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:01Z",
+		RunID:      parent,
+		State:      state.StateRunning,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent running lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:02Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append child planned lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:03Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StateRunning,
+	}); err != nil {
+		t.Fatalf("append child running lifecycle: %v", err)
+	}
+	writeAttempt(t, repo, child, 651, 1, "job-651-1", workerReport(651, usageTotal(6510)))
+	writeEventLine(t, repo, child, `{"ts":"2026-07-09T00:00:43Z","run_id":"run-child","job_id":"job-651-1","issue":651,"phase":"pr_created","status":"succeeded","pr":"https://github.com/owner/repo/pull/651","summary":"implemented run tree observability"}`)
+
+	report, err := Load(Options{RepoPath: repo, RunID: child})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	data, err := MarshalJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		RunID   string `json:"run_id"`
+		Project struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+		RunTree struct {
+			RootRunID     string `json:"root_run_id"`
+			SelectedRunID string `json:"selected_run_id"`
+			Summary       struct {
+				RunCount int `json:"run_count"`
+			} `json:"summary"`
+			Nodes []RunTreeNode `json:"nodes"`
+		} `json:"run_tree"`
+		Rows []Row `json:"rows"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("status JSON did not unmarshal: %v\n%s", err, string(data))
+	}
+	if payload.RunID != child || payload.RunTree.RootRunID != parent || payload.RunTree.SelectedRunID != child {
+		t.Fatalf("run identifiers = run_id=%q root=%q selected=%q", payload.RunID, payload.RunTree.RootRunID, payload.RunTree.SelectedRunID)
+	}
+	if payload.Project.ProjectID == "" {
+		t.Fatalf("project_id missing from status JSON:\n%s", string(data))
+	}
+	if payload.RunTree.Summary.RunCount != 2 || len(payload.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree size = summary=%#v nodes=%#v", payload.RunTree.Summary, payload.RunTree.Nodes)
+	}
+	var childNode *RunTreeNode
+	for i := range payload.RunTree.Nodes {
+		if payload.RunTree.Nodes[i].RunID == child {
+			childNode = &payload.RunTree.Nodes[i]
+		}
+	}
+	if childNode == nil {
+		t.Fatalf("child node missing: %#v", payload.RunTree.Nodes)
+	}
+	if childNode.ParentRunID != parent || childNode.Issue != 651 || childNode.Role != "worker" || childNode.Provider != "codex" || childNode.Permission != "write" {
+		t.Fatalf("child node metadata = %#v", *childNode)
+	}
+	if childNode.PR != "https://github.com/owner/repo/pull/651" || childNode.ReportSummary == "" || childNode.StartedAt == "" || childNode.UpdatedAt == "" {
+		t.Fatalf("child node observability fields incomplete = %#v", *childNode)
+	}
+	if len(payload.Rows) != 1 || payload.Rows[0].Issue != "#651" {
+		t.Fatalf("rows = %#v, want issue #651", payload.Rows)
+	}
+	if strings.Contains(string(data), "RunID") {
+		t.Fatalf("status JSON used unstable CamelCase keys:\n%s", string(data))
+	}
+}
+
+func TestLoadAcceptsLifecycleOnlyRun(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-lifecycle-only"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp: "2026-07-09T00:00:00Z",
+		RunID:     runID,
+		State:     state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append lifecycle: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error for lifecycle-only run: %v", err)
+	}
+	if report.LifecycleState != string(state.StatePlanned) || len(report.Rows) != 0 || report.RunTree.RootRunID != runID {
+		t.Fatalf("lifecycle-only report = %#v", report)
+	}
+	got := Render(report)
+	for _, want := range []string{
+		"Lifecycle: planned (source=lifecycle entries=1)",
+		"Run tree",
+		"- run-lifecycle-only (state=planned)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered lifecycle-only status missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -60,6 +225,43 @@ func TestRenderTotalOnlyTokensAsNotReportedSplit(t *testing.T) {
 	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | codex_exited | succeeded | not reported |"
 	if !strings.Contains(got, want) {
 		t.Fatalf("rendered status missing total-only token row %q:\n%s", want, got)
+	}
+}
+
+func TestRenderInterruptedChildRunStatus(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-interrupted"
+	errText := "parent run timed out before child dispatch"
+	_, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:             1,
+		JobID:               "job-801-abandoned",
+		Issue:               801,
+		Attempt:             1,
+		Provider:            "codex",
+		PID:                 0,
+		Phase:               "parent_stopped_before_dispatch",
+		Status:              state.StatusTimedOut,
+		Branch:              "loop/issue-801",
+		RecoveryContextPath: state.RecoveryBriefPath(repo, runID, "job-801-abandoned"),
+		StartedAt:           "2026-07-09T00:00:00Z",
+		HeartbeatAt:         "2026-07-09T00:00:00Z",
+		LastProgressAt:      "2026-07-09T00:00:00Z",
+		LogBytes:            0,
+		Error:               &errText,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt returned error: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+
+	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
+	if !strings.Contains(got, want) {
+		t.Fatalf("rendered status missing timed out child row %q:\n%s", want, got)
 	}
 }
 

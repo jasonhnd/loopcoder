@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 )
 
 type AntigravityRunner struct{}
@@ -65,13 +66,20 @@ func (AntigravityRunner) Run(ctx context.Context, inv Invocation) (Result, error
 	startedAt := time.Now()
 	if inv.ReadOnly {
 		endedAt := time.Now()
-		return resultWithTiming(1, "", metadata, startedAt, endedAt), errors.New("antigravity read-only mode is not available or verified")
+		return resultWithTiming(1, "", metadata, startedAt, endedAt), runtimecap.RequireProviderCapability("antigravity", runtimecap.ProviderReadOnly)
 	}
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("antigravity log path is required")
 	}
-	if _, err := mcpServersForInvocation(inv); err != nil {
+	mcpServers, err := mcpServersForInvocation(inv)
+	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("antigravity MCP configuration: %w", err)
+	}
+	if len(mcpServers) > 0 {
+		return Result{ExitCode: -1}, fmt.Errorf("antigravity MCP configuration: %w", runtimecap.RequireProviderCapability("antigravity", runtimecap.ProviderMCPConfig))
+	}
+	if strings.TrimSpace(inv.OutputSchema) != "" {
+		return Result{ExitCode: -1}, fmt.Errorf("antigravity output schema: %w", runtimecap.RequireProviderCapability("antigravity", runtimecap.ProviderJSONOutput))
 	}
 
 	logFile, err := createSensitiveFile(inv.LogPath)

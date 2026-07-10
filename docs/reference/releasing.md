@@ -28,18 +28,44 @@ Before tagging a release:
 4. Confirm the three surfaces agree on command names, config keys, compatibility aliases, breaking-change wording, and upgrade steps.
 5. Run the release's required local verification, including markdown well-formedness checks when available and `go build ./...` for loopcoder source releases.
 
-After publishing a release, run the consumer artifact smoke:
+After publishing v0.7.0 or any later release, run the consumer artifact smoke:
 
 ```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.6.1
+pwsh scripts/release-smoke.ps1 -Version 0.7.0
 ```
 
 The smoke script downloads the published archive for the current platform,
 verifies `SHA256SUMS` with cosign, checks the archive checksum, runs
-`loopcoder version`, exercises a temporary-repository `init` / `skill install`
-/ `doctor --format json` / `report` path, and confirms
-`loopcoder upgrade --version 0.6.1` recognizes the selected binary as already
-latest. It is verification-only and must not create tags, publish releases, or
-upload assets.
+`loopcoder version`, confirms the source checkout has no tracked `.loopcoder/`
+files, exercises a temporary-repository `init` / `skill install` / project
+registry / `doctor --format json` / `migrate local-state --dry-run` /
+`report --format json` path, invokes the self-bootstrap acceptance smoke for
+nested run-tree observability, confirms the selected binary recognizes itself
+as already latest, and verifies upgrade from the previous release when
+`-PreviousVersion` is set. It is verification-only and must not create tags,
+publish releases, or upload assets.
+
+## v0.7.0 Self-Bootstrap Acceptance
+
+Before tagging v0.7.0, run the self-bootstrap acceptance path in
+[`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
+include:
+
+- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1`;
+- project registry evidence for the loopcoder checkout;
+- proof that `$LOOPCODER_HOME/data/loopcoder.db` exists outside the repository;
+- doctor JSON showing storage, project registry, provider compatibility, and
+  nested-run health;
+- status and report JSON showing at least one parent/child run tree;
+- issue-to-PR evidence for the v0.7.0 implementation issues;
+- the normal consumer artifact smoke,
+  `pwsh scripts/release-smoke.ps1 -Version 0.7.0`, after release assets exist.
+- the completed go/no-go report from
+  [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md), attached to the release
+  readiness PR or issue.
+
+This acceptance path is verification-only. It must not force production
+auto-merge, fake success without PR evidence, or depend on paid provider
+services that are not available to the operator.
 
 Historical changelog entries and accepted specs are release history. Do not terminology-sweep old release entries or shipped specs merely because current naming changed.

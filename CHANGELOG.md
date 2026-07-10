@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **v0.7.0 self-bootstrap acceptance** - added
+  `docs/reference/self-bootstrap.md` and
+  `scripts/self-bootstrap-smoke.ps1` so the release can prove loopcoder's own
+  registry, machine-local database, provider compatibility visibility, and
+  nested parent/child run-tree observability before tagging.
+- **v0.7.0 release readiness artifacts** - added
+  `.github/release-notes/v0.7.0.md` and
+  `docs/reference/v0.7.0-go-no-go.md` so the final release PR can attach a
+  truthful go/no-go report without claiming v0.7.0 is installable before the
+  tag and signed assets exist.
+- **Expanded v0.7.0 release smoke** - `scripts/release-smoke.ps1` now defaults
+  to the v0.7.0 candidate and verifies signed release assets, archive
+  extraction, `doctor --format json`, `report --format json`, project registry
+  registration/list/show, machine-local database placement outside the repo,
+  `migrate local-state --dry-run`, provider compatibility, self-bootstrap
+  nested run-tree observability, already-latest upgrade behavior, and upgrade
+  from v0.6.1.
+
+### Fixed
+
+- **Release smoke already-latest assertion** - joined native command output
+  before matching so multi-line PowerShell arrays no longer produce a false
+  negative for a good already-latest upgrade.
+- **Host-sensitive provider compatibility smoke** - the codex Worker
+  compatibility assertion now accepts `supported` on known hosts and
+  `experimental` on the generic-local fallback host, while still failing closed
+  for unsupported compatibility.
+- **Self-bootstrap build path** - `scripts/self-bootstrap-smoke.ps1 -Repo
+  <path>` now builds `./cmd/loopcoder` from the supplied repo path instead of
+  the caller's current working directory.
+
 ## [0.6.1] - 2026-07-08
 
 0.6.1 is the customer-ready bridge for the public 0.6 line. The latest public

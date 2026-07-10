@@ -22,6 +22,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
@@ -86,6 +87,52 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
+func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"doctor", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			return doctor.WithMetadata(doctor.Report{
+				HostProfile: doctor.HostProfile{
+					Name:               "codex-cli",
+					Source:             "env",
+					Selector:           "LOOPCODER_HOST",
+					InvocationStyle:    "interactive Codex CLI conductor session calls loopcoder as a local subprocess",
+					SupportsJSONOutput: true,
+				},
+				Checks: []doctor.Check{{
+					Name:    "host profile",
+					Status:  doctor.StatusOK,
+					Message: "profile=codex-cli source=env selector=LOOPCODER_HOST",
+				}},
+			}, opts.RepoPath, doctor.BuildInfo{Version: "0.7.0", Commit: "abc123", Date: "2026-07-10T00:00:00Z"})
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		HostProfile struct {
+			Name   string `json:"name"`
+			Source string `json:"source"`
+		} `json:"host_profile"`
+		Checks []struct {
+			Name string `json:"name"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not clean doctor JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.HostProfile.Name != "codex-cli" || payload.HostProfile.Source != "env" || len(payload.Checks) != 1 {
+		t.Fatalf("payload = %#v, want host profile and one check", payload)
+	}
+}
+
 func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
@@ -147,6 +194,205 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	}
 	if pending := relaygate.Check(repo); len(pending) != 0 {
 		t.Fatalf("report command mutated relay state: %#v", pending)
+	}
+}
+
+func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-cli-parent"
+	child := "run-cli-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StatePlanned,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+	record := validDispatchReport()
+	record.Issue = 651
+	if _, err := state.WriteAttempt(repo, child, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-651-1",
+		Issue:          651,
+		Attempt:        1,
+		Provider:       "codex",
+		Status:         "succeeded",
+		Phase:          "codex_exited",
+		StartedAt:      "2026-07-09T00:00:02Z",
+		HeartbeatAt:    "2026-07-09T00:00:03Z",
+		LastProgressAt: "2026-07-09T00:00:03Z",
+		Report:         &record,
+	}); err != nil {
+		t.Fatalf("write child attempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", child, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		RunID   string `json:"run_id"`
+		Project struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+		RunTree struct {
+			RootRunID string `json:"root_run_id"`
+			Nodes     []struct {
+				RunID       string `json:"run_id"`
+				ParentRunID string `json:"parent_run_id"`
+				Issue       int    `json:"issue"`
+				Provider    string `json:"provider"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("status output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.RunID != child || payload.Project.ProjectID == "" || payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
+		t.Fatalf("status JSON = %#v", payload)
+	}
+	var foundChild bool
+	for _, node := range payload.RunTree.Nodes {
+		if node.RunID == child && node.ParentRunID == parent && node.Issue == 651 && node.Provider == "codex" {
+			foundChild = true
+		}
+	}
+	if !foundChild {
+		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+}
+
+func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-report-parent"
+	child := "run-report-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StatePlanned,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StatePlanned,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+	record := validDispatchReport()
+	record.WorkID = child
+	record.Issue = 651
+	if _, err := state.WriteAttempt(repo, child, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-651-1",
+		Issue:          651,
+		Attempt:        1,
+		Provider:       "codex",
+		Status:         "succeeded",
+		StartedAt:      "2026-07-09T00:00:02Z",
+		HeartbeatAt:    "2026-07-09T00:00:03Z",
+		LastProgressAt: "2026-07-09T00:00:03Z",
+		Report:         &record,
+	}); err != nil {
+		t.Fatalf("write child attempt: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"report", "--repo", repo, "--run", child, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		Reports []reporter.Report `json:"reports"`
+		Records []struct {
+			RunID string `json:"run_id"`
+		} `json:"records"`
+		RunTree struct {
+			RootRunID string `json:"root_run_id"`
+			Nodes     []struct {
+				RunID string `json:"run_id"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("report output is not JSON: %v\n%s", err, stdout.String())
+	}
+	if len(payload.Reports) != 1 || len(payload.Records) != 1 || payload.Records[0].RunID != child {
+		t.Fatalf("report records = %#v %#v", payload.Reports, payload.Records)
+	}
+	if payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree = %#v", payload.RunTree)
+	}
+}
+
+func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"migrate", "local-state", "--repo", repo, "--dry-run", "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		MigrateLocalState: func(_ context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			if !opts.DryRun {
+				t.Fatalf("DryRun = false, want true")
+			}
+			return localmigrate.Result{
+				RepoPath:       opts.RepoPath,
+				ProjectID:      "proj_test",
+				DatabasePath:   filepath.Join(repo, "loopcoder.db"),
+				DryRun:         opts.DryRun,
+				Status:         "completed-with-warnings",
+				ScannedCount:   3,
+				ImportedCount:  2,
+				SkippedCount:   1,
+				MalformedCount: 1,
+				Diagnostics: []localmigrate.Diagnostic{{
+					SourcePath: ".loopcoder/runs/run-test/events.jsonl",
+					Line:       2,
+					Message:    "malformed event JSONL",
+				}},
+			}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%s", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		ProjectID      string                    `json:"project_id"`
+		DryRun         bool                      `json:"dry_run"`
+		Status         string                    `json:"status"`
+		MalformedCount int                       `json:"malformed_count"`
+		Diagnostics    []localmigrate.Diagnostic `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.ProjectID != "proj_test" || !payload.DryRun || payload.Status != "completed-with-warnings" || payload.MalformedCount != 1 || len(payload.Diagnostics) != 1 {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 
@@ -264,6 +510,143 @@ func TestModelsCommandRejectsAgyProviderWithHint(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
 		}
+	}
+}
+
+func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/repo.git")
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var registerOut, registerErr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &registerOut, &registerErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("register exit = %d stderr=%q", exitCode, registerErr.String())
+	}
+	var registered struct {
+		Project struct {
+			ProjectID           string `json:"project_id"`
+			DisplayName         string `json:"display_name"`
+			RemoteURLNormalized string `json:"remote_url_normalized"`
+			IdentitySource      string `json:"identity_source"`
+		} `json:"project"`
+		Created bool `json:"created"`
+	}
+	if err := json.Unmarshal(registerOut.Bytes(), &registered); err != nil {
+		t.Fatalf("register JSON: %v\n%s", err, registerOut.String())
+	}
+	if !registered.Created || registered.Project.ProjectID == "" || registered.Project.DisplayName != "repo" || registered.Project.IdentitySource != "github" {
+		t.Fatalf("registered = %#v", registered)
+	}
+
+	var secondOut, secondErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &secondOut, &secondErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("second register exit = %d stderr=%q", exitCode, secondErr.String())
+	}
+	var second struct {
+		Updated bool `json:"updated"`
+	}
+	if err := json.Unmarshal(secondOut.Bytes(), &second); err != nil {
+		t.Fatalf("second register JSON: %v\n%s", err, secondOut.String())
+	}
+	if !second.Updated {
+		t.Fatalf("second = %#v, want updated", second)
+	}
+
+	var listOut, listErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "list", "--format", "json"}, &listOut, &listErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list exit = %d stderr=%q", exitCode, listErr.String())
+	}
+	var list struct {
+		Projects []struct {
+			ProjectID string `json:"project_id"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(listOut.Bytes(), &list); err != nil {
+		t.Fatalf("list JSON: %v\n%s", err, listOut.String())
+	}
+	if len(list.Projects) != 1 || list.Projects[0].ProjectID != registered.Project.ProjectID {
+		t.Fatalf("list = %#v, want one registered project", list)
+	}
+
+	var showOut, showErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &showOut, &showErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show exit = %d stderr=%q", exitCode, showErr.String())
+	}
+	var show struct {
+		Registered bool `json:"registered"`
+		Project    struct {
+			ProjectID string `json:"project_id"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(showOut.Bytes(), &show); err != nil {
+		t.Fatalf("show JSON: %v\n%s", err, showOut.String())
+	}
+	if !show.Registered || show.Project.ProjectID != registered.Project.ProjectID {
+		t.Fatalf("show = %#v, want registered project", show)
+	}
+
+	var removeOut, removeErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "remove", "--repo", repo, "--format", "json"}, &removeOut, &removeErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("remove exit = %d stderr=%q", exitCode, removeErr.String())
+	}
+	var removed struct {
+		Removed           bool `json:"removed"`
+		RunHistoryDeleted bool `json:"run_history_deleted"`
+	}
+	if err := json.Unmarshal(removeOut.Bytes(), &removed); err != nil {
+		t.Fatalf("remove JSON: %v\n%s", err, removeOut.String())
+	}
+	if !removed.Removed || removed.RunHistoryDeleted {
+		t.Fatalf("removed = %#v, want removed without run history deletion", removed)
+	}
+}
+
+func TestProjectsListJSONUsesEmptyArrayWhenNoProjects(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "list", "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("list JSON: %v\n%s", err, stdout.String())
+	}
+	if got := strings.TrimSpace(string(payload["projects"])); got != "[]" {
+		t.Fatalf("projects JSON = %s, want []\nfull output:\n%s", got, stdout.String())
+	}
+}
+
+func TestProjectsShowJSONWorksWhenUnregistered(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/unregistered.git")
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var show struct {
+		Registered bool `json:"registered"`
+		Project    struct {
+			ProjectID      string `json:"project_id"`
+			IdentitySource string `json:"identity_source"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &show); err != nil {
+		t.Fatalf("show JSON: %v\n%s", err, stdout.String())
+	}
+	if show.Registered || show.Project.ProjectID == "" || show.Project.IdentitySource != "github" {
+		t.Fatalf("show = %#v, want unregistered github candidate", show)
 	}
 }
 
@@ -4515,6 +4898,77 @@ func TestResumeRunsWithInjectedReaderAndDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestResumeRendersJSONWithRunTreeAndRecoveryDecision(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      "run-parent",
+		State:      state.StateRunning,
+		ChildRunID: "run-child",
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       "run-child",
+		ParentRunID: "run-parent",
+		State:       state.StateFailed,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+
+	exitCode := RunWithDeps([]string{"resume", "--repo", repo, "--run-id", "run-parent", "--format", "json"}, &stdout, &stderr, Deps{
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			return cliFakeReader{
+				issues: []gh.Issue{{Number: 650, Title: "Interrupted child", State: "OPEN"}},
+			}
+		},
+		ProcessAlive: func(int) bool { return false },
+		Now: func() time.Time {
+			return time.Date(2026, 7, 9, 0, 1, 0, 0, time.UTC)
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var got struct {
+		RunTree struct {
+			Nodes []struct {
+				RunID            string `json:"run_id"`
+				RecoveryDecision struct {
+					Outcome      string `json:"outcome"`
+					RetryAllowed bool   `json:"retry_allowed"`
+				} `json:"recovery_decision"`
+			} `json:"nodes"`
+		} `json:"run_tree"`
+		Issues []struct {
+			RecoveryDecision struct {
+				Outcome      string `json:"outcome"`
+				SafeToResume bool   `json:"safe_to_resume"`
+			} `json:"recovery_decision"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("resume JSON did not unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.RunTree.Nodes) != 2 {
+		t.Fatalf("run tree nodes = %#v, want parent and child", got.RunTree.Nodes)
+	}
+	childRetry := false
+	for _, node := range got.RunTree.Nodes {
+		if node.RunID == "run-child" && node.RecoveryDecision.Outcome == "retry" && node.RecoveryDecision.RetryAllowed {
+			childRetry = true
+		}
+	}
+	if !childRetry {
+		t.Fatalf("run tree missing retryable child decision: %#v", got.RunTree.Nodes)
+	}
+	if len(got.Issues) != 1 || got.Issues[0].RecoveryDecision.Outcome != "dispatch" || !got.Issues[0].RecoveryDecision.SafeToResume {
+		t.Fatalf("issue recovery decision = %#v", got.Issues)
+	}
+}
+
 func TestResumeRequiresRepo(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
@@ -4645,6 +5099,25 @@ func initRepoWithDeliveryOnlyOnBranch(t *testing.T, baseBranch string) string {
 	runCLITestGit(t, repo, "commit", "-m", "add delivery config")
 	runCLITestGit(t, repo, "checkout", "main")
 	return repo
+}
+
+func initProjectRegistryCLITestRepo(t *testing.T, remote string) string {
+	t.Helper()
+	repo := t.TempDir()
+	runCLITestGit(t, repo, "init", "-b", "main")
+	runCLITestGit(t, repo, "config", "user.email", "loopcoder-test@example.com")
+	runCLITestGit(t, repo, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runCLITestGit(t, repo, "add", "README.md")
+	runCLITestGit(t, repo, "commit", "-m", "initial")
+	runCLITestGit(t, repo, "remote", "add", "origin", remote)
+	return repo
+}
+
+func fixedCLINow() time.Time {
+	return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 }
 
 func runCLITestGit(t *testing.T, repo string, args ...string) {

@@ -20,7 +20,9 @@ Every document is exactly one of these types:
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
+- [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.7.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
+- [`reference/v0.7.0-go-no-go.md`](reference/v0.7.0-go-no-go.md): v0.7.0 release readiness report template.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
 - [`reference/usage.md`](reference/usage.md): setup and end-to-end usage.
 - [`specs/`](specs/): accepted specs and historical design records.

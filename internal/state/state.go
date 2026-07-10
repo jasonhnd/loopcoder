@@ -3,7 +3,9 @@ package state
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +20,21 @@ import (
 
 const runIDTimeLayout = "20060102T150405Z"
 
-var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave)$`)
+var runIDPattern = regexp.MustCompile(`^run-\d{8}T\d{6}Z-(?:issue-[1-9]\d*|wave|child-(?:[a-z0-9][a-z0-9-]{0,62}|\d+-[a-z0-9][a-z0-9-]{0,62}))$`)
+
+const (
+	StatusPlanned    = "planned"
+	StatusQueued     = "queued"
+	StatusRunning    = "running"
+	StatusWaiting    = "waiting"
+	StatusSucceeded  = "succeeded"
+	StatusFailed     = "failed"
+	StatusCancelled  = "cancelled"
+	StatusTimedOut   = "timed_out"
+	StatusAbandoned  = "abandoned"
+	StatusNeedsHuman = "needs-human"
+	StatusHung       = "hung"
+)
 
 type Attempt struct {
 	Version             int              `json:"version,omitempty"`
@@ -83,6 +99,46 @@ type Event struct {
 	Details           any     `json:"details,omitempty"`
 }
 
+// FailureStatus maps context-driven failures to explicit durable statuses.
+// Non-context failures remain failed so callers can preserve their existing
+// error paths while still distinguishing parent cancellation and timeout.
+func FailureStatus(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return StatusCancelled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return StatusTimedOut
+	}
+	return StatusFailed
+}
+
+func IsTerminalStatus(status string) bool {
+	switch NormalizeStatus(status) {
+	case StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusAbandoned, StatusNeedsHuman, StatusHung:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "completed", "complete", "done":
+		return StatusSucceeded
+	case "failure", "error":
+		return StatusFailed
+	case "canceled":
+		return StatusCancelled
+	case "timeout", "timed-out":
+		return StatusTimedOut
+	default:
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
 // FormatTimestamp formats timestamps in UTC RFC3339 for loopcoder sidecars.
 func FormatTimestamp(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
@@ -107,9 +163,47 @@ func RunIDForWave(at time.Time) string {
 	return fmt.Sprintf("run-%s-wave", at.UTC().Format(runIDTimeLayout))
 }
 
+// RunIDForChild returns a run id in the run-<utc-compact>-child-<index>-<slug> shape.
+func RunIDForChild(slug string, index int, at time.Time) string {
+	if index < 0 {
+		index = 0
+	}
+	return fmt.Sprintf("run-%s-child-%d-%s", at.UTC().Format(runIDTimeLayout), index, normalizeChildRunSlug(slug))
+}
+
 // IsRunID reports whether value matches the documented run id shape.
 func IsRunID(value string) bool {
 	return runIDPattern.MatchString(value)
+}
+
+func normalizeChildRunSlug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var out strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if valid {
+			out.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if out.Len() == 0 || lastDash {
+			continue
+		}
+		out.WriteByte('-')
+		lastDash = true
+	}
+	slug := strings.Trim(out.String(), "-")
+	if slug == "" {
+		return "child"
+	}
+	if len(slug) > 63 {
+		slug = strings.TrimRight(slug[:63], "-")
+	}
+	if slug == "" {
+		return "child"
+	}
+	return slug
 }
 
 // LatestRunID selects the newest local run directory by modification time.
