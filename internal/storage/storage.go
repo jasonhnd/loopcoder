@@ -12,12 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/gitremote"
+
 	_ "modernc.org/sqlite"
 )
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 3
+	CurrentSchemaVersion = 4
 
 	driverName = "sqlite"
 )
@@ -176,6 +178,11 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: 4,
+		name:    "scrub project remote urls",
+		apply:   scrubProjectRemoteURLs,
+	},
 }
 
 var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "legacy_import_records", "legacy_import_status"}
@@ -184,6 +191,7 @@ type migration struct {
 	version    int
 	name       string
 	statements []string
+	apply      func(context.Context, *sql.Tx) error
 }
 
 // Open opens or creates the SQLite-backed store and applies supported migrations.
@@ -361,6 +369,11 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
 			}
 		}
+		if migration.apply != nil {
+			if err := migration.apply(ctx, tx); err != nil {
+				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO migrations(version, name, applied_at) VALUES (?, ?, ?)`,
 			migration.version, migration.name, formatTimestamp(s.now())); err != nil {
 			return fmt.Errorf("record storage migration %d: %w", migration.version, err)
@@ -371,6 +384,50 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("migrate storage: commit: %w", err)
+	}
+	return nil
+}
+
+func scrubProjectRemoteURLs(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, remote_url, remote_url_normalized FROM projects`)
+	if err != nil {
+		return err
+	}
+	type projectRemote struct {
+		id         string
+		display    string
+		normalized string
+	}
+	var updates []projectRemote
+	for rows.Next() {
+		var current projectRemote
+		if err := rows.Scan(&current.id, &current.display, &current.normalized); err != nil {
+			rows.Close()
+			return err
+		}
+		nextDisplay, _ := gitremote.SanitizeDisplayURL(current.display)
+		nextNormalized, _, _, normalizedOK := gitremote.NormalizeURL(current.normalized)
+		if !normalizedOK {
+			nextNormalized, _, _, normalizedOK = gitremote.NormalizeURL(nextDisplay)
+		}
+		if !normalizedOK {
+			nextNormalized = ""
+		}
+		if current.display != nextDisplay || current.normalized != nextNormalized {
+			updates = append(updates, projectRemote{
+				id:         current.id,
+				display:    nextDisplay,
+				normalized: nextNormalized,
+			})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET remote_url = ?, remote_url_normalized = ? WHERE id = ?`, update.display, update.normalized, update.id); err != nil {
+			return err
+		}
 	}
 	return nil
 }

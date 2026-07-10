@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -636,6 +637,46 @@ func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
 	}
 	if !removed.Removed || removed.RunHistoryDeleted {
 		t.Fatalf("removed = %#v, want removed without run history deletion", removed)
+	}
+}
+
+func TestProjectsCommandNeverEmitsOrPersistsRemoteCredentialSentinel(t *testing.T) {
+	secret := "loopcoder-sentinel-secret-687"
+	remote := "https://alice:" + secret + "@github.com/owner/private.git?access_token=" + secret + "&X-Amz-Signature=" + secret + "#token=" + secret
+	repo := initProjectRegistryCLITestRepo(t, remote)
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+
+	var combined bytes.Buffer
+	runProjectsJSONForSecretTest := func(args ...string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := RunWithDeps(args, &stdout, &stderr, Deps{Now: fixedCLINow})
+		combined.Write(stdout.Bytes())
+		combined.Write(stderr.Bytes())
+		if exitCode != 0 {
+			t.Fatalf("%v exit = %d stderr=%q", args, exitCode, stderr.String())
+		}
+		if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) {
+			t.Fatalf("%v leaked secret\nstdout:\n%s\nstderr:\n%s", args, stdout.String(), stderr.String())
+		}
+	}
+
+	runProjectsJSONForSecretTest("projects", "register", "--repo", repo, "--format", "json")
+	runProjectsJSONForSecretTest("projects", "list", "--format", "json")
+	runProjectsJSONForSecretTest("projects", "show", "--repo", repo, "--format", "json")
+
+	dbText := readAllSQLiteText(t, filepath.Join(homeDir, "data", "loopcoder.db"))
+	if strings.Contains(dbText, secret) {
+		t.Fatalf("SQLite text fields leaked secret:\n%s", dbText)
+	}
+	if !strings.Contains(dbText, "https://github.com/owner/private") {
+		t.Fatalf("SQLite text fields missing sanitized remote:\n%s", dbText)
+	}
+
+	runProjectsJSONForSecretTest("projects", "remove", "--repo", repo, "--format", "json")
+	if strings.Contains(combined.String(), secret) {
+		t.Fatalf("combined command output leaked secret:\n%s", combined.String())
 	}
 }
 
@@ -5166,6 +5207,88 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(cmdArgs, " "), err, string(output))
 	}
+}
+
+func readAllSQLiteText(t *testing.T, dbPath string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	tables, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query sqlite tables: %v", err)
+	}
+	defer tables.Close()
+	var out strings.Builder
+	for tables.Next() {
+		var table string
+		if err := tables.Scan(&table); err != nil {
+			t.Fatalf("scan table: %v", err)
+		}
+		columns := sqliteTextColumns(t, db, table)
+		for _, column := range columns {
+			rows, err := db.Query(`SELECT ` + quoteSQLiteIdentifier(column) + ` FROM ` + quoteSQLiteIdentifier(table))
+			if err != nil {
+				t.Fatalf("query %s.%s: %v", table, column, err)
+			}
+			for rows.Next() {
+				var value sql.NullString
+				if err := rows.Scan(&value); err != nil {
+					rows.Close()
+					t.Fatalf("scan %s.%s: %v", table, column, err)
+				}
+				if value.Valid {
+					out.WriteString(table)
+					out.WriteByte('.')
+					out.WriteString(column)
+					out.WriteByte('=')
+					out.WriteString(value.String)
+					out.WriteByte('\n')
+				}
+			}
+			if err := rows.Close(); err != nil {
+				t.Fatalf("close %s.%s rows: %v", table, column, err)
+			}
+		}
+	}
+	if err := tables.Err(); err != nil {
+		t.Fatalf("iterate sqlite tables: %v", err)
+	}
+	return out.String()
+}
+
+func sqliteTextColumns(t *testing.T, db *sql.DB, table string) []string {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + quoteSQLiteIdentifier(table) + `)`)
+	if err != nil {
+		t.Fatalf("pragma table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		if strings.Contains(strings.ToUpper(typ), "TEXT") {
+			columns = append(columns, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
+	return columns
+}
+
+func quoteSQLiteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func cliPendingPrettyBlock(role string) string {
