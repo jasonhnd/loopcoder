@@ -19,7 +19,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 4
+	CurrentSchemaVersion = 5
 
 	driverName = "sqlite"
 )
@@ -153,7 +153,7 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_reports_source_hash ON reports(source_hash)`,
 			`CREATE TABLE IF NOT EXISTS legacy_import_records (
 				id TEXT PRIMARY KEY,
-				project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				project_id TEXT NOT NULL REFERENCES projects(id),
 				run_id TEXT,
 				record_type TEXT NOT NULL,
 				source_path TEXT NOT NULL,
@@ -165,7 +165,7 @@ var migrations = []migration{
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
 			`CREATE INDEX IF NOT EXISTS idx_legacy_import_records_project ON legacy_import_records(project_id)`,
 			`CREATE TABLE IF NOT EXISTS legacy_import_status (
-				project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+				project_id TEXT PRIMARY KEY REFERENCES projects(id),
 				repo_path TEXT NOT NULL,
 				started_at TEXT NOT NULL,
 				completed_at TEXT NOT NULL,
@@ -182,6 +182,14 @@ var migrations = []migration{
 		version: 4,
 		name:    "scrub project remote urls",
 		apply:   scrubProjectRemoteURLs,
+	},
+	{
+		version: 5,
+		name:    "preserve project history on registry removal",
+		statements: []string{
+			`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
+		},
+		apply: rebuildLegacyImportTablesWithoutCascade,
 	},
 }
 
@@ -445,6 +453,49 @@ func scrubProjectRemoteURLs(ctx context.Context, tx *sql.Tx) error {
 	}
 	for _, update := range updates {
 		if _, err := tx.ExecContext(ctx, `UPDATE projects SET remote_url = ?, remote_url_normalized = ? WHERE id = ?`, update.display, update.normalized, update.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rebuildLegacyImportTablesWithoutCascade(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range []string{
+		`CREATE TABLE legacy_import_records_v5 (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL REFERENCES projects(id),
+			run_id TEXT,
+			record_type TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			source_line INTEGER NOT NULL DEFAULT 0,
+			source_hash TEXT NOT NULL,
+			payload_json TEXT NOT NULL DEFAULT '{}',
+			imported_at TEXT NOT NULL
+		)`,
+		`INSERT INTO legacy_import_records_v5(id, project_id, run_id, record_type, source_path, source_line, source_hash, payload_json, imported_at)
+			SELECT id, project_id, run_id, record_type, source_path, source_line, source_hash, payload_json, imported_at FROM legacy_import_records`,
+		`DROP TABLE legacy_import_records`,
+		`ALTER TABLE legacy_import_records_v5 RENAME TO legacy_import_records`,
+		`CREATE UNIQUE INDEX idx_legacy_import_records_source ON legacy_import_records(project_id, record_type, source_path, source_line, source_hash)`,
+		`CREATE INDEX idx_legacy_import_records_project ON legacy_import_records(project_id)`,
+		`CREATE TABLE legacy_import_status_v5 (
+			project_id TEXT PRIMARY KEY REFERENCES projects(id),
+			repo_path TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			completed_at TEXT NOT NULL,
+			status TEXT NOT NULL,
+			scanned_count INTEGER NOT NULL DEFAULT 0,
+			imported_count INTEGER NOT NULL DEFAULT 0,
+			skipped_count INTEGER NOT NULL DEFAULT 0,
+			malformed_count INTEGER NOT NULL DEFAULT 0,
+			message TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO legacy_import_status_v5(project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count, skipped_count, malformed_count, message)
+			SELECT project_id, repo_path, started_at, completed_at, status, scanned_count, imported_count, skipped_count, malformed_count, message FROM legacy_import_status`,
+		`DROP TABLE legacy_import_status`,
+		`ALTER TABLE legacy_import_status_v5 RENAME TO legacy_import_status`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return err
 		}
 	}

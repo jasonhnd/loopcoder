@@ -107,7 +107,7 @@ loopcoder models --provider antigravity       # list agy-backed model choices
 loopcoder projects register --repo .          # add or refresh this checkout in the global project registry
 loopcoder projects list --format json         # list registered projects for machine use
 loopcoder projects show --repo .              # inspect this checkout's resolved registry identity
-loopcoder projects remove --repo .            # remove registry entry without deleting run history
+loopcoder projects remove --repo .            # detach active registry entry while preserving history
 loopcoder migrate local-state --repo . --dry-run
 loopcoder migrate local-state --repo .        # copy legacy .loopcoder records into local storage
 loopcoder audit --repo . --layer sast         # run read-only security audit
@@ -217,7 +217,7 @@ loopcoder projects show --repo . --format json
 loopcoder projects remove --repo .
 ```
 
-`show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source. `remove --repo .` deletes only the project registry row; historical run records are left in the database and are not deleted by default. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
+`list` shows active projects. `show --repo .` also works for an unregistered checkout and reports the candidate project ID and identity source; for a detached checkout it reports the preserved project identity with `detached: true`. `remove --repo .` detaches the active registry entry by setting `detached_at`; it does not delete the project row, runs, run events, run edges, reports, legacy import records, or import status. Re-running `register --repo .` for the same identity reactivates the preserved project row and reconnects the existing history. `doctor --repo .` includes a `project registry` check and warns when the current checkout's identity is ambiguous.
 
 ### Local State Migration
 

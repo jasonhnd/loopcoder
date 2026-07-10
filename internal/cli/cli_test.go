@@ -630,13 +630,100 @@ func TestProjectsCommandRegisterListShowRemoveJSON(t *testing.T) {
 	}
 	var removed struct {
 		Removed           bool `json:"removed"`
+		Detached          bool `json:"detached"`
+		ProjectDeleted    bool `json:"project_deleted"`
 		RunHistoryDeleted bool `json:"run_history_deleted"`
+		Preserved         struct {
+			Runs                int `json:"runs"`
+			RunEvents           int `json:"run_events"`
+			RunEdges            int `json:"run_edges"`
+			Reports             int `json:"reports"`
+			LegacyImportRecords int `json:"legacy_import_records"`
+			LegacyImportStatus  int `json:"legacy_import_status"`
+		} `json:"preserved"`
+		Deleted struct {
+			Runs                int `json:"runs"`
+			RunEvents           int `json:"run_events"`
+			RunEdges            int `json:"run_edges"`
+			Reports             int `json:"reports"`
+			LegacyImportRecords int `json:"legacy_import_records"`
+			LegacyImportStatus  int `json:"legacy_import_status"`
+		} `json:"deleted"`
 	}
 	if err := json.Unmarshal(removeOut.Bytes(), &removed); err != nil {
 		t.Fatalf("remove JSON: %v\n%s", err, removeOut.String())
 	}
-	if !removed.Removed || removed.RunHistoryDeleted {
-		t.Fatalf("removed = %#v, want removed without run history deletion", removed)
+	if !removed.Removed || !removed.Detached || removed.ProjectDeleted || removed.RunHistoryDeleted {
+		t.Fatalf("removed = %#v, want detached without history deletion", removed)
+	}
+	if removed.Deleted != (struct {
+		Runs                int `json:"runs"`
+		RunEvents           int `json:"run_events"`
+		RunEdges            int `json:"run_edges"`
+		Reports             int `json:"reports"`
+		LegacyImportRecords int `json:"legacy_import_records"`
+		LegacyImportStatus  int `json:"legacy_import_status"`
+	}{}) {
+		t.Fatalf("removed deleted counts = %#v, want zero", removed.Deleted)
+	}
+
+	var listAfterRemoveOut, listAfterRemoveErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "list", "--format", "json"}, &listAfterRemoveOut, &listAfterRemoveErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("list after remove exit = %d stderr=%q", exitCode, listAfterRemoveErr.String())
+	}
+	var listAfterRemove struct {
+		Projects []struct {
+			ProjectID string `json:"project_id"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(listAfterRemoveOut.Bytes(), &listAfterRemove); err != nil {
+		t.Fatalf("list after remove JSON: %v\n%s", err, listAfterRemoveOut.String())
+	}
+	if len(listAfterRemove.Projects) != 0 {
+		t.Fatalf("list after remove = %#v, want no active projects", listAfterRemove)
+	}
+
+	var showAfterRemoveOut, showAfterRemoveErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "show", "--repo", repo, "--format", "json"}, &showAfterRemoveOut, &showAfterRemoveErr, Deps{})
+	if exitCode != 0 {
+		t.Fatalf("show after remove exit = %d stderr=%q", exitCode, showAfterRemoveErr.String())
+	}
+	var showAfterRemove struct {
+		Registered bool `json:"registered"`
+		Detached   bool `json:"detached"`
+		Project    struct {
+			ProjectID  string `json:"project_id"`
+			DetachedAt string `json:"detached_at"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(showAfterRemoveOut.Bytes(), &showAfterRemove); err != nil {
+		t.Fatalf("show after remove JSON: %v\n%s", err, showAfterRemoveOut.String())
+	}
+	if showAfterRemove.Registered || !showAfterRemove.Detached || showAfterRemove.Project.ProjectID != registered.Project.ProjectID || showAfterRemove.Project.DetachedAt == "" {
+		t.Fatalf("show after remove = %#v, want detached preserved project", showAfterRemove)
+	}
+
+	var reactivateOut, reactivateErr bytes.Buffer
+	exitCode = RunWithDeps([]string{"projects", "register", "--repo", repo, "--format", "json"}, &reactivateOut, &reactivateErr, Deps{
+		Now: fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("reactivate exit = %d stderr=%q", exitCode, reactivateErr.String())
+	}
+	var reactivated struct {
+		Updated     bool `json:"updated"`
+		Reactivated bool `json:"reactivated"`
+		Project     struct {
+			ProjectID  string `json:"project_id"`
+			DetachedAt string `json:"detached_at"`
+		} `json:"project"`
+	}
+	if err := json.Unmarshal(reactivateOut.Bytes(), &reactivated); err != nil {
+		t.Fatalf("reactivate JSON: %v\n%s", err, reactivateOut.String())
+	}
+	if !reactivated.Updated || !reactivated.Reactivated || reactivated.Project.ProjectID != registered.Project.ProjectID || reactivated.Project.DetachedAt != "" {
+		t.Fatalf("reactivated = %#v, want same active project", reactivated)
 	}
 }
 

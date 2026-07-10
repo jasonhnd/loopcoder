@@ -45,24 +45,41 @@ type Project struct {
 	IdentitySource      IdentitySource `json:"identity_source"`
 	CreatedAt           string         `json:"created_at,omitempty"`
 	UpdatedAt           string         `json:"updated_at,omitempty"`
+	DetachedAt          string         `json:"detached_at,omitempty"`
 }
 
 type RegisterResult struct {
-	Project Project `json:"project"`
-	Created bool    `json:"created"`
-	Updated bool    `json:"updated"`
+	Project     Project `json:"project"`
+	Created     bool    `json:"created"`
+	Updated     bool    `json:"updated"`
+	Reactivated bool    `json:"reactivated,omitempty"`
 }
 
 type ShowResult struct {
 	Registered bool      `json:"registered"`
+	Detached   bool      `json:"detached,omitempty"`
 	Project    Project   `json:"project"`
 	Conflicts  []Project `json:"conflicts,omitempty"`
 }
 
+type HistoryCounts struct {
+	Runs                int64 `json:"runs"`
+	RunEvents           int64 `json:"run_events"`
+	RunEdges            int64 `json:"run_edges"`
+	Reports             int64 `json:"reports"`
+	LegacyImportRecords int64 `json:"legacy_import_records"`
+	LegacyImportStatus  int64 `json:"legacy_import_status"`
+}
+
 type RemoveResult struct {
-	Removed           bool    `json:"removed"`
-	Project           Project `json:"project"`
-	RunHistoryDeleted bool    `json:"run_history_deleted"`
+	Removed           bool          `json:"removed"`
+	Detached          bool          `json:"detached"`
+	ProjectDeleted    bool          `json:"project_deleted"`
+	Project           Project       `json:"project"`
+	DetachedAt        string        `json:"detached_at,omitempty"`
+	RunHistoryDeleted bool          `json:"run_history_deleted"`
+	Deleted           HistoryCounts `json:"deleted"`
+	Preserved         HistoryCounts `json:"preserved"`
 }
 
 type Options struct {
@@ -117,12 +134,13 @@ func Register(ctx context.Context, opts Options, deps Deps) (RegisterResult, err
 			return err
 		}
 		if ok {
+			reactivated := strings.TrimSpace(existing.DetachedAt) != ""
 			project.CreatedAt = existing.CreatedAt
 			project.UpdatedAt = now
 			if err := updateProject(ctx, tx, project); err != nil {
 				return err
 			}
-			result = RegisterResult{Project: project, Updated: true}
+			result = RegisterResult{Project: project, Updated: true, Reactivated: reactivated}
 			return nil
 		}
 		project.CreatedAt = now
@@ -149,7 +167,7 @@ func List(ctx context.Context, opts Options, deps Deps) ([]Project, error) {
 
 	var projects []Project
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at FROM projects ORDER BY display_name, id`)
+		rows, err := tx.Query(ctx, `SELECT `+projectSelectColumns+` FROM projects WHERE detached_at = '' ORDER BY display_name, id`)
 		if err != nil {
 			return fmt.Errorf("list projects: %w", err)
 		}
@@ -193,7 +211,8 @@ func Show(ctx context.Context, opts Options, deps Deps) (ShowResult, error) {
 			return err
 		}
 		if ok {
-			result.Registered = true
+			result.Registered = strings.TrimSpace(existing.DetachedAt) == ""
+			result.Detached = strings.TrimSpace(existing.DetachedAt) != ""
 			result.Project = existing
 		}
 		return nil
@@ -216,7 +235,7 @@ func Remove(ctx context.Context, opts Options, deps Deps) (RemoveResult, error) 
 	}
 	defer store.Close()
 
-	result := RemoveResult{Project: project}
+	result := RemoveResult{Project: project, RunHistoryDeleted: false}
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
 		existing, ok, err := getProject(ctx, tx, project.ProjectID)
 		if err != nil {
@@ -225,12 +244,29 @@ func Remove(ctx context.Context, opts Options, deps Deps) (RemoveResult, error) 
 		if !ok {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM projects WHERE id = ?`, existing.ProjectID); err != nil {
+		result.Project = existing
+		if strings.TrimSpace(existing.DetachedAt) != "" {
+			result.Detached = true
+			result.DetachedAt = existing.DetachedAt
+			return nil
+		}
+		counts, err := historyCounts(ctx, tx, existing.ProjectID)
+		if err != nil {
+			return err
+		}
+		detachedAt := formatTimestamp(normalizeNow(opts.Now)())
+		if _, err := tx.Exec(ctx, `UPDATE projects SET detached_at = ?, updated_at = ? WHERE id = ?`, detachedAt, detachedAt, existing.ProjectID); err != nil {
 			return fmt.Errorf("remove project: %w", err)
 		}
+		existing.DetachedAt = detachedAt
+		existing.UpdatedAt = detachedAt
 		result.Project = existing
 		result.Removed = true
+		result.Detached = true
+		result.ProjectDeleted = false
+		result.DetachedAt = detachedAt
 		result.RunHistoryDeleted = false
+		result.Preserved = counts
 		return nil
 	})
 	if err != nil {
@@ -331,8 +367,10 @@ func databasePath(opts Options, deps Deps) (string, error) {
 	return layout.DatabasePath(), nil
 }
 
+const projectSelectColumns = `id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at`
+
 func getProject(ctx context.Context, tx storage.Tx, id string) (Project, bool, error) {
-	row := tx.QueryRow(ctx, `SELECT id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at FROM projects WHERE id = ?`, id)
+	row := tx.QueryRow(ctx, `SELECT `+projectSelectColumns+` FROM projects WHERE id = ?`, id)
 	project, err := scanProject(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Project{}, false, nil
@@ -347,7 +385,7 @@ func pathConflicts(ctx context.Context, tx storage.Tx, project Project) ([]Proje
 	if strings.TrimSpace(project.LocalPathCanonical) == "" {
 		return nil, nil
 	}
-	rows, err := tx.Query(ctx, `SELECT id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at FROM projects WHERE local_path_canonical = ? AND id <> ? ORDER BY id`, project.LocalPathCanonical, project.ProjectID)
+	rows, err := tx.Query(ctx, `SELECT `+projectSelectColumns+` FROM projects WHERE local_path_canonical = ? AND id <> ? ORDER BY id`, project.LocalPathCanonical, project.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("inspect project conflicts: %w", err)
 	}
@@ -365,8 +403,8 @@ func pathConflicts(ctx context.Context, tx storage.Tx, project Project) ([]Proje
 
 func insertProject(ctx context.Context, tx storage.Tx, project Project) error {
 	project = sanitizeProject(project)
-	_, err := tx.Exec(ctx, `INSERT INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		project.ProjectID, project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.CreatedAt, project.UpdatedAt)
+	_, err := tx.Exec(ctx, `INSERT INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		project.ProjectID, project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.CreatedAt, project.UpdatedAt, project.DetachedAt)
 	if err != nil {
 		return fmt.Errorf("insert project: %w", err)
 	}
@@ -375,12 +413,43 @@ func insertProject(ctx context.Context, tx storage.Tx, project Project) error {
 
 func updateProject(ctx context.Context, tx storage.Tx, project Project) error {
 	project = sanitizeProject(project)
-	_, err := tx.Exec(ctx, `UPDATE projects SET display_name = ?, local_path = ?, local_path_canonical = ?, git_root = ?, default_branch = ?, remote_url = ?, remote_url_normalized = ?, github_owner = ?, github_name = ?, identity_source = ?, updated_at = ? WHERE id = ?`,
-		project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.UpdatedAt, project.ProjectID)
+	_, err := tx.Exec(ctx, `UPDATE projects SET display_name = ?, local_path = ?, local_path_canonical = ?, git_root = ?, default_branch = ?, remote_url = ?, remote_url_normalized = ?, github_owner = ?, github_name = ?, identity_source = ?, updated_at = ?, detached_at = ? WHERE id = ?`,
+		project.DisplayName, project.LocalPath, project.LocalPathCanonical, project.GitRoot, project.DefaultBranch, project.RemoteURL, project.RemoteURLNormalized, project.GitHubOwner, project.GitHubName, string(project.IdentitySource), project.UpdatedAt, project.DetachedAt, project.ProjectID)
 	if err != nil {
 		return fmt.Errorf("update project: %w", err)
 	}
 	return nil
+}
+
+func historyCounts(ctx context.Context, tx storage.Tx, projectID string) (HistoryCounts, error) {
+	count := func(query string, args ...any) (int64, error) {
+		var value int64
+		if err := tx.QueryRow(ctx, query, args...).Scan(&value); err != nil {
+			return 0, err
+		}
+		return value, nil
+	}
+	var counts HistoryCounts
+	var err error
+	if counts.Runs, err = count(`SELECT COUNT(*) FROM runs WHERE project_id = ?`, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved runs: %w", err)
+	}
+	if counts.RunEvents, err = count(`SELECT COUNT(*) FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)`, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved run events: %w", err)
+	}
+	if counts.RunEdges, err = count(`SELECT COUNT(*) FROM run_edges WHERE parent_run_id IN (SELECT id FROM runs WHERE project_id = ?) OR child_run_id IN (SELECT id FROM runs WHERE project_id = ?)`, projectID, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved run edges: %w", err)
+	}
+	if counts.Reports, err = count(`SELECT COUNT(DISTINCT id) FROM reports WHERE project_id = ? OR run_id IN (SELECT id FROM runs WHERE project_id = ?)`, projectID, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved reports: %w", err)
+	}
+	if counts.LegacyImportRecords, err = count(`SELECT COUNT(*) FROM legacy_import_records WHERE project_id = ?`, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved legacy import records: %w", err)
+	}
+	if counts.LegacyImportStatus, err = count(`SELECT COUNT(*) FROM legacy_import_status WHERE project_id = ?`, projectID); err != nil {
+		return HistoryCounts{}, fmt.Errorf("count preserved legacy import status: %w", err)
+	}
+	return counts, nil
 }
 
 type projectScanner interface {
@@ -404,6 +473,7 @@ func scanProject(scanner projectScanner) (Project, error) {
 		&source,
 		&project.CreatedAt,
 		&project.UpdatedAt,
+		&project.DetachedAt,
 	); err != nil {
 		return Project{}, err
 	}

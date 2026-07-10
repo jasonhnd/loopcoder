@@ -110,10 +110,57 @@ func TestOpenMigratesProjectIdentityColumns(t *testing.T) {
 	if health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, CurrentSchemaVersion)
 	}
-	for _, column := range []string{"local_path_canonical", "git_root", "remote_url_normalized", "identity_source"} {
+	for _, column := range []string{"local_path_canonical", "git_root", "remote_url_normalized", "identity_source", "detached_at"} {
 		if !projectColumnExists(t, store, column) {
 			t.Fatalf("missing migrated projects column %s", column)
 		}
+	}
+}
+
+func TestOpenMigratesLegacyImportForeignKeysWithoutCascades(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV3Schema(t, raw)
+	for _, statement := range []string{
+		`INSERT INTO migrations(version, name, applied_at) VALUES (4, 'scrub project remote urls', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at) VALUES ('project-1', '/repo', '/repo', 'repo', 'local-path', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO legacy_import_records(id, project_id, record_type, source_path, source_hash, imported_at) VALUES ('record-1', 'project-1', 'event', '.loopcoder/runs/r/events.jsonl', 'hash', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO legacy_import_status(project_id, repo_path, started_at, completed_at, status) VALUES ('project-1', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'completed')`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec cascade fixture statement: %v\n%s", err, statement)
+		}
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	var recordCount, statusCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM legacy_import_records WHERE project_id = 'project-1'`).Scan(&recordCount); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM legacy_import_status WHERE project_id = 'project-1'`).Scan(&statusCount); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM projects WHERE id = 'project-1'`)
+		if err == nil {
+			return errors.New("project delete succeeded; legacy import foreign keys still cascade or do not restrict")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify migrated legacy import rows: %v", err)
+	}
+	if recordCount != 1 || statusCount != 1 {
+		t.Fatalf("legacy rows after migration = records:%d status:%d, want 1/1", recordCount, statusCount)
+	}
+	if tableSQLContains(t, store, "legacy_import_records", "ON DELETE CASCADE") || tableSQLContains(t, store, "legacy_import_status", "ON DELETE CASCADE") {
+		t.Fatalf("legacy import schema still contains ON DELETE CASCADE")
 	}
 }
 
@@ -347,6 +394,17 @@ func projectColumnExists(t *testing.T, store Store, column string) bool {
 		t.Fatalf("query projects columns: %v", err)
 	}
 	return found
+}
+
+func tableSQLContains(t *testing.T, store Store, table, fragment string) bool {
+	t.Helper()
+	var sqlText string
+	if err := store.WithTx(context.Background(), func(tx Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&sqlText)
+	}); err != nil {
+		t.Fatalf("query table SQL for %s: %v", table, err)
+	}
+	return strings.Contains(sqlText, fragment)
 }
 
 func createRawDB(t *testing.T, path string) *sql.DB {
