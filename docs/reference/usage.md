@@ -924,8 +924,12 @@ strictly validates child keys, dependencies, depth, fan-out, declared scope,
 permission, and aggregation policy before launching child work. It persists the
 accepted plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`,
 then schedules ready children with dependency-aware fan-out/fan-in. Re-running
-the same plan resumes from durable child attempt records and does not dispatch a
-child whose run already has a terminal attempt.
+the same `plan_id` first resolves child identity from the durable SQL
+`(plan_id, child_key)` edge: succeeded children are reported as `reused`,
+queued/running/interrupted children are `resumed`, failed/cancelled/timed-out
+children are retried under the same child `run_id`, and `needs-human` children
+are blocked for human action. A changed plan body under an existing `plan_id`
+fails closed; use a new `plan_id` for a real plan revision.
 
 For production providers, loopcoder launches write-capable child runs through
 the existing Worker dispatch adapter path. That means `codex` and `claude`
