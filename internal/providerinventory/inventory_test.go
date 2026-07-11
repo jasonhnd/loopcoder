@@ -213,8 +213,8 @@ func TestDiscoverProbeTimeoutAndSecretRedaction(t *testing.T) {
 			t.Fatalf("probe bounds exceeded: %#v", req)
 		}
 		return ProbeExecutionResult{
-			Stdout:   "custom sk-testsecret1234567890",
-			Stderr:   "Bearer abcdefghijklmnopqrstuvwxyz",
+			Stdout:   "custom " + "sk-" + strings.Repeat("t", 20),
+			Stderr:   "Bearer " + strings.Repeat("a", 26),
 			ExitCode: 1,
 			TimedOut: true,
 			Killed:   true,
@@ -265,6 +265,10 @@ func TestDiscoverRedactsAdversarialProviderOutputBeforePersistence(t *testing.T)
 		return ""
 	}
 	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		anthropicKey := "sk-ant-" + strings.Repeat("r", 24)
+		awsSecret := "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
+		jsonKey := strings.Repeat("a", 26) + strings.Repeat("B", 6) + strings.Repeat("1", 10)
+		awsAccessKey := "AKIA" + strings.Repeat("A", 16)
 		for _, entry := range req.Env {
 			if strings.HasPrefix(entry, "ANTHROPIC_API_KEY=") || strings.HasPrefix(entry, "AWS_SECRET_ACCESS_KEY=") {
 				t.Fatalf("credential env reached probe: %q", entry)
@@ -272,10 +276,10 @@ func TestDiscoverRedactsAdversarialProviderOutputBeforePersistence(t *testing.T)
 		}
 		return ProbeExecutionResult{
 			Stdout: strings.Join([]string{
-				"ANTHROPIC_API_KEY=sk-ant-redactedredactedredacted",
-				"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-				`{"api_key":"abcdefghijklmnopqrstuvwxyzABCDEF1234567890"}`,
-				"access AKIAABCDEFGHIJKLMNOP",
+				"ANTHROPIC_API_KEY=" + anthropicKey,
+				"AWS_SECRET_ACCESS_KEY=" + awsSecret,
+				`{"api_key":"` + jsonKey + `"}`,
+				"access " + awsAccessKey,
 			}, "\n"),
 			ExitCode: 0,
 		}, nil
@@ -301,7 +305,7 @@ func TestDiscoverRedactsAdversarialProviderOutputBeforePersistence(t *testing.T)
 			summary += probe.StdoutSummary + probe.StderrSummary
 		}
 	}
-	for _, notWant := range []string{"sk-ant-", "wJalrXUtn", "abcdefghijklmnopqrstuvwxyzABCDEF", "AKIAABCDEFGHIJKLMNOP"} {
+	for _, notWant := range []string{"sk-ant-", "wJalrXUtn", strings.Repeat("a", 26) + strings.Repeat("B", 6), "AKIA" + strings.Repeat("A", 16)} {
 		if strings.Contains(summary, notWant) {
 			t.Fatalf("persisted probe summary retained secret %q: %s", notWant, summary)
 		}
@@ -503,7 +507,7 @@ func TestRedactionKeepsPowerShellErrorIdentifiers(t *testing.T) {
 	if findings != 0 || strings.Contains(output, "[REDACTED]") {
 		t.Fatalf("redacted PowerShell error identifier: findings=%d output=%q", findings, output)
 	}
-	secretOutput, secretFindings := redactProviderOutput(`{"api_key":"abcdefghijklmnopqrstuvwxyzABCDEF1234567890"}`)
+	secretOutput, secretFindings := redactProviderOutput(`{"api_key":"` + strings.Repeat("a", 26) + strings.Repeat("B", 6) + strings.Repeat("1", 10) + `"}`)
 	if secretFindings == 0 || strings.Contains(secretOutput, "abcdefghijklmnopqrstuvwxyzABCDEF") {
 		t.Fatalf("failed to redact opaque key/value secret: findings=%d output=%q", secretFindings, secretOutput)
 	}
@@ -575,6 +579,196 @@ func TestDiscoverDistinguishesInstalledUnusableFromProbeFailed(t *testing.T) {
 	customProbe = onlyCustomProbe(t, report)
 	if customProbe.Outcome != OutcomeProbeFailed {
 		t.Fatalf("infrastructure failure outcome = %q, want probe-failed", customProbe.Outcome)
+	}
+}
+
+func TestDiscoverSkipsNetworkDeclaredAuthProbeByDefault(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("agy"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "agy 1.0.0"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	calls := 0
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		calls++
+		if len(req.Argv) > 1 && req.Argv[1] == "models" {
+			t.Fatalf("network-declared auth probe executed by default: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{Stdout: "agy 1.0.0\n", ExitCode: 0}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "antigravity"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("RunProbe calls = %d, want only version probe", calls)
+	}
+	authProbe := findProbe(t, report, "antigravity", "auth-readiness")
+	if !authProbe.NetworkDeclared || authProbe.NetworkPermission != NetworkDenied {
+		t.Fatalf("auth probe network = declared %v permission %q, want true denied", authProbe.NetworkDeclared, authProbe.NetworkPermission)
+	}
+	if !contains(authProbe.GapReasons, "network-permission-denied") {
+		t.Fatalf("auth probe gaps = %#v, want network-permission-denied", authProbe.GapReasons)
+	}
+	if len(report.AuthReadiness) != 1 || report.AuthReadiness[0].ReadinessState != ReadinessUnknown || !contains(report.AuthReadiness[0].GapReasons, "network-permission-denied") {
+		t.Fatalf("auth readiness = %#v, want unknown network denied", report.AuthReadiness)
+	}
+}
+
+func TestAuthReadinessExpiredRefreshLoadRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("custom"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "custom 1.0.0"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	report, err := Discover(ctx, Options{Config: config.Config{Adapters: config.Adapters{Worker: "custom"}}, Now: fixedInventoryNow}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	installation := onlyCustomInstallation(t, report)
+	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", ExecutableNames: []string{"custom"}, AuthProbeCommand: []string{"custom", "auth", "status"}}
+	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
+		return ProbeExecutionResult{Stdout: "profile alice expired refresh required\n", ExitCode: 0}, nil
+	}
+	profiles, readiness, authProbe := inspectAuthReadiness(ctx, adapter, candidate{path: exe, source: DiscoveryPath}, installation.ProviderInstallationID, fixedInventoryNow(), deps)
+	report.AccountProfiles = profiles
+	report.AuthReadiness = readiness
+	report.ProbeResults = append(report.ProbeResults, *authProbe)
+
+	if err := Refresh(ctx, store, report, fixedInventoryNow()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	loaded, err := Load(ctx, store)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.AccountProfiles) != 1 || loaded.AccountProfiles[0].ProfileDisplay != "alice" {
+		t.Fatalf("loaded profiles = %#v, want alice profile", loaded.AccountProfiles)
+	}
+	if len(loaded.AuthReadiness) < 1 {
+		t.Fatalf("loaded auth readiness empty")
+	}
+	foundExpired := false
+	for _, item := range loaded.AuthReadiness {
+		if item.AdapterID == "custom" && item.ReadinessState == ReadinessExpired && item.RefreshRequired {
+			foundExpired = true
+		}
+	}
+	if !foundExpired {
+		t.Fatalf("loaded auth readiness = %#v, want expired refresh-required custom record", loaded.AuthReadiness)
+	}
+}
+
+func TestAuthProbeTimeoutYieldsUnknownReadiness(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("custom"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, nil)
+	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
+		return ProbeExecutionResult{ExitCode: -1, TimedOut: true, Killed: true}, nil
+	}
+	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", ExecutableNames: []string{"custom"}, AuthProbeCommand: []string{"custom", "auth", "status"}}
+	_, readiness, probe := inspectAuthReadiness(context.Background(), adapter, candidate{path: exe, source: DiscoveryPath}, "pinst_custom", fixedInventoryNow(), deps)
+	if probe == nil || !probe.TimedOut || probe.TerminalErrorCode != "ErrAuthProbeTimeout" {
+		t.Fatalf("auth probe = %#v, want timeout terminal error", probe)
+	}
+	if len(readiness) != 1 || readiness[0].ReadinessState != ReadinessUnknown || !contains(readiness[0].GapReasons, "auth-probe-timeout") {
+		t.Fatalf("readiness = %#v, want unknown timeout", readiness)
+	}
+}
+
+func TestInaccessibleAuthArtifactYieldsTypedUnknown(t *testing.T) {
+	deps := fakeDeps(t, nil)
+	deps.Lstat = func(string) (os.FileInfo, error) {
+		return nil, os.ErrPermission
+	}
+	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", AuthArtifactPaths: []string{filepath.Join(t.TempDir(), "auth.json")}}
+	_, readiness, _ := inspectAuthReadiness(context.Background(), adapter, candidate{}, "pinst_custom", fixedInventoryNow(), deps)
+	if len(readiness) != 1 {
+		t.Fatalf("readiness count = %d, want 1", len(readiness))
+	}
+	if readiness[0].ReadinessState != ReadinessUnknown || readiness[0].TerminalErrorCode != "ErrAuthArtifactInaccessible" || !contains(readiness[0].GapReasons, "auth-artifact-inaccessible") {
+		t.Fatalf("readiness = %#v, want typed inaccessible unknown", readiness[0])
+	}
+}
+
+func TestTextAuthParserUsesAllowlistedDisplayAndHashedReference(t *testing.T) {
+	raw := "authenticated as jane.doe@example.com"
+	parsed := parseTextAuthStatus("custom", raw)
+	if len(parsed) != 1 {
+		t.Fatalf("parsed count = %d, want 1", len(parsed))
+	}
+	if parsed[0].Display != "j***@example.com" {
+		t.Fatalf("display = %q, want redacted email", parsed[0].Display)
+	}
+	if strings.Contains(parsed[0].ReferenceHash, "jane") || parsed[0].ReferenceHash == raw {
+		t.Fatalf("reference hash retained raw line: %#v", parsed[0])
+	}
+	unknown := parseTextAuthStatus("custom", "ready $$$")
+	if len(unknown) != 1 || !strings.HasPrefix(unknown[0].Display, "profile-") {
+		t.Fatalf("unknown display = %#v, want profile suffix", unknown)
+	}
+	unstructured := parseTextAuthStatus("custom", "ready bob")
+	if len(unstructured) != 1 || !strings.HasPrefix(unstructured[0].Display, "profile-") {
+		t.Fatalf("unstructured display = %#v, want profile suffix", unstructured)
+	}
+}
+
+func TestProfileSelectionPolicyUsesOpaqueAccountID(t *testing.T) {
+	parsed := parseTextAuthStatus("custom", strings.Join([]string{
+		"profile alice ready",
+		"profile bob ready",
+	}, "\n"))
+	if len(parsed) != 2 {
+		t.Fatalf("parsed = %#v, want two profiles", parsed)
+	}
+	selectedID := accountProfileID("custom", string(ProfileSourceStatusCommand), parsed[1].ReferenceHash)
+	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", SelectedAccountProfileID: selectedID}
+	profiles, _ := authRecordsFromParsed(adapter, "pinst_custom", parsed, fixedInventoryNow())
+	if len(profiles) != 2 {
+		t.Fatalf("profiles = %#v, want two", profiles)
+	}
+	states := map[string]SelectionState{}
+	for _, profile := range profiles {
+		states[profile.AccountProfileID] = profile.SelectionState
+	}
+	if states[selectedID] != SelectionExplicit {
+		t.Fatalf("selected profile state = %q, want explicit", states[selectedID])
+	}
+	for _, profile := range profiles {
+		if profile.AccountProfileID != selectedID && profile.SelectionState != SelectionSuperseded {
+			t.Fatalf("unselected profile = %#v, want superseded", profile)
+		}
+	}
+}
+
+func TestParsedFieldsSetterRedactsStructurally(t *testing.T) {
+	var probe ProbeResult
+	secret := "sk-" + strings.Repeat("x", 20)
+	probe.setParsedFields(map[string]string{"token_hint": secret})
+	if strings.Contains(probe.ParsedFields["token_hint"], secret) || !strings.Contains(probe.ParsedFields["token_hint"], "[REDACTED]") {
+		t.Fatalf("parsed fields not redacted: %#v", probe.ParsedFields)
 	}
 }
 
@@ -748,6 +942,26 @@ func onlyCustomProbe(t *testing.T, report Report) ProbeResult {
 	}
 	t.Fatalf("custom probe missing in %#v", report.ProbeResults)
 	return ProbeResult{}
+}
+
+func findProbe(t *testing.T, report Report, adapterID, kind string) ProbeResult {
+	t.Helper()
+	for _, probe := range report.ProbeResults {
+		if probe.AdapterID == adapterID && probe.ProbeKind == kind {
+			return probe
+		}
+	}
+	t.Fatalf("%s %s probe missing in %#v", adapterID, kind, report.ProbeResults)
+	return ProbeResult{}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func stableProbeIDs() func() string {

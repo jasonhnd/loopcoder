@@ -316,7 +316,7 @@ for an account profile, installation, or adapter when no profile is known.
 | `evidence_kind` | yes | `exit-code`, `sanctioned-status-command`, `machine-readable-status`, `file-existence`, `environment-name-existence`, `provider-error-class`, `unsupported`, or `not-run`. |
 | `authorization_scope_state` | yes | `all-known`, `partial`, `unknown`, or `not-applicable`. |
 | `authorization_scope_summary` | no | Bounded non-secret summary such as "profile can list models" or "model authorization unknown". |
-| `expires_at` | no | Provider-declared auth expiry when exposed without credential access. |
+| `expires_at` | no | Provider-declared auth expiry when exposed without credential access. The initial #726 implementation intentionally omits this field from Go structs and SQLite payloads because no current adapter exposes a credential-blind machine-readable expiry value. |
 | `refresh_required` | yes | Whether evidence says the provider requires login or refresh; this never triggers refresh automatically. |
 | `unsupported_reason` | no | Required when readiness is unknown because the adapter lacks a safe readiness mechanism. |
 

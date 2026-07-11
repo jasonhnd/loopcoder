@@ -56,15 +56,25 @@ try to automate provider authentication.
 
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation
-inventory in machine-local SQLite. ProviderInstallation and ProbeResult records
-show discovery source, redacted executable provenance, captured time,
-freshness, confidence, probe outcome, output bounds, and
-`usable_for_invocation: "unknown"` from installation evidence alone.
+and auth-readiness inventory in machine-local SQLite. ProviderInstallation,
+ProbeResult, AccountProfile, and AuthReadiness records show discovery source,
+redacted executable/profile provenance, captured time, freshness, confidence,
+probe outcome, output bounds, and `usable_for_invocation: "unknown"` from
+installation evidence alone.
 Provider installation probes pass only a bounded environment allowlist for
 location and platform facts; script shims may receive variables such as
 `LOCALAPPDATA`, `APPDATA`, `SystemRoot`, `ComSpec`, `PATH`, `PATHEXT`, `TMPDIR`,
 `LANG`, and `LC_ALL`, but credential-like variable names are denied regardless
 of allowlist membership.
+
+Auth readiness probes are credential-blind. Unsupported providers emit
+`readiness_state: "unknown"` with an explicit reason. A runtime-declared
+network auth probe is skipped unless a future permission path grants network
+access; today Antigravity's `agy models` is recorded with
+`network_declared: true`, `network_permission: "denied"`, and
+`network-permission-denied`. No current adapter exposes a safe
+machine-readable expiry value, so the implementation does not emit or persist
+an `expires_at` field.
 
 Support levels:
 

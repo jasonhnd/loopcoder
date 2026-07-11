@@ -44,6 +44,7 @@ type ProviderRuntime struct {
 	Cancellation           bool
 	TokenUsageReporting    bool
 	AuthProbeCommand       []string
+	MayNetwork             bool
 	KnownLimitations       []string
 	UnsupportedSuggestions map[ProviderCapability]string
 }
@@ -462,6 +463,7 @@ var staticContract = Contract{
 				"agy",
 				"models",
 			},
+			MayNetwork: true,
 			KnownLimitations: []string{
 				"read-only mode is not available or verified",
 				"MCP configuration injection is not implemented",

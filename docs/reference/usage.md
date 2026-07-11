@@ -667,18 +667,37 @@ this version.
 ```
 
 `loopcoder providers refresh --repo .` explicitly persists the same
-ProviderInstallation and ProbeResult inventory to the machine-local SQLite
-store. Refreshes append immutable probe history and mark disappeared
-installations stale instead of deleting them. Probe output is bounded and
-redacted, raw absolute paths are redacted in JSON/human output, and command
-execution uses fixed argv arrays, no shell interpolation, and an explicit
-non-credential environment allowlist. The allowlist carries location and
-platform variables required by provider script shims, including Windows
+ProviderInstallation, ProbeResult, AccountProfile, and AuthReadiness inventory
+to the machine-local SQLite store. Refreshes append immutable probe history and
+mark disappeared installations stale instead of deleting them. Probe output is
+bounded and redacted, raw absolute paths and profile references are redacted or
+hashed in JSON/human output, and command execution uses fixed argv arrays, no
+shell interpolation, and an explicit non-credential environment allowlist. The
+allowlist carries location and platform variables required by provider script
+shims, including Windows
 `LOCALAPPDATA`, `APPDATA`, `ProgramData`, `ProgramFiles`, `SystemRoot`,
 `ComSpec`, `PSModulePath`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `HOME`,
 `USERPROFILE`, `OS`, `PROCESSOR_ARCHITECTURE`, and Unix `TMPDIR`, `LANG`, and
 `LC_ALL`. A denylist still removes any variable whose name contains `key`,
 `secret`, `token`, `password`, `credential`, or `auth`.
+
+Auth readiness is independent of installation. Provider-supported readiness
+commands may produce `ready`, `not-authenticated`, `expired`, or `unknown`;
+unsupported providers return `unknown` with `auth-readiness-unsupported`.
+Readiness records can reference multiple credential-blind account profiles,
+using deterministic `acct_` IDs from the adapter, source, and reference hash.
+Profile displays are built only from allowlisted status structure such as a
+redacted email or short handle after a marker like `profile` or `as`; otherwise
+they fall back to `profile-<hash>`. If displays collide, policy must select the
+opaque account profile ID rather than display text. The implementation does not
+emit `expires_at` today because no current adapter exposes a credential-blind
+machine-readable expiry field.
+
+Network-declared auth probes are skipped by default. For example,
+Antigravity's `agy models` auth probe is persisted as an auth-readiness
+ProbeResult with `network_declared: true`, `network_permission: "denied"`, and
+`gap_reasons: ["network-permission-denied"]`; the matching AuthReadiness record
+is `unknown` and no network I/O is attempted.
 
 Operators can add explicit executable locations without scanning a disk:
 
@@ -687,10 +706,14 @@ provider_inventory:
   executables:
     custom-provider:
       - /opt/custom-provider/bin/custom-provider
+  profile_selection:
+    custom-provider: acct_abcdefghijklmnopqrstuvwxyz123456
 ```
 
 Those paths are checked before PATH entries and rendered with
-`discovery_source: "explicit-config"` and redacted path output.
+`discovery_source: "explicit-config"` and redacted path output. Profile
+selection pins use opaque `acct_` IDs from prior inventory output; they are not
+display labels and do not copy provider config.
 
 `loopcoder status --repo . --format json` includes `inventory_refs`, not full
 raw inventory. Until a DeliveryRun binds inventory records, the arrays are empty
@@ -807,8 +830,9 @@ loopcoder doctor --repo .
 
 When the configured Worker or Verifier provider is `antigravity`, `doctor`
 and `providers refresh` look for executable `agy` through bounded installation
-probes only. Auth readiness is not inferred from installation evidence in this
-slice. The Antigravity Worker invocation uses this argv shape after
+probes and then record the declared network auth probe as skipped by default.
+Auth readiness is never inferred from installation evidence. The Antigravity
+Worker invocation uses this argv shape after
 registry/default resolution:
 
 ```text

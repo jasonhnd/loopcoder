@@ -453,10 +453,10 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 		report.ProbeResults = []providerinventory.ProbeResult{}
 	}
 	if report.AccountProfiles == nil {
-		report.AccountProfiles = []any{}
+		report.AccountProfiles = []providerinventory.AccountProfile{}
 	}
 	if report.AuthReadiness == nil {
-		report.AuthReadiness = []any{}
+		report.AuthReadiness = []providerinventory.AuthReadiness{}
 	}
 	if report.ModelCatalogSnapshots == nil {
 		report.ModelCatalogSnapshots = []any{}
