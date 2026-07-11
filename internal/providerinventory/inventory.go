@@ -533,10 +533,13 @@ type EvidenceSummary struct {
 
 type AdapterDeclaration struct {
 	AdapterID                  string
+	AdapterVersion             string
+	DeclarationSchemaVersion   string
 	DisplayName                string
 	Vendor                     string
 	ExecutableNames            []string
 	VersionArgv                []string
+	ConformanceVersion         string
 	AuthProbeCommand           []string
 	AuthProbeParser            string
 	AuthProbeMayNetwork        bool
@@ -546,6 +549,7 @@ type AdapterDeclaration struct {
 	CatalogProbeCommand        []string
 	CatalogProbeParser         string
 	CatalogProbeMayNetwork     bool
+	StaticCatalogEntries       []CatalogInputEntry
 	SelectedAccountProfileID   string
 	KnownLimitations           []string
 	MayNetwork                 bool
@@ -554,9 +558,10 @@ type AdapterDeclaration struct {
 }
 
 type Options struct {
-	RepoPath string
-	Config   config.Config
-	Now      func() time.Time
+	RepoPath        string
+	Config          config.Config
+	RuntimeContract runtimecap.Contract
+	Now             func() time.Time
 }
 
 type Deps struct {
@@ -620,7 +625,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	}
 	deps = normalizeDeps(deps)
 	now := normalizeNow(opts.Now)().UTC()
-	adapters := adapterDeclarations(opts.Config)
+	contract := normalizeRuntimeContract(opts.RuntimeContract)
+	if violations := contract.InvariantViolations(); len(violations) > 0 {
+		return Report{}, fmt.Errorf("%w: runtime capability contract: %s", ErrInvalidRecord, strings.Join(violations, "; "))
+	}
+	adapters, err := adapterDeclarations(opts.Config, contract)
+	if err != nil {
+		return Report{}, err
+	}
 	var installations []ProviderInstallation
 	var probes []ProbeResult
 	var accountProfiles []AccountProfile
@@ -1835,19 +1847,24 @@ func baseProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult
 	return probe
 }
 
-func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
+func adapterDeclarations(cfg config.Config, contract runtimecap.Contract) ([]AdapterDeclaration, error) {
 	byID := map[string]AdapterDeclaration{}
-	for _, provider := range runtimecap.DefaultContract().Providers {
+	for _, provider := range contract.Providers {
 		byID[provider.Name] = declarationFromRuntime(provider)
 	}
 	for _, provider := range models.DefaultRegistry().Providers {
 		decl := byID[provider.Name]
 		if decl.AdapterID == "" {
 			decl.AdapterID = provider.Name
+			decl.AdapterVersion = AdapterVersion
+			decl.DeclarationSchemaVersion = AdapterDeclarationSchema
+			decl.ConformanceVersion = "loopcoder.adapter_conformance.v1"
 			decl.DisplayName = provider.DisplayName
 			decl.Vendor = provider.Vendor
 			decl.ExecutableNames = []string{firstNonEmpty(provider.CLI, provider.Name)}
 			decl.VersionArgv = []string{"--version"}
+			decl.AuthUnsupportedReason = "adapter declares no credential-blind auth readiness mechanism"
+			decl.KnownLimitations = []string{"adapter has installation discovery and static catalog only; auth readiness is unknown"}
 		}
 		if decl.DisplayName == "" {
 			decl.DisplayName = provider.DisplayName
@@ -1859,12 +1876,16 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 			continue
 		}
 		byID[provider] = AdapterDeclaration{
-			AdapterID:        provider,
-			DisplayName:      provider,
-			Vendor:           "custom",
-			ExecutableNames:  []string{provider},
-			VersionArgv:      []string{"--version"},
-			KnownLimitations: []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
+			AdapterID:                provider,
+			AdapterVersion:           AdapterVersion,
+			DeclarationSchemaVersion: AdapterDeclarationSchema,
+			ConformanceVersion:       "loopcoder.adapter_conformance.v1",
+			DisplayName:              provider,
+			Vendor:                   "custom",
+			ExecutableNames:          []string{provider},
+			VersionArgv:              []string{"--version"},
+			AuthUnsupportedReason:    "custom adapter declares no credential-blind auth readiness mechanism",
+			KnownLimitations:         []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
 		}
 	}
 	for adapterID, paths := range cfg.ProviderInventory.Executables {
@@ -1875,12 +1896,16 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 		decl := byID[adapterID]
 		if decl.AdapterID == "" {
 			decl = AdapterDeclaration{
-				AdapterID:        adapterID,
-				DisplayName:      adapterID,
-				Vendor:           "custom",
-				ExecutableNames:  []string{adapterID},
-				VersionArgv:      []string{"--version"},
-				KnownLimitations: []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
+				AdapterID:                adapterID,
+				AdapterVersion:           AdapterVersion,
+				DeclarationSchemaVersion: AdapterDeclarationSchema,
+				ConformanceVersion:       "loopcoder.adapter_conformance.v1",
+				DisplayName:              adapterID,
+				Vendor:                   "custom",
+				ExecutableNames:          []string{adapterID},
+				VersionArgv:              []string{"--version"},
+				AuthUnsupportedReason:    "custom adapter declares no credential-blind auth readiness mechanism",
+				KnownLimitations:         []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
 			}
 		}
 		decl.ExplicitPaths = append(decl.ExplicitPaths, paths...)
@@ -1894,12 +1919,16 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 		decl := byID[adapterID]
 		if decl.AdapterID == "" {
 			decl = AdapterDeclaration{
-				AdapterID:        adapterID,
-				DisplayName:      adapterID,
-				Vendor:           "custom",
-				ExecutableNames:  []string{adapterID},
-				VersionArgv:      []string{"--version"},
-				KnownLimitations: []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
+				AdapterID:                adapterID,
+				AdapterVersion:           AdapterVersion,
+				DeclarationSchemaVersion: AdapterDeclarationSchema,
+				ConformanceVersion:       "loopcoder.adapter_conformance.v1",
+				DisplayName:              adapterID,
+				Vendor:                   "custom",
+				ExecutableNames:          []string{adapterID},
+				VersionArgv:              []string{"--version"},
+				AuthUnsupportedReason:    "custom adapter declares no credential-blind auth readiness mechanism",
+				KnownLimitations:         []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
 			}
 		}
 		decl.SelectedAccountProfileID = strings.TrimSpace(accountProfileID)
@@ -1907,41 +1936,198 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 	}
 	out := make([]AdapterDeclaration, 0, len(byID))
 	for _, decl := range byID {
-		if len(decl.VersionArgv) == 0 {
-			decl.VersionArgv = []string{"--version"}
+		decl = normalizeAdapterDeclaration(decl)
+		if violations := ValidateAdapterDeclaration(decl); len(violations) > 0 {
+			return nil, fmt.Errorf("%w: adapter declaration %q: %s", ErrInvalidRecord, decl.AdapterID, strings.Join(violations, "; "))
 		}
 		out = append(out, decl)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].AdapterID < out[j].AdapterID })
-	return out
+	return out, nil
 }
 
 func declarationFromRuntime(provider runtimecap.ProviderRuntime) AdapterDeclaration {
-	display := provider.Name
+	display := firstNonEmpty(provider.DisplayName, provider.Name)
 	if modelProvider, ok := models.LookupProvider(provider.Name); ok {
 		display = firstNonEmpty(modelProvider.DisplayName, provider.Name)
 	}
 	decl := AdapterDeclaration{
-		AdapterID:             provider.Name,
-		DisplayName:           display,
-		Vendor:                provider.Name,
-		ExecutableNames:       []string{provider.Executable},
-		VersionArgv:           []string{"--version"},
-		AuthProbeCommand:      append([]string(nil), provider.AuthProbeCommand...),
-		AuthProbeParser:       provider.AuthProbeParser,
-		AuthProbeMayNetwork:   provider.MayNetwork,
-		AuthArtifactPaths:     append([]string(nil), provider.AuthArtifactPaths...),
-		AuthEnvironmentNames:  append([]string(nil), provider.AuthEnvironmentNames...),
-		AuthUnsupportedReason: provider.AuthUnsupportedReason,
-		MayNetwork:            provider.MayNetwork,
-		KnownLimitations:      append([]string(nil), provider.KnownLimitations...),
-	}
-	if provider.Name == "antigravity" {
-		decl.CatalogProbeCommand = []string{"agy", "models"}
-		decl.CatalogProbeParser = "agy-models"
-		decl.CatalogProbeMayNetwork = true
+		AdapterID:                provider.Name,
+		AdapterVersion:           firstNonEmpty(provider.AdapterVersion, AdapterVersion),
+		DeclarationSchemaVersion: firstNonEmpty(provider.DeclarationSchemaVersion, AdapterDeclarationSchema),
+		ConformanceVersion:       firstNonEmpty(provider.ConformanceVersion, "loopcoder.adapter_conformance.v1"),
+		DisplayName:              display,
+		Vendor:                   firstNonEmpty(provider.Vendor, provider.Name),
+		ExecutableNames:          []string{provider.Executable},
+		VersionArgv:              append([]string(nil), provider.VersionArgv...),
+		AuthProbeCommand:         append([]string(nil), provider.AuthProbeCommand...),
+		AuthProbeParser:          provider.AuthProbeParser,
+		AuthProbeMayNetwork:      provider.MayNetwork,
+		AuthArtifactPaths:        append([]string(nil), provider.AuthArtifactPaths...),
+		AuthEnvironmentNames:     append([]string(nil), provider.AuthEnvironmentNames...),
+		AuthUnsupportedReason:    provider.AuthUnsupportedReason,
+		CatalogProbeCommand:      append([]string(nil), provider.CatalogProbeCommand...),
+		CatalogProbeParser:       provider.CatalogProbeParser,
+		CatalogProbeMayNetwork:   provider.CatalogProbeMayNetwork,
+		StaticCatalogEntries:     catalogEntriesFromRuntime(provider.StaticModelCatalog),
+		MayNetwork:               provider.MayNetwork,
+		KnownLimitations:         append([]string(nil), provider.KnownLimitations...),
 	}
 	return decl
+}
+
+func normalizeRuntimeContract(contract runtimecap.Contract) runtimecap.Contract {
+	defaultContract := runtimecap.DefaultContract()
+	if len(contract.Providers) == 0 && len(contract.Hosts) == 0 {
+		return defaultContract
+	}
+	if len(contract.Hosts) == 0 {
+		contract.Hosts = defaultContract.Hosts
+	}
+	return contract
+}
+
+func normalizeAdapterDeclaration(decl AdapterDeclaration) AdapterDeclaration {
+	decl.AdapterID = strings.TrimSpace(decl.AdapterID)
+	if decl.AdapterVersion == "" {
+		decl.AdapterVersion = AdapterVersion
+	}
+	if decl.DeclarationSchemaVersion == "" {
+		decl.DeclarationSchemaVersion = AdapterDeclarationSchema
+	}
+	if decl.ConformanceVersion == "" {
+		decl.ConformanceVersion = "loopcoder.adapter_conformance.v1"
+	}
+	if decl.DisplayName == "" {
+		decl.DisplayName = decl.AdapterID
+	}
+	if decl.Vendor == "" {
+		decl.Vendor = decl.AdapterID
+	}
+	if len(decl.ExecutableNames) == 0 && decl.AdapterID != "" {
+		decl.ExecutableNames = []string{decl.AdapterID}
+	}
+	if len(decl.VersionArgv) == 0 {
+		decl.VersionArgv = []string{"--version"}
+	}
+	if len(decl.StaticCatalogEntries) == 0 {
+		decl.StaticCatalogEntries = []CatalogInputEntry{}
+	}
+	return decl
+}
+
+func ValidateAdapterDeclaration(decl AdapterDeclaration) []string {
+	decl = normalizeAdapterDeclaration(decl)
+	var violations []string
+	if !safeAdapterKey(decl.AdapterID) {
+		violations = append(violations, "adapter_id must be a non-empty safe provider key")
+	}
+	if decl.DeclarationSchemaVersion != AdapterDeclarationSchema {
+		violations = append(violations, fmt.Sprintf("declaration_schema_version %q is unsupported", decl.DeclarationSchemaVersion))
+	}
+	if strings.TrimSpace(decl.AdapterVersion) == "" {
+		violations = append(violations, "adapter_version is required")
+	}
+	if strings.TrimSpace(decl.ConformanceVersion) == "" {
+		violations = append(violations, "conformance_version is required")
+	}
+	if strings.TrimSpace(decl.DisplayName) == "" {
+		violations = append(violations, "display_name is required")
+	}
+	if strings.TrimSpace(decl.Vendor) == "" {
+		violations = append(violations, "vendor is required")
+	}
+	if len(decl.ExecutableNames) == 0 {
+		violations = append(violations, "executable_names must declare at least one command name")
+	}
+	for index, name := range decl.ExecutableNames {
+		if !safeCommandName(name) {
+			violations = append(violations, fmt.Sprintf("executable_names[%d] must be a command name without path separators", index))
+		}
+	}
+	violations = append(violations, validateFixedArgv("version_argv", decl.VersionArgv, false)...)
+	violations = append(violations, validateFixedArgv("auth_probe_command", decl.AuthProbeCommand, true)...)
+	violations = append(violations, validateFixedArgv("catalog_probe_command", decl.CatalogProbeCommand, true)...)
+	if decl.AuthProbeMayNetwork && len(decl.AuthProbeCommand) == 0 {
+		violations = append(violations, "auth_probe_may_network requires auth_probe_command")
+	}
+	if decl.CatalogProbeMayNetwork && len(decl.CatalogProbeCommand) == 0 {
+		violations = append(violations, "catalog_probe_may_network requires catalog_probe_command")
+	}
+	if decl.MayNetwork && len(decl.AuthProbeCommand) == 0 && len(decl.CatalogProbeCommand) == 0 {
+		violations = append(violations, "may_network requires at least one declared bounded command")
+	}
+	if len(decl.AuthProbeCommand) == 0 && len(decl.AuthArtifactPaths) == 0 && len(decl.AuthEnvironmentNames) == 0 && strings.TrimSpace(decl.AuthUnsupportedReason) == "" {
+		violations = append(violations, "auth_readiness_contract must declare credential-blind evidence or unsupported reason")
+	}
+	for index, name := range decl.AuthEnvironmentNames {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.Contains(name, "=") {
+			violations = append(violations, fmt.Sprintf("auth_environment_names[%d] must be an environment variable name, not a value", index))
+		}
+	}
+	for index, entry := range decl.StaticCatalogEntries {
+		if strings.TrimSpace(entry.CanonicalModelID) == "" {
+			violations = append(violations, fmt.Sprintf("static_catalog_entries[%d].canonical_model_id is required", index))
+		}
+	}
+	return violations
+}
+
+func validateFixedArgv(field string, argv []string, includesExecutable bool) []string {
+	if len(argv) == 0 {
+		return nil
+	}
+	var violations []string
+	for index, arg := range argv {
+		if strings.TrimSpace(arg) == "" {
+			violations = append(violations, fmt.Sprintf("%s[%d] must not be empty", field, index))
+		}
+	}
+	if includesExecutable && !safeCommandName(argv[0]) {
+		violations = append(violations, fmt.Sprintf("%s[0] must be a command name without path separators", field))
+	}
+	return violations
+}
+
+var safeAdapterKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+func safeAdapterKey(value string) bool {
+	value = strings.TrimSpace(value)
+	return safeAdapterKeyPattern.MatchString(value) && !strings.ContainsAny(value, `/\`)
+}
+
+func safeCommandName(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !strings.ContainsAny(value, `/\`)
+}
+
+func catalogEntriesFromRuntime(models []runtimecap.ProviderModelCapability) []CatalogInputEntry {
+	out := make([]CatalogInputEntry, 0, len(models))
+	for _, model := range models {
+		entry := CatalogInputEntry{
+			CanonicalModelID:    model.ModelID,
+			DisplayName:         model.DisplayName,
+			Aliases:             append([]string(nil), model.Aliases...),
+			LifecycleState:      LifecycleState(model.LifecycleState),
+			ReplacementModelID:  model.ReplacementModelID,
+			AvailabilityState:   AvailabilityState(model.AvailabilityState),
+			ReadOnly:            boolCapability(model.ReadOnly),
+			JSONOutput:          boolCapability(model.JSONOutput),
+			NestedSubagents:     boolCapability(model.NestedSubagents),
+			MCPConfig:           boolCapability(model.MCPConfig),
+			Cancellation:        boolCapability(model.Cancellation),
+			TokenUsageReporting: boolCapability(model.TokenUsageReporting),
+			ImageInput:          boolCapability(model.ImageInput),
+			ImageOutput:         boolCapability(model.ImageOutput),
+			Constraints:         append([]string(nil), model.Constraints...),
+		}
+		for _, role := range model.RolesSupported {
+			entry.RolesSupported = append(entry.RolesSupported, CatalogRole(role))
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func configuredProviderNames(cfg config.Config) []string {
@@ -2064,7 +2250,8 @@ func installationID(adapterID string, identity ExecutableIdentity, path, platfor
 }
 
 func adapterDeclarationID(adapter AdapterDeclaration) string {
-	return "adapter_" + hashBase32(adapter.AdapterID, AdapterDeclarationSchema, AdapterVersion)[:32]
+	adapter = normalizeAdapterDeclaration(adapter)
+	return "adapter_" + hashBase32(adapter.AdapterID, adapter.DeclarationSchemaVersion, adapter.AdapterVersion)[:32]
 }
 
 func runProbeCommand(ctx context.Context, req ProbeExecution) (ProbeExecutionResult, error) {

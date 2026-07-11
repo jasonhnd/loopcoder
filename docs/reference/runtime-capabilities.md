@@ -10,6 +10,10 @@ model, and depth still resolve from command flags, `.delivery.yml`, and the
 static model registry. Runtime capabilities describe whether the selected
 provider or host can safely satisfy a requested invocation mode.
 
+Future provider declarations use the same contract and must follow
+[`future-provider-adapters.md`](future-provider-adapters.md) before they can
+participate in provider inventory or later routing.
+
 ## Provider Capability Fields
 
 Each provider runtime is represented internally with these fields:
