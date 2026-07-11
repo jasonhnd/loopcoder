@@ -16,6 +16,15 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
+func TestProbeTimeoutConstantsUseGenerousHangGuard(t *testing.T) {
+	if InstallProbeTimeout != 20*time.Second {
+		t.Fatalf("InstallProbeTimeout = %s, want 20s hang guard", InstallProbeTimeout)
+	}
+	if AuthProbeTimeout != 20*time.Second {
+		t.Fatalf("AuthProbeTimeout = %s, want 20s hang guard", AuthProbeTimeout)
+	}
+}
+
 func TestDiscoverRecordsAbsentProviderWithoutRunningProbe(t *testing.T) {
 	deps := fakeDeps(t, nil)
 	deps.Getenv = func(key string) string {

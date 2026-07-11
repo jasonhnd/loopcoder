@@ -42,11 +42,17 @@ const (
 	AdapterVersion           = "v1"
 	PolicyVersion            = "provider-inventory-v1"
 
-	InstallProbeTimeout = 5 * time.Second
-	AuthProbeTimeout    = 10 * time.Second
-	StdoutLimitBytes    = 64 * 1024
-	StderrLimitBytes    = 64 * 1024
-	CombinedLimitBytes  = 128 * 1024
+	// InstallProbeTimeout is a hang guard, not a startup race. Real Node-based
+	// CLIs on Windows have measured 5-10s cold starts, including gemini
+	// --version at 6-9s, so keep this generous enough for valid probes.
+	InstallProbeTimeout = 20 * time.Second
+	// AuthProbeTimeout uses the same hang-guard budget because auth readiness
+	// probes can pay the same Node-shim cold-start cost before doing useful
+	// local work.
+	AuthProbeTimeout   = 20 * time.Second
+	StdoutLimitBytes   = 64 * 1024
+	StderrLimitBytes   = 64 * 1024
+	CombinedLimitBytes = 128 * 1024
 )
 
 var ErrInvalidRecord = errors.New("ErrInvalidRecord")
