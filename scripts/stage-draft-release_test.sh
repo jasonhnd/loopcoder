@@ -101,6 +101,41 @@ run_case() {
   )
 }
 
+run_resolve_id_case() {
+  local name="$1"
+  local releases_json="$2"
+  local expected_status="$3"
+  local case_dir
+
+  case_dir="${tmp_root}/${name}"
+  mkdir -p "${case_dir}"
+  printf '%s\n' "${releases_json}" >"${case_dir}/releases.json"
+  : >"${case_dir}/gh.log"
+
+  (
+    cd "${case_dir}"
+    export PATH="${stub_dir}:${PATH}"
+    export GH_REPO="owner/repo"
+    export TAG_NAME="v0.7.0"
+    export GH_STUB_LOG="${case_dir}/gh.log"
+    export GH_STUB_RELEASES_FILE="${case_dir}/releases.json"
+
+    set +e
+    (set -e; bash "${repo_root}/scripts/stage-draft-release.sh" resolve-id) >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+    status="$?"
+    set -e
+
+    if [[ "${status}" -ne "${expected_status}" ]]; then
+      echo "${name}: expected exit ${expected_status}, got ${status}" >&2
+      echo "stdout:" >&2
+      cat "${case_dir}/stdout.txt" >&2
+      echo "stderr:" >&2
+      cat "${case_dir}/stderr.txt" >&2
+      exit 1
+    fi
+  )
+}
+
 run_case "create_none" '[[]]' 0
 assert_contains "${tmp_root}/create_none/gh.log" "api repos/owner/repo/releases --paginate --slurp"
 assert_contains "${tmp_root}/create_none/gh.log" "release create v0.7.0"
@@ -125,6 +160,16 @@ assert_contains "${tmp_root}/refuse_duplicate_drafts/stderr.txt" "found 2 draft 
 assert_not_contains "${tmp_root}/refuse_duplicate_drafts/gh.log" "release create"
 assert_not_contains "${tmp_root}/refuse_duplicate_drafts/gh.log" "release edit"
 assert_not_contains "${tmp_root}/refuse_duplicate_drafts/gh.log" "release upload"
+
+run_resolve_id_case "resolve_draft_id" '[[{"id":7,"tag_name":"v0.7.0","draft":true,"body":"notes"}]]' 0
+assert_contains "${tmp_root}/resolve_draft_id/stdout.txt" "7"
+assert_contains "${tmp_root}/resolve_draft_id/gh.log" "api repos/owner/repo/releases --paginate --slurp"
+
+run_resolve_id_case "resolve_missing" '[[]]' 1
+assert_contains "${tmp_root}/resolve_missing/stderr.txt" "release v0.7.0 was not found"
+
+run_resolve_id_case "resolve_duplicate" '[[{"id":8,"tag_name":"v0.7.0","draft":true},{"id":9,"tag_name":"v0.7.0","draft":true}]]' 1
+assert_contains "${tmp_root}/resolve_duplicate/stderr.txt" "found 2 releases for v0.7.0; refusing to choose one"
 
 # Regression guard: an old releases/tags/:tag lookup would see this 404 stdout
 # body and misclassify it as an existing public release. This script lists all
