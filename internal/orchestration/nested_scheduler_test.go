@@ -28,6 +28,8 @@ func TestScheduleNestedRunsFansOutWithConcurrencyLimitAndDeterministicResults(t 
 	var mu sync.Mutex
 	running := 0
 	maxRunning := 0
+	release := make(chan struct{})
+	var releaseOnce sync.Once
 
 	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
 		RepoPath:         repo,
@@ -48,8 +50,13 @@ func TestScheduleNestedRunsFansOutWithConcurrencyLimitAndDeterministicResults(t 
 			if running > maxRunning {
 				maxRunning = running
 			}
+			if running == 2 {
+				releaseOnce.Do(func() {
+					close(release)
+				})
+			}
 			mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			waitForNestedSignal(t, release, "two concurrent children")
 			mu.Lock()
 			running--
 			mu.Unlock()
@@ -152,8 +159,9 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 	repo := t.TempDir()
 	now := nestedTestNow()
 	ctx, cancel := context.WithCancel(context.Background())
-	started := make(chan struct{})
+	firstRunning := make(chan struct{})
 	release := make(chan struct{})
+	var firstRunningOnce sync.Once
 	done := make(chan struct {
 		report NestedScheduleReport
 		err    error
@@ -171,10 +179,33 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 				{ID: "first", Issue: 1, Permission: "write", Required: true},
 				{ID: "second", Issue: 2, Permission: "write", Required: true},
 			},
-			Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			RecordEvent: func(repoPath, runID string, event state.Event) error {
+				if runID == "run-20260709T000000Z-wave" && event.Event == NestedEventChildRunning {
+					var details nestedChildEventDetails
+					detailsJSON, err := json.Marshal(event.Details)
+					if err != nil {
+						return err
+					}
+					if err := json.Unmarshal(detailsJSON, &details); err != nil {
+						return err
+					}
+					if details.Child.ID == "first" {
+						firstRunningOnce.Do(func() {
+							close(firstRunning)
+						})
+					}
+				}
+				return state.AppendEvent(repoPath, runID, event)
+			},
+			Execute: func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error) {
 				if child.ID == "first" {
-					close(started)
 					<-release
+				}
+				if child.ID == "second" {
+					if err := ctx.Err(); err != nil {
+						return ChildRunResult{}, err
+					}
+					return ChildRunResult{Status: NestedStatusFailed, Error: "second child executed before cancellation"}, nil
 				}
 				return ChildRunResult{Status: NestedStatusSucceeded}, nil
 			},
@@ -185,22 +216,10 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 		}{report: report, err: err}
 	}()
 
-	select {
-	case <-started:
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for first child to start")
-	}
+	waitForNestedSignal(t, firstRunning, "first child to start")
 	cancel()
 	close(release)
-	var outcome struct {
-		report NestedScheduleReport
-		err    error
-	}
-	select {
-	case outcome = <-done:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for nested scheduler")
-	}
+	outcome := receiveNestedTestValue(t, done, "nested scheduler")
 	if outcome.err != nil {
 		t.Fatalf("ScheduleNestedRuns returned error: %v", outcome.err)
 	}
@@ -1141,17 +1160,8 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	go run(storeA, planA, nestedTestNow().Add(10*time.Hour))
 	go run(storeB, planB, nestedTestNow().Add(48*time.Hour))
 	close(start)
-	select {
-	case <-executeStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first provider execution")
-	}
-	var first outcome
-	select {
-	case first = <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for active-owner observer")
-	}
+	waitForNestedSignal(t, executeStarted, "first provider execution")
+	first := receiveNestedTestValue(t, done, "active-owner observer")
 	if first.err != nil {
 		t.Fatalf("active-owner observer returned error before release: %v", first.err)
 	}
@@ -1217,7 +1227,7 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	if err := cmdA.Start(); err != nil {
 		t.Fatalf("start helper A: %v", err)
 	}
-	waitForFile(t, activePath, 3*time.Second)
+	waitForFile(t, activePath)
 
 	cmdB := startHelper(reportBPath, nestedTestNow().Add(48*time.Hour).Format(time.RFC3339Nano))
 	outB, err := cmdB.CombinedOutput()
@@ -1326,12 +1336,8 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 			err    error
 		}{report: report, err: err}
 	}()
-	select {
-	case <-executeStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for provider execution")
-	}
-	waitForDurableClaimRenewal(t, ctx, storeB, 5*time.Second)
+	waitForNestedSignal(t, executeStarted, "provider execution")
+	waitForDurableClaimRenewal(t, ctx, storeB)
 	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
 		MaxChildren: 1,
@@ -1427,11 +1433,7 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 			err    error
 		}{report: report, err: err}
 	}()
-	select {
-	case <-executeStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for provider execution")
-	}
+	waitForNestedSignal(t, executeStarted, "provider execution")
 	if err := storeB.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET lease_expires_at = ?`,
 			time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
@@ -1786,7 +1788,7 @@ func TestNestedReplayHelperProcess(t *testing.T) {
 				t.Fatalf("duplicate provider execution: %v", err)
 			}
 			_ = file.Close()
-			waitForFile(t, os.Getenv("LOOPCODER_NESTED_REPLAY_RELEASE"), 5*time.Second)
+			waitForFile(t, os.Getenv("LOOPCODER_NESTED_REPLAY_RELEASE"))
 			return ChildRunResult{Status: NestedStatusSucceeded}, nil
 		},
 	})
@@ -1802,9 +1804,47 @@ func TestNestedReplayHelperProcess(t *testing.T) {
 	}
 }
 
-func waitForFile(t *testing.T, path string, timeout time.Duration) {
+func receiveNestedTestValue[T any](t *testing.T, ch <-chan T, description string) T {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	timer := time.NewTimer(time.Until(nestedTestHangDeadline(t)))
+	defer timer.Stop()
+	select {
+	case value := <-ch:
+		return value
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", description)
+	}
+	var zero T
+	return zero
+}
+
+func waitForNestedSignal(t *testing.T, ch <-chan struct{}, description string) {
+	t.Helper()
+	timer := time.NewTimer(time.Until(nestedTestHangDeadline(t)))
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func nestedTestHangDeadline(t *testing.T) time.Time {
+	t.Helper()
+	if deadline, ok := t.Deadline(); ok {
+		if time.Until(deadline) > 2*time.Second {
+			return deadline.Add(-time.Second)
+		}
+		return deadline
+	}
+	return time.Now().Add(60 * time.Second)
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := nestedTestHangDeadline(t)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		if _, err := os.Stat(path); err == nil {
 			return
@@ -1814,11 +1854,11 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", path)
 		}
-		time.Sleep(20 * time.Millisecond)
+		<-ticker.C
 	}
 }
 
-func waitForDurableClaimRenewal(t *testing.T, ctx context.Context, store storage.Store, timeout time.Duration) {
+func waitForDurableClaimRenewal(t *testing.T, ctx context.Context, store storage.Store) {
 	t.Helper()
 	type claimSnapshot struct {
 		heartbeatAt    time.Time
@@ -1847,7 +1887,9 @@ func waitForDurableClaimRenewal(t *testing.T, ctx context.Context, store storage
 		return claimSnapshot{heartbeatAt: heartbeat, leaseExpiresAt: lease, phase: phase}, true
 	}
 
-	deadline := time.Now().Add(timeout)
+	deadline := nestedTestHangDeadline(t)
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
 	var initial claimSnapshot
 	for {
 		snapshot, ok := readSnapshot()
@@ -1858,7 +1900,7 @@ func waitForDurableClaimRenewal(t *testing.T, ctx context.Context, store storage
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for initial durable claim")
 		}
-		time.Sleep(25 * time.Millisecond)
+		<-ticker.C
 	}
 	for {
 		snapshot, ok := readSnapshot()
@@ -1874,7 +1916,7 @@ func waitForDurableClaimRenewal(t *testing.T, ctx context.Context, store storage
 				initial.leaseExpiresAt.Format(time.RFC3339Nano),
 				initial.phase)
 		}
-		time.Sleep(25 * time.Millisecond)
+		<-ticker.C
 	}
 }
 
