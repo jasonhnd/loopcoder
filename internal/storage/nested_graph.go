@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,7 +16,14 @@ const (
 	ClaimOutcomeTerminalReused = "terminal-reused"
 	ClaimOutcomeBlocked        = "blocked"
 	ClaimOutcomeStaleClaim     = "stale-claim"
+
+	ClaimPhaseClaimed   = "claimed"
+	ClaimPhaseLaunching = "launching"
+	ClaimPhaseExecuting = "executing"
+	ClaimPhaseCompleted = "completed"
 )
+
+var ErrStaleChildRunClaim = errors.New("stale claim")
 
 // RunNode describes the durable run graph metadata required for nested runs.
 type RunNode struct {
@@ -90,6 +98,9 @@ type ChildPlanReplayChild struct {
 	ClaimedAt       string
 	LeaseExpiresAt  string
 	HeartbeatAt     string
+	ClaimPhase      string
+	ProviderKey     string
+	ProviderReceipt string
 }
 
 // RunStatusTransition describes one authoritative durable status transition.
@@ -115,8 +126,15 @@ type ClaimResult struct {
 	HeartbeatAt     string
 	RunStatus       string
 	EdgeStatus      string
+	ClaimPhase      string
+	ProviderKey     string
+	ProviderReceipt string
 	PreviousOwner   string
 	PreviousLease   string
+}
+
+func IsStaleChildRunClaim(err error) bool {
+	return errors.Is(err, ErrStaleChildRunClaim)
 }
 
 // LoadChildPlanReplayRecord loads the authoritative durable child identity for
@@ -170,7 +188,10 @@ func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) 
 				COALESCE(c.claim_generation, 0),
 				COALESCE(c.claimed_at, ''),
 				COALESCE(c.lease_expires_at, ''),
-				COALESCE(c.heartbeat_at, '')
+				COALESCE(c.heartbeat_at, ''),
+				COALESCE(c.phase, ''),
+				COALESCE(c.provider_idempotency_key, ''),
+				COALESCE(c.provider_receipt, '')
 			FROM run_edges e
 			LEFT JOIN runs r ON r.id = e.child_run_id
 			LEFT JOIN run_claims c ON c.run_id = e.child_run_id
@@ -203,6 +224,9 @@ func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) 
 				&child.ClaimedAt,
 				&child.LeaseExpiresAt,
 				&child.HeartbeatAt,
+				&child.ClaimPhase,
+				&child.ProviderKey,
+				&child.ProviderReceipt,
 			); err != nil {
 				return fmt.Errorf("load child plan %s edge: %w", planID, err)
 			}
@@ -368,6 +392,91 @@ func ClaimChildRunExecution(ctx context.Context, store Store, parentRunID, child
 	return result, err
 }
 
+func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID string, claimGeneration int64, now, leaseUntil time.Time) error {
+	if store == nil {
+		return nil
+	}
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	if childRunID == "" || executorID == "" || claimGeneration <= 0 {
+		return fmt.Errorf("renew child run claim: child_run_id, executor_id, and claim_generation are required")
+	}
+	now = now.UTC()
+	leaseUntil = leaseUntil.UTC()
+	if now.IsZero() || leaseUntil.IsZero() || !leaseUntil.After(now) {
+		return fmt.Errorf("renew child run claim: valid now and future lease_until are required")
+	}
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			result, err := tx.Exec(ctx, `UPDATE run_claims
+				SET heartbeat_at = ?, lease_expires_at = ?
+				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+				formatTimestamp(now), formatTimestamp(leaseUntil), childRunID, executorID, claimGeneration)
+			if err != nil {
+				return fmt.Errorf("renew child run claim: %w", err)
+			}
+			affected, err := result.RowsAffected()
+			if err == nil && affected == 0 {
+				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+			}
+			return nil
+		})
+	})
+}
+
+func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, phase, at, receipt string) error {
+	if store == nil {
+		return nil
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	phase = normalizeClaimPhase(phase)
+	at = strings.TrimSpace(at)
+	receipt = strings.TrimSpace(receipt)
+	if parentRunID == "" || childRunID == "" || executorID == "" || claimGeneration <= 0 || phase == "" || at == "" {
+		return fmt.Errorf("update child run claim phase: parent_run_id, child_run_id, executor_id, claim_generation, phase, and at are required")
+	}
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			result, err := tx.Exec(ctx, `UPDATE run_claims
+				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN ? <> '' THEN ? ELSE provider_receipt END
+				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+				phase, at, receipt, receipt, childRunID, executorID, claimGeneration)
+			if err != nil {
+				return fmt.Errorf("update child run claim phase: %w", err)
+			}
+			affected, err := result.RowsAffected()
+			if err == nil && affected == 0 {
+				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+			}
+			status := ""
+			switch phase {
+			case ClaimPhaseLaunching:
+				status = "launching"
+			case ClaimPhaseExecuting:
+				status = "running"
+			}
+			if status != "" {
+				if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+					RunID:       childRunID,
+					ParentRunID: parentRunID,
+					ChildRunID:  childRunID,
+					Status:      status,
+					UpdatedAt:   at,
+					Reason:      "child claim phase " + phase,
+					Source:      "nested-scheduler",
+				}); err != nil {
+					return err
+				}
+			} else if err := appendClaimPhaseEvent(ctx, tx, childRunID, at, phase, "nested-scheduler"); err != nil {
+				return err
+			}
+			return nil
+		})
+	})
+}
+
 func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, status, updatedAt, reason string) error {
 	if store == nil {
 		return nil
@@ -386,17 +495,16 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 	}
 	return withRetry(ctx, func() error {
 		return store.WithWriteTx(ctx, func(tx Tx) error {
-			var existing string
-			var existingGeneration int64
-			err := tx.QueryRow(ctx, `SELECT executor_id, claim_generation FROM run_claims WHERE run_id = ?`, childRunID).Scan(&existing, &existingGeneration)
+			result, err := tx.Exec(ctx, `UPDATE run_claims
+				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN provider_receipt = '' THEN ? ELSE provider_receipt END
+				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+				ClaimPhaseCompleted, updatedAt, status, childRunID, executorID, claimGeneration)
 			if err != nil {
-				if err == sql.ErrNoRows {
-					return fmt.Errorf("complete claimed child run: claim for run %q is missing", childRunID)
-				}
-				return fmt.Errorf("complete claimed child run: inspect claim: %w", err)
+				return fmt.Errorf("complete claimed child run: fence claim: %w", err)
 			}
-			if existing != executorID || existingGeneration != claimGeneration {
-				return fmt.Errorf("complete claimed child run: stale claim for run %q; owner/generation is %s/%d", childRunID, existing, existingGeneration)
+			affected, err := result.RowsAffected()
+			if err == nil && affected == 0 {
+				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
 			}
 			return transitionRunStatusTx(ctx, tx, RunStatusTransition{
 				RunID:       childRunID,
@@ -447,6 +555,25 @@ func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunI
 		claim.EdgeStatus = edgeStatus
 		return claim, nil
 	}
+	if hasClaim && !claimPhaseAutoTakeoverAllowed(claim.ClaimPhase) {
+		if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+			RunID:       childRunID,
+			ParentRunID: parentRunID,
+			ChildRunID:  childRunID,
+			Status:      "needs-human",
+			UpdatedAt:   now,
+			Reason:      fmt.Sprintf("expired child execution claim in %s phase requires human recovery", normalizeClaimPhase(claim.ClaimPhase)),
+			Source:      "nested-scheduler",
+		}); err != nil {
+			return ClaimResult{}, err
+		}
+		claim.Outcome = ClaimOutcomeBlocked
+		claim.RunStatus = "needs-human"
+		claim.EdgeStatus = "needs-human"
+		claim.PreviousOwner = claim.ExecutorID
+		claim.PreviousLease = claim.LeaseExpiresAt
+		return claim, nil
+	}
 
 	generation := int64(1)
 	outcome := ClaimOutcomeClaimed
@@ -458,22 +585,30 @@ func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunI
 		previousOwner = claim.ExecutorID
 		previousLease = claim.LeaseExpiresAt
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+	providerKey := providerIdempotencyKey(childRunID, generation)
+	if _, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')
 		ON CONFLICT(run_id) DO UPDATE SET
 			executor_id = excluded.executor_id,
 			claim_generation = excluded.claim_generation,
 			claimed_at = excluded.claimed_at,
 			lease_expires_at = excluded.lease_expires_at,
-			heartbeat_at = excluded.heartbeat_at`,
-		childRunID, executorID, generation, now, leaseUntil, now); err != nil {
+			heartbeat_at = excluded.heartbeat_at,
+			phase = excluded.phase,
+			provider_idempotency_key = excluded.provider_idempotency_key,
+			provider_receipt = excluded.provider_receipt`,
+		childRunID, executorID, generation, now, leaseUntil, now, ClaimPhaseClaimed, providerKey); err != nil {
 		return ClaimResult{}, fmt.Errorf("claim child run execution: persist claim: %w", err)
+	}
+	targetStatus := "launching"
+	if status == "running" {
+		targetStatus = "running"
 	}
 	if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
 		RunID:       childRunID,
 		ParentRunID: parentRunID,
 		ChildRunID:  childRunID,
-		Status:      "running",
+		Status:      targetStatus,
 		UpdatedAt:   now,
 		Reason:      "child execution claimed",
 		Source:      "nested-scheduler",
@@ -488,8 +623,10 @@ func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunI
 		ClaimedAt:       now,
 		LeaseExpiresAt:  leaseUntil,
 		HeartbeatAt:     now,
-		RunStatus:       "running",
-		EdgeStatus:      "running",
+		ClaimPhase:      ClaimPhaseClaimed,
+		ProviderKey:     providerKey,
+		RunStatus:       targetStatus,
+		EdgeStatus:      targetStatus,
 		PreviousOwner:   previousOwner,
 		PreviousLease:   previousLease,
 	}, nil
@@ -836,7 +973,7 @@ func currentRunEdgeStatus(ctx context.Context, tx Tx, parentRunID, childRunID st
 
 func currentRunClaim(ctx context.Context, tx Tx, runID string) (ClaimResult, bool, error) {
 	var claim ClaimResult
-	err := tx.QueryRow(ctx, `SELECT run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at
+	err := tx.QueryRow(ctx, `SELECT run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt
 		FROM run_claims WHERE run_id = ?`, runID).Scan(
 		&claim.RunID,
 		&claim.ExecutorID,
@@ -844,6 +981,9 @@ func currentRunClaim(ctx context.Context, tx Tx, runID string) (ClaimResult, boo
 		&claim.ClaimedAt,
 		&claim.LeaseExpiresAt,
 		&claim.HeartbeatAt,
+		&claim.ClaimPhase,
+		&claim.ProviderKey,
+		&claim.ProviderReceipt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -851,7 +991,31 @@ func currentRunClaim(ctx context.Context, tx Tx, runID string) (ClaimResult, boo
 		}
 		return ClaimResult{}, false, fmt.Errorf("inspect run claim %q: %w", runID, err)
 	}
+	claim.ClaimPhase = normalizeClaimPhase(claim.ClaimPhase)
 	return claim, true, nil
+}
+
+func normalizeClaimPhase(phase string) string {
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case ClaimPhaseClaimed, "":
+		return ClaimPhaseClaimed
+	case ClaimPhaseLaunching:
+		return ClaimPhaseLaunching
+	case ClaimPhaseExecuting:
+		return ClaimPhaseExecuting
+	case ClaimPhaseCompleted, "complete", "finished":
+		return ClaimPhaseCompleted
+	default:
+		return strings.ToLower(strings.TrimSpace(phase))
+	}
+}
+
+func claimPhaseAutoTakeoverAllowed(phase string) bool {
+	return normalizeClaimPhase(phase) == ClaimPhaseClaimed
+}
+
+func providerIdempotencyKey(runID string, generation int64) string {
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(runID), generation)
 }
 
 func claimLeaseActive(leaseExpiresAt, now string) bool {
@@ -884,6 +1048,18 @@ func durableBlockedStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func appendClaimPhaseEvent(ctx context.Context, tx Tx, runID, at, phase, source string) error {
+	payload, err := json.Marshal(map[string]string{
+		"run_id": runID,
+		"phase":  phase,
+		"source": source,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run claim phase event: %w", err)
+	}
+	return appendRunTransitionEvent(ctx, tx, runID, at, "run.claim.phase", string(payload))
 }
 
 func appendRunTransitionEvent(ctx context.Context, tx Tx, runID, at, eventType, payloadJSON string) error {
