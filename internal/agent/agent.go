@@ -29,6 +29,10 @@ type Invocation struct {
 	// place it in a per-run kill-group (spec 0390, Decision 11).
 	RunID string
 	Role  string
+	// ProviderKey is loopcoder's durable idempotency key for the logical child
+	// operation. Runners may pass it to providers with native support; providers
+	// without native support receive it only as loopcoder metadata.
+	ProviderKey string
 	// MCPServers carries provider-neutral MCP declarations. Provider-specific
 	// flags and config files are still owned by each runner.
 	MCPServers []MCPServer

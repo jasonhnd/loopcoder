@@ -24,6 +24,7 @@ Each provider runtime is represented internally with these fields:
 | `mcp_config` | Provider adapter can inject selected MCP server configuration for the invocation. |
 | `cancellation` | Provider process can be cancelled by loopcoder's context, timeout, or kill-group supervision. |
 | `token_usage_reporting` | Provider output exposes stable parseable token usage, or loopcoder has a verified parser for it. |
+| `provider_idempotency` | Provider has a native request idempotency mechanism that loopcoder can pass for a logical child operation. |
 | `auth_probe_command` | Optional read-only command that can check provider authentication readiness. |
 | `known_limitations` | Human-readable limitations that must appear in actionable failure paths when relevant. |
 
@@ -84,6 +85,14 @@ Those checks distinguish `missing_executable`, `unauthenticated_provider`,
 `unsupported_read_only_mode`, and `unsupported_nested_agents`. Unavailable
 optional providers do not hard-fail unless they are selected by `.delivery.yml`
 or command defaults.
+
+Current provider idempotency support is metadata-only for the local CLI
+providers. Loopcoder threads a durable logical child idempotency key through the
+Worker and provider invocation request, and includes it in the worker prompt.
+No current CLI adapter exposes a verified native idempotency API, so this is
+not treated as proof of exactly-once provider-side execution. A durable
+`provider_receipt` must come from a real provider response, external resource
+ID, or verifiable local execution record.
 
 ## Host Invocation Contract
 

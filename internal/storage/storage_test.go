@@ -134,8 +134,8 @@ func TestOpenMigratesRunClaimsLifecycleColumnsFromV8(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("query migrated claim: %v", err)
 	}
-	if phase != ClaimPhaseClaimed || key != "" || receipt != "" {
-		t.Fatalf("migrated claim lifecycle fields = %q/%q/%q, want claimed/empty/empty", phase, key, receipt)
+	if phase != ClaimPhaseExecuting || key != "" || receipt != "" {
+		t.Fatalf("migrated claim lifecycle fields = %q/%q/%q, want executing/empty/empty", phase, key, receipt)
 	}
 }
 
@@ -769,12 +769,24 @@ func TestClaimChildRunExecutionClaimsObservesAndFencesCompletion(t *testing.T) {
 	if stale.Outcome != ClaimOutcomeStaleClaim || stale.ClaimGeneration != 2 || stale.PreviousOwner != "executor-a" || stale.ExecutorID != "executor-c" {
 		t.Fatalf("stale claim = %#v, want takeover generation 2 from executor-a to executor-c", stale)
 	}
-	err = CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-a", 1, "succeeded", "2026-07-10T00:03:01Z", "stale completion")
+	if stale.ProviderKey == "" || stale.ProviderKey != claim.ProviderKey {
+		t.Fatalf("stale provider key = %q, first key = %q, want stable logical child key across generations", stale.ProviderKey, claim.ProviderKey)
+	}
+	err = CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-a", 1, "succeeded", "2026-07-10T00:03:01Z", "stale completion", "")
 	if err == nil || !strings.Contains(err.Error(), "stale claim") {
 		t.Fatalf("stale completion error = %v, want stale claim rejection", err)
 	}
-	if err := CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-c", 2, "succeeded", "2026-07-10T00:03:02Z", "winner completion"); err != nil {
+	if err := CompleteClaimedChildRun(ctx, store, parent.RunID, childRunID, "executor-c", 2, "succeeded", "2026-07-10T00:03:02Z", "winner completion", "provider-receipt-1"); err != nil {
 		t.Fatalf("CompleteClaimedChildRun winner: %v", err)
+	}
+	var receipt string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT provider_receipt FROM run_claims WHERE run_id = ?`, childRunID).Scan(&receipt)
+	}); err != nil {
+		t.Fatalf("query provider receipt: %v", err)
+	}
+	if receipt != "provider-receipt-1" {
+		t.Fatalf("provider_receipt = %q, want real receipt", receipt)
 	}
 	reused, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-d", now.Add(4*time.Minute), now.Add(5*time.Minute))
 	if err != nil {
@@ -838,7 +850,7 @@ func TestClaimChildRunExecutionExpiredExecutingClaimNeedsHuman(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimChildRunExecution: %v", err)
 	}
-	if err := UpdateChildRunClaimPhase(ctx, store, parent.RunID, childRunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, formatTimestamp(now.Add(time.Second)), claim.ProviderKey); err != nil {
+	if err := UpdateChildRunClaimPhase(ctx, store, parent.RunID, childRunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, formatTimestamp(now.Add(time.Second)), ""); err != nil {
 		t.Fatalf("UpdateChildRunClaimPhase executing: %v", err)
 	}
 	blocked, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-b", now.Add(2*time.Minute), now.Add(3*time.Minute))

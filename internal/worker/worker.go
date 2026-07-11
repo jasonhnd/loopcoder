@@ -39,6 +39,7 @@ type Options struct {
 	BaseBranch      string
 	Branch          string
 	RunID           string
+	ProviderKey     string
 	Attempt         int
 	RecoveryContext string
 	Provider        string
@@ -325,6 +326,7 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		IssueTitle:      dispatch.opts.IssueTitle,
 		IssueBody:       dispatch.opts.IssueBody,
 		Branch:          dispatch.opts.Branch,
+		ProviderKey:     dispatch.opts.ProviderKey,
 		RecoveryContext: dispatch.opts.RecoveryContext,
 		RepoSkills:      repoSkills,
 	})
@@ -357,6 +359,7 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		LivenessMode:    domainPolicy.AgentLivenessMode(),
 		LivenessCommand: domainPolicy.LivenessCommand,
 		RunID:           dispatch.opts.RunID,
+		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
 		MCPServers:      mcpServers,
 	}, nil
@@ -604,6 +607,7 @@ type PromptOptions struct {
 	IssueTitle      string
 	IssueBody       string
 	Branch          string
+	ProviderKey     string
 	RecoveryContext string
 	RepoSkills      string
 }
@@ -622,6 +626,12 @@ func BuildPrompt(opts PromptOptions) string {
 - You may read files and run commands, but do NOT run git commit or git push — the harness commits and opens the PR.
 - When finished, print a 2-4 sentence final summary in English describing exactly what you changed.
 `, opts.IssueNumber, opts.Branch, opts.IssueTitle, opts.IssueBody)
+
+	if strings.TrimSpace(opts.ProviderKey) != "" {
+		prompt += fmt.Sprintf(`
+Provider idempotency key: %s
+`, strings.TrimSpace(opts.ProviderKey))
+	}
 
 	if strings.TrimSpace(opts.RepoSkills) != "" {
 		prompt += fmt.Sprintf(`

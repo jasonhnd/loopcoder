@@ -274,7 +274,16 @@ var migrations = []migration{
 			`ALTER TABLE run_claims ADD COLUMN phase TEXT NOT NULL DEFAULT 'claimed'`,
 			`ALTER TABLE run_claims ADD COLUMN provider_idempotency_key TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE run_claims ADD COLUMN provider_receipt TEXT NOT NULL DEFAULT ''`,
-			`UPDATE run_claims SET phase = 'claimed' WHERE phase = ''`,
+			`UPDATE run_claims
+				SET phase = CASE
+					WHEN EXISTS (
+						SELECT 1 FROM runs r
+						WHERE r.id = run_claims.run_id
+							AND LOWER(TRIM(COALESCE(r.status, ''))) IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked')
+					) THEN 'completed'
+					ELSE 'executing'
+				END
+				WHERE phase = '' OR phase = 'claimed'`,
 		},
 	},
 }

@@ -424,7 +424,7 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 	})
 }
 
-func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, phase, at, receipt string) error {
+func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, phase, at, providerReceipt string) error {
 	if store == nil {
 		return nil
 	}
@@ -433,7 +433,7 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 	executorID = strings.TrimSpace(executorID)
 	phase = normalizeClaimPhase(phase)
 	at = strings.TrimSpace(at)
-	receipt = strings.TrimSpace(receipt)
+	providerReceipt = strings.TrimSpace(providerReceipt)
 	if parentRunID == "" || childRunID == "" || executorID == "" || claimGeneration <= 0 || phase == "" || at == "" {
 		return fmt.Errorf("update child run claim phase: parent_run_id, child_run_id, executor_id, claim_generation, phase, and at are required")
 	}
@@ -442,7 +442,7 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 			result, err := tx.Exec(ctx, `UPDATE run_claims
 				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN ? <> '' THEN ? ELSE provider_receipt END
 				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
-				phase, at, receipt, receipt, childRunID, executorID, claimGeneration)
+				phase, at, providerReceipt, providerReceipt, childRunID, executorID, claimGeneration)
 			if err != nil {
 				return fmt.Errorf("update child run claim phase: %w", err)
 			}
@@ -477,7 +477,7 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 	})
 }
 
-func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, status, updatedAt, reason string) error {
+func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, status, updatedAt, reason, providerReceipt string) error {
 	if store == nil {
 		return nil
 	}
@@ -487,6 +487,7 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 	status = normalizeDurableStatus(status)
 	updatedAt = strings.TrimSpace(updatedAt)
 	reason = strings.TrimSpace(reason)
+	providerReceipt = strings.TrimSpace(providerReceipt)
 	if parentRunID == "" || childRunID == "" || executorID == "" || claimGeneration <= 0 || status == "" || updatedAt == "" {
 		return fmt.Errorf("complete claimed child run: parent_run_id, child_run_id, executor_id, claim_generation, status, and updated_at are required")
 	}
@@ -498,7 +499,7 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 			result, err := tx.Exec(ctx, `UPDATE run_claims
 				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN provider_receipt = '' THEN ? ELSE provider_receipt END
 				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
-				ClaimPhaseCompleted, updatedAt, status, childRunID, executorID, claimGeneration)
+				ClaimPhaseCompleted, updatedAt, providerReceipt, childRunID, executorID, claimGeneration)
 			if err != nil {
 				return fmt.Errorf("complete claimed child run: fence claim: %w", err)
 			}
@@ -585,7 +586,7 @@ func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunI
 		previousOwner = claim.ExecutorID
 		previousLease = claim.LeaseExpiresAt
 	}
-	providerKey := providerIdempotencyKey(childRunID, generation)
+	providerKey := providerIdempotencyKey(childRunID)
 	if _, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')
 		ON CONFLICT(run_id) DO UPDATE SET
@@ -1014,8 +1015,8 @@ func claimPhaseAutoTakeoverAllowed(phase string) bool {
 	return normalizeClaimPhase(phase) == ClaimPhaseClaimed
 }
 
-func providerIdempotencyKey(runID string, generation int64) string {
-	return fmt.Sprintf("%s:%d", strings.TrimSpace(runID), generation)
+func providerIdempotencyKey(runID string) string {
+	return "child-run:" + strings.TrimSpace(runID)
 }
 
 func claimLeaseActive(leaseExpiresAt, now string) bool {

@@ -1470,6 +1470,120 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 	}
 }
 
+func TestScheduleNestedRunsMigratedLegacyExecutingClaimBlocksWithoutExecute(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-migrated-legacy-executing"
+	plan.Items[0].ChildKey = "legacy-child"
+	childRunID := state.RunIDForChild(plan.Items[0].ChildKey, 0, nestedTestNow())
+	seedDurableReplayPlan(t, ctx, store, plan, childRunID, NestedStatusRunning)
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt)
+			VALUES (?, 'legacy-executor', 1, ?, ?, ?, ?, '', '')`,
+			childRunID,
+			state.FormatTimestamp(nestedTestNow()),
+			state.FormatTimestamp(nestedTestNow().Add(-time.Minute)),
+			state.FormatTimestamp(nestedTestNow()),
+			storage.ClaimPhaseExecuting)
+		return err
+	}); err != nil {
+		t.Fatalf("seed migrated legacy executing claim: %v", err)
+	}
+
+	var executeCount int64
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow().Add(time.Hour),
+		Clock:       func() time.Time { return nestedTestNow().Add(time.Hour) },
+		Plan:        &plan,
+		Store:       store,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			atomic.AddInt64(&executeCount, 1)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 0 {
+		t.Fatalf("execute count = %d, want 0", got)
+	}
+	if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("child status = %q, want needs-human", got)
+	}
+	if got := report.Children[0].ClaimOutcome; got != storage.ClaimOutcomeBlocked {
+		t.Fatalf("claim outcome = %q, want blocked", got)
+	}
+}
+
+func TestScheduleNestedRunsPassesIdempotencyKeyAndPersistsOnlyRealReceipt(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-provider-key-receipt"
+	var executedRunID, executedProviderKey string
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Plan:        &plan,
+		Store:       store,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			executedRunID = child.RunID
+			executedProviderKey = child.ProviderKey
+			var receipt string
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.QueryRow(ctx, `SELECT provider_receipt FROM run_claims WHERE run_id = ?`, child.RunID).Scan(&receipt)
+			}); err != nil {
+				t.Fatalf("query provider receipt during execute: %v", err)
+			}
+			if receipt != "" {
+				t.Fatalf("provider_receipt during execute = %q, want empty until real provider response", receipt)
+			}
+			return ChildRunResult{Status: NestedStatusSucceeded, ProviderReceipt: "receipt:" + child.RunID}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if executedProviderKey == "" || executedProviderKey != "child-run:"+executedRunID {
+		t.Fatalf("executed provider key = %q for run %q, want stable child-run key", executedProviderKey, executedRunID)
+	}
+	if got := report.Children[0].ProviderKey; got != executedProviderKey {
+		t.Fatalf("report provider key = %q, want %q", got, executedProviderKey)
+	}
+	var receipt string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT provider_receipt FROM run_claims WHERE run_id = ?`, executedRunID).Scan(&receipt)
+	}); err != nil {
+		t.Fatalf("query provider receipt after completion: %v", err)
+	}
+	if receipt != "receipt:"+executedRunID {
+		t.Fatalf("provider_receipt = %q, want real execution receipt", receipt)
+	}
+}
+
 func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 	oldLease := nestedClaimLeaseDuration
 	oldRenew := nestedClaimRenewEvery
@@ -1526,6 +1640,62 @@ func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 	parentEvents := readNestedEvents(t, repo, report.ParentRunID)
 	if strings.Contains(parentEvents, NestedEventChildFinished) || strings.Contains(parentEvents, NestedEventParentDone) {
 		t.Fatalf("stale owner parent events include terminal event:\n%s", parentEvents)
+	}
+}
+
+func TestScheduleNestedRunsSuppressesParentDoneAfterChildCompletionPersistenceFailure(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	baseStore, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer baseStore.Close()
+	store := failExecStore{
+		Store: baseStore,
+		match: func(query string) bool {
+			return strings.Contains(query, "CASE WHEN provider_receipt = ''")
+		},
+		err: errors.New("injected child completion failure"),
+	}
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-complete-failure-suppresses-parent"
+	var eventsMu sync.Mutex
+	var events []state.Event
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Plan:        &plan,
+		Store:       store,
+		RecordEvent: func(_ string, _ string, event state.Event) error {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, event)
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected child completion failure") {
+		t.Fatalf("ScheduleNestedRuns error = %v, want injected child completion failure", err)
+	}
+	var parentStatus string
+	if err := baseStore.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, report.ParentRunID).Scan(&parentStatus)
+	}); err != nil {
+		t.Fatalf("query parent status: %v", err)
+	}
+	if parentStatus == NestedStatusSucceeded {
+		t.Fatalf("parent status = %q, want non-terminal after child completion failure", parentStatus)
+	}
+	for _, event := range events {
+		if event.Event == NestedEventParentDone {
+			t.Fatalf("recorded parent finished event after child completion failure: %#v", event)
+		}
 	}
 }
 
@@ -1807,4 +1977,29 @@ func readNestedEvents(t *testing.T, repo, runID string) string {
 		t.Fatalf("ReadFile events for %s: %v", runID, err)
 	}
 	return string(data)
+}
+
+type failExecStore struct {
+	storage.Store
+	match func(string) bool
+	err   error
+}
+
+func (s failExecStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	return s.Store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		return fn(failExecTx{Tx: tx, match: s.match, err: s.err})
+	})
+}
+
+type failExecTx struct {
+	storage.Tx
+	match func(string) bool
+	err   error
+}
+
+func (tx failExecTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if tx.match != nil && tx.match(query) {
+		return nil, tx.err
+	}
+	return tx.Tx.Exec(ctx, query, args...)
 }
