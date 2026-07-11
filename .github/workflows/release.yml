@@ -233,6 +233,7 @@ jobs:
           release_id="$(jq -r '.id' <<<"${release_json}")"
           gh api "repos/${GH_REPO}/releases/${release_id}" \
             --method PATCH \
+            -f tag_name="${TAG_NAME}" \
             -F draft=false \
             -F prerelease=false \
             -f make_latest=true >/dev/null
@@ -269,6 +270,7 @@ jobs:
           } > failed-draft-notes.md
           gh api "repos/${GH_REPO}/releases/${release_id}" \
             --method PATCH \
+            -f tag_name="${TAG_NAME}" \
             -F draft=true \
             -F prerelease=true \
             -f body="$(cat failed-draft-notes.md)" >/dev/null
