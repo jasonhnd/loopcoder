@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 9
+	CurrentSchemaVersion = 10
 
 	driverName = "sqlite"
 
@@ -286,9 +286,36 @@ var migrations = []migration{
 				WHERE phase = '' OR phase = 'claimed'`,
 		},
 	},
+	{
+		version: 10,
+		name:    "delivery run contracts",
+		apply:   migrateDeliveryRunContracts,
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{
+	"migrations",
+	"projects",
+	"runs",
+	"run_events",
+	"run_edges",
+	"reports",
+	"child_plans",
+	"run_claims",
+	"legacy_import_records",
+	"legacy_import_status",
+	"delivery_runs",
+	"delivery_tasks",
+	"delivery_dependency_edges",
+	"delivery_attempts",
+	"delivery_decisions",
+	"delivery_approvals",
+	"delivery_overrides",
+	"delivery_plan_fingerprints",
+	"delivery_idempotency",
+	"delivery_migration_backups",
+	"delivery_legacy_imports",
+}
 
 type migration struct {
 	version    int
