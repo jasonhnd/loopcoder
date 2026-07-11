@@ -54,6 +54,18 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
+`doctor --format json` also includes `provider_inventory`, and
+`loopcoder providers refresh --repo .` persists the same bounded installation
+inventory in machine-local SQLite. ProviderInstallation and ProbeResult records
+show discovery source, redacted executable provenance, captured time,
+freshness, confidence, probe outcome, output bounds, and
+`usable_for_invocation: "unknown"` from installation evidence alone.
+Provider installation probes pass only a bounded environment allowlist for
+location and platform facts; script shims may receive variables such as
+`LOCALAPPDATA`, `APPDATA`, `SystemRoot`, `ComSpec`, `PATH`, `PATHEXT`, `TMPDIR`,
+`LANG`, and `LC_ALL`, but credential-like variable names are denied regardless
+of allowlist membership.
+
 Support levels:
 
 | Level | Meaning |

@@ -80,6 +80,30 @@ func TestParseReadsHostProfile(t *testing.T) {
 	}
 }
 
+func TestParseRejectsUnsafeWorkerAdapterName(t *testing.T) {
+	_, err := Parse([]byte("version: 1\nadapters:\n  worker: \"../../evil\"\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want unsafe worker adapter rejection")
+	}
+	for _, want := range []string{"adapters.worker", "../../evil", "safe provider adapter name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+	}
+}
+
+func TestParseRejectsUnsafeVerifierAdapterName(t *testing.T) {
+	_, err := Parse([]byte("version: 1\nadapters:\n  verifier: \"bad;provider\"\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want unsafe verifier adapter rejection")
+	}
+	for _, want := range []string{"adapters.verifier", "bad;provider", "safe provider adapter name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+	}
+}
+
 func TestParseRejectsUnknownHostProfile(t *testing.T) {
 	_, err := Parse([]byte("version: 1\nhost:\n  profile: unknown-host\n"))
 	if err == nil {
