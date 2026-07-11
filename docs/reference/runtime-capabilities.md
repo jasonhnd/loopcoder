@@ -54,6 +54,13 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
+`doctor --format json` also includes `provider_inventory`, and
+`loopcoder providers refresh --repo .` persists the same bounded installation
+inventory in machine-local SQLite. ProviderInstallation and ProbeResult records
+show discovery source, redacted executable provenance, captured time,
+freshness, confidence, probe outcome, output bounds, and
+`usable_for_invocation: "unknown"` from installation evidence alone.
+
 Support levels:
 
 | Level | Meaning |

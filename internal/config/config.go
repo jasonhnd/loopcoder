@@ -19,22 +19,23 @@ import (
 )
 
 type Config struct {
-	Version      int          `yaml:"version"`
-	Adapters     Adapters     `yaml:"adapters"`
-	Worker       Worker       `yaml:"worker"`
-	Verifier     Verifier     `yaml:"verifier"`
-	CI           CI           `yaml:"ci"`
-	Models       Models       `yaml:"models"`
-	Verification Verification `yaml:"verification"`
-	Resilience   Resilience   `yaml:"resilience"`
-	Guardrails   Guardrails   `yaml:"guardrails"`
-	Environment  Environment  `yaml:"environment"`
-	Evidence     Evidence     `yaml:"evidence"`
-	Host         Host         `yaml:"host,omitempty"`
-	Domain       Domain       `yaml:"domain,omitempty"`
-	MCP          MCP          `yaml:"mcp,omitempty"`
-	Audit        Audit        `yaml:"audit,omitempty"`
-	Report       Report       `yaml:"report"`
+	Version           int               `yaml:"version"`
+	Adapters          Adapters          `yaml:"adapters"`
+	Worker            Worker            `yaml:"worker"`
+	Verifier          Verifier          `yaml:"verifier"`
+	CI                CI                `yaml:"ci"`
+	Models            Models            `yaml:"models"`
+	Verification      Verification      `yaml:"verification"`
+	Resilience        Resilience        `yaml:"resilience"`
+	Guardrails        Guardrails        `yaml:"guardrails"`
+	Environment       Environment       `yaml:"environment"`
+	Evidence          Evidence          `yaml:"evidence"`
+	Host              Host              `yaml:"host,omitempty"`
+	Domain            Domain            `yaml:"domain,omitempty"`
+	MCP               MCP               `yaml:"mcp,omitempty"`
+	ProviderInventory ProviderInventory `yaml:"provider_inventory,omitempty"`
+	Audit             Audit             `yaml:"audit,omitempty"`
+	Report            Report            `yaml:"report"`
 }
 
 type ShowBaseConfigFunc func(ctx context.Context, repoPath, baseBranch string) ([]byte, error)
@@ -248,6 +249,10 @@ type MCPAuth struct {
 	Env    string `yaml:"env,omitempty"`
 }
 
+type ProviderInventory struct {
+	Executables map[string][]string `yaml:"executables,omitempty"`
+}
+
 // Audit is the optional 0.5.3 audit command configuration surface. It is
 // additive: absent fields preserve built-in audit defaults.
 type Audit struct {
@@ -413,6 +418,9 @@ func Parse(data []byte) (Config, error) {
 }
 
 func validateParsedConfig(cfg Config) error {
+	if err := validateAdapterProviderNames(cfg.Adapters); err != nil {
+		return err
+	}
 	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
 		return err
 	}
@@ -420,6 +428,9 @@ func validateParsedConfig(cfg Config) error {
 		return err
 	}
 	if err := validateMCP(cfg.MCP); err != nil {
+		return err
+	}
+	if err := validateProviderInventory(cfg.ProviderInventory); err != nil {
 		return err
 	}
 	if err := validateDomainCommands(cfg.Domain); err != nil {
@@ -430,6 +441,25 @@ func validateParsedConfig(cfg Config) error {
 	}
 	if err := validateHost(cfg.Host); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateAdapterProviderNames(adapters Adapters) error {
+	for _, candidate := range []struct {
+		path  string
+		value string
+	}{
+		{path: "adapters.worker", value: adapters.Worker},
+		{path: "adapters.verifier", value: adapters.Verifier},
+	} {
+		value := strings.TrimSpace(candidate.value)
+		if value == "" {
+			continue
+		}
+		if !validMCPServerName(value) {
+			return fmt.Errorf("invalid delivery config: %s %q is not a safe provider adapter name", candidate.path, candidate.value)
+		}
 	}
 	return nil
 }
@@ -511,6 +541,20 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 
 func validateMCP(m MCP) error {
 	return validateMCPDeclarations(m, "invalid delivery config: ")
+}
+
+func validateProviderInventory(inventory ProviderInventory) error {
+	for provider, paths := range inventory.Executables {
+		if !validMCPServerName(provider) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.executables contains unsafe provider key %q", provider)
+		}
+		for index, path := range paths {
+			if strings.TrimSpace(path) == "" {
+				return fmt.Errorf("invalid delivery config: provider_inventory.executables.%s[%d] must not be empty", provider, index)
+			}
+		}
+	}
+	return nil
 }
 
 func validateMCPDeclarations(m MCP, errorPrefix string) error {

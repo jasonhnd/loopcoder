@@ -30,6 +30,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/provider"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
@@ -83,6 +84,7 @@ type Deps struct {
 	ProjectShow        func(context.Context, registry.Options) (registry.ShowResult, error)
 	ProjectDuplicates  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	ProjectRepair      func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	ProviderInventory  func(context.Context, providerinventory.Options) (providerinventory.Report, error)
 }
 
 type CommandResult struct {
@@ -109,6 +111,7 @@ type Report struct {
 	HostProfile           HostProfile
 	Runtime               RuntimeHealth
 	ProviderCompatibility []ProviderCompatibility
+	ProviderInventory     providerinventory.Report
 	Checks                []Check
 }
 
@@ -351,6 +354,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		Host                  renderedHostProfile             `json:"host_profile"`
 		Runtime               renderedRuntime                 `json:"runtime"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
+		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
 		Checks                []renderedCheck                 `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
@@ -369,6 +373,7 @@ func RenderJSON(w io.Writer, report Report) error {
 			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
 		},
 		ProviderCompatibility: compatibility,
+		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
 		Checks:                checks,
 	}
 	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
@@ -428,6 +433,43 @@ func renderLegacySurfaces(surfaces []LegacySurface) []renderedLegacySurface {
 	return out
 }
 
+func normalizeProviderInventory(report providerinventory.Report) providerinventory.Report {
+	if strings.TrimSpace(report.SchemaVersion) == "" {
+		report.SchemaVersion = providerinventory.ProviderInventoryJSONSchema
+	}
+	if strings.TrimSpace(report.GeneratedAt) == "" {
+		report.GeneratedAt = "1970-01-01T00:00:00Z"
+	}
+	if strings.TrimSpace(report.InventoryFingerprint) == "" {
+		report.InventoryFingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	if report.Confidence == "" {
+		report.Confidence = providerinventory.ConfidenceUnknown
+	}
+	if report.Installations == nil {
+		report.Installations = []providerinventory.ProviderInstallation{}
+	}
+	if report.ProbeResults == nil {
+		report.ProbeResults = []providerinventory.ProbeResult{}
+	}
+	if report.AccountProfiles == nil {
+		report.AccountProfiles = []any{}
+	}
+	if report.AuthReadiness == nil {
+		report.AuthReadiness = []any{}
+	}
+	if report.ModelCatalogSnapshots == nil {
+		report.ModelCatalogSnapshots = []any{}
+	}
+	if report.ModelCapabilities == nil {
+		report.ModelCapabilities = []any{}
+	}
+	if report.GapReasons == nil {
+		report.GapReasons = []string{}
+	}
+	return report
+}
+
 func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 	build = normalizeBuildInfo(build)
 	if strings.TrimSpace(report.RepoPath) == "" {
@@ -478,6 +520,9 @@ func DefaultDeps() Deps {
 		ProjectRepair: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
 			return registry.RepairDuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
 		},
+		ProviderInventory: func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			return providerinventory.Discover(ctx, opts, providerinventory.DefaultDeps())
+		},
 	}
 }
 
@@ -501,6 +546,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	}
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
+	inventory, inventoryCheck := discoverProviderInventory(ctx, repoPath, delivery.Config, deps)
 	checks := make([]Check, 0, 10)
 	host, hostCheck := resolveHostProfile(delivery, deps)
 
@@ -516,7 +562,10 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkDeliveryConfig(delivery))
 	checks = append(checks, hostCheck)
 	checks = append(checks, checkModelSelections(delivery))
-	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
+	if inventoryCheck.Name != "" {
+		checks = append(checks, inventoryCheck)
+	}
+	checks = append(checks, checkProviders(inventory, configuredProviders(delivery.Config))...)
 	checks = append(checks, checkProviderCompatibility(delivery.Config, host)...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
@@ -547,6 +596,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		HostProfile:           host,
 		Runtime:               runtimeHealth(ctx, repoPath, deps),
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
+		ProviderInventory:     inventory,
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -595,6 +645,7 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		Runtime:               readOnly.Runtime,
 		HostProfile:           readOnly.HostProfile,
 		ProviderCompatibility: readOnly.ProviderCompatibility,
+		ProviderInventory:     readOnly.ProviderInventory,
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -914,6 +965,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ProjectRepair == nil {
 		deps.ProjectRepair = defaults.ProjectRepair
+	}
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = defaults.ProviderInventory
 	}
 	return deps
 }
@@ -2132,42 +2186,98 @@ func configuredProviders(cfg config.Config) []providerSpec {
 	return providers
 }
 
-func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []Check {
+func discoverProviderInventory(ctx context.Context, repoPath string, cfg config.Config, deps Deps) (providerinventory.Report, Check) {
+	report, err := deps.ProviderInventory(ctx, providerinventory.Options{
+		RepoPath: repoPath,
+		Config:   cfg,
+	})
+	if err != nil {
+		return normalizeProviderInventory(providerinventory.Report{}), Check{
+			Name:    "provider inventory",
+			Code:    "provider_inventory_failed",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("bounded provider CLI discovery failed: %v", err),
+		}
+	}
+	return normalizeProviderInventory(report), Check{
+		Name:    "provider inventory",
+		Code:    "provider_inventory_refreshed",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("bounded install probes captured %d installation(s) and %d probe result(s); usable capacity remains unknown without auth, model, quota, and invocation checks", len(report.Installations), len(report.ProbeResults)),
+	}
+}
+
+func checkProviders(inventory providerinventory.Report, providers []providerSpec) []Check {
 	checks := make([]Check, 0, len(providers))
 	for _, provider := range providers {
 		roleText := strings.Join(provider.Roles, ", ")
 		cliName := providerCLIName(provider.Name)
-		path, err := deps.LookPath(cliName)
-		if err != nil || strings.TrimSpace(path) == "" {
+		installations := installationsForProvider(inventory, provider.Name)
+		if len(installations) == 0 {
 			status := StatusWarn
 			hard := false
 			fix := ""
 			if provider.Name == "antigravity" {
 				status = StatusFail
 				hard = true
-				fix = "; install Google Antigravity CLI and run: agy login"
+				fix = "; install Google Antigravity CLI"
 			}
 			checks = append(checks, Check{
 				Name:    "provider " + provider.Name,
 				Code:    "missing_executable",
 				Status:  status,
-				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH%s", roleText, cliName, fix),
+				Message: fmt.Sprintf("configured for %s but declared CLI %q was not found through bounded provider inventory probes%s", roleText, cliName, fix),
 				Hard:    hard,
 			})
 			continue
 		}
-		if provider.Name == "antigravity" {
-			checks = append(checks, checkAntigravityOAuth(ctx, deps, roleText, path))
-			continue
+		best := installations[0]
+		status := StatusOK
+		code := "provider_installed"
+		for _, installation := range installations {
+			if installation.InstallationState == providerinventory.InstallationInstalled {
+				best = installation
+				break
+			}
+		}
+		if best.InstallationState != providerinventory.InstallationInstalled {
+			status = StatusWarn
+			code = "provider_installation_probe_failed"
 		}
 		checks = append(checks, Check{
-			Name:    "provider " + provider.Name,
-			Code:    "provider_ready",
-			Status:  StatusOK,
-			Message: fmt.Sprintf("configured for %s; CLI %q found at %s; authentication not checked by a stable cheap probe", roleText, cliName, path),
+			Name:   "provider " + provider.Name,
+			Code:   code,
+			Status: status,
+			Message: fmt.Sprintf("configured for %s; CLI %q discovered via %s at %s; state=%s confidence=%s freshness=%s captured_at=%s usable_for_invocation=%s; auth, account, model authorization, quota, and invocation readiness not checked",
+				roleText,
+				cliName,
+				best.DiscoverySource,
+				best.CanonicalPathRedacted,
+				best.InstallationState,
+				best.Confidence,
+				best.FreshnessState,
+				best.CapturedAt,
+				best.UsableForInvocation,
+			),
 		})
 	}
 	return checks
+}
+
+func installationsForProvider(inventory providerinventory.Report, providerName string) []providerinventory.ProviderInstallation {
+	var out []providerinventory.ProviderInstallation
+	for _, installation := range inventory.Installations {
+		if installation.AdapterID == providerName {
+			out = append(out, installation)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].InstallationState != out[j].InstallationState {
+			return out[i].InstallationState == providerinventory.InstallationInstalled
+		}
+		return out[i].DiscoveryOrder < out[j].DiscoveryOrder
+	})
+	return out
 }
 
 func checkProviderCompatibility(cfg config.Config, host HostProfile) []Check {
@@ -2282,65 +2392,6 @@ func providerCLIName(provider string) string {
 		return strings.TrimSpace(registered.CLI)
 	}
 	return provider
-}
-
-func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string) Check {
-	result, err := deps.RunCommand(ctx, "", "agy", "models")
-	if err != nil {
-		detail := commandDetail(result)
-		if detail != "" {
-			detail = ": " + detail
-		}
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models could not run: %v%s; run: agy login", roleText, path, err, detail),
-			Hard:    true,
-		}
-	}
-	if result.ExitCode != 0 {
-		detail := commandDetail(result)
-		if detail == "" {
-			detail = fmt.Sprintf("exit code %d", result.ExitCode)
-		}
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models failed: %s; run: agy login", roleText, path, detail),
-			Hard:    true,
-		}
-	}
-	if antigravityAuthProbeLooksFailed(result.Stdout + "\n" + result.Stderr) {
-		detail := commandDetail(result)
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models reported an authentication problem: %s; run: agy login", roleText, path, firstNonEmpty(detail, "authentication required")),
-			Hard:    true,
-		}
-	}
-	return Check{
-		Name:    "provider antigravity",
-		Code:    "provider_authenticated",
-		Status:  StatusOK,
-		Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s; agy models OAuth probe succeeded", roleText, path),
-	}
-}
-
-func antigravityAuthProbeLooksFailed(text string) bool {
-	lower := strings.ToLower(text)
-	authSignal := strings.Contains(lower, "oauth") ||
-		strings.Contains(lower, "login") ||
-		strings.Contains(lower, "auth")
-	failureSignal := strings.Contains(lower, "error") ||
-		strings.Contains(lower, "failed") ||
-		strings.Contains(lower, "required") ||
-		strings.Contains(lower, "unauthorized") ||
-		strings.Contains(lower, "not logged")
-	return authSignal && failureSignal
 }
 
 func checkOrigin(ctx context.Context, deps Deps, repoPath string, gitPresent bool) (Check, bool) {

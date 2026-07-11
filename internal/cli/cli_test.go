@@ -28,6 +28,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -133,6 +134,94 @@ func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	}
 	if payload.HostProfile.Name != "codex-cli" || payload.HostProfile.Source != "env" || len(payload.Checks) != 1 {
 		t.Fatalf("payload = %#v, want host profile and one check", payload)
+	}
+}
+
+func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	report := providerinventory.Report{
+		SchemaVersion:        providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:          now.Format(time.RFC3339),
+		InventoryFingerprint: "sha256:test",
+		Confidence:           providerinventory.ConfidenceExact,
+		Installations: []providerinventory.ProviderInstallation{{
+			SchemaVersion:          providerinventory.ProviderInstallationSchema,
+			RecordVersion:          1,
+			Scope:                  "machine",
+			ProviderInstallationID: "pinst_test",
+			AdapterID:              "codex",
+			AdapterDeclarationID:   "adapter_test",
+			ProviderDisplayName:    "Codex",
+			ExecutableName:         "codex",
+			ExecutableIdentity: providerinventory.ExecutableIdentity{
+				Basename:          "codex",
+				Platform:          "test",
+				PathHash:          "sha256:test",
+				SymlinkResolution: "not-symlink",
+				ExecutableMode:    "executable",
+			},
+			CanonicalPathRedacted: ".../bin/codex",
+			DiscoverySource:       providerinventory.DiscoveryPath,
+			VersionConfidence:     providerinventory.ConfidenceExact,
+			InstallationState:     providerinventory.InstallationInstalled,
+			UsableForInvocation:   "unknown",
+			KnownLimitations:      []string{},
+			CreatedAt:             now.Format(time.RFC3339),
+			UpdatedAt:             now.Format(time.RFC3339),
+			CreatedBy:             providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"},
+			UpdatedBy:             providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"},
+			Host:                  providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"},
+			PolicyVersion:         providerinventory.PolicyVersion,
+			Confidence:            providerinventory.ConfidenceExact,
+			FreshnessState:        providerinventory.FreshnessFresh,
+			CapturedAt:            now.Format(time.RFC3339),
+			SideEffectClass:       "local-read",
+			Classification:        "sensitive-path",
+			Source:                providerinventory.SourceDescriptor{Kind: "test", AdapterID: "codex"},
+			Evidence:              providerinventory.EvidenceSummary{Kind: "test", CommandBounded: true, NoShell: true},
+			GapReasons:            []string{},
+		}},
+		ProbeResults:          []providerinventory.ProbeResult{},
+		AccountProfiles:       []any{},
+		AuthReadiness:         []any{},
+		ModelCatalogSnapshots: []any{},
+		ModelCapabilities:     []any{},
+		GapReasons:            []string{},
+	}
+	refreshed := false
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "refresh", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			return report, nil
+		},
+		ProviderInventoryRefresh: func(_ context.Context, got providerinventory.Report, gotNow time.Time) error {
+			refreshed = true
+			if got.InventoryFingerprint != report.InventoryFingerprint || !gotNow.Equal(now) {
+				t.Fatalf("refresh args = %#v %s", got, gotNow)
+			}
+			return nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if !refreshed {
+		t.Fatal("ProviderInventoryRefresh was not called")
+	}
+	var payload providerinventory.Report
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != providerinventory.ProviderInventoryJSONSchema || len(payload.Installations) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Installations[0].UsableForInvocation != "unknown" {
+		t.Fatalf("usable_for_invocation = %q, want unknown", payload.Installations[0].UsableForInvocation)
 	}
 }
 
