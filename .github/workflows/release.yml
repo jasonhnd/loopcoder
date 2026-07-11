@@ -181,34 +181,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          assets=(dist/loopcoder_* dist/SHA256SUMS dist/SHA256SUMS.sigstore)
-          notes_file=".github/release-notes/${TAG_NAME}.md"
-          if [[ -f "${notes_file}" ]]; then
-            cp "${notes_file}" release-notes.md
-          else
-            identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG_NAME}"
-            issuer="https://token.actions.githubusercontent.com"
-            printf 'Automated release for %s. SHA256SUMS is signed with cosign keyless identity %s and OIDC issuer %s.\n' "${TAG_NAME}" "${identity}" "${issuer}" > release-notes.md
-          fi
-
-          release_json="$(gh api "repos/${GH_REPO}/releases/tags/${TAG_NAME}" 2>/dev/null || true)"
-          if [[ -n "${release_json}" ]]; then
-            draft="$(jq -r '.draft' <<<"${release_json}")"
-            if [[ "${draft}" != "true" ]]; then
-              echo "release ${TAG_NAME} already exists and is public; refusing to overwrite final release" >&2
-              exit 1
-            fi
-            gh release edit "${TAG_NAME}" --repo "${GH_REPO}" --prerelease --notes-file release-notes.md
-            gh release upload "${TAG_NAME}" --repo "${GH_REPO}" "${assets[@]}" --clobber
-          else
-            gh release create "${TAG_NAME}" "${assets[@]}" \
-              --repo "${GH_REPO}" \
-              --verify-tag \
-              --draft \
-              --prerelease \
-              --title "${TAG_NAME}" \
-              --notes-file release-notes.md
-          fi
+          # ubuntu-latest includes python3, which the helper uses for JSON parsing.
+          bash scripts/stage-draft-release.sh
 
   smoke:
     name: smoke (${{ matrix.os }})
