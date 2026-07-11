@@ -92,12 +92,13 @@ type CommandResult struct {
 }
 
 type Check struct {
-	Name       string
-	Code       string
-	Status     Status
-	Message    string
-	Hard       bool
-	FixCommand string
+	Name           string
+	Code           string
+	Status         Status
+	Message        string
+	Hard           bool
+	FixCommand     string
+	LegacySurfaces []LegacySurface
 }
 
 type Report struct {
@@ -171,7 +172,32 @@ type RuntimeProjectRegistry struct {
 type RuntimeMigration struct {
 	Status         Status
 	LegacySurfaces int
+	Surfaces       []LegacySurface
 	Message        string
+}
+
+type LegacySurface struct {
+	Surface        string
+	Identifier     string
+	Classification string
+	Remediation    string
+	Legacy         string
+	Current        string
+	Location       string
+	Detail         string
+	Conflict       bool
+}
+
+type renderedLegacySurface struct {
+	Surface        string `json:"surface"`
+	Identifier     string `json:"identifier"`
+	Classification string `json:"classification"`
+	Remediation    string `json:"remediation"`
+	Legacy         string `json:"legacy,omitempty"`
+	Current        string `json:"current,omitempty"`
+	Location       string `json:"location,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+	Conflict       bool   `json:"conflict,omitempty"`
 }
 
 type RuntimeNestedRuns struct {
@@ -206,18 +232,26 @@ func Render(w io.Writer, report Report) error {
 		if _, err := fmt.Fprintf(w, "[%s] %s: %s\n", check.Status, check.Name, check.Message); err != nil {
 			return err
 		}
+		if len(check.LegacySurfaces) > 0 {
+			for _, surface := range check.LegacySurfaces {
+				if _, err := fmt.Fprintf(w, "  - %s: identifier=%s classification=%s remediation=%s\n", surface.Surface, surface.Identifier, surface.Classification, surface.Remediation); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
 
 func RenderJSON(w io.Writer, report Report) error {
 	type renderedCheck struct {
-		Name       string `json:"name"`
-		Code       string `json:"code,omitempty"`
-		Status     Status `json:"status"`
-		Hard       bool   `json:"hard"`
-		Message    string `json:"message"`
-		FixCommand string `json:"fix_command"`
+		Name           string                  `json:"name"`
+		Code           string                  `json:"code,omitempty"`
+		Status         Status                  `json:"status"`
+		Hard           bool                    `json:"hard"`
+		Message        string                  `json:"message"`
+		FixCommand     string                  `json:"fix_command"`
+		LegacySurfaces []renderedLegacySurface `json:"legacy_surfaces,omitempty"`
 	}
 	type renderedHostProfile struct {
 		Name               string   `json:"name"`
@@ -267,9 +301,10 @@ func RenderJSON(w io.Writer, report Report) error {
 			Message        string `json:"message"`
 		} `json:"project_registry"`
 		Migration struct {
-			Status         Status `json:"status"`
-			LegacySurfaces int    `json:"legacy_surfaces"`
-			Message        string `json:"message"`
+			Status         Status                  `json:"status"`
+			LegacySurfaces int                     `json:"legacy_surfaces"`
+			Surfaces       []renderedLegacySurface `json:"surfaces,omitempty"`
+			Message        string                  `json:"message"`
 		} `json:"migration"`
 		NestedRuns struct {
 			Status       Status `json:"status"`
@@ -282,13 +317,15 @@ func RenderJSON(w io.Writer, report Report) error {
 	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
+		surfaces := renderLegacySurfaces(check.LegacySurfaces)
 		checks = append(checks, renderedCheck{
-			Name:       check.Name,
-			Code:       check.Code,
-			Status:     check.Status,
-			Hard:       check.Hard,
-			Message:    check.Message,
-			FixCommand: check.FixCommand,
+			Name:           check.Name,
+			Code:           check.Code,
+			Status:         check.Status,
+			Hard:           check.Hard,
+			Message:        check.Message,
+			FixCommand:     check.FixCommand,
+			LegacySurfaces: surfaces,
 		})
 	}
 	compatibility := make([]renderedProviderCompatibility, 0, len(report.ProviderCompatibility))
@@ -357,6 +394,7 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
 	payload.Runtime.Migration.Status = report.Runtime.Migration.Status
 	payload.Runtime.Migration.LegacySurfaces = report.Runtime.Migration.LegacySurfaces
+	payload.Runtime.Migration.Surfaces = renderLegacySurfaces(report.Runtime.Migration.Surfaces)
 	payload.Runtime.Migration.Message = report.Runtime.Migration.Message
 	payload.Runtime.NestedRuns.Status = report.Runtime.NestedRuns.Status
 	payload.Runtime.NestedRuns.RunCount = report.Runtime.NestedRuns.RunCount
@@ -367,6 +405,27 @@ func RenderJSON(w io.Writer, report Report) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
+}
+
+func renderLegacySurfaces(surfaces []LegacySurface) []renderedLegacySurface {
+	if len(surfaces) == 0 {
+		return nil
+	}
+	out := make([]renderedLegacySurface, 0, len(surfaces))
+	for _, surface := range surfaces {
+		out = append(out, renderedLegacySurface{
+			Surface:        surface.Surface,
+			Identifier:     filepath.ToSlash(surface.Identifier),
+			Classification: surface.Classification,
+			Remediation:    surface.Remediation,
+			Legacy:         surface.Legacy,
+			Current:        surface.Current,
+			Location:       filepath.ToSlash(surface.Location),
+			Detail:         surface.Detail,
+			Conflict:       surface.Conflict,
+		})
+	}
+	return out
 }
 
 func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
@@ -503,12 +562,14 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		fixStaleState(repoPath),
 	}
 	status := scanMigrationStatus(repoPath, deps)
-	remaining := migrationLegacyCount(status)
+	remainingSurfaces := migrationLegacySurfaces(status, true)
+	remaining := len(remainingSurfaces)
 	if remaining > 0 {
 		checks = append(checks, Check{
-			Name:    "post-upgrade repair",
-			Status:  StatusWarn,
-			Message: fmt.Sprintf("repair completed with %d legacy surface(s) still reported; env vars must be changed in the shell and unreadable state may need manual repair", remaining),
+			Name:           "post-upgrade repair",
+			Status:         StatusWarn,
+			Message:        fmt.Sprintf("repair completed with %d legacy surface(s) still reported; see per-surface remediation below", remaining),
+			LegacySurfaces: remainingSurfaces,
 		})
 	} else {
 		checks = append(checks, Check{
@@ -523,6 +584,12 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		BaseBranch: baseBranch,
 		BuildInfo:  build,
 	}, deps)
+	readOnly.Runtime.Migration = runtimeMigrationWithMode(repoPath, deps, true)
+	for i := range readOnly.Checks {
+		if readOnly.Checks[i].Name == "migration status" {
+			readOnly.Checks[i] = checkMigrationStatusWithMode(repoPath, deps, true)
+		}
+	}
 	checks = append(checks, readOnly.Checks...)
 	return WithMetadata(Report{
 		Runtime:               readOnly.Runtime,
@@ -1482,13 +1549,18 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 }
 
 func runtimeMigration(repoPath string, deps Deps) RuntimeMigration {
+	return runtimeMigrationWithMode(repoPath, deps, false)
+}
+
+func runtimeMigrationWithMode(repoPath string, deps Deps, afterFix bool) RuntimeMigration {
 	status := scanMigrationStatus(repoPath, deps)
-	legacyCount := migrationLegacyCount(status)
-	if legacyCount > 0 {
+	surfaces := migrationLegacySurfaces(status, afterFix)
+	if len(surfaces) > 0 {
 		return RuntimeMigration{
 			Status:         StatusWarn,
-			LegacySurfaces: legacyCount,
-			Message:        "legacy surfaces require explicit doctor --fix migration",
+			LegacySurfaces: len(surfaces),
+			Surfaces:       surfaces,
+			Message:        legacySurfaceSummary(afterFix),
 		}
 	}
 	if strings.TrimSpace(status.ScanWarning) != "" {
@@ -2463,7 +2535,7 @@ func checkVersionStatus(build BuildInfo, repoPath string, deps Deps) Check {
 	}
 	if legacyCount > 0 {
 		status = StatusWarn
-		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); run: loopcoder doctor --repo . --fix", legacyCount))
+		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); see migration status check for per-surface remediation", legacyCount))
 	} else {
 		parts = append(parts, "migration scan found no legacy surfaces")
 	}
@@ -3121,14 +3193,19 @@ func compareSemver(a, b semver) int {
 }
 
 func checkMigrationStatus(repoPath string, deps Deps) Check {
-	status := scanMigrationStatus(repoPath, deps)
-	legacyCount := migrationLegacyCount(status)
+	return checkMigrationStatusWithMode(repoPath, deps, false)
+}
 
-	if legacyCount > 0 {
+func checkMigrationStatusWithMode(repoPath string, deps Deps, afterFix bool) Check {
+	status := scanMigrationStatus(repoPath, deps)
+	surfaces := migrationLegacySurfaces(status, afterFix)
+
+	if len(surfaces) > 0 {
 		return Check{
-			Name:    "migration status",
-			Status:  StatusWarn,
-			Message: fmt.Sprintf("found %d legacy surface(s) requiring migration; run: loopcoder doctor --repo . --fix", legacyCount),
+			Name:           "migration status",
+			Status:         StatusWarn,
+			Message:        fmt.Sprintf("found %d legacy surface(s) requiring migration; see per-surface remediation below", len(surfaces)),
+			LegacySurfaces: surfaces,
 		}
 	}
 	return Check{
@@ -3148,7 +3225,99 @@ func scanMigrationStatus(repoPath string, deps Deps) upgrade.MigrationStatus {
 }
 
 func migrationLegacyCount(status upgrade.MigrationStatus) int {
+	return len(migrationLegacySurfaces(status, false))
+}
+
+func legacySurfaceSummary(afterFix bool) string {
+	if afterFix {
+		return "legacy surfaces remain after doctor --fix; follow per-surface remediation"
+	}
+	return "legacy surfaces require migration; follow per-surface remediation"
+}
+
+func migrationLegacySurfaces(status upgrade.MigrationStatus, afterFix bool) []LegacySurface {
+	surfaces := make([]LegacySurface, 0, migrationLegacyCountRaw(status))
+	appendDiagnosticSurfaces := func(diagnostics []migration.Diagnostic) {
+		for _, diagnostic := range diagnostics {
+			surfaces = append(surfaces, legacySurfaceFromDiagnostic(diagnostic, afterFix))
+		}
+	}
+	appendDiagnosticSurfaces(status.ConfigDiagnostics)
+	appendDiagnosticSurfaces(status.EnvDiagnostics)
+	appendDiagnosticSurfaces(status.HookDiagnostics)
+	for _, diagnostic := range status.OldSurfaceDiagnostics {
+		surfaces = append(surfaces, legacySurfaceFromOldSurface(diagnostic, afterFix))
+	}
+	sort.SliceStable(surfaces, func(i, j int) bool {
+		if surfaces[i].Surface != surfaces[j].Surface {
+			return surfaces[i].Surface < surfaces[j].Surface
+		}
+		return surfaces[i].Identifier < surfaces[j].Identifier
+	})
+	return surfaces
+}
+
+func migrationLegacyCountRaw(status upgrade.MigrationStatus) int {
 	return len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
+}
+
+func legacySurfaceFromDiagnostic(diagnostic migration.Diagnostic, afterFix bool) LegacySurface {
+	surface := LegacySurface{
+		Surface:    string(diagnostic.Surface),
+		Identifier: diagnostic.Legacy,
+		Legacy:     diagnostic.Legacy,
+		Current:    diagnostic.Current,
+		Detail:     diagnostic.Detail,
+		Conflict:   diagnostic.Conflict,
+	}
+	switch diagnostic.Surface {
+	case migration.SurfaceEnv:
+		surface.Classification = "manual"
+		surface.Remediation = firstNonEmpty(diagnostic.FixCommand, fmt.Sprintf("set %s and unset %s in the shell environment", diagnostic.Current, diagnostic.Legacy))
+	case migration.SurfaceHookCommand:
+		surface.Identifier = fmt.Sprintf(".claude/settings.json command %q", diagnostic.Legacy)
+		surface.Location = ".claude/settings.json"
+		if afterFix {
+			surface.Classification = "manual"
+			surface.Remediation = "doctor --fix did not clear this hook command; inspect .claude/settings.json and replace the legacy command manually"
+		} else {
+			surface.Classification = "fix-with-flag"
+			surface.Remediation = "run: loopcoder doctor --repo . --fix"
+		}
+	case migration.SurfaceConfigKey:
+		surface.Identifier = fmt.Sprintf(".delivery.yml key %q", diagnostic.Legacy)
+		surface.Location = ".delivery.yml"
+		if afterFix {
+			surface.Classification = "manual"
+			surface.Remediation = "doctor --fix did not clear this config key; inspect .delivery.yml and migrate it to the current report key manually"
+		} else {
+			surface.Classification = "fix-with-flag"
+			surface.Remediation = "run: loopcoder doctor --repo . --fix"
+		}
+	default:
+		surface.Classification = "ignorable-during-transition-window"
+		surface.Remediation = firstNonEmpty(diagnostic.FixCommand, "accepted by compatibility aliases during the transition window")
+	}
+	return surface
+}
+
+func legacySurfaceFromOldSurface(diagnostic upgrade.OldSurfaceDiagnostic, afterFix bool) LegacySurface {
+	surface := LegacySurface{
+		Surface:    diagnostic.Surface,
+		Identifier: firstNonEmpty(diagnostic.Location, diagnostic.Legacy),
+		Legacy:     diagnostic.Legacy,
+		Current:    diagnostic.Current,
+		Location:   diagnostic.Location,
+		Detail:     diagnostic.Detail,
+	}
+	if afterFix {
+		surface.Classification = "manual"
+		surface.Remediation = fmt.Sprintf("doctor --fix did not clear this %s; inspect the reported path and repair it manually", diagnostic.Surface)
+		return surface
+	}
+	surface.Classification = "fix-with-flag"
+	surface.Remediation = "run: loopcoder doctor --repo . --fix"
+	return surface
 }
 
 func checkStaleState(repoPath string, deps Deps) Check {

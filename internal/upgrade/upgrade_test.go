@@ -894,6 +894,38 @@ func TestRunReports060MigrationStatusAfterUpgrade(t *testing.T) {
 	}
 }
 
+func TestScanMigrationStatusSortsLegacyStateEntries(t *testing.T) {
+	repo := t.TempDir()
+	writeTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+	aPath := filepath.Join(repo, ".loopcoder", "runs", "run-a", "workers", "a.attempt.json")
+	bPath := filepath.Join(repo, ".loopcoder", "runs", "run-b", "workers", "b.attempt.json")
+	writeTextFile(t, bPath, fmt.Sprintf(`{"%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+	writeTextFile(t, aPath, fmt.Sprintf(`{"%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	deps := DefaultDeps()
+	deps.Getwd = func() (string, error) { return repo, nil }
+	deps.Getenv = func(string) string { return "" }
+	deps.ReadDir = func(path string) ([]fs.DirEntry, error) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+			entries[i], entries[j] = entries[j], entries[i]
+		}
+		return entries, nil
+	}
+
+	status := ScanMigrationStatus(deps)
+	if len(status.OldSurfaceDiagnostics) != 2 {
+		t.Fatalf("OldSurfaceDiagnostics = %#v, want two state-key diagnostics", status.OldSurfaceDiagnostics)
+	}
+	if status.OldSurfaceDiagnostics[0].Location != aPath || status.OldSurfaceDiagnostics[1].Location != bPath {
+		t.Fatalf("diagnostic order = %#v, want a then b", status.OldSurfaceDiagnostics)
+	}
+}
+
 func TestParseSkillInstallOutputRequiresBothManagedFiles(t *testing.T) {
 	_, _, err := parseSkillInstallOutput("loopcoder skill install complete\n" +
 		"  directory /home/.claude/skills/loopcoder\n" +

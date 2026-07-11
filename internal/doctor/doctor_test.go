@@ -1146,11 +1146,66 @@ func TestCheckMigrationStatusWarnsForLegacySurfaces(t *testing.T) {
 	if check.Status != StatusWarn {
 		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{"legacy surface(s)", "run: loopcoder doctor --repo . --fix"} {
+	for _, want := range []string{"legacy surface(s)", "per-surface remediation"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("message = %q, want containing %q", check.Message, want)
 		}
 	}
+	if len(check.LegacySurfaces) != 3 {
+		t.Fatalf("LegacySurfaces = %#v, want env plus two config surfaces", check.LegacySurfaces)
+	}
+	assertLegacySurface(t, check.LegacySurfaces, migration.LegacyReporterScopeEnv, "manual", "set LOOPCODER_CONDUCTOR_REPORTER_SCOPE")
+	assertLegacySurface(t, check.LegacySurfaces, `.delivery.yml key "`+migration.LegacyReportConfigRoot+`"`, "fix-with-flag", "loopcoder doctor --repo . --fix")
+}
+
+func TestCheckMigrationStatusEnumeratesHookStateAndStateKeySurfaces(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName, "session-a.json"), `{"ok":true}`)
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-b", "workers", "job.attempt.json")
+	writeDoctorTextFile(t, statePath, fmt.Sprintf(`{"status":"succeeded","%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	check := checkMigrationStatus(repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if len(check.LegacySurfaces) != 2 {
+		t.Fatalf("LegacySurfaces = %#v, want hook-state and state-key", check.LegacySurfaces)
+	}
+	assertLegacySurface(t, check.LegacySurfaces, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName), "fix-with-flag", "loopcoder doctor --repo . --fix")
+	assertLegacySurface(t, check.LegacySurfaces, statePath, "fix-with-flag", "loopcoder doctor --repo . --fix")
+}
+
+func TestCheckMigrationStatusAfterFixDoesNotPointAtDoctorFix(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+
+	check := checkMigrationStatusWithMode(repo, Deps{
+		Getenv: func(key string) string {
+			if key == migration.LegacyReporterScopeEnv {
+				return "auto"
+			}
+			return ""
+		},
+		ReadFile: os.ReadFile,
+	}, true)
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if len(check.LegacySurfaces) != 1 {
+		t.Fatalf("LegacySurfaces = %#v, want env surface", check.LegacySurfaces)
+	}
+	if strings.Contains(check.LegacySurfaces[0].Remediation, "loopcoder doctor --repo . --fix") {
+		t.Fatalf("after-fix remediation points at doctor --fix: %#v", check.LegacySurfaces[0])
+	}
+	assertLegacySurface(t, check.LegacySurfaces, migration.LegacyReporterScopeEnv, "manual", "unset LOOPCODER_CONDUCTOR_ATTEST_SCOPE")
 }
 
 func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
@@ -1442,6 +1497,27 @@ func TestCheckVersionStatusWarnsBeforeBreakingBoundary(t *testing.T) {
 	}
 }
 
+func TestCheckVersionStatusPointsLegacySurfacesAtMigrationStatus(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n"+migration.LegacyReportConfigRoot+":\n  channel: chat\n")
+
+	check := checkVersionStatus(BuildInfo{Version: "0.7.0"}, repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if strings.Contains(check.Message, "loopcoder doctor --repo . --fix") {
+		t.Fatalf("version status points at doctor --fix: %q", check.Message)
+	}
+	if !strings.Contains(check.Message, "see migration status check") {
+		t.Fatalf("message = %q, want migration status pointer", check.Message)
+	}
+}
+
 func TestCheckStaleStateWarnsForCleanupEligibleItems(t *testing.T) {
 	check := checkStaleState("/repo", Deps{
 		CleanupPlan: func(opts localcleanup.Options) (localcleanup.Result, error) {
@@ -1654,6 +1730,93 @@ func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	want := "[ok] git: found\n[fail] gh: missing\n"
 	if output.String() != want {
 		t.Fatalf("output = %q, want %q", output.String(), want)
+	}
+}
+
+func TestRenderPrintsLegacySurfaceDetails(t *testing.T) {
+	report := Report{Checks: []Check{{
+		Name:    "migration status",
+		Status:  StatusWarn,
+		Message: "found 1 legacy surface(s) requiring migration; see per-surface remediation below",
+		LegacySurfaces: []LegacySurface{{
+			Surface:        "hook-state",
+			Identifier:     ".loopcoder/hooks/conductor-attest",
+			Classification: "fix-with-flag",
+			Remediation:    "run: loopcoder doctor --repo . --fix",
+		}},
+	}}}
+	var output bytes.Buffer
+
+	if err := Render(&output, report); err != nil {
+		t.Fatalf("Render returned error: %v", err)
+	}
+	for _, want := range []string{
+		"[warn] migration status:",
+		"identifier=.loopcoder/hooks/conductor-attest",
+		"classification=fix-with-flag",
+		"remediation=run: loopcoder doctor --repo . --fix",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output = %q, want containing %q", output.String(), want)
+		}
+	}
+}
+
+func TestRenderJSONIncludesLegacySurfaceDetails(t *testing.T) {
+	report := WithMetadata(Report{
+		Runtime: RuntimeHealth{Migration: RuntimeMigration{
+			Status:         StatusWarn,
+			LegacySurfaces: 1,
+			Surfaces: []LegacySurface{{
+				Surface:        "state-key",
+				Identifier:     filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+				Classification: "fix-with-flag",
+				Remediation:    "run: loopcoder doctor --repo . --fix",
+				Legacy:         migration.LegacyReportStateKey,
+				Current:        migration.ReportStateKey,
+				Location:       filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+			}},
+		}},
+		Checks: []Check{{
+			Name:    "migration status",
+			Status:  StatusWarn,
+			Message: "found 1 legacy surface(s) requiring migration; see per-surface remediation below",
+			LegacySurfaces: []LegacySurface{{
+				Surface:        "state-key",
+				Identifier:     filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+				Classification: "fix-with-flag",
+				Remediation:    "run: loopcoder doctor --repo . --fix",
+				Legacy:         migration.LegacyReportStateKey,
+				Current:        migration.ReportStateKey,
+			}},
+		}},
+	}, "/repo", BuildInfo{Version: "0.7.0"})
+	var out bytes.Buffer
+
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		Runtime struct {
+			Migration struct {
+				Surfaces []LegacySurface `json:"surfaces"`
+			} `json:"migration"`
+		} `json:"runtime"`
+		Checks []struct {
+			LegacySurfaces []LegacySurface `json:"legacy_surfaces"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.Runtime.Migration.Surfaces) != 1 || len(payload.Checks[0].LegacySurfaces) != 1 {
+		t.Fatalf("legacy surfaces missing from JSON: %s", out.String())
+	}
+	if got := payload.Runtime.Migration.Surfaces[0].Identifier; got != ".loopcoder/runs/run-1/workers/job.attempt.json" {
+		t.Fatalf("runtime surface identifier = %q", got)
+	}
+	if payload.Checks[0].LegacySurfaces[0].Classification != "fix-with-flag" {
+		t.Fatalf("check surface = %#v", payload.Checks[0].LegacySurfaces[0])
 	}
 }
 
@@ -2012,6 +2175,23 @@ func requireCheck(t *testing.T, report Report, name string) Check {
 		t.Fatalf("missing check %q in %#v", name, report.Checks)
 	}
 	return check
+}
+
+func assertLegacySurface(t *testing.T, surfaces []LegacySurface, identifier string, classification string, remediationContains string) {
+	t.Helper()
+	for _, surface := range surfaces {
+		if surface.Identifier != identifier {
+			continue
+		}
+		if surface.Classification != classification {
+			t.Fatalf("surface %q classification = %q, want %q (%#v)", identifier, surface.Classification, classification, surface)
+		}
+		if !strings.Contains(surface.Remediation, remediationContains) {
+			t.Fatalf("surface %q remediation = %q, want containing %q", identifier, surface.Remediation, remediationContains)
+		}
+		return
+	}
+	t.Fatalf("surface %q not found in %#v", identifier, surfaces)
 }
 
 func containsString(values []string, want string) bool {
