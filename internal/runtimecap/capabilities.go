@@ -44,6 +44,11 @@ type ProviderRuntime struct {
 	Cancellation           bool
 	TokenUsageReporting    bool
 	AuthProbeCommand       []string
+	AuthProbeParser        string
+	AuthArtifactPaths      []string
+	AuthEnvironmentNames   []string
+	AuthUnsupportedReason  string
+	MayNetwork             bool
 	KnownLimitations       []string
 	UnsupportedSuggestions map[ProviderCapability]string
 }
@@ -358,6 +363,9 @@ func (c Contract) InvariantViolations() []string {
 		if len(provider.AuthProbeCommand) > 0 && strings.TrimSpace(provider.AuthProbeCommand[0]) == "" {
 			violations = append(violations, fmt.Sprintf("provider %q auth probe executable is empty", name))
 		}
+		if provider.MayNetwork && len(provider.AuthProbeCommand) == 0 {
+			violations = append(violations, fmt.Sprintf("provider %q declares network auth probing without an auth probe command", name))
+		}
 	}
 
 	seenHosts := map[string]bool{}
@@ -404,6 +412,8 @@ func cloneContract(contract Contract) Contract {
 
 func cloneProvider(provider ProviderRuntime) ProviderRuntime {
 	provider.AuthProbeCommand = append([]string(nil), provider.AuthProbeCommand...)
+	provider.AuthArtifactPaths = append([]string(nil), provider.AuthArtifactPaths...)
+	provider.AuthEnvironmentNames = append([]string(nil), provider.AuthEnvironmentNames...)
 	provider.KnownLimitations = append([]string(nil), provider.KnownLimitations...)
 	if provider.UnsupportedSuggestions != nil {
 		suggestions := make(map[ProviderCapability]string, len(provider.UnsupportedSuggestions))
@@ -430,6 +440,16 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// `codex login status` is the provider-sanctioned local status
+			// command; it reports login state without requiring LoopCoder to
+			// read Codex credential files or token-bearing config.
+			AuthProbeCommand: []string{
+				"codex",
+				"login",
+				"status",
+			},
+			AuthProbeParser: "codex-login-status",
+			MayNetwork:      false,
 		},
 		{
 			Name:                "claude",
@@ -440,6 +460,17 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// `claude auth status --json` is a local machine-readable status
+			// surface with declared non-secret fields; LoopCoder persists only
+			// redacted displays, hashes, and summarized authorization metadata.
+			AuthProbeCommand: []string{
+				"claude",
+				"auth",
+				"status",
+				"--json",
+			},
+			AuthProbeParser: "claude-auth-status-json",
+			MayNetwork:      false,
 		},
 		{
 			Name:                "gemini",
@@ -449,6 +480,18 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// Gemini currently has no sanctioned credential-blind local status
+			// command here, so LoopCoder checks only whether declared auth
+			// references exist and never reads their values or file contents.
+			AuthArtifactPaths: []string{
+				"~/.gemini/oauth_creds.json",
+			},
+			AuthEnvironmentNames: []string{
+				"GEMINI_API_KEY",
+				"GOOGLE_API_KEY",
+			},
+			AuthUnsupportedReason: "gemini adapter has no dedicated credential-blind auth status command; only secret-reference existence can be reported",
+			MayNetwork:            false,
 			KnownLimitations: []string{
 				"experimental and not part of the static model registry",
 				"ignores reasoning effort because the CLI has no separate effort knob",
@@ -458,10 +501,15 @@ var staticContract = Contract{
 			Name:         "antigravity",
 			Executable:   "agy",
 			Cancellation: true,
+			// `agy models` is the narrow provider surface available for
+			// auth/model reachability, but it may contact the network; runtime
+			// policy therefore records it and skips it by default.
 			AuthProbeCommand: []string{
 				"agy",
 				"models",
 			},
+			AuthProbeParser: "agy-models",
+			MayNetwork:      true,
 			KnownLimitations: []string{
 				"read-only mode is not available or verified",
 				"MCP configuration injection is not implemented",

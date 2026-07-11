@@ -36,10 +36,10 @@ capability, supporting alternatives when known, and the local fix.
 
 | Provider | Executable | Read-only | Nested sub-agents | JSON output | MCP config | Cancellation | Token usage | Auth probe | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `codex` | `codex` | yes | no | yes | yes | yes | yes | none | Default Worker provider. |
-| `claude` | `claude` | yes | yes | yes | yes | yes | yes | none | Verified Worker and Verifier provider. |
-| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | none | Experimental direct Gemini path, outside the static model registry. |
-| `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Uses plain text summary capture and self-reported selected model string. |
+| `codex` | `codex` | yes | no | yes | yes | yes | yes | `codex login status` | Default Worker provider; local status text only. |
+| `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider; local machine-readable status fields only. |
+| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
+| `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
 
 `antigravity` is the clearest partial provider today. If selected for a
 read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,
@@ -56,15 +56,31 @@ try to automate provider authentication.
 
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation
-inventory in machine-local SQLite. ProviderInstallation and ProbeResult records
-show discovery source, redacted executable provenance, captured time,
-freshness, confidence, probe outcome, output bounds, and
-`usable_for_invocation: "unknown"` from installation evidence alone.
+and auth-readiness inventory in machine-local SQLite. ProviderInstallation,
+ProbeResult, AccountProfile, and AuthReadiness records show discovery source,
+redacted executable/profile provenance, captured time, freshness, confidence,
+probe outcome, output bounds, and `usable_for_invocation: "unknown"` from
+installation evidence alone.
 Provider installation probes pass only a bounded environment allowlist for
 location and platform facts; script shims may receive variables such as
 `LOCALAPPDATA`, `APPDATA`, `SystemRoot`, `ComSpec`, `PATH`, `PATHEXT`, `TMPDIR`,
 `LANG`, and `LC_ALL`, but credential-like variable names are denied regardless
 of allowlist membership.
+
+Auth readiness probes are credential-blind. Unsupported providers emit
+`readiness_state: "unknown"` with an explicit reason. A runtime-declared
+network auth probe is skipped unless a future permission path grants network
+access; today Antigravity's `agy models` is recorded with
+`network_declared: true`, `network_permission: "denied"`, and
+`network-permission-denied`. No current adapter exposes a safe
+machine-readable expiry value, so the implementation does not emit or persist
+an `expires_at` field.
+
+Built-in local declarations are part of `internal/runtimecap`: Codex uses
+`codex login status` as sanctioned local status text, Claude uses
+`claude auth status --json` as declared non-secret machine-readable status,
+Gemini reports only auth-reference existence, and Antigravity declares
+`agy models` as network-capable so it is recorded but not run by default.
 
 Support levels:
 
