@@ -807,9 +807,9 @@ loopcoder doctor --repo .
 
 When the configured Worker or Verifier provider is `antigravity`, `doctor`
 and `providers refresh` look for executable `agy` through bounded installation
-probes only. Auth readiness is not inferred from installation evidence in this
-slice. The Antigravity Worker invocation uses this argv shape after
-registry/default resolution:
+probes and the read-only `agy models` readiness surface. Auth readiness is
+never inferred from installation evidence alone. The Antigravity Worker
+invocation uses this argv shape after registry/default resolution:
 
 ```text
 agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"
@@ -818,6 +818,32 @@ agy -p <prompt> --add-dir <worktree> --model "<model> (<Depth>)"
 The mandatory `--add-dir` is the workspace pin. Antigravity read-only mode is
 not available or verified, so `loopreview` and audit-review invocations fail
 closed when selected with provider `antigravity`.
+
+`loopcoder providers refresh --repo .` and `loopcoder doctor --repo .
+--format json` include credential-blind account/profile and auth readiness
+records. The built-in readiness probes are read-only and bounded:
+
+| Provider | Readiness evidence |
+| --- | --- |
+| `codex` | `codex login status` exit/status text |
+| `claude` | `claude auth status --json` declared non-secret fields |
+| `gemini` | declared environment-name or auth-artifact existence only; validity remains `unknown` without a safe status command |
+| `antigravity` | `agy models` exit/status text |
+
+The readiness states are `ready`, `not-authenticated`, `expired`, and
+`unknown`. `unknown` is a first-class result for unsupported, inaccessible,
+ambiguous, stale, or unsafe evidence. LoopCoder does not read credential file
+contents, parse provider auth JSON, hash credential bytes, copy cookies, or
+serialize environment variable values. Multiple profiles are represented by
+opaque `account_profile_id` handles; when display labels collide, selection
+must use the opaque ID. A project-level override can pin one profile without
+using a display label:
+
+```yaml
+provider_inventory:
+  profile_overrides:
+    claude: acct_exampleprofileid
+```
 
 ## Doc-First Process
 

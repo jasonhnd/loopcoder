@@ -822,6 +822,36 @@ guardrails:
 	}
 }
 
+func TestParseReadsAndValidatesProviderInventoryProfileOverrides(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+provider_inventory:
+  executables:
+    claude: ["/opt/claude"]
+  profile_overrides:
+    claude: acct_abcdefghijklmnopqrstuvwxyz234567
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if got := cfg.ProviderInventory.ProfileOverrides["claude"]; got != "acct_abcdefghijklmnopqrstuvwxyz234567" {
+		t.Fatalf("profile override = %q", got)
+	}
+
+	_, err = Parse([]byte(`
+version: 1
+provider_inventory:
+  profile_overrides:
+    claude: "alice@example.com"
+`))
+	if err == nil {
+		t.Fatal("Parse returned nil error for display-like profile override")
+	}
+	if !strings.Contains(err.Error(), "account_profile_id") {
+		t.Fatalf("Parse error = %v, want account_profile_id context", err)
+	}
+}
+
 func TestParseReadsLegacyReportConfig(t *testing.T) {
 	data := []byte("version: 1\n" + migration.LegacyReportConfigRoot + ":\n  channel: legacy-chat\n")
 

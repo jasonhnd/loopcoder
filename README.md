@@ -241,6 +241,24 @@ Installation evidence is not auth readiness, account readiness, model
 authorization, quota, or usable capacity; human and JSON output keep
 `usable_for_invocation` as `unknown` from install evidence alone.
 
+v0.8 provider inventory also records credential-blind `account_profiles` and
+`auth_readiness` entries. Built-in readiness probes use only adapter-declared
+read-only status surfaces: `codex login status`, `claude auth status --json`,
+`agy models`, or declared Gemini secret-reference existence when no safe status
+command is available. Readiness states are `ready`, `not-authenticated`,
+`expired`, and `unknown`; `unknown` is preserved instead of being coerced to
+success or failure. LoopCoder never reads credential file contents or
+environment variable values for these records, and it persists only redacted
+profile labels, opaque profile IDs, hashes of non-secret references, probe
+metadata, and bounded redacted command summaries. If a project must pin a
+specific discovered profile, use the collision-safe ID:
+
+```yaml
+provider_inventory:
+  profile_overrides:
+    claude: acct_exampleprofileid
+```
+
 ### Project Registry
 
 `loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. On Unix-like systems, loopcoder creates and tightens `$LOOPCODER_HOME` and `data/` to owner-only directory permissions and the SQLite database plus `-wal`/`-shm` sidecars to owner-only file permissions. Existing broader modes are reported by `doctor` and repaired by `doctor --fix`; symlink and non-regular storage paths are refused. On Windows, v0.7.0 does not implement owner-only DACL hardening, and `doctor` reports that limitation explicitly instead of claiming POSIX mode protection. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects. Git remote URLs are sanitized before output or persistence; loopcoder never stores URL credentials, tokens, credential-like query strings, or fragments in project metadata.

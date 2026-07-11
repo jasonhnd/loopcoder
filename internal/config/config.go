@@ -250,7 +250,8 @@ type MCPAuth struct {
 }
 
 type ProviderInventory struct {
-	Executables map[string][]string `yaml:"executables,omitempty"`
+	Executables      map[string][]string `yaml:"executables,omitempty"`
+	ProfileOverrides map[string]string   `yaml:"profile_overrides,omitempty"`
 }
 
 // Audit is the optional 0.5.3 audit command configuration surface. It is
@@ -554,7 +555,35 @@ func validateProviderInventory(inventory ProviderInventory) error {
 			}
 		}
 	}
+	for provider, accountProfileID := range inventory.ProfileOverrides {
+		if !validMCPServerName(provider) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_overrides contains unsafe provider key %q", provider)
+		}
+		accountProfileID = strings.TrimSpace(accountProfileID)
+		if accountProfileID == "" {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_overrides.%s must not be empty", provider)
+		}
+		if !strings.HasPrefix(accountProfileID, "acct_") || !validOpaqueInventoryID(accountProfileID) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_overrides.%s must be an account_profile_id beginning with acct_", provider)
+		}
+	}
 	return nil
+}
+
+func validOpaqueInventoryID(value string) bool {
+	if value == "" || len(value) > 96 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateMCPDeclarations(m MCP, errorPrefix string) error {

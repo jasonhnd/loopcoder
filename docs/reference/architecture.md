@@ -139,9 +139,12 @@ Validation is exact and case-sensitive. In default mode, invalid selections
 emit warnings and preserve pass-through values. With `.delivery.yml`
 `models.strict: true` or a one-run `--strict` flag, invalid selections reject
 before Worker or Verifier provider launch. `loopcoder doctor` reports the same
-model/depth validation and, when `antigravity` is configured, reports bounded
-installation discovery for executable `agy` without inferring OAuth readiness,
-account readiness, model authorization, quota, or usable capacity.
+model/depth validation and provider inventory evidence. Installation discovery
+is separate from auth readiness: provider inventory may report
+`account_profiles` and `auth_readiness` from adapter-declared read-only status
+commands or secret-reference existence checks, but it never treats an installed
+CLI as authenticated, authorized for every model, quota-ready, or launch
+approved.
 
 ## State Model
 

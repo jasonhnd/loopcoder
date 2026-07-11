@@ -788,7 +788,7 @@ func TestRunChecksAntigravityProviderInstallOnly(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("provider antigravity status = %s, want ok (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{`CLI "agy" discovered`, "usable_for_invocation=unknown", "auth, account, model authorization, quota, and invocation readiness not checked"} {
+	for _, want := range []string{`CLI "agy" discovered`, "usable_for_invocation=unknown", "auth_readiness=unknown evidence=not-run", "model authorization, quota, and invocation approval remain separate"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
@@ -835,7 +835,7 @@ func TestRunDoesNotTreatAntigravityInstallAsAuthReadiness(t *testing.T) {
 	if check.Code != "provider_installed" {
 		t.Fatalf("provider antigravity code = %q, want provider_installed", check.Code)
 	}
-	for _, want := range []string{"usable_for_invocation=unknown", "auth, account, model authorization, quota, and invocation readiness not checked"} {
+	for _, want := range []string{"usable_for_invocation=unknown", "auth_readiness=unknown evidence=not-run", "model authorization, quota, and invocation approval remain separate"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
@@ -2238,8 +2238,8 @@ func (f *fakeDoctorEnv) providerInventory(cfg config.Config) providerinventory.R
 		Confidence:            providerinventory.ConfidenceExact,
 		Installations:         installations,
 		ProbeResults:          probes,
-		AccountProfiles:       []any{},
-		AuthReadiness:         []any{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
 		ModelCatalogSnapshots: []any{},
 		ModelCapabilities:     []any{},
 		GapReasons:            []string{},

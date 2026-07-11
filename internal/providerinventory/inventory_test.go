@@ -578,6 +578,213 @@ func TestDiscoverDistinguishesInstalledUnusableFromProbeFailed(t *testing.T) {
 	}
 }
 
+func TestDiscoverAuthReadinessStatesFromStatusCommand(t *testing.T) {
+	tests := []struct {
+		name      string
+		stdout    string
+		exitCode  int
+		wantState ReadinessState
+		wantGap   string
+		wantScope AuthorizationScopeState
+	}{
+		{name: "authenticated", stdout: "Logged in using ChatGPT\n", exitCode: 0, wantState: ReadinessReady, wantScope: AuthorizationUnknown},
+		{name: "logged out", stdout: "Not logged in. Run codex login.\n", exitCode: 1, wantState: ReadinessNotAuthenticated, wantGap: "provider-reports-not-authenticated", wantScope: AuthorizationUnknown},
+		{name: "expired", stdout: "Credentials expired; refresh required.\n", exitCode: 1, wantState: ReadinessExpired, wantGap: "provider-reports-expired", wantScope: AuthorizationUnknown},
+		{name: "partial authorization", stdout: "not authorized for selected project\n", exitCode: 1, wantState: ReadinessUnknown, wantGap: "provider-authorization-partial", wantScope: AuthorizationPartial},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			exe := filepath.Join(dir, executableName("codex"))
+			writeExecutable(t, exe)
+			deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "codex 1.2.3"})
+			deps.Getenv = func(key string) string {
+				if key == "PATH" {
+					return dir
+				}
+				return ""
+			}
+			deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+				if len(req.Argv) >= 3 && req.Argv[1] == "login" && req.Argv[2] == "status" {
+					return ProbeExecutionResult{Stdout: tt.stdout, ExitCode: tt.exitCode}, nil
+				}
+				return ProbeExecutionResult{Stdout: "codex 1.2.3\n", ExitCode: 0}, nil
+			}
+
+			report, err := Discover(context.Background(), Options{
+				Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+				Now:    fixedInventoryNow,
+			}, deps)
+			if err != nil {
+				t.Fatalf("Discover returned error: %v", err)
+			}
+			got := latestAuthReadinessFor(t, report, "codex")
+			if got.ReadinessState != tt.wantState {
+				t.Fatalf("readiness_state = %q, want %q; record=%#v", got.ReadinessState, tt.wantState, got)
+			}
+			if got.AuthorizationScopeState != tt.wantScope {
+				t.Fatalf("authorization_scope_state = %q, want %q", got.AuthorizationScopeState, tt.wantScope)
+			}
+			if tt.wantGap != "" && !containsString(got.GapReasons, tt.wantGap) {
+				t.Fatalf("gap_reasons = %#v, want %q", got.GapReasons, tt.wantGap)
+			}
+		})
+	}
+}
+
+func TestDiscoverClaudeAuthProfilesRedactsAndMarksCollisions(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("claude"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "1.0.0"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		if len(req.Argv) >= 4 && req.Argv[1] == "auth" && req.Argv[2] == "status" {
+			return ProbeExecutionResult{Stdout: `{
+				"loggedIn": true,
+				"token": "sk-ant-redactedredactedredacted",
+				"profiles": [
+					{"id":"profile-a","email":"alice@example.com","display":"Shared","orgId":"org-a","apiProvider":"firstParty","subscriptionType":"max"},
+					{"id":"profile-b","email":"bob@example.com","display":"Shared","orgId":"org-b","apiProvider":"firstParty","subscriptionType":"pro"}
+				]
+			}`, ExitCode: 0}, nil
+		}
+		return ProbeExecutionResult{Stdout: "claude 1.2.3\n", ExitCode: 0}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "claude"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if len(report.AccountProfiles) != 2 {
+		t.Fatalf("account profiles = %d, want 2: %#v", len(report.AccountProfiles), report.AccountProfiles)
+	}
+	for _, profile := range report.AccountProfiles {
+		if profile.ProfileReferenceHash == "" || strings.Contains(profile.ProfileReferenceHash, "profile-") {
+			t.Fatalf("profile reference hash is not opaque: %#v", profile)
+		}
+		if len(profile.CollisionSet) != 2 {
+			t.Fatalf("collision_set = %#v, want both profile ids", profile.CollisionSet)
+		}
+		if profile.SelectionState == SelectionDefault {
+			t.Fatalf("colliding profile kept default selection: %#v", profile)
+		}
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal report: %v", err)
+	}
+	for _, notWant := range []string{"sk-ant-redacted", "alice@example.com", "bob@example.com"} {
+		if strings.Contains(string(data), notWant) {
+			t.Fatalf("serialized report retained sensitive profile/status material %q: %s", notWant, data)
+		}
+	}
+}
+
+func TestDiscoverAuthReadinessNeverReadsCredentialFileContents(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	root := t.TempDir()
+	homeDir := filepath.Join(root, "home")
+	authFile := filepath.Join(homeDir, ".gemini", "oauth_creds.json")
+	sentinel := "sentinel-refresh-token-should-not-appear"
+	if err := os.MkdirAll(filepath.Dir(authFile), 0o755); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := os.WriteFile(authFile, []byte(`{"refresh_token":"`+sentinel+`"}`), 0o600); err != nil {
+		t.Fatalf("write auth fixture: %v", err)
+	}
+	binDir := filepath.Join(root, "bin")
+	exe := filepath.Join(binDir, executableName("gemini"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "gemini 9.9.9"})
+	deps.UserHomeDir = func() (string, error) { return homeDir, nil }
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return binDir
+		}
+		return ""
+	}
+
+	report, err := Discover(ctx, Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "gemini"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	got := latestAuthReadinessFor(t, report, "gemini")
+	if got.ReadinessState != ReadinessUnknown || got.EvidenceKind != EvidenceFileExistence {
+		t.Fatalf("gemini readiness = %#v, want unknown from file-existence", got)
+	}
+	if err := Refresh(ctx, store, report, fixedInventoryNow()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	loaded, err := Load(ctx, store)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	data, err := json.Marshal(loaded)
+	if err != nil {
+		t.Fatalf("Marshal loaded report: %v", err)
+	}
+	if strings.Contains(string(data), sentinel) || strings.Contains(string(data), "refresh_token") {
+		t.Fatalf("persisted/serialized inventory retained credential fixture content: %s", data)
+	}
+}
+
+func TestDiscoverAuthReadinessEnvironmentReferenceDoesNotSerializeValue(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("gemini"))
+	writeExecutable(t, exe)
+	secretValue := "gemini-secret-value-123456"
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "gemini 9.9.9"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.LookupEnv = func(key string) (string, bool) {
+		if key == "GEMINI_API_KEY" {
+			return secretValue, true
+		}
+		return "", false
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "gemini"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	got := latestAuthReadinessFor(t, report, "gemini")
+	if got.EvidenceKind != EvidenceEnvNameExistence || got.ReadinessState != ReadinessUnknown {
+		t.Fatalf("gemini env readiness = %#v, want unknown env-name-existence", got)
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal report: %v", err)
+	}
+	if strings.Contains(string(data), secretValue) || strings.Contains(string(data), "GEMINI_API_KEY") {
+		t.Fatalf("serialized inventory retained env secret value or name: %s", data)
+	}
+}
+
 func TestRefreshPersistsHistoryAndMarksStale(t *testing.T) {
 	ctx := context.Background()
 	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedInventoryNow})
@@ -748,6 +955,26 @@ func onlyCustomProbe(t *testing.T, report Report) ProbeResult {
 	}
 	t.Fatalf("custom probe missing in %#v", report.ProbeResults)
 	return ProbeResult{}
+}
+
+func latestAuthReadinessFor(t *testing.T, report Report, adapterID string) AuthReadiness {
+	t.Helper()
+	for i := len(report.AuthReadiness) - 1; i >= 0; i-- {
+		if report.AuthReadiness[i].AdapterID == adapterID {
+			return report.AuthReadiness[i]
+		}
+	}
+	t.Fatalf("auth readiness for %s missing in %#v", adapterID, report.AuthReadiness)
+	return AuthReadiness{}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func stableProbeIDs() func() string {

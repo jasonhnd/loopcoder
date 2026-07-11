@@ -35,6 +35,8 @@ const (
 	InventoryRefsSchema         = "loopcoder.inventory_refs.v1"
 	ProviderInstallationSchema  = "loopcoder.provider_installation.v1"
 	ProbeResultSchema           = "loopcoder.probe_result.v1"
+	AccountProfileSchema        = "loopcoder.account_profile.v1"
+	AuthReadinessSchema         = "loopcoder.auth_readiness.v1"
 
 	AdapterDeclarationSchema = "loopcoder.adapter_declaration.v1"
 	AdapterVersion           = "v1"
@@ -44,6 +46,7 @@ const (
 	StdoutLimitBytes    = 64 * 1024
 	StderrLimitBytes    = 64 * 1024
 	CombinedLimitBytes  = 128 * 1024
+	AuthProbeTimeout    = 10 * time.Second
 )
 
 var ErrInvalidRecord = errors.New("ErrInvalidRecord")
@@ -89,10 +92,11 @@ const (
 type ProbeMethod string
 
 const (
-	ProbeMethodLookPath     ProbeMethod = "look-path"
-	ProbeMethodLstat        ProbeMethod = "lstat"
-	ProbeMethodFixedCommand ProbeMethod = "fixed-command"
-	ProbeMethodConfigured   ProbeMethod = "configured-overlay"
+	ProbeMethodLookPath      ProbeMethod = "look-path"
+	ProbeMethodLstat         ProbeMethod = "lstat"
+	ProbeMethodFixedCommand  ProbeMethod = "fixed-command"
+	ProbeMethodConfigured    ProbeMethod = "configured-overlay"
+	ProbeMethodStatusCommand ProbeMethod = "sanctioned-status-command"
 )
 
 type DiscoverySource string
@@ -108,6 +112,58 @@ type NetworkPermission string
 const (
 	NetworkNotNeeded NetworkPermission = "not-needed"
 	NetworkDenied    NetworkPermission = "denied"
+)
+
+type ProfileSource string
+
+const (
+	ProfileSourceStatusCommand ProfileSource = "provider-status-command"
+	ProfileSourceConfigRef     ProfileSource = "provider-config-reference"
+	ProfileSourceEnvRef        ProfileSource = "environment-reference"
+	ProfileSourceUserConfig    ProfileSource = "user-config"
+	ProfileSourceFixture       ProfileSource = "fixture"
+	ProfileSourceUnknown       ProfileSource = "unknown"
+)
+
+type SelectionState string
+
+const (
+	SelectionDefault    SelectionState = "default"
+	SelectionExplicit   SelectionState = "explicit"
+	SelectionCandidate  SelectionState = "candidate"
+	SelectionSuperseded SelectionState = "superseded"
+	SelectionUnknown    SelectionState = "unknown"
+)
+
+type ReadinessState string
+
+const (
+	ReadinessReady            ReadinessState = "ready"
+	ReadinessNotAuthenticated ReadinessState = "not-authenticated"
+	ReadinessExpired          ReadinessState = "expired"
+	ReadinessUnknown          ReadinessState = "unknown"
+)
+
+type EvidenceKind string
+
+const (
+	EvidenceExitCode           EvidenceKind = "exit-code"
+	EvidenceStatusCommand      EvidenceKind = "sanctioned-status-command"
+	EvidenceMachineStatus      EvidenceKind = "machine-readable-status"
+	EvidenceFileExistence      EvidenceKind = "file-existence"
+	EvidenceEnvNameExistence   EvidenceKind = "environment-name-existence"
+	EvidenceProviderErrorClass EvidenceKind = "provider-error-class"
+	EvidenceUnsupported        EvidenceKind = "unsupported"
+	EvidenceNotRun             EvidenceKind = "not-run"
+)
+
+type AuthorizationScopeState string
+
+const (
+	AuthorizationAllKnown      AuthorizationScopeState = "all-known"
+	AuthorizationPartial       AuthorizationScopeState = "partial"
+	AuthorizationUnknown       AuthorizationScopeState = "unknown"
+	AuthorizationNotApplicable AuthorizationScopeState = "not-applicable"
 )
 
 func (c *Confidence) UnmarshalJSON(data []byte) error {
@@ -172,7 +228,7 @@ func (m *ProbeMethod) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch ProbeMethod(value) {
-	case ProbeMethodLookPath, ProbeMethodLstat, ProbeMethodFixedCommand, ProbeMethodConfigured:
+	case ProbeMethodLookPath, ProbeMethodLstat, ProbeMethodFixedCommand, ProbeMethodConfigured, ProbeMethodStatusCommand:
 		*m = ProbeMethod(value)
 		return nil
 	default:
@@ -205,6 +261,76 @@ func (p *NetworkPermission) UnmarshalJSON(data []byte) error {
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown network_permission %q", ErrInvalidRecord, value)
+	}
+}
+
+func (s *ProfileSource) UnmarshalJSON(data []byte) error {
+	value, err := unmarshalEnumString(data, "profile_source")
+	if err != nil {
+		return err
+	}
+	switch ProfileSource(value) {
+	case ProfileSourceStatusCommand, ProfileSourceConfigRef, ProfileSourceEnvRef, ProfileSourceUserConfig, ProfileSourceFixture, ProfileSourceUnknown:
+		*s = ProfileSource(value)
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown profile_source %q", ErrInvalidRecord, value)
+	}
+}
+
+func (s *SelectionState) UnmarshalJSON(data []byte) error {
+	value, err := unmarshalEnumString(data, "selection_state")
+	if err != nil {
+		return err
+	}
+	switch SelectionState(value) {
+	case SelectionDefault, SelectionExplicit, SelectionCandidate, SelectionSuperseded, SelectionUnknown:
+		*s = SelectionState(value)
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown selection_state %q", ErrInvalidRecord, value)
+	}
+}
+
+func (s *ReadinessState) UnmarshalJSON(data []byte) error {
+	value, err := unmarshalEnumString(data, "readiness_state")
+	if err != nil {
+		return err
+	}
+	switch ReadinessState(value) {
+	case ReadinessReady, ReadinessNotAuthenticated, ReadinessExpired, ReadinessUnknown:
+		*s = ReadinessState(value)
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown readiness_state %q", ErrInvalidRecord, value)
+	}
+}
+
+func (k *EvidenceKind) UnmarshalJSON(data []byte) error {
+	value, err := unmarshalEnumString(data, "evidence_kind")
+	if err != nil {
+		return err
+	}
+	switch EvidenceKind(value) {
+	case EvidenceExitCode, EvidenceStatusCommand, EvidenceMachineStatus, EvidenceFileExistence, EvidenceEnvNameExistence, EvidenceProviderErrorClass, EvidenceUnsupported, EvidenceNotRun:
+		*k = EvidenceKind(value)
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown evidence_kind %q", ErrInvalidRecord, value)
+	}
+}
+
+func (s *AuthorizationScopeState) UnmarshalJSON(data []byte) error {
+	value, err := unmarshalEnumString(data, "authorization_scope_state")
+	if err != nil {
+		return err
+	}
+	switch AuthorizationScopeState(value) {
+	case AuthorizationAllKnown, AuthorizationPartial, AuthorizationUnknown, AuthorizationNotApplicable:
+		*s = AuthorizationScopeState(value)
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown authorization_scope_state %q", ErrInvalidRecord, value)
 	}
 }
 
@@ -243,8 +369,8 @@ type Report struct {
 	Confidence            Confidence             `json:"confidence"`
 	Installations         []ProviderInstallation `json:"installations"`
 	ProbeResults          []ProbeResult          `json:"probe_results"`
-	AccountProfiles       []any                  `json:"account_profiles"`
-	AuthReadiness         []any                  `json:"auth_readiness"`
+	AccountProfiles       []AccountProfile       `json:"account_profiles"`
+	AuthReadiness         []AuthReadiness        `json:"auth_readiness"`
 	ModelCatalogSnapshots []any                  `json:"model_catalog_snapshots"`
 	ModelCapabilities     []any                  `json:"model_capabilities"`
 	GapReasons            []string               `json:"gap_reasons"`
@@ -357,6 +483,76 @@ type ProbeResult struct {
 	TerminalErrorCode        string            `json:"terminal_error_code,omitempty"`
 }
 
+type AccountProfile struct {
+	SchemaVersion                string           `json:"schema_version"`
+	RecordVersion                int              `json:"record_version"`
+	Scope                        string           `json:"scope"`
+	ProjectID                    *string          `json:"project_id"`
+	AccountProfileID             string           `json:"account_profile_id"`
+	AdapterID                    string           `json:"adapter_id"`
+	ProviderInstallationID       *string          `json:"provider_installation_id,omitempty"`
+	ProfileSource                ProfileSource    `json:"profile_source"`
+	ProfileReferenceHash         string           `json:"profile_reference_hash"`
+	ProfileDisplay               string           `json:"profile_display,omitempty"`
+	ProviderAccountKind          string           `json:"provider_account_kind,omitempty"`
+	TenantOrProjectReferenceHash string           `json:"tenant_or_project_reference_hash,omitempty"`
+	SelectionState               SelectionState   `json:"selection_state"`
+	LatestAuthReadinessID        string           `json:"latest_auth_readiness_id,omitempty"`
+	AllowedScopeSummary          string           `json:"allowed_scope_summary,omitempty"`
+	CollisionSet                 []string         `json:"collision_set"`
+	CreatedAt                    string           `json:"created_at"`
+	UpdatedAt                    string           `json:"updated_at"`
+	CreatedBy                    ActorProvenance  `json:"created_by"`
+	UpdatedBy                    ActorProvenance  `json:"updated_by"`
+	Host                         HostProvenance   `json:"host"`
+	PolicyVersion                string           `json:"policy_version"`
+	CapturedAt                   string           `json:"captured_at"`
+	StaleAfter                   string           `json:"stale_after,omitempty"`
+	FreshnessState               FreshnessState   `json:"freshness_state"`
+	Confidence                   Confidence       `json:"confidence"`
+	SideEffectClass              string           `json:"side_effect_class"`
+	Classification               string           `json:"classification"`
+	Source                       SourceDescriptor `json:"source"`
+	Evidence                     EvidenceSummary  `json:"evidence"`
+	GapReasons                   []string         `json:"gap_reasons"`
+	TerminalErrorCode            string           `json:"terminal_error_code,omitempty"`
+}
+
+type AuthReadiness struct {
+	SchemaVersion             string                  `json:"schema_version"`
+	RecordVersion             int                     `json:"record_version"`
+	Scope                     string                  `json:"scope"`
+	ProjectID                 *string                 `json:"project_id"`
+	AuthReadinessID           string                  `json:"auth_readiness_id"`
+	AdapterID                 string                  `json:"adapter_id"`
+	ProviderInstallationID    *string                 `json:"provider_installation_id,omitempty"`
+	AccountProfileID          *string                 `json:"account_profile_id,omitempty"`
+	ReadinessState            ReadinessState          `json:"readiness_state"`
+	ReadinessConfidence       Confidence              `json:"readiness_confidence"`
+	EvidenceKind              EvidenceKind            `json:"evidence_kind"`
+	AuthorizationScopeState   AuthorizationScopeState `json:"authorization_scope_state"`
+	AuthorizationScopeSummary string                  `json:"authorization_scope_summary,omitempty"`
+	ExpiresAt                 string                  `json:"expires_at,omitempty"`
+	RefreshRequired           bool                    `json:"refresh_required"`
+	UnsupportedReason         string                  `json:"unsupported_reason,omitempty"`
+	CreatedAt                 string                  `json:"created_at"`
+	UpdatedAt                 string                  `json:"updated_at"`
+	CreatedBy                 ActorProvenance         `json:"created_by"`
+	UpdatedBy                 ActorProvenance         `json:"updated_by"`
+	Host                      HostProvenance          `json:"host"`
+	PolicyVersion             string                  `json:"policy_version"`
+	CapturedAt                string                  `json:"captured_at"`
+	StaleAfter                string                  `json:"stale_after,omitempty"`
+	FreshnessState            FreshnessState          `json:"freshness_state"`
+	Confidence                Confidence              `json:"confidence"`
+	SideEffectClass           string                  `json:"side_effect_class"`
+	Classification            string                  `json:"classification"`
+	Source                    SourceDescriptor        `json:"source"`
+	Evidence                  EvidenceSummary         `json:"evidence"`
+	GapReasons                []string                `json:"gap_reasons"`
+	TerminalErrorCode         string                  `json:"terminal_error_code,omitempty"`
+}
+
 type SourceDescriptor struct {
 	Kind            string `json:"kind"`
 	AdapterID       string `json:"adapter_id"`
@@ -379,10 +575,20 @@ type AdapterDeclaration struct {
 	Vendor                     string
 	ExecutableNames            []string
 	VersionArgv                []string
+	AuthReadiness              AuthReadinessDeclaration
 	KnownLimitations           []string
 	MayNetwork                 bool
 	ExplicitPaths              []string
 	DiscoverySourceForExplicit DiscoverySource
+}
+
+type AuthReadinessDeclaration struct {
+	CommandID         string
+	Argv              []string
+	Parser            string
+	EnvSecretRefs     []string
+	AuthArtifactPaths []string
+	UnsupportedReason string
 }
 
 type Options struct {
@@ -393,6 +599,7 @@ type Options struct {
 
 type Deps struct {
 	Getenv       func(string) string
+	LookupEnv    func(string) (string, bool)
 	UserHomeDir  func() (string, error)
 	Lstat        func(string) (os.FileInfo, error)
 	Abs          func(string) (string, error)
@@ -421,6 +628,7 @@ type ProbeExecutionResult struct {
 func DefaultDeps() Deps {
 	return Deps{
 		Getenv:       os.Getenv,
+		LookupEnv:    os.LookupEnv,
 		UserHomeDir:  os.UserHomeDir,
 		Lstat:        os.Lstat,
 		Abs:          filepath.Abs,
@@ -453,6 +661,8 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	adapters := adapterDeclarations(opts.Config)
 	var installations []ProviderInstallation
 	var probes []ProbeResult
+	var profiles []AccountProfile
+	var readiness []AuthReadiness
 	var gaps []string
 
 	for _, adapter := range adapters {
@@ -463,10 +673,15 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			installation, probe := inspectCandidate(ctx, adapter, candidate, now, deps)
 			installations = append(installations, installation)
 			probes = append(probes, probe)
+			authProbes, authProfiles, authReadiness := inspectAuthReadiness(ctx, adapter, installation, candidate.path, now, deps)
+			probes = append(probes, authProbes...)
+			profiles = append(profiles, authProfiles...)
+			readiness = append(readiness, authReadiness...)
 		}
 		if !found {
 			probe := absentProbe(adapter, now, deps)
 			probes = append(probes, probe)
+			readiness = append(readiness, absentAuthReadiness(adapter, now))
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
 		}
 	}
@@ -479,14 +694,27 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		}
 		return installations[i].ProviderInstallationID < installations[j].ProviderInstallationID
 	})
+	finalizeProfiles(profiles, opts.Config.ProviderInventory.ProfileOverrides)
+	sort.SliceStable(profiles, func(i, j int) bool {
+		if profiles[i].AdapterID != profiles[j].AdapterID {
+			return profiles[i].AdapterID < profiles[j].AdapterID
+		}
+		return profiles[i].AccountProfileID < profiles[j].AccountProfileID
+	})
+	sort.SliceStable(readiness, func(i, j int) bool {
+		if readiness[i].AdapterID != readiness[j].AdapterID {
+			return readiness[i].AdapterID < readiness[j].AdapterID
+		}
+		return readiness[i].AuthReadinessID < readiness[j].AuthReadinessID
+	})
 	report := Report{
 		SchemaVersion:         ProviderInventoryJSONSchema,
 		GeneratedAt:           formatTime(now),
 		Confidence:            confidenceForInventory(installations, probes),
 		Installations:         installations,
 		ProbeResults:          probes,
-		AccountProfiles:       []any{},
-		AuthReadiness:         []any{},
+		AccountProfiles:       profiles,
+		AuthReadiness:         readiness,
 		ModelCatalogSnapshots: []any{},
 		ModelCapabilities:     []any{},
 		GapReasons:            gaps,
@@ -524,6 +752,16 @@ func Refresh(ctx context.Context, store storage.Store, report Report, now time.T
 		}
 		for _, probe := range report.ProbeResults {
 			if err := insertProbe(ctx, tx, probe); err != nil {
+				return err
+			}
+		}
+		for _, profile := range report.AccountProfiles {
+			if err := upsertAccountProfile(ctx, tx, profile); err != nil {
+				return err
+			}
+		}
+		for _, readiness := range report.AuthReadiness {
+			if err := insertAuthReadiness(ctx, tx, readiness); err != nil {
 				return err
 			}
 		}
@@ -599,6 +837,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 	}
 	var installations []ProviderInstallation
 	var probes []ProbeResult
+	var profiles []AccountProfile
+	var readiness []AuthReadiness
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT payload_json FROM provider_installations ORDER BY adapter_id, discovery_order, provider_installation_id`)
 		if err != nil {
@@ -637,6 +877,46 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 			}
 			probes = append(probes, probe)
 		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM account_profiles ORDER BY adapter_id, account_profile_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var profile AccountProfile
+			if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+				rows.Close()
+				return err
+			}
+			profiles = append(profiles, profile)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM auth_readiness ORDER BY adapter_id, auth_readiness_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var entry AuthReadiness
+			if err := json.Unmarshal([]byte(payload), &entry); err != nil {
+				rows.Close()
+				return err
+			}
+			readiness = append(readiness, entry)
+		}
 		return rows.Close()
 	})
 	if err != nil {
@@ -649,8 +929,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 		Confidence:            confidenceForInventory(installations, probes),
 		Installations:         installations,
 		ProbeResults:          probes,
-		AccountProfiles:       []any{},
-		AuthReadiness:         []any{},
+		AccountProfiles:       profiles,
+		AuthReadiness:         readiness,
 		ModelCatalogSnapshots: []any{},
 		ModelCapabilities:     []any{},
 		GapReasons:            []string{},
@@ -846,6 +1126,565 @@ func absentProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResu
 	return probe
 }
 
+type authCapture struct {
+	ProfileReference          string
+	ProfileDisplay            string
+	ProviderAccountKind       string
+	TenantOrProjectReference  string
+	Selection                 SelectionState
+	AllowedScopeSummary       string
+	State                     ReadinessState
+	Confidence                Confidence
+	EvidenceKind              EvidenceKind
+	AuthorizationScopeState   AuthorizationScopeState
+	AuthorizationScopeSummary string
+	ExpiresAt                 string
+	RefreshRequired           bool
+	UnsupportedReason         string
+	GapReasons                []string
+	TerminalErrorCode         string
+}
+
+func inspectAuthReadiness(ctx context.Context, adapter AdapterDeclaration, installation ProviderInstallation, executablePath string, now time.Time, deps Deps) ([]ProbeResult, []AccountProfile, []AuthReadiness) {
+	if len(adapter.AuthReadiness.Argv) == 0 {
+		capture := authReadinessFromReferences(adapter, installation, now, deps)
+		return nil, nil, []AuthReadiness{authReadinessRecord(adapter, installation, nil, capture, now)}
+	}
+
+	argv := append([]string{executablePath}, adapter.AuthReadiness.Argv...)
+	env := probeEnvironment(deps.Getenv)
+	probe := baseProbe(adapter, now, deps)
+	probe.ProbeKind = "auth-readiness"
+	probe.ProviderInstallationID = &installation.ProviderInstallationID
+	probe.ProbeCommandID = adapter.AuthReadiness.CommandID
+	probe.ProbeMethod = ProbeMethodStatusCommand
+	probe.Argv = redactArgv(argv)
+	probe.EnvironmentKeys = environmentKeys(env)
+	probe.TimeoutMS = int(AuthProbeTimeout / time.Millisecond)
+	probe.StdoutLimitBytes = StdoutLimitBytes
+	probe.StderrLimitBytes = StderrLimitBytes
+	probe.CombinedOutputLimitBytes = CombinedLimitBytes
+	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: adapter.AuthReadiness.CommandID, ExecutableName: filepath.Base(executablePath)}
+	probe.Evidence = EvidenceSummary{Kind: "bounded-auth-readiness-command", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
+
+	result, err := deps.RunProbe(ctx, ProbeExecution{
+		Argv:               argv,
+		Env:                env,
+		Timeout:            AuthProbeTimeout,
+		StdoutLimitBytes:   StdoutLimitBytes,
+		StderrLimitBytes:   StderrLimitBytes,
+		CombinedLimitBytes: CombinedLimitBytes,
+	})
+	stdout, stdoutFindings := redactProviderOutput(result.Stdout)
+	stderr, stderrFindings := redactProviderOutput(result.Stderr)
+	probe.StdoutSummary = stdout
+	probe.StderrSummary = stderr
+	probe.SecretFindingCount = stdoutFindings + stderrFindings
+	probe.TimedOut = result.TimedOut
+	probe.Killed = result.Killed
+	probe.ExitCode = &result.ExitCode
+	probe.Confidence = ConfidenceExact
+	probe.Outcome = OutcomeInstalled
+	if err != nil || result.TimedOut || result.Killed {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnknown
+		probe.TerminalErrorCode = "ErrAuthProbeExecutionFailed"
+		probe.GapReasons = append(probe.GapReasons, "auth-readiness-probe-failed")
+	}
+
+	captures := parseAuthCaptures(adapter, result, err)
+	if len(captures) == 0 {
+		captures = []authCapture{unknownAuthCapture("auth-readiness-unparseable", "safe auth readiness command did not return a supported status shape")}
+	}
+	probe.ParsedFields = map[string]string{
+		"readiness_state": string(captures[0].State),
+		"profile_count":   fmt.Sprintf("%d", len(captures)),
+	}
+	if captures[0].AuthorizationScopeState != "" {
+		probe.ParsedFields["authorization_scope_state"] = string(captures[0].AuthorizationScopeState)
+	}
+	if captures[0].State == ReadinessNotAuthenticated || captures[0].State == ReadinessExpired {
+		probe.Outcome = OutcomeInstalledUnusable
+		probe.Confidence = captures[0].Confidence
+	}
+	if captures[0].State == ReadinessUnknown && probe.Outcome == OutcomeInstalled {
+		probe.Outcome = OutcomeInstalledUnusable
+		probe.Confidence = ConfidenceUnknown
+	}
+
+	var profiles []AccountProfile
+	var readiness []AuthReadiness
+	for _, capture := range captures {
+		var profileID *string
+		if strings.TrimSpace(capture.ProfileReference) != "" || strings.TrimSpace(capture.ProfileDisplay) != "" {
+			profile := accountProfileRecord(adapter, installation, capture, now)
+			profileID = &profile.AccountProfileID
+			captureReadiness := authReadinessRecord(adapter, installation, profileID, capture, now)
+			profile.LatestAuthReadinessID = captureReadiness.AuthReadinessID
+			profiles = append(profiles, profile)
+			readiness = append(readiness, captureReadiness)
+			continue
+		}
+		readiness = append(readiness, authReadinessRecord(adapter, installation, nil, capture, now))
+	}
+	return []ProbeResult{probe}, profiles, readiness
+}
+
+func absentAuthReadiness(adapter AdapterDeclaration, now time.Time) AuthReadiness {
+	capture := unknownAuthCapture("provider-executable-not-installed", "provider executable not installed; auth readiness was not run")
+	capture.EvidenceKind = EvidenceNotRun
+	return authReadinessRecord(adapter, ProviderInstallation{}, nil, capture, now)
+}
+
+func authReadinessFromReferences(adapter AdapterDeclaration, installation ProviderInstallation, now time.Time, deps Deps) authCapture {
+	for _, key := range adapter.AuthReadiness.EnvSecretRefs {
+		if _, ok := deps.LookupEnv(key); ok {
+			return authCapture{
+				State:                     ReadinessUnknown,
+				Confidence:                ConfidenceUnknown,
+				EvidenceKind:              EvidenceEnvNameExistence,
+				AuthorizationScopeState:   AuthorizationUnknown,
+				AuthorizationScopeSummary: "secret reference exists; credential validity unknown",
+				UnsupportedReason:         firstNonEmpty(adapter.AuthReadiness.UnsupportedReason, "adapter has no credential-blind status command"),
+				GapReasons:                []string{"auth-reference-present-validity-unknown"},
+			}
+		}
+	}
+	for _, rawPath := range adapter.AuthReadiness.AuthArtifactPaths {
+		path, err := expandAuthArtifactPath(rawPath, deps)
+		if err != nil {
+			return unknownAuthCapture("auth-reference-inaccessible", "declared auth reference path could not be resolved")
+		}
+		if _, err := deps.Lstat(path); err == nil {
+			return authCapture{
+				State:                     ReadinessUnknown,
+				Confidence:                ConfidenceUnknown,
+				EvidenceKind:              EvidenceFileExistence,
+				AuthorizationScopeState:   AuthorizationUnknown,
+				AuthorizationScopeSummary: "auth artifact exists; credential validity unknown",
+				UnsupportedReason:         firstNonEmpty(adapter.AuthReadiness.UnsupportedReason, "adapter has no credential-blind status command"),
+				GapReasons:                []string{"auth-artifact-present-validity-unknown"},
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			capture := unknownAuthCapture("auth-reference-inaccessible", "declared auth reference path was inaccessible")
+			capture.EvidenceKind = EvidenceFileExistence
+			capture.TerminalErrorCode = "ErrAuthReferenceInaccessible"
+			return capture
+		}
+	}
+	reason := firstNonEmpty(adapter.AuthReadiness.UnsupportedReason, "adapter declares no safe auth readiness mechanism")
+	if len(adapter.AuthReadiness.EnvSecretRefs) > 0 || len(adapter.AuthReadiness.AuthArtifactPaths) > 0 {
+		return authCapture{
+			State:                     ReadinessNotAuthenticated,
+			Confidence:                ConfidenceEstimated,
+			EvidenceKind:              EvidenceFileExistence,
+			AuthorizationScopeState:   AuthorizationNotApplicable,
+			AuthorizationScopeSummary: "declared auth references are absent",
+			RefreshRequired:           true,
+			UnsupportedReason:         reason,
+			GapReasons:                []string{"declared-auth-references-absent"},
+		}
+	}
+	return unknownAuthCapture("auth-readiness-unsupported", reason)
+}
+
+func parseAuthCaptures(adapter AdapterDeclaration, result ProbeExecutionResult, runErr error) []authCapture {
+	output := strings.TrimSpace(result.Stdout + "\n" + result.Stderr)
+	if runErr != nil || result.TimedOut || result.Killed {
+		capture := unknownAuthCapture("auth-readiness-probe-failed", "safe auth readiness command failed")
+		capture.TerminalErrorCode = "ErrAuthProbeExecutionFailed"
+		return []authCapture{capture}
+	}
+	switch adapter.AuthReadiness.Parser {
+	case "claude-auth-status-json":
+		return parseClaudeAuthStatus(output, result.ExitCode)
+	case "codex-login-status":
+		return []authCapture{parseTextAuthStatus("codex", output, result.ExitCode)}
+	case "agy-models":
+		return []authCapture{parseTextAuthStatus("antigravity", output, result.ExitCode)}
+	default:
+		return []authCapture{parseTextAuthStatus(adapter.AdapterID, output, result.ExitCode)}
+	}
+}
+
+func parseClaudeAuthStatus(output string, exitCode int) []authCapture {
+	type profileJSON struct {
+		ID               string `json:"id"`
+		Email            string `json:"email"`
+		Display          string `json:"display"`
+		OrgID            string `json:"orgId"`
+		OrgName          string `json:"orgName"`
+		AuthMethod       string `json:"authMethod"`
+		APIProvider      string `json:"apiProvider"`
+		SubscriptionType string `json:"subscriptionType"`
+		Status           string `json:"status"`
+	}
+	type statusJSON struct {
+		LoggedIn         bool          `json:"loggedIn"`
+		AuthMethod       string        `json:"authMethod"`
+		APIProvider      string        `json:"apiProvider"`
+		Email            string        `json:"email"`
+		OrgID            string        `json:"orgId"`
+		OrgName          string        `json:"orgName"`
+		SubscriptionType string        `json:"subscriptionType"`
+		Profiles         []profileJSON `json:"profiles"`
+	}
+	var parsed statusJSON
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		return []authCapture{parseTextAuthStatus("claude", output, exitCode)}
+	}
+	if len(parsed.Profiles) == 0 {
+		if !parsed.LoggedIn && firstNonEmpty(parsed.Email, parsed.OrgID, parsed.OrgName, parsed.AuthMethod, parsed.APIProvider, parsed.SubscriptionType) == "" {
+			return []authCapture{{
+				State:                     ReadinessNotAuthenticated,
+				Confidence:                ConfidenceExact,
+				EvidenceKind:              EvidenceMachineStatus,
+				AuthorizationScopeState:   AuthorizationNotApplicable,
+				AuthorizationScopeSummary: "provider reports not authenticated",
+				RefreshRequired:           true,
+				GapReasons:                []string{"provider-reports-not-authenticated"},
+			}}
+		}
+		parsed.Profiles = []profileJSON{{
+			Email:            parsed.Email,
+			OrgID:            parsed.OrgID,
+			OrgName:          parsed.OrgName,
+			AuthMethod:       parsed.AuthMethod,
+			APIProvider:      parsed.APIProvider,
+			SubscriptionType: parsed.SubscriptionType,
+		}}
+	}
+	captures := make([]authCapture, 0, len(parsed.Profiles))
+	for index, profile := range parsed.Profiles {
+		state := ReadinessReady
+		confidence := ConfidenceExact
+		refresh := false
+		gaps := []string{}
+		status := strings.ToLower(strings.TrimSpace(profile.Status))
+		if !parsed.LoggedIn || strings.Contains(status, "not") || strings.Contains(status, "logged-out") {
+			state = ReadinessNotAuthenticated
+			refresh = true
+			gaps = append(gaps, "provider-reports-not-authenticated")
+		}
+		if strings.Contains(status, "expired") || strings.Contains(status, "revoked") || strings.Contains(status, "refresh") {
+			state = ReadinessExpired
+			refresh = true
+			gaps = append(gaps, "provider-reports-expired")
+		}
+		reference := firstNonEmpty(profile.ID, profile.Email, profile.OrgID, profile.OrgName, fmt.Sprintf("claude-profile-%d", index))
+		display := firstNonEmpty(profile.Display, profile.Email, profile.OrgName, "Claude profile")
+		summaryParts := []string{}
+		if profile.APIProvider != "" {
+			summaryParts = append(summaryParts, "api_provider="+boundedToken(profile.APIProvider, 48))
+		}
+		if profile.SubscriptionType != "" {
+			summaryParts = append(summaryParts, "subscription="+boundedToken(profile.SubscriptionType, 48))
+		}
+		captures = append(captures, authCapture{
+			ProfileReference:          reference,
+			ProfileDisplay:            display,
+			ProviderAccountKind:       "user",
+			TenantOrProjectReference:  firstNonEmpty(profile.OrgID, profile.OrgName),
+			Selection:                 selectionForIndex(index),
+			AllowedScopeSummary:       strings.Join(summaryParts, "; "),
+			State:                     state,
+			Confidence:                confidence,
+			EvidenceKind:              EvidenceMachineStatus,
+			AuthorizationScopeState:   AuthorizationUnknown,
+			AuthorizationScopeSummary: "model authorization unknown",
+			RefreshRequired:           refresh,
+			GapReasons:                gaps,
+		})
+	}
+	return captures
+}
+
+func parseTextAuthStatus(adapterID, output string, exitCode int) authCapture {
+	lower := strings.ToLower(output)
+	capture := authCapture{
+		State:                     ReadinessUnknown,
+		Confidence:                ConfidenceUnknown,
+		EvidenceKind:              EvidenceStatusCommand,
+		AuthorizationScopeState:   AuthorizationUnknown,
+		AuthorizationScopeSummary: "authorization scope unknown",
+		UnsupportedReason:         "",
+		GapReasons:                []string{},
+	}
+	if exitCode == 0 {
+		capture.State = ReadinessReady
+		capture.Confidence = ConfidenceExact
+		capture.ProfileReference = firstNonEmpty(firstNonEmptyLine(output), adapterID+"-default")
+		capture.ProfileDisplay = capture.ProfileReference
+		capture.Selection = SelectionDefault
+		capture.AuthorizationScopeSummary = "readiness command succeeded; model authorization may vary"
+	}
+	if strings.Contains(lower, "not logged") || strings.Contains(lower, "not authenticated") || strings.Contains(lower, "login required") || strings.Contains(lower, "no credentials") {
+		capture.State = ReadinessNotAuthenticated
+		capture.Confidence = ConfidenceExact
+		capture.RefreshRequired = true
+		capture.GapReasons = append(capture.GapReasons, "provider-reports-not-authenticated")
+	}
+	if strings.Contains(lower, "expired") || strings.Contains(lower, "revoked") || strings.Contains(lower, "refresh") {
+		capture.State = ReadinessExpired
+		capture.Confidence = ConfidenceExact
+		capture.RefreshRequired = true
+		capture.GapReasons = append(capture.GapReasons, "provider-reports-expired")
+	}
+	if strings.Contains(lower, "permission") || strings.Contains(lower, "not authorized") || strings.Contains(lower, "forbidden") || strings.Contains(lower, "ineligible") || strings.Contains(lower, "unsupported_client") {
+		capture.State = ReadinessUnknown
+		capture.Confidence = ConfidenceExact
+		capture.EvidenceKind = EvidenceProviderErrorClass
+		capture.AuthorizationScopeState = AuthorizationPartial
+		capture.AuthorizationScopeSummary = "provider reports partial or unavailable authorization"
+		capture.GapReasons = append(capture.GapReasons, "provider-authorization-partial")
+	}
+	if exitCode != 0 && len(capture.GapReasons) == 0 {
+		capture.State = ReadinessUnknown
+		capture.Confidence = ConfidenceUnknown
+		capture.EvidenceKind = EvidenceProviderErrorClass
+		capture.GapReasons = append(capture.GapReasons, "auth-readiness-command-nonzero-exit")
+		capture.TerminalErrorCode = "ErrAuthProbeNonZeroExit"
+	}
+	return capture
+}
+
+func unknownAuthCapture(gap, reason string) authCapture {
+	return authCapture{
+		State:                     ReadinessUnknown,
+		Confidence:                ConfidenceUnknown,
+		EvidenceKind:              EvidenceUnsupported,
+		AuthorizationScopeState:   AuthorizationUnknown,
+		AuthorizationScopeSummary: "authorization scope unknown",
+		UnsupportedReason:         reason,
+		GapReasons:                []string{gap},
+	}
+}
+
+func accountProfileRecord(adapter AdapterDeclaration, installation ProviderInstallation, capture authCapture, now time.Time) AccountProfile {
+	source := ProfileSourceStatusCommand
+	reference := firstNonEmpty(capture.ProfileReference, capture.ProfileDisplay, adapter.AdapterID+"-default")
+	referenceHash := "sha256:" + hashHex(adapter.AdapterID, string(source), strings.ToLower(strings.TrimSpace(reference)))
+	accountProfileID := "acct_" + hashBase32(adapter.AdapterID, string(source), referenceHash)[:32]
+	installationID := installation.ProviderInstallationID
+	tenantHash := ""
+	if strings.TrimSpace(capture.TenantOrProjectReference) != "" {
+		tenantHash = "sha256:" + hashHex(adapter.AdapterID, strings.TrimSpace(capture.TenantOrProjectReference))
+	}
+	selection := capture.Selection
+	if selection == "" {
+		selection = SelectionCandidate
+	}
+	return AccountProfile{
+		SchemaVersion:                AccountProfileSchema,
+		RecordVersion:                1,
+		Scope:                        "machine",
+		ProjectID:                    nil,
+		AccountProfileID:             accountProfileID,
+		AdapterID:                    adapter.AdapterID,
+		ProviderInstallationID:       &installationID,
+		ProfileSource:                source,
+		ProfileReferenceHash:         referenceHash,
+		ProfileDisplay:               safeDisplay(capture.ProfileDisplay),
+		ProviderAccountKind:          boundedToken(capture.ProviderAccountKind, 48),
+		TenantOrProjectReferenceHash: tenantHash,
+		SelectionState:               selection,
+		AllowedScopeSummary:          safeSummary(capture.AllowedScopeSummary),
+		CollisionSet:                 []string{},
+		CreatedAt:                    formatTime(now),
+		UpdatedAt:                    formatTime(now),
+		CreatedBy:                    defaultActorProvenance(),
+		UpdatedBy:                    defaultActorProvenance(),
+		Host:                         hostProvenance(),
+		PolicyVersion:                PolicyVersion,
+		CapturedAt:                   formatTime(now),
+		StaleAfter:                   formatTime(now.Add(24 * time.Hour)),
+		FreshnessState:               FreshnessFresh,
+		Confidence:                   capture.Confidence,
+		SideEffectClass:              "local-read",
+		Classification:               "secret-reference",
+		Source:                       SourceDescriptor{Kind: "auth-readiness-profile", AdapterID: adapter.AdapterID, ProbeCommandID: adapter.AuthReadiness.CommandID},
+		Evidence:                     EvidenceSummary{Kind: "credential-blind-profile-reference", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false},
+		GapReasons:                   copyStringSlice(capture.GapReasons),
+		TerminalErrorCode:            capture.TerminalErrorCode,
+	}
+}
+
+func authReadinessRecord(adapter AdapterDeclaration, installation ProviderInstallation, profileID *string, capture authCapture, now time.Time) AuthReadiness {
+	var installationID *string
+	if installation.ProviderInstallationID != "" {
+		id := installation.ProviderInstallationID
+		installationID = &id
+	}
+	confidence := capture.Confidence
+	if confidence == "" {
+		confidence = ConfidenceUnknown
+	}
+	evidenceKind := capture.EvidenceKind
+	if evidenceKind == "" {
+		evidenceKind = EvidenceUnsupported
+	}
+	scopeState := capture.AuthorizationScopeState
+	if scopeState == "" {
+		scopeState = AuthorizationUnknown
+	}
+	return AuthReadiness{
+		SchemaVersion:             AuthReadinessSchema,
+		RecordVersion:             1,
+		Scope:                     "machine",
+		ProjectID:                 nil,
+		AuthReadinessID:           randomAuthReadinessID(),
+		AdapterID:                 adapter.AdapterID,
+		ProviderInstallationID:    installationID,
+		AccountProfileID:          profileID,
+		ReadinessState:            capture.State,
+		ReadinessConfidence:       confidence,
+		EvidenceKind:              evidenceKind,
+		AuthorizationScopeState:   scopeState,
+		AuthorizationScopeSummary: safeSummary(capture.AuthorizationScopeSummary),
+		ExpiresAt:                 capture.ExpiresAt,
+		RefreshRequired:           capture.RefreshRequired,
+		UnsupportedReason:         safeSummary(capture.UnsupportedReason),
+		CreatedAt:                 formatTime(now),
+		UpdatedAt:                 formatTime(now),
+		CreatedBy:                 defaultActorProvenance(),
+		UpdatedBy:                 defaultActorProvenance(),
+		Host:                      hostProvenance(),
+		PolicyVersion:             PolicyVersion,
+		CapturedAt:                formatTime(now),
+		StaleAfter:                formatTime(now.Add(24 * time.Hour)),
+		FreshnessState:            FreshnessFresh,
+		Confidence:                confidence,
+		SideEffectClass:           "local-read",
+		Classification:            "local-diagnostic",
+		Source:                    SourceDescriptor{Kind: "auth-readiness", AdapterID: adapter.AdapterID, ProbeCommandID: adapter.AuthReadiness.CommandID},
+		Evidence:                  EvidenceSummary{Kind: string(evidenceKind), CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false},
+		GapReasons:                copyStringSlice(capture.GapReasons),
+		TerminalErrorCode:         capture.TerminalErrorCode,
+	}
+}
+
+func finalizeProfiles(profiles []AccountProfile, overrides map[string]string) {
+	byDisplay := map[string][]int{}
+	for i := range profiles {
+		key := strings.ToLower(strings.TrimSpace(profiles[i].AdapterID + "\x00" + profiles[i].ProfileDisplay))
+		if strings.TrimSpace(profiles[i].ProfileDisplay) != "" {
+			byDisplay[key] = append(byDisplay[key], i)
+		}
+		if override := strings.TrimSpace(overrides[profiles[i].AdapterID]); override != "" {
+			if override == profiles[i].AccountProfileID {
+				profiles[i].SelectionState = SelectionExplicit
+			} else if profiles[i].SelectionState == SelectionDefault {
+				profiles[i].SelectionState = SelectionCandidate
+			}
+		}
+	}
+	for _, indexes := range byDisplay {
+		if len(indexes) < 2 {
+			continue
+		}
+		ids := make([]string, 0, len(indexes))
+		for _, index := range indexes {
+			ids = append(ids, profiles[index].AccountProfileID)
+		}
+		sort.Strings(ids)
+		for _, index := range indexes {
+			profiles[index].CollisionSet = append([]string(nil), ids...)
+			if profiles[index].SelectionState == SelectionDefault {
+				profiles[index].SelectionState = SelectionCandidate
+			}
+		}
+	}
+}
+
+func expandAuthArtifactPath(path string, deps Deps) (string, error) {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) || path == "~" {
+		homeDir, err := deps.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			path = homeDir
+		} else {
+			path = filepath.Join(homeDir, path[2:])
+		}
+	}
+	return canonicalPath(path, deps), nil
+}
+
+func randomAuthReadinessID() string {
+	var buf [16]byte
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		return "auth_" + hashBase32(time.Now().UTC().Format(time.RFC3339Nano))[:26]
+	}
+	return "auth_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf[:]))
+}
+
+func selectionForIndex(index int) SelectionState {
+	if index == 0 {
+		return SelectionDefault
+	}
+	return SelectionCandidate
+}
+
+func safeDisplay(value string) string {
+	value = safeSummary(value)
+	value = emailPattern.ReplaceAllStringFunc(value, redactEmail)
+	if secretLike(value) {
+		return "[REDACTED]"
+	}
+	return value
+}
+
+func safeSummary(value string) string {
+	value, _ = redactProviderOutput(value)
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\r\n", "\n"))
+	if len(value) > 240 {
+		value = value[:240] + "..."
+	}
+	return value
+}
+
+func boundedToken(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) > limit {
+		return value[:limit]
+	}
+	return value
+}
+
+func copyStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	return append([]string(nil), values...)
+}
+
+func secretLike(value string) bool {
+	for _, pattern := range secretPatterns {
+		if pattern.MatchString(value) {
+			return true
+		}
+	}
+	return genericKeyValueSecretPattern.MatchString(value)
+}
+
+var emailPattern = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+
+func redactEmail(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 || parts[0] == "" {
+		return "[REDACTED_EMAIL]"
+	}
+	local := parts[0]
+	if len(local) > 1 {
+		local = local[:1] + "***"
+	} else {
+		local = "***"
+	}
+	return local + "@" + parts[1]
+}
+
 func baseProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
 	probe := ProbeResult{
 		SchemaVersion:            ProbeResultSchema,
@@ -903,6 +1742,9 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 		if decl.DisplayName == "" {
 			decl.DisplayName = provider.DisplayName
 		}
+		if authReadinessDeclarationEmpty(decl.AuthReadiness) {
+			decl.AuthReadiness = defaultAuthReadinessDeclaration(provider.Name)
+		}
 		byID[provider.Name] = decl
 	}
 	for _, provider := range configuredProviderNames(cfg) {
@@ -915,6 +1757,7 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 			Vendor:           "custom",
 			ExecutableNames:  []string{provider},
 			VersionArgv:      []string{"--version"},
+			AuthReadiness:    defaultAuthReadinessDeclaration(provider),
 			KnownLimitations: []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
 		}
 	}
@@ -931,6 +1774,7 @@ func adapterDeclarations(cfg config.Config) []AdapterDeclaration {
 				Vendor:           "custom",
 				ExecutableNames:  []string{adapterID},
 				VersionArgv:      []string{"--version"},
+				AuthReadiness:    defaultAuthReadinessDeclaration(adapterID),
 				KnownLimitations: []string{"custom adapter has installation discovery only; auth, catalog, quota, and invocation readiness are unknown"},
 			}
 		}
@@ -959,8 +1803,51 @@ func declarationFromRuntime(provider runtimecap.ProviderRuntime) AdapterDeclarat
 		Vendor:           provider.Name,
 		ExecutableNames:  []string{provider.Executable},
 		VersionArgv:      []string{"--version"},
+		AuthReadiness:    defaultAuthReadinessDeclaration(provider.Name),
 		KnownLimitations: append([]string(nil), provider.KnownLimitations...),
 	}
+}
+
+func defaultAuthReadinessDeclaration(adapterID string) AuthReadinessDeclaration {
+	switch adapterID {
+	case "codex":
+		return AuthReadinessDeclaration{
+			CommandID: "codex-login-status",
+			Argv:      []string{"login", "status"},
+			Parser:    "codex-login-status",
+		}
+	case "claude":
+		return AuthReadinessDeclaration{
+			CommandID: "claude-auth-status-json",
+			Argv:      []string{"auth", "status", "--json"},
+			Parser:    "claude-auth-status-json",
+		}
+	case "antigravity":
+		return AuthReadinessDeclaration{
+			CommandID: "agy-models",
+			Argv:      []string{"models"},
+			Parser:    "agy-models",
+		}
+	case "gemini":
+		return AuthReadinessDeclaration{
+			EnvSecretRefs:     []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+			AuthArtifactPaths: []string{"~/.gemini/oauth_creds.json"},
+			UnsupportedReason: "gemini adapter has no dedicated credential-blind auth status command; only secret-reference existence can be reported",
+		}
+	default:
+		return AuthReadinessDeclaration{
+			UnsupportedReason: "adapter declares no safe credential-blind auth readiness mechanism",
+		}
+	}
+}
+
+func authReadinessDeclarationEmpty(decl AuthReadinessDeclaration) bool {
+	return strings.TrimSpace(decl.CommandID) == "" &&
+		len(decl.Argv) == 0 &&
+		strings.TrimSpace(decl.Parser) == "" &&
+		len(decl.EnvSecretRefs) == 0 &&
+		len(decl.AuthArtifactPaths) == 0 &&
+		strings.TrimSpace(decl.UnsupportedReason) == ""
 }
 
 func configuredProviderNames(cfg config.Config) []string {
@@ -1223,6 +2110,7 @@ func redactProviderOutput(output string) (string, int) {
 		findings++
 		return "[REDACTED]"
 	})
+	output = emailPattern.ReplaceAllStringFunc(output, redactEmail)
 	return output, findings
 }
 
@@ -1540,6 +2428,47 @@ func upsertInstallation(ctx context.Context, tx storage.Tx, installation Provide
 	return err
 }
 
+func upsertAccountProfile(ctx context.Context, tx storage.Tx, profile AccountProfile) error {
+	payload, err := json.Marshal(profile)
+	if err != nil {
+		return err
+	}
+	providerInstallationID := any(nil)
+	if profile.ProviderInstallationID != nil {
+		providerInstallationID = *profile.ProviderInstallationID
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO account_profiles(
+		account_profile_id, adapter_id, provider_installation_id, payload_json
+	) VALUES (?, ?, ?, ?)
+	ON CONFLICT(account_profile_id) DO UPDATE SET
+		adapter_id = excluded.adapter_id,
+		provider_installation_id = excluded.provider_installation_id,
+		payload_json = excluded.payload_json`,
+		profile.AccountProfileID, profile.AdapterID, providerInstallationID, string(payload))
+	return err
+}
+
+func insertAuthReadiness(ctx context.Context, tx storage.Tx, readiness AuthReadiness) error {
+	payload, err := json.Marshal(readiness)
+	if err != nil {
+		return err
+	}
+	providerInstallationID := any(nil)
+	if readiness.ProviderInstallationID != nil {
+		providerInstallationID = *readiness.ProviderInstallationID
+	}
+	accountProfileID := any(nil)
+	if readiness.AccountProfileID != nil {
+		accountProfileID = *readiness.AccountProfileID
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO auth_readiness(
+		auth_readiness_id, adapter_id, provider_installation_id, account_profile_id, payload_json
+	) VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT(auth_readiness_id) DO NOTHING`,
+		readiness.AuthReadinessID, readiness.AdapterID, providerInstallationID, accountProfileID, string(payload))
+	return err
+}
+
 func marshalJSONText(v any) (string, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -1598,6 +2527,9 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.Getenv == nil {
 		deps.Getenv = defaults.Getenv
 	}
+	if deps.LookupEnv == nil {
+		deps.LookupEnv = defaults.LookupEnv
+	}
 	if deps.UserHomeDir == nil {
 		deps.UserHomeDir = defaults.UserHomeDir
 	}
@@ -1634,6 +2566,15 @@ func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstNonEmptyLine(text string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
 		}
 	}
 	return ""

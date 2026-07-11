@@ -36,9 +36,9 @@ capability, supporting alternatives when known, and the local fix.
 
 | Provider | Executable | Read-only | Nested sub-agents | JSON output | MCP config | Cancellation | Token usage | Auth probe | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `codex` | `codex` | yes | no | yes | yes | yes | yes | none | Default Worker provider. |
-| `claude` | `claude` | yes | yes | yes | yes | yes | yes | none | Verified Worker and Verifier provider. |
-| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | none | Experimental direct Gemini path, outside the static model registry. |
+| `codex` | `codex` | yes | no | yes | yes | yes | yes | `codex login status` | Default Worker provider. |
+| `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider. |
+| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | secret-reference existence only | Experimental direct Gemini path, outside the static model registry. |
 | `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Uses plain text summary capture and self-reported selected model string. |
 
 `antigravity` is the clearest partial provider today. If selected for a
