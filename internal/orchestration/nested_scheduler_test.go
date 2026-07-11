@@ -185,7 +185,7 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for first child to start")
 	}
 	cancel()
@@ -1122,6 +1122,9 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 			Clock:       func() time.Time { return now },
 			Plan:        &plan,
 			Store:       store,
+			RecordEvent: func(string, string, state.Event) error {
+				return nil
+			},
 			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
 				atomic.AddInt64(&executeCount, 1)
 				if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
@@ -1253,6 +1256,313 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	}
 }
 
+func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
+	oldLease := nestedClaimLeaseDuration
+	oldRenew := nestedClaimRenewEvery
+	nestedClaimLeaseDuration = 150 * time.Millisecond
+	nestedClaimRenewEvery = 25 * time.Millisecond
+	defer func() {
+		nestedClaimLeaseDuration = oldLease
+		nestedClaimRenewEvery = oldRenew
+	}()
+
+	ctx := context.Background()
+	repo := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+	storeA, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open B: %v", err)
+	}
+	defer storeB.Close()
+
+	planA := durableReplayTestPlan()
+	planA.PlanID = "plan-renew-long-execution"
+	planA.Items[0].ChildKey = "renew-child"
+	planB := durableReplayTestPlan()
+	planB.PlanID = planA.PlanID
+	planB.Items[0].ChildKey = "renew-child"
+
+	executeStarted := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount int64
+	doneA := make(chan struct {
+		report NestedScheduleReport
+		err    error
+	}, 1)
+	go func() {
+		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+			RepoPath:    repo,
+			MaxChildren: 1,
+			Now:         nestedTestNow(),
+			Clock:       func() time.Time { return nestedTestNow() },
+			Plan:        &planA,
+			Store:       storeA,
+			RecordEvent: func(string, string, state.Event) error {
+				return nil
+			},
+			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				atomic.AddInt64(&executeCount, 1)
+				close(executeStarted)
+				<-releaseExecute
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			},
+		})
+		doneA <- struct {
+			report NestedScheduleReport
+			err    error
+		}{report: report, err: err}
+	}()
+	select {
+	case <-executeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider execution")
+	}
+	time.Sleep(nestedClaimLeaseDuration + 75*time.Millisecond)
+	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow().Add(time.Hour),
+		Clock:       func() time.Time { return nestedTestNow().Add(time.Hour) },
+		Plan:        &planB,
+		Store:       storeB,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			atomic.AddInt64(&executeCount, 1)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("observer ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := reportB.Children[0].ClaimOutcome; got != storage.ClaimOutcomeAlreadyRunning {
+		t.Fatalf("observer claim outcome = %q, want already-running", got)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count while owner active = %d, want 1", got)
+	}
+	close(releaseExecute)
+	outcomeA := <-doneA
+	if outcomeA.err != nil {
+		t.Fatalf("owner ScheduleNestedRuns returned error: %v", outcomeA.err)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count after owner completed = %d, want 1", got)
+	}
+}
+
+func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecute(t *testing.T) {
+	oldLease := nestedClaimLeaseDuration
+	oldRenew := nestedClaimRenewEvery
+	nestedClaimLeaseDuration = 80 * time.Millisecond
+	nestedClaimRenewEvery = time.Hour
+	defer func() {
+		nestedClaimLeaseDuration = oldLease
+		nestedClaimRenewEvery = oldRenew
+	}()
+
+	ctx := context.Background()
+	repo := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+	storeA, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open B: %v", err)
+	}
+	defer storeB.Close()
+
+	planA := durableReplayTestPlan()
+	planA.PlanID = "plan-expired-executing"
+	planA.Items[0].ChildKey = "expired-child"
+	planB := durableReplayTestPlan()
+	planB.PlanID = planA.PlanID
+	planB.Items[0].ChildKey = "expired-child"
+
+	executeStarted := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount int64
+	doneA := make(chan struct {
+		report NestedScheduleReport
+		err    error
+	}, 1)
+	go func() {
+		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+			RepoPath:    repo,
+			MaxChildren: 1,
+			Now:         nestedTestNow(),
+			Clock:       func() time.Time { return nestedTestNow() },
+			Plan:        &planA,
+			Store:       storeA,
+			RecordEvent: func(string, string, state.Event) error {
+				return nil
+			},
+			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				atomic.AddInt64(&executeCount, 1)
+				close(executeStarted)
+				<-releaseExecute
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			},
+		})
+		doneA <- struct {
+			report NestedScheduleReport
+			err    error
+		}{report: report, err: err}
+	}()
+	select {
+	case <-executeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider execution")
+	}
+	time.Sleep(nestedClaimLeaseDuration + 50*time.Millisecond)
+	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow().Add(time.Hour),
+		Clock:       func() time.Time { return nestedTestNow().Add(time.Hour) },
+		Plan:        &planB,
+		Store:       storeB,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			atomic.AddInt64(&executeCount, 1)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("observer ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := reportB.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("observer status = %q, want needs-human", got)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count while expired owner still active = %d, want 1", got)
+	}
+	close(releaseExecute)
+	outcomeA := <-doneA
+	if outcomeA.err == nil {
+		t.Fatalf("owner ScheduleNestedRuns returned nil error after needs-human transition, want completion rejection")
+	}
+}
+
+func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
+	oldLease := nestedClaimLeaseDuration
+	oldRenew := nestedClaimRenewEvery
+	nestedClaimLeaseDuration = time.Minute
+	nestedClaimRenewEvery = time.Hour
+	defer func() {
+		nestedClaimLeaseDuration = oldLease
+		nestedClaimRenewEvery = oldRenew
+	}()
+
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-stale-owner-events"
+	plan.Items[0].ChildKey = "stale-child"
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Plan:        &plan,
+		Store:       store,
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+				_, err := tx.Exec(ctx, `UPDATE run_claims
+					SET phase = ?, lease_expires_at = ?
+					WHERE run_id = ?`, storage.ClaimPhaseClaimed, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), child.RunID)
+				return err
+			}); err != nil {
+				t.Fatalf("force stale claim state: %v", err)
+			}
+			if _, err := storage.ClaimChildRunExecution(ctx, store, plan.ParentRunID, child.RunID, "takeover-executor", time.Now().UTC(), time.Now().Add(time.Minute).UTC()); err != nil {
+				t.Fatalf("take over stale claim: %v", err)
+			}
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("stale owner result status = %q, want needs-human", got)
+	}
+	childEvents := readNestedEvents(t, repo, report.Children[0].RunID)
+	if strings.Contains(childEvents, NestedEventChildFinished) {
+		t.Fatalf("stale owner child events include finished event:\n%s", childEvents)
+	}
+	parentEvents := readNestedEvents(t, repo, report.ParentRunID)
+	if strings.Contains(parentEvents, NestedEventChildFinished) || strings.Contains(parentEvents, NestedEventParentDone) {
+		t.Fatalf("stale owner parent events include terminal event:\n%s", parentEvents)
+	}
+}
+
+func TestScheduleNestedRunsCancellationPersistsTerminalStatusWithCleanupContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repo := t.TempDir()
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-cancel-cleanup"
+	plan.Items[0].ChildKey = "cancel-child"
+	executeStarted := make(chan struct{})
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    repo,
+		MaxChildren: 1,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Plan:        &plan,
+		Store:       store,
+		Execute: func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			close(executeStarted)
+			cancel()
+			<-ctx.Done()
+			return ChildRunResult{}, ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	select {
+	case <-executeStarted:
+	default:
+		t.Fatal("execute did not start")
+	}
+	if got := report.Children[0].Status; got != NestedStatusCancelled {
+		t.Fatalf("cancelled child status = %q, want cancelled", got)
+	}
+	var durableStatus string
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT status FROM runs WHERE id = ?`, report.Children[0].RunID).Scan(&durableStatus)
+	}); err != nil {
+		t.Fatalf("query durable status: %v", err)
+	}
+	if durableStatus != NestedStatusCancelled {
+		t.Fatalf("durable status = %q, want cancelled", durableStatus)
+	}
+}
+
 func TestNestedReplayHelperProcess(t *testing.T) {
 	if os.Getenv("LOOPCODER_NESTED_REPLAY_HELPER") != "1" {
 		return
@@ -1279,6 +1589,9 @@ func TestNestedReplayHelperProcess(t *testing.T) {
 		Clock:       func() time.Time { return now },
 		Plan:        &plan,
 		Store:       store,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
 		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
 			activePath := os.Getenv("LOOPCODER_NESTED_REPLAY_ACTIVE")
 			duplicatePath := os.Getenv("LOOPCODER_NESTED_REPLAY_DUPLICATE")

@@ -597,6 +597,12 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 		if child.LeaseExpiresAt != "" {
 			line += " lease_expires_at=" + child.LeaseExpiresAt
 		}
+		if child.ClaimPhase != "" {
+			line += " phase=" + child.ClaimPhase
+		}
+		if child.ProviderKey != "" {
+			line += " provider_key=" + child.ProviderKey
+		}
 		if child.Error != "" {
 			line += " error=" + reporter.BoundDecisionText(child.Error)
 		}

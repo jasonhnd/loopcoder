@@ -243,7 +243,10 @@ CREATE TABLE run_claims (
   claim_generation INTEGER NOT NULL,
   claimed_at TEXT NOT NULL,
   lease_expires_at TEXT NOT NULL,
-  heartbeat_at TEXT NOT NULL
+  heartbeat_at TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT 'claimed',
+  provider_idempotency_key TEXT NOT NULL DEFAULT '',
+  provider_receipt TEXT NOT NULL DEFAULT ''
 );
 ```
 
@@ -264,8 +267,19 @@ Required storage invariants:
 - Claim acquisition MUST distinguish `claimed`, `already-running`,
   `terminal-reused`, `blocked`, and stale-claim takeover. Only the claim owner
   for the current generation may write terminal completion.
+- Claim owners MUST record the current claim phase. `claimed` means the
+  provider has not launched; `launching` and `executing` are ambiguous after
+  lease expiry and MUST fail closed to `needs-human` rather than auto-take over.
+- While a provider is executing, the scheduler MUST renew `heartbeat_at` and
+  `lease_expires_at` with a fenced `run_id`, `executor_id`, and
+  `claim_generation` predicate. Renewal stops and joins before completion.
+- Provider launch MUST carry a durable idempotency key or receipt when the
+  provider supports it. The key is metadata for recovery, not a universal
+  exactly-once guarantee.
 - Terminal completion MUST be fenced by `run_id`, `executor_id`, and
   `claim_generation` so an older owner cannot overwrite a newer recovery owner.
+- If terminal completion is rejected as stale, that owner MUST NOT publish
+  child finished events or parent terminal state.
 - Write-intent storage paths use an immediate SQLite write transaction with a
   bounded retry around the full database-only transaction after `SQLITE_BUSY`.
 
@@ -419,16 +433,22 @@ PRs, checks, and explicit local run records are the source of truth.
   It returns a non-error observation with the owner, generation, lease, and
   replay action so the parent can observe or retry after the lease state changes.
 - If a process crashes after claiming but before provider launch, observers see
-  the active lease. After expiry, recovery may take over with a new generation;
-  if side effects cannot be proven absent, recovery must fail closed to
-  `needs-human`.
+  the active lease and `claimed` phase. After expiry, recovery may take over
+  with a new generation because the durable phase proves the provider did not
+  launch.
 - If a process crashes during provider execution, the active lease prevents a
-  duplicate launch until expiry. Takeover is fenced by generation; stale
-  completions are rejected.
+  duplicate launch while heartbeats renew it. If the lease expires in
+  `launching` or `executing`, recovery MUST mark or return `needs-human` rather
+  than launch a duplicate provider. Stale completions are rejected and must not
+  publish finished events.
 - If a process crashes after external side effects but before terminal
   persistence, loopcoder does not claim universal exactly-once side effects.
   Recovery uses durable ownership, fencing, provider idempotency keys or
   receipts where available, and `needs-human` when completion cannot be proven.
+- If cancellation happens during provider execution, terminal child persistence
+  uses a bounded cleanup context that is independent of the cancelled caller
+  context. Rollback paths also use independent cleanup context and discard a
+  connection if rollback cannot be proven.
 - Cancellation while another scheduler owns the claim is an observation path:
   the cancelling scheduler must not cancel or overwrite the owner unless a
   later explicit recovery policy takes over an expired lease.
