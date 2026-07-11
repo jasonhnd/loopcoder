@@ -5,11 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-11
 
-This section describes the v0.7.0 candidate on `main`/`pre-prod`. v0.7.0 is
-not the customer install target until the tag, signed checksums, platform
-assets, release smoke, and go/no-go report are complete.
+v0.7.0 is the current customer install target. It moves loopcoder's local
+runtime from repo-only files toward a machine-local project registry and
+SQLite-backed runtime store, adds explicit local-state migration and nested
+run-tree observability, and ships through the staged signed release flow.
 
 ### Added
 
@@ -68,9 +69,8 @@ assets, release smoke, and go/no-go report are complete.
   nested parent/child run-tree observability before tagging.
 - **v0.7.0 release readiness artifacts** - added
   `.github/release-notes/v0.7.0.md` and
-  `docs/reference/v0.7.0-go-no-go.md` so the final release PR can attach a
-  truthful go/no-go report without claiming v0.7.0 is installable before the
-  tag and signed assets exist.
+  `docs/reference/v0.7.0-go-no-go.md`, now completed with the post-publication
+  GO decision and release evidence.
 - **Expanded v0.7.0 release smoke and CI gates** - the release workflow stages
   a signed draft release, runs native smoke on Ubuntu, macOS, and Windows, keeps
   failed candidates draft-only, and requires the `release-publication`
@@ -97,13 +97,12 @@ assets, release smoke, and go/no-go report are complete.
   treated as authoritative orchestration. The accepted child plan, permission
   ceiling, scope validation, persistence, cancellation, timeout, resume, and
   aggregation rules belong to loopcoder.
-- **Release process** - v0.7.0 assets are created as a draft release first;
-  publication is a separate human-gated environment step after staged smoke
-  passes. README install and upgrade examples remain on v0.6.1 until that gate
-  publishes the final signed release.
-- **README and usage command inventory** - stable v0.6.1 commands and
-  unreleased v0.7.0 preview commands are documented separately so users
-  following stable install instructions do not encounter unknown commands.
+- **Release process** - v0.7.0 assets were created as a draft release first;
+  publication was a separate human-gated environment step after staged smoke
+  passed. README install and upgrade examples now target the final signed
+  v0.7.0 release.
+- **README and usage command inventory** - v0.7.0 commands and output fields
+  are documented as the current public release surface.
 
 ### Fixed
 
@@ -153,9 +152,8 @@ assets, release smoke, and go/no-go report are complete.
 
 ### Compatibility
 
-- v0.7.0 is a pre-release candidate until signed assets and the go/no-go report
-  exist. Stable install and upgrade examples must continue to target v0.6.1
-  before publication.
+- v0.7.0 is the current public release, with signed platform archives,
+  `SHA256SUMS`, and `SHA256SUMS.sigstore` published on 2026-07-11.
 - Existing repo-local `.loopcoder/` state remains readable during the
   compatibility window. `migrate local-state` copies compatible records into
   machine-local storage and leaves the source files in place.
@@ -172,9 +170,9 @@ assets, release smoke, and go/no-go report are complete.
 
 ### Upgrade
 
-After v0.7.0 is published, upgrade from v0.6.1 with
-`loopcoder upgrade --version 0.7.0`, run `loopcoder skill install --repo .`,
-register each checkout with `loopcoder projects register --repo .`, inspect
+Upgrade from v0.6.1 with `loopcoder upgrade --version 0.7.0`, run
+`loopcoder skill install --repo .`, register each checkout with
+`loopcoder projects register --repo .`, inspect
 `loopcoder migrate local-state --repo . --dry-run`, and run the non-dry-run
 migration only after reviewing the copied record set. Roll back by selecting a
 prior released binary such as v0.6.1 and keeping or backing up
