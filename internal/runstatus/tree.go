@@ -287,6 +287,8 @@ func applyClaimMetadata(repoPath, runID string, node *RunTreeNode) {
 				ClaimOwner      string `json:"claim_owner"`
 				ClaimGeneration int64  `json:"claim_generation"`
 				LeaseExpiresAt  string `json:"lease_expires_at"`
+				ClaimPhase      string `json:"claim_phase"`
+				ProviderKey     string `json:"provider_idempotency_key"`
 			} `json:"result"`
 		}
 		if err := json.Unmarshal(event.Details, &details); err != nil {
@@ -306,6 +308,12 @@ func applyClaimMetadata(repoPath, runID string, node *RunTreeNode) {
 		}
 		if strings.TrimSpace(details.Result.LeaseExpiresAt) != "" {
 			node.LeaseExpiresAt = strings.TrimSpace(details.Result.LeaseExpiresAt)
+		}
+		if strings.TrimSpace(details.Result.ClaimPhase) != "" {
+			node.ClaimPhase = strings.TrimSpace(details.Result.ClaimPhase)
+		}
+		if strings.TrimSpace(details.Result.ProviderKey) != "" {
+			node.ProviderKey = strings.TrimSpace(details.Result.ProviderKey)
 		}
 	}
 }

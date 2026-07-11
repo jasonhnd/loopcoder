@@ -458,7 +458,7 @@ context, read the ledger, and continue.
 Nested child runs add a stricter local database ownership rule. Stable
 `run_id` replay is not enough to relaunch a child provider: the scheduler must
 own the current durable execution claim for the child. Claim acquisition,
-child/edge transition to `running`, and SQL transition event insertion happen
+child/edge transition to `launching` or `running`, and SQL transition event insertion happen
 inside one immediate write transaction. If two schedulers replay the same child,
 one receives `claimed` and may launch the provider; the other receives an
 active-owner observation with owner, generation, and lease metadata and must
@@ -467,15 +467,23 @@ not execute.
 Crash handling for nested children is conservative:
 
 - Crash after claim but before provider launch: observers see the active lease.
-  After expiry, recovery may take over with a new generation; if absence of
-  side effects cannot be proven, recovery fails closed to `needs-human`.
+  After expiry, recovery may take over only if the durable claim phase is still
+  `claimed`, which proves the provider did not launch.
 - Crash during provider execution: the active lease prevents duplicate launch
-  until expiry. A takeover increments `claim_generation`, and stale completion
-  from the older owner is rejected by owner/generation fencing.
+  while the owner renews `heartbeat_at` and `lease_expires_at`. If the lease
+  expires in `launching` or `executing`, recovery fails closed to
+  `needs-human`; it must not launch a duplicate provider. Stale completion from
+  the older owner is rejected by owner/generation fencing and must not publish
+  finished child events or parent terminal state.
 - Crash after external side effects but before terminal persistence: loopcoder
   does not claim universal exactly-once effects. Recovery must use provider
   idempotency keys, receipts, local attempt records, or human review to decide
   whether to persist a terminal state or mark the child `needs-human`.
+- Cancellation during provider execution does not leave a durable child stuck
+  in `running`: terminal persistence uses a bounded cleanup context independent
+  of the cancelled caller context. Rollback also uses independent cleanup; if a
+  rollback cannot be proven, the connection is discarded rather than returned
+  to the pool with an open transaction.
 - Cancellation while observing another owner is non-mutating. The observer may
   return a running/blocked result, but it must not cancel the owner or publish a
   terminal child status.

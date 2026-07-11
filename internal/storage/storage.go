@@ -4,6 +4,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -23,9 +24,11 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 8
+	CurrentSchemaVersion = 9
 
 	driverName = "sqlite"
+
+	rollbackTimeout = 5 * time.Second
 )
 
 // Store is the internal storage interface for v0.7 runtime state.
@@ -72,6 +75,8 @@ type sqlTx struct {
 type sqlConnTx struct {
 	conn *sql.Conn
 }
+
+var rollbackConnTxHookForTest func(*sql.Conn) error
 
 var migrations = []migration{
 	{
@@ -262,6 +267,16 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_run_claims_lease_expires_at ON run_claims(lease_expires_at)`,
 		},
 	},
+	{
+		version: 9,
+		name:    "nested child claim lifecycle phase",
+		statements: []string{
+			`ALTER TABLE run_claims ADD COLUMN phase TEXT NOT NULL DEFAULT 'claimed'`,
+			`ALTER TABLE run_claims ADD COLUMN provider_idempotency_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE run_claims ADD COLUMN provider_receipt TEXT NOT NULL DEFAULT ''`,
+			`UPDATE run_claims SET phase = 'claimed' WHERE phase = ''`,
+		},
+	},
 }
 
 var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "legacy_import_records", "legacy_import_status"}
@@ -432,21 +447,35 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 	}
 	wrapped := sqlConnTx{conn: conn}
 	if err := fn(wrapped); err != nil {
-		if rollbackErr := rollbackConnTx(ctx, conn); rollbackErr != nil {
+		if rollbackErr := rollbackConnTx(conn); rollbackErr != nil {
+			_ = discardConn(conn)
 			return fmt.Errorf("storage write transaction: rollback after %v: %w", err, rollbackErr)
 		}
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		_ = rollbackConnTx(ctx, conn)
+		if rollbackErr := rollbackConnTx(conn); rollbackErr != nil {
+			_ = discardConn(conn)
+		}
 		return fmt.Errorf("storage write transaction: commit: %w", err)
 	}
 	return nil
 }
 
-func rollbackConnTx(ctx context.Context, conn *sql.Conn) error {
+func rollbackConnTx(conn *sql.Conn) error {
+	if rollbackConnTxHookForTest != nil {
+		return rollbackConnTxHookForTest(conn)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
 	_, err := conn.ExecContext(ctx, `ROLLBACK`)
 	return err
+}
+
+func discardConn(conn *sql.Conn) error {
+	return conn.Raw(func(any) error {
+		return driver.ErrBadConn
+	})
 }
 
 func withRetry(ctx context.Context, op func() error) error {

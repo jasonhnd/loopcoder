@@ -87,6 +87,11 @@ func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
 	if !tableExists(t, store, "run_claims") {
 		t.Fatalf("missing run_claims table")
 	}
+	for _, column := range []string{"phase", "provider_idempotency_key", "provider_receipt"} {
+		if !tableColumnExists(t, store, "run_claims", column) {
+			t.Fatalf("missing migrated run_claims column %s", column)
+		}
+	}
 	var rootRunID string
 	if err := store.WithTx(ctx, func(tx Tx) error {
 		return tx.QueryRow(ctx, `SELECT root_run_id FROM runs WHERE id = 'run-20260709T000000Z-wave'`).Scan(&rootRunID)
@@ -95,6 +100,42 @@ func TestOpenMigratesNestedGraphSchemaFromV6(t *testing.T) {
 	}
 	if rootRunID != "run-20260709T000000Z-wave" {
 		t.Fatalf("migrated root_run_id = %q, want self root", rootRunID)
+	}
+}
+
+func TestOpenMigratesRunClaimsLifecycleColumnsFromV8(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV8NestedClaimsSchema(t, raw)
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	if health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, CurrentSchemaVersion)
+	}
+	for _, column := range []string{"phase", "provider_idempotency_key", "provider_receipt"} {
+		if !tableColumnExists(t, store, "run_claims", column) {
+			t.Fatalf("missing migrated run_claims column %s", column)
+		}
+	}
+	var phase, key, receipt string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT phase, provider_idempotency_key, provider_receipt FROM run_claims WHERE run_id = 'run-child'`).Scan(&phase, &key, &receipt)
+	}); err != nil {
+		t.Fatalf("query migrated claim: %v", err)
+	}
+	if phase != ClaimPhaseClaimed || key != "" || receipt != "" {
+		t.Fatalf("migrated claim lifecycle fields = %q/%q/%q, want claimed/empty/empty", phase, key, receipt)
 	}
 }
 
@@ -744,6 +785,104 @@ func TestClaimChildRunExecutionClaimsObservesAndFencesCompletion(t *testing.T) {
 	}
 }
 
+func TestRenewChildRunClaimExtendsLeaseAndFencesOwner(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	childRunID := children[0].RunID
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-a", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution: %v", err)
+	}
+	renewedUntil := now.Add(4 * time.Minute)
+	if err := RenewChildRunClaim(ctx, store, childRunID, claim.ExecutorID, claim.ClaimGeneration, now.Add(30*time.Second), renewedUntil); err != nil {
+		t.Fatalf("RenewChildRunClaim: %v", err)
+	}
+	loser, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-b", now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution loser: %v", err)
+	}
+	if loser.Outcome != ClaimOutcomeAlreadyRunning || loser.LeaseExpiresAt != formatTimestamp(renewedUntil) {
+		t.Fatalf("loser claim = %#v, want active renewed owner through %s", loser, formatTimestamp(renewedUntil))
+	}
+	err = RenewChildRunClaim(ctx, store, childRunID, "executor-b", claim.ClaimGeneration, now.Add(time.Minute), now.Add(5*time.Minute))
+	if !IsStaleChildRunClaim(err) {
+		t.Fatalf("stale renew error = %v, want ErrStaleChildRunClaim", err)
+	}
+}
+
+func TestClaimChildRunExecutionExpiredExecutingClaimNeedsHuman(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	childRunID := children[0].RunID
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-a", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution: %v", err)
+	}
+	if err := UpdateChildRunClaimPhase(ctx, store, parent.RunID, childRunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, formatTimestamp(now.Add(time.Second)), claim.ProviderKey); err != nil {
+		t.Fatalf("UpdateChildRunClaimPhase executing: %v", err)
+	}
+	blocked, err := ClaimChildRunExecution(ctx, store, parent.RunID, childRunID, "executor-b", now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution expired executing: %v", err)
+	}
+	if blocked.Outcome != ClaimOutcomeBlocked || blocked.RunStatus != "needs-human" || blocked.PreviousOwner != "executor-a" {
+		t.Fatalf("blocked claim = %#v, want needs-human for expired executing owner", blocked)
+	}
+}
+
+func TestWithWriteTxRollbackFailureDiscardsConnection(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	wantErr := errors.New("force rollback")
+	rollbackErr := errors.New("forced rollback failure")
+	rollbackConnTxHookForTest = func(*sql.Conn) error {
+		return rollbackErr
+	}
+	defer func() { rollbackConnTxHookForTest = nil }()
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('project-rollback', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+			t.Fatalf("insert project before forced rollback: %v", err)
+		}
+		return wantErr
+	})
+	if err == nil || !strings.Contains(err.Error(), "rollback after") || !errors.Is(err, rollbackErr) {
+		t.Fatalf("WithWriteTx error = %v, want rollback failure", err)
+	}
+	rollbackConnTxHookForTest = nil
+
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('project-after-rollback', '/repo2', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	}); err != nil {
+		t.Fatalf("write after rollback failure: %v", err)
+	}
+}
+
 func TestCheckHealthRejectsCorruptDurableRunGraph(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -907,6 +1046,70 @@ func createV3Schema(t *testing.T, db *sql.DB) {
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("exec v3 fixture statement: %v\n%s", err, statement)
+		}
+	}
+}
+
+func createV8NestedClaimsSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	createV3Schema(t, db)
+	for _, statement := range []string{
+		`INSERT INTO migrations(version, name, applied_at) VALUES (4, 'scrub project remote urls', '2026-01-01T00:00:00Z')`,
+		`ALTER TABLE projects ADD COLUMN detached_at TEXT NOT NULL DEFAULT ''`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (5, 'preserve project history on registry removal', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (6, 'reconcile physical project identities', '2026-01-01T00:00:00Z')`,
+		`ALTER TABLE runs ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN origin TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_root_run_id ON runs(root_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_depth ON runs(depth)`,
+		`CREATE TABLE child_plans (
+			plan_id TEXT PRIMARY KEY,
+			parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			root_run_id TEXT NOT NULL,
+			schema_version TEXT NOT NULL,
+			max_depth INTEGER NOT NULL,
+			max_concurrency INTEGER NOT NULL,
+			plan_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_child_plans_parent_run_id ON child_plans(parent_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_child_plans_root_run_id ON child_plans(root_run_id)`,
+		`ALTER TABLE run_edges ADD COLUMN root_run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_edges ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_edges ADD COLUMN child_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_edges ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE run_edges ADD COLUMN ordinal INTEGER NOT NULL DEFAULT -1`,
+		`ALTER TABLE run_edges ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE run_edges ADD COLUMN permission TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_edges ADD COLUMN aggregation_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE run_edges ADD COLUMN status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_edges ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_run_edges_root_run_id ON run_edges(root_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_edges_plan_id ON run_edges(plan_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_plan_child_key ON run_edges(plan_id, child_key) WHERE plan_id <> '' AND child_key <> ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_run_edges_parent_ordinal ON run_edges(parent_run_id, ordinal) WHERE ordinal >= 0`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (7, 'nested child plans and durable run graph', '2026-01-01T00:00:00Z')`,
+		`CREATE TABLE run_claims (
+			run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+			executor_id TEXT NOT NULL,
+			claim_generation INTEGER NOT NULL,
+			claimed_at TEXT NOT NULL,
+			lease_expires_at TEXT NOT NULL,
+			heartbeat_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_claims_executor_id ON run_claims(executor_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_claims_lease_expires_at ON run_claims(lease_expires_at)`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (8, 'nested child execution claims', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO runs(id, status, started_at, updated_at, root_run_id, depth, origin, created_at) VALUES ('run-parent', 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'run-parent', 0, 'nested_parent', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO runs(id, parent_run_id, status, started_at, updated_at, root_run_id, depth, origin, created_at) VALUES ('run-child', 'run-parent', 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'run-parent', 1, 'sub_agent', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at, root_run_id, plan_id, child_key, depth, ordinal, scope_json, permission, aggregation_json, status, updated_at) VALUES ('run-parent', 'run-child', 'child', '2026-01-01T00:00:00Z', 'run-parent', 'plan-parent', 'child', 1, 0, '{}', 'write', '{}', 'running', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at) VALUES ('run-child', 'executor-a', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:30:00Z', '2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec v8 fixture statement: %v\n%s", err, statement)
 		}
 	}
 }

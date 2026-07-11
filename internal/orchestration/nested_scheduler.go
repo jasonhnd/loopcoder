@@ -46,10 +46,14 @@ const (
 	ReplayActionRetried = "retried"
 	ReplayActionBlocked = "blocked"
 
-	nestedClaimLeaseDuration = 30 * time.Minute
+	nestedClaimCleanupTimeout = 5 * time.Second
 )
 
 var nestedExecutorSequence uint64
+var (
+	nestedClaimLeaseDuration = 30 * time.Minute
+	nestedClaimRenewEvery    = nestedClaimLeaseDuration / 3
+)
 
 type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
@@ -130,6 +134,8 @@ type ChildRunResult struct {
 	ClaimOwner          string           `json:"claim_owner,omitempty"`
 	ClaimGeneration     int64            `json:"claim_generation,omitempty"`
 	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
+	ClaimPhase          string           `json:"claim_phase,omitempty"`
+	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -349,6 +355,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 
 	var eventMu sync.Mutex
 	var completeErr error
+	suppressParentDone := false
 	setCompleteErr := func(err error) {
 		if err == nil {
 			return
@@ -358,6 +365,16 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		if completeErr == nil {
 			completeErr = err
 		}
+	}
+	markSuppressParentDone := func() {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		suppressParentDone = true
+	}
+	parentDoneSuppressed := func() bool {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		return suppressParentDone
 	}
 	runChild := func(index int) {
 		child := children[index]
@@ -399,6 +416,23 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(fmt.Errorf("claim child run %s returned unknown outcome %q", child.RunID, claim.Outcome))
 			return
 		}
+		phaseAt := time.Now().UTC()
+		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), claim.ProviderKey); err != nil {
+			if storage.IsStaleChildRunClaim(err) {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe the current durable child owner before replaying"
+				results[index] = withNestedDecision(result)
+				markSuppressParentDone()
+				return
+			}
+			setCompleteErr(err)
+			return
+		}
+		result.ClaimPhase = storage.ClaimPhaseExecuting
+		if result.StartedAt == "" {
+			result.StartedAt = state.FormatTimestamp(phaseAt)
+		}
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
 		eventMu.Unlock()
@@ -407,7 +441,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(err)
 		}
 
+		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
 		executed, err := opts.Execute(ctx, child)
+		heartbeatErr := stopHeartbeat()
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
 			executed.Status = NestedStatusFailed
 		}
@@ -424,7 +460,24 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		results[index] = result
 
 		finishedAt := parseOrClock(result.FinishedAt, clock)
-		setCompleteErr(storage.CompleteClaimedChildRun(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.Status, result.FinishedAt, "child provider finished"))
+		if heartbeatErr != nil && !storage.IsStaleChildRunClaim(heartbeatErr) {
+			setCompleteErr(heartbeatErr)
+		}
+		completeCtx, cancelComplete := nestedCleanupContext()
+		completeClaimErr := storage.CompleteClaimedChildRun(completeCtx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.Status, result.FinishedAt, "child provider finished")
+		cancelComplete()
+		if storage.IsStaleChildRunClaim(completeClaimErr) {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = completeClaimErr.Error()
+			result.NextAction = "observe the current durable child owner before publishing terminal state"
+			results[index] = withNestedDecision(result)
+			markSuppressParentDone()
+			return
+		}
+		setCompleteErr(completeClaimErr)
+		if completeClaimErr != nil {
+			return
+		}
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
 		eventMu.Unlock()
@@ -493,8 +546,18 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	report.Summary = nestedSummary(results)
 	report.Status = nestedParentStatus(results)
-	if err := recordNestedParentDone(ctx, opts, report, finished); err != nil && completeErr == nil {
-		completeErr = err
+	if !parentDoneSuppressed() {
+		parentCtx := ctx
+		var cancelParent context.CancelFunc
+		if ctx.Err() != nil {
+			parentCtx, cancelParent = nestedCleanupContext()
+		}
+		if err := recordNestedParentDone(parentCtx, opts, report, finished); err != nil && completeErr == nil {
+			completeErr = err
+		}
+		if cancelParent != nil {
+			cancelParent()
+		}
 	}
 	if completeErr != nil {
 		return report, completeErr
@@ -877,6 +940,12 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.LeaseExpiresAt) != "" {
 		base.LeaseExpiresAt = strings.TrimSpace(result.LeaseExpiresAt)
 	}
+	if strings.TrimSpace(result.ClaimPhase) != "" {
+		base.ClaimPhase = strings.TrimSpace(result.ClaimPhase)
+	}
+	if strings.TrimSpace(result.ProviderKey) != "" {
+		base.ProviderKey = strings.TrimSpace(result.ProviderKey)
+	}
 	base.Error = strings.TrimSpace(result.Error)
 	base.Reason = strings.TrimSpace(result.Reason)
 	base.NextAction = strings.TrimSpace(result.NextAction)
@@ -902,10 +971,57 @@ func applyClaimResult(result ChildRunResult, claim storage.ClaimResult) ChildRun
 	result.ClaimOwner = claim.ExecutorID
 	result.ClaimGeneration = claim.ClaimGeneration
 	result.LeaseExpiresAt = claim.LeaseExpiresAt
+	result.ClaimPhase = claim.ClaimPhase
+	result.ProviderKey = claim.ProviderKey
 	if strings.TrimSpace(claim.ClaimedAt) != "" {
 		result.StartedAt = claim.ClaimedAt
 	}
 	return result
+}
+
+func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64) func() error {
+	if store == nil || strings.TrimSpace(childRunID) == "" || strings.TrimSpace(executorID) == "" || generation <= 0 {
+		return func() error { return nil }
+	}
+	interval := nestedClaimRenewEvery
+	if interval <= 0 {
+		interval = nestedClaimLeaseDuration / 3
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var lastErr error
+		for {
+			select {
+			case <-stop:
+				done <- lastErr
+				return
+			case <-ticker.C:
+				now := time.Now().UTC()
+				renewCtx, cancel := nestedCleanupContext()
+				err := storage.RenewChildRunClaim(renewCtx, store, childRunID, executorID, generation, now, now.Add(nestedClaimLeaseDuration))
+				cancel()
+				if err != nil {
+					done <- err
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() error {
+		once.Do(func() { close(stop) })
+		return <-done
+	}
+}
+
+func nestedCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), nestedClaimCleanupTimeout)
 }
 
 func evaluateNestedBudget(opts NestedScheduleOptions, child ChildRunPlan, plannedAttempts int, now time.Time) (string, bool, error) {
