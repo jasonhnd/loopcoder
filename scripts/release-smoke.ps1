@@ -66,6 +66,18 @@ function Assert-SupportIsReady([object]$Entry, [string]$Label) {
     }
 }
 
+function Assert-DoctorCheckIsReady([object]$Entry, [string]$Label) {
+    if (-not $Entry) {
+        Fail "$Label was not present"
+    }
+    if (@("supported", "experimental") -notcontains $Entry.code) {
+        Fail "$Label code must be supported or experimental, got $($Entry.code)"
+    }
+    if ($Entry.status -ne "ok") {
+        Fail "$Label status must be ok, got $($Entry.status)"
+    }
+}
+
 function Get-PlatformAssetName([string]$SelectedVersion) {
     $goos = switch ($PSVersionTable.Platform) {
         "Unix" {
@@ -142,6 +154,197 @@ function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
         PlainVersion = $selectedPlainVersion
         Asset = $selectedAsset
         ArchivePath = $archivePath
+        SumsPath = $sumsPath
+        SignaturePath = $signaturePath
+    }
+}
+
+function Get-FreeLoopbackPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Start-LocalReleaseApi([object]$Release) {
+    $port = Get-FreeLoopbackPort
+    $baseUrl = "http://127.0.0.1:$port/"
+    $assetPaths = @{
+        $Release.Asset = $Release.ArchivePath
+        "SHA256SUMS" = $Release.SumsPath
+        "SHA256SUMS.sigstore" = $Release.SignaturePath
+    }
+    $job = Start-Job -Name "loopcoder-release-smoke-api-$port" -ScriptBlock {
+        param(
+            [string]$Prefix,
+            [string]$RepoName,
+            [string]$TagName,
+            [hashtable]$Assets
+        )
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = "Stop"
+        $listener = [System.Net.HttpListener]::new()
+        $listener.Prefixes.Add($Prefix)
+        $listener.Start()
+
+        function Write-Bytes([System.Net.HttpListenerResponse]$Response, [int]$StatusCode, [string]$ContentType, [byte[]]$Bytes) {
+            $Response.StatusCode = $StatusCode
+            $Response.ContentType = $ContentType
+            $Response.ContentLength64 = $Bytes.Length
+            $Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+            $Response.OutputStream.Close()
+        }
+
+        function Write-Json([System.Net.HttpListenerResponse]$Response, [int]$StatusCode, [object]$Payload) {
+            $json = $Payload | ConvertTo-Json -Depth 8 -Compress
+            Write-Bytes $Response $StatusCode "application/json" ([System.Text.Encoding]::UTF8.GetBytes($json))
+        }
+
+        try {
+            while ($listener.IsListening) {
+                try {
+                    $context = $listener.GetContext()
+                }
+                catch [System.Net.HttpListenerException] {
+                    break
+                }
+                catch [System.ObjectDisposedException] {
+                    break
+                }
+
+                try {
+                    $path = [System.Uri]::UnescapeDataString($context.Request.Url.AbsolutePath)
+                    if ($context.Request.HttpMethod -ne "GET") {
+                        Write-Json $context.Response 405 @{ message = "method not allowed" }
+                        continue
+                    }
+                    if ($path -eq "/__health") {
+                        Write-Json $context.Response 200 @{ status = "ok" }
+                        continue
+                    }
+                    if ($path -eq "/__stop") {
+                        Write-Json $context.Response 200 @{ status = "stopping" }
+                        break
+                    }
+
+                    $releasePath = "/repos/$RepoName/releases/tags/$TagName"
+                    if ($path -eq $releasePath) {
+                        $assetPayload = @(
+                            foreach ($name in $Assets.Keys) {
+                                @{
+                                    name = $name
+                                    browser_download_url = "${Prefix}assets/$([System.Uri]::EscapeDataString($name))"
+                                }
+                            }
+                        )
+                        Write-Json $context.Response 200 @{
+                            tag_name = $TagName
+                            draft = $false
+                            prerelease = $false
+                            assets = $assetPayload
+                        }
+                        continue
+                    }
+
+                    if ($path.StartsWith("/assets/", [System.StringComparison]::Ordinal)) {
+                        $assetName = $path.Substring("/assets/".Length)
+                        if ($Assets.ContainsKey($assetName) -and (Test-Path -LiteralPath $Assets[$assetName])) {
+                            $stream = [System.IO.File]::OpenRead($Assets[$assetName])
+                            try {
+                                $context.Response.StatusCode = 200
+                                $context.Response.ContentType = "application/octet-stream"
+                                $context.Response.ContentLength64 = $stream.Length
+                                $stream.CopyTo($context.Response.OutputStream)
+                                $context.Response.OutputStream.Close()
+                            }
+                            finally {
+                                $stream.Dispose()
+                            }
+                            continue
+                        }
+                    }
+
+                    Write-Json $context.Response 404 @{ message = "not found" }
+                }
+                catch {
+                    try {
+                        Write-Json $context.Response 500 @{ message = $_.Exception.Message }
+                    }
+                    catch {
+                    }
+                }
+            }
+        }
+        finally {
+            $listener.Stop()
+            $listener.Close()
+        }
+    } -ArgumentList $baseUrl, $Repo, $Release.Tag, $assetPaths
+
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        if (@("Completed", "Failed", "Stopped") -contains $job.State) {
+            $jobOutput = Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue | Out-String
+            Fail "local release API exited before becoming ready: $($job.State)`n$jobOutput"
+        }
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + "__health") -TimeoutSec 1
+            if ($response.StatusCode -eq 200) {
+                return [pscustomobject]@{
+                    Url = $baseUrl.TrimEnd("/")
+                    Job = $job
+                }
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+
+    Stop-Job -Job $job -ErrorAction SilentlyContinue
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    Fail "local release API did not become ready at $baseUrl"
+}
+
+function Stop-LocalReleaseApi([object]$Server) {
+    if (-not $Server) {
+        return
+    }
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri ($Server.Url + "/__stop") -TimeoutSec 1 | Out-Null
+    }
+    catch {
+    }
+    try {
+        Wait-Job -Job $Server.Job -Timeout 5 | Out-Null
+    }
+    catch {
+    }
+    if ($Server.Job.State -eq "Running") {
+        Stop-Job -Job $Server.Job -ErrorAction SilentlyContinue
+    }
+    Remove-Job -Job $Server.Job -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-WithMockReleaseApi([object]$Server, [scriptblock]$Block) {
+    $previousBaseUrl = [Environment]::GetEnvironmentVariable("GITHUB_BASE_URL", "Process")
+    $previousApiUrl = [Environment]::GetEnvironmentVariable("GITHUB_API_URL", "Process")
+    $previousCosignIdentity = [Environment]::GetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", "Process")
+    $releaseIdentity = "$GitHubBaseUrl/$Repo/.github/workflows/release.yml@refs/tags/$tag"
+    try {
+        [Environment]::SetEnvironmentVariable("GITHUB_BASE_URL", $Server.Url, "Process")
+        [Environment]::SetEnvironmentVariable("GITHUB_API_URL", $Server.Url, "Process")
+        [Environment]::SetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", $releaseIdentity, "Process")
+        & $Block
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("GITHUB_BASE_URL", $previousBaseUrl, "Process")
+        [Environment]::SetEnvironmentVariable("GITHUB_API_URL", $previousApiUrl, "Process")
+        [Environment]::SetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", $previousCosignIdentity, "Process")
     }
 }
 
@@ -157,6 +360,7 @@ $oldHome = [Environment]::GetEnvironmentVariable("LOOPCODER_HOME", "Process")
 $oldUpgradeRepo = [Environment]::GetEnvironmentVariable("LOOPCODER_UPGRADE_REPO", "Process")
 $oldGitHubBaseUrl = [Environment]::GetEnvironmentVariable("GITHUB_BASE_URL", "Process")
 $oldGitHubApiUrl = [Environment]::GetEnvironmentVariable("GITHUB_API_URL", "Process")
+$oldCosignIdentity = [Environment]::GetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", "Process")
 $loopcoderHome = Join-Path $tmp "home"
 New-Item -ItemType Directory -Path $loopcoderHome | Out-Null
 [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $loopcoderHome, "Process")
@@ -165,9 +369,11 @@ New-Item -ItemType Directory -Path $loopcoderHome | Out-Null
 [Environment]::SetEnvironmentVariable("GITHUB_API_URL", $GitHubApiUrl, "Process")
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $sourceRepo = (Resolve-Path -LiteralPath (Join-Path $scriptRoot "..")).Path
+$mockReleaseApi = $null
 
 try {
     $release = Get-ReleaseArchive $plainVersion "candidate"
+    $mockReleaseApi = Start-LocalReleaseApi $release
 
     $extractDir = Join-Path $tmp "extract"
     New-Item -ItemType Directory -Path $extractDir | Out-Null
@@ -343,7 +549,7 @@ try {
     if ($defaultWorkerCheck.Count -ne 1) {
         Fail "doctor JSON did not include selected default codex worker compatibility check"
     }
-    Assert-SupportIsReady $defaultWorkerCheck[0] "doctor JSON codex worker compatibility check"
+    Assert-DoctorCheckIsReady $defaultWorkerCheck[0] "doctor JSON codex worker compatibility check"
     Invoke-Checked "loopcoder report" {
         $script:reportOutput = @(& $binary report --repo $repoTmp --format json)
         $script:reportOutput | ForEach-Object { Write-Host $_ }
@@ -352,8 +558,12 @@ try {
     if (@($report.records | Where-Object { $_.run_id -eq "run-release-smoke" -and $_.report.role -eq "worker" }).Count -lt 1) {
         Fail "report JSON did not include the release smoke worker fixture"
     }
-    $upgradeOutput = & $binary upgrade --version $plainVersion
-    Write-Host $upgradeOutput
+    Invoke-Checked "upgrade already-latest $plainVersion" {
+        Invoke-WithMockReleaseApi -Server $mockReleaseApi -Block {
+            $script:upgradeOutput = @(& $binary upgrade --version $plainVersion)
+            $script:upgradeOutput | ForEach-Object { Write-Host $_ }
+        }
+    }
     if (-not (($upgradeOutput -join "`n") -match "Already latest|already latest|no download needed")) {
         Fail "upgrade did not recognize $plainVersion as already latest"
     }
@@ -376,8 +586,10 @@ try {
             Fail "previous archive did not contain loopcoder binary"
         }
         Invoke-Checked "upgrade from $($previous.PlainVersion) to $plainVersion" {
-            $script:previousUpgradeOutput = @(& $previousBinary upgrade --version $plainVersion)
-            $script:previousUpgradeOutput | ForEach-Object { Write-Host $_ }
+            Invoke-WithMockReleaseApi -Server $mockReleaseApi -Block {
+                $script:previousUpgradeOutput = @(& $previousBinary upgrade --version $plainVersion)
+                $script:previousUpgradeOutput | ForEach-Object { Write-Host $_ }
+            }
         }
         if (-not (($previousUpgradeOutput -join "`n") -match "After: .*version=v?$([regex]::Escape($plainVersion))|Installed versioned binary:")) {
             Fail "previous-version upgrade output did not show installation of $plainVersion"
@@ -387,9 +599,11 @@ try {
     Write-Host "release smoke verification passed for $tag"
 }
 finally {
+    Stop-LocalReleaseApi $mockReleaseApi
     [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $oldHome, "Process")
     [Environment]::SetEnvironmentVariable("LOOPCODER_UPGRADE_REPO", $oldUpgradeRepo, "Process")
     [Environment]::SetEnvironmentVariable("GITHUB_BASE_URL", $oldGitHubBaseUrl, "Process")
     [Environment]::SetEnvironmentVariable("GITHUB_API_URL", $oldGitHubApiUrl, "Process")
+    [Environment]::SetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", $oldCosignIdentity, "Process")
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
