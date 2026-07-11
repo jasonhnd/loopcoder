@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 9
+	CurrentSchemaVersion = 10
 
 	driverName = "sqlite"
 
@@ -286,9 +286,35 @@ var migrations = []migration{
 				WHERE phase = '' OR phase = 'claimed'`,
 		},
 	},
+	{
+		version: 10,
+		name:    "delivery run contracts",
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{
+	"migrations",
+	"projects",
+	"runs",
+	"run_events",
+	"run_edges",
+	"reports",
+	"child_plans",
+	"run_claims",
+	"legacy_import_records",
+	"legacy_import_status",
+	"delivery_runs",
+	"delivery_tasks",
+	"delivery_dependency_edges",
+	"delivery_attempts",
+	"delivery_decisions",
+	"delivery_approvals",
+	"delivery_overrides",
+	"delivery_plan_fingerprints",
+	"delivery_idempotency",
+	"delivery_migration_backups",
+	"delivery_legacy_imports",
+}
 
 type migration struct {
 	version    int
@@ -555,6 +581,28 @@ func (s *sqliteStore) configure(ctx context.Context) error {
 }
 
 func (s *sqliteStore) migrate(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS migrations (
+		version INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("migrate storage: initialize migrations table: %w", err)
+	}
+	version, err := schemaVersion(ctx, s.db)
+	if err != nil {
+		return fmt.Errorf("migrate storage: %w", err)
+	}
+	if version > CurrentSchemaVersion {
+		return unsupportedVersionError(version)
+	}
+	var deliveryV10Backup *deliveryMigrationBackup
+	if version == 9 && CurrentSchemaVersion >= 10 {
+		deliveryV10Backup, err = prepareDeliveryV10Backup(s.path, formatTimestamp(s.now()))
+		if err != nil {
+			return err
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("migrate storage: begin: %w", err)
@@ -568,7 +616,7 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("migrate storage: initialize migrations table: %w", err)
 	}
-	version, err := txSchemaVersion(ctx, tx)
+	version, err = txSchemaVersion(ctx, tx)
 	if err != nil {
 		return fmt.Errorf("migrate storage: %w", err)
 	}
@@ -582,6 +630,11 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 		}
 		for _, statement := range migration.statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
+			}
+		}
+		if migration.version == 10 {
+			if err := migrateDeliveryRunContracts(ctx, tx, deliveryV10Backup, formatTimestamp(s.now())); err != nil {
 				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
 			}
 		}

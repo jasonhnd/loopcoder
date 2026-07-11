@@ -259,6 +259,30 @@ the affected issue and surface `guardrail-frozen`/`needs-human` reports.
 Design rationale:
 [`../specs/0192-delivery-guardrails.md`](../specs/0192-delivery-guardrails.md).
 
+### DeliveryRun Contracts
+
+The v0.8 storage boundary adds schema version 10 tables for the versioned
+DeliveryRun contract in [`../specs/0801-delivery-run-contracts.md`](../specs/0801-delivery-run-contracts.md).
+The contract records DeliveryRun, Task, dependency edge, Attempt, Decision,
+Approval, Override, immutable plan fingerprint, idempotency replay, backup
+metadata, and conservative legacy-import diagnostics as normalized SQLite rows
+with JSON payload columns only for bounded structured fields.
+
+The implementation surface is `internal/delivery`. It exposes typed Go records
+with snake_case JSON tags, canonical JSON and authorization fingerprint helpers,
+DeliveryRun and Task lifecycle transition tables, and transaction-scoped
+persistence functions. Invalid transitions, dependency cycles, stale approvals,
+duplicate replay, missing references, and cross-project references return the
+stable typed errors from the spec and roll back the whole write transaction.
+
+When a schema-v9 database is opened, migration 10 captures a local backup image
+before opening the migration write transaction, then records that backup
+metadata in the v10 tables during the migration. Legacy v0.7 `runs` rows are
+imported only as conservative DeliveryRun-compatible records; the migration does
+not synthesize approvals, overrides, user intent, or plan fingerprints.
+Ambiguous non-terminal legacy execution claims are marked `needs-human` with
+`ErrAmbiguousLegacyState` diagnostics.
+
 ### Self-Improvement
 
 Current self-improvement is human-gated and advisory. `docs/learnings.md` is an
