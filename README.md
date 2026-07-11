@@ -228,10 +228,11 @@ object, `provider_compatibility[]` entries for the smoke matrix, a root
 `code`, `status`, `hard`, `message`, and `fix_command`.
 
 `loopcoder providers refresh --repo .` runs the same bounded provider CLI
-installation probes and persists machine-local ProviderInstallation and
-ProbeResult history in `$LOOPCODER_HOME/data/loopcoder.db`. Probes use fixed
-argv arrays, an explicit non-credential environment allowlist, strict
-time/output caps, redacted provider output, and no shell interpolation.
+installation and auth-readiness probes and persists machine-local
+ProviderInstallation, ProbeResult, AccountProfile, and AuthReadiness history in
+`$LOOPCODER_HOME/data/loopcoder.db`. Probes use fixed argv arrays, an explicit
+non-credential environment allowlist, strict time/output caps, redacted
+provider output, and no shell interpolation.
 The allowlist includes location and platform variables needed by script shims
 such as `LOCALAPPDATA`, `APPDATA`, `ProgramFiles`, `SystemRoot`, `ComSpec`,
 `PSModulePath`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `HOME`, `USERPROFILE`,
@@ -239,7 +240,15 @@ such as `LOCALAPPDATA`, `APPDATA`, `ProgramFiles`, `SystemRoot`, `ComSpec`,
 `token`, `password`, `credential`, or `auth` is still denied even if listed.
 Installation evidence is not auth readiness, account readiness, model
 authorization, quota, or usable capacity; human and JSON output keep
-`usable_for_invocation` as `unknown` from install evidence alone.
+`usable_for_invocation` as `unknown` from install evidence alone. Unsupported
+auth readiness returns `unknown` with a reason. Built-in local declarations use
+`codex login status`, `claude auth status --json`, and Gemini auth-reference
+existence checks without reading credential values or files. Network-declared
+auth probes, including Antigravity's `agy models`, are recorded but not
+executed by default; their readiness is `unknown` with
+`network-permission-denied`. The initial schema intentionally has no
+`expires_at` field because no current adapter exposes a credential-blind
+machine-readable expiry value.
 
 ### Project Registry
 

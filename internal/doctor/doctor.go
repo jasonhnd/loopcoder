@@ -453,10 +453,10 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 		report.ProbeResults = []providerinventory.ProbeResult{}
 	}
 	if report.AccountProfiles == nil {
-		report.AccountProfiles = []any{}
+		report.AccountProfiles = []providerinventory.AccountProfile{}
 	}
 	if report.AuthReadiness == nil {
-		report.AuthReadiness = []any{}
+		report.AuthReadiness = []providerinventory.AuthReadiness{}
 	}
 	if report.ModelCatalogSnapshots == nil {
 		report.ModelCatalogSnapshots = []any{}
@@ -2203,7 +2203,7 @@ func discoverProviderInventory(ctx context.Context, repoPath string, cfg config.
 		Name:    "provider inventory",
 		Code:    "provider_inventory_refreshed",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("bounded install probes captured %d installation(s) and %d probe result(s); usable capacity remains unknown without auth, model, quota, and invocation checks", len(report.Installations), len(report.ProbeResults)),
+		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), and %d auth readiness record(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness)),
 	}
 }
 
@@ -2244,11 +2244,12 @@ func checkProviders(inventory providerinventory.Report, providers []providerSpec
 			status = StatusWarn
 			code = "provider_installation_probe_failed"
 		}
+		authSummary := providerAuthSummary(inventory, provider.Name)
 		checks = append(checks, Check{
 			Name:   "provider " + provider.Name,
 			Code:   code,
 			Status: status,
-			Message: fmt.Sprintf("configured for %s; CLI %q discovered via %s at %s; state=%s confidence=%s freshness=%s captured_at=%s usable_for_invocation=%s; auth, account, model authorization, quota, and invocation readiness not checked",
+			Message: fmt.Sprintf("configured for %s; CLI %q discovered via %s at %s; state=%s confidence=%s freshness=%s captured_at=%s usable_for_invocation=%s; %s; model authorization, quota, and invocation approval remain separate",
 				roleText,
 				cliName,
 				best.DiscoverySource,
@@ -2258,10 +2259,36 @@ func checkProviders(inventory providerinventory.Report, providers []providerSpec
 				best.FreshnessState,
 				best.CapturedAt,
 				best.UsableForInvocation,
+				authSummary,
 			),
 		})
 	}
 	return checks
+}
+
+func providerAuthSummary(inventory providerinventory.Report, providerName string) string {
+	var latest *providerinventory.AuthReadiness
+	for i := range inventory.AuthReadiness {
+		entry := &inventory.AuthReadiness[i]
+		if entry.AdapterID != providerName {
+			continue
+		}
+		if latest == nil || entry.CapturedAt > latest.CapturedAt || (entry.CapturedAt == latest.CapturedAt && entry.AuthReadinessID > latest.AuthReadinessID) {
+			latest = entry
+		}
+	}
+	if latest == nil {
+		return "auth_readiness=unknown evidence=not-run"
+	}
+	parts := []string{
+		"auth_readiness=" + string(latest.ReadinessState),
+		"evidence=" + string(latest.EvidenceKind),
+		"scope=" + string(latest.AuthorizationScopeState),
+	}
+	if latest.UnsupportedReason != "" {
+		parts = append(parts, "reason="+latest.UnsupportedReason)
+	}
+	return strings.Join(parts, " ")
 }
 
 func installationsForProvider(inventory providerinventory.Report, providerName string) []providerinventory.ProviderInstallation {

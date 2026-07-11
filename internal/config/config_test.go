@@ -104,6 +104,24 @@ func TestParseRejectsUnsafeVerifierAdapterName(t *testing.T) {
 	}
 }
 
+func TestParseReadsProviderInventoryProfileSelection(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nprovider_inventory:\n  profile_selection:\n    codex: acct_abcdefghijklmnopqrstuvwxyz123456\n"))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.ProviderInventory.ProfileSelection["codex"] != "acct_abcdefghijklmnopqrstuvwxyz123456" {
+		t.Fatalf("ProfileSelection = %#v", cfg.ProviderInventory.ProfileSelection)
+	}
+
+	_, err = Parse([]byte("version: 1\nprovider_inventory:\n  profile_selection:\n    codex: jane@example.com\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want opaque acct_ id validation")
+	}
+	if !strings.Contains(err.Error(), "profile_selection.codex") || !strings.Contains(err.Error(), "acct_") {
+		t.Fatalf("error = %v, want profile selection acct_ hint", err)
+	}
+}
+
 func TestParseRejectsUnknownHostProfile(t *testing.T) {
 	_, err := Parse([]byte("version: 1\nhost:\n  profile: unknown-host\n"))
 	if err == nil {

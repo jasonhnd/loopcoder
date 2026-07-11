@@ -250,7 +250,8 @@ type MCPAuth struct {
 }
 
 type ProviderInventory struct {
-	Executables map[string][]string `yaml:"executables,omitempty"`
+	Executables      map[string][]string `yaml:"executables,omitempty"`
+	ProfileSelection map[string]string   `yaml:"profile_selection,omitempty"`
 }
 
 // Audit is the optional 0.5.3 audit command configuration surface. It is
@@ -552,6 +553,15 @@ func validateProviderInventory(inventory ProviderInventory) error {
 			if strings.TrimSpace(path) == "" {
 				return fmt.Errorf("invalid delivery config: provider_inventory.executables.%s[%d] must not be empty", provider, index)
 			}
+		}
+	}
+	for provider, accountProfileID := range inventory.ProfileSelection {
+		if !validMCPServerName(provider) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection contains unsafe provider key %q", provider)
+		}
+		accountProfileID = strings.TrimSpace(accountProfileID)
+		if !strings.HasPrefix(accountProfileID, "acct_") || len(accountProfileID) < len("acct_")+8 {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection.%s must be an opaque acct_ account profile id", provider)
 		}
 	}
 	return nil

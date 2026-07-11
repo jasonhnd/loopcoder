@@ -50,6 +50,62 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 	}
 }
 
+func TestDefaultContractDeclaresCredentialBlindAuthReadiness(t *testing.T) {
+	tests := []struct {
+		provider string
+		command  []string
+		parser   string
+		network  bool
+		envNames []string
+		paths    []string
+	}{
+		{
+			provider: "codex",
+			command:  []string{"codex", "login", "status"},
+			parser:   "codex-login-status",
+		},
+		{
+			provider: "claude",
+			command:  []string{"claude", "auth", "status", "--json"},
+			parser:   "claude-auth-status-json",
+		},
+		{
+			provider: "gemini",
+			envNames: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+			paths:    []string{"~/.gemini/oauth_creds.json"},
+		},
+		{
+			provider: "antigravity",
+			command:  []string{"agy", "models"},
+			parser:   "agy-models",
+			network:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			provider, ok := runtimecap.LookupProvider(tt.provider)
+			if !ok {
+				t.Fatalf("LookupProvider(%q) returned false", tt.provider)
+			}
+			if !reflect.DeepEqual(provider.AuthProbeCommand, tt.command) {
+				t.Fatalf("AuthProbeCommand = %#v, want %#v", provider.AuthProbeCommand, tt.command)
+			}
+			if provider.AuthProbeParser != tt.parser {
+				t.Fatalf("AuthProbeParser = %q, want %q", provider.AuthProbeParser, tt.parser)
+			}
+			if provider.MayNetwork != tt.network {
+				t.Fatalf("MayNetwork = %v, want %v", provider.MayNetwork, tt.network)
+			}
+			if !reflect.DeepEqual(provider.AuthEnvironmentNames, tt.envNames) {
+				t.Fatalf("AuthEnvironmentNames = %#v, want %#v", provider.AuthEnvironmentNames, tt.envNames)
+			}
+			if !reflect.DeepEqual(provider.AuthArtifactPaths, tt.paths) {
+				t.Fatalf("AuthArtifactPaths = %#v, want %#v", provider.AuthArtifactPaths, tt.paths)
+			}
+		})
+	}
+}
+
 func TestDefaultContractRepresentsExistingHosts(t *testing.T) {
 	if got, want := runtimecap.HostNames(), []string{"claude-code", "codex-cli", "generic-local", "paseo-style"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("HostNames = %#v, want %#v", got, want)
@@ -71,6 +127,9 @@ func TestDefaultContractRepresentsExistingHosts(t *testing.T) {
 func TestContractReturnsCopies(t *testing.T) {
 	contract := runtimecap.DefaultContract()
 	contract.Providers[0].Name = "changed"
+	contract.Providers[0].AuthProbeCommand = append(contract.Providers[0].AuthProbeCommand, "changed")
+	contract.Providers[0].AuthArtifactPaths = append(contract.Providers[0].AuthArtifactPaths, "changed")
+	contract.Providers[0].AuthEnvironmentNames = append(contract.Providers[0].AuthEnvironmentNames, "changed")
 	contract.Providers[0].KnownLimitations = append(contract.Providers[0].KnownLimitations, "changed")
 	contract.Hosts[0].Name = "changed"
 	contract.Hosts[0].KnownLimitations = append(contract.Hosts[0].KnownLimitations, "changed")
@@ -81,6 +140,14 @@ func TestContractReturnsCopies(t *testing.T) {
 	}
 	if len(next.Hosts[0].KnownLimitations) > 0 && next.Hosts[0].KnownLimitations[len(next.Hosts[0].KnownLimitations)-1] == "changed" {
 		t.Fatalf("DefaultContract leaked mutation: %#v", next)
+	}
+	for _, provider := range next.Providers {
+		if provider.Name != "codex" {
+			continue
+		}
+		if len(provider.AuthProbeCommand) != 3 || provider.AuthProbeCommand[len(provider.AuthProbeCommand)-1] == "changed" {
+			t.Fatalf("DefaultContract leaked auth command mutation: %#v", provider)
+		}
 	}
 }
 
