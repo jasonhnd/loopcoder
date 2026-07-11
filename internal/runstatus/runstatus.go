@@ -96,6 +96,8 @@ type RunTreeNode struct {
 	ClaimOwner      string   `json:"claim_owner,omitempty"`
 	ClaimGeneration int64    `json:"claim_generation,omitempty"`
 	LeaseExpiresAt  string   `json:"lease_expires_at,omitempty"`
+	ClaimPhase      string   `json:"claim_phase,omitempty"`
+	ProviderKey     string   `json:"provider_idempotency_key,omitempty"`
 	LifecycleStatus string   `json:"lifecycle_status"`
 	LifecycleSource string   `json:"lifecycle_source,omitempty"`
 	StartedAt       string   `json:"started_at,omitempty"`
@@ -320,6 +322,12 @@ func Render(report Report) string {
 			}
 			if strings.TrimSpace(node.LeaseExpiresAt) != "" {
 				parts = append(parts, "lease_expires_at="+node.LeaseExpiresAt)
+			}
+			if strings.TrimSpace(node.ClaimPhase) != "" {
+				parts = append(parts, "phase="+node.ClaimPhase)
+			}
+			if strings.TrimSpace(node.ProviderKey) != "" {
+				parts = append(parts, "provider_key="+node.ProviderKey)
 			}
 			fmt.Fprintf(&out, "%s- %s (%s)\n", indent, node.RunID, strings.Join(parts, " "))
 			if strings.TrimSpace(node.ReportSummary) != "" {
