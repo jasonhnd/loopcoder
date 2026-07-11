@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -691,6 +692,9 @@ func scanLegacyStateRoot(root string, deps Deps) ([]OldSurfaceDiagnostic, int, [
 			skipped = append(skipped, filepath.ToSlash(dir)+": "+err.Error())
 			return
 		}
+		sort.SliceStable(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
 		for _, entry := range entries {
 			if seen > maxMigrationStatusEntries || len(diagnostics) >= maxMigrationStatusFindings {
 				return

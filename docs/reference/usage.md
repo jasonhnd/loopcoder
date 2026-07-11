@@ -560,7 +560,9 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 - reportquery readability for local report/run/relay records;
 - storage permissions, storage health, and the current checkout's
   machine-local project registry identity, including ambiguity warnings;
-- migration status and nested run tree health for parent/child run records;
+- migration status, including concrete legacy surface identifiers,
+  classifications, and per-surface remediation when migration warnings are
+  present, plus nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -647,6 +649,11 @@ this version.
   ]
 }
 ```
+
+When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
+the `migration status` check's `legacy_surfaces[]` entries include `surface`,
+`identifier`, `classification`, `remediation`, and, where applicable, `legacy`,
+`current`, `location`, `detail`, and `conflict`.
 
 ## Security Audit
 
