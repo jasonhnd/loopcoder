@@ -111,6 +111,9 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Release draft staging unit test
+        run: bash scripts/stage-draft-release_test.sh
+
   go:
     runs-on: ubuntu-latest
     steps:
