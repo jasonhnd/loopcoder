@@ -1075,6 +1075,22 @@ loopcoder command recreates storage as needed. Removing machine-local runtime
 state does not delete repo-local `.loopcoder/` history, and deleting
 repo-local `.loopcoder/` is still a manual user action outside migration.
 
+Opening a schema-v9 database with a v0.8 binary upgrades machine-local storage
+to schema 10 and creates the DeliveryRun contract tables from
+[`../specs/0801-delivery-run-contracts.md`](../specs/0801-delivery-run-contracts.md).
+The migration records backup metadata in `delivery_migration_backups` before
+the v0.8 migration commits, and the backup image itself is captured before the
+migration write transaction opens. Backup images are local runtime state only:
+do not copy them into repositories, PR bodies, issue comments, commits, or
+tracked fixtures.
+
+The schema-v10 migration preserves legacy run identity but does not infer an
+approved v0.8 plan, approval, override, or plan fingerprint from logs or issue
+titles. Legacy non-terminal execution claims that cannot prove whether provider
+side effects launched are imported as `needs-human` with
+`ErrAmbiguousLegacyState`; inspect the legacy run, claim, provider receipt, and
+recovery context before continuing.
+
 `loopcoder report` is the read-only query surface for those local records:
 
 ```text
