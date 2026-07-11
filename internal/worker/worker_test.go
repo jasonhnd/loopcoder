@@ -101,6 +101,7 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 		IssueTitle:  "Implement dispatch",
 		IssueBody:   "Body",
 		RunID:       "run-test",
+		ProviderKey: "child-run:run-test-child",
 		Provider:    "codex",
 		Stderr:      &warnings,
 	}, Deps{
@@ -141,6 +142,12 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if result.AttemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-4321.attempt.json") {
 		t.Fatalf("AttemptPath = %q", result.AttemptPath)
+	}
+	if fakeAgent.invocation.ProviderKey != "child-run:run-test-child" {
+		t.Fatalf("agent provider key = %q, want child-run:run-test-child", fakeAgent.invocation.ProviderKey)
+	}
+	if !strings.Contains(fakeAgent.invocation.Prompt, "Provider idempotency key: child-run:run-test-child") {
+		t.Fatalf("agent prompt missing provider idempotency key:\n%s", fakeAgent.invocation.Prompt)
 	}
 	if result.Report == nil {
 		t.Fatal("result missing report")
