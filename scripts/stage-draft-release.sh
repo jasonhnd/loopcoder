@@ -49,6 +49,49 @@ print(json.dumps(matches, separators=(",", ":")))
 ' <<<"${releases_json}"
 }
 
+resolve_release_json_for_tag() {
+  require_env GH_REPO
+  require_env TAG_NAME
+
+  local matches_json
+  matches_json="$(matching_releases_for_tag)"
+
+  TAG_NAME="${TAG_NAME}" python3 -c '
+import json
+import os
+import sys
+
+tag = os.environ["TAG_NAME"]
+matches = json.load(sys.stdin)
+if len(matches) == 0:
+    print(f"release {tag} was not found", file=sys.stderr)
+    sys.exit(1)
+if len(matches) > 1:
+    print(f"found {len(matches)} releases for {tag}; refusing to choose one; delete duplicate releases manually and rerun", file=sys.stderr)
+    sys.exit(1)
+
+release = matches[0]
+if not isinstance(release, dict):
+    print(f"release lookup for {tag} returned a non-object record", file=sys.stderr)
+    sys.exit(1)
+if "id" not in release:
+    print(f"release lookup for {tag} returned a record without an id field", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps(release, separators=(",", ":")))
+' <<<"${matches_json}"
+}
+
+resolve_release_id_for_tag() {
+  resolve_release_json_for_tag | python3 -c '
+import json
+import sys
+
+release = json.load(sys.stdin)
+print(release["id"])
+'
+}
+
 stage_draft_release() {
   require_env GH_REPO
   require_env TAG_NAME
@@ -108,5 +151,23 @@ print("update" if drafts else "create")
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  stage_draft_release "$@"
+  mode="${1:-stage}"
+  case "${mode}" in
+    stage)
+      shift || true
+      stage_draft_release "$@"
+      ;;
+    resolve-json)
+      shift || true
+      resolve_release_json_for_tag "$@"
+      ;;
+    resolve-id)
+      shift || true
+      resolve_release_id_for_tag "$@"
+      ;;
+    *)
+      echo "usage: $0 [stage|resolve-json|resolve-id]" >&2
+      exit 2
+      ;;
+  esac
 fi
