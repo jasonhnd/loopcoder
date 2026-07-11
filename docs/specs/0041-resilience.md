@@ -273,6 +273,14 @@ A heartbeat can be fresh while progress is stale; that is a stuck worker. A
 heartbeat can be stale because the supervisor died; that is an orphaned or lost
 worker until the conductor proves otherwise from process and GitHub state.
 
+Nested child execution claims use the same conservative recovery stance. A
+legacy or current claim in an ambiguous execution phase is not proof that a
+provider did not launch; after lease expiry it must become `needs-human` unless
+the durable phase proves it was still only claimed before launch. A provider
+idempotency key is recovery metadata, while `provider_receipt` is reserved for
+real provider responses, external resource IDs, or verifiable local execution
+records.
+
 ## What Counts As Progress
 
 For the Codex worker in `loopcoder dispatch`, progress is any

@@ -86,6 +86,7 @@ type ChildRunPlan struct {
 	Title        string           `json:"title,omitempty"`
 	Role         string           `json:"role,omitempty"`
 	RunID        string           `json:"run_id,omitempty"`
+	ProviderKey  string           `json:"provider_idempotency_key,omitempty"`
 	Issue        int              `json:"issue,omitempty"`
 	ScopeIssues  []int            `json:"scope_issues,omitempty"`
 	Scope        ChildScope       `json:"scope"`
@@ -136,6 +137,7 @@ type ChildRunResult struct {
 	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
 	ClaimPhase          string           `json:"claim_phase,omitempty"`
 	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
+	ProviderReceipt     string           `json:"provider_receipt,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -417,7 +419,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		phaseAt := time.Now().UTC()
-		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), claim.ProviderKey); err != nil {
+		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), ""); err != nil {
 			if storage.IsStaleChildRunClaim(err) {
 				result.Status = NestedStatusNeedsHuman
 				result.Error = err.Error()
@@ -430,6 +432,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		result.ClaimPhase = storage.ClaimPhaseExecuting
+		child.ProviderKey = claim.ProviderKey
 		if result.StartedAt == "" {
 			result.StartedAt = state.FormatTimestamp(phaseAt)
 		}
@@ -464,14 +467,16 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(heartbeatErr)
 		}
 		completeCtx, cancelComplete := nestedCleanupContext()
-		completeClaimErr := storage.CompleteClaimedChildRun(completeCtx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.Status, result.FinishedAt, "child provider finished")
+		completeClaimErr := storage.CompleteClaimedChildRun(completeCtx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.Status, result.FinishedAt, "child provider finished", result.ProviderReceipt)
 		cancelComplete()
+		if completeClaimErr != nil {
+			markSuppressParentDone()
+		}
 		if storage.IsStaleChildRunClaim(completeClaimErr) {
 			result.Status = NestedStatusNeedsHuman
 			result.Error = completeClaimErr.Error()
 			result.NextAction = "observe the current durable child owner before publishing terminal state"
 			results[index] = withNestedDecision(result)
-			markSuppressParentDone()
 			return
 		}
 		setCompleteErr(completeClaimErr)
@@ -945,6 +950,9 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	}
 	if strings.TrimSpace(result.ProviderKey) != "" {
 		base.ProviderKey = strings.TrimSpace(result.ProviderKey)
+	}
+	if strings.TrimSpace(result.ProviderReceipt) != "" {
+		base.ProviderReceipt = strings.TrimSpace(result.ProviderReceipt)
 	}
 	base.Error = strings.TrimSpace(result.Error)
 	base.Reason = strings.TrimSpace(result.Reason)

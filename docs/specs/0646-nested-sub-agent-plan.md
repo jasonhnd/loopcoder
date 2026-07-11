@@ -275,11 +275,19 @@ Required storage invariants:
   `claim_generation` predicate. Renewal stops and joins before completion.
 - Provider launch MUST carry a durable idempotency key or receipt when the
   provider supports it. The key is metadata for recovery, not a universal
-  exactly-once guarantee.
+  exactly-once guarantee. The idempotency key is bound to the logical child
+  operation, not to `claim_generation`; generation is a fencing value only.
+- `provider_receipt` MUST start empty and MUST NOT be fabricated from the
+  idempotency key, status, or claim metadata. It may be filled only from a real
+  provider response, external resource identifier, or verifiable local
+  execution record. Recovery MUST treat a missing receipt as no proof of
+  provider completion.
 - Terminal completion MUST be fenced by `run_id`, `executor_id`, and
   `claim_generation` so an older owner cannot overwrite a newer recovery owner.
-- If terminal completion is rejected as stale, that owner MUST NOT publish
-  child finished events or parent terminal state.
+- If terminal child completion persistence fails for any reason, that scheduler
+  MUST NOT publish child finished events or parent terminal state. The parent
+  may become terminal only after every aggregation-participating child terminal
+  state has persisted successfully.
 - Write-intent storage paths use an immediate SQLite write transaction with a
   bounded retry around the full database-only transaction after `SQLITE_BUSY`.
 
@@ -289,6 +297,13 @@ keeps its established primary key column name `id`, and v7 adds
 table. Existing minimal `run_edges` rows remain valid; v7 adds the enriched
 columns and enforces plan child-key and parent ordinal uniqueness only for
 enriched nested edges.
+
+The v8-to-v9 claim lifecycle migration is conservative for existing claims.
+Legacy claim rows do not prove whether a provider launched, so every
+non-terminal legacy claim MUST migrate to an ambiguous execution phase such as
+`executing`. After expiry, those rows fail closed to `needs-human` rather than
+automatic takeover. Only a post-v9 `claimed` phase created before provider
+launch is eligible for automatic expired-lease takeover.
 
 During the repo-local-state transition, the scheduler MUST keep the
 `.loopcoder/runs/` event mirror consistent with the SQL graph by writing the
@@ -445,6 +460,8 @@ PRs, checks, and explicit local run records are the source of truth.
   persistence, loopcoder does not claim universal exactly-once side effects.
   Recovery uses durable ownership, fencing, provider idempotency keys or
   receipts where available, and `needs-human` when completion cannot be proven.
+  A stored idempotency key without a receipt is not proof that the provider
+  completed.
 - If cancellation happens during provider execution, terminal child persistence
   uses a bounded cleanup context that is independent of the cancelled caller
   context. Rollback paths also use independent cleanup context and discard a
