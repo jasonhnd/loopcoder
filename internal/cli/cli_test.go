@@ -185,8 +185,8 @@ func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
 		ProbeResults:          []providerinventory.ProbeResult{},
 		AccountProfiles:       []providerinventory.AccountProfile{},
 		AuthReadiness:         []providerinventory.AuthReadiness{},
-		ModelCatalogSnapshots: []any{},
-		ModelCapabilities:     []any{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
 		GapReasons:            []string{},
 	}
 	refreshed := false

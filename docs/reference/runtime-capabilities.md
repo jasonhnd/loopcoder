@@ -55,9 +55,10 @@ The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
 `doctor --format json` also includes `provider_inventory`, and
-`loopcoder providers refresh --repo .` persists the same bounded installation
-and auth-readiness inventory in machine-local SQLite. ProviderInstallation,
-ProbeResult, AccountProfile, and AuthReadiness records show discovery source,
+`loopcoder providers refresh --repo .` persists the same bounded installation,
+auth-readiness, and model catalog inventory in machine-local SQLite.
+ProviderInstallation, ProbeResult, AccountProfile, AuthReadiness,
+ModelCatalogSnapshot, and ModelCapability records show discovery source,
 redacted executable/profile provenance, captured time, freshness, confidence,
 probe outcome, output bounds, and `usable_for_invocation: "unknown"` from
 installation evidence alone.
@@ -81,6 +82,14 @@ Built-in local declarations are part of `internal/runtimecap`: Codex uses
 `claude auth status --json` as declared non-secret machine-readable status,
 Gemini reports only auth-reference existence, and Antigravity declares
 `agy models` as network-capable so it is recorded but not run by default.
+
+ModelCapability records reuse this same capability vocabulary rather than
+creating a parallel model-tier scheme. `read_only`, `json_output`,
+`nested_subagents`, `mcp_config`, `cancellation`, and
+`token_usage_reporting` are `true`, `false`, or `unknown` facts with
+provenance and freshness. Unknown or stale values do not satisfy hard
+requirements; routing policies must use the exact `model_catalog_snapshot_id`
+and `model_capability_id` when they consume catalog evidence.
 
 Support levels:
 

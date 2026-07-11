@@ -459,10 +459,10 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 		report.AuthReadiness = []providerinventory.AuthReadiness{}
 	}
 	if report.ModelCatalogSnapshots == nil {
-		report.ModelCatalogSnapshots = []any{}
+		report.ModelCatalogSnapshots = []providerinventory.ModelCatalogSnapshot{}
 	}
 	if report.ModelCapabilities == nil {
-		report.ModelCapabilities = []any{}
+		report.ModelCapabilities = []providerinventory.ModelCapability{}
 	}
 	if report.GapReasons == nil {
 		report.GapReasons = []string{}

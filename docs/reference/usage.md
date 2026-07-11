@@ -667,14 +667,15 @@ this version.
 ```
 
 `loopcoder providers refresh --repo .` explicitly persists the same
-ProviderInstallation, ProbeResult, AccountProfile, and AuthReadiness inventory
-to the machine-local SQLite store. Refreshes append immutable probe history and
-mark disappeared installations stale instead of deleting them. Probe output is
-bounded and redacted, raw absolute paths and profile references are redacted or
-hashed in JSON/human output, and command execution uses fixed argv arrays, no
-shell interpolation, and an explicit non-credential environment allowlist. The
-allowlist carries location and platform variables required by provider script
-shims, including Windows
+ProviderInstallation, ProbeResult, AccountProfile, AuthReadiness,
+ModelCatalogSnapshot, and ModelCapability inventory to the machine-local SQLite
+store. Refreshes append immutable probe history and immutable catalog snapshots,
+and mark disappeared installations stale instead of deleting them. Probe output
+is bounded and redacted, raw absolute paths and profile references are redacted
+or hashed in JSON/human output, and command execution uses fixed argv arrays,
+no shell interpolation, and an explicit non-credential environment allowlist.
+The allowlist carries location and platform variables required by provider
+script shims, including Windows
 `LOCALAPPDATA`, `APPDATA`, `ProgramData`, `ProgramFiles`, `SystemRoot`,
 `ComSpec`, `PSModulePath`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `HOME`,
 `USERPROFILE`, `OS`, `PROCESSOR_ARCHITECTURE`, and Unix `TMPDIR`, `LANG`, and
@@ -703,6 +704,17 @@ Antigravity's `agy models` auth probe is persisted as an auth-readiness
 ProbeResult with `network_declared: true`, `network_permission: "denied"`, and
 `gap_reasons: ["network-permission-denied"]`; the matching AuthReadiness record
 is `unknown` and no network I/O is attempted.
+
+Model catalog snapshots are captured from LoopCoder-owned static declarations
+by default. Each ModelCapability records the exact snapshot ID, canonical model
+ID, aliases, lifecycle state, availability state, runtime capability fields
+(`read_only`, `json_output`, `nested_subagents`, `mcp_config`, `cancellation`,
+and `token_usage_reporting`), freshness, confidence, and entry provenance.
+Static catalog availability stays `unknown` because registry membership does
+not prove account authorization or quota. Catalog listing commands that may
+hit the network, such as Antigravity's `agy models`, are recorded as skipped
+with an explicit `network-permission-denied` gap unless a future permission path
+grants network access.
 
 Operators can add explicit executable locations without scanning a disk:
 
@@ -835,9 +847,9 @@ loopcoder doctor --repo .
 
 When the configured Worker or Verifier provider is `antigravity`, `doctor`
 and `providers refresh` look for executable `agy` through bounded installation
-probes and then record the declared network auth probe as skipped by default.
-Auth readiness is never inferred from installation evidence. The Antigravity
-Worker invocation uses this argv shape after
+probes and then record declared network auth/catalog probes as skipped by
+default. Auth readiness and model availability are never inferred from
+installation evidence. The Antigravity Worker invocation uses this argv shape after
 registry/default resolution:
 
 ```text

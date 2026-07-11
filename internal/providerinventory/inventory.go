@@ -330,8 +330,8 @@ type Report struct {
 	ProbeResults          []ProbeResult          `json:"probe_results"`
 	AccountProfiles       []AccountProfile       `json:"account_profiles"`
 	AuthReadiness         []AuthReadiness        `json:"auth_readiness"`
-	ModelCatalogSnapshots []any                  `json:"model_catalog_snapshots"`
-	ModelCapabilities     []any                  `json:"model_capabilities"`
+	ModelCatalogSnapshots []ModelCatalogSnapshot `json:"model_catalog_snapshots"`
+	ModelCapabilities     []ModelCapability      `json:"model_capabilities"`
 	GapReasons            []string               `json:"gap_reasons"`
 }
 
@@ -537,6 +537,9 @@ type AdapterDeclaration struct {
 	AuthArtifactPaths          []string
 	AuthEnvironmentNames       []string
 	AuthUnsupportedReason      string
+	CatalogProbeCommand        []string
+	CatalogProbeParser         string
+	CatalogProbeMayNetwork     bool
 	SelectedAccountProfileID   string
 	KnownLimitations           []string
 	MayNetwork                 bool
@@ -616,9 +619,21 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	var probes []ProbeResult
 	var accountProfiles []AccountProfile
 	var authReadiness []AuthReadiness
+	var modelCatalogSnapshots []ModelCatalogSnapshot
+	var modelCapabilities []ModelCapability
 	var gaps []string
 
 	for _, adapter := range adapters {
+		snapshot, capabilities, err := staticCatalogForAdapter(adapter, now)
+		if err != nil {
+			return Report{}, err
+		}
+		modelCatalogSnapshots = append(modelCatalogSnapshots, snapshot)
+		modelCapabilities = append(modelCapabilities, capabilities...)
+		if adapter.CatalogProbeMayNetwork {
+			probes = append(probes, skippedCatalogProbe(adapter, now, deps))
+			gaps = append(gaps, "provider-"+adapter.AdapterID+"-catalog-network-permission-denied")
+		}
 		found := false
 		candidates := discoverCandidates(adapter, deps)
 		for _, candidate := range candidates {
@@ -656,8 +671,8 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		ProbeResults:          probes,
 		AccountProfiles:       accountProfiles,
 		AuthReadiness:         authReadiness,
-		ModelCatalogSnapshots: []any{},
-		ModelCapabilities:     []any{},
+		ModelCatalogSnapshots: modelCatalogSnapshots,
+		ModelCapabilities:     modelCapabilities,
 		GapReasons:            gaps,
 	}
 	fingerprint, err := fingerprint(report)
@@ -703,6 +718,16 @@ func Refresh(ctx context.Context, store storage.Store, report Report, now time.T
 		}
 		for _, readiness := range report.AuthReadiness {
 			if err := insertAuthReadiness(ctx, tx, readiness); err != nil {
+				return err
+			}
+		}
+		for _, snapshot := range report.ModelCatalogSnapshots {
+			if err := insertModelCatalogSnapshot(ctx, tx, snapshot); err != nil {
+				return err
+			}
+		}
+		for _, capability := range report.ModelCapabilities {
+			if err := insertModelCapability(ctx, tx, capability); err != nil {
 				return err
 			}
 		}
@@ -780,6 +805,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 	var probes []ProbeResult
 	var profiles []AccountProfile
 	var readiness []AuthReadiness
+	var snapshots []ModelCatalogSnapshot
+	var capabilities []ModelCapability
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT payload_json FROM provider_installations ORDER BY adapter_id, discovery_order, provider_installation_id`)
 		if err != nil {
@@ -858,12 +885,55 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 			}
 			readiness = append(readiness, item)
 		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM model_catalog_snapshots ORDER BY adapter_id, model_catalog_snapshot_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var item ModelCatalogSnapshot
+			if err := json.Unmarshal([]byte(payload), &item); err != nil {
+				rows.Close()
+				return err
+			}
+			snapshots = append(snapshots, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM model_capabilities ORDER BY adapter_id, model_catalog_snapshot_id, model_capability_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var item ModelCapability
+			if err := json.Unmarshal([]byte(payload), &item); err != nil {
+				rows.Close()
+				return err
+			}
+			capabilities = append(capabilities, item)
+		}
 		return rows.Close()
 	})
 	if err != nil {
 		return Report{}, err
 	}
 	now := time.Now().UTC()
+	for i := range snapshots {
+		snapshots[i], capabilities = markCatalogFreshness(snapshots[i], capabilities, now)
+	}
 	report := Report{
 		SchemaVersion:         ProviderInventoryJSONSchema,
 		GeneratedAt:           formatTime(now),
@@ -872,8 +942,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 		ProbeResults:          probes,
 		AccountProfiles:       profiles,
 		AuthReadiness:         readiness,
-		ModelCatalogSnapshots: []any{},
-		ModelCapabilities:     []any{},
+		ModelCatalogSnapshots: snapshots,
+		ModelCapabilities:     capabilities,
 		GapReasons:            []string{},
 	}
 	fingerprint, err := fingerprint(report)
@@ -1699,6 +1769,30 @@ func absentProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResu
 	return probe
 }
 
+func skippedCatalogProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
+	probe := baseProbe(adapter, now, deps)
+	argv := append([]string(nil), adapter.CatalogProbeCommand...)
+	if len(argv) == 0 {
+		argv = []string{firstNonEmpty(adapter.ExecutableNames...), "models"}
+	}
+	probe.ProbeKind = "catalog"
+	probe.ProbeCommandID = "model-catalog"
+	probe.ProbeMethod = ProbeMethodMachineJSON
+	probe.Outcome = OutcomeProbeFailed
+	probe.Argv = redactArgv(argv)
+	probe.TimeoutMS = int((15 * time.Second).Milliseconds())
+	probe.NetworkDeclared = true
+	probe.NetworkPermission = NetworkDenied
+	probe.FreshnessState = FreshnessNotApplicable
+	probe.Confidence = ConfidenceUnavailable
+	probe.SideEffectClass = "not-run"
+	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: "model-catalog", ExecutableName: firstNonEmpty(adapter.ExecutableNames...)}
+	probe.Evidence = EvidenceSummary{Kind: string(EvidenceNotRun), CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
+	probe.GapReasons = []string{"network-permission-denied"}
+	probe.TerminalErrorCode = "ErrNetworkPermissionDenied"
+	return probe
+}
+
 func baseProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
 	probe := ProbeResult{
 		SchemaVersion:            ProbeResultSchema,
@@ -1821,7 +1915,7 @@ func declarationFromRuntime(provider runtimecap.ProviderRuntime) AdapterDeclarat
 	if modelProvider, ok := models.LookupProvider(provider.Name); ok {
 		display = firstNonEmpty(modelProvider.DisplayName, provider.Name)
 	}
-	return AdapterDeclaration{
+	decl := AdapterDeclaration{
 		AdapterID:             provider.Name,
 		DisplayName:           display,
 		Vendor:                provider.Name,
@@ -1836,6 +1930,12 @@ func declarationFromRuntime(provider runtimecap.ProviderRuntime) AdapterDeclarat
 		MayNetwork:            provider.MayNetwork,
 		KnownLimitations:      append([]string(nil), provider.KnownLimitations...),
 	}
+	if provider.Name == "antigravity" {
+		decl.CatalogProbeCommand = []string{"agy", "models"}
+		decl.CatalogProbeParser = "agy-models"
+		decl.CatalogProbeMayNetwork = true
+	}
+	return decl
 }
 
 func configuredProviderNames(cfg config.Config) []string {
@@ -2406,6 +2506,34 @@ func insertAuthReadiness(ctx context.Context, tx storage.Tx, readiness AuthReadi
 		auth_readiness_id, adapter_id, provider_installation_id, account_profile_id, payload_json
 	) VALUES (?, ?, ?, ?, ?)`,
 		readiness.AuthReadinessID, readiness.AdapterID, providerInstallationID, accountProfileID, string(payload))
+	return err
+}
+
+func insertModelCatalogSnapshot(ctx context.Context, tx storage.Tx, snapshot ModelCatalogSnapshot) error {
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	providerInstallationID := any(nil)
+	if snapshot.ProviderInstallationID != nil {
+		providerInstallationID = *snapshot.ProviderInstallationID
+	}
+	_, err = tx.Exec(ctx, `INSERT OR IGNORE INTO model_catalog_snapshots(
+		model_catalog_snapshot_id, adapter_id, provider_installation_id, payload_json
+	) VALUES (?, ?, ?, ?)`,
+		snapshot.ModelCatalogSnapshotID, snapshot.AdapterID, providerInstallationID, string(payload))
+	return err
+}
+
+func insertModelCapability(ctx context.Context, tx storage.Tx, capability ModelCapability) error {
+	payload, err := json.Marshal(capability)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT OR IGNORE INTO model_capabilities(
+		model_capability_id, model_catalog_snapshot_id, adapter_id, payload_json
+	) VALUES (?, ?, ?, ?)`,
+		capability.ModelCapabilityID, capability.ModelCatalogSnapshotID, capability.AdapterID, string(payload))
 	return err
 }
 

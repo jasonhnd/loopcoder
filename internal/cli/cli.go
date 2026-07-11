@@ -1362,7 +1362,7 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), report.Confidence, report.InventoryFingerprint)
+	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), report.Confidence, report.InventoryFingerprint)
 	for _, installation := range report.Installations {
 		fmt.Fprintf(stdout, "- %s %s at %s state=%s confidence=%s freshness=%s usable_for_invocation=%s captured_at=%s\n",
 			installation.AdapterID,

@@ -2240,8 +2240,8 @@ func (f *fakeDoctorEnv) providerInventory(cfg config.Config) providerinventory.R
 		ProbeResults:          probes,
 		AccountProfiles:       []providerinventory.AccountProfile{},
 		AuthReadiness:         []providerinventory.AuthReadiness{},
-		ModelCatalogSnapshots: []any{},
-		ModelCapabilities:     []any{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
 		GapReasons:            []string{},
 	}
 }
