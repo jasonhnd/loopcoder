@@ -154,6 +154,8 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	release := make(chan struct{})
+	secondCancelled := make(chan struct{})
+	var secondCancelledOnce sync.Once
 	done := make(chan struct {
 		report NestedScheduleReport
 		err    error
@@ -170,6 +172,14 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 			Children: []ChildRunPlan{
 				{ID: "first", Issue: 1, Permission: "write", Required: true},
 				{ID: "second", Issue: 2, Permission: "write", Required: true},
+			},
+			RecordEvent: func(repoPath, runID string, event state.Event) error {
+				if event.Event == NestedEventChildFinished && event.Issue == 2 && event.Status == state.StatusCancelled {
+					secondCancelledOnce.Do(func() {
+						close(secondCancelled)
+					})
+				}
+				return state.AppendEvent(repoPath, runID, event)
 			},
 			Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
 				if child.ID == "first" {
@@ -191,6 +201,12 @@ func TestScheduleNestedRunsRecordsFinishedEventForCancelledQueuedChild(t *testin
 		t.Fatal("timed out waiting for first child to start")
 	}
 	cancel()
+	select {
+	case <-secondCancelled:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("timed out waiting for second child cancellation")
+	}
 	close(release)
 	var outcome struct {
 		report NestedScheduleReport
@@ -958,7 +974,7 @@ func TestScheduleNestedRunsResumesDurableNonTerminalChildUnderPersistedRunID(t *
 	if got := report.Children[0].RunID; got != persistedRunID {
 		t.Fatalf("report run_id = %q, want persisted %q", got, persistedRunID)
 	}
-	afterPlans, afterRuns, afterEdges, afterOrphans := countNestedDurableRows(t, ctx, store, storedPlan.RootRunID, storedPlan.PlanID)
+	afterPlans, afterRuns, afterEdges, afterOrphans := waitForNestedDurableRows(t, ctx, store, storedPlan.RootRunID, storedPlan.PlanID, beforePlans, beforeRuns, beforeEdges, beforeOrphans, 2*time.Second)
 	if beforePlans != afterPlans || beforeRuns != afterRuns || beforeEdges != afterEdges || beforeOrphans != afterOrphans {
 		t.Fatalf("durable counts changed plans/runs/edges/orphans %d/%d/%d/%d -> %d/%d/%d/%d, want unchanged",
 			beforePlans, beforeRuns, beforeEdges, beforeOrphans, afterPlans, afterRuns, afterEdges, afterOrphans)
@@ -988,7 +1004,7 @@ func TestScheduleNestedRunsRejectsPlanMutationWithoutChangingSQLState(t *testing
 	}); err != nil {
 		t.Fatalf("initial ScheduleNestedRuns returned error: %v", err)
 	}
-	beforePlans, beforeRuns, beforeEdges, beforeOrphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
+	beforePlans, beforeRuns, beforeEdges, beforeOrphans := waitForNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID, 1, 2, 1, 0, 2*time.Second)
 
 	mutated := durableReplayTestPlan()
 	mutated.Items[0].Title = "Changed title"
@@ -1007,7 +1023,7 @@ func TestScheduleNestedRunsRejectsPlanMutationWithoutChangingSQLState(t *testing
 	if err == nil || !strings.Contains(err.Error(), "mutation rejected") || !strings.Contains(err.Error(), "items[0].title") {
 		t.Fatalf("mutation error = %v, want precise title fingerprint rejection", err)
 	}
-	afterPlans, afterRuns, afterEdges, afterOrphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
+	afterPlans, afterRuns, afterEdges, afterOrphans := waitForNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID, beforePlans, beforeRuns, beforeEdges, beforeOrphans, 2*time.Second)
 	if beforePlans != afterPlans || beforeRuns != afterRuns || beforeEdges != afterEdges || afterOrphans != 0 || beforeOrphans != 0 {
 		t.Fatalf("post-rejection counts plans/runs/edges/orphans %d/%d/%d/%d -> %d/%d/%d/%d, want stable and no orphans",
 			beforePlans, beforeRuns, beforeEdges, beforeOrphans, afterPlans, afterRuns, afterEdges, afterOrphans)
@@ -1071,7 +1087,7 @@ func TestScheduleNestedRunsReplayPolicyForDurableStatuses(t *testing.T) {
 			if got := report.Children[0].Status; got != tt.wantStatus {
 				t.Fatalf("Status = %q, want %q", got, tt.wantStatus)
 			}
-			plans, runs, edges, orphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
+			plans, runs, edges, orphans := waitForNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID, 1, 2, 1, 0, 2*time.Second)
 			if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
 				t.Fatalf("durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
 			}
@@ -1174,7 +1190,7 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	if got := atomic.LoadInt64(&executeCount); got != 1 {
 		t.Fatalf("execute count = %d, want exactly one provider execution", got)
 	}
-	plans, runs, edges, orphans := countNestedDurableRows(t, ctx, storeA, planA.RootRunID, planA.PlanID)
+	plans, runs, edges, orphans := waitForNestedDurableRows(t, ctx, storeA, planA.RootRunID, planA.PlanID, 1, 2, 1, 0, 2*time.Second)
 	if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
 		t.Fatalf("concurrent durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
 	}
@@ -1252,7 +1268,7 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	plan := durableReplayTestPlan()
 	plan.PlanID = "plan-concurrent-replay"
 	plan.Items[0].ChildKey = "race-child"
-	plans, runs, edges, orphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
+	plans, runs, edges, orphans := waitForNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID, 1, 2, 1, 0, 2*time.Second)
 	if plans != 1 || runs != 2 || edges != 1 || orphans != 0 {
 		t.Fatalf("two-process durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want 1/2/1/0", plans, runs, edges, orphans)
 	}
@@ -1937,6 +1953,22 @@ func durableReplayTestPlan() ChildPlan {
 			Scope: ChildScope{Repo: ".", Issues: []int{709}}, Permission: "write", DependsOn: []string{},
 			Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
 		}},
+	}
+}
+
+func waitForNestedDurableRows(t *testing.T, ctx context.Context, store storage.Store, rootRunID, planID string, wantPlans, wantRuns, wantEdges, wantOrphans int, timeout time.Duration) (plans, runs, edges, orphans int) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		plans, runs, edges, orphans = countNestedDurableRows(t, ctx, store, rootRunID, planID)
+		if plans == wantPlans && runs == wantRuns && edges == wantEdges && orphans == wantOrphans {
+			return plans, runs, edges, orphans
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for durable counts plans/runs/edges/orphans = %d/%d/%d/%d, want %d/%d/%d/%d",
+				plans, runs, edges, orphans, wantPlans, wantRuns, wantEdges, wantOrphans)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
