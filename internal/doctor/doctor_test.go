@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -728,7 +729,7 @@ func TestRunWarnsWhenProviderCLIMissing(t *testing.T) {
 	if check.Status != StatusWarn {
 		t.Fatalf("provider codex status = %s, want warn", check.Status)
 	}
-	if !strings.Contains(check.Message, "not found on PATH") {
+	if !strings.Contains(check.Message, "not found through bounded provider inventory probes") {
 		t.Fatalf("provider codex message = %q", check.Message)
 	}
 }
@@ -773,13 +774,10 @@ func TestRunFailsForInvalidModelSelectionInStrictMode(t *testing.T) {
 	}
 }
 
-func TestRunChecksAntigravityProviderWithAgyModels(t *testing.T) {
+func TestRunChecksAntigravityProviderInstallOnly(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Worker = "antigravity"
 	env.paths["agy"] = "/bin/agy"
-	env.commands[cmdKey("agy", "models")] = CommandResult{
-		Stdout: "Gemini 3.1 Pro\n",
-	}
 
 	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
 
@@ -790,7 +788,7 @@ func TestRunChecksAntigravityProviderWithAgyModels(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("provider antigravity status = %s, want ok (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{`CLI "agy" found at /bin/agy`, "agy models OAuth probe succeeded"} {
+	for _, want := range []string{`CLI "agy" discovered`, "usable_for_invocation=unknown", "auth, account, model authorization, quota, and invocation readiness not checked"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
@@ -813,38 +811,38 @@ func TestRunFailsAntigravityProviderWhenAgyMissing(t *testing.T) {
 	if check.Code != "missing_executable" {
 		t.Fatalf("provider antigravity code = %q, want missing_executable", check.Code)
 	}
-	for _, want := range []string{`CLI "agy" was not found on PATH`, "run: agy login"} {
+	for _, want := range []string{`CLI "agy" was not found through bounded provider inventory probes`, "install Google Antigravity CLI"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
 	}
 }
 
-func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
+func TestRunDoesNotTreatAntigravityInstallAsAuthReadiness(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Verifier = "antigravity"
 	env.paths["agy"] = "/bin/agy"
-	env.commands[cmdKey("agy", "models")] = CommandResult{
-		Stderr:   "OAuth login required\n",
-		ExitCode: 1,
-	}
 
 	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
 
 	if got := report.ExitCode(); got != 1 {
-		t.Fatalf("ExitCode = %d, want 1", got)
+		t.Fatalf("ExitCode = %d, want 1 from compatibility hard fail", got)
 	}
 	check := requireCheck(t, report, "provider antigravity")
-	if check.Status != StatusFail || !check.Hard {
-		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
+	if check.Status != StatusOK || check.Hard {
+		t.Fatalf("provider antigravity check = %#v, want install-only ok", check)
 	}
-	if check.Code != "unauthenticated_provider" {
-		t.Fatalf("provider antigravity code = %q, want unauthenticated_provider", check.Code)
+	if check.Code != "provider_installed" {
+		t.Fatalf("provider antigravity code = %q, want provider_installed", check.Code)
 	}
-	for _, want := range []string{"agy models failed", "OAuth login required", "run: agy login"} {
+	for _, want := range []string{"usable_for_invocation=unknown", "auth, account, model authorization, quota, and invocation readiness not checked"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
+	}
+	compatibility := requireCheck(t, report, "provider compatibility antigravity verifier")
+	if compatibility.Status != StatusFail || !compatibility.Hard || compatibility.Code != "unsupported_read_only_mode" {
+		t.Fatalf("provider compatibility antigravity verifier = %#v, want hard read-only failure", compatibility)
 	}
 	auditProvider := requireCheck(t, report, "audit llm provider")
 	if auditProvider.Status != StatusOK || !strings.Contains(auditProvider.Message, `CLI "agy" resolves`) {
@@ -2104,6 +2102,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 			}
 			return nil, nil
 		},
+		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			return f.providerInventory(opts.Config), nil
+		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
 		clean := filepath.Clean(path)
@@ -2136,6 +2137,126 @@ func (f *fakeDoctorEnv) deps() Deps {
 		return f.file, nil
 	}
 	return deps
+}
+
+func (f *fakeDoctorEnv) providerInventory(cfg config.Config) providerinventory.Report {
+	now := "2026-07-12T00:00:00Z"
+	providers := []struct {
+		id      string
+		cli     string
+		display string
+	}{
+		{id: "codex", cli: "codex", display: "Codex"},
+		{id: "claude", cli: "claude", display: "Claude"},
+		{id: "gemini", cli: "gemini", display: "Gemini"},
+		{id: "antigravity", cli: "agy", display: "Antigravity"},
+	}
+	configured := []string{strings.TrimSpace(cfg.Adapters.Worker), strings.TrimSpace(cfg.Adapters.Verifier)}
+	for _, name := range configured {
+		if name == "" || fakeProviderKnown(providers, name) {
+			continue
+		}
+		providers = append(providers, struct {
+			id      string
+			cli     string
+			display string
+		}{id: name, cli: name, display: name})
+	}
+	var installations []providerinventory.ProviderInstallation
+	var probes []providerinventory.ProbeResult
+	for _, provider := range providers {
+		path, ok := f.paths[provider.cli]
+		probeID := "probe_" + provider.id
+		if !ok {
+			probes = append(probes, providerinventory.ProbeResult{
+				SchemaVersion:     providerinventory.ProbeResultSchema,
+				ProbeResultID:     probeID,
+				AdapterID:         provider.id,
+				Outcome:           providerinventory.OutcomeNotInstalled,
+				ProbeMethod:       providerinventory.ProbeMethodLookPath,
+				Confidence:        providerinventory.ConfidenceUnavailable,
+				FreshnessState:    providerinventory.FreshnessNotApplicable,
+				CapturedAt:        now,
+				CreatedAt:         now,
+				UpdatedAt:         now,
+				NetworkPermission: providerinventory.NetworkNotNeeded,
+				EnvironmentKeys:   []string{},
+				GapReasons:        []string{"executable-not-found"},
+			})
+			continue
+		}
+		installationID := "pinst_" + provider.id
+		probes = append(probes, providerinventory.ProbeResult{
+			SchemaVersion:            providerinventory.ProbeResultSchema,
+			ProbeResultID:            probeID,
+			AdapterID:                provider.id,
+			ProviderInstallationID:   &installationID,
+			Outcome:                  providerinventory.OutcomeInstalled,
+			ProbeMethod:              providerinventory.ProbeMethodFixedCommand,
+			Confidence:               providerinventory.ConfidenceExact,
+			FreshnessState:           providerinventory.FreshnessFresh,
+			CapturedAt:               now,
+			CreatedAt:                now,
+			UpdatedAt:                now,
+			NetworkPermission:        providerinventory.NetworkNotNeeded,
+			EnvironmentKeys:          []string{},
+			GapReasons:               []string{},
+			TimeoutMS:                5000,
+			StdoutLimitBytes:         providerinventory.StdoutLimitBytes,
+			StderrLimitBytes:         providerinventory.StderrLimitBytes,
+			CombinedOutputLimitBytes: providerinventory.CombinedLimitBytes,
+		})
+		installations = append(installations, providerinventory.ProviderInstallation{
+			SchemaVersion:          providerinventory.ProviderInstallationSchema,
+			RecordVersion:          1,
+			Scope:                  "machine",
+			ProviderInstallationID: installationID,
+			AdapterID:              provider.id,
+			ProviderDisplayName:    provider.display,
+			ExecutableName:         provider.cli,
+			CanonicalPathRedacted:  filepath.ToSlash(filepath.Join("...", filepath.Base(filepath.Dir(path)), filepath.Base(path))),
+			DiscoverySource:        providerinventory.DiscoveryPath,
+			DiscoveryOrder:         len(installations),
+			Platform:               "test",
+			VersionConfidence:      providerinventory.ConfidenceExact,
+			LatestProbeResultID:    probeID,
+			InstallationState:      providerinventory.InstallationInstalled,
+			UsableForInvocation:    "unknown",
+			KnownLimitations:       []string{},
+			CreatedAt:              now,
+			UpdatedAt:              now,
+			CapturedAt:             now,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			GapReasons:             []string{},
+		})
+	}
+	return providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now,
+		InventoryFingerprint:  "sha256:test",
+		Confidence:            providerinventory.ConfidenceExact,
+		Installations:         installations,
+		ProbeResults:          probes,
+		AccountProfiles:       []any{},
+		AuthReadiness:         []any{},
+		ModelCatalogSnapshots: []any{},
+		ModelCapabilities:     []any{},
+		GapReasons:            []string{},
+	}
+}
+
+func fakeProviderKnown(providers []struct {
+	id      string
+	cli     string
+	display string
+}, name string) bool {
+	for _, provider := range providers {
+		if provider.id == name {
+			return true
+		}
+	}
+	return false
 }
 
 func writeDoctorTextFile(t *testing.T, path string, content string) {

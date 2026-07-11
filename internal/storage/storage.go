@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 10
+	CurrentSchemaVersion = 11
 
 	driverName = "sqlite"
 
@@ -290,6 +290,11 @@ var migrations = []migration{
 		version: 10,
 		name:    "delivery run contracts",
 	},
+	{
+		version:    11,
+		name:       "provider inventory",
+		statements: providerInventorySchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -314,6 +319,14 @@ var requiredTables = []string{
 	"delivery_idempotency",
 	"delivery_migration_backups",
 	"delivery_legacy_imports",
+	"adapter_declarations",
+	"provider_installations",
+	"provider_probe_results",
+	"account_profiles",
+	"auth_readiness",
+	"model_catalog_snapshots",
+	"model_capabilities",
+	"inventory_events",
 }
 
 type migration struct {

@@ -106,6 +106,7 @@ Environment variables cannot be edited by loopcoder. If doctor reports old `LOOP
 loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
+loopcoder providers refresh --repo .          # refresh bounded provider CLI installation inventory
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -168,6 +169,7 @@ loopcoder models
 loopcoder models --provider codex
 loopcoder models --provider claude
 loopcoder models --provider antigravity
+loopcoder providers refresh --repo .
 ```
 
 Initial registry defaults:
@@ -197,6 +199,7 @@ The provider key is `antigravity`; the executable is `agy`.
 agy login
 agy models
 loopcoder models --provider antigravity
+loopcoder providers refresh --repo .
 loopcoder doctor --repo .
 ```
 
@@ -220,9 +223,17 @@ v0.7.0 expands `doctor` with resolved host profile, provider/host
 compatibility, storage permissions, storage health, project registry identity,
 and migration status. `--format json` emits
 `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile`
-object, `provider_compatibility[]` entries for the smoke matrix, and ordered
-`checks[]` objects with `name`, `code`, `status`, `hard`, `message`, and
-`fix_command`.
+object, `provider_compatibility[]` entries for the smoke matrix, a root
+`provider_inventory` object, and ordered `checks[]` objects with `name`,
+`code`, `status`, `hard`, `message`, and `fix_command`.
+
+`loopcoder providers refresh --repo .` runs the same bounded provider CLI
+installation probes and persists machine-local ProviderInstallation and
+ProbeResult history in `$LOOPCODER_HOME/data/loopcoder.db`. Probes use fixed
+argv arrays, strict time/output caps, redacted provider output, and no shell
+interpolation. Installation evidence is not auth readiness, account readiness,
+model authorization, quota, or usable capacity; human and JSON output keep
+`usable_for_invocation` as `unknown` from install evidence alone.
 
 ### Project Registry
 

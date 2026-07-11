@@ -139,9 +139,9 @@ Validation is exact and case-sensitive. In default mode, invalid selections
 emit warnings and preserve pass-through values. With `.delivery.yml`
 `models.strict: true` or a one-run `--strict` flag, invalid selections reject
 before Worker or Verifier provider launch. `loopcoder doctor` reports the same
-model/depth validation and, when `antigravity` is configured, checks executable
-`agy` plus `agy models` OAuth readiness and points users to `agy login` on
-failure.
+model/depth validation and, when `antigravity` is configured, reports bounded
+installation discovery for executable `agy` without inferring OAuth readiness,
+account readiness, model authorization, quota, or usable capacity.
 
 ## State Model
 

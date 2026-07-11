@@ -103,9 +103,9 @@ field, flag, provider key, model/depth token, or label has been removed or
 renamed, `doctor` should explain the incompatibility and point to the relevant
 migration guidance. Incompatible configuration or automation must produce an
 explicit diagnostic instead of a silent fallback. When provider `antigravity`
-is configured, doctor checks executable `agy` and runs `agy models` as the
-current OAuth readiness probe; authentication failures should point to
-`agy login`.
+is configured, doctor checks executable `agy` through bounded installation
+inventory only; authentication readiness, model authorization, quota, and usable
+capacity must remain separate diagnostics.
 
 ## CHANGELOG Discipline
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -40,19 +41,20 @@ type Options struct {
 }
 
 type Report struct {
-	RunID               string          `json:"run_id"`
-	RunNote             string          `json:"run_note"`
-	RunPath             string          `json:"run_path"`
-	Project             ProjectMetadata `json:"project"`
-	EventCount          int             `json:"event_count"`
-	VerifierRecordCount int             `json:"verifier_record_count"`
-	LifecycleState      string          `json:"lifecycle_state"`
-	LifecycleSource     string          `json:"lifecycle_source"`
-	LifecycleEvents     int             `json:"lifecycle_events"`
-	ParentRunID         string          `json:"parent_run_id,omitempty"`
-	ChildRunIDs         []string        `json:"child_run_ids"`
-	RunTree             RunTree         `json:"run_tree"`
-	Rows                []Row           `json:"rows"`
+	RunID               string                          `json:"run_id"`
+	RunNote             string                          `json:"run_note"`
+	RunPath             string                          `json:"run_path"`
+	Project             ProjectMetadata                 `json:"project"`
+	EventCount          int                             `json:"event_count"`
+	VerifierRecordCount int                             `json:"verifier_record_count"`
+	LifecycleState      string                          `json:"lifecycle_state"`
+	LifecycleSource     string                          `json:"lifecycle_source"`
+	LifecycleEvents     int                             `json:"lifecycle_events"`
+	ParentRunID         string                          `json:"parent_run_id,omitempty"`
+	ChildRunIDs         []string                        `json:"child_run_ids"`
+	InventoryRefs       providerinventory.InventoryRefs `json:"inventory_refs"`
+	RunTree             RunTree                         `json:"run_tree"`
+	Rows                []Row                           `json:"rows"`
 }
 
 type ProjectMetadata struct {
@@ -427,6 +429,9 @@ func normalizeReport(report Report) Report {
 	}
 	if report.RunTree.Nodes == nil {
 		report.RunTree.Nodes = []RunTreeNode{}
+	}
+	if report.InventoryRefs.SchemaVersion == "" {
+		report.InventoryRefs = providerinventory.EmptyRefs()
 	}
 	for i := range report.RunTree.Nodes {
 		if report.RunTree.Nodes[i].ChildRunIDs == nil {

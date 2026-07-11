@@ -27,6 +27,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relay"
@@ -56,34 +57,36 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader   func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter    func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter  func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter  func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive      func(pid int) bool
-	Now               func() time.Time
-	IsTerminal        func(w io.Writer) bool
-	Stdin             io.Reader
-	BuildInfo         BuildInfo
-	ComputeReadySet   func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick              func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover          func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile           func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch          func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview        func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote           func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover           func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify            func(ctx context.Context, opts verify.Options) verify.Result
-	Audit             func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor            func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init              func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade           func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	SkillInstall      func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush         func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull         func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter           func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive             func(pid int) bool
+	Now                      func() time.Time
+	IsTerminal               func(w io.Writer) bool
+	Stdin                    io.Reader
+	BuildInfo                BuildInfo
+	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                   func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                    func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	Init                     func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                  func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState        func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall             func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 }
 
 var commands = []Command{
@@ -91,6 +94,7 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
+	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -192,6 +196,17 @@ func DefaultDeps() Deps {
 		Doctor: func(ctx context.Context, opts doctor.Options) doctor.Report {
 			return doctor.Run(ctx, opts, doctor.DefaultDeps())
 		},
+		ProviderInventory: func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			return providerinventory.Discover(ctx, opts, providerinventory.DefaultDeps())
+		},
+		ProviderInventoryRefresh: func(ctx context.Context, report providerinventory.Report, now time.Time) error {
+			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), func() time.Time { return now })
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			return providerinventory.Refresh(ctx, store, report, now)
+		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
@@ -267,6 +282,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "projects" {
 		return runProjects(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "providers" {
+		return runProviders(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
@@ -383,6 +401,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "projects" {
 		printProjectsHelp(w)
+		return
+	}
+	if command.Name == "providers" {
+		printProvidersHelp(w)
 		return
 	}
 	if command.Name == "nested" {
@@ -1249,6 +1271,115 @@ func parseRelayRepo(name string, args []string, stderr io.Writer) (string, bool)
 		return "", false
 	}
 	return repoPath, true
+}
+
+func printProvidersHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder providers refresh [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+	fmt.Fprintln(w, "  --base-branch string   base branch for .delivery.yml fallback (default \"main\")")
+	fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help                 show help")
+}
+
+func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = DefaultDeps().ProviderInventory
+	}
+	if deps.ProviderInventoryRefresh == nil {
+		deps.ProviderInventoryRefresh = DefaultDeps().ProviderInventoryRefresh
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	subcommand := "refresh"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		subcommand = strings.TrimSpace(args[0])
+		args = args[1:]
+	}
+	if subcommand != "refresh" {
+		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh)\n", subcommand)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("providers refresh", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	format := "text"
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers refresh: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers refresh: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 1
+	}
+	now := deps.Now()
+	report, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
+		RepoPath: resolvedRepo,
+		Config:   cfg,
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 1
+	}
+	if err := deps.ProviderInventoryRefresh(context.Background(), report, now); err != nil {
+		fmt.Fprintf(stderr, "providers refresh: persist inventory: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(report); err != nil {
+			fmt.Fprintf(stderr, "providers refresh: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), report.Confidence, report.InventoryFingerprint)
+	for _, installation := range report.Installations {
+		fmt.Fprintf(stdout, "- %s %s at %s state=%s confidence=%s freshness=%s usable_for_invocation=%s captured_at=%s\n",
+			installation.AdapterID,
+			installation.ExecutableName,
+			installation.CanonicalPathRedacted,
+			installation.InstallationState,
+			installation.Confidence,
+			installation.FreshnessState,
+			installation.UsableForInvocation,
+			installation.CapturedAt,
+		)
+	}
+	if len(report.Installations) == 0 {
+		fmt.Fprintln(stdout, "- no provider CLI installations discovered")
+	}
+	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+	return 0
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {

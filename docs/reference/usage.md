@@ -537,6 +537,8 @@ loopcoder version=<version> commit=<commit> date=<build-date> go=<go-version> pl
 loopcoder doctor --repo .
 loopcoder doctor --repo . --format text
 loopcoder doctor --repo . --format json
+loopcoder providers refresh --repo .
+loopcoder providers refresh --repo . --format json
 ```
 
 It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
@@ -544,7 +546,7 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 - `git` on `PATH`;
 - `gh` on `PATH` and `gh auth status`;
 - `.delivery.yml` presence and parse validity;
-- configured worker and verifier provider CLI availability;
+- configured worker and verifier provider CLI installation inventory;
 - repository `origin` and detectable default branch;
 - selected loopcoder binary path, version, commit, date, and release or
   development track;
@@ -570,10 +572,11 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
   `generic-local`) and conductor runtime responsibility, which remains
   user-provided by the active host.
 
-Provider authentication is reported only where loopcoder has a stable cheap
-probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
-does not invent provider-authentication status when the provider has no stable
-probe.
+Provider installation is separate from provider authentication. Today `doctor`
+checks `gh` authentication and bounded provider CLI installation inventory; it
+does not infer provider-authentication status, account readiness, model
+authorization, quota, invocation readiness, or usable capacity from an installed
+CLI.
 
 On Unix-like systems, v0.7.0 creates and tightens `$LOOPCODER_HOME` and
 `$LOOPCODER_HOME/data` with owner-only directory permissions, and
@@ -638,6 +641,19 @@ this version.
       "message": "run tree readable; 1 run(s), no nested edges"
     }
   },
+  "provider_inventory": {
+    "schema_version": "loopcoder.provider_inventory_json.v1",
+    "generated_at": "2026-07-12T00:00:00Z",
+    "inventory_fingerprint": "sha256:...",
+    "confidence": "exact",
+    "installations": [],
+    "probe_results": [],
+    "account_profiles": [],
+    "auth_readiness": [],
+    "model_catalog_snapshots": [],
+    "model_capabilities": [],
+    "gap_reasons": []
+  },
   "checks": [
     {
       "name": "local-state exclude",
@@ -649,6 +665,29 @@ this version.
   ]
 }
 ```
+
+`loopcoder providers refresh --repo .` explicitly persists the same
+ProviderInstallation and ProbeResult inventory to the machine-local SQLite
+store. Refreshes append immutable probe history and mark disappeared
+installations stale instead of deleting them. Probe output is bounded and
+redacted, raw absolute paths are redacted in JSON/human output, and command
+execution uses fixed argv arrays with no shell interpolation.
+
+Operators can add explicit executable locations without scanning a disk:
+
+```yaml
+provider_inventory:
+  executables:
+    custom-provider:
+      - /opt/custom-provider/bin/custom-provider
+```
+
+Those paths are checked before PATH entries and rendered with
+`discovery_source: "explicit-config"` and redacted path output.
+
+`loopcoder status --repo . --format json` includes `inventory_refs`, not full
+raw inventory. Until a DeliveryRun binds inventory records, the arrays are empty
+and confidence is `unknown`.
 
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,
@@ -755,12 +794,14 @@ Antigravity setup uses the Google Antigravity CLI:
 ```text
 agy login
 agy models
+loopcoder providers refresh --repo .
 loopcoder doctor --repo .
 ```
 
 When the configured Worker or Verifier provider is `antigravity`, `doctor`
-looks for executable `agy` and runs `agy models` as a bounded OAuth readiness
-probe. The Antigravity Worker invocation uses this argv shape after
+and `providers refresh` look for executable `agy` through bounded installation
+probes only. Auth readiness is not inferred from installation evidence in this
+slice. The Antigravity Worker invocation uses this argv shape after
 registry/default resolution:
 
 ```text
