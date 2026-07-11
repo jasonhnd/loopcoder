@@ -319,7 +319,9 @@ func staticCatalogForAdapter(adapter AdapterDeclaration, now time.Time) (ModelCa
 		Confidence:     ConfidenceExact,
 		FreshnessState: FreshnessFresh,
 	}
-	if provider, ok := models.LookupProvider(adapter.AdapterID); ok {
+	if len(adapter.StaticCatalogEntries) > 0 {
+		source.Entries = append(source.Entries, adapter.StaticCatalogEntries...)
+	} else if provider, ok := models.LookupProvider(adapter.AdapterID); ok {
 		for _, model := range provider.Models {
 			source.Entries = append(source.Entries, catalogEntryFromModel(adapter.AdapterID, model))
 		}

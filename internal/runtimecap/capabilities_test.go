@@ -106,6 +106,19 @@ func TestDefaultContractDeclaresCredentialBlindAuthReadiness(t *testing.T) {
 	}
 }
 
+func TestDefaultContractDeclaresCatalogProbeProvenance(t *testing.T) {
+	antigravity, ok := runtimecap.LookupProvider("antigravity")
+	if !ok {
+		t.Fatal("LookupProvider(\"antigravity\") returned false")
+	}
+	if !reflect.DeepEqual(antigravity.CatalogProbeCommand, []string{"agy", "models"}) {
+		t.Fatalf("CatalogProbeCommand = %#v, want agy models", antigravity.CatalogProbeCommand)
+	}
+	if antigravity.CatalogProbeParser != "agy-models" || !antigravity.CatalogProbeMayNetwork {
+		t.Fatalf("catalog probe declaration = %#v, want agy-models network declared", antigravity)
+	}
+}
+
 func TestDefaultContractRepresentsExistingHosts(t *testing.T) {
 	if got, want := runtimecap.HostNames(), []string{"claude-code", "codex-cli", "generic-local", "paseo-style"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("HostNames = %#v, want %#v", got, want)
@@ -222,6 +235,9 @@ func TestInvariantViolationsRejectInvalidContract(t *testing.T) {
 		Providers: []runtimecap.ProviderRuntime{
 			{Name: "custom"},
 			{Name: "custom", Executable: "custom"},
+			{Name: "bad/path", Executable: "bad/path", AuthUnsupportedReason: "unsupported"},
+			{Name: "network", Executable: "network", MayNetwork: true, AuthUnsupportedReason: "unsupported"},
+			{Name: "catalog", Executable: "catalog", CatalogProbeMayNetwork: true, AuthUnsupportedReason: "unsupported"},
 		},
 		Hosts: []runtimecap.HostRuntime{
 			{Name: "host"},
@@ -231,6 +247,10 @@ func TestInvariantViolationsRejectInvalidContract(t *testing.T) {
 	for _, want := range []string{
 		`provider "custom" executable is empty`,
 		`provider "custom" is duplicated`,
+		`provider "bad/path" name contains a path separator`,
+		`provider "bad/path" executable "bad/path" must be a command name, not a path`,
+		`provider "network" declares network auth probing without an auth probe command`,
+		`provider "catalog" declares network catalog probing without a catalog probe command`,
 		`host "host" invocation style is empty`,
 		`host "host" must preserve stdout`,
 		`host "host" must preserve stderr`,

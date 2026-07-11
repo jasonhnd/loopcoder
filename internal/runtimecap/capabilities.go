@@ -35,22 +35,51 @@ const (
 )
 
 type ProviderRuntime struct {
-	Name                   string
-	Executable             string
-	ReadOnly               bool
-	NestedSubagents        bool
-	JSONOutput             bool
-	MCPConfig              bool
-	Cancellation           bool
-	TokenUsageReporting    bool
-	AuthProbeCommand       []string
-	AuthProbeParser        string
-	AuthArtifactPaths      []string
-	AuthEnvironmentNames   []string
-	AuthUnsupportedReason  string
-	MayNetwork             bool
-	KnownLimitations       []string
-	UnsupportedSuggestions map[ProviderCapability]string
+	Name                     string
+	AdapterVersion           string
+	DeclarationSchemaVersion string
+	DisplayName              string
+	Vendor                   string
+	Executable               string
+	VersionArgv              []string
+	ReadOnly                 bool
+	NestedSubagents          bool
+	JSONOutput               bool
+	MCPConfig                bool
+	Cancellation             bool
+	TokenUsageReporting      bool
+	AuthProbeCommand         []string
+	AuthProbeParser          string
+	AuthArtifactPaths        []string
+	AuthEnvironmentNames     []string
+	AuthUnsupportedReason    string
+	CatalogProbeCommand      []string
+	CatalogProbeParser       string
+	CatalogProbeMayNetwork   bool
+	StaticModelCatalog       []ProviderModelCapability
+	MayNetwork               bool
+	ConformanceVersion       string
+	KnownLimitations         []string
+	UnsupportedSuggestions   map[ProviderCapability]string
+}
+
+type ProviderModelCapability struct {
+	ModelID             string
+	DisplayName         string
+	ReadOnly            bool
+	NestedSubagents     bool
+	JSONOutput          bool
+	MCPConfig           bool
+	Cancellation        bool
+	TokenUsageReporting bool
+	ImageInput          bool
+	ImageOutput         bool
+	RolesSupported      []CompatibilityRole
+	AvailabilityState   string
+	LifecycleState      string
+	ReplacementModelID  string
+	Aliases             []string
+	Constraints         []string
 }
 
 type HostRuntime struct {
@@ -353,6 +382,9 @@ func (c Contract) InvariantViolations() []string {
 		if name == "" {
 			violations = append(violations, "provider name is empty")
 		}
+		if unsafeIdentifier(name) {
+			violations = append(violations, fmt.Sprintf("provider %q name contains a path separator", name))
+		}
 		if seenProviders[name] {
 			violations = append(violations, fmt.Sprintf("provider %q is duplicated", name))
 		}
@@ -360,11 +392,39 @@ func (c Contract) InvariantViolations() []string {
 		if strings.TrimSpace(provider.Executable) == "" {
 			violations = append(violations, fmt.Sprintf("provider %q executable is empty", name))
 		}
+		if unsafeIdentifier(provider.Executable) {
+			violations = append(violations, fmt.Sprintf("provider %q executable %q must be a command name, not a path", name, provider.Executable))
+		}
+		if len(provider.VersionArgv) > 0 {
+			violations = append(violations, fixedArgvViolations(name, "version argv", provider.VersionArgv, false)...)
+		}
 		if len(provider.AuthProbeCommand) > 0 && strings.TrimSpace(provider.AuthProbeCommand[0]) == "" {
 			violations = append(violations, fmt.Sprintf("provider %q auth probe executable is empty", name))
 		}
+		if len(provider.AuthProbeCommand) > 0 {
+			violations = append(violations, fixedArgvViolations(name, "auth probe command", provider.AuthProbeCommand, true)...)
+		}
+		if len(provider.CatalogProbeCommand) > 0 {
+			violations = append(violations, fixedArgvViolations(name, "catalog probe command", provider.CatalogProbeCommand, true)...)
+		}
 		if provider.MayNetwork && len(provider.AuthProbeCommand) == 0 {
 			violations = append(violations, fmt.Sprintf("provider %q declares network auth probing without an auth probe command", name))
+		}
+		if provider.CatalogProbeMayNetwork && len(provider.CatalogProbeCommand) == 0 {
+			violations = append(violations, fmt.Sprintf("provider %q declares network catalog probing without a catalog probe command", name))
+		}
+		if len(provider.AuthProbeCommand) == 0 && len(provider.AuthArtifactPaths) == 0 && len(provider.AuthEnvironmentNames) == 0 && strings.TrimSpace(provider.AuthUnsupportedReason) == "" {
+			violations = append(violations, fmt.Sprintf("provider %q must declare credential-blind auth evidence or an unsupported reason", name))
+		}
+		for _, envName := range provider.AuthEnvironmentNames {
+			if strings.TrimSpace(envName) == "" || strings.Contains(envName, "=") {
+				violations = append(violations, fmt.Sprintf("provider %q auth environment name %q is invalid", name, envName))
+			}
+		}
+		for _, model := range provider.StaticModelCatalog {
+			if strings.TrimSpace(model.ModelID) == "" {
+				violations = append(violations, fmt.Sprintf("provider %q static catalog model id is empty", name))
+			}
 		}
 	}
 
@@ -392,6 +452,23 @@ func (c Contract) InvariantViolations() []string {
 	return violations
 }
 
+func unsafeIdentifier(value string) bool {
+	return strings.ContainsAny(strings.TrimSpace(value), `/\`)
+}
+
+func fixedArgvViolations(providerName, field string, argv []string, commandIncludesExecutable bool) []string {
+	var violations []string
+	for index, arg := range argv {
+		if strings.TrimSpace(arg) == "" {
+			violations = append(violations, fmt.Sprintf("provider %q %s[%d] is empty", providerName, field, index))
+		}
+	}
+	if commandIncludesExecutable && len(argv) > 0 && unsafeIdentifier(argv[0]) {
+		violations = append(violations, fmt.Sprintf("provider %q %s executable %q must be a command name, not a path", providerName, field, argv[0]))
+	}
+	return violations
+}
+
 func (c Contract) MustBeValid() {
 	if violations := c.InvariantViolations(); len(violations) > 0 {
 		panic("invalid runtime capability contract: " + strings.Join(violations, "; "))
@@ -411,9 +488,12 @@ func cloneContract(contract Contract) Contract {
 }
 
 func cloneProvider(provider ProviderRuntime) ProviderRuntime {
+	provider.VersionArgv = append([]string(nil), provider.VersionArgv...)
 	provider.AuthProbeCommand = append([]string(nil), provider.AuthProbeCommand...)
 	provider.AuthArtifactPaths = append([]string(nil), provider.AuthArtifactPaths...)
 	provider.AuthEnvironmentNames = append([]string(nil), provider.AuthEnvironmentNames...)
+	provider.CatalogProbeCommand = append([]string(nil), provider.CatalogProbeCommand...)
+	provider.StaticModelCatalog = cloneStaticModelCatalog(provider.StaticModelCatalog)
 	provider.KnownLimitations = append([]string(nil), provider.KnownLimitations...)
 	if provider.UnsupportedSuggestions != nil {
 		suggestions := make(map[ProviderCapability]string, len(provider.UnsupportedSuggestions))
@@ -425,6 +505,17 @@ func cloneProvider(provider ProviderRuntime) ProviderRuntime {
 	return provider
 }
 
+func cloneStaticModelCatalog(models []ProviderModelCapability) []ProviderModelCapability {
+	out := make([]ProviderModelCapability, 0, len(models))
+	for _, model := range models {
+		model.RolesSupported = append([]CompatibilityRole(nil), model.RolesSupported...)
+		model.Aliases = append([]string(nil), model.Aliases...)
+		model.Constraints = append([]string(nil), model.Constraints...)
+		out = append(out, model)
+	}
+	return out
+}
+
 func cloneHost(host HostRuntime) HostRuntime {
 	host.KnownLimitations = append([]string(nil), host.KnownLimitations...)
 	return host
@@ -434,7 +525,11 @@ var staticContract = Contract{
 	Providers: []ProviderRuntime{
 		{
 			Name:                "codex",
+			AdapterVersion:      "v1",
+			DisplayName:         "Codex",
+			Vendor:              "OpenAI Codex",
 			Executable:          "codex",
+			VersionArgv:         []string{"--version"},
 			ReadOnly:            true,
 			JSONOutput:          true,
 			MCPConfig:           true,
@@ -453,7 +548,11 @@ var staticContract = Contract{
 		},
 		{
 			Name:                "claude",
+			AdapterVersion:      "v1",
+			DisplayName:         "Claude",
+			Vendor:              "Anthropic",
 			Executable:          "claude",
+			VersionArgv:         []string{"--version"},
 			ReadOnly:            true,
 			NestedSubagents:     true,
 			JSONOutput:          true,
@@ -474,7 +573,11 @@ var staticContract = Contract{
 		},
 		{
 			Name:                "gemini",
+			AdapterVersion:      "v1",
+			DisplayName:         "Gemini",
+			Vendor:              "Google",
 			Executable:          "gemini",
+			VersionArgv:         []string{"--version"},
 			ReadOnly:            true,
 			JSONOutput:          true,
 			MCPConfig:           true,
@@ -498,9 +601,13 @@ var staticContract = Contract{
 			},
 		},
 		{
-			Name:         "antigravity",
-			Executable:   "agy",
-			Cancellation: true,
+			Name:           "antigravity",
+			AdapterVersion: "v1",
+			DisplayName:    "Antigravity",
+			Vendor:         "Google Antigravity",
+			Executable:     "agy",
+			VersionArgv:    []string{"--version"},
+			Cancellation:   true,
 			// `agy models` is the narrow provider surface available for
 			// auth/model reachability, but it may contact the network; runtime
 			// policy therefore records it and skips it by default.
@@ -510,6 +617,12 @@ var staticContract = Contract{
 			},
 			AuthProbeParser: "agy-models",
 			MayNetwork:      true,
+			CatalogProbeCommand: []string{
+				"agy",
+				"models",
+			},
+			CatalogProbeParser:     "agy-models",
+			CatalogProbeMayNetwork: true,
 			KnownLimitations: []string{
 				"read-only mode is not available or verified",
 				"MCP configuration injection is not implemented",
