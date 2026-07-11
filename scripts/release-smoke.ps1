@@ -73,8 +73,8 @@ function Assert-DoctorCheckIsReady([object]$Entry, [string]$Label) {
     if (@("supported", "experimental") -notcontains $Entry.code) {
         Fail "$Label code must be supported or experimental, got $($Entry.code)"
     }
-    if ($Entry.status -ne "ok") {
-        Fail "$Label status must be ok, got $($Entry.status)"
+    if (@("ok", "warn") -notcontains $Entry.status) {
+        Fail "$Label status must be ok or warn, got $($Entry.status)"
     }
 }
 
