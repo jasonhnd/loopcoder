@@ -1586,7 +1586,7 @@ func TestScheduleNestedRunsPassesIdempotencyKeyAndPersistsOnlyRealReceipt(t *tes
 	}
 }
 
-func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
+func TestScheduleNestedRunsRegistersNativeChildAfterClaimBeforeExecute(t *testing.T) {
 	ctx := context.Background()
 	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
 	if err != nil {
@@ -1605,30 +1605,57 @@ func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
 		Children: []ChildRunPlan{{
 			ChildKey:   "native-child",
 			Title:      "native child",
+			Role:       "worker",
 			Permission: "write",
-			Scope:      ChildScope{Paths: []string{"src/native.go"}},
+			Scope:      ChildScope{Repo: ".", Paths: []string{"src/native.go"}},
 			Aggregation: ChildAggregation{
-				Mode:     ChildAggregationCollect,
-				Required: true,
+				Mode:          ChildAggregationCollect,
+				Required:      true,
+				IncludeReport: true,
 			},
 			Metadata: json.RawMessage(`{"native_subagent":true}`),
 		}},
-		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
 			executed = true
+			var registrationState, claimExecutor string
+			var claimGeneration, activeBudgets, heldLocks int
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				if err := tx.QueryRow(ctx, `SELECT registration_state, executor_id, claim_generation FROM agent_registrations WHERE child_run_id = ?`, child.RunID).Scan(&registrationState, &claimExecutor, &claimGeneration); err != nil {
+					return err
+				}
+				if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM agent_budget_bindings WHERE reservation_state = 'active'`).Scan(&activeBudgets); err != nil {
+					return err
+				}
+				return tx.QueryRow(ctx, `SELECT COUNT(*) FROM agent_ownership_locks WHERE state = 'held' AND run_id = ?`, child.RunID).Scan(&heldLocks)
+			}); err != nil {
+				t.Fatalf("query native registration before execute: %v", err)
+			}
+			if registrationState != storage.AgentStateRunning || claimExecutor == "" || claimGeneration <= 0 || activeBudgets != 1 || heldLocks != 1 {
+				t.Fatalf("registration before execute state/executor/generation/budgets/locks = %q/%q/%d/%d/%d", registrationState, claimExecutor, claimGeneration, activeBudgets, heldLocks)
+			}
 			return ChildRunResult{Status: NestedStatusSucceeded}, nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns: %v", err)
 	}
-	if executed {
-		t.Fatalf("native child executor was called without registration")
+	if !executed {
+		t.Fatalf("native child executor was not called after registration; children = %#v", report.Children)
 	}
-	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
-		t.Fatalf("children = %#v, want needs-human refusal", report.Children)
+	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusSucceeded {
+		t.Fatalf("children = %#v, want succeeded native child", report.Children)
 	}
-	if !strings.Contains(report.Children[0].Error, "ErrAgentRegistrationRequired") {
-		t.Fatalf("native refusal error = %q, want ErrAgentRegistrationRequired", report.Children[0].Error)
+	var registrationState, lockState string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE child_run_id = ?`, report.Children[0].RunID).Scan(&registrationState); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT state FROM agent_ownership_locks WHERE run_id = ?`, report.Children[0].RunID).Scan(&lockState)
+	}); err != nil {
+		t.Fatalf("query native registration after completion: %v", err)
+	}
+	if registrationState != storage.AgentStateSucceeded || lockState != storage.OwnershipStateReleased {
+		t.Fatalf("native terminal state/lock = %q/%q, want succeeded/released", registrationState, lockState)
 	}
 }
 

@@ -213,6 +213,147 @@ func TestChildOutputBoundedRedactedAndClosedStatus(t *testing.T) {
 	}
 }
 
+func TestChildOutputRedactsBeforeTruncatingSecretPrefix(t *testing.T) {
+	secret := "AK" + "IA" + strings.Repeat("B", 16)
+	envelope, err := NormalizeChildOutput(secret+" suffix", "failed", 8)
+	if err != nil {
+		t.Fatalf("NormalizeChildOutput: %v", err)
+	}
+	if !envelope.Redacted || !envelope.Truncated {
+		t.Fatalf("envelope flags = %#v, want redacted and truncated", envelope)
+	}
+	if strings.Contains(envelope.Output, "AKIA") || strings.Contains(envelope.Output, secret[:8]) {
+		t.Fatalf("output leaked credential prefix after truncation: %#v", envelope)
+	}
+}
+
+func TestValidateNativeChildLaunchRequiresActiveBudgetReservation(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name string
+		edit string
+	}{
+		{name: "inactive", edit: `UPDATE agent_budget_bindings SET reservation_state = 'cancelled'`},
+		{name: "empty quantities", edit: `UPDATE agent_budget_bindings SET reserved_quantities_json = '{}'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+			claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+			record, err := RegisterAgent(ctx, store, federationRequest(claim))
+			if err != nil {
+				t.Fatalf("RegisterAgent: %v", err)
+			}
+			if err := store.WithWriteTx(ctx, func(tx Tx) error {
+				_, err := tx.Exec(ctx, tt.edit+` WHERE child_agent_id = ?`, record.ChildAgentID)
+				return err
+			}); err != nil {
+				t.Fatalf("mutate budget binding: %v", err)
+			}
+			if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration); !errors.Is(err, ErrChildBudgetRequired) {
+				t.Fatalf("ValidateNativeChildLaunch error = %v, want ErrChildBudgetRequired", err)
+			}
+		})
+	}
+}
+
+func TestValidateNativeChildLaunchRequiresActiveClaimFencedLockCoverage(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		edit string
+	}{
+		{name: "expired", edit: `UPDATE agent_ownership_locks SET lease_expires_at = '2026-01-01T00:00:00Z'`},
+		{name: "released", edit: `UPDATE agent_ownership_locks SET state = 'released'`},
+		{name: "stale claim", edit: `UPDATE agent_ownership_locks SET claim_generation = claim_generation + 1`},
+		{name: "uncovered write scope", edit: `UPDATE agent_ownership_locks SET resource_key = 'src/other.go'`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+			claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+			record, err := RegisterAgent(ctx, store, federationRequest(claim))
+			if err != nil {
+				t.Fatalf("RegisterAgent: %v", err)
+			}
+			if err := store.WithWriteTx(ctx, func(tx Tx) error {
+				_, err := tx.Exec(ctx, tt.edit+` WHERE child_agent_id = ?`, record.ChildAgentID)
+				return err
+			}); err != nil {
+				t.Fatalf("mutate ownership lock: %v", err)
+			}
+			if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration); !errors.Is(err, ErrOwnershipRequired) {
+				t.Fatalf("ValidateNativeChildLaunch error = %v, want ErrOwnershipRequired", err)
+			}
+		})
+	}
+}
+
+func TestTransitionAgentRegistrationTerminalReleasesHeldLocks(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		actions []string
+		want    string
+	}{
+		{name: "succeeded", actions: []string{AgentActionLaunch, AgentActionHeartbeat, AgentActionCompleteSuccess}, want: AgentStateSucceeded},
+		{name: "failed", actions: []string{AgentActionLaunch, AgentActionHeartbeat, AgentActionCompleteFailure}, want: AgentStateFailed},
+		{name: "cancelled", actions: []string{AgentActionLaunch, AgentActionHeartbeat, AgentActionCancel, AgentActionCompleteFailure}, want: AgentStateCancelled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timestamps := []string{"2026-01-02T03:04:06Z", "2026-01-02T03:04:07Z", "2026-01-02T03:04:08Z", "2026-01-02T03:04:09Z"}
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+			claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+			record, err := RegisterAgent(ctx, store, federationRequest(claim))
+			if err != nil {
+				t.Fatalf("RegisterAgent: %v", err)
+			}
+			for i, action := range tt.actions {
+				record, err = TransitionAgentRegistration(ctx, store, record.ChildAgentID, action, claim.ExecutorID, claim.ClaimGeneration, timestamps[i])
+				if err != nil {
+					t.Fatalf("TransitionAgentRegistration %s: %v", action, err)
+				}
+			}
+			if record.RegistrationState != tt.want {
+				t.Fatalf("registration state = %s, want %s", record.RegistrationState, tt.want)
+			}
+			var states []string
+			if err := store.WithTx(ctx, func(tx Tx) error {
+				rows, err := tx.Query(ctx, `SELECT state FROM agent_ownership_locks WHERE child_agent_id = ? ORDER BY id`, record.ChildAgentID)
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+				for rows.Next() {
+					var state string
+					if err := rows.Scan(&state); err != nil {
+						return err
+					}
+					states = append(states, state)
+				}
+				return rows.Err()
+			}); err != nil {
+				t.Fatalf("query ownership locks: %v", err)
+			}
+			if len(states) != 1 || states[0] != OwnershipStateReleased {
+				t.Fatalf("lock states = %#v, want released", states)
+			}
+		})
+	}
+}
+
 type federationClaim struct {
 	ParentRunID     string
 	RunID           string
@@ -288,14 +429,15 @@ func federationRequest(claim federationClaim) AgentRegistrationRequest {
 		BudgetBindings: []AgentBudgetBinding{{
 			BudgetPolicyID:         "bpol-a",
 			BudgetReservationID:    "bres-a-" + claim.ChildKey,
-			ReservedQuantitiesJSON: "{}",
+			ReservedQuantitiesJSON: `{"attempts":1}`,
 			AncestorBudgetRefsJSON: "[]",
 			ReservationState:       "active",
 		}},
 		OwnershipLocks: []AgentOwnershipLock{{
-			ResourceKind: "repo-path",
-			ResourceKey:  "src/a.go",
-			State:        OwnershipStateHeld,
+			ResourceKind:   "repo-path",
+			ResourceKey:    "src/a.go",
+			State:          OwnershipStateHeld,
+			LeaseExpiresAt: "2026-01-03T00:00:00Z",
 		}},
 		ClaimGeneration:        claim.ClaimGeneration,
 		ExecutorID:             claim.ExecutorID,

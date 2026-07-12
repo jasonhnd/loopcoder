@@ -723,6 +723,11 @@ func TransitionAgentRegistration(ctx context.Context, store Store, childAgentID,
 			record.RegistrationState = next
 			record.UpdatedAt = at
 			record.RecordVersion++
+			if isTerminalAgentState(next) {
+				if err := releaseHeldOwnershipLocksTx(ctx, tx, record, at); err != nil {
+					return err
+				}
+			}
 			if _, err := tx.Exec(ctx, `UPDATE agent_registrations
 				SET registration_state = ?, updated_at = ?, record_version = ?
 				WHERE id = ?`,
@@ -759,10 +764,16 @@ func ValidateNativeChildLaunch(ctx context.Context, store Store, childRunID, exe
 		if len(record.BudgetBindingIDs) == 0 {
 			return federationError(ErrChildBudgetRequiredCode, "registration %s has no budget binding", record.ChildAgentID)
 		}
+		if err := validateActiveBudgetBindingsTx(ctx, tx, record); err != nil {
+			return err
+		}
 		if record.Permission != PermissionReadOnly && len(record.OwnershipLockIDs) == 0 {
 			return federationError(ErrOwnershipRequiredCode, "registration %s has no ownership locks", record.ChildAgentID)
 		}
 		if err := validateRegistrationClaimTx(ctx, tx, record, executorID, claimGeneration); err != nil {
+			return err
+		}
+		if err := validateActiveOwnershipLocksTx(ctx, tx, record, store.Now()); err != nil {
 			return err
 		}
 		return nil
@@ -857,13 +868,12 @@ func NormalizeChildOutput(raw string, status string, maxBytes int) (ChildOutputE
 	if maxBytes <= 0 {
 		maxBytes = DefaultChildOutputLimit
 	}
-	output := raw
+	output, didRedact := redactSecretLike(raw)
 	truncated := false
 	if len([]byte(output)) > maxBytes {
 		output = string([]byte(output)[:maxBytes])
 		truncated = true
 	}
-	redacted, didRedact := redactSecretLike(output)
 	return ChildOutputEnvelope{
 		SchemaVersion:  "loopcoder.child_output.v1",
 		Status:         normalizedStatus,
@@ -871,7 +881,7 @@ func NormalizeChildOutput(raw string, status string, maxBytes int) (ChildOutputE
 		Accepted:       false,
 		Truncated:      truncated,
 		Redacted:       didRedact,
-		Output:         redacted,
+		Output:         output,
 		GapReasons:     []string{"untrusted-until-accepted"},
 	}, nil
 }
@@ -1096,6 +1106,158 @@ func validateRegistrationClaimTx(ctx context.Context, tx Tx, record AgentRegistr
 		return federationError(ErrStaleClaimCode, "registration claim does not match current owner/generation")
 	}
 	return nil
+}
+
+func validateActiveBudgetBindingsTx(ctx context.Context, tx Tx, record AgentRegistration) error {
+	if len(record.BudgetBindingIDs) == 0 {
+		return federationError(ErrChildBudgetRequiredCode, "registration %s has no budget binding", record.ChildAgentID)
+	}
+	for _, id := range record.BudgetBindingIDs {
+		var childAgentID, policyID, reservationID, quantitiesJSON, state string
+		err := tx.QueryRow(ctx, `SELECT child_agent_id, budget_policy_id, budget_reservation_id, reserved_quantities_json, reservation_state
+			FROM agent_budget_bindings WHERE id = ?`, id).Scan(&childAgentID, &policyID, &reservationID, &quantitiesJSON, &state)
+		if err != nil {
+			return federationError(ErrChildBudgetRequiredCode, "budget binding %s is missing", id)
+		}
+		if childAgentID != record.ChildAgentID || strings.TrimSpace(policyID) == "" || strings.TrimSpace(reservationID) == "" {
+			return federationError(ErrChildBudgetRequiredCode, "budget binding %s is inconsistent", id)
+		}
+		if strings.ToLower(strings.TrimSpace(state)) != "active" {
+			return federationError(ErrChildBudgetRequiredCode, "budget binding %s is %s, want active", id, state)
+		}
+		if !hasReservedQuantities(quantitiesJSON) {
+			return federationError(ErrChildBudgetRequiredCode, "budget binding %s has no reserved quantities", id)
+		}
+	}
+	return nil
+}
+
+func validateActiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistration, now time.Time) error {
+	if record.Permission == PermissionReadOnly {
+		return nil
+	}
+	if len(record.OwnershipLockIDs) == 0 {
+		return federationError(ErrOwnershipRequiredCode, "registration %s has no ownership locks", record.ChildAgentID)
+	}
+	scope, err := loadScopeGrantPayloadTx(ctx, tx, record.ScopeGrantID, record.ChildAgentID)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	locks := make([]AgentOwnershipLock, 0, len(record.OwnershipLockIDs))
+	for _, id := range record.OwnershipLockIDs {
+		lock, err := loadOwnershipLockTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if lock.ChildAgentID != record.ChildAgentID || lock.RunID != record.RunID || lock.ClaimGeneration != record.ClaimGeneration {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s is not fenced to the current child claim", id)
+		}
+		if lock.State != OwnershipStateHeld {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s is %s, want held", id, lock.State)
+		}
+		lease, err := time.Parse(time.RFC3339Nano, lock.LeaseExpiresAt)
+		if err != nil || !lease.After(now.UTC()) {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s is expired", id)
+		}
+		locks = append(locks, lock)
+	}
+	for _, writeScope := range scope.WriteScope {
+		if strings.TrimSpace(writeScope) == "" {
+			continue
+		}
+		covered := false
+		for _, lock := range locks {
+			if resourceKeyCovers(lock.ResourceKind, lock.ResourceKey, writeScope) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return federationError(ErrOwnershipRequiredCode, "write scope %s is not covered by an active ownership lock", writeScope)
+		}
+	}
+	return nil
+}
+
+func releaseHeldOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistration, at string) error {
+	if len(record.OwnershipLockIDs) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+		SET state = ?, updated_at = ?
+		WHERE child_agent_id = ? AND run_id = ? AND claim_generation = ? AND state = ?`,
+		OwnershipStateReleased, at, record.ChildAgentID, record.RunID, record.ClaimGeneration, OwnershipStateHeld); err != nil {
+		return fmt.Errorf("release ownership locks: %w", err)
+	}
+	return nil
+}
+
+func loadScopeGrantPayloadTx(ctx context.Context, tx Tx, scopeGrantID, childAgentID string) (struct {
+	WriteScope []string `json:"write_scope"`
+}, error) {
+	var raw string
+	if err := tx.QueryRow(ctx, `SELECT scope_json FROM agent_scope_grants WHERE id = ? AND child_agent_id = ?`, scopeGrantID, childAgentID).Scan(&raw); err != nil {
+		return struct {
+			WriteScope []string `json:"write_scope"`
+		}{}, federationError(ErrOwnershipRequiredCode, "scope grant %s is missing", scopeGrantID)
+	}
+	var scope struct {
+		WriteScope []string `json:"write_scope"`
+	}
+	if err := json.Unmarshal([]byte(raw), &scope); err != nil {
+		return scope, federationError(ErrInvalidRecordCode, "scope grant %s is invalid", scopeGrantID)
+	}
+	scope.WriteScope = normalizeScopeList(scope.WriteScope, true)
+	return scope, nil
+}
+
+func loadOwnershipLockTx(ctx context.Context, tx Tx, id string) (AgentOwnershipLock, error) {
+	var lock AgentOwnershipLock
+	var conflictsJSON string
+	err := tx.QueryRow(ctx, `SELECT id, project_id, delivery_run_id, child_agent_id, run_id, claim_generation,
+			lock_generation, resource_kind, resource_key, lock_mode, state, lease_expires_at,
+			heartbeat_at, conflicts_with_json, created_at, updated_at
+		FROM agent_ownership_locks WHERE id = ?`, id).Scan(
+		&lock.AgentOwnershipLockID, &lock.ProjectID, &lock.DeliveryRunID, &lock.ChildAgentID, &lock.RunID, &lock.ClaimGeneration,
+		&lock.LockGeneration, &lock.ResourceKind, &lock.ResourceKey, &lock.LockMode, &lock.State, &lock.LeaseExpiresAt,
+		&lock.HeartbeatAt, &conflictsJSON, &lock.CreatedAt, &lock.UpdatedAt)
+	if err != nil {
+		return AgentOwnershipLock{}, federationError(ErrOwnershipRequiredCode, "ownership lock %s is missing", id)
+	}
+	lock.SchemaVersion = AgentOwnershipLockSchema
+	lock.ConflictsWith = decodeStringList(conflictsJSON)
+	return lock, nil
+}
+
+func hasReservedQuantities(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" || raw == "[]" || raw == "null" || !json.Valid([]byte(raw)) {
+		return false
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return false
+	}
+	switch value := decoded.(type) {
+	case map[string]any:
+		return len(value) > 0
+	case []any:
+		return len(value) > 0
+	default:
+		return true
+	}
+}
+
+func isTerminalAgentState(state string) bool {
+	switch normalizeAgentRegistrationState(state) {
+	case AgentStateSucceeded, AgentStateFailed, AgentStateCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func ensureNoParentAgentCycle(ctx context.Context, tx Tx, childAgentID, parentAgentID, projectID string) error {
@@ -1469,6 +1631,21 @@ func resourceKeysConflict(kind, existing, requested string) bool {
 	}
 	if kind == "repo-path" {
 		return strings.HasPrefix(existing, requested+"/") || strings.HasPrefix(requested, existing+"/")
+	}
+	return false
+}
+
+func resourceKeyCovers(kind, lockKey, requested string) bool {
+	lockKey = canonicalResourceKey(kind, lockKey)
+	requested = canonicalResourceKey(kind, requested)
+	if lockKey == "" || requested == "" {
+		return false
+	}
+	if lockKey == requested {
+		return true
+	}
+	if kind == "repo-path" {
+		return strings.HasPrefix(requested, lockKey+"/")
 	}
 	return false
 }
