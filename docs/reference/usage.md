@@ -807,10 +807,13 @@ loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserv
 ```
 
 The command creates machine and project hard budget policies in the
-machine-local store, reserves capacity, commits observed usage, releases the
-unused reservation balance, and prints the resulting JSON accounting summary.
-Reusing the same `--idempotency-key` replays the same operation keys instead of
-reserving, committing, or releasing twice.
+machine-local store by default, reserves capacity, commits observed usage,
+releases the unused reservation balance, and prints the resulting JSON
+accounting summary. Use `--policy-mode soft --overflow-behavior warn-only` to
+exercise soft-budget warning paths; text output prints budget warnings, and JSON
+output includes the same `gap_reasons`. Reusing the same `--idempotency-key`
+replays the same operation keys instead of reserving, committing, or releasing
+twice.
 
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,

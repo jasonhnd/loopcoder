@@ -284,6 +284,69 @@ func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBudgetSmokeSoftPolicyWarningsInTextAndJSON(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Unix(8, 0).UTC()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var textStdout, textStderr bytes.Buffer
+	textExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-text",
+	}, &textStdout, &textStderr, Deps{Now: func() time.Time { return now }})
+	if textExit != 0 {
+		t.Fatalf("budget soft text exit = %d stderr=%q", textExit, textStderr.String())
+	}
+	if !strings.Contains(textStdout.String(), "Budget warning: soft-budget-warn-only:") || !strings.Contains(textStdout.String(), "Budget warning: soft-budget-overflow:") {
+		t.Fatalf("text output = %q, want soft budget warnings", textStdout.String())
+	}
+
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var jsonStdout, jsonStderr bytes.Buffer
+	jsonExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli_json",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-json",
+		"--format", "json",
+	}, &jsonStdout, &jsonStderr, Deps{Now: func() time.Time { return now }})
+	if jsonExit != 0 {
+		t.Fatalf("budget soft json exit = %d stderr=%q", jsonExit, jsonStderr.String())
+	}
+	var payload struct {
+		Reserved struct {
+			Reservation struct {
+				GapReasons []string `json:"gap_reasons"`
+			} `json:"reservation"`
+		} `json:"reserved"`
+		BudgetSummary []struct {
+			GapReasons []string `json:"gap_reasons"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(jsonStdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, jsonStdout.String())
+	}
+	if !containsPrefix(payload.Reserved.Reservation.GapReasons, "soft-budget-warn-only:") {
+		t.Fatalf("reserved gap reasons = %#v, want soft warn-only reason", payload.Reserved.Reservation.GapReasons)
+	}
+	var summaryReasons []string
+	for _, summary := range payload.BudgetSummary {
+		summaryReasons = append(summaryReasons, summary.GapReasons...)
+	}
+	if !containsPrefix(summaryReasons, "soft-budget-overflow:") {
+		t.Fatalf("summary gap reasons = %#v, want soft overflow reason", summaryReasons)
+	}
+}
+
 func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
@@ -6591,6 +6654,15 @@ func cliLabels(names []string) []gh.Label {
 		labels = append(labels, gh.Label{Name: name})
 	}
 	return labels
+}
+
+func containsPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func cliApplyLabelChanges(labels []gh.Label, addLabels, removeLabels []string) []gh.Label {

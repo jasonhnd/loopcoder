@@ -110,3 +110,8 @@ var budgetSchemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_quota_budget_events_reservation ON quota_budget_events(budget_reservation_id, event_kind)`,
 	`CREATE INDEX IF NOT EXISTS idx_quota_budget_events_policy ON quota_budget_events(budget_policy_id, event_time)`,
 }
+
+var budgetSchemaV15Statements = []string{
+	`DROP INDEX IF EXISTS idx_budget_reservations_idempotency`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_budget_reservations_idempotency ON budget_reservations(idempotency_key, COALESCE(json_extract(policy_ids_json, '$[0]'), ''))`,
+}

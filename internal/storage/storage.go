@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 14
+	CurrentSchemaVersion = 15
 
 	driverName = "sqlite"
 
@@ -311,6 +311,11 @@ var migrations = []migration{
 		name:       "hierarchical budget accounting",
 		statements: budgetSchemaStatements,
 	},
+	{
+		version:    15,
+		name:       "scoped budget reservation idempotency",
+		statements: budgetSchemaV15Statements,
+	},
 }
 
 var requiredTables = []string{
@@ -581,6 +586,17 @@ func IsBusy(err error) bool {
 	var sqliteErr *moderncsqlite.Error
 	if errors.As(err, &sqliteErr) {
 		return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+	}
+	return false
+}
+
+func IsConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 	}
 	return false
 }

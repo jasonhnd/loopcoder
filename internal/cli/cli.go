@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -291,6 +292,7 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "delivery" {
 		return runDelivery(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "budget" {
 		return runBudget(args[1:], stdout, stderr, deps)
 	}
@@ -417,6 +419,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "delivery" {
 		printDeliveryHelp(w)
+		return
+	}
 	if command.Name == "budget" {
 		printBudgetHelp(w)
 		return
@@ -1440,6 +1444,8 @@ func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
 	commitValue := int64(25)
 	releaseValue := int64(0)
 	idempotencyKey := "budget-smoke"
+	policyModeValue := string(budget.PolicyHard)
+	overflowBehaviorValue := string(budget.OverflowWarnOnly)
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&projectID, "project-id", "", "project id override")
 	fs.StringVar(&quantityValue, "quantity-kind", string(providerinventory.QuantityTotalTokens), "quantity kind")
@@ -1448,6 +1454,8 @@ func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.Int64Var(&commitValue, "commit", 25, "commit amount")
 	fs.Int64Var(&releaseValue, "release", 0, "release amount")
 	fs.StringVar(&idempotencyKey, "idempotency-key", "budget-smoke", "idempotency key")
+	fs.StringVar(&policyModeValue, "policy-mode", string(budget.PolicyHard), "policy mode: hard or soft")
+	fs.StringVar(&overflowBehaviorValue, "overflow-behavior", string(budget.OverflowWarnOnly), "soft overflow behavior: warn-only or requires-approval")
 	fs.StringVar(&format, "format", "text", "output format")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1463,6 +1471,18 @@ func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if ceiling < 0 || reserveValue < 0 || commitValue < 0 || releaseValue < 0 {
 		fmt.Fprintln(stderr, "budget smoke: amounts must be non-negative")
+		return 2
+	}
+	policyMode := budget.PolicyMode(strings.ToLower(strings.TrimSpace(policyModeValue)))
+	if policyMode != budget.PolicyHard && policyMode != budget.PolicySoft {
+		fmt.Fprintf(stderr, "budget smoke: invalid --policy-mode %q; want hard or soft\n", policyModeValue)
+		return 2
+	}
+	overflowBehavior := budget.SoftOverflowBehavior(strings.ToLower(strings.TrimSpace(overflowBehaviorValue)))
+	if policyMode == budget.PolicyHard {
+		overflowBehavior = ""
+	} else if overflowBehavior != budget.OverflowWarnOnly && overflowBehavior != budget.OverflowRequiresApproval {
+		fmt.Fprintf(stderr, "budget smoke: invalid --overflow-behavior %q; want warn-only or requires-approval\n", overflowBehaviorValue)
 		return 2
 	}
 	resolvedRepo, err := resolveRepo(repoPath)
@@ -1492,30 +1512,32 @@ func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
 	projectScope := budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: projectID}
 	machineScope := budget.Scope{ScopeKind: budget.ScopeMachine}
 	machinePolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
-		Scope:         machineScope,
-		QuantityKind:  quantity,
-		WindowKind:    providerinventory.WindowUnbounded,
-		PolicyMode:    budget.PolicyHard,
-		CeilingValue:  ceiling,
-		PolicyVersion: "cli-smoke-v1",
-		Ordinal:       "machine",
-		Actor:         actor,
-		Host:          host,
+		Scope:            machineScope,
+		QuantityKind:     quantity,
+		WindowKind:       providerinventory.WindowUnbounded,
+		PolicyMode:       policyMode,
+		OverflowBehavior: overflowBehavior,
+		CeilingValue:     ceiling,
+		PolicyVersion:    "cli-smoke-v1",
+		Ordinal:          "machine",
+		Actor:            actor,
+		Host:             host,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "budget smoke: upsert machine policy: %v\n", err)
 		return 1
 	}
 	projectPolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
-		Scope:         projectScope,
-		QuantityKind:  quantity,
-		WindowKind:    providerinventory.WindowUnbounded,
-		PolicyMode:    budget.PolicyHard,
-		CeilingValue:  ceiling,
-		PolicyVersion: "cli-smoke-v1",
-		Ordinal:       "project",
-		Actor:         actor,
-		Host:          host,
+		Scope:            projectScope,
+		QuantityKind:     quantity,
+		WindowKind:       providerinventory.WindowUnbounded,
+		PolicyMode:       policyMode,
+		OverflowBehavior: overflowBehavior,
+		CeilingValue:     ceiling,
+		PolicyVersion:    "cli-smoke-v1",
+		Ordinal:          "project",
+		Actor:            actor,
+		Host:             host,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "budget smoke: upsert project policy: %v\n", err)
@@ -1591,7 +1613,34 @@ func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	fmt.Fprintf(stdout, "Budget smoke ok: reserved=%d committed=%d released=%d reservation=%s policies=%s\n",
 		reserveValue, commitValue, released.Reservation.ReleasedValue, released.Reservation.BudgetReservationID, strings.Join(payload.PolicyIDs, ","))
+	warnings := budgetSmokeWarnings(payload.Reserved.Reservation.GapReasons, payload.Committed.Reservation.GapReasons, payload.Released.Reservation.GapReasons, payload.BudgetSummary)
+	for _, warning := range warnings {
+		fmt.Fprintf(stdout, "Budget warning: %s\n", warning)
+	}
 	return 0
+}
+
+func budgetSmokeWarnings(reserveReasons, commitReasons, releaseReasons []string, summaries []budget.Summary) []string {
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(values []string) {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			warnings = append(warnings, value)
+		}
+	}
+	add(reserveReasons)
+	add(commitReasons)
+	add(releaseReasons)
+	for _, summary := range summaries {
+		add(summary.GapReasons)
+	}
+	sort.Strings(warnings)
+	return warnings
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {

@@ -28,6 +28,7 @@ const (
 var (
 	ErrBudgetExhausted          = errors.New("ErrBudgetExhausted")
 	ErrBudgetScopeConflict      = errors.New("ErrBudgetScopeConflict")
+	ErrDuplicateReplay          = errors.New("ErrDuplicateReplay")
 	ErrReservationExpired       = errors.New("ErrReservationExpired")
 	ErrReservationStateConflict = errors.New("ErrReservationStateConflict")
 	ErrBudgetRecordMalformed    = errors.New("ErrBudgetRecordMalformed")
@@ -63,12 +64,13 @@ const (
 type ReservationState string
 
 const (
-	StateActive    ReservationState = "active"
-	StateCommitted ReservationState = "committed"
-	StateReleased  ReservationState = "released"
-	StateCancelled ReservationState = "cancelled"
-	StateExpired   ReservationState = "expired"
-	StateRefused   ReservationState = "refused"
+	StateActive             ReservationState = "active"
+	StatePartiallyCommitted ReservationState = "partially-committed"
+	StateCommitted          ReservationState = "committed"
+	StateReleased           ReservationState = "released"
+	StateCancelled          ReservationState = "cancelled"
+	StateExpired            ReservationState = "expired"
+	StateRefused            ReservationState = "refused"
 )
 
 type Actor struct {
@@ -200,6 +202,7 @@ type MutationRequest struct {
 	IdempotencyKey string
 	Generation     int64
 	Value          int64
+	LeaseExpiresAt time.Time
 	UsageRecordIDs []string
 	Actor          Actor
 	Host           Host
@@ -318,17 +321,6 @@ func Reserve(ctx context.Context, store storage.Store, req ReserveRequest) (Resu
 	var refusalErr error
 	err := withBudgetRetry(ctx, func() error {
 		return store.WithWriteTx(ctx, func(tx storage.Tx) error {
-			existing, found, err := loadReservationByIdempotency(ctx, tx, req.IdempotencyKey)
-			if err != nil {
-				return err
-			}
-			if found {
-				if existing.RequestFingerprint != fingerprint {
-					return fmt.Errorf("%w: idempotency key replayed with different reserve request", ErrReservationStateConflict)
-				}
-				result = Result{Reservation: existing, Replay: true}
-				return nil
-			}
 			policies, err := loadApplicablePolicies(ctx, tx, req.ScopeChain, req.QuantityKind, req.WindowKind)
 			if err != nil {
 				return err
@@ -338,10 +330,24 @@ func Reserve(ctx context.Context, store storage.Store, req ReserveRequest) (Resu
 			if len(ids) > 0 {
 				primaryPolicyID = ids[0]
 			}
-			reservationID := reservationID(req.IdempotencyKey, primaryPolicyID, req.RequesterID)
+			existing, found, err := loadReservationByIdempotency(ctx, tx, req.IdempotencyKey, primaryPolicyID)
+			if err != nil {
+				return err
+			}
+			if found {
+				if existing.RequestFingerprint != fingerprint {
+					return fmt.Errorf("%w: idempotency key replayed with different reserve request", ErrDuplicateReplay)
+				}
+				result = Result{Reservation: existing, Replay: true}
+				return nil
+			}
+			reservationID, err := allocateReservationID(ctx, tx, req.IdempotencyKey, primaryPolicyID, req.RequesterID, fingerprint)
+			if err != nil {
+				return err
+			}
 			if err := checkRequirementConfidence(req); err != nil {
 				refusalErr = err
-				return insertRefusal(ctx, tx, store.Now(), reservationID, req, fingerprint, nil, err)
+				return insertRefusal(ctx, tx, store.Now(), reservationID, req, fingerprint, ids, err)
 			}
 			softBreaches, err := checkPolicyCapacity(policies, req.RequestedValue, req.ApprovalID)
 			if err != nil {
@@ -421,6 +427,10 @@ func Cancel(ctx context.Context, store storage.Store, req MutationRequest) (Resu
 	return mutateReservation(ctx, store, req, "cancel")
 }
 
+func Renew(ctx context.Context, store storage.Store, req MutationRequest) (Result, error) {
+	return mutateReservation(ctx, store, req, "renew")
+}
+
 func ExpireStale(ctx context.Context, store storage.Store, now time.Time, actor Actor, host Host) ([]Reservation, error) {
 	if store == nil {
 		return nil, errors.New("budget expire: storage store is required")
@@ -428,8 +438,8 @@ func ExpireStale(ctx context.Context, store storage.Store, now time.Time, actor 
 	var expired []Reservation
 	err := withBudgetRetry(ctx, func() error {
 		return store.WithWriteTx(ctx, func(tx storage.Tx) error {
-			rows, err := tx.Query(ctx, `SELECT payload_json FROM budget_reservations WHERE state = ? AND lease_expires_at <= ? ORDER BY lease_expires_at, budget_reservation_id`,
-				string(StateActive), formatTime(now))
+			rows, err := tx.Query(ctx, `SELECT payload_json FROM budget_reservations WHERE state IN (?, ?) AND lease_expires_at <= ? ORDER BY lease_expires_at, budget_reservation_id`,
+				string(StateActive), string(StatePartiallyCommitted), formatTime(now))
 			if err != nil {
 				return err
 			}
@@ -567,17 +577,18 @@ type policyWithAggregate struct {
 }
 
 type eventRecord struct {
-	OperationKey      string
-	ReservationID     string
-	BudgetPolicyID    string
-	EventKind         string
-	Generation        int64
-	RequestGeneration int64
-	DeltaReserved     int64
-	DeltaCommitted    int64
-	EventTime         string
-	Actor             Actor
-	Host              Host
+	OperationKey       string
+	ReservationID      string
+	BudgetPolicyID     string
+	EventKind          string
+	Generation         int64
+	RequestGeneration  int64
+	RequestFingerprint string
+	DeltaReserved      int64
+	DeltaCommitted     int64
+	EventTime          string
+	Actor              Actor
+	Host               Host
 }
 
 func mutateReservation(ctx context.Context, store storage.Store, req MutationRequest, kind string) (Result, error) {
@@ -592,11 +603,16 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 	if req.Value < 0 {
 		return Result{}, fmt.Errorf("%w: mutation value must be non-negative", ErrReservationStateConflict)
 	}
+	req.UsageRecordIDs = dedupeStrings(req.UsageRecordIDs)
+	fingerprint := mutationFingerprint(req, kind)
 	var result Result
 	err := withBudgetRetry(ctx, func() error {
 		return store.WithWriteTx(ctx, func(tx storage.Tx) error {
 			opKey := kind + ":" + req.ReservationID + ":" + req.IdempotencyKey
-			if eventExists(ctx, tx, opKey) {
+			if existingFingerprint, exists := eventFingerprint(ctx, tx, opKey); exists {
+				if existingFingerprint != "" && existingFingerprint != fingerprint {
+					return fmt.Errorf("%w: %s idempotency key replayed with different request", ErrDuplicateReplay, kind)
+				}
 				existing, found, err := loadReservation(ctx, tx, req.ReservationID)
 				if err != nil {
 					return err
@@ -620,7 +636,10 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 			if req.Generation != reservation.Generation {
 				return fmt.Errorf("%w: stale generation %d for reservation generation %d", ErrReservationExpired, req.Generation, reservation.Generation)
 			}
-			if reservation.State != StateActive {
+			if kind == "renew" && req.LeaseExpiresAt.IsZero() {
+				return fmt.Errorf("%w: renewal lease expiry is required", ErrReservationExpired)
+			}
+			if reservation.State != StateActive && reservation.State != StatePartiallyCommitted {
 				return fmt.Errorf("%w: reservation state is %s", ErrReservationStateConflict, reservation.State)
 			}
 			if expired(store.Now(), reservation.LeaseExpiresAt) {
@@ -639,10 +658,15 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 			next.UpdatedAt = now
 			next.UpdatedBy = req.Actor
 			next.Host = req.Host
-			req.UsageRecordIDs = dedupeStrings(req.UsageRecordIDs)
 			deltaReserved := -value
 			deltaCommitted := int64(0)
 			switch kind {
+			case "renew":
+				if !req.LeaseExpiresAt.UTC().After(store.Now().UTC()) {
+					return fmt.Errorf("%w: renewal lease expiry must be in the future", ErrReservationExpired)
+				}
+				next.LeaseExpiresAt = formatTime(req.LeaseExpiresAt)
+				deltaReserved = 0
 			case "commit":
 				next.ReservedValue -= value
 				next.CommittedValue += value
@@ -650,6 +674,8 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 				deltaCommitted = value
 				if next.ReservedValue == 0 {
 					next.State = StateCommitted
+				} else {
+					next.State = StatePartiallyCommitted
 				}
 			case "release":
 				next.ReservedValue -= value
@@ -657,12 +683,17 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 				next.ReleaseUsageRecordIDs = dedupeStrings(append(next.ReleaseUsageRecordIDs, req.UsageRecordIDs...))
 				if next.ReservedValue == 0 {
 					next.State = StateReleased
+				} else {
+					next.State = StatePartiallyCommitted
 				}
 			case "cancel":
-				next.ReleasedValue += next.ReservedValue
-				deltaReserved = -next.ReservedValue
-				next.ReservedValue = 0
-				next.State = StateCancelled
+				next.ReservedValue -= value
+				next.ReleasedValue += value
+				if next.ReservedValue == 0 {
+					next.State = StateCancelled
+				} else {
+					next.State = StatePartiallyCommitted
+				}
 				next.ReleaseUsageRecordIDs = dedupeStrings(append(next.ReleaseUsageRecordIDs, req.UsageRecordIDs...))
 			default:
 				return fmt.Errorf("%w: unsupported mutation kind %s", ErrReservationStateConflict, kind)
@@ -676,16 +707,17 @@ func mutateReservation(ctx context.Context, store storage.Store, req MutationReq
 				}
 			}
 			if err := insertEvent(ctx, tx, eventRecord{
-				OperationKey:      opKey,
-				ReservationID:     reservation.BudgetReservationID,
-				EventKind:         kind,
-				Generation:        next.Generation,
-				RequestGeneration: req.Generation,
-				DeltaReserved:     deltaReserved,
-				DeltaCommitted:    deltaCommitted,
-				EventTime:         now,
-				Actor:             req.Actor,
-				Host:              req.Host,
+				OperationKey:       opKey,
+				ReservationID:      reservation.BudgetReservationID,
+				EventKind:          kind,
+				Generation:         next.Generation,
+				RequestGeneration:  req.Generation,
+				DeltaReserved:      deltaReserved,
+				DeltaCommitted:     deltaCommitted,
+				RequestFingerprint: fingerprint,
+				EventTime:          now,
+				Actor:              req.Actor,
+				Host:               req.Host,
 			}); err != nil {
 				return err
 			}
@@ -870,6 +902,9 @@ func insertReservation(ctx context.Context, tx storage.Tx, reservation Reservati
 		reservation.LeaseExpiresAt, reservation.ScopeKey, string(policyIDs),
 		string(sourceEstimateIDs), string(commitUsageIDs), string(releaseUsageIDs), string(payload),
 		reservation.CreatedAt, reservation.UpdatedAt)
+	if storage.IsConstraint(err) {
+		return fmt.Errorf("%w: reservation insert constraint for idempotency key %q", ErrDuplicateReplay, reservation.IdempotencyKey)
+	}
 	return err
 }
 
@@ -891,10 +926,10 @@ func updateReservation(ctx context.Context, tx storage.Tx, reservation Reservati
 	}
 	res, err := tx.Exec(ctx, `UPDATE budget_reservations SET
 		reserved_value = ?, committed_value = ?, released_value = ?, state = ?, generation = ?,
-		commit_usage_record_ids_json = ?, release_usage_record_ids_json = ?, payload_json = ?, updated_at = ?
+		lease_expires_at = ?, commit_usage_record_ids_json = ?, release_usage_record_ids_json = ?, payload_json = ?, updated_at = ?
 		WHERE budget_reservation_id = ?`,
 		reservation.ReservedValue, reservation.CommittedValue, reservation.ReleasedValue,
-		string(reservation.State), reservation.Generation, string(commitUsageIDs), string(releaseUsageIDs), string(payload), reservation.UpdatedAt,
+		string(reservation.State), reservation.Generation, reservation.LeaseExpiresAt, string(commitUsageIDs), string(releaseUsageIDs), string(payload), reservation.UpdatedAt,
 		reservation.BudgetReservationID)
 	if err != nil {
 		return err
@@ -942,9 +977,10 @@ func insertEvent(ctx context.Context, tx storage.Tx, event eventRecord) error {
 		return err
 	}
 	payload, err := json.Marshal(map[string]any{
-		"schema_version":     EventSchema,
-		"operation_key":      event.OperationKey,
-		"request_generation": event.RequestGeneration,
+		"schema_version":      EventSchema,
+		"operation_key":       event.OperationKey,
+		"request_generation":  event.RequestGeneration,
+		"request_fingerprint": event.RequestFingerprint,
 	})
 	if err != nil {
 		return err
@@ -959,17 +995,25 @@ func insertEvent(ctx context.Context, tx storage.Tx, event eventRecord) error {
 	return err
 }
 
-func eventExists(ctx context.Context, tx storage.Tx, operationKey string) bool {
-	var count int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM quota_budget_events WHERE idempotency_key = ?`, operationKey).Scan(&count); err != nil {
-		return false
+func eventFingerprint(ctx context.Context, tx storage.Tx, operationKey string) (string, bool) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM quota_budget_events WHERE idempotency_key = ?`, operationKey).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) || err != nil {
+		return "", false
 	}
-	return count > 0
+	var decoded struct {
+		RequestFingerprint string `json:"request_fingerprint"`
+	}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return "", true
+	}
+	return decoded.RequestFingerprint, true
 }
 
-func loadReservationByIdempotency(ctx context.Context, tx storage.Tx, key string) (Reservation, bool, error) {
+func loadReservationByIdempotency(ctx context.Context, tx storage.Tx, key, primaryPolicyID string) (Reservation, bool, error) {
 	var payload string
-	err := tx.QueryRow(ctx, `SELECT payload_json FROM budget_reservations WHERE idempotency_key = ?`, key).Scan(&payload)
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM budget_reservations
+		WHERE idempotency_key = ? AND COALESCE(json_extract(policy_ids_json, '$[0]'), '') = ?`, key, primaryPolicyID).Scan(&payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Reservation{}, false, nil
 	}
@@ -1001,10 +1045,10 @@ func loadReservation(ctx context.Context, tx storage.Tx, id string) (Reservation
 
 func activeReservationIDs(ctx context.Context, tx storage.Tx, policyID string) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT budget_reservation_id FROM budget_reservations
-		WHERE state = ? AND EXISTS (
+		WHERE state IN (?, ?) AND EXISTS (
 			SELECT 1 FROM json_each(policy_ids_json) WHERE value = ?
 		)
-		ORDER BY budget_reservation_id`, string(StateActive), policyID)
+		ORDER BY budget_reservation_id`, string(StateActive), string(StatePartiallyCommitted), policyID)
 	if err != nil {
 		return nil, err
 	}
@@ -1264,6 +1308,31 @@ func reserveFingerprint(req ReserveRequest) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func mutationFingerprint(req MutationRequest, kind string) string {
+	type canonical struct {
+		Kind           string   `json:"kind"`
+		ReservationID  string   `json:"reservation_id"`
+		IdempotencyKey string   `json:"idempotency_key"`
+		Value          int64    `json:"value"`
+		LeaseExpiresAt string   `json:"lease_expires_at,omitempty"`
+		UsageRecordIDs []string `json:"usage_record_ids"`
+	}
+	lease := ""
+	if !req.LeaseExpiresAt.IsZero() {
+		lease = formatTime(req.LeaseExpiresAt)
+	}
+	data, _ := json.Marshal(canonical{
+		Kind:           kind,
+		ReservationID:  req.ReservationID,
+		IdempotencyKey: req.IdempotencyKey,
+		Value:          req.Value,
+		LeaseExpiresAt: lease,
+		UsageRecordIDs: req.UsageRecordIDs,
+	})
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func reserveGapReasons(req ReserveRequest) []string {
 	switch req.RequirementConfidence {
 	case providerinventory.ConfidenceExact:
@@ -1293,6 +1362,29 @@ func policyID(scopeKey string, quantity providerinventory.QuantityKind, window p
 
 func reservationID(idempotencyKey, budgetPolicyID, requesterID string) string {
 	return "bres_" + hashBase32(idempotencyKey, budgetPolicyID, requesterID)[:26]
+}
+
+func allocateReservationID(ctx context.Context, tx storage.Tx, idempotencyKey, budgetPolicyID, requesterID, fingerprint string) (string, error) {
+	base := reservationID(idempotencyKey, budgetPolicyID, requesterID)
+	existing, found, err := loadReservation(ctx, tx, base)
+	if err != nil || !found {
+		return base, err
+	}
+	if existing.RequestFingerprint == fingerprint {
+		return base, nil
+	}
+	suffix := hashBase32(fingerprint)[:8]
+	candidate := base + "-" + suffix
+	for i := 0; ; i++ {
+		existing, found, err := loadReservation(ctx, tx, candidate)
+		if err != nil || !found {
+			return candidate, err
+		}
+		if existing.RequestFingerprint == fingerprint {
+			return candidate, nil
+		}
+		candidate = fmt.Sprintf("%s-%s-%d", base, suffix, i+2)
+	}
 }
 
 func unitForQuantity(kind providerinventory.QuantityKind) string {
@@ -1356,7 +1448,7 @@ func knownOverflowBehavior(mode PolicyMode, behavior SoftOverflowBehavior) bool 
 
 func knownReservationState(state ReservationState) bool {
 	switch state {
-	case StateActive, StateCommitted, StateReleased, StateCancelled, StateExpired, StateRefused:
+	case StateActive, StatePartiallyCommitted, StateCommitted, StateReleased, StateCancelled, StateExpired, StateRefused:
 		return true
 	default:
 		return false
@@ -1385,6 +1477,8 @@ func errorCode(err error) string {
 	switch {
 	case errors.Is(err, ErrBudgetExhausted):
 		return "ErrBudgetExhausted"
+	case errors.Is(err, ErrDuplicateReplay):
+		return "ErrDuplicateReplay"
 	case errors.Is(err, providerinventory.ErrQuotaConfidenceInsufficient):
 		return "ErrQuotaConfidenceInsufficient"
 	case errors.Is(err, ErrReservationExpired):

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -519,6 +520,255 @@ func TestReservationIDAndSpecFieldsPersist(t *testing.T) {
 	}
 	if !containsString(committed.Reservation.CommitUsageRecordIDs, "usage_commit_1") || !containsString(released.Reservation.ReleaseUsageRecordIDs, "usage_release_1") {
 		t.Fatalf("usage record ids commit=%#v release=%#v", committed.Reservation.CommitUsageRecordIDs, released.Reservation.ReleaseUsageRecordIDs)
+	}
+}
+
+func TestPartialCommitRenewReleaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(10, 0).UTC()}
+	store := openBudgetStore(t, clock)
+	defer store.Close()
+	scope := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget"}
+	upsertPolicy(t, ctx, store, scope, 100, "project")
+
+	reserved, err := Reserve(ctx, store, ReserveRequest{
+		ScopeChain:            []Scope{scope},
+		QuantityKind:          providerinventory.QuantityTotalTokens,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        40,
+		LeaseExpiresAt:        clock.Now().Add(time.Hour),
+		IdempotencyKey:        "partial-reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 testActor(),
+		Host:                  testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	committed, err := Commit(ctx, store, MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: "partial-commit",
+		Generation:     reserved.Reservation.Generation,
+		Value:          25,
+		Actor:          testActor(),
+		Host:           testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if committed.Reservation.State != StatePartiallyCommitted || committed.Reservation.ReservedValue != 15 || committed.Reservation.CommittedValue != 25 {
+		t.Fatalf("committed reservation = %#v, want partial hold", committed.Reservation)
+	}
+	summary := onlySummary(t, ctx, store, "proj_budget")
+	if summary.ReservedValue != 15 || summary.CommittedValue != 25 || len(summary.ActiveReservationIDs) != 1 {
+		t.Fatalf("summary = %#v, want partial reservation still active", summary)
+	}
+
+	newLease := clock.Now().Add(2 * time.Hour)
+	renewed, err := Renew(ctx, store, MutationRequest{
+		ReservationID:  committed.Reservation.BudgetReservationID,
+		IdempotencyKey: "partial-renew",
+		Generation:     committed.Reservation.Generation,
+		LeaseExpiresAt: newLease,
+		Actor:          testActor(),
+		Host:           testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if renewed.Reservation.State != StatePartiallyCommitted || renewed.Reservation.Generation != committed.Reservation.Generation+1 || renewed.Reservation.LeaseExpiresAt != formatTime(newLease) {
+		t.Fatalf("renewed reservation = %#v, want same partial state with new lease generation", renewed.Reservation)
+	}
+
+	released, err := Release(ctx, store, MutationRequest{
+		ReservationID:  renewed.Reservation.BudgetReservationID,
+		IdempotencyKey: "partial-release",
+		Generation:     renewed.Reservation.Generation,
+		Actor:          testActor(),
+		Host:           testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if released.Reservation.State != StateReleased || released.Reservation.ReleasedValue != 15 || released.Reservation.CommittedValue != 25 {
+		t.Fatalf("released reservation = %#v, want release of remaining partial hold", released.Reservation)
+	}
+}
+
+func TestExpireStalePartiallyCommittedReleasesRemainingHold(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(11, 0).UTC()}
+	store := openBudgetStore(t, clock)
+	defer store.Close()
+	scope := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget"}
+	upsertPolicy(t, ctx, store, scope, 30, "project")
+
+	reserved, err := Reserve(ctx, store, ReserveRequest{
+		ScopeChain:            []Scope{scope},
+		QuantityKind:          providerinventory.QuantityTotalTokens,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        20,
+		LeaseExpiresAt:        clock.Now().Add(time.Minute),
+		IdempotencyKey:        "partial-expire-reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 testActor(),
+		Host:                  testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	committed, err := Commit(ctx, store, MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: "partial-expire-commit",
+		Generation:     reserved.Reservation.Generation,
+		Value:          8,
+		Actor:          testActor(),
+		Host:           testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if committed.Reservation.State != StatePartiallyCommitted {
+		t.Fatalf("commit state = %s, want partial", committed.Reservation.State)
+	}
+	clock.Advance(2 * time.Minute)
+	expired, err := ExpireStale(ctx, store, clock.Now(), testActor(), testHost())
+	if err != nil {
+		t.Fatalf("ExpireStale: %v", err)
+	}
+	if len(expired) != 1 || expired[0].State != StateExpired || expired[0].CommittedValue != 8 || expired[0].ReleasedValue != 12 || expired[0].ReservedValue != 0 {
+		t.Fatalf("expired = %#v, want remaining hold released only", expired)
+	}
+	summary := onlySummary(t, ctx, store, "proj_budget")
+	if summary.ReservedValue != 0 || summary.CommittedValue != 8 || summary.AvailableValue != 22 {
+		t.Fatalf("summary = %#v, want committed usage retained and hold recovered", summary)
+	}
+}
+
+func TestDuplicateReplayErrorForDifferentFingerprints(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(12, 0).UTC()}
+	store := openBudgetStore(t, clock)
+	defer store.Close()
+	scope := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget"}
+	upsertPolicy(t, ctx, store, scope, 100, "project")
+	req := ReserveRequest{
+		ScopeChain:            []Scope{scope},
+		QuantityKind:          providerinventory.QuantityTotalTokens,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        30,
+		LeaseExpiresAt:        clock.Now().Add(time.Hour),
+		IdempotencyKey:        "duplicate-replay-reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 testActor(),
+		Host:                  testHost(),
+	}
+	reserved, err := Reserve(ctx, store, req)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	req.RequestedValue = 31
+	if _, err := Reserve(ctx, store, req); !errors.Is(err, ErrDuplicateReplay) {
+		t.Fatalf("Reserve duplicate replay error = %v, want ErrDuplicateReplay", err)
+	}
+	committed, err := Commit(ctx, store, MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: "duplicate-replay-commit",
+		Generation:     reserved.Reservation.Generation,
+		Value:          10,
+		Actor:          testActor(),
+		Host:           testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := Commit(ctx, store, MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: "duplicate-replay-commit",
+		Generation:     committed.Reservation.Generation,
+		Value:          11,
+		Actor:          testActor(),
+		Host:           testHost(),
+	}); !errors.Is(err, ErrDuplicateReplay) {
+		t.Fatalf("Commit duplicate replay error = %v, want ErrDuplicateReplay", err)
+	}
+}
+
+func TestIdempotencyKeyIsScopedByPrimaryPolicy(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(13, 0).UTC()}
+	store := openBudgetStore(t, clock)
+	defer store.Close()
+	scopeA := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget_a"}
+	scopeB := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget_b"}
+	upsertPolicy(t, ctx, store, scopeA, 100, "project-a")
+	upsertPolicy(t, ctx, store, scopeB, 100, "project-b")
+
+	for _, scope := range []Scope{scopeA, scopeB} {
+		if _, err := Reserve(ctx, store, ReserveRequest{
+			ScopeChain:            []Scope{scope},
+			QuantityKind:          providerinventory.QuantityTotalTokens,
+			WindowKind:            providerinventory.WindowUnbounded,
+			RequestedValue:        10,
+			LeaseExpiresAt:        clock.Now().Add(time.Hour),
+			IdempotencyKey:        "shared-idempotency-key",
+			RequesterID:           "same-requester",
+			RequirementConfidence: providerinventory.ConfidenceExact,
+			Actor:                 testActor(),
+			Host:                  testHost(),
+		}); err != nil {
+			t.Fatalf("Reserve for %s: %v", scope.ProjectID, err)
+		}
+	}
+	for _, projectID := range []string{"proj_budget_a", "proj_budget_b"} {
+		summary := onlySummary(t, ctx, store, projectID)
+		if summary.ReservedValue != 10 {
+			t.Fatalf("summary for %s = %#v, want independent reservation", projectID, summary)
+		}
+	}
+}
+
+func TestReservationIDCollisionSuffixOnlyForDifferentFingerprint(t *testing.T) {
+	ctx := context.Background()
+	clock := &fakeClock{now: time.Unix(14, 0).UTC()}
+	store := openBudgetStore(t, clock)
+	defer store.Close()
+	scope := Scope{ScopeKind: ScopeProject, ProjectID: "proj_budget"}
+	policy := upsertPolicy(t, ctx, store, scope, 100, "project")
+	reserved, err := Reserve(ctx, store, ReserveRequest{
+		ScopeChain:            []Scope{scope},
+		QuantityKind:          providerinventory.QuantityTotalTokens,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        10,
+		LeaseExpiresAt:        clock.Now().Add(time.Hour),
+		IdempotencyKey:        "collision-reserve",
+		RequesterID:           "requester-a",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 testActor(),
+		Host:                  testHost(),
+	})
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		same, err := allocateReservationID(ctx, tx, "collision-reserve", policy.BudgetPolicyID, "requester-a", reserved.Reservation.RequestFingerprint)
+		if err != nil {
+			return err
+		}
+		if same != reserved.Reservation.BudgetReservationID {
+			t.Fatalf("same fingerprint id = %q, want unsuffixed %q", same, reserved.Reservation.BudgetReservationID)
+		}
+		different, err := allocateReservationID(ctx, tx, "collision-reserve", policy.BudgetPolicyID, "requester-a", "sha256:different")
+		if err != nil {
+			return err
+		}
+		if different == reserved.Reservation.BudgetReservationID || !strings.HasPrefix(different, reserved.Reservation.BudgetReservationID+"-") {
+			t.Fatalf("different fingerprint id = %q, want collision suffix after %q", different, reserved.Reservation.BudgetReservationID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("allocate collision id: %v", err)
 	}
 }
 
