@@ -144,8 +144,10 @@ func TestSecretMaterialFixtureRefusesRoute(t *testing.T) {
 	input := baseInput()
 	input.Scope = Scope{ContainsSecretMaterial: true, AllowsProviderLaunch: true}
 	got, err := Classify(input)
-	if err != nil {
-		t.Fatalf("Classify() error = %v", err)
+	// Secret-material scope must fail closed: Classify returns a typed
+	// ErrNoEligibleCandidate, not a routable success (spec 0804:908).
+	if !errors.Is(err, ErrNoEligibleCandidate) {
+		t.Fatalf("Classify() error = %v, want ErrNoEligibleCandidate", err)
 	}
 	if got.RiskTier != RiskCritical || got.TerminalErrorCode != string(ErrNoEligibleCandidateCode) {
 		t.Fatalf("secret material classification = %#v", got)

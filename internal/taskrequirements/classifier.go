@@ -344,6 +344,14 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 	if req.TerminalErrorCode == string(ErrRequirementUnknownCode) {
 		return req, typed(ErrRequirementUnknownCode, "ambiguous high-risk task requirement needs approval")
 	}
+	// Secret-material scope must fail closed with a typed refusal (spec 0804:
+	// "unknown or secret-material requirements fail closed with typed errors";
+	// data.secret-material => "no route is eligible"). Setting the terminal
+	// error code alone is insufficient: a caller checking only the returned
+	// error would treat the classification as routable.
+	if req.TerminalErrorCode == string(ErrNoEligibleCandidateCode) {
+		return req, typed(ErrNoEligibleCandidateCode, "secret-material scope has no eligible route")
+	}
 	return req, nil
 }
 

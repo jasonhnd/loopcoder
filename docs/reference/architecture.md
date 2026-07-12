@@ -309,7 +309,7 @@ cannot satisfy routing constraints, and ambiguous high-risk scope returns
 `ErrRequirementUnknown` with a human approval requirement rather than silently
 lowering risk.
 
-Storage schema version 14 persists immutable `task_requirements` rows plus
+Storage schema version 16 persists immutable `task_requirements` rows plus
 scoped `task_requirement_overrides` for operator corrections. Overrides are
 visible in later decisions through `source.record_ids` and are revalidated
 against the deterministic floor whenever they apply. Operator, policy, schema,

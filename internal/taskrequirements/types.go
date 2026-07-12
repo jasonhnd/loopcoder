@@ -47,6 +47,7 @@ const (
 
 var (
 	ErrRequirementUnknown                = &TypedError{Code: ErrRequirementUnknownCode}
+	ErrNoEligibleCandidate               = &TypedError{Code: ErrNoEligibleCandidateCode}
 	ErrRequirementConfidenceInsufficient = &TypedError{Code: ErrRequirementConfidenceInsufficientCode}
 	ErrInvalidRecord                     = &TypedError{Code: ErrInvalidRecordCode}
 	ErrDuplicateRecord                   = &TypedError{Code: ErrDuplicateRecordCode}

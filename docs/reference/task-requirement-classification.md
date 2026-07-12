@@ -41,7 +41,7 @@ Secret material is classified as `critical` and terminally refused with
 
 The JSON schema lives at
 [`docs/schemas/task_requirement.v1.schema.json`](../schemas/task_requirement.v1.schema.json).
-Storage schema version 14 adds:
+Storage schema version 16 adds:
 
 - `task_requirements`: queryable requirement identity, risk, permission,
   side-effect, policy, scope, provenance, typed error, and canonical payload

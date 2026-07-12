@@ -1294,7 +1294,7 @@ side effects launched are imported as `needs-human` with
 `ErrAmbiguousLegacyState`; inspect the legacy run, claim, provider receipt, and
 recovery context before continuing.
 
-Opening a database older than schema 14 with a v0.8 planner-capable binary also
+Opening a database older than schema 16 with a v0.8 planner-capable binary also
 adds `task_requirements` and `task_requirement_overrides`. Operators can inspect
 these rows through future routing/status surfaces; until then they are local
 planner evidence. User corrections are stored as scoped overrides and are
