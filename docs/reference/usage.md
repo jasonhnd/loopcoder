@@ -652,6 +652,8 @@ this version.
     "auth_readiness": [],
     "model_catalog_snapshots": [],
     "model_capabilities": [],
+    "quota_telemetry_sources": [],
+    "quota_snapshots": [],
     "gap_reasons": []
   },
   "checks": [
@@ -668,12 +670,14 @@ this version.
 
 `loopcoder providers refresh --repo .` explicitly persists the same
 ProviderInstallation, ProbeResult, AccountProfile, AuthReadiness,
-ModelCatalogSnapshot, and ModelCapability inventory to the machine-local SQLite
-store. Refreshes append immutable probe history and immutable catalog snapshots,
-and mark disappeared installations stale instead of deleting them. Probe output
-is bounded and redacted, raw absolute paths and profile references are redacted
-or hashed in JSON/human output, and command execution uses fixed argv arrays,
-no shell interpolation, and an explicit non-credential environment allowlist.
+ModelCatalogSnapshot, ModelCapability, QuotaTelemetrySource, and QuotaSnapshot
+inventory to the machine-local SQLite store. Refreshes append immutable probe
+history, immutable catalog snapshots, and immutable quota snapshots, and mark
+disappeared installations stale instead of deleting them. Probe and quota
+diagnostic output is bounded and redacted, raw absolute paths and profile
+references are redacted or hashed in JSON/human output, and command execution
+uses fixed argv arrays, no shell interpolation, and an explicit non-credential
+environment allowlist.
 The allowlist carries location and platform variables required by provider
 script shims, including Windows
 `LOCALAPPDATA`, `APPDATA`, `ProgramData`, `ProgramFiles`, `SystemRoot`,
@@ -716,6 +720,21 @@ hit the network, such as Antigravity's `agy models`, are recorded as skipped
 with an explicit `network-permission-denied` gap unless a future permission path
 grants network access.
 
+Quota telemetry is allowlist-only. Supported source declarations are limited to
+official machine-readable provider APIs, official fixed-argv CLI JSON/status
+commands, documented provider export files, LoopCoder's local ledger, operator
+policy overlays, and fixtures. Private web UI scraping, copied browser cookies,
+reverse-engineered endpoints, credential-file parsing, shell interpolation, and
+environment value inspection are rejected instead of treated as best effort.
+When no current provider exposes a safe machine-readable quota source,
+`doctor` and JSON output still include a QuotaSnapshot with `confidence:
+"unavailable"`, `freshness_state: "not-applicable"`, `reset_semantics:
+"unknown"`, and `gap_reasons` such as `unsupported-source` and
+`not-collected`; this is intentional and must not be rendered as exact quota.
+Telemetry commands that declare possible network are skipped unless an explicit
+future policy grants network permission, producing typed `network-denied`
+evidence rather than performing network I/O.
+
 Operators can add explicit executable locations without scanning a disk:
 
 ```yaml
@@ -732,9 +751,10 @@ Those paths are checked before PATH entries and rendered with
 selection pins use opaque `acct_` IDs from prior inventory output; they are not
 display labels and do not copy provider config.
 
-`loopcoder status --repo . --format json` includes `inventory_refs`, not full
-raw inventory. Until a DeliveryRun binds inventory records, the arrays are empty
-and confidence is `unknown`.
+`loopcoder status --repo . --format json` includes `inventory_refs` and
+`quota_usage_refs`, not full raw inventory or quota history. Until a DeliveryRun
+binds inventory or quota records, the arrays are empty and confidence is
+`unknown`.
 
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,

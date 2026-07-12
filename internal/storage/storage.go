@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 11
+	CurrentSchemaVersion = 12
 
 	driverName = "sqlite"
 
@@ -35,6 +35,7 @@ const (
 type Store interface {
 	Close() error
 	Path() string
+	Now() time.Time
 	Health(context.Context) (Health, error)
 	WithTx(context.Context, func(Tx) error) error
 	WithWriteTx(context.Context, func(Tx) error) error
@@ -295,6 +296,11 @@ var migrations = []migration{
 		name:       "provider inventory",
 		statements: providerInventorySchemaStatements,
 	},
+	{
+		version:    12,
+		name:       "quota telemetry",
+		statements: quotaTelemetrySchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -326,6 +332,8 @@ var requiredTables = []string{
 	"auth_readiness",
 	"model_catalog_snapshots",
 	"model_capabilities",
+	"quota_telemetry_sources",
+	"quota_snapshots",
 	"inventory_events",
 }
 
@@ -448,6 +456,10 @@ func (s *sqliteStore) Close() error {
 
 func (s *sqliteStore) Path() string {
 	return s.path
+}
+
+func (s *sqliteStore) Now() time.Time {
+	return s.now().UTC()
 }
 
 func (s *sqliteStore) Health(ctx context.Context) (Health, error) {
