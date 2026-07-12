@@ -22,7 +22,10 @@ func PersistTaskRequirement(ctx context.Context, store storage.Store, req TaskRe
 	if store == nil {
 		return TaskRequirement{}, typed(ErrInvalidRecordCode, "store is required")
 	}
-	now := optionNow(opts)
+	now, err := optionNow(opts)
+	if err != nil {
+		return TaskRequirement{}, err
+	}
 	req = normalizeRequirement(req, now)
 	if req.TaskRequirementFingerprint == "" {
 		fp, err := FingerprintRequirement(req)
@@ -90,7 +93,10 @@ func PersistRequirementOverride(ctx context.Context, store storage.Store, overri
 	if store == nil {
 		return RequirementOverride{}, typed(ErrInvalidRecordCode, "store is required")
 	}
-	now := optionNow(opts)
+	now, err := optionNow(opts)
+	if err != nil {
+		return RequirementOverride{}, err
+	}
 	override = normalizeOverride(override, now)
 	if err := ValidateOverride(override); err != nil {
 		return RequirementOverride{}, err
@@ -404,11 +410,11 @@ func ensureTaskProject(ctx context.Context, tx storage.Tx, projectID, deliveryRu
 	return nil
 }
 
-func optionNow(opts PersistOptions) time.Time {
+func optionNow(opts PersistOptions) (time.Time, error) {
 	if opts.Now.IsZero() {
-		return time.Now().UTC()
+		return time.Time{}, typed(ErrInvalidRecordCode, "persist now is required")
 	}
-	return opts.Now.UTC()
+	return opts.Now.UTC(), nil
 }
 
 func marshalJSON(value any) (string, error) {

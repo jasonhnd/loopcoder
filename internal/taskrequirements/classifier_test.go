@@ -147,8 +147,47 @@ func TestSecretMaterialFixtureRefusesRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Classify() error = %v", err)
 	}
-	if got.RiskTier != RiskCritical || got.TerminalErrorCode != "ErrPolicyDenied" {
+	if got.RiskTier != RiskCritical || got.TerminalErrorCode != string(ErrNoEligibleCandidateCode) {
 		t.Fatalf("secret material classification = %#v", got)
+	}
+}
+
+func TestClassifyRequiresInjectedNow(t *testing.T) {
+	input := baseInput()
+	input.Now = time.Time{}
+	_, err := Classify(input)
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Classify() error = %v, want ErrInvalidRecord", err)
+	}
+}
+
+func TestProviderLaunchOnlyRecordsRule(t *testing.T) {
+	input := baseInput()
+	input.Scope = Scope{AllowsProviderLaunch: true}
+	got, err := Classify(input)
+	if err != nil {
+		t.Fatalf("Classify() error = %v", err)
+	}
+	if got.RiskTier != RiskMedium || got.SideEffectClass != SideEffectProviderLaunch {
+		t.Fatalf("provider launch classification = %#v", got)
+	}
+	if !contains(got.ClassificationRules, "scope.provider-launch") {
+		t.Fatalf("classification rules = %#v, missing scope.provider-launch", got.ClassificationRules)
+	}
+}
+
+func TestGitHubReferencesDoNotImplyGitHubWrite(t *testing.T) {
+	input := baseInput()
+	input.Scope = Scope{Issues: []int{733}, PullRequests: []int{815}}
+	got, err := Classify(input)
+	if err != nil {
+		t.Fatalf("Classify() error = %v", err)
+	}
+	if got.RiskTier != RiskLow || got.PermissionRequired != PermissionReadOnly || got.SideEffectClass != SideEffectLocalRead {
+		t.Fatalf("github reference-only classification = (%s, %s, %s), want read-only low/local-read", got.RiskTier, got.PermissionRequired, got.SideEffectClass)
+	}
+	if contains(got.ClassificationRules, "scope.github-write") {
+		t.Fatalf("classification rules = %#v, did not expect scope.github-write", got.ClassificationRules)
 	}
 }
 

@@ -131,6 +131,34 @@ func TestPersistTaskRequirementMissingTaskFailsClosed(t *testing.T) {
 	}
 }
 
+func TestPersistRequiresInjectedNow(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
+	defer store.Close()
+	seedDeliveryTask(t, ctx, store)
+	input := baseInput()
+	input.Scope = Scope{AllowsRepoWrite: true}
+	req, err := Classify(input)
+	if err != nil {
+		t.Fatalf("Classify() error = %v", err)
+	}
+	if _, err := PersistTaskRequirement(ctx, store, req, PersistOptions{}); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("PersistTaskRequirement() error = %v, want ErrInvalidRecord", err)
+	}
+	override := RequirementOverride{
+		ProjectID:     input.ProjectID,
+		DeliveryRunID: input.DeliveryRunID,
+		TaskKey:       input.TaskKey,
+		ScopeKey:      input.TaskKey,
+		Field:         "risk_tier",
+		ValueJSON:     `"high"`,
+		Justification: "operator correction after review",
+	}
+	if _, err := PersistRequirementOverride(ctx, store, override, PersistOptions{}); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("PersistRequirementOverride() error = %v, want ErrInvalidRecord", err)
+	}
+}
+
 func openStore(t *testing.T, ctx context.Context, path string) storage.Store {
 	t.Helper()
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)

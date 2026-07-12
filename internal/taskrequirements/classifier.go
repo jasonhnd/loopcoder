@@ -75,8 +75,9 @@ type ClassificationInput struct {
 func Classify(input ClassificationInput) (TaskRequirement, error) {
 	now := input.Now
 	if now.IsZero() {
-		now = time.Now().UTC()
+		return TaskRequirement{}, typed(ErrInvalidRecordCode, "classification now is required")
 	}
+	now = now.UTC()
 	if input.PolicyVersion == "" {
 		input.PolicyVersion = PolicyVersion
 	}
@@ -173,7 +174,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 		raiseSideEffect(SideEffectRepoWrite)
 		raiseRisk(RiskMedium)
 	}
-	if scope.AllowsGitHubWrite || len(scope.Issues) > 0 || len(scope.PullRequests) > 0 {
+	if scope.AllowsGitHubWrite {
 		applyRule("scope.github-write")
 		raisePermission(PermissionWrite)
 		raiseSideEffect(SideEffectGitHubWrite)
@@ -199,6 +200,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 		raiseRisk(RiskMedium)
 	}
 	if scope.AllowsProviderLaunch {
+		applyRule("scope.provider-launch")
 		raiseSideEffect(SideEffectProviderLaunch)
 		raiseRisk(RiskMedium)
 		req.NetworkRequired = NetworkAllowedIfProfileGrants
@@ -258,7 +260,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 	if scope.ContainsSecretMaterial {
 		applyRule("data.secret-material")
 		req.DataClassification = "secret-material"
-		req.TerminalErrorCode = "ErrPolicyDenied"
+		req.TerminalErrorCode = string(ErrNoEligibleCandidateCode)
 		req.GapReasons = appendReason(req.GapReasons, "secret-material-refusal")
 		raiseRisk(RiskCritical)
 		addVerification(&req, VerificationHumanApproval, []RiskTier{RiskCritical}, IndependenceHuman, PermissionReadOnly, OutputVerificationVerdict, "data.secret-material")
