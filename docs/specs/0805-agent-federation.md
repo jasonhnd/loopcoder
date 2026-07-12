@@ -610,7 +610,7 @@ provider-native child:
 | Gate | Required inputs | Refusal |
 | --- | --- | --- |
 | Child plan accepted | `0646` child plan and run edge | `ErrMissingReference` |
-| Depth and concurrency | `0646` `max_depth`, `max_concurrency`, active child counts | `ErrGraphBoundExceeded` |
+| Depth and concurrency | `0646` `max_depth`, `max_concurrency`, active child counts | `ErrGraphBoundExceeded` or `ErrPolicyDenied` |
 | Provider eligibility | `0802` inventory, runtime capability matrix, `0804` route | `ErrUnsupportedNativeSubAgent` or `ErrNoEligibleCandidate` |
 | Scope inheritance | Parent effective AgentScopeGrant or root task scope | `ErrScopeWidening` or `ErrScopeUnknown` |
 | Approval freshness | `0801` approval/override and authorization fingerprint | `ErrApprovalRequired`, `ErrOverrideRequired`, or `ErrStaleApproval` |
