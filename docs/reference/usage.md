@@ -751,9 +751,22 @@ Those paths are checked before PATH entries and rendered with
 selection pins use opaque `acct_` IDs from prior inventory output; they are not
 display labels and do not copy provider config.
 
+`loopcoder doctor --repo . --format json` includes a `quota_usage_budget` root
+object. It summarizes the machine-local usage ledger and, when the persisted
+ledger has no rows for the project, conservatively derives a bounded summary
+from the same local report surfaces used by `loopcoder report`: imported
+reports, run attempt files, run JSON/JSONL records, relay ledgers, and pending
+relay records. That fallback is marked with gap reasons such as
+`persisted-ledger-empty`, `derived-from-reports-fallback`, and
+`loopcoder-local-ledger-not-provider-global`. It is local evidence only and
+must not be read as provider-global remaining quota.
+
 `loopcoder status --repo . --format json` includes `inventory_refs` and
-`quota_usage_refs`, not full raw inventory or quota history. Until a DeliveryRun
-binds inventory or quota records, the arrays are empty and confidence is
+`quota_usage_refs`, not full raw inventory, quota, or usage history. When the
+selected run has local report usage, `quota_usage_refs.usage_record_ids` lists
+deterministic usage ledger record IDs and the confidence remains conservative
+because local reports do not cover work outside LoopCoder. Until a DeliveryRun
+binds inventory or quota records, unrelated arrays are empty and confidence is
 `unknown`.
 
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and

@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 12
+	CurrentSchemaVersion = 13
 
 	driverName = "sqlite"
 
@@ -301,6 +301,11 @@ var migrations = []migration{
 		name:       "quota telemetry",
 		statements: quotaTelemetrySchemaStatements,
 	},
+	{
+		version:    13,
+		name:       "usage ledger",
+		statements: usageLedgerSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -334,6 +339,8 @@ var requiredTables = []string{
 	"model_capabilities",
 	"quota_telemetry_sources",
 	"quota_snapshots",
+	"usage_records",
+	"usage_reconciliations",
 	"inventory_events",
 }
 

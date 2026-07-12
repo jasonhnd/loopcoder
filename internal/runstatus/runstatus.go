@@ -22,7 +22,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/usageledger"
 )
 
 const NotReported = "not reported"
@@ -38,6 +40,7 @@ const (
 type Options struct {
 	RepoPath string
 	RunID    string
+	Now      func() time.Time
 }
 
 type Report struct {
@@ -192,7 +195,7 @@ func Load(opts Options) (Report, error) {
 		return Report{}, fmt.Errorf("run path is not a directory: %s", filepath.ToSlash(runPath))
 	}
 
-	now := time.Now().UTC()
+	now := normalizeNow(opts.Now)().UTC()
 	if err := validateRunStatusAttemptRecords(runPath, now); err != nil {
 		return Report{}, err
 	}
@@ -233,6 +236,8 @@ func Load(opts Options) (Report, error) {
 	sortRows(rows)
 	project := resolveProjectMetadata(repoPath)
 	runTree := loadRunTree(repoPath, runID, project.ProjectID, now)
+	usageRecords := usageRecordsForStatus(attempts, verifiers, runID, project.ProjectID, now)
+	quotaUsageRefs := usageledger.QuotaUsageRefs(usageRecords, providerinventory.ConfidenceEstimated, nil)
 
 	return Report{
 		RunID:               runID,
@@ -246,6 +251,7 @@ func Load(opts Options) (Report, error) {
 		LifecycleEvents:     len(lifecycle.History),
 		ParentRunID:         lifecycle.ParentRunID,
 		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
+		QuotaUsageRefs:      quotaUsageRefs,
 		RunTree:             runTree,
 		Rows:                rows,
 	}, nil
@@ -444,6 +450,57 @@ func normalizeReport(report Report) Report {
 	}
 	report.RunTree.Summary = summarizeRunTree(report.RunTree.Nodes)
 	return report
+}
+
+func normalizeNow(now func() time.Time) func() time.Time {
+	if now == nil {
+		return time.Now
+	}
+	return now
+}
+
+func usageRecordsForStatus(attempts []state.Attempt, verifiers []verifierRecord, runID, projectID string, now time.Time) []usageledger.UsageRecord {
+	records := make([]reportquery.Record, 0, len(attempts)+len(verifiers))
+	for _, attempt := range attempts {
+		if attempt.Report == nil {
+			continue
+		}
+		report := *attempt.Report
+		if strings.TrimSpace(report.WorkID) == "" {
+			report.WorkID = runID
+		}
+		if report.Issue == 0 {
+			report.Issue = attempt.Issue
+		}
+		if strings.TrimSpace(report.Branch) == "" {
+			report.Branch = attempt.Branch
+		}
+		records = append(records, reportquery.Record{
+			Report: report,
+			Source: "attempt",
+			RunID:  runID,
+			Path:   attempt.Path,
+		})
+	}
+	for _, verifier := range verifiers {
+		if verifier.Report == nil {
+			continue
+		}
+		report := *verifier.Report
+		if strings.TrimSpace(report.WorkID) == "" {
+			report.WorkID = runID
+		}
+		if report.Issue == 0 {
+			report.Issue = verifier.Issue
+		}
+		records = append(records, reportquery.Record{
+			Report: report,
+			Source: "status-verifier",
+			RunID:  runID,
+			Path:   verifier.Path,
+		})
+	}
+	return usageledger.UsageRecordsFromReporter(records, projectID, now).Records
 }
 
 func resolveProjectMetadata(repoPath string) ProjectMetadata {

@@ -1,0 +1,47 @@
+package storage
+
+var usageLedgerSchemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS usage_records (
+		usage_record_id TEXT PRIMARY KEY,
+		project_id TEXT NOT NULL DEFAULT '',
+		delivery_run_id TEXT NOT NULL DEFAULT '',
+		task_id TEXT NOT NULL DEFAULT '',
+		attempt_id TEXT NOT NULL DEFAULT '',
+		worker_id TEXT NOT NULL DEFAULT '',
+		sub_agent_id TEXT NOT NULL DEFAULT '',
+		adapter_id TEXT NOT NULL DEFAULT '',
+		account_profile_id TEXT NOT NULL DEFAULT '',
+		model_capability_id TEXT NOT NULL DEFAULT '',
+		event_kind TEXT NOT NULL,
+		event_time TEXT NOT NULL,
+		quantity_kind TEXT NOT NULL,
+		unit TEXT NOT NULL,
+		value INTEGER NOT NULL,
+		value_scale INTEGER NOT NULL DEFAULT 0,
+		confidence TEXT NOT NULL,
+		idempotency_key TEXT NOT NULL,
+		dedupe_key TEXT NOT NULL DEFAULT '',
+		payload_json TEXT NOT NULL DEFAULT '{}',
+		CHECK(json_valid(payload_json))
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_idempotency ON usage_records(idempotency_key)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_records_project_scope ON usage_records(project_id, adapter_id, account_profile_id, model_capability_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_records_run_task ON usage_records(project_id, delivery_run_id, task_id, worker_id, sub_agent_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_records_quantity_time ON usage_records(quantity_kind, event_time)`,
+	`CREATE TABLE IF NOT EXISTS usage_reconciliations (
+		usage_reconciliation_id TEXT PRIMARY KEY,
+		project_id TEXT NOT NULL DEFAULT '',
+		provider_snapshot_id TEXT NOT NULL DEFAULT '',
+		scope_key TEXT NOT NULL,
+		quantity_kind TEXT NOT NULL,
+		window_kind TEXT NOT NULL,
+		window_start TEXT NOT NULL DEFAULT '',
+		window_end TEXT NOT NULL DEFAULT '',
+		outcome TEXT NOT NULL,
+		idempotency_key TEXT NOT NULL,
+		payload_json TEXT NOT NULL DEFAULT '{}',
+		CHECK(json_valid(payload_json))
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_reconciliations_idempotency ON usage_reconciliations(idempotency_key)`,
+	`CREATE INDEX IF NOT EXISTS idx_usage_reconciliations_scope ON usage_reconciliations(project_id, scope_key, quantity_kind, window_kind)`,
+}

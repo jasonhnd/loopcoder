@@ -18,6 +18,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
@@ -253,6 +254,87 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRenderJSONIncludesQuotaUsageBudgetFallbackContract(t *testing.T) {
+	now := time.Unix(0, 0).UTC().Add(803 * time.Hour)
+	repo := t.TempDir()
+	runID := state.RunIDForIssue(730, now)
+	report := doctorUsageReport(730, now)
+	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-730-1",
+		Issue:          730,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            123,
+		Phase:          "codex_exited",
+		Status:         "succeeded",
+		StartedAt:      report.StartedAt,
+		HeartbeatAt:    report.EndedAt,
+		LastProgressAt: report.EndedAt,
+		Report:         &report,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	budget, check := buildQuotaUsageBudget(context.Background(), repo, "proj_test", now)
+	if check.Status != StatusOK {
+		t.Fatalf("quota usage check = %#v, want OK", check)
+	}
+	var out bytes.Buffer
+	if err := RenderJSON(&out, WithMetadata(Report{QuotaUsageBudget: budget, Checks: []Check{check}}, repo, BuildInfo{Version: "0.8.0", Commit: "abc123", Date: now.Format(time.RFC3339Nano)})); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		QuotaUsageBudget struct {
+			SchemaVersion         string                       `json:"schema_version"`
+			GeneratedAt           string                       `json:"generated_at"`
+			QuotaUsageFingerprint string                       `json:"quota_usage_fingerprint"`
+			Confidence            providerinventory.Confidence `json:"confidence"`
+			UsageSummary          []struct {
+				AdapterID      string                         `json:"adapter_id"`
+				QuantityKind   providerinventory.QuantityKind `json:"quantity_kind"`
+				TotalValue     int64                          `json:"total_value"`
+				Confidence     providerinventory.Confidence   `json:"confidence"`
+				UsageRecordIDs []string                       `json:"usage_record_ids"`
+			} `json:"usage_summary"`
+			GapReasons []string `json:"gap_reasons"`
+		} `json:"quota_usage_budget"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.QuotaUsageBudget.SchemaVersion != "loopcoder.quota_usage_budget_json.v1" || payload.QuotaUsageBudget.GeneratedAt == "" {
+		t.Fatalf("quota usage metadata = %#v", payload.QuotaUsageBudget)
+	}
+	if !strings.HasPrefix(payload.QuotaUsageBudget.QuotaUsageFingerprint, "sha256:") {
+		t.Fatalf("fingerprint = %q", payload.QuotaUsageBudget.QuotaUsageFingerprint)
+	}
+	if payload.QuotaUsageBudget.Confidence != providerinventory.ConfidenceEstimated {
+		t.Fatalf("confidence = %q, want estimated fallback", payload.QuotaUsageBudget.Confidence)
+	}
+	for _, want := range []string{"persisted-ledger-empty", "derived-from-reports-fallback", "loopcoder-local-ledger-not-provider-global"} {
+		if !containsString(payload.QuotaUsageBudget.GapReasons, want) {
+			t.Fatalf("gap reasons = %#v, missing %q", payload.QuotaUsageBudget.GapReasons, want)
+		}
+	}
+	if len(payload.QuotaUsageBudget.UsageSummary) == 0 {
+		t.Fatalf("usage summary empty:\n%s", out.String())
+	}
+	foundTotal := false
+	for _, summary := range payload.QuotaUsageBudget.UsageSummary {
+		if summary.AdapterID == "codex" && summary.QuantityKind == providerinventory.QuantityTotalTokens && summary.TotalValue == 7300 {
+			foundTotal = true
+			if summary.Confidence != providerinventory.ConfidenceEstimated || len(summary.UsageRecordIDs) == 0 {
+				t.Fatalf("total summary = %#v", summary)
+			}
+		}
+	}
+	if !foundTotal {
+		t.Fatalf("total token summary missing: %#v", payload.QuotaUsageBudget.UsageSummary)
 	}
 }
 
@@ -2129,6 +2211,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
 			return f.providerInventory(opts.Config), nil
 		},
+		Now: func() time.Time {
+			return time.Unix(0, 0).UTC().Add(807 * time.Hour)
+		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
 		clean := filepath.Clean(path)
@@ -2346,4 +2431,27 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func doctorUsageReport(issue int, start time.Time) reporter.Report {
+	total := int64(issue * 10)
+	return reporter.Report{
+		WorkID:      state.RunIDForIssue(issue, start),
+		Issue:       issue,
+		Role:        reporter.RoleWorker,
+		Provider:    "codex",
+		Model:       "gpt-fixture",
+		ModelSource: reporter.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  reporter.PermissionWrite,
+		Action:      "implement issue #" + fmt.Sprint(issue),
+		ExitCode:    0,
+		StartedAt:   start.UTC().Format(time.RFC3339Nano),
+		EndedAt:     start.Add(42 * time.Second).UTC().Format(time.RFC3339Nano),
+		DurationMS:  int64((42 * time.Second).Milliseconds()),
+		Usage: reporter.Usage{
+			TotalTokens: &total,
+		},
+		Verified: true,
+	}
 }
