@@ -1,6 +1,7 @@
 package reportquery
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -185,6 +187,55 @@ func TestListAcceptsLegacyReportInputs(t *testing.T) {
 	}
 	if got := bySource["relay-ledger"]; got.Report.Role != reporter.RoleVerifier || got.RunID != runID || got.Report.WorkID != runID || got.Path != ledgerPath {
 		t.Fatalf("legacy header record = %#v, want relay-ledger verifier context", got)
+	}
+}
+
+func TestListReadsExistingGlobalPayloadForUnregisteredProject(t *testing.T) {
+	repo := t.TempDir()
+	loopHome := filepath.Join(t.TempDir(), "loopcoder-home")
+	t.Setenv("LOOPCODER_HOME", loopHome)
+	project, err := registry.Resolve(context.Background(), registry.Options{RepoPath: repo}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("registry.Resolve: %v", err)
+	}
+	runID := "run-global-read"
+	report := testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement global payload fixture", "2026-07-07T00:02:00Z")
+	report.WorkID = "job-global-read"
+	attempt := state.Attempt{
+		Version:        1,
+		JobID:          "job-global-read",
+		Issue:          730,
+		Attempt:        1,
+		Provider:       "codex",
+		Phase:          "codex_exited",
+		Status:         "succeeded",
+		StartedAt:      report.StartedAt,
+		HeartbeatAt:    report.EndedAt,
+		LastProgressAt: report.EndedAt,
+		Report:         &report,
+	}
+	workersDir := filepath.Join(loopHome, "projects", project.ProjectID, "runs", runID, "workers")
+	if err := os.MkdirAll(workersDir, 0o755); err != nil {
+		t.Fatalf("create workers dir: %v", err)
+	}
+	data, err := json.Marshal(attempt)
+	if err != nil {
+		t.Fatalf("marshal attempt: %v", err)
+	}
+	attemptPath := filepath.Join(workersDir, "job-global-read.attempt.json")
+	if err := os.WriteFile(attemptPath, data, 0o644); err != nil {
+		t.Fatalf("write attempt: %v", err)
+	}
+
+	records, err := List(Options{RepoPath: repo, Limit: 10})
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %#v, want one global payload report", records)
+	}
+	if records[0].Source != "attempt" || records[0].RunID != runID || records[0].Path != attemptPath || records[0].Report.WorkID != "job-global-read" {
+		t.Fatalf("record = %#v, want global attempt report context", records[0])
 	}
 }
 

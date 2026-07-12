@@ -560,9 +560,27 @@ func relayRootsForRead(repoPath string) []string {
 	if err != nil {
 		return []string{filepath.Join(repoPath, ".loopcoder", "relay")}
 	}
-	out := []string{roots.RelayRoot}
+	out := []string{}
+	if candidate, ok := runtimepath.CandidateProjectPayloadRootsForRead(context.Background(), repoPath); ok && candidate.RelayRoot != "" {
+		out = append(out, candidate.RelayRoot)
+	}
+	out = append(out, roots.RelayRoot)
 	if roots.Registered && roots.LegacyRelayRoot != "" && roots.LegacyRelayRoot != roots.RelayRoot {
 		out = append(out, roots.LegacyRelayRoot)
+	}
+	return dedupeReportPaths(out)
+}
+
+func dedupeReportPaths(paths []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
 	}
 	return out
 }

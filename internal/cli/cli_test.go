@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -379,6 +380,13 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 				Provider    string `json:"provider"`
 			} `json:"nodes"`
 		} `json:"run_tree"`
+		QuotaUsageRefs struct {
+			SchemaVersion         string   `json:"schema_version"`
+			QuotaUsageFingerprint string   `json:"quota_usage_fingerprint"`
+			UsageRecordIDs        []string `json:"usage_record_ids"`
+			Confidence            string   `json:"confidence"`
+			GapReasons            []string `json:"gap_reasons"`
+		} `json:"quota_usage_refs"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("status output is not JSON: %v\n%s", err, stdout.String())
@@ -394,6 +402,15 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 	}
 	if !foundChild {
 		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+	if payload.QuotaUsageRefs.SchemaVersion != providerinventory.QuotaUsageRefsSchema || payload.QuotaUsageRefs.QuotaUsageFingerprint == "" {
+		t.Fatalf("quota_usage_refs identity missing: %#v", payload.QuotaUsageRefs)
+	}
+	if payload.QuotaUsageRefs.Confidence != string(providerinventory.ConfidenceExact) || len(payload.QuotaUsageRefs.UsageRecordIDs) == 0 {
+		t.Fatalf("quota_usage_refs = %#v, want exact refs with usage ids", payload.QuotaUsageRefs)
+	}
+	if !slices.Contains(payload.QuotaUsageRefs.GapReasons, "local-wall-time-not-provider-billing") || !slices.Contains(payload.QuotaUsageRefs.GapReasons, "local-launch-count-only") {
+		t.Fatalf("quota_usage_refs gap reasons = %#v, want local accounting gaps", payload.QuotaUsageRefs.GapReasons)
 	}
 }
 

@@ -85,6 +85,7 @@ type Deps struct {
 	ProjectDuplicates  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	ProjectRepair      func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	ProviderInventory  func(context.Context, providerinventory.Options) (providerinventory.Report, error)
+	Now                func() time.Time
 }
 
 type CommandResult struct {
@@ -112,6 +113,7 @@ type Report struct {
 	Runtime               RuntimeHealth
 	ProviderCompatibility []ProviderCompatibility
 	ProviderInventory     providerinventory.Report
+	QuotaUsageBudget      providerinventory.QuotaUsageBudgetReport
 	Checks                []Check
 }
 
@@ -346,16 +348,17 @@ func RenderJSON(w io.Writer, report Report) error {
 		})
 	}
 	payload := struct {
-		RepoPath              string                          `json:"repo_path"`
-		Version               string                          `json:"version"`
-		Commit                string                          `json:"commit"`
-		Date                  string                          `json:"date"`
-		ExitCode              int                             `json:"exit_code"`
-		Host                  renderedHostProfile             `json:"host_profile"`
-		Runtime               renderedRuntime                 `json:"runtime"`
-		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
-		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
-		Checks                []renderedCheck                 `json:"checks"`
+		RepoPath              string                                   `json:"repo_path"`
+		Version               string                                   `json:"version"`
+		Commit                string                                   `json:"commit"`
+		Date                  string                                   `json:"date"`
+		ExitCode              int                                      `json:"exit_code"`
+		Host                  renderedHostProfile                      `json:"host_profile"`
+		Runtime               renderedRuntime                          `json:"runtime"`
+		ProviderCompatibility []renderedProviderCompatibility          `json:"provider_compatibility"`
+		ProviderInventory     providerinventory.Report                 `json:"provider_inventory"`
+		QuotaUsageBudget      providerinventory.QuotaUsageBudgetReport `json:"quota_usage_budget"`
+		Checks                []renderedCheck                          `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
 		Version:  report.Version,
@@ -374,6 +377,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		},
 		ProviderCompatibility: compatibility,
 		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
+		QuotaUsageBudget:      normalizeQuotaUsageBudget(report.QuotaUsageBudget),
 		Checks:                checks,
 	}
 	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
@@ -476,6 +480,37 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 	return report
 }
 
+func normalizeQuotaUsageBudget(report providerinventory.QuotaUsageBudgetReport) providerinventory.QuotaUsageBudgetReport {
+	if strings.TrimSpace(report.SchemaVersion) == "" {
+		return providerinventory.EmptyQuotaUsageBudget(time.Unix(0, 0).UTC())
+	}
+	if report.QuotaSources == nil {
+		report.QuotaSources = []providerinventory.QuotaTelemetrySource{}
+	}
+	if report.QuotaSnapshots == nil {
+		report.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
+	if report.UsageSummary == nil {
+		report.UsageSummary = []providerinventory.UsageSummary{}
+	}
+	if report.Reconciliations == nil {
+		report.Reconciliations = []providerinventory.UsageReconciliation{}
+	}
+	if report.BudgetSummary == nil {
+		report.BudgetSummary = []any{}
+	}
+	if report.AvailabilityScores == nil {
+		report.AvailabilityScores = []any{}
+	}
+	if report.CircuitBreakers == nil {
+		report.CircuitBreakers = []any{}
+	}
+	if report.GapReasons == nil {
+		report.GapReasons = []string{}
+	}
+	return report
+}
+
 func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 	build = normalizeBuildInfo(build)
 	if strings.TrimSpace(report.RepoPath) == "" {
@@ -529,6 +564,7 @@ func DefaultDeps() Deps {
 		ProviderInventory: func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
 			return providerinventory.Discover(ctx, opts, providerinventory.DefaultDeps())
 		},
+		Now: time.Now,
 	}
 }
 
@@ -553,6 +589,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
 	inventory, inventoryCheck := discoverProviderInventory(ctx, repoPath, delivery.Config, deps)
+	quotaUsageBudget := loadQuotaUsageBudget(ctx, repoPath, deps)
 	checks := make([]Check, 0, 10)
 	host, hostCheck := resolveHostProfile(delivery, deps)
 
@@ -604,6 +641,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		Runtime:               runtimeHealth(ctx, repoPath, deps),
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
 		ProviderInventory:     inventory,
+		QuotaUsageBudget:      quotaUsageBudget,
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -976,7 +1014,78 @@ func normalizeDeps(deps Deps) Deps {
 	if deps.ProviderInventory == nil {
 		deps.ProviderInventory = defaults.ProviderInventory
 	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
+	}
 	return deps
+}
+
+func loadQuotaUsageBudget(ctx context.Context, repoPath string, deps Deps) providerinventory.QuotaUsageBudgetReport {
+	now := deps.Now().UTC()
+	layout, err := home.Resolve(home.Deps{Getenv: deps.Getenv, UserHomeDir: deps.UserHomeDir})
+	if err != nil {
+		return providerinventory.EmptyQuotaUsageBudget(now)
+	}
+	dbPath := layout.DatabasePath()
+	show, err := deps.ProjectShow(ctx, registry.Options{RepoPath: repoPath, DatabasePath: dbPath})
+	if err != nil {
+		return buildLocalQuotaUsageBudget(repoPath, "", now, []string{"project-registry-unavailable"})
+	}
+	projectID := strings.TrimSpace(show.Project.ProjectID)
+	if !show.Registered {
+		return buildLocalQuotaUsageBudget(repoPath, projectID, now, []string{"project-registry-unregistered", "persisted-ledger-empty"})
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return buildLocalQuotaUsageBudget(repoPath, projectID, now, []string{"persisted-ledger-empty"})
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: deps.Now})
+	if err != nil {
+		return buildLocalQuotaUsageBudget(repoPath, projectID, now, []string{"persisted-ledger-load-failed"})
+	}
+	defer store.Close()
+	report, err := providerinventory.LoadQuotaUsageBudget(ctx, store, projectID, true)
+	if err == nil && len(report.UsageSummary) > 0 {
+		return report
+	}
+	derived, deriveErr := providerinventory.BuildQuotaUsageBudgetFromReports(ctx, store, projectID, now, true)
+	if deriveErr == nil && len(derived.UsageSummary) > 0 {
+		if err != nil {
+			derived.GapReasons = append(derived.GapReasons, "persisted-ledger-load-failed")
+		} else {
+			derived.GapReasons = append(derived.GapReasons, "persisted-ledger-empty")
+		}
+		return normalizeQuotaUsageBudget(derived)
+	}
+	extraGaps := []string{}
+	if err != nil {
+		extraGaps = append(extraGaps, "persisted-ledger-load-failed")
+	} else {
+		extraGaps = append(extraGaps, "persisted-ledger-empty")
+	}
+	if deriveErr != nil {
+		extraGaps = append(extraGaps, "imported-report-load-failed")
+	}
+	local := buildLocalQuotaUsageBudget(repoPath, projectID, now, extraGaps)
+	if len(local.UsageSummary) > 0 {
+		return local
+	}
+	if err == nil {
+		return report
+	}
+	return providerinventory.EmptyQuotaUsageBudget(now)
+}
+
+func buildLocalQuotaUsageBudget(repoPath, projectID string, now time.Time, extraGaps []string) providerinventory.QuotaUsageBudgetReport {
+	localRecords, localErr := reportquery.List(reportquery.Options{RepoPath: repoPath, Limit: int(^uint(0) >> 1)})
+	if localErr != nil || len(localRecords) == 0 {
+		return providerinventory.EmptyQuotaUsageBudget(now)
+	}
+	localDerived, localDeriveErr := providerinventory.BuildQuotaUsageBudgetFromReportQueryRecords(localRecords, projectID, now, true)
+	if localDeriveErr != nil || len(localDerived.UsageSummary) == 0 {
+		return providerinventory.EmptyQuotaUsageBudget(now)
+	}
+	localDerived.GapReasons = append(localDerived.GapReasons, extraGaps...)
+	return normalizeQuotaUsageBudget(localDerived)
 }
 
 func execRunCommand(ctx context.Context, dir string, name string, args ...string) (CommandResult, error) {

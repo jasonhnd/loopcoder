@@ -95,6 +95,38 @@ func Resolve(ctx context.Context, repoPath string) (Roots, error) {
 	return roots, nil
 }
 
+// CandidateProjectPayloadRootsForRead returns an existing machine-local project
+// payload root for the repo's resolved identity even when the registry row is
+// absent. It is for read-only compatibility surfaces only; unregistered writes
+// still use repo-local roots through Resolve.
+func CandidateProjectPayloadRootsForRead(ctx context.Context, repoPath string) (Roots, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	roots, err := Resolve(ctx, repoPath)
+	if err != nil || roots.Registered {
+		return Roots{}, false
+	}
+	project, err := registry.Resolve(ctx, registry.Options{RepoPath: roots.RepoPath, DatabasePath: roots.DatabasePath}, registry.DefaultDeps())
+	if err != nil || strings.TrimSpace(project.ProjectID) == "" {
+		return Roots{}, false
+	}
+	layout := home.New(roots.HomeDir)
+	projectRoot := layout.ProjectDir(project.ProjectID)
+	if info, err := os.Stat(projectRoot); err != nil || !info.IsDir() {
+		return Roots{}, false
+	}
+	candidate := roots
+	candidate.FallbackMode = "unregistered-global-read"
+	candidate.ProjectID = project.ProjectID
+	candidate.ProjectRoot = projectRoot
+	candidate.RunsRoot = filepath.Join(projectRoot, "runs")
+	candidate.RelayRoot = filepath.Join(projectRoot, "relay")
+	candidate.RecoveryRoot = filepath.Join(projectRoot, "recovery")
+	candidate.AuditRoot = filepath.Join(projectRoot, "audit")
+	return candidate, true
+}
+
 type cacheEntry struct {
 	dbStamp string
 	roots   Roots

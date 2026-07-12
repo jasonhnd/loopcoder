@@ -152,6 +152,10 @@ The current state model has three layers:
 - Local run state under `.loopcoder/runs/<RunId>/` records the durable run
   lifecycle, worker attempts, event transitions, and recovery briefs for
   liveness and retry decisions.
+- Machine-local SQLite stores provider inventory, quota snapshots, normalized
+  usage ledger rows, and usage reconciliations. Usage rows are append-only and
+  scoped by project, run, task, worker, provider, account, and model when those
+  IDs are known.
 - `loopcoder state push`, `state pull`, `lease acquire`, and `lease release`
   publish scrubbed run snapshots and a best-effort conductor lease on the
   dedicated state branch when cross-session state is needed.

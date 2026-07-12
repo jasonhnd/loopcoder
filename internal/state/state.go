@@ -260,11 +260,15 @@ func RunsRoot(repoPath string) string {
 
 func RunsRootsForRead(repoPath string) []string {
 	roots := runtimeRoots(repoPath)
-	out := []string{roots.RunsRoot}
+	out := []string{}
+	if candidate, ok := runtimepath.CandidateProjectPayloadRootsForRead(context.Background(), repoPath); ok && candidate.RunsRoot != "" {
+		out = append(out, candidate.RunsRoot)
+	}
+	out = append(out, roots.RunsRoot)
 	if roots.Registered && roots.LegacyRunsRoot != "" && roots.LegacyRunsRoot != roots.RunsRoot {
 		out = append(out, roots.LegacyRunsRoot)
 	}
-	return out
+	return dedupePaths(out)
 }
 
 func RunPath(repoPath, runID string) string {
@@ -272,18 +276,34 @@ func RunPath(repoPath, runID string) string {
 }
 
 func RunPathForRead(repoPath, runID string) string {
-	global := RunPath(repoPath, runID)
-	if _, err := os.Stat(global); err == nil {
-		return global
-	}
-	roots := runtimeRoots(repoPath)
-	if roots.Registered && roots.LegacyRunsRoot != "" {
-		legacy := filepath.Join(roots.LegacyRunsRoot, runID)
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy
+	var fallback string
+	for _, root := range RunsRootsForRead(repoPath) {
+		path := filepath.Join(root, runID)
+		if fallback == "" {
+			fallback = path
+		}
+		if _, err := os.Stat(path); err == nil {
+			return path
 		}
 	}
-	return global
+	if fallback != "" {
+		return fallback
+	}
+	return RunPath(repoPath, runID)
+}
+
+func dedupePaths(paths []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
 }
 
 func WorkersPath(repoPath, runID string) string {
