@@ -185,3 +185,27 @@ higher-authority source and report the conflict.
 - Candidate improvement: none (playbook already prescribes reading from the base branch; this reinforces it)
 - Confidence: medium
 - Supersedes: none
+
+### 2026-07-12 - run p0rt01-20260712 - Storage schema newer than every available binary: back up and recreate
+
+- Scope: loopcoder doctor / global storage (~/.loopcoder/data/loopcoder.db)
+- Role: conductor
+- Observed: doctor failed with "unsupported storage schema version 11; selected loopcoder supports schema version 9" while the release 0.7.0 binary, a fresh main build, and pre-prod supported at most schema 10; grepping CurrentSchemaVersion across all refs found no source for schema 11, so no available binary could open the DB.
+- Evidence: doctor output in the mem P0-RT-01 conductor session (run p0rt01-20260712); `git grep "CurrentSchemaVersion = 11"` across all refs returned nothing.
+- Learning: An experimental or since-deleted dev build can leave global storage at a schema version no shipping binary supports. GitHub remains the source of truth for delivery state and local run records are advisory, so the recovery is to rename the DB aside (for example loopcoder.db.schema11.bak) and let the selected binary recreate fresh storage; only local report history is lost.
+- Applies to: docs, conductor
+- Candidate improvement: doctor --fix could offer a guarded backup-and-recreate when the schema is newer than the selected binary and no known upgrade target supports it.
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-12 - run p0rt01-20260712 - Backgrounded dispatch/loopreview leaves relay records pending; flush before the next mechanical command
+
+- Scope: dispatch-wave / loopreview run as background jobs; relay gate reserved exit code 4
+- Role: conductor
+- Observed: After running dispatch-wave and loopreview in background shells and relaying their pretty report blocks verbatim in chat, the next mechanical commands (ready-set, a loopreview retry) still refused with exit code 4 until `loopcoder relay flush --repo .` ran in the foreground.
+- Evidence: ready-set and loopreview invocations in run p0rt01-20260712 exited 4 with pending-relay recovery instructions.
+- Learning: Chat relay alone does not acknowledge relay records. Whenever dispatch/dispatch-wave/loopreview output is captured from a background job, plan a foreground `loopcoder relay flush --repo <repo>` immediately after relaying the blocks, before any further dispatch, ready-set, loopreview, verify-local, recover, or promote call.
+- Applies to: SKILL.md, conductor
+- Candidate improvement: none
+- Confidence: high
+- Supersedes: none
