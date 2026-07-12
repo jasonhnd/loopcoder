@@ -800,3 +800,40 @@ func TestSupersedeMarksApprovalRowsStaleWithSpecStatus(t *testing.T) {
 	}
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals WHERE status = 'active'`, 0)
 }
+
+func TestDecideAndContinueRejectMissingExpectedFingerprint(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	if _, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID}); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	_, err := Decide(ctx, store, DecisionOptions{
+		ProjectID:      run.ProjectID,
+		DeliveryRunID:  run.DeliveryRunID,
+		Action:         DecisionActionApprove,
+		Actor:          actor(),
+		Host:           host(),
+		IdempotencyKey: "approve-no-fingerprint",
+		Now:            fixedTime().Add(time.Minute),
+	})
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Decide without expected fingerprint error = %v, want ErrInvalidRecord", err)
+	}
+	// Continue may omit the optimistic-concurrency guard: authorization is
+	// enforced by the active-approval lookup keyed on the CURRENT proposal
+	// fingerprint, so with no approval it must refuse with ErrApprovalRequired.
+	_, err = Continue(ctx, store, ContinueOptions{
+		ProjectID:      run.ProjectID,
+		DeliveryRunID:  run.DeliveryRunID,
+		Actor:          actor(),
+		Host:           host(),
+		IdempotencyKey: "continue-no-fingerprint",
+		Now:            fixedTime().Add(2 * time.Minute),
+	})
+	if !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("Continue without approval error = %v, want ErrApprovalRequired", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 0)
+}

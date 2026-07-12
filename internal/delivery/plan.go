@@ -142,6 +142,9 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 		return DecisionResult{}, typed(ErrInvalidRecordCode, "now is required")
 	}
 	opts.Action = strings.ToLower(strings.TrimSpace(opts.Action))
+	if strings.TrimSpace(opts.ExpectedAuthorizationFingerprint) == "" {
+		return DecisionResult{}, typed(ErrInvalidRecordCode, "expected authorization fingerprint is required for decisions")
+	}
 	if !validDecisionAction(opts.Action) {
 		return DecisionResult{}, typed(ErrInvalidRecordCode, "unknown decision action %q", opts.Action)
 	}
