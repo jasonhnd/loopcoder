@@ -225,6 +225,128 @@ func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
 	}
 }
 
+func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Unix(7, 0).UTC()
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_cli",
+		"--ceiling", "50",
+		"--reserve", "20",
+		"--commit", "12",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: func() time.Time { return now }})
+	if exitCode != 0 {
+		t.Fatalf("budget smoke exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		OK        bool     `json:"ok"`
+		PolicyIDs []string `json:"budget_policy_ids"`
+		Released  struct {
+			Reservation struct {
+				State          string `json:"state"`
+				CommittedValue int64  `json:"committed_value"`
+				ReleasedValue  int64  `json:"released_value"`
+				ReservedValue  int64  `json:"reserved_value"`
+			} `json:"reservation"`
+		} `json:"released"`
+		BudgetSummary []struct {
+			BudgetPolicyID   string `json:"budget_policy_id"`
+			CeilingValue     int64  `json:"ceiling_value"`
+			ReservedValue    int64  `json:"reserved_value"`
+			CommittedValue   int64  `json:"committed_value"`
+			AvailableValue   int64  `json:"available_value"`
+			EffectiveCeiling int64  `json:"effective_ceiling"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if !payload.OK || len(payload.PolicyIDs) != 2 || payload.Released.Reservation.State != "released" {
+		t.Fatalf("payload = %#v, want successful smoke release", payload)
+	}
+	if payload.Released.Reservation.CommittedValue != 12 || payload.Released.Reservation.ReleasedValue != 8 || payload.Released.Reservation.ReservedValue != 0 {
+		t.Fatalf("released reservation = %#v", payload.Released.Reservation)
+	}
+	if len(payload.BudgetSummary) != 2 {
+		t.Fatalf("budget summaries = %#v, want machine and project summaries", payload.BudgetSummary)
+	}
+	for _, summary := range payload.BudgetSummary {
+		if summary.CeilingValue != 50 || summary.ReservedValue != 0 || summary.CommittedValue != 12 || summary.AvailableValue != 38 || summary.EffectiveCeiling != 50 {
+			t.Fatalf("summary = %#v, want committed smoke accounting", summary)
+		}
+	}
+}
+
+func TestBudgetSmokeSoftPolicyWarningsInTextAndJSON(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Unix(8, 0).UTC()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var textStdout, textStderr bytes.Buffer
+	textExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-text",
+	}, &textStdout, &textStderr, Deps{Now: func() time.Time { return now }})
+	if textExit != 0 {
+		t.Fatalf("budget soft text exit = %d stderr=%q", textExit, textStderr.String())
+	}
+	if !strings.Contains(textStdout.String(), "Budget warning: soft-budget-warn-only:") || !strings.Contains(textStdout.String(), "Budget warning: soft-budget-overflow:") {
+		t.Fatalf("text output = %q, want soft budget warnings", textStdout.String())
+	}
+
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var jsonStdout, jsonStderr bytes.Buffer
+	jsonExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli_json",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-json",
+		"--format", "json",
+	}, &jsonStdout, &jsonStderr, Deps{Now: func() time.Time { return now }})
+	if jsonExit != 0 {
+		t.Fatalf("budget soft json exit = %d stderr=%q", jsonExit, jsonStderr.String())
+	}
+	var payload struct {
+		Reserved struct {
+			Reservation struct {
+				GapReasons []string `json:"gap_reasons"`
+			} `json:"reservation"`
+		} `json:"reserved"`
+		BudgetSummary []struct {
+			GapReasons []string `json:"gap_reasons"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(jsonStdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, jsonStdout.String())
+	}
+	if !containsPrefix(payload.Reserved.Reservation.GapReasons, "soft-budget-warn-only:") {
+		t.Fatalf("reserved gap reasons = %#v, want soft warn-only reason", payload.Reserved.Reservation.GapReasons)
+	}
+	var summaryReasons []string
+	for _, summary := range payload.BudgetSummary {
+		summaryReasons = append(summaryReasons, summary.GapReasons...)
+	}
+	if !containsPrefix(summaryReasons, "soft-budget-overflow:") {
+		t.Fatalf("summary gap reasons = %#v, want soft overflow reason", summaryReasons)
+	}
+}
+
 func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
@@ -6532,6 +6654,15 @@ func cliLabels(names []string) []gh.Label {
 		labels = append(labels, gh.Label{Name: name})
 	}
 	return labels
+}
+
+func containsPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func cliApplyLabelChanges(labels []gh.Label, addLabels, removeLabels []string) []gh.Label {

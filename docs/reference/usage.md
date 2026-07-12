@@ -769,6 +769,52 @@ because local reports do not cover work outside LoopCoder. Until a DeliveryRun
 binds inventory or quota records, unrelated arrays are empty and confidence is
 `unknown`.
 
+Hierarchical budget accounting is also machine-local. Budget policies can be
+recorded for machine, project, DeliveryRun, task, worker, sub-agent, and
+provider/account/model scopes, with `parent_budget_policy_ids` preserved for
+audit inheritance. A reservation checks every applicable policy in its supplied
+scope chain inside one SQLite `BEGIN IMMEDIATE` transaction, then either
+reserves the full requested value at every level or persists a typed refusal
+such as `ErrBudgetExhausted` without changing any aggregate. Hard ceiling
+breaches refuse the reservation. Soft ceiling breaches are explicit:
+`warn-only` reservations proceed with soft-breach gap reasons, while
+`requires-approval` breaches return `ErrBudgetApprovalRequired` unless the
+request includes an approval id. Commits, releases, cancellations, and stale
+lease expiry are generation-fenced; replay still checks the current generation
+before returning `replay: true` so stale callers cannot hide behind an old
+operation key.
+
+`doctor --format json` renders budget state under
+`quota_usage_budget.budget_summary[]`. Each summary includes the policy id,
+scope, quantity, effective ceiling, reserved value, committed value, available
+value, confidence, policy version, active reservation ids, denial code when
+present, soft-overflow gap reasons, and approval/override provenance. Budget
+reservation records use ids derived from
+`idempotency_key`, `budget_policy_id`, and `requester_id`, and persist
+`requester_id`, `authorization_fingerprint`, source estimate usage record ids,
+commit usage record ids, and release usage record ids for audit.
+
+Unknown or estimated requirements do not silently consume budget. Exact local
+accounting can reserve directly; estimated requirements require an explicit
+approval id and are marked with conservative gap reasons. Budget override or
+approval only changes accounting policy and is not a permission, safety, or
+provider-auth override.
+
+For a local zero-network smoke check, use:
+
+```text
+loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserve 40 --commit 25 --format json
+```
+
+The command creates machine and project hard budget policies in the
+machine-local store by default, reserves capacity, commits observed usage,
+releases the unused reservation balance, and prints the resulting JSON
+accounting summary. Use `--policy-mode soft --overflow-behavior warn-only` to
+exercise soft-budget warning paths; text output prints budget warnings, and JSON
+output includes the same `gap_reasons`. Reusing the same `--idempotency-key`
+replays the same operation keys instead of reserving, committing, or releasing
+twice.
+
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,
 `identifier`, `classification`, `remediation`, and, where applicable, `legacy`,

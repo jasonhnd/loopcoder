@@ -107,6 +107,7 @@ loopcoder version                             # print version and build informat
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
 loopcoder providers refresh --repo .          # refresh bounded provider CLI installation inventory
+loopcoder budget smoke --repo . --project-id <project-id> --format json # exercise local quota usage budget accounting
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -255,6 +256,10 @@ default; their readiness or telemetry is `unknown`/`unavailable` with
 `network-permission-denied` or `network-denied`. The initial auth schema
 intentionally has no `expires_at` field because no current adapter exposes a
 credential-blind machine-readable expiry value.
+
+### Budget Accounting
+
+`loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserve 40 --commit 25 --format json` runs a local-only reserve/commit/release smoke check against the machine-local budget store. It creates machine and project hard budget policies by default, reserves capacity, commits observed usage, releases the unused reservation balance, and prints the resulting JSON accounting summary. Use `--policy-mode soft --overflow-behavior warn-only` to exercise soft-budget warning paths; text output prints budget warnings, and JSON output includes the same `gap_reasons`. Reusing the same `--idempotency-key` replays the same operation keys instead of reserving, committing, or releasing twice. Budget accounting is local evidence only and is not a permission, safety, provider-auth, or provider-global quota override.
 
 ### Project Registry
 

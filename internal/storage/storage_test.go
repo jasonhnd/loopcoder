@@ -33,10 +33,44 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
+	}
+}
+
+func TestBudgetReservationIdempotencyIndexScopedByPrimaryPolicy(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	insert := func(id, policyID string) error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			_, err := tx.Exec(ctx, `INSERT INTO budget_reservations(
+				budget_reservation_id, idempotency_key, request_fingerprint, requester_id,
+				quantity_kind, unit, value_scale, requested_value, reserved_value, committed_value,
+				released_value, state, generation, lease_expires_at, scope_key, policy_ids_json,
+				payload_json, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, "shared-key", "sha256:"+id, "requester",
+				"total-tokens", "token", 0, 1, 1, 0,
+				0, "active", 1, fixedNow().Add(time.Hour).Format(time.RFC3339Nano), "{}",
+				`["`+policyID+`"]`, "{}", fixedNow().Format(time.RFC3339Nano), fixedNow().Format(time.RFC3339Nano))
+			return err
+		})
+	}
+	if err := insert("bres_policy_a", "bpol_a"); err != nil {
+		t.Fatalf("insert policy a: %v", err)
+	}
+	if err := insert("bres_policy_b", "bpol_b"); err != nil {
+		t.Fatalf("insert policy b with same idempotency key: %v", err)
+	}
+	if err := insert("bres_policy_a_duplicate", "bpol_a"); err == nil {
+		t.Fatal("duplicate same-policy idempotency insert succeeded, want constraint failure")
 	}
 }
 

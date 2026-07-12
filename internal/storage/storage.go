@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 13
+	CurrentSchemaVersion = 15
 
 	driverName = "sqlite"
 
@@ -306,6 +306,16 @@ var migrations = []migration{
 		name:       "usage ledger",
 		statements: usageLedgerSchemaStatements,
 	},
+	{
+		version:    14,
+		name:       "hierarchical budget accounting",
+		statements: budgetSchemaStatements,
+	},
+	{
+		version:    15,
+		name:       "scoped budget reservation idempotency",
+		statements: budgetSchemaV15Statements,
+	},
 }
 
 var requiredTables = []string{
@@ -341,6 +351,10 @@ var requiredTables = []string{
 	"quota_snapshots",
 	"usage_records",
 	"usage_reconciliations",
+	"budget_policies",
+	"budget_reservations",
+	"budget_aggregates",
+	"quota_budget_events",
 	"inventory_events",
 }
 
@@ -552,7 +566,7 @@ func withRetry(ctx context.Context, op func() error) error {
 	var err error
 	for attempt := 0; attempt < 8; attempt++ {
 		err = op()
-		if err == nil || !sqliteBusy(err) {
+		if err == nil || !IsBusy(err) {
 			return err
 		}
 		delay := time.Duration(attempt+1) * 25 * time.Millisecond
@@ -565,13 +579,24 @@ func withRetry(ctx context.Context, op func() error) error {
 	return err
 }
 
-func sqliteBusy(err error) bool {
+func IsBusy(err error) bool {
 	if err == nil {
 		return false
 	}
 	var sqliteErr *moderncsqlite.Error
 	if errors.As(err, &sqliteErr) {
 		return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+	}
+	return false
+}
+
+func IsConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 	}
 	return false
 }
