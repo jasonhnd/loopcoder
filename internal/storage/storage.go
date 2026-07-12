@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 15
+	CurrentSchemaVersion = 16
 
 	driverName = "sqlite"
 
@@ -316,6 +316,11 @@ var migrations = []migration{
 		name:       "scoped budget reservation idempotency",
 		statements: budgetSchemaV15Statements,
 	},
+	{
+		version:    16,
+		name:       "task requirement classification",
+		statements: taskRequirementSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -356,6 +361,8 @@ var requiredTables = []string{
 	"budget_aggregates",
 	"quota_budget_events",
 	"inventory_events",
+	"task_requirements",
+	"task_requirement_overrides",
 }
 
 type migration struct {

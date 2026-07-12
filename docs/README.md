@@ -22,6 +22,7 @@ Every document is exactly one of these types:
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.7.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
+- [`reference/task-requirement-classification.md`](reference/task-requirement-classification.md): v0.8 planner task requirement classification.
 - [`reference/v0.7.0-go-no-go.md`](reference/v0.7.0-go-no-go.md): v0.7.0 release readiness report template.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
 - [`reference/usage.md`](reference/usage.md): setup and end-to-end usage.

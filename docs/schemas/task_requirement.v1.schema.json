@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loopcoder.local/schemas/task_requirement.v1.schema.json",
+  "title": "LoopCoder TaskRequirement v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_version",
+    "task_requirement_id",
+    "task_requirement_fingerprint",
+    "project_id",
+    "delivery_run_id",
+    "task_id",
+    "task_key",
+    "role_key",
+    "risk_tier",
+    "permission_required",
+    "side_effect_class",
+    "required_capabilities",
+    "required_output",
+    "verification_requirements",
+    "scope_json",
+    "data_classification",
+    "network_required",
+    "nested_allowed",
+    "cancellation_required",
+    "quality_floor",
+    "classification_rules",
+    "heuristics",
+    "provenance_summary",
+    "policy_version",
+    "plan_fingerprint",
+    "created_at",
+    "updated_at",
+    "created_by",
+    "updated_by",
+    "host",
+    "classification",
+    "confidence",
+    "source",
+    "heuristic",
+    "gap_reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": "loopcoder.task_requirement.v1" },
+    "record_version": { "const": 1 },
+    "task_requirement_id": { "type": "string", "pattern": "^treq_[a-z2-7]+$" },
+    "task_requirement_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "project_id": { "type": "string", "minLength": 1 },
+    "delivery_run_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "task_key": { "type": "string", "minLength": 1 },
+    "role_key": { "type": "string", "minLength": 1 },
+    "risk_tier": { "enum": ["low", "medium", "high", "critical"] },
+    "permission_required": { "enum": ["read-only", "write", "orchestrate"] },
+    "side_effect_class": { "enum": ["none", "local-read", "local-write", "repo-write", "git-remote-write", "github-write", "provider-launch", "external-write"] },
+    "required_capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/capability_requirement" }
+    },
+    "required_output": { "enum": ["freeform", "markdown", "json", "json-schema", "patch", "branch", "pr", "report", "verification-verdict"] },
+    "verification_requirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/verification_requirement" }
+    },
+    "scope_json": { "type": "string", "minLength": 2 },
+    "data_classification": { "type": "string", "minLength": 1 },
+    "network_required": { "enum": ["not-needed", "allowed-if-profile-grants", "required"] },
+    "nested_allowed": { "type": "boolean" },
+    "cancellation_required": { "type": "boolean" },
+    "quality_floor": { "enum": ["standard", "strong", "adversarial"] },
+    "classification_rules": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9.-]+$" },
+      "minItems": 1
+    },
+    "heuristics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/heuristic" }
+    },
+    "provenance_summary": { "type": "string", "minLength": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "plan_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "created_by": { "type": "object" },
+    "updated_by": { "type": "object" },
+    "host": { "type": "object" },
+    "classification": { "type": "string", "minLength": 1 },
+    "confidence": { "enum": ["exact", "estimated", "unknown", "unavailable", "stale"] },
+    "source": { "$ref": "#/$defs/source" },
+    "heuristic": { "type": "boolean" },
+    "heuristic_reason": { "type": "string" },
+    "terminal_error_code": { "type": "string" },
+    "gap_reasons": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9.-]+$" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "capability_requirement": {
+      "type": "object",
+      "required": ["dimension", "required_value", "minimum_confidence", "freshness_required", "source"],
+      "properties": {
+        "dimension": {
+          "enum": [
+            "roles_supported",
+            "read_only",
+            "json_output",
+            "nested_subagents",
+            "mcp_config",
+            "cancellation",
+            "token_usage_reporting",
+            "context_window_tokens",
+            "tool_support",
+            "image_input",
+            "image_output"
+          ]
+        },
+        "required_value": {},
+        "minimum_confidence": { "enum": ["exact", "estimated", "unknown", "unavailable", "stale"] },
+        "freshness_required": { "enum": ["fresh", "stale", "expired", "not-applicable"] },
+        "source": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "verification_requirement": {
+      "type": "object",
+      "required": ["verification_kind", "required_for_risk_tiers", "independence_level", "permission_required", "output_contract", "source"],
+      "properties": {
+        "verification_kind": { "enum": ["none", "self-check", "local-command", "hosted-check", "loopreview", "security-review", "human-approval", "override"] },
+        "required_for_risk_tiers": {
+          "type": "array",
+          "items": { "enum": ["low", "medium", "high", "critical"] }
+        },
+        "independence_level": { "enum": ["none", "different-model", "different-account", "different-provider", "human"] },
+        "permission_required": { "enum": ["read-only", "write", "orchestrate"] },
+        "output_contract": { "enum": ["verification-verdict", "json-schema", "markdown", "freeform", "json", "report"] },
+        "source": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "heuristic": {
+      "type": "object",
+      "required": ["rule_id", "reason", "confidence"],
+      "properties": {
+        "rule_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "confidence": { "enum": ["exact", "estimated", "unknown", "unavailable", "stale"] }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["source_kind", "source_reference"],
+      "properties": {
+        "source_kind": { "type": "string", "minLength": 1 },
+        "source_reference": { "type": "string", "minLength": 1 },
+        "input_fingerprints": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "record_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
