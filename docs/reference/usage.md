@@ -1034,6 +1034,10 @@ loopcoder nested run --repo . --plan child-plan.json --provider codex --format j
 
 loopcoder status --repo . --format json
 loopcoder report --repo . --run <run-id> --format json
+
+loopcoder delivery plan --project-id <project-id> --run-id <run-id> --format json
+loopcoder delivery decide --project-id <project-id> --run-id <run-id> --action approve --expected-authorization-fingerprint <sha256:...>
+loopcoder delivery continue --project-id <project-id> --run-id <run-id> --expected-authorization-fingerprint <sha256:...>
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
@@ -1041,8 +1045,36 @@ loopcoder report --repo . --run <run-id> --format json
 advanced/operator commands in v0.6.1. `projects`, `migrate`, and `nested` are
 v0.7.0 candidate commands before the v0.7.0 release is published. `state push`
 is the explicit
-state-branch publish path; `kill` only targets loopcoder-managed processes for
+state-branch publish path; `delivery` is a v0.8.0 candidate approval-gating
+surface for DeliveryRun records; `kill` only targets loopcoder-managed processes for
 a run or repository and should not be used as a bare process-name terminator.
+
+### DeliveryRun Approval Gates (v0.8.0 Candidate)
+
+`loopcoder delivery` is the host-safe v0.8 DeliveryRun approval surface for
+terminal users and JSON callers. It works against the machine-local storage
+database and takes explicit `--project-id` plus `--run-id` selectors.
+
+`loopcoder delivery plan` is side-effect-free at the DeliveryRun layer: it reads
+the persisted run, task, and dependency rows and returns a fingerprinted
+proposal without launching providers, dispatching workers, mutating worktrees,
+editing GitHub, changing credentials, or writing DeliveryRun rows. The response
+contains `input_fingerprint`, `policy_fingerprint`, `plan_fingerprint`, and
+`authorization_fingerprint`; callers should pass the authorization fingerprint
+back to `decide` and `continue` with
+`--expected-authorization-fingerprint`.
+
+`loopcoder delivery decide` records a fingerprint-bound decision in one write
+transaction. Supported actions are `approve`, `reject`, `edit`, `expire`, and
+`supersede`. An approval is valid only for the exact current proposal
+fingerprint; changed task requirements, scope, dependency graph, policy inputs,
+or run intent produce `ErrStaleApproval` and require a fresh `plan` response
+and decision.
+
+`loopcoder delivery continue` is approval-gated. It verifies that the current
+proposal still matches the expected fingerprint, that an active approval exists
+and is not expired, and only then advances the DeliveryRun to a schedulable
+state. It does not dispatch workers or launch providers.
 
 ### Nested Child Plans (v0.7.0 Candidate)
 
@@ -1107,6 +1139,9 @@ remote provider.
   local-only Worker/Verifier blocks. Run `loopcoder relay flush --repo <path>`
   to print and acknowledge them, or `loopcoder relay list --repo <path>` to
   inspect without clearing.
+- `loopcoder delivery decide` and `loopcoder delivery continue` reserve `10`
+  for pending or expired approval, `11` for stale plan or stale approval, `12`
+  for rejection, and `13` for deterministic policy denial.
 
 ## Verifier Provider Status
 

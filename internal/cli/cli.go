@@ -95,6 +95,7 @@ var commands = []Command{
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -286,6 +287,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "providers" {
 		return runProviders(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "delivery" {
+		return runDelivery(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
 	}
@@ -405,6 +409,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "providers" {
 		printProvidersHelp(w)
+		return
+	}
+	if command.Name == "delivery" {
+		printDeliveryHelp(w)
 		return
 	}
 	if command.Name == "nested" {

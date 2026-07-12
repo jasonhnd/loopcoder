@@ -283,6 +283,14 @@ persistence functions. Invalid transitions, dependency cycles, stale approvals,
 duplicate replay, missing references, and cross-project references return the
 stable typed errors from the spec and roll back the whole write transaction.
 
+The v0.8 candidate approval surface is `loopcoder delivery`. `delivery plan`
+performs only read transactions over existing DeliveryRun, task, and dependency
+rows and returns the current input, policy, plan, and authorization
+fingerprints. `delivery decide` records approval decisions for the exact current
+fingerprint, and `delivery continue` refuses stale, expired, rejected, or
+policy-denied work before it can become schedulable. These commands do not
+dispatch workers or launch providers.
+
 When a schema-v9 database is opened, migration 10 captures a local backup image
 before opening the migration write transaction, then records that backup
 metadata in the v10 tables during the migration. Legacy v0.7 `runs` rows are
