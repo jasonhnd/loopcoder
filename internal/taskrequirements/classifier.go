@@ -192,7 +192,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 		raiseRisk(RiskCritical)
 		addVerification(&req, VerificationHumanApproval, []RiskTier{RiskCritical}, IndependenceHuman, PermissionReadOnly, OutputVerificationVerdict, "scope.external-write")
 	}
-	if scope.AllowsLocalRuntimeWrite {
+	if scope.AllowsLocalRuntimeWrite || scope.RuntimeCommands || len(scope.Commands) > 0 {
 		applyRule("scope.local-runtime-write")
 		raisePermission(PermissionWrite)
 		raiseSideEffect(SideEffectLocalWrite)
@@ -239,7 +239,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 	if scope.RequiredContextTokens > 0 {
 		addCapability(&req, CapabilityContextWindowTokens, scope.RequiredContextTokens, "deterministic-rule:scope.required-context")
 	}
-	if scope.AllowsProviderLaunch || scope.RequiresNested || scope.RuntimeCommands {
+	if scope.AllowsProviderLaunch || scope.RequiresNested || scope.RuntimeCommands || len(scope.Commands) > 0 {
 		applyRule("cap.cancellation")
 		req.CancellationRequired = true
 		addCapability(&req, CapabilityCancellation, true, "deterministic-rule:cap.cancellation")
@@ -258,7 +258,7 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 	if scope.ContainsSecretMaterial {
 		applyRule("data.secret-material")
 		req.DataClassification = "secret-material"
-		req.TerminalErrorCode = "ErrPolicyDenied"
+		req.TerminalErrorCode = string(ErrPolicyDeniedCode)
 		req.GapReasons = appendReason(req.GapReasons, "secret-material-refusal")
 		raiseRisk(RiskCritical)
 		addVerification(&req, VerificationHumanApproval, []RiskTier{RiskCritical}, IndependenceHuman, PermissionReadOnly, OutputVerificationVerdict, "data.secret-material")
@@ -338,6 +338,9 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 	}
 	if err := Validate(req); err != nil {
 		return req, err
+	}
+	if req.TerminalErrorCode == string(ErrPolicyDeniedCode) {
+		return req, typed(ErrPolicyDeniedCode, "secret-material task requirement denied by policy")
 	}
 	if req.TerminalErrorCode == string(ErrRequirementUnknownCode) {
 		return req, typed(ErrRequirementUnknownCode, "ambiguous high-risk task requirement needs approval")
@@ -578,7 +581,7 @@ func writesFromOutput(output OutputContract) bool {
 }
 
 func isDocsOnly(scope Scope) bool {
-	if scope.AllowsGitHubWrite || scope.AllowsGitRemoteWrite || scope.AllowsExternalWrite || scope.AllowsLocalRuntimeWrite || scope.AllowsProviderLaunch || scope.RuntimeCommands {
+	if scope.AllowsGitHubWrite || scope.AllowsGitRemoteWrite || scope.AllowsExternalWrite || scope.AllowsLocalRuntimeWrite || scope.AllowsProviderLaunch || scope.RuntimeCommands || len(scope.Commands) > 0 {
 		return false
 	}
 	if scope.Documentation {

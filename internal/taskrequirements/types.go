@@ -38,6 +38,7 @@ const (
 	ErrReplanRequiredCode                    ErrorCode = "ErrReplanRequired"
 	ErrReplanBoundExceededCode               ErrorCode = "ErrReplanBoundExceeded"
 	ErrRoutingFingerprintMismatchCode        ErrorCode = "ErrRoutingFingerprintMismatch"
+	ErrPolicyDeniedCode                      ErrorCode = ErrorCode(delivery.ErrPolicyDeniedCode)
 	ErrInvalidRecordCode                     ErrorCode = ErrorCode(delivery.ErrInvalidRecordCode)
 	ErrDuplicateRecordCode                   ErrorCode = ErrorCode(delivery.ErrDuplicateRecordCode)
 	ErrMissingReferenceCode                  ErrorCode = ErrorCode(delivery.ErrMissingReferenceCode)
@@ -49,6 +50,7 @@ var (
 	ErrRequirementUnknown                = &TypedError{Code: ErrRequirementUnknownCode}
 	ErrRequirementConfidenceInsufficient = &TypedError{Code: ErrRequirementConfidenceInsufficientCode}
 	ErrInvalidRecord                     = &TypedError{Code: ErrInvalidRecordCode}
+	ErrPolicyDenied                      = &TypedError{Code: ErrPolicyDeniedCode}
 	ErrDuplicateRecord                   = &TypedError{Code: ErrDuplicateRecordCode}
 	ErrMissingReference                  = &TypedError{Code: ErrMissingReferenceCode}
 	ErrCrossProjectReference             = &TypedError{Code: ErrCrossProjectReferenceCode}
@@ -72,10 +74,14 @@ func (e *TypedError) Error() string {
 
 func (e *TypedError) Is(target error) bool {
 	var typed *TypedError
-	if !errors.As(target, &typed) {
-		return false
+	if errors.As(target, &typed) {
+		return e.Code == typed.Code
 	}
-	return e.Code == typed.Code
+	var deliveryTyped *delivery.TypedError
+	if errors.As(target, &deliveryTyped) {
+		return string(e.Code) == string(deliveryTyped.Code)
+	}
+	return false
 }
 
 func typed(code ErrorCode, format string, args ...any) error {
@@ -301,7 +307,7 @@ func (req CapabilityRequirement) SatisfiedBy(evidence CapabilityEvidenceSet) boo
 	if !ok {
 		return false
 	}
-	if fact.Freshness == providerinventory.FreshnessStale || fact.Freshness == providerinventory.FreshnessExpired {
+	if !freshnessSatisfied(req.FreshnessRequired, fact.Freshness) {
 		return false
 	}
 	if fact.Confidence == providerinventory.ConfidenceUnknown || fact.Confidence == providerinventory.ConfidenceUnavailable || fact.Confidence == providerinventory.ConfidenceStale {
@@ -311,6 +317,17 @@ func (req CapabilityRequirement) SatisfiedBy(evidence CapabilityEvidenceSet) boo
 		return false
 	}
 	return requiredValueSatisfied(req.RequiredValue, fact.Value)
+}
+
+func freshnessSatisfied(required, actual providerinventory.FreshnessState) bool {
+	switch required {
+	case providerinventory.FreshnessFresh:
+		return actual == providerinventory.FreshnessFresh
+	case providerinventory.FreshnessNotApplicable:
+		return actual == providerinventory.FreshnessNotApplicable
+	default:
+		return false
+	}
 }
 
 func HardRequirementsSatisfied(requirements []CapabilityRequirement, evidence CapabilityEvidenceSet) bool {

@@ -144,11 +144,46 @@ func TestSecretMaterialFixtureRefusesRoute(t *testing.T) {
 	input := baseInput()
 	input.Scope = Scope{ContainsSecretMaterial: true, AllowsProviderLaunch: true}
 	got, err := Classify(input)
-	if err != nil {
-		t.Fatalf("Classify() error = %v", err)
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("Classify() error = %v, want ErrPolicyDenied", err)
 	}
-	if got.RiskTier != RiskCritical || got.TerminalErrorCode != "ErrPolicyDenied" {
+	if got.RiskTier != RiskCritical || got.TerminalErrorCode != string(ErrPolicyDeniedCode) {
 		t.Fatalf("secret material classification = %#v", got)
+	}
+}
+
+func TestRuntimeCommandsRaiseMediumLocalWriteFloor(t *testing.T) {
+	tests := []struct {
+		name  string
+		scope Scope
+	}{
+		{
+			name:  "runtime command flag",
+			scope: Scope{RuntimeCommands: true},
+		},
+		{
+			name:  "populated command scope",
+			scope: Scope{Commands: []string{"go test ./internal/taskrequirements -count=1"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := baseInput()
+			input.Scope = tt.scope
+			got, err := Classify(input)
+			if err != nil {
+				t.Fatalf("Classify() error = %v", err)
+			}
+			if got.RiskTier != RiskMedium || got.PermissionRequired != PermissionWrite || got.SideEffectClass != SideEffectLocalWrite {
+				t.Fatalf("runtime classification = (%s, %s, %s), want (%s, %s, %s)", got.RiskTier, got.PermissionRequired, got.SideEffectClass, RiskMedium, PermissionWrite, SideEffectLocalWrite)
+			}
+			if !contains(got.ClassificationRules, "scope.local-runtime-write") || !contains(got.ClassificationRules, "cap.cancellation") {
+				t.Fatalf("classification rules = %#v, want runtime floor and cancellation", got.ClassificationRules)
+			}
+			if !got.CancellationRequired {
+				t.Fatalf("CancellationRequired = false, want true")
+			}
+		})
 	}
 }
 
@@ -166,8 +201,19 @@ func TestUnknownCapabilityEvidenceCannotSatisfyHardRequirement(t *testing.T) {
 	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessStale}}) {
 		t.Fatal("stale evidence satisfied hard requirement")
 	}
+	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessNotApplicable}}) {
+		t.Fatal("not-applicable freshness satisfied fresh hard requirement")
+	}
+	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact}}) {
+		t.Fatal("zero freshness satisfied fresh hard requirement")
+	}
 	if !req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessFresh}}) {
 		t.Fatal("fresh exact evidence did not satisfy hard requirement")
+	}
+
+	req.FreshnessRequired = ""
+	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessFresh}}) {
+		t.Fatal("malformed freshness requirement was satisfied")
 	}
 }
 
