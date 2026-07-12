@@ -18,12 +18,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/usageledger"
 )
 
@@ -237,7 +240,12 @@ func Load(opts Options) (Report, error) {
 	project := resolveProjectMetadata(repoPath)
 	runTree := loadRunTree(repoPath, runID, project.ProjectID, now)
 	usageRecords := usageRecordsForStatus(attempts, verifiers, runID, project.ProjectID, now)
-	quotaUsageRefs := usageledger.QuotaUsageRefs(usageRecords, providerinventory.ConfidenceEstimated, nil)
+	budgetPolicyIDs, budgetReservationIDs := budgetRefsForStatus(context.Background(), project.ProjectID, now)
+	confidence := providerinventory.ConfidenceEstimated
+	if len(usageRecords) == 0 && (len(budgetPolicyIDs) > 0 || len(budgetReservationIDs) > 0) {
+		confidence = providerinventory.ConfidenceExact
+	}
+	quotaUsageRefs := usageledger.QuotaUsageRefsWithBudget(usageRecords, confidence, nil, budgetPolicyIDs, budgetReservationIDs)
 
 	return Report{
 		RunID:               runID,
@@ -255,6 +263,34 @@ func Load(opts Options) (Report, error) {
 		RunTree:             runTree,
 		Rows:                rows,
 	}, nil
+}
+
+func budgetRefsForStatus(ctx context.Context, projectID string, now time.Time) ([]string, []string) {
+	layout, err := home.Resolve(home.DefaultDeps())
+	if err != nil {
+		return nil, nil
+	}
+	if _, err := os.Stat(layout.DatabasePath()); err != nil {
+		return nil, nil
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: layout.DatabasePath(), Now: func() time.Time { return now }})
+	if err != nil {
+		return nil, nil
+	}
+	defer store.Close()
+	summaries, err := budget.Summaries(ctx, store, projectID)
+	if err != nil {
+		return nil, nil
+	}
+	var policyIDs []string
+	var reservationIDs []string
+	for _, summary := range summaries {
+		policyIDs = append(policyIDs, summary.BudgetPolicyID)
+		reservationIDs = append(reservationIDs, summary.ActiveReservationIDs...)
+	}
+	sort.Strings(policyIDs)
+	sort.Strings(reservationIDs)
+	return policyIDs, reservationIDs
 }
 
 func MarshalJSON(report Report) ([]byte, error) {

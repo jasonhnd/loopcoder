@@ -769,6 +769,42 @@ because local reports do not cover work outside LoopCoder. Until a DeliveryRun
 binds inventory or quota records, unrelated arrays are empty and confidence is
 `unknown`.
 
+Hierarchical budget accounting is also machine-local. Budget policies can be
+recorded for machine, project, DeliveryRun, task, worker, sub-agent, and
+provider/account/model scopes. A reservation checks every applicable hard
+policy in its supplied scope chain inside one SQLite `BEGIN IMMEDIATE`
+transaction, then either reserves the full requested value at every level or
+persists a typed refusal such as `ErrBudgetExhausted` without changing any
+aggregate. Commits, releases, cancellations, and stale lease expiry are
+generation-fenced and idempotent, so replaying the same operation key does not
+double count.
+
+`doctor --format json` renders budget state under
+`quota_usage_budget.budget_summary[]`. Each summary includes the policy id,
+scope, quantity, effective ceiling, reserved value, committed value, available
+value, confidence, policy version, active reservation ids, denial code when
+present, and approval/override provenance. `status --format json` keeps the
+lighter reference contract and lists relevant `budget_policy_ids` and
+`budget_reservation_ids` in `quota_usage_refs`.
+
+Unknown or estimated requirements do not silently consume budget. Exact local
+accounting can reserve directly; estimated requirements require an explicit
+approval id and are marked with conservative gap reasons. Budget override or
+approval only changes accounting policy and is not a permission, safety, or
+provider-auth override.
+
+For a local zero-network smoke check, use:
+
+```text
+loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserve 40 --commit 25 --format json
+```
+
+The command creates machine and project hard budget policies in the
+machine-local store, reserves capacity, commits observed usage, releases the
+unused reservation balance, and prints the resulting JSON accounting summary.
+Reusing the same `--idempotency-key` replays the same operation keys instead of
+reserving, committing, or releasing twice.
+
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,
 `identifier`, `classification`, `remediation`, and, where applicable, `legacy`,

@@ -2,6 +2,7 @@ package runstatus
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
@@ -237,6 +240,68 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	}
 	if strings.Contains(string(data), "RunID") {
 		t.Fatalf("status JSON used unstable CamelCase keys:\n%s", string(data))
+	}
+}
+
+func TestLoadStatusIncludesBudgetRefsFromMachineLocalStorage(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+	repo := t.TempDir()
+	runID := "run-budget-refs"
+	now := time.Unix(8, 0).UTC()
+	writeAttempt(t, repo, runID, 731, 1, "job-731-1", workerReport(731, reporter.Usage{}))
+	if err := os.Chtimes(state.AttemptPath(repo, runID, "job-731-1"), now, now); err != nil {
+		t.Fatalf("Chtimes attempt: %v", err)
+	}
+
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(homeDir, "data", "loopcoder.db"), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	scope := budget.Scope{ScopeKind: budget.ScopeMachine}
+	policy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
+		Scope:         scope,
+		QuantityKind:  providerinventory.QuantityTotalTokens,
+		WindowKind:    providerinventory.WindowUnbounded,
+		PolicyMode:    budget.PolicyHard,
+		CeilingValue:  10,
+		PolicyVersion: "status-test-v1",
+		Actor:         budget.Actor{ActorID: "test", Role: "test"},
+		Host:          budget.Host{HostID: "test"},
+	})
+	if err != nil {
+		t.Fatalf("UpsertPolicy: %v", err)
+	}
+	reserved, err := budget.Reserve(context.Background(), store, budget.ReserveRequest{
+		ScopeChain:            []budget.Scope{scope},
+		QuantityKind:          providerinventory.QuantityTotalTokens,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        3,
+		LeaseExpiresAt:        now.Add(time.Hour),
+		IdempotencyKey:        "status-budget-reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 budget.Actor{ActorID: "test", Role: "test"},
+		Host:                  budget.Host{HostID: "test"},
+	})
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !containsString(report.QuotaUsageRefs.BudgetPolicyIDs, policy.BudgetPolicyID) {
+		t.Fatalf("budget policy refs = %#v, missing %s", report.QuotaUsageRefs.BudgetPolicyIDs, policy.BudgetPolicyID)
+	}
+	if !containsString(report.QuotaUsageRefs.BudgetReservationIDs, reserved.Reservation.BudgetReservationID) {
+		t.Fatalf("budget reservation refs = %#v, missing %s", report.QuotaUsageRefs.BudgetReservationIDs, reserved.Reservation.BudgetReservationID)
+	}
+	if !containsString(report.QuotaUsageRefs.GapReasons, "operator-configured-budget-policy") {
+		t.Fatalf("quota usage refs gaps = %#v", report.QuotaUsageRefs.GapReasons)
 	}
 }
 

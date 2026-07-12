@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
@@ -141,7 +142,7 @@ type QuotaUsageBudget struct {
 	QuotaSources          []providerinventory.QuotaTelemetrySource `json:"quota_sources"`
 	QuotaSnapshots        []providerinventory.QuotaSnapshot        `json:"quota_snapshots"`
 	UsageSummary          []UsageSummary                           `json:"usage_summary"`
-	BudgetSummary         []any                                    `json:"budget_summary"`
+	BudgetSummary         []budget.Summary                         `json:"budget_summary"`
 	AvailabilityScores    []any                                    `json:"availability_scores"`
 	CircuitBreakers       []any                                    `json:"circuit_breakers"`
 	GapReasons            []string                                 `json:"gap_reasons"`
@@ -258,12 +259,18 @@ func RefreshUsageLedgerFromReports(ctx context.Context, store storage.Store, rep
 func BuildQuotaUsageBudgetFromReports(ctx context.Context, store storage.Store, repoPath, projectID string, observedAt time.Time) (QuotaUsageBudget, error) {
 	var records []UsageRecord
 	var gaps []string
+	var budgetSummaries []budget.Summary
 	if store != nil {
 		loaded, err := QueryUsageRecords(ctx, store, Query{ProjectID: projectID})
 		if err != nil {
 			return QuotaUsageBudget{}, err
 		}
 		records = loaded
+		summaries, err := budget.Summaries(ctx, store, projectID)
+		if err != nil {
+			return QuotaUsageBudget{}, err
+		}
+		budgetSummaries = summaries
 	}
 	if len(records) == 0 {
 		reports, err := reportquery.List(reportquery.Options{RepoPath: repoPath, Limit: maxReportRecords})
@@ -275,7 +282,13 @@ func BuildQuotaUsageBudgetFromReports(ctx context.Context, store storage.Store, 
 		gaps = append(gaps, ingested.GapReasons...)
 		gaps = append(gaps, "persisted-ledger-empty", "derived-from-reports-fallback")
 	}
-	return BuildQuotaUsageBudget(records, observedAt, gaps), nil
+	built := BuildQuotaUsageBudget(records, observedAt, gaps)
+	built.BudgetSummary = budgetSummaries
+	if len(budgetSummaries) > 0 {
+		built.GapReasons = dedupeStrings(append(built.GapReasons, "operator-configured-budget-policy"))
+		built.QuotaUsageFingerprint = fingerprintBudget(built)
+	}
+	return built, nil
 }
 
 func BuildQuotaUsageBudget(records []UsageRecord, observedAt time.Time, gapReasons []string) QuotaUsageBudget {
@@ -293,7 +306,7 @@ func BuildQuotaUsageBudget(records []UsageRecord, observedAt time.Time, gapReaso
 		QuotaSources:       []providerinventory.QuotaTelemetrySource{},
 		QuotaSnapshots:     []providerinventory.QuotaSnapshot{},
 		UsageSummary:       summaries,
-		BudgetSummary:      []any{},
+		BudgetSummary:      []budget.Summary{},
 		AvailabilityScores: []any{},
 		CircuitBreakers:    []any{},
 		GapReasons:         gapReasons,
@@ -303,22 +316,38 @@ func BuildQuotaUsageBudget(records []UsageRecord, observedAt time.Time, gapReaso
 }
 
 func QuotaUsageRefs(records []UsageRecord, confidence providerinventory.Confidence, gapReasons []string) providerinventory.QuotaUsageRefs {
+	return QuotaUsageRefsWithBudget(records, confidence, gapReasons, nil, nil)
+}
+
+func QuotaUsageRefsWithBudget(records []UsageRecord, confidence providerinventory.Confidence, gapReasons []string, budgetPolicyIDs, budgetReservationIDs []string) providerinventory.QuotaUsageRefs {
 	ids := make([]string, 0, len(records))
 	for _, record := range records {
 		ids = append(ids, record.UsageRecordID)
 	}
 	sort.Strings(ids)
-	if len(ids) == 0 {
+	budgetPolicyIDs = dedupeStrings(budgetPolicyIDs)
+	budgetReservationIDs = dedupeStrings(budgetReservationIDs)
+	if len(ids) == 0 && len(budgetPolicyIDs) == 0 && len(budgetReservationIDs) == 0 {
 		return providerinventory.EmptyQuotaUsageRefs()
 	}
-	gapReasons = dedupeStrings(append(gapReasons, "loopcoder-local-ledger-not-provider-global"))
+	if len(ids) > 0 {
+		gapReasons = append(gapReasons, "loopcoder-local-ledger-not-provider-global")
+	}
+	if len(budgetPolicyIDs) > 0 || len(budgetReservationIDs) > 0 {
+		gapReasons = append(gapReasons, "operator-configured-budget-policy")
+	}
+	gapReasons = dedupeStrings(gapReasons)
 	return providerinventory.QuotaUsageRefs{
-		SchemaVersion:         providerinventory.QuotaUsageRefsSchema,
-		QuotaUsageFingerprint: "sha256:" + hashHex("quota_usage_refs", strings.Join(ids, "\x00"), strings.Join(gapReasons, "\x00")),
+		SchemaVersion: providerinventory.QuotaUsageRefsSchema,
+		QuotaUsageFingerprint: "sha256:" + hashHex("quota_usage_refs",
+			strings.Join(ids, "\x00"),
+			strings.Join(budgetPolicyIDs, "\x00"),
+			strings.Join(budgetReservationIDs, "\x00"),
+			strings.Join(gapReasons, "\x00")),
 		QuotaSnapshotIDs:      []string{},
 		UsageRecordIDs:        ids,
-		BudgetPolicyIDs:       []string{},
-		BudgetReservationIDs:  []string{},
+		BudgetPolicyIDs:       budgetPolicyIDs,
+		BudgetReservationIDs:  budgetReservationIDs,
 		AvailabilityScoreIDs:  []string{},
 		CircuitBreakerIDs:     []string{},
 		Confidence:            confidence,

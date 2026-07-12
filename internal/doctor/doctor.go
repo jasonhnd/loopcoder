@@ -20,6 +20,7 @@ import (
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -440,7 +441,7 @@ func normalizeQuotaUsageBudget(report usageledger.QuotaUsageBudget) usageledger.
 		report.UsageSummary = []usageledger.UsageSummary{}
 	}
 	if report.BudgetSummary == nil {
-		report.BudgetSummary = []any{}
+		report.BudgetSummary = []budget.Summary{}
 	}
 	if report.AvailabilityScores == nil {
 		report.AvailabilityScores = []any{}
@@ -2315,7 +2316,18 @@ func checkQuotaTelemetry(inventory providerinventory.Report) Check {
 }
 
 func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now time.Time) (usageledger.QuotaUsageBudget, Check) {
-	budget, err := usageledger.BuildQuotaUsageBudgetFromReports(ctx, nil, repoPath, projectID, now)
+	store := storage.Store(nil)
+	layout, layoutErr := home.Resolve(home.DefaultDeps())
+	if layoutErr == nil {
+		if health, healthErr := storage.CheckHealth(ctx, layout.DatabasePath()); healthErr == nil && health.OK && health.SchemaVersion == storage.CurrentSchemaVersion {
+			opened, openErr := storage.Open(ctx, storage.Options{Path: layout.DatabasePath(), Now: func() time.Time { return now }})
+			if openErr == nil {
+				store = opened
+				defer store.Close()
+			}
+		}
+	}
+	budget, err := usageledger.BuildQuotaUsageBudgetFromReports(ctx, store, repoPath, projectID, now)
 	if err != nil {
 		return normalizeQuotaUsageBudget(usageledger.QuotaUsageBudget{}), Check{
 			Name:    "quota usage budget",
@@ -2325,12 +2337,20 @@ func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now 
 		}
 	}
 	budget = normalizeQuotaUsageBudget(budget)
-	if len(budget.UsageSummary) == 0 {
+	if len(budget.UsageSummary) == 0 && len(budget.BudgetSummary) == 0 {
 		return budget, Check{
 			Name:    "quota usage budget",
 			Code:    "quota_usage_budget_empty",
 			Status:  StatusWarn,
 			Message: "no local usage records found; quota remains unknown and no provider-wide usage is inferred",
+		}
+	}
+	if len(budget.BudgetSummary) > 0 {
+		return budget, Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_policy_state",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("local budget accounting summarized %d budget scope(s), %d usage scope(s), confidence=%s; gaps=%s", len(budget.BudgetSummary), len(budget.UsageSummary), budget.Confidence, strings.Join(budget.GapReasons, ",")),
 		}
 	}
 	return budget, Check{

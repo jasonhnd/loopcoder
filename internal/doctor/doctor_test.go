@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
@@ -21,6 +22,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/usageledger"
 )
 
 func TestRunReportsHealthyPreflight(t *testing.T) {
@@ -335,6 +337,78 @@ func TestRenderJSONIncludesQuotaUsageBudgetFallbackContract(t *testing.T) {
 	}
 	if !foundTotal {
 		t.Fatalf("total token summary missing: %#v", payload.QuotaUsageBudget.UsageSummary)
+	}
+}
+
+func TestRenderJSONIncludesBudgetSummaryContract(t *testing.T) {
+	now := time.Unix(0, 0).UTC().Add(804 * time.Hour)
+	report := usageledger.QuotaUsageBudget{
+		SchemaVersion:         usageledger.QuotaUsageBudgetSchema,
+		GeneratedAt:           now.Format(time.RFC3339Nano),
+		QuotaUsageFingerprint: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		Confidence:            providerinventory.ConfidenceEstimated,
+		QuotaSources:          []providerinventory.QuotaTelemetrySource{},
+		QuotaSnapshots:        []providerinventory.QuotaSnapshot{},
+		UsageSummary:          []usageledger.UsageSummary{},
+		BudgetSummary: []budget.Summary{{
+			BudgetPolicyID:       "bpol_test",
+			Scope:                budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: "proj_test"},
+			ScopeKey:             `{"scope_kind":"project","project_id":"proj_test"}`,
+			QuantityKind:         providerinventory.QuantityTotalTokens,
+			Unit:                 "token",
+			WindowKind:           providerinventory.WindowUnbounded,
+			PolicyMode:           budget.PolicyHard,
+			CeilingValue:         100,
+			ReservedValue:        40,
+			CommittedValue:       25,
+			AvailableValue:       35,
+			EffectiveCeiling:     100,
+			Confidence:           providerinventory.ConfidenceExact,
+			PolicyVersion:        "test-v1",
+			ActiveReservationIDs: []string{"bres_test"},
+			Denial:               "ErrBudgetExhausted",
+			ApprovalID:           "approval_test",
+			GapReasons:           []string{"operator-configured-budget-policy"},
+		}},
+		AvailabilityScores: []any{},
+		CircuitBreakers:    []any{},
+		GapReasons:         []string{"operator-configured-budget-policy"},
+	}
+	var out bytes.Buffer
+	if err := RenderJSON(&out, WithMetadata(Report{QuotaUsageBudget: report}, t.TempDir(), BuildInfo{Version: "0.8.0", Commit: "abc123", Date: now.Format(time.RFC3339Nano)})); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		QuotaUsageBudget struct {
+			BudgetSummary []struct {
+				BudgetPolicyID       string                         `json:"budget_policy_id"`
+				QuantityKind         providerinventory.QuantityKind `json:"quantity_kind"`
+				CeilingValue         int64                          `json:"ceiling_value"`
+				ReservedValue        int64                          `json:"reserved_value"`
+				CommittedValue       int64                          `json:"committed_value"`
+				AvailableValue       int64                          `json:"available_value"`
+				EffectiveCeiling     int64                          `json:"effective_ceiling"`
+				Confidence           providerinventory.Confidence   `json:"confidence"`
+				PolicyVersion        string                         `json:"policy_version"`
+				ActiveReservationIDs []string                       `json:"active_reservation_ids"`
+				Denial               string                         `json:"denial"`
+				ApprovalID           string                         `json:"approval_id"`
+				GapReasons           []string                       `json:"gap_reasons"`
+			} `json:"budget_summary"`
+		} `json:"quota_usage_budget"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.QuotaUsageBudget.BudgetSummary) != 1 {
+		t.Fatalf("budget summary = %#v", payload.QuotaUsageBudget.BudgetSummary)
+	}
+	got := payload.QuotaUsageBudget.BudgetSummary[0]
+	if got.BudgetPolicyID != "bpol_test" || got.AvailableValue != 35 || got.ReservedValue != 40 || got.CommittedValue != 25 || got.Denial != "ErrBudgetExhausted" || got.ApprovalID != "approval_test" {
+		t.Fatalf("budget summary = %#v, want accounting and provenance fields", got)
+	}
+	if got.Confidence != providerinventory.ConfidenceExact || len(got.ActiveReservationIDs) != 1 || !containsString(got.GapReasons, "operator-configured-budget-policy") {
+		t.Fatalf("budget summary confidence/provenance = %#v", got)
 	}
 }
 
