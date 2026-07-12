@@ -750,3 +750,53 @@ func stringsRepeat(s string, count int) string {
 	}
 	return out
 }
+
+func TestSupersedeMarksApprovalRowsStaleWithSpecStatus(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if _, err := Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionApprove,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "approve-before-supersede",
+		Now:                              fixedTime().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("Decide approve: %v", err)
+	}
+	result, err := Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionSupersede,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "supersede-approved-plan",
+		Now:                              fixedTime().Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Decide supersede: %v", err)
+	}
+	if result.ApprovalStatus != "stale" {
+		t.Fatalf("supersede run approval status = %q, want stale", result.ApprovalStatus)
+	}
+	var status string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT status FROM delivery_approvals WHERE project_id = ? AND delivery_run_id = ?`, run.ProjectID, run.DeliveryRunID).Scan(&status)
+	}); err != nil {
+		t.Fatalf("query approval status: %v", err)
+	}
+	// Spec 0801 Approval.status enum: active, rejected, expired, revoked, stale.
+	if status != "stale" {
+		t.Fatalf("approval row status = %q, want spec-legal %q", status, "stale")
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals WHERE status = 'active'`, 0)
+}

@@ -375,7 +375,7 @@ func applyDecisionInTx(ctx context.Context, tx storage.Tx, proposal PlanProposal
 		}
 		return proposal.RunState, "expired", markRunApprovalStatus(ctx, tx, proposal, "expired", opts.Actor, opts.Host, opts.Now)
 	case DecisionActionSupersede:
-		if err := updateApprovalRows(ctx, tx, proposal, "superseded", opts.Now); err != nil {
+		if err := updateApprovalRows(ctx, tx, proposal, "stale", opts.Now); err != nil {
 			return "", "", err
 		}
 		return proposal.RunState, "stale", markRunApprovalStatus(ctx, tx, proposal, "stale", opts.Actor, opts.Host, opts.Now)
