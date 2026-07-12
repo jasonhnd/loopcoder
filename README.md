@@ -241,14 +241,17 @@ such as `LOCALAPPDATA`, `APPDATA`, `ProgramFiles`, `SystemRoot`, `ComSpec`,
 Installation evidence is not auth readiness, account readiness, model
 authorization, quota, or usable capacity; human and JSON output keep
 `usable_for_invocation` as `unknown` from install evidence alone. Unsupported
-auth readiness returns `unknown` with a reason. Built-in local declarations use
-`codex login status`, `claude auth status --json`, and Gemini auth-reference
-existence checks without reading credential values or files. Network-declared
-auth probes, including Antigravity's `agy models`, are recorded but not
-executed by default; their readiness is `unknown` with
-`network-permission-denied`. The initial schema intentionally has no
-`expires_at` field because no current adapter exposes a credential-blind
-machine-readable expiry value.
+auth readiness returns `unknown` with a reason. Unsupported quota telemetry
+returns an immutable QuotaSnapshot with unavailable confidence, unknown reset
+semantics, and explicit `unsupported-source` / `not-collected` gap reasons
+instead of guessing capacity. Built-in local declarations use `codex login
+status`, `claude auth status --json`, and Gemini auth-reference existence checks
+without reading credential values or files. Network-declared auth and quota
+probes, including Antigravity's `agy models`, are recorded but not executed by
+default; their readiness or telemetry is `unknown`/`unavailable` with
+`network-permission-denied` or `network-denied`. The initial auth schema
+intentionally has no `expires_at` field because no current adapter exposes a
+credential-blind machine-readable expiry value.
 
 ### Project Registry
 

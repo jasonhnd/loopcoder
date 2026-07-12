@@ -795,6 +795,30 @@ func TestRunChecksAntigravityProviderInstallOnly(t *testing.T) {
 	}
 }
 
+func TestQuotaTelemetryHumanLineNamesConflictSetIDs(t *testing.T) {
+	check := checkQuotaTelemetry(providerinventory.Report{
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSourceID:  "qsrc_fixture",
+			AdapterID:      "codex",
+			ScopeKey:       "provider:codex/account:acct_fixture",
+			Unit:           "request",
+			ResetSemantics: providerinventory.ResetUnknown,
+			Confidence:     providerinventory.ConfidenceUnknown,
+			FreshnessState: providerinventory.FreshnessFresh,
+			ConflictSet:    []string{"qsnap_conflict_a", "qsnap_conflict_b"},
+			GapReasons:     []string{"provider-disagreement"},
+		}},
+	})
+	if check.Status != StatusOK || check.Code != "quota_telemetry_honest" {
+		t.Fatalf("quota telemetry check = %#v, want ok honest", check)
+	}
+	for _, want := range []string{"conflict_set=qsnap_conflict_a,qsnap_conflict_b", "provider-disagreement"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("quota telemetry message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
 func TestRunFailsAntigravityProviderWhenAgyMissing(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Worker = "antigravity"

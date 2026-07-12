@@ -338,6 +338,8 @@ type Report struct {
 	AuthReadiness         []AuthReadiness        `json:"auth_readiness"`
 	ModelCatalogSnapshots []ModelCatalogSnapshot `json:"model_catalog_snapshots"`
 	ModelCapabilities     []ModelCapability      `json:"model_capabilities"`
+	QuotaTelemetrySources []QuotaTelemetrySource `json:"quota_telemetry_sources"`
+	QuotaSnapshots        []QuotaSnapshot        `json:"quota_snapshots"`
 	GapReasons            []string               `json:"gap_reasons"`
 }
 
@@ -349,6 +351,7 @@ type InventoryRefs struct {
 	AuthReadinessIDs        []string   `json:"auth_readiness_ids"`
 	ModelCatalogSnapshotIDs []string   `json:"model_catalog_snapshot_ids"`
 	ModelCapabilityIDs      []string   `json:"model_capability_ids"`
+	QuotaSnapshotIDs        []string   `json:"quota_snapshot_ids"`
 	Confidence              Confidence `json:"confidence"`
 	GapReasons              []string   `json:"gap_reasons"`
 }
@@ -614,6 +617,7 @@ func EmptyRefs() InventoryRefs {
 		AuthReadinessIDs:        []string{},
 		ModelCatalogSnapshotIDs: []string{},
 		ModelCapabilityIDs:      []string{},
+		QuotaSnapshotIDs:        []string{},
 		Confidence:              ConfidenceUnknown,
 		GapReasons:              []string{"inventory-not-bound-to-run"},
 	}
@@ -639,9 +643,15 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	var authReadiness []AuthReadiness
 	var modelCatalogSnapshots []ModelCatalogSnapshot
 	var modelCapabilities []ModelCapability
+	var quotaTelemetrySources []QuotaTelemetrySource
+	var quotaSnapshots []QuotaSnapshot
 	var gaps []string
 
 	for _, adapter := range adapters {
+		quotaSource, quotaSnapshot := unsupportedQuotaTelemetryForAdapter(adapter, now)
+		quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
+		quotaSnapshots = append(quotaSnapshots, quotaSnapshot)
+		gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
 		snapshot, capabilities, err := staticCatalogForAdapter(adapter, now)
 		if err != nil {
 			return Report{}, err
@@ -672,6 +682,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
 		}
 	}
+	quotaSnapshots = LinkQuotaConflicts(quotaSnapshots)
 	sort.SliceStable(installations, func(i, j int) bool {
 		if installations[i].AdapterID != installations[j].AdapterID {
 			return installations[i].AdapterID < installations[j].AdapterID
@@ -691,6 +702,8 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		AuthReadiness:         authReadiness,
 		ModelCatalogSnapshots: modelCatalogSnapshots,
 		ModelCapabilities:     modelCapabilities,
+		QuotaTelemetrySources: quotaTelemetrySources,
+		QuotaSnapshots:        quotaSnapshots,
 		GapReasons:            gaps,
 	}
 	fingerprint, err := fingerprint(report)
@@ -704,6 +717,23 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 func Refresh(ctx context.Context, store storage.Store, report Report, now time.Time) error {
 	if store == nil {
 		return errors.New("provider inventory refresh: storage store is required")
+	}
+	sourceByID := map[string]QuotaTelemetrySource{}
+	for _, source := range report.QuotaTelemetrySources {
+		source = normalizeQuotaTelemetrySource(source)
+		if err := ValidateQuotaTelemetrySource(source); err != nil {
+			return err
+		}
+		sourceByID[source.QuotaSourceID] = source
+	}
+	for _, snapshot := range report.QuotaSnapshots {
+		source, ok := sourceByID[snapshot.QuotaSourceID]
+		if !ok {
+			return fmt.Errorf("%w: quota snapshot %q references undeclared source %q", ErrQuotaSnapshotMalformed, snapshot.QuotaSnapshotID, snapshot.QuotaSourceID)
+		}
+		if err := ValidateQuotaSnapshot(source, snapshot); err != nil {
+			return err
+		}
 	}
 	nowText := formatTime(now.UTC())
 	currentByAdapter := map[string]map[string]bool{}
@@ -746,6 +776,16 @@ func Refresh(ctx context.Context, store storage.Store, report Report, now time.T
 		}
 		for _, capability := range report.ModelCapabilities {
 			if err := insertModelCapability(ctx, tx, capability); err != nil {
+				return err
+			}
+		}
+		for _, source := range report.QuotaTelemetrySources {
+			if err := upsertQuotaTelemetrySource(ctx, tx, source); err != nil {
+				return err
+			}
+		}
+		for _, snapshot := range report.QuotaSnapshots {
+			if err := insertQuotaSnapshot(ctx, tx, snapshot); err != nil {
 				return err
 			}
 		}
@@ -825,6 +865,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 	var readiness []AuthReadiness
 	var snapshots []ModelCatalogSnapshot
 	var capabilities []ModelCapability
+	var quotaSources []QuotaTelemetrySource
+	var quotaSnapshots []QuotaSnapshot
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT payload_json FROM provider_installations ORDER BY adapter_id, discovery_order, provider_installation_id`)
 		if err != nil {
@@ -943,15 +985,56 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 			}
 			capabilities = append(capabilities, item)
 		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM quota_telemetry_sources ORDER BY adapter_id, quota_source_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var item QuotaTelemetrySource
+			if err := json.Unmarshal([]byte(payload), &item); err != nil {
+				rows.Close()
+				return err
+			}
+			quotaSources = append(quotaSources, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT payload_json FROM quota_snapshots ORDER BY adapter_id, captured_at, quota_snapshot_id`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				rows.Close()
+				return err
+			}
+			var item QuotaSnapshot
+			if err := json.Unmarshal([]byte(payload), &item); err != nil {
+				rows.Close()
+				return err
+			}
+			quotaSnapshots = append(quotaSnapshots, item)
+		}
 		return rows.Close()
 	})
 	if err != nil {
 		return Report{}, err
 	}
-	now := time.Now().UTC()
+	now := store.Now()
 	for i := range snapshots {
 		snapshots[i], capabilities = markCatalogFreshness(snapshots[i], capabilities, now)
 	}
+	quotaSnapshots = markQuotaFreshness(LinkQuotaConflicts(quotaSnapshots), now)
 	report := Report{
 		SchemaVersion:         ProviderInventoryJSONSchema,
 		GeneratedAt:           formatTime(now),
@@ -962,6 +1045,8 @@ func Load(ctx context.Context, store storage.Store) (Report, error) {
 		AuthReadiness:         readiness,
 		ModelCatalogSnapshots: snapshots,
 		ModelCapabilities:     capabilities,
+		QuotaTelemetrySources: quotaSources,
+		QuotaSnapshots:        quotaSnapshots,
 		GapReasons:            []string{},
 	}
 	fingerprint, err := fingerprint(report)
@@ -2727,6 +2812,54 @@ func insertModelCapability(ctx context.Context, tx storage.Tx, capability ModelC
 		model_capability_id, model_catalog_snapshot_id, adapter_id, payload_json
 	) VALUES (?, ?, ?, ?)`,
 		capability.ModelCapabilityID, capability.ModelCatalogSnapshotID, capability.AdapterID, string(payload))
+	return err
+}
+
+func upsertQuotaTelemetrySource(ctx context.Context, tx storage.Tx, source QuotaTelemetrySource) error {
+	source = normalizeQuotaTelemetrySource(source)
+	if err := ValidateQuotaTelemetrySource(source); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(source)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO quota_telemetry_sources(
+		quota_source_id, schema_version, record_version, adapter_id, source_kind,
+		source_key, source_schema_version, network_declared, unsupported_reason,
+		payload_json
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(quota_source_id) DO UPDATE SET
+		record_version = excluded.record_version,
+		source_kind = excluded.source_kind,
+		source_key = excluded.source_key,
+		source_schema_version = excluded.source_schema_version,
+		network_declared = excluded.network_declared,
+		unsupported_reason = excluded.unsupported_reason,
+		payload_json = excluded.payload_json`,
+		source.QuotaSourceID, source.SchemaVersion, source.RecordVersion,
+		source.AdapterID, string(source.SourceKind), source.SourceKey,
+		source.SourceSchemaVersion, boolInt(source.NetworkDeclared),
+		source.UnsupportedReason, string(payload))
+	return err
+}
+
+func insertQuotaSnapshot(ctx context.Context, tx storage.Tx, snapshot QuotaSnapshot) error {
+	snapshot = normalizeQuotaSnapshot(snapshot)
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT OR IGNORE INTO quota_snapshots(
+		quota_snapshot_id, quota_source_id, source_kind, adapter_id, scope_key,
+		quantity_kind, unit, window_kind, confidence, freshness_state,
+		captured_at, stale_after, terminal_error_code, payload_json
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		snapshot.QuotaSnapshotID, snapshot.QuotaSourceID, string(snapshot.SourceKind),
+		snapshot.AdapterID, snapshot.ScopeKey, string(snapshot.QuantityKind),
+		snapshot.Unit, string(snapshot.WindowKind), string(snapshot.Confidence),
+		string(snapshot.FreshnessState), snapshot.CapturedAt, snapshot.StaleAfter,
+		snapshot.TerminalErrorCode, string(payload))
 	return err
 }
 

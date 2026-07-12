@@ -21,6 +21,7 @@ Every adapter declaration must define:
 | `version_argv` | Fixed argv suffix for install/version probes, usually `--version`. |
 | `auth_readiness_contract` | One credential-blind mechanism: bounded status command, auth artifact existence, environment-name existence, or explicit unsupported reason. |
 | `catalog_contract` | Static model entries and optional bounded catalog command with source provenance. Network-capable catalog commands must declare that fact. |
+| `quota_telemetry_contract` | Allowlisted quota source declarations only: official machine-readable API, official fixed-argv CLI JSON/status command, documented provider export, LoopCoder local ledger, operator policy overlay, fixture, or explicit unsupported reason. |
 | `invocation_profile` | Provider-neutral capabilities: read-only, JSON output, MCP config, cancellation, usage reporting, and nested sub-agent support. |
 | `unsupported_operations` | Missing capabilities with typed reasons and actionable suggestions. |
 | `conformance_version` | The conformance suite version the declaration passed. |
@@ -36,6 +37,7 @@ runtimecap.ProviderRuntime{
     Executable:            "example",
     VersionArgv:           []string{"--version"},
     AuthUnsupportedReason: "example has no credential-blind status command",
+    KnownLimitations:      []string{"example declares no supported machine-readable quota source"},
     Cancellation:          true,
     StaticModelCatalog: []runtimecap.ProviderModelCapability{{
         ModelID:            "example-model",
@@ -59,6 +61,18 @@ environment variable name existence, or provider status fields declared as
 non-secret. It must never read credential bytes, serialize environment values,
 parse token caches, run login or refresh commands, scrape private provider UI,
 or persist raw provider output.
+
+Quota telemetry has the same fail-closed shape. Exact quota, remaining capacity,
+or reset time may come only from official machine-readable provider surfaces
+that declare those fields exact, or from LoopCoder-local ledgers for
+LoopCoder-local usage only. Adapters must not scrape private web UI pages, reuse
+browser cookies, call reverse-engineered endpoints, inspect credential files,
+guess reset times, parse free-form text as exact quota, or treat a configured
+operator limit as provider-authoritative remaining quota. Network-capable quota
+commands must declare the command, parser schema, output bounds, environment
+key names, field classifications, and permission scope; without a future
+network grant they are skipped and recorded as unknown/unavailable with typed
+gap reasons.
 
 Provider output is untrusted. Parser code must reject malformed schemas,
 preserve `unknown` for ambiguous evidence, redact before persistence, and map
