@@ -735,6 +735,23 @@ Telemetry commands that declare possible network are skipped unless an explicit
 future policy grants network permission, producing typed `network-denied`
 evidence rather than performing network I/O.
 
+Usage accounting is a normalized local ledger, not a provider billing portal.
+LoopCoder derives initial usage records from its persisted Worker, Verifier,
+audit, and Conductor reporter records. Each reporter row is expanded into
+append-only `usage_records` for input tokens, output tokens, total tokens,
+requests, and wall milliseconds when those facts are present. The records keep
+the original quantity payload, source record IDs, idempotency key, confidence,
+and gap reasons so duplicate reporter rows, crash replay, resumed streams, and
+provider rounding do not double-count or create false precision.
+
+Provider-reported token fields and local launch/wall-time counters are exact
+only for the LoopCoder-local event they describe. Conservative remaining
+capacity estimates are always `confidence: "estimated"` with estimator
+metadata and must not satisfy exact-quota policy. Reconciliation appends
+`usage_reconciliations` and correction `usage_records`; it preserves prior
+facts and reports `provider-higher` or `provider-lower` disagreements instead
+of overwriting history.
+
 Operators can add explicit executable locations without scanning a disk:
 
 ```yaml
@@ -751,10 +768,18 @@ Those paths are checked before PATH entries and rendered with
 selection pins use opaque `acct_` IDs from prior inventory output; they are not
 display labels and do not copy provider config.
 
+`loopcoder doctor --repo . --format json` includes additive
+`quota_usage_budget` diagnostics with quota source summaries, usage summaries,
+bounded usage records, confidence, fingerprint, and gap reasons. The command
+does not call provider quota APIs for this ledger; if persisted usage ledger
+rows are absent it can derive a bounded read-only view from imported reporter
+records and marks that provenance explicitly.
+
 `loopcoder status --repo . --format json` includes `inventory_refs` and
-`quota_usage_refs`, not full raw inventory or quota history. Until a DeliveryRun
-binds inventory or quota records, the arrays are empty and confidence is
-`unknown`.
+`quota_usage_refs`, not full raw inventory or quota history. `quota_usage_refs`
+contains usage record IDs and a fingerprint for the selected run when local
+attempt or verifier reports are available. Until a DeliveryRun binds inventory,
+quota, or usage records, the arrays are empty and confidence is `unknown`.
 
 When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
 the `migration status` check's `legacy_surfaces[]` entries include `surface`,

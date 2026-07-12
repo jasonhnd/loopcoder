@@ -232,6 +232,7 @@ func Load(opts Options) (Report, error) {
 	}
 	sortRows(rows)
 	project := resolveProjectMetadata(repoPath)
+	quotaUsageRefs := usageRefsForStatus(project.ProjectID, runID, attempts, verifiers, now)
 	runTree := loadRunTree(repoPath, runID, project.ProjectID, now)
 
 	return Report{
@@ -246,6 +247,7 @@ func Load(opts Options) (Report, error) {
 		LifecycleEvents:     len(lifecycle.History),
 		ParentRunID:         lifecycle.ParentRunID,
 		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
+		QuotaUsageRefs:      quotaUsageRefs,
 		RunTree:             runTree,
 		Rows:                rows,
 	}, nil
@@ -444,6 +446,49 @@ func normalizeReport(report Report) Report {
 	}
 	report.RunTree.Summary = summarizeRunTree(report.RunTree.Nodes)
 	return report
+}
+
+func usageRefsForStatus(projectID, runID string, attempts []state.Attempt, verifiers []verifierRecord, now time.Time) providerinventory.QuotaUsageRefs {
+	var records []providerinventory.UsageRecord
+	for _, attempt := range attempts {
+		if attempt.Report == nil {
+			continue
+		}
+		reportID := firstNonEmpty(attempt.JobID, attempt.Report.WorkID, fmt.Sprintf("issue-%d-attempt-%d", attempt.Issue, attempt.Attempt))
+		stored := providerinventory.StoredReportRecord{
+			ReportID:   "attempt:" + reportID,
+			ProjectID:  projectID,
+			RunID:      runID,
+			SourceKind: "attempt",
+			SourcePath: attempt.Path,
+			CreatedAt:  firstNonEmpty(attempt.Report.EndedAt, attempt.Report.StartedAt, attempt.LastWriteUTC.UTC().Format(time.RFC3339Nano)),
+			Report:     *attempt.Report,
+		}
+		usage, err := providerinventory.UsageRecordsFromReporter(stored, now)
+		if err == nil {
+			records = append(records, usage...)
+		}
+	}
+	for _, verifier := range verifiers {
+		if verifier.Report == nil {
+			continue
+		}
+		reportID := firstNonEmpty(verifier.JobID, verifier.Report.WorkID, verifier.Path)
+		stored := providerinventory.StoredReportRecord{
+			ReportID:   "verifier:" + reportID,
+			ProjectID:  projectID,
+			RunID:      runID,
+			SourceKind: "verifier",
+			SourcePath: verifier.Path,
+			CreatedAt:  firstNonEmpty(verifier.Report.EndedAt, verifier.Report.StartedAt),
+			Report:     *verifier.Report,
+		}
+		usage, err := providerinventory.UsageRecordsFromReporter(stored, now)
+		if err == nil {
+			records = append(records, usage...)
+		}
+	}
+	return providerinventory.QuotaUsageRefsFromUsageRecords(records)
 }
 
 func resolveProjectMetadata(repoPath string) ProjectMetadata {

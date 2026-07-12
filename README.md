@@ -284,6 +284,12 @@ The stale-state cleanup policy retains active runs, recent runs, the newest reta
 
 Worker, Verifier, audit, and Conductor invocations now produce validated local-only reports with `[reporter]` headers and result JSON `report` objects. Reports cover role, provider, model, model source, effort/depth, permission, action, exit code, timing, token usage when available, and verification status. Default human output is a compact receipt without embedded raw JSON; `loopcoder report --repo . --verbose` shows the canonical record in text output, and `loopcoder report --repo . --format json` emits clean parseable JSON only. Machine consumers should parse stable headers, canonical JSON, or the nested `report` object.
 
+v0.8 usage accounting normalizes those local reporter records into an
+append-only machine-local usage ledger. `doctor --format json` exposes a
+`quota_usage_budget` object and `status --format json` exposes
+`quota_usage_refs`; both preserve confidence and provenance, and estimates are
+marked estimated rather than exact provider quota.
+
 During the 0.6.x transition window, readers accept legacy `[attestation]` headers, legacy result JSON `attestation` objects, the old `loopcoder hook conductor-attest` command, old `.delivery.yml attestation` keys, and old `LOOPCODER_CONDUCTOR_ATTEST_*` env vars. New output and writes use `[reporter]`, `report`, `report.channel`, `conductor-reporter`, and `LOOPCODER_CONDUCTOR_REPORTER_*`. Frozen local machinery stays frozen: `.loopcoder/relay/*.attest` keeps its extension and canonical report JSON field names are unchanged.
 
 `loopcoder hook conductor-reporter` enforces the local Conductor self-report step before a delivery or merge turn can finish. `loopcoder hook conductor-relay-guard` prevents hidden Worker and Verifier report blocks from completing a turn. The relay hard gate blocks mechanical progress with exit code `4` while pending Worker/Verifier blocks are unacknowledged; `loopcoder relay flush --repo .` prints and clears them, and `loopcoder relay list --repo .` inspects them.

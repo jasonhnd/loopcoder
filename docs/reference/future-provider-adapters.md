@@ -74,6 +74,15 @@ key names, field classifications, and permission scope; without a future
 network grant they are skipped and recorded as unknown/unavailable with typed
 gap reasons.
 
+Usage reporting is separate from quota telemetry. Adapters may expose parsed
+token counts through reporter records, but those values become normalized
+LoopCoder-local `UsageRecord` rows with source provenance and original units
+preserved. If a provider reports only total tokens, split fields stay absent;
+if it reports split tokens but no total, LoopCoder may record an exact
+split-sum total only for that local report. Provider-defined units that cannot
+be safely converted stay `provider-defined`, and any heuristic estimate must
+be `confidence: "estimated"` with estimator metadata.
+
 Provider output is untrusted. Parser code must reject malformed schemas,
 preserve `unknown` for ambiguous evidence, redact before persistence, and map
 timeouts, cancellation, malformed output, unsupported operations, and schema
