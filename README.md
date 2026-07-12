@@ -117,6 +117,9 @@ loopcoder skill install --repo .              # install global skill and project
 loopcoder discover --repo .                   # advanced: discover CI failures and file issues
 loopcoder compile --repo .                    # advanced: compile ROADMAP.md into issues
 loopcoder ready-set     --repo .              # classify ready vs blocked work
+loopcoder delivery plan --project-id <id> --run-id <id> --format json # side-effect-free v0.8 DeliveryRun proposal
+loopcoder delivery decide --project-id <id> --run-id <id> --action approve --expected-authorization-fingerprint <sha256:...>
+loopcoder delivery continue --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...>
 loopcoder tick          --repo .              # run one unattended delivery pass
 loopcoder trigger goal-loop --repo .          # advanced: run an automation trigger
 loopcoder promote      --repo .               # may change production branch when gates pass

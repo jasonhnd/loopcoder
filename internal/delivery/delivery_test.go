@@ -275,6 +275,149 @@ func TestTransitionsReplayByIdempotencyKey(t *testing.T) {
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_idempotency WHERE operation IN ('transition_delivery_run', 'transition_task')`, 2)
 }
 
+func TestPlanIsSideEffectFreeAndDoesNotMutateStorage(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	before := deliveryTableRows(t, ctx, store)
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	after := deliveryTableRows(t, ctx, store)
+	if after != before {
+		t.Fatalf("Plan mutated delivery tables: before=%d after=%d", before, after)
+	}
+	if proposal.AuthorizationFingerprint == "" || proposal.FingerprintStatus != "current" || proposal.TaskCount != 1 {
+		t.Fatalf("proposal = %#v, want current fingerprinted one-task plan", proposal)
+	}
+}
+
+func TestDecisionApprovalIsBoundToCurrentPlanFingerprint(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	changedTask := taskFixture(run, "a")
+	changedTask.State = TaskAwaitingApproval
+	changedTask.ScopeJSON = `{"paths":["docs/changed.md"]}`
+	changedTask.PlanFingerprint = "sha256:" + stringsRepeat("3", 64)
+	if _, err := PersistTask(ctx, store, changedTask, PersistOptions{IdempotencyKey: "material-task-change", Now: fixedTime().Add(time.Minute)}); err != nil {
+		t.Fatalf("PersistTask material change: %v", err)
+	}
+	_, err = Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionApprove,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "approve-stale",
+		Now:                              fixedTime().Add(2 * time.Minute),
+	})
+	if !errors.Is(err, ErrStaleApproval) {
+		t.Fatalf("Decide stale approval error = %v, want ErrStaleApproval", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 0)
+}
+
+func TestDecideApproveAndContinueAreIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	approved, err := Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionApprove,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "approve-current",
+		Now:                              fixedTime().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Decide approve: %v", err)
+	}
+	if approved.RunState != RunApproved || approved.ApprovalStatus != "approved" {
+		t.Fatalf("approve result = %#v, want approved", approved)
+	}
+	first, err := Continue(ctx, store, ContinueOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "continue-current",
+		Now:                              fixedTime().Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	second, err := Continue(ctx, store, ContinueOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "continue-current",
+		Now:                              fixedTime().Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("Continue replay: %v", err)
+	}
+	if first.RunState != RunQueued || second.RunState != first.RunState || second.AuthorizationFingerprint != first.AuthorizationFingerprint {
+		t.Fatalf("continue replay = %#v then %#v, want stable queued result", first, second)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_attempts`, 0)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks WHERE state = 'ready'`, 1)
+}
+
+func TestRejectedDecisionBlocksContinueWithTypedError(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if _, err := Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionReject,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "reject-current",
+		Now:                              fixedTime().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("Decide reject: %v", err)
+	}
+	_, err = Continue(ctx, store, ContinueOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "continue-rejected",
+		Now:                              fixedTime().Add(2 * time.Minute),
+	})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("Continue rejected run error = %v, want ErrPolicyDenied", err)
+	}
+}
+
 func TestDerivedIdempotencyKeyFailsOnCanonicalJSONError(t *testing.T) {
 	if _, err := idempotencyKey("", "bad", map[string]any{"not_canonical": math.NaN()}); err == nil {
 		t.Fatal("idempotencyKey returned nil error for non-canonical request")
@@ -381,6 +524,57 @@ func seedProject(t *testing.T, ctx context.Context, store storage.Store, project
 	}); err != nil {
 		t.Fatalf("seed project: %v", err)
 	}
+}
+
+func seedApprovalRun(t *testing.T, ctx context.Context, store storage.Store) DeliveryRun {
+	t.Helper()
+	seedProject(t, ctx, store, "proj_a")
+	run := deliveryRunFixture("proj_a", "run_approval")
+	run.State = RunAwaitingApproval
+	run.InputFingerprint = ""
+	run.PolicyFingerprint = ""
+	run.PlanFingerprint = ""
+	run.AuthorizationFingerprint = ""
+	run.ApprovalStatus = "required"
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "approval-run", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	task := taskFixture(run, "a")
+	task.State = TaskAwaitingApproval
+	task.AuthorizationFingerprint = ""
+	task.PlanFingerprint = "sha256:" + stringsRepeat("3", 64)
+	if _, err := PersistTask(ctx, store, task, PersistOptions{IdempotencyKey: "approval-task", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistTask: %v", err)
+	}
+	return run
+}
+
+func deliveryTableRows(t *testing.T, ctx context.Context, store storage.Store) int {
+	t.Helper()
+	var total int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		for _, table := range []string{
+			"delivery_runs",
+			"delivery_plan_fingerprints",
+			"delivery_tasks",
+			"delivery_dependency_edges",
+			"delivery_attempts",
+			"delivery_decisions",
+			"delivery_approvals",
+			"delivery_overrides",
+			"delivery_idempotency",
+		} {
+			var count int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
+				return err
+			}
+			total += count
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("count delivery table rows: %v", err)
+	}
+	return total
 }
 
 func deliveryRunFixture(projectID, runID string) DeliveryRun {

@@ -1,0 +1,300 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"strings"
+
+	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/storage"
+)
+
+const (
+	deliveryPendingApprovalExitCode = 10
+	deliveryStalePlanExitCode       = 11
+	deliveryRejectedExitCode        = 12
+	deliveryPolicyDeniedExitCode    = 13
+)
+
+func printDeliveryHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder delivery plan --project-id <id> --run-id <id> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder delivery decide --project-id <id> --run-id <id> --action approve|reject|edit|expire|supersede --expected-authorization-fingerprint <sha256:...>")
+	fmt.Fprintln(w, "  loopcoder delivery continue --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...>")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Approval-gated DeliveryRun plan, decide, and continue operations.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --db string                         storage database path (default $LOOPCODER_HOME/data/loopcoder.db)")
+	fmt.Fprintln(w, "  --project-id string                 project id (required)")
+	fmt.Fprintln(w, "  --run-id string                     delivery run id (required)")
+	fmt.Fprintln(w, "  --format string                     output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --action string                     decide action: approve, reject, edit, expire, or supersede")
+	fmt.Fprintln(w, "  --expected-authorization-fingerprint string")
+	fmt.Fprintln(w, "                                      stale-plan guard from a prior plan response")
+	fmt.Fprintln(w, "  --expires-at string                 optional RFC3339 approval expiry for approve")
+	fmt.Fprintln(w, "  --actor-id string                   actor id for decision provenance (default \"local-user\")")
+	fmt.Fprintln(w, "  --reason string                     optional human decision reason")
+	fmt.Fprintln(w, "  --idempotency-key string            caller-stable replay key")
+	fmt.Fprintln(w, "  --help                              show help")
+}
+
+func runDelivery(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if len(args) == 0 {
+		printDeliveryHelp(stderr)
+		return 2
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	switch args[0] {
+	case "plan":
+		return runDeliveryPlan(args[1:], stdout, stderr, deps)
+	case "decide":
+		return runDeliveryDecide(args[1:], stdout, stderr, deps)
+	case "continue":
+		return runDeliveryContinue(args[1:], stdout, stderr, deps)
+	default:
+		fmt.Fprintf(stderr, "delivery: unknown subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func runDeliveryPlan(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("delivery plan", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	common := deliveryFlags{}
+	common.bind(fs)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if err := common.validate("delivery plan"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	store, closeStore, err := openDeliveryStoreForCLI(context.Background(), common.DBPath, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery plan: %v\n", err)
+		return 1
+	}
+	defer closeStore()
+	proposal, err := delivery.Plan(context.Background(), store, delivery.PlanProposalInput{ProjectID: common.ProjectID, DeliveryRunID: common.RunID})
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery plan: %v\n", err)
+		return deliveryExitCode(err)
+	}
+	return renderDeliveryOutput(stdout, stderr, common.Format, proposal, renderPlanText)
+}
+
+func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("delivery decide", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	common := deliveryFlags{}
+	common.bind(fs)
+	var action, expected, expiresAt, actorID, reason, idempotencyKey, edited string
+	fs.StringVar(&action, "action", "", "decision action")
+	fs.StringVar(&expected, "expected-authorization-fingerprint", "", "expected authorization fingerprint")
+	fs.StringVar(&expiresAt, "expires-at", "", "approval expiry")
+	fs.StringVar(&actorID, "actor-id", "local-user", "actor id")
+	fs.StringVar(&reason, "reason", "", "decision reason")
+	fs.StringVar(&idempotencyKey, "idempotency-key", "", "idempotency key")
+	fs.StringVar(&edited, "edited-proposal-json", "", "edited proposal JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if err := common.validate("delivery decide"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if strings.TrimSpace(action) == "" {
+		fmt.Fprintln(stderr, "delivery decide: --action is required")
+		return 2
+	}
+	store, closeStore, err := openDeliveryStoreForCLI(context.Background(), common.DBPath, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery decide: %v\n", err)
+		return 1
+	}
+	defer closeStore()
+	now := deps.Now().UTC()
+	result, err := delivery.Decide(context.Background(), store, delivery.DecisionOptions{
+		ProjectID:                        common.ProjectID,
+		DeliveryRunID:                    common.RunID,
+		Action:                           action,
+		ExpectedAuthorizationFingerprint: expected,
+		Actor:                            deliveryActor(actorID),
+		Host:                             deliveryHost(deps),
+		IdempotencyKey:                   idempotencyKey,
+		Now:                              now,
+		ExpiresAt:                        expiresAt,
+		EditedProposalJSON:               edited,
+		Reason:                           reason,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery decide: %v\n", err)
+		return deliveryExitCode(err)
+	}
+	return renderDeliveryOutput(stdout, stderr, common.Format, result, renderDecisionText)
+}
+
+func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("delivery continue", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	common := deliveryFlags{}
+	common.bind(fs)
+	var expected, actorID, idempotencyKey string
+	fs.StringVar(&expected, "expected-authorization-fingerprint", "", "expected authorization fingerprint")
+	fs.StringVar(&actorID, "actor-id", "local-user", "actor id")
+	fs.StringVar(&idempotencyKey, "idempotency-key", "", "idempotency key")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if err := common.validate("delivery continue"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	store, closeStore, err := openDeliveryStoreForCLI(context.Background(), common.DBPath, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery continue: %v\n", err)
+		return 1
+	}
+	defer closeStore()
+	result, err := delivery.Continue(context.Background(), store, delivery.ContinueOptions{
+		ProjectID:                        common.ProjectID,
+		DeliveryRunID:                    common.RunID,
+		ExpectedAuthorizationFingerprint: expected,
+		Actor:                            deliveryActor(actorID),
+		Host:                             deliveryHost(deps),
+		IdempotencyKey:                   idempotencyKey,
+		Now:                              deps.Now().UTC(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery continue: %v\n", err)
+		return deliveryExitCode(err)
+	}
+	return renderDeliveryOutput(stdout, stderr, common.Format, result, renderContinueText)
+}
+
+type deliveryFlags struct {
+	DBPath    string
+	ProjectID string
+	RunID     string
+	Format    string
+}
+
+func (f *deliveryFlags) bind(fs *flag.FlagSet) {
+	fs.StringVar(&f.DBPath, "db", "", "storage database path")
+	fs.StringVar(&f.ProjectID, "project-id", "", "project id")
+	fs.StringVar(&f.RunID, "run-id", "", "delivery run id")
+	fs.StringVar(&f.Format, "format", "text", "output format")
+}
+
+func (f deliveryFlags) validate(label string) error {
+	if strings.TrimSpace(f.ProjectID) == "" {
+		return fmt.Errorf("%s: --project-id is required", label)
+	}
+	if strings.TrimSpace(f.RunID) == "" {
+		return fmt.Errorf("%s: --run-id is required", label)
+	}
+	switch f.Format {
+	case "text", "json":
+		return nil
+	default:
+		return fmt.Errorf("%s: invalid --format %q; want text or json", label, f.Format)
+	}
+}
+
+func openDeliveryStoreForCLI(ctx context.Context, dbPath string, deps Deps) (storage.Store, func(), error) {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
+		layout, err := home.Resolve(home.Deps{Getenv: os.Getenv, UserHomeDir: os.UserHomeDir})
+		if err != nil {
+			return nil, nil, err
+		}
+		dbPath = layout.DatabasePath()
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: deps.Now})
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, func() { _ = store.Close() }, nil
+}
+
+func renderDeliveryOutput[T any](stdout, stderr io.Writer, format string, value T, text func(io.Writer, T) error) int {
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(value); err != nil {
+			fmt.Fprintf(stderr, "delivery: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if err := text(stdout, value); err != nil {
+		fmt.Fprintf(stderr, "delivery: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderPlanText(w io.Writer, proposal delivery.PlanProposal) error {
+	_, err := fmt.Fprintf(w, "DELIVERY PLAN\nrun: %s\nstate: %s\napproval: %s\nfingerprint: %s\ntasks: %d\nedges: %d\n",
+		proposal.DeliveryRunID, proposal.RunState, proposal.ApprovalRequirement, proposal.AuthorizationFingerprint, proposal.TaskCount, proposal.EdgeCount)
+	return err
+}
+
+func renderDecisionText(w io.Writer, result delivery.DecisionResult) error {
+	_, err := fmt.Fprintf(w, "DELIVERY DECISION\nrun: %s\naction: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\n",
+		result.DeliveryRunID, result.Action, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint)
+	return err
+}
+
+func renderContinueText(w io.Writer, result delivery.ContinueResult) error {
+	_, err := fmt.Fprintf(w, "DELIVERY CONTINUE\nrun: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\n",
+		result.DeliveryRunID, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint)
+	return err
+}
+
+func deliveryExitCode(err error) int {
+	switch {
+	case errors.Is(err, delivery.ErrApprovalRequired), errors.Is(err, delivery.ErrExpiredApproval):
+		return deliveryPendingApprovalExitCode
+	case errors.Is(err, delivery.ErrStaleApproval):
+		return deliveryStalePlanExitCode
+	case errors.Is(err, delivery.ErrPolicyDenied):
+		return deliveryPolicyDeniedExitCode
+	case errors.Is(err, delivery.ErrInvalidTransition):
+		if strings.Contains(err.Error(), "rejected") {
+			return deliveryRejectedExitCode
+		}
+		return 1
+	default:
+		return 1
+	}
+}
+
+func deliveryActor(actorID string) delivery.Actor {
+	actorID = strings.TrimSpace(actorID)
+	if actorID == "" {
+		actorID = "local-user"
+	}
+	return delivery.Actor{ActorKind: "user", ActorID: actorID, Display: actorID, DecisionAuthority: "user", Source: "cli"}
+}
+
+func deliveryHost(deps Deps) delivery.Host {
+	return delivery.Host{
+		HostKind:         "cli",
+		HostID:           runtime.GOOS + "-" + runtime.GOARCH,
+		SessionID:        "local-cli",
+		ProcessID:        os.Getpid(),
+		LoopcoderVersion: normalizeBuildInfo(deps.BuildInfo).Version,
+		Platform:         runtime.GOOS + "-" + runtime.GOARCH,
+	}
+}
