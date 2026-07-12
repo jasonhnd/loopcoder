@@ -143,6 +143,14 @@ model/depth validation and, when `antigravity` is configured, reports bounded
 installation discovery for executable `agy` without inferring OAuth readiness,
 account readiness, model authorization, quota, or usable capacity.
 
+Provider inventory, quota telemetry, and the local usage ledger are separate
+state streams. The usage ledger records append-only LoopCoder-observed report
+facts with deterministic idempotency keys, normalized quantities, source
+record provenance, and local-only confidence bounds. Reconciliation appends
+new disagreement records instead of rewriting prior facts, so provider-higher
+usage remains evidence of possible out-of-band work, rounding, or missing
+local records rather than a fabricated LoopCoder dispatch.
+
 ## State Model
 
 The current state model has three layers:

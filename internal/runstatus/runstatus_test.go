@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
@@ -177,6 +178,13 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 			} `json:"summary"`
 			Nodes []RunTreeNode `json:"nodes"`
 		} `json:"run_tree"`
+		QuotaUsageRefs struct {
+			SchemaVersion         string                       `json:"schema_version"`
+			QuotaUsageFingerprint string                       `json:"quota_usage_fingerprint"`
+			UsageRecordIDs        []string                     `json:"usage_record_ids"`
+			Confidence            providerinventory.Confidence `json:"confidence"`
+			GapReasons            []string                     `json:"gap_reasons"`
+		} `json:"quota_usage_refs"`
 		Rows []Row `json:"rows"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -217,6 +225,15 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	}
 	if len(payload.Rows) != 1 || payload.Rows[0].Issue != "#651" {
 		t.Fatalf("rows = %#v, want issue #651", payload.Rows)
+	}
+	if payload.QuotaUsageRefs.SchemaVersion != providerinventory.QuotaUsageRefsSchema || !strings.HasPrefix(payload.QuotaUsageRefs.QuotaUsageFingerprint, "sha256:") {
+		t.Fatalf("quota usage refs metadata = %#v", payload.QuotaUsageRefs)
+	}
+	if payload.QuotaUsageRefs.Confidence != providerinventory.ConfidenceEstimated || len(payload.QuotaUsageRefs.UsageRecordIDs) == 0 {
+		t.Fatalf("quota usage refs = %#v, want estimated local refs", payload.QuotaUsageRefs)
+	}
+	if !containsString(payload.QuotaUsageRefs.GapReasons, "loopcoder-local-ledger-not-provider-global") {
+		t.Fatalf("quota usage refs gaps = %#v", payload.QuotaUsageRefs.GapReasons)
 	}
 	if strings.Contains(string(data), "RunID") {
 		t.Fatalf("status JSON used unstable CamelCase keys:\n%s", string(data))
@@ -566,4 +583,13 @@ func usageTotal(total int64) reporter.Usage {
 	return reporter.Usage{
 		TotalTokens: &total,
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

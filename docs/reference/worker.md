@@ -93,6 +93,12 @@ Worker reports are surfaced locally only: the `dispatch` stdout records, the
 dispatch result JSON `report` object, stderr pretty output, and gitignored
 `.loopcoder/` run records. The PR body does not carry reports; it should
 contain delivery text such as the issue closing line and provider summary.
+The local usage ledger ingests these same report surfaces when token usage is
+present. It normalizes input, output, and total token quantities into
+append-only records with deterministic replay keys; duplicate reporter events
+and replayed relay records resolve to the same usage IDs instead of increasing
+totals. Ledger summaries stay local-only and do not claim provider-wide quota
+or exact remaining capacity.
 
 This replaces the older bare `worker: <provider>` line. If report
 validation fails, including missing model identity or token usage, dispatch

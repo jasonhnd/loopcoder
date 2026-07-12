@@ -393,6 +393,11 @@ quantity, and window:
 ## Normalized Local Usage Ledger
 
 Implementation issue #730 owns the first code implementation of this section.
+The v0.8.0 slice persists `usage_records` and `usage_reconciliations`, derives
+usage records from the real local reporter surfaces, and exposes conservative
+doctor/status JSON. Budget reservations, availability scoring, and circuit
+breaker state remain separate implementation slices and therefore render empty
+arrays until their owning issues land.
 
 ### Quantity Normalization
 
@@ -449,6 +454,11 @@ they do not mutate or delete prior facts.
 Duplicate reporter events, resumed streams, repeated provider receipts, and
 crash replay must use idempotency and dedupe keys to return the existing record
 or fail with `ErrDuplicateReplay`. They must not double-count.
+Reporter ingestion uses the same persisted surfaces as `loopcoder report`:
+imported machine-local report rows, run attempt files, run JSON/JSONL report
+objects, relay ledgers, and pending relay records. The SQL `reports` table is
+not assumed to be complete. Malformed usage payloads are counted and surfaced
+as `malformed-report-payloads:<n>` gap reasons rather than skipped silently.
 
 ### Conservative Estimation
 
