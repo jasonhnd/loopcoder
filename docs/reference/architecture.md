@@ -291,6 +291,23 @@ not synthesize approvals, overrides, user intent, or plan fingerprints.
 Ambiguous non-terminal legacy execution claims are marked `needs-human` with
 `ErrAmbiguousLegacyState` diagnostics.
 
+### Task Requirement Classification
+
+The v0.8 planner now has a typed TaskRequirement boundary before routing.
+`internal/taskrequirements` classifies task scope into risk, permission,
+side-effect, capability, network, quality, and verification requirements using
+the deterministic rules from spec 0804. Unknown or stale hard capability facts
+cannot satisfy routing constraints, and ambiguous high-risk scope returns
+`ErrRequirementUnknown` with a human approval requirement rather than silently
+lowering risk.
+
+Storage schema version 14 persists immutable `task_requirements` rows plus
+scoped `task_requirement_overrides` for operator corrections. Overrides are
+visible in later decisions through `source.record_ids` and are revalidated
+against the deterministic floor whenever they apply. Operator, policy, schema,
+and adapter notes live in
+[`task-requirement-classification.md`](task-requirement-classification.md).
+
 ### Self-Improvement
 
 Current self-improvement is human-gated and advisory. `docs/learnings.md` is an

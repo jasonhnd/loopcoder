@@ -91,6 +91,14 @@ code behind the adapter boundary only. It must not require provider-name
 branches in planner, router, scheduler, task lifecycle, DeliveryRun approval,
 or routing-policy core.
 
+Adapters consume planner TaskRequirement records but do not create or weaken
+them. Required capabilities, permission, side-effect class, network boundary,
+quality floor, and verification requirements come from
+[`task-requirement-classification.md`](task-requirement-classification.md).
+Unknown, unavailable, stale, malformed, or conflicting adapter evidence remains
+ineligible for hard requirements unless a routing policy later persists an
+explicit estimated path for the exact requirement.
+
 Before a provider is considered conformant, run the provider inventory
 conformance tests against it, including partial implementation, malformed
 output, timeout, cancellation, redaction, unsupported operations, schema

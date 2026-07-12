@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 13
+	CurrentSchemaVersion = 14
 
 	driverName = "sqlite"
 
@@ -306,6 +306,11 @@ var migrations = []migration{
 		name:       "usage ledger",
 		statements: usageLedgerSchemaStatements,
 	},
+	{
+		version:    14,
+		name:       "task requirement classification",
+		statements: taskRequirementSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -342,6 +347,8 @@ var requiredTables = []string{
 	"usage_records",
 	"usage_reconciliations",
 	"inventory_events",
+	"task_requirements",
+	"task_requirement_overrides",
 }
 
 type migration struct {
