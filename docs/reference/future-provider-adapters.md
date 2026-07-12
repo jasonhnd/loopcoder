@@ -95,3 +95,13 @@ Before a provider is considered conformant, run the provider inventory
 conformance tests against it, including partial implementation, malformed
 output, timeout, cancellation, redaction, unsupported operations, schema
 mismatch, and declaration version upgrade coverage.
+
+For provider-native sub-agent support, a future provider must also pass the
+agent-federation bridge conformance suite. The adapter may report
+`nested_subagents: true` only when fresh capability evidence, cancellation
+behavior, bounded output, usage/result envelopes, unsupported-operation
+responses, and provider session reference handling are declared. The scheduler
+still requires LoopCoder-owned registration, monotonic scope, one-writer locks,
+budget reservation references, current claim ownership, and plan/policy
+fingerprints before launch; provider-native orchestration never controls global
+policy, budgets, approvals, or final acceptance.

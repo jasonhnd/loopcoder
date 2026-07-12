@@ -23,7 +23,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/usageledger"
 )
 
@@ -58,6 +60,7 @@ type Report struct {
 	InventoryRefs       providerinventory.InventoryRefs  `json:"inventory_refs"`
 	QuotaUsageRefs      providerinventory.QuotaUsageRefs `json:"quota_usage_refs"`
 	RunTree             RunTree                          `json:"run_tree"`
+	AgentTree           storage.AgentTree                `json:"agent_tree"`
 	Rows                []Row                            `json:"rows"`
 }
 
@@ -236,6 +239,7 @@ func Load(opts Options) (Report, error) {
 	sortRows(rows)
 	project := resolveProjectMetadata(repoPath)
 	runTree := loadRunTree(repoPath, runID, project.ProjectID, now)
+	agentTree := loadAgentTree(repoPath, runTree.RootRunID, project.ProjectID, now)
 	usageRecords := usageRecordsForStatus(attempts, verifiers, runID, project.ProjectID, now)
 	quotaUsageRefs := usageledger.QuotaUsageRefs(usageRecords, providerinventory.ConfidenceEstimated, nil)
 
@@ -253,6 +257,7 @@ func Load(opts Options) (Report, error) {
 		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
 		QuotaUsageRefs:      quotaUsageRefs,
 		RunTree:             runTree,
+		AgentTree:           agentTree,
 		Rows:                rows,
 	}, nil
 }
@@ -349,6 +354,26 @@ func Render(report Report) string {
 	}
 	fmt.Fprintln(&out)
 
+	fmt.Fprintln(&out, "Agent tree")
+	if len(report.AgentTree.Registrations) == 0 {
+		fmt.Fprintln(&out, "- none")
+	} else {
+		fmt.Fprintf(&out, "- root=%s fingerprint=%s\n", display(report.AgentTree.RootRunID), display(report.AgentTree.AgentFederationFingerprint))
+		for _, reg := range report.AgentTree.Registrations {
+			parts := []string{
+				"state=" + display(reg.RegistrationState),
+				"run=" + display(reg.RunID),
+				"adapter=" + display(reg.AdapterID),
+				"claim_generation=" + strconv.FormatInt(reg.ClaimGeneration, 10),
+			}
+			if len(reg.GapReasons) > 0 {
+				parts = append(parts, "gaps="+strings.Join(reg.GapReasons, ","))
+			}
+			fmt.Fprintf(&out, "  - %s (%s)\n", reg.ChildAgentID, strings.Join(parts, " "))
+		}
+	}
+	fmt.Fprintln(&out)
+
 	headers := []string{
 		"Issue",
 		"Worker job",
@@ -437,6 +462,18 @@ func normalizeReport(report Report) Report {
 	if report.RunTree.Nodes == nil {
 		report.RunTree.Nodes = []RunTreeNode{}
 	}
+	if report.AgentTree.SchemaVersion == "" {
+		report.AgentTree = storage.AgentTree{SchemaVersion: storage.AgentTreeSchema, Registrations: []storage.AgentTreeRegistration{}, Blocked: []string{}, NeedsHuman: []string{}}
+	}
+	if report.AgentTree.Registrations == nil {
+		report.AgentTree.Registrations = []storage.AgentTreeRegistration{}
+	}
+	if report.AgentTree.Blocked == nil {
+		report.AgentTree.Blocked = []string{}
+	}
+	if report.AgentTree.NeedsHuman == nil {
+		report.AgentTree.NeedsHuman = []string{}
+	}
 	if report.InventoryRefs.SchemaVersion == "" {
 		report.InventoryRefs = providerinventory.EmptyRefs()
 	}
@@ -457,6 +494,34 @@ func normalizeNow(now func() time.Time) func() time.Time {
 		return time.Now
 	}
 	return now
+}
+
+func loadAgentTree(repoPath, rootRunID, projectID string, now time.Time) storage.AgentTree {
+	tree := storage.AgentTree{
+		SchemaVersion: storage.AgentTreeSchema,
+		RootRunID:     strings.TrimSpace(rootRunID),
+		Registrations: []storage.AgentTreeRegistration{},
+		Blocked:       []string{},
+		NeedsHuman:    []string{},
+	}
+	if strings.TrimSpace(rootRunID) == "" {
+		return tree
+	}
+	ctx := context.Background()
+	roots, err := runtimepath.Resolve(ctx, repoPath)
+	if err != nil || !roots.Registered || strings.TrimSpace(roots.DatabasePath) == "" {
+		return tree
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: func() time.Time { return now }})
+	if err != nil {
+		return tree
+	}
+	defer store.Close()
+	loaded, err := storage.LoadAgentTree(ctx, store, firstNonEmpty(projectID, roots.ProjectID), rootRunID)
+	if err != nil {
+		return tree
+	}
+	return loaded
 }
 
 func usageRecordsForStatus(attempts []state.Attempt, verifiers []verifierRecord, runID, projectID string, now time.Time) []usageledger.UsageRecord {

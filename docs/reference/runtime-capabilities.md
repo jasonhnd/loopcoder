@@ -58,6 +58,15 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
+For v0.8 agent federation, `doctor --format json` also includes an
+`agent_federation` object. It reports the `0805.agent_federation.v1` policy
+version, each provider's nested-sub-agent support, monotonic scope and
+one-writer requirements, and the hard requirement that child budget
+reservations exist before native launch. `codex`, `gemini`, and `antigravity`
+remain unsupported for provider-native sub-agents in the live matrix; a future
+provider must pass the same nested-sub-agent conformance checks with fresh
+capability evidence before the scheduler can treat it as eligible.
+
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation,
 auth-readiness, and model catalog inventory in machine-local SQLite.

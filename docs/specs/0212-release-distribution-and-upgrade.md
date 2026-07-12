@@ -182,6 +182,9 @@ Per-project isolation uses existing mechanisms:
 - State branches isolate published loopcoder state.
 - Leases isolate conductor ownership.
 - Worktree locks are keyed by canonical repository path.
+- Schema-v14 agent-federation tables isolate provider-native child
+  registration, scope grants, ownership locks, budget bindings, and
+  tamper-evident events in the machine-local SQLite store.
 
 These mechanisms mean co-located repositories can use different loopcoder
 versions, different `.delivery.yml` settings, different worktrees, and different

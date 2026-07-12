@@ -267,6 +267,15 @@ consumers. Each node includes `project_id`,
 role, provider, model, effort, permission, claim owner/lease fields, lifecycle
 status/source, timestamps, last error, and report summary when those fields are
 present in local records.
+For registered projects, `status --format json` also exposes an additive
+`agent_tree` object loaded from machine-local SQLite. It reports
+`loopcoder.agent_tree.v1`, the root run id, the deterministic
+`agent_federation_fingerprint`, and the durable `agent_registrations` rows with
+child agent id, parent/run/task/attempt references, adapter id, registration
+state, scope grant id, budget reservation ids, ownership lock ids, claim
+generation, and gap reasons. This is the restart/replay authority for
+provider-native sub-agents; opaque provider session state is only a diagnostic
+reference.
 The output is read-only and local-only: for registered projects it reads the
 global project payload root first, then legacy repo-local `.loopcoder/` only as
 a compatibility fallback. It must not be copied into PR bodies, issues,
@@ -329,6 +338,14 @@ Example JSON shape:
       "failed_runs": 0,
       "needs_human_runs": 0
     }
+  },
+  "agent_tree": {
+    "schema_version": "loopcoder.agent_tree.v1",
+    "root_run_id": "run-20260709T000000Z-wave",
+    "agent_federation_fingerprint": "sha256:...",
+    "registrations": [],
+    "blocked": [],
+    "needs_human": []
   }
 }
 ```
@@ -640,6 +657,30 @@ this version.
       "problem_count": 0,
       "message": "run tree readable; 1 run(s), no nested edges"
     }
+  },
+  "agent_federation": {
+    "schema_version": "loopcoder.agent_federation_json.v1",
+    "generated_at": "2026-07-12T00:00:00Z",
+    "agent_federation_policy_version": "0805.agent_federation.v1",
+    "providers": [
+      {
+        "adapter_id": "claude",
+        "nested_subagents": true,
+        "capability_confidence": "exact",
+        "support": "supported",
+        "gap_reasons": []
+      }
+    ],
+    "scope_policy": {
+      "monotonic_inheritance": true,
+      "credential_material_allowed": false,
+      "one_writer_required": true
+    },
+    "budget_policy": {
+      "hierarchical_budgets_required": true,
+      "child_reservation_required": true
+    },
+    "gap_reasons": []
   },
   "provider_inventory": {
     "schema_version": "loopcoder.provider_inventory_json.v1",

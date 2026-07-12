@@ -1586,6 +1586,52 @@ func TestScheduleNestedRunsPassesIdempotencyKeyAndPersistsOnlyRealReceipt(t *tes
 	}
 }
 
+func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    t.TempDir(),
+		RootRunID:   "run-native-parent",
+		ParentRunID: "run-native-parent",
+		Store:       store,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Children: []ChildRunPlan{{
+			ChildKey:   "native-child",
+			Title:      "native child",
+			Permission: "write",
+			Scope:      ChildScope{Paths: []string{"src/native.go"}},
+			Aggregation: ChildAggregation{
+				Mode:     ChildAggregationCollect,
+				Required: true,
+			},
+			Metadata: json.RawMessage(`{"native_subagent":true}`),
+		}},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if executed {
+		t.Fatalf("native child executor was called without registration")
+	}
+	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
+		t.Fatalf("children = %#v, want needs-human refusal", report.Children)
+	}
+	if !strings.Contains(report.Children[0].Error, "ErrAgentRegistrationRequired") {
+		t.Fatalf("native refusal error = %q, want ErrAgentRegistrationRequired", report.Children[0].Error)
+	}
+}
+
 func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 	oldLease := nestedClaimLeaseDuration
 	oldRenew := nestedClaimRenewEvery

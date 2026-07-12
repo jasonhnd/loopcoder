@@ -256,6 +256,21 @@ allow controlled takeover by a new generation, but uncertain external side
 effects still route to receipts/idempotency checks or `needs-human`; loopcoder
 does not claim universal exactly-once side effects across crashes.
 
+Provider-native sub-agent execution now adds an agent-federation registration
+layer on top of that nested run graph. A native-marked child cannot reach the
+provider executor unless `agent_registrations` has a `registered` row for the
+child run, the row points at the current run claim owner/generation, it carries
+scope, budget, ownership, provider route, and plan/policy fingerprints, and the
+registration is moved through the guarded lifecycle states
+`registered -> launching -> running -> succeeded|failed|cancelled|needs-human`.
+Registration transitions append tamper-evident `agent_events` with
+`payload_hash`, `previous_event_hash`, and `event_hash`; restart/replay reads
+the agent tree from SQLite rather than treating opaque provider session state as
+authority. Active ownership locks are protected by a partial unique SQLite
+index over `(project_id, resource_kind, resource_key)` for non-terminal lock
+states, with additional repo-path ancestor/descendant overlap checks before
+insert.
+
 ### Delivery Guardrails
 
 Current built guardrails include readiness checks, open-PR duplicate

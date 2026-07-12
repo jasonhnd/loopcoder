@@ -419,6 +419,32 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		phaseAt := time.Now().UTC()
+		nativeAgent := childRequiresNativeRegistration(child)
+		var nativeRegistration storage.AgentRegistration
+		if nativeAgent {
+			nativeRegistration, err = storage.ValidateNativeChildLaunch(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
+			if err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "register the provider-native child before launch"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child registration gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
+			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe native child registration before replaying"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				_ = storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child launch transition failed")
+				results[index] = withNestedDecision(result)
+				return
+			}
+		}
 		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), ""); err != nil {
 			if storage.IsStaleChildRunClaim(err) {
 				result.Status = NestedStatusNeedsHuman
@@ -432,6 +458,17 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		result.ClaimPhase = storage.ClaimPhaseExecuting
+		if nativeAgent {
+			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe native child registration before replaying"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				_ = storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child running transition failed")
+				results[index] = withNestedDecision(result)
+				return
+			}
+		}
 		child.ProviderKey = claim.ProviderKey
 		if result.StartedAt == "" {
 			result.StartedAt = state.FormatTimestamp(phaseAt)
@@ -482,6 +519,23 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		setCompleteErr(completeClaimErr)
 		if completeClaimErr != nil {
 			return
+		}
+		if nativeAgent {
+			action := storage.AgentActionCompleteFailure
+			if result.Status == NestedStatusSucceeded || result.Status == NestedStatusSucceededWithOptionalFailures {
+				action = storage.AgentActionCompleteSuccess
+			}
+			registrationCtx, cancelRegistration := nestedCleanupContext()
+			_, err := storage.TransitionAgentRegistration(registrationCtx, opts.Store, nativeRegistration.ChildAgentID, action, claim.ExecutorID, claim.ClaimGeneration, result.FinishedAt)
+			cancelRegistration()
+			if err != nil {
+				markSuppressParentDone()
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe native child registration before publishing terminal state"
+				results[index] = withNestedDecision(result)
+				return
+			}
 		}
 		eventMu.Lock()
 		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
@@ -1189,6 +1243,29 @@ func normalizeNestedStatus(status string) string {
 		return NestedStatusFailed
 	default:
 		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
+func childRequiresNativeRegistration(child ChildRunPlan) bool {
+	if len(child.Metadata) == 0 {
+		return false
+	}
+	var metadata struct {
+		NativeSubagent         bool   `json:"native_subagent"`
+		ProviderNativeSubagent bool   `json:"provider_native_subagent"`
+		ExecutionKind          string `json:"execution_kind"`
+	}
+	if err := json.Unmarshal(child.Metadata, &metadata); err != nil {
+		return false
+	}
+	if metadata.NativeSubagent || metadata.ProviderNativeSubagent {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(metadata.ExecutionKind)) {
+	case "native-subagent", "provider-native-subagent":
+		return true
+	default:
+		return false
 	}
 }
 
