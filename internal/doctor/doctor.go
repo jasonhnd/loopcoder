@@ -322,6 +322,29 @@ func RenderJSON(w io.Writer, report Report) error {
 			Message      string `json:"message"`
 		} `json:"nested_runs"`
 	}
+	type renderedAgentFederationProvider struct {
+		AdapterID            string   `json:"adapter_id"`
+		NestedSubagents      bool     `json:"nested_subagents"`
+		CapabilityConfidence string   `json:"capability_confidence"`
+		Support              string   `json:"support"`
+		GapReasons           []string `json:"gap_reasons"`
+	}
+	type renderedAgentFederation struct {
+		SchemaVersion                string                            `json:"schema_version"`
+		GeneratedAt                  string                            `json:"generated_at"`
+		AgentFederationPolicyVersion string                            `json:"agent_federation_policy_version"`
+		Providers                    []renderedAgentFederationProvider `json:"providers"`
+		ScopePolicy                  struct {
+			MonotonicInheritance      bool `json:"monotonic_inheritance"`
+			CredentialMaterialAllowed bool `json:"credential_material_allowed"`
+			OneWriterRequired         bool `json:"one_writer_required"`
+		} `json:"scope_policy"`
+		BudgetPolicy struct {
+			HierarchicalBudgetsRequired bool `json:"hierarchical_budgets_required"`
+			ChildReservationRequired    bool `json:"child_reservation_required"`
+		} `json:"budget_policy"`
+		GapReasons []string `json:"gap_reasons"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		surfaces := renderLegacySurfaces(check.LegacySurfaces)
@@ -349,6 +372,35 @@ func RenderJSON(w io.Writer, report Report) error {
 			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
 		})
 	}
+	agentFederation := renderedAgentFederation{
+		SchemaVersion:                "loopcoder.agent_federation_json.v1",
+		GeneratedAt:                  report.Date,
+		AgentFederationPolicyVersion: storage.AgentPolicyVersion,
+		Providers:                    []renderedAgentFederationProvider{},
+		GapReasons:                   []string{},
+	}
+	agentFederation.ScopePolicy.MonotonicInheritance = true
+	agentFederation.ScopePolicy.CredentialMaterialAllowed = false
+	agentFederation.ScopePolicy.OneWriterRequired = true
+	agentFederation.BudgetPolicy.HierarchicalBudgetsRequired = true
+	agentFederation.BudgetPolicy.ChildReservationRequired = true
+	for _, entry := range report.ProviderCompatibility {
+		if entry.Role != string(runtimecap.RoleNestedSubagents) {
+			continue
+		}
+		gaps := append([]string(nil), entry.MissingCapabilities...)
+		if strings.TrimSpace(entry.Code) != "" && entry.Support != string(runtimecap.SupportSupported) {
+			gaps = append(gaps, entry.Code)
+		}
+		sort.Strings(gaps)
+		agentFederation.Providers = append(agentFederation.Providers, renderedAgentFederationProvider{
+			AdapterID:            entry.Provider,
+			NestedSubagents:      entry.Support == string(runtimecap.SupportSupported),
+			CapabilityConfidence: "exact",
+			Support:              entry.Support,
+			GapReasons:           gaps,
+		})
+	}
 	payload := struct {
 		RepoPath              string                          `json:"repo_path"`
 		Version               string                          `json:"version"`
@@ -357,6 +409,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		ExitCode              int                             `json:"exit_code"`
 		Host                  renderedHostProfile             `json:"host_profile"`
 		Runtime               renderedRuntime                 `json:"runtime"`
+		AgentFederation       renderedAgentFederation         `json:"agent_federation"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
 		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
 		QuotaUsageBudget      usageledger.QuotaUsageBudget    `json:"quota_usage_budget"`
@@ -377,6 +430,7 @@ func RenderJSON(w io.Writer, report Report) error {
 			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
 			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
 		},
+		AgentFederation:       agentFederation,
 		ProviderCompatibility: compatibility,
 		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
 		QuotaUsageBudget:      normalizeQuotaUsageBudget(report.QuotaUsageBudget),

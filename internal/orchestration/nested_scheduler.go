@@ -382,9 +382,43 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		child := children[index]
 		result := childResultFromPlan(child)
 		result.Status = NestedStatusRunning
-		claimAt := time.Now().UTC()
-		claim, err := storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration))
+		claimAt := clock().UTC()
+		executorID := nestedExecutorID(opts.ParentRunID)
+		nativeAgent := childRequiresNativeRegistration(child)
+		var nativeRegistration storage.AgentRegistration
+		var claim storage.ClaimResult
+		var err error
+		if nativeAgent {
+			req, buildErr := nativeRegistrationRequestFromChild(opts, child, claimAt)
+			if buildErr != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = buildErr.Error()
+				result.NextAction = "provide accepted native child authority metadata before launch"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child authority gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
+			claim, nativeRegistration, err = storage.ClaimAndRegisterNativeChild(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration), req)
+		} else {
+			claim, err = storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration))
+		}
 		if err != nil {
+			if nativeAgent {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "fix native child authority, budget, or ownership before launch"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child atomic registration gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
 			setCompleteErr(err)
 			return
 		}
@@ -418,7 +452,31 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(fmt.Errorf("claim child run %s returned unknown outcome %q", child.RunID, claim.Outcome))
 			return
 		}
-		phaseAt := time.Now().UTC()
+		phaseAt := clock().UTC()
+		if nativeAgent {
+			nativeRegistration, err = storage.ValidateNativeChildLaunch(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
+			if err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "register the provider-native child before launch"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child registration gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
+			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe native child registration before replaying"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				_ = storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child launch transition failed")
+				results[index] = withNestedDecision(result)
+				return
+			}
+		}
 		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), ""); err != nil {
 			if storage.IsStaleChildRunClaim(err) {
 				result.Status = NestedStatusNeedsHuman
@@ -432,6 +490,17 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		result.ClaimPhase = storage.ClaimPhaseExecuting
+		if nativeAgent {
+			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "observe native child registration before replaying"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				_ = storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child running transition failed")
+				results[index] = withNestedDecision(result)
+				return
+			}
+		}
 		child.ProviderKey = claim.ProviderKey
 		if result.StartedAt == "" {
 			result.StartedAt = state.FormatTimestamp(phaseAt)
@@ -444,7 +513,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(err)
 		}
 
-		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
+		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, clock)
 		executed, err := opts.Execute(ctx, child)
 		heartbeatErr := stopHeartbeat()
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
@@ -987,9 +1056,12 @@ func applyClaimResult(result ChildRunResult, claim storage.ClaimResult) ChildRun
 	return result
 }
 
-func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64) func() error {
+func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64, clock func() time.Time) func() error {
 	if store == nil || strings.TrimSpace(childRunID) == "" || strings.TrimSpace(executorID) == "" || generation <= 0 {
 		return func() error { return nil }
+	}
+	if clock == nil {
+		clock = func() time.Time { return time.Now().UTC() }
 	}
 	interval := nestedClaimRenewEvery
 	if interval <= 0 {
@@ -1010,7 +1082,7 @@ func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID strin
 				done <- lastErr
 				return
 			case <-ticker.C:
-				now := time.Now().UTC()
+				now := clock().UTC()
 				renewCtx, cancel := nestedCleanupContext()
 				err := storage.RenewChildRunClaim(renewCtx, store, childRunID, executorID, generation, now, now.Add(nestedClaimLeaseDuration))
 				cancel()
@@ -1189,6 +1261,133 @@ func normalizeNestedStatus(status string) string {
 		return NestedStatusFailed
 	default:
 		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
+type nativeChildAuthorityMetadata struct {
+	NativeSubagent           bool                         `json:"native_subagent"`
+	ProviderNativeSubagent   bool                         `json:"provider_native_subagent"`
+	ExecutionKind            string                       `json:"execution_kind"`
+	ProjectID                string                       `json:"project_id"`
+	DeliveryRunID            string                       `json:"delivery_run_id"`
+	TaskID                   string                       `json:"task_id"`
+	AttemptID                string                       `json:"attempt_id"`
+	AdapterID                string                       `json:"adapter_id"`
+	ProviderInstallationID   string                       `json:"provider_installation_id"`
+	AccountProfileID         string                       `json:"account_profile_id"`
+	ModelCapabilityID        string                       `json:"model_capability_id"`
+	RoutingDecisionID        string                       `json:"routing_decision_id"`
+	ProviderSessionRef       string                       `json:"provider_session_ref"`
+	PlanFingerprint          string                       `json:"plan_fingerprint"`
+	PolicyFingerprint        string                       `json:"policy_fingerprint"`
+	AuthorizationFingerprint string                       `json:"authorization_fingerprint"`
+	SideEffectClass          string                       `json:"side_effect_class"`
+	CancellationChannel      string                       `json:"cancellation_channel"`
+	ExpectedOutputs          json.RawMessage              `json:"expected_outputs"`
+	ParentScope              *storage.AgentScopeGrant     `json:"parent_scope"`
+	Scope                    *storage.AgentScopeGrant     `json:"scope"`
+	BudgetBindings           []storage.AgentBudgetBinding `json:"budget_bindings"`
+	OwnershipLocks           []storage.AgentOwnershipLock `json:"ownership_locks"`
+}
+
+func nativeRegistrationRequestFromChild(opts NestedScheduleOptions, child ChildRunPlan, at time.Time) (storage.AgentRegistrationRequest, error) {
+	var metadata nativeChildAuthorityMetadata
+	if err := json.Unmarshal(child.Metadata, &metadata); err != nil {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is invalid: %w", err)
+	}
+	expectedOutputs := strings.TrimSpace(string(metadata.ExpectedOutputs))
+	if expectedOutputs == "" {
+		expectedOutputs = "{}"
+	}
+	scope := storage.AgentScopeGrant{}
+	if metadata.Scope != nil {
+		scope = *metadata.Scope
+	} else {
+		scope = storage.AgentScopeGrant{
+			ReadScope:       append([]string{}, child.Scope.Paths...),
+			PathScope:       append([]string{}, child.Scope.Paths...),
+			RepositoryScope: []string{firstNonEmptyChild(child.Scope.Repo, filepath.ToSlash(opts.RepoPath))},
+			CommandScope:    append([]string{}, child.Scope.Commands...),
+			NetworkScope:    []string{"none"},
+			CredentialScope: []string{"none"},
+			ApprovalScope:   []string{"none"},
+		}
+		if child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate {
+			scope.WriteScope = append([]string{}, child.Scope.Paths...)
+		}
+	}
+	sideEffectClass := strings.TrimSpace(metadata.SideEffectClass)
+	if sideEffectClass == "" {
+		sideEffectClass = storage.SideEffectLocalRead
+		if child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate {
+			sideEffectClass = storage.SideEffectRepoWrite
+		}
+	}
+	if len(scope.SideEffectScope) == 0 {
+		scope.SideEffectScope = []string{sideEffectClass}
+	}
+	locks := append([]storage.AgentOwnershipLock{}, metadata.OwnershipLocks...)
+	if len(locks) == 0 && (child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate) {
+		for _, path := range child.Scope.Paths {
+			locks = append(locks, storage.AgentOwnershipLock{
+				ResourceKind: "repo-path",
+				ResourceKey:  path,
+				State:        storage.OwnershipStateHeld,
+			})
+		}
+	}
+	return storage.AgentRegistrationRequest{
+		ProjectID:                metadata.ProjectID,
+		DeliveryRunID:            metadata.DeliveryRunID,
+		RootRunID:                opts.RootRunID,
+		ParentRunID:              opts.ParentRunID,
+		RunID:                    child.RunID,
+		Depth:                    child.Depth,
+		TaskID:                   metadata.TaskID,
+		AttemptID:                metadata.AttemptID,
+		PlanID:                   opts.PlanID,
+		ChildKey:                 child.ChildKey,
+		AdapterID:                metadata.AdapterID,
+		ProviderInstallationID:   metadata.ProviderInstallationID,
+		AccountProfileID:         metadata.AccountProfileID,
+		ModelCapabilityID:        metadata.ModelCapabilityID,
+		RoutingDecisionID:        metadata.RoutingDecisionID,
+		ProviderSessionRef:       metadata.ProviderSessionRef,
+		Scope:                    scope,
+		ParentScope:              metadata.ParentScope,
+		Permission:               child.Permission,
+		SideEffectClass:          sideEffectClass,
+		BudgetBindings:           metadata.BudgetBindings,
+		OwnershipLocks:           locks,
+		CancellationChannel:      firstNonEmptyChild(metadata.CancellationChannel, "local-cancel"),
+		ExpectedOutputsJSON:      expectedOutputs,
+		PlanFingerprint:          metadata.PlanFingerprint,
+		PolicyFingerprint:        metadata.PolicyFingerprint,
+		AuthorizationFingerprint: metadata.AuthorizationFingerprint,
+		CreatedAt:                state.FormatTimestamp(at.UTC()),
+	}, nil
+}
+
+func childRequiresNativeRegistration(child ChildRunPlan) bool {
+	if len(child.Metadata) == 0 {
+		return false
+	}
+	var metadata struct {
+		NativeSubagent         bool   `json:"native_subagent"`
+		ProviderNativeSubagent bool   `json:"provider_native_subagent"`
+		ExecutionKind          string `json:"execution_kind"`
+	}
+	if err := json.Unmarshal(child.Metadata, &metadata); err != nil {
+		return false
+	}
+	if metadata.NativeSubagent || metadata.ProviderNativeSubagent {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(metadata.ExecutionKind)) {
+	case "native-subagent", "provider-native-subagent":
+		return true
+	default:
+		return false
 	}
 }
 

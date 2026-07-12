@@ -58,6 +58,13 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
+Provider-native sub-agent eligibility is stricter than a static adapter claim:
+the live scheduler requires fresh durable provider inventory, task requirement,
+budget reservation, scope, ownership-lock, and plan/policy fingerprint authority
+before a native child can launch. `codex`, `gemini`, and `antigravity` remain
+unsupported for provider-native sub-agents in the live matrix until a future
+provider passes the same conformance suite with accepted capability evidence.
+
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation,
 auth-readiness, and model catalog inventory in machine-local SQLite.
