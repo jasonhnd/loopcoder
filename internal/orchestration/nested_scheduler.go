@@ -391,10 +391,10 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		var claim storage.ClaimResult
 		var nativeRegistration storage.AgentRegistration
 		if nativeAgent {
-			req, err := nativeRegistrationRequestForChild(*plan, child, phaseAt)
-			if err != nil {
+			req, reqErr := nativeRegistrationRequestForChild(*plan, child, phaseAt)
+			if reqErr != nil {
 				result.Status = NestedStatusNeedsHuman
-				result.Error = err.Error()
+				result.Error = reqErr.Error()
 				result.NextAction = "fix the provider-native child registration metadata before launch"
 				result.FinishedAt = state.FormatTimestamp(clock().UTC())
 				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child registration build failed"); persistErr != nil {
@@ -404,11 +404,12 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				results[index] = withNestedDecision(result)
 				return
 			}
-			claim, nativeRegistration, err = storage.ClaimAndStartNativeChild(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration), req)
+			var claimErr error
+			claim, nativeRegistration, claimErr = storage.ClaimAndStartNativeChild(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration), req)
 			result = applyClaimResult(result, claim)
-			if err != nil {
+			if claimErr != nil {
 				result.Status = NestedStatusNeedsHuman
-				result.Error = err.Error()
+				result.Error = claimErr.Error()
 				result.NextAction = "register the provider-native child before launch"
 				result.FinishedAt = state.FormatTimestamp(clock().UTC())
 				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "native child registration gate"); persistErr != nil {
@@ -423,10 +424,10 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				return
 			}
 		} else {
-			var err error
-			claim, err = storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration))
-			if err != nil {
-				setCompleteErr(err)
+			var claimErr error
+			claim, claimErr = storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration))
+			if claimErr != nil {
+				setCompleteErr(claimErr)
 				return
 			}
 			result = applyClaimResult(result, claim)
@@ -453,23 +454,23 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			result.StartedAt = state.FormatTimestamp(phaseAt)
 		}
 		eventMu.Lock()
-		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
+		runningEventErr := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock))
 		eventMu.Unlock()
-		setCompleteErr(err)
+		setCompleteErr(runningEventErr)
 		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock)); err != nil {
 			setCompleteErr(err)
 		}
 
 		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
-		executed, err := opts.Execute(ctx, child)
+		executed, executeErr := opts.Execute(ctx, child)
 		heartbeatErr := stopHeartbeat()
-		if err == nil && strings.TrimSpace(executed.Status) == "" {
+		if executeErr == nil && strings.TrimSpace(executed.Status) == "" {
 			executed.Status = NestedStatusFailed
 		}
 		result = mergeChildResult(result, executed)
-		if err != nil {
-			result.Status = normalizeNestedStatus(state.FailureStatus(err))
-			result.Error = err.Error()
+		if executeErr != nil {
+			result.Status = normalizeNestedStatus(state.FailureStatus(executeErr))
+			result.Error = executeErr.Error()
 		}
 		result.Status = normalizeNestedStatus(result.Status)
 		if result.FinishedAt == "" {
@@ -505,9 +506,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		eventMu.Lock()
-		err = recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
+		finishedEventErr := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, finishedAt)
 		eventMu.Unlock()
-		setCompleteErr(err)
+		setCompleteErr(finishedEventErr)
 		if err := recordNestedEvent(opts, child.RunID, child, result, NestedEventChildFinished, finishedAt); err != nil {
 			setCompleteErr(err)
 		}
@@ -1462,11 +1463,6 @@ func nativeOwnershipLocks(child ChildRunPlan, permission string, createdAt strin
 		})
 	}
 	return locks
-}
-
-func childScopedFingerprint(parts ...string) string {
-	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
 func replayActionForStatus(status string) string {

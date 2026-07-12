@@ -94,6 +94,47 @@ func TestScheduleNestedRunsFansOutWithConcurrencyLimitAndDeterministicResults(t 
 	}
 }
 
+func TestScheduleNestedRunsConcurrentChildExecutionDoesNotShareErrorState(t *testing.T) {
+	repo := t.TempDir()
+	now := nestedTestNow()
+	children := make([]ChildRunPlan, 8)
+	for i := range children {
+		children[i] = ChildRunPlan{ID: string(rune('a' + i)), Issue: i + 1, Permission: "write", Required: true}
+	}
+	allExecuting := make(chan struct{})
+	var releaseOnce sync.Once
+	var executing atomic.Int32
+
+	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+		RepoPath:         repo,
+		ParentRunID:      "run-20260709T000000Z-wave",
+		BaseBranch:       "main",
+		ConcurrencyLimit: len(children),
+		MaxChildren:      len(children),
+		Now:              now,
+		Clock:            func() time.Time { return now },
+		Children:         children,
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			if executing.Add(1) == int32(len(children)) {
+				releaseOnce.Do(func() {
+					close(allExecuting)
+				})
+			}
+			waitForNestedSignal(t, allExecuting, "all children executing")
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if report.Status != NestedStatusSucceeded {
+		t.Fatalf("status = %s, want succeeded", report.Status)
+	}
+	if report.Summary.SucceededCount != len(children) {
+		t.Fatalf("summary = %#v, want %d succeeded", report.Summary, len(children))
+	}
+}
+
 func TestScheduleNestedRunsChildRunIDsUseIndexForSlugCollisions(t *testing.T) {
 	repo := t.TempDir()
 	now := nestedTestNow()

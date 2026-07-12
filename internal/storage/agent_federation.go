@@ -1963,15 +1963,6 @@ func actionRequiresClaim(action string) bool {
 	}
 }
 
-func isUnsupportedNativeAdapter(adapterID string) bool {
-	switch strings.ToLower(strings.TrimSpace(adapterID)) {
-	case "codex", "gemini", "antigravity":
-		return true
-	default:
-		return false
-	}
-}
-
 func normalizeClosedChildStatus(status string) (string, bool) {
 	switch normalizeDurableStatus(status) {
 	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "launching", "running", "waiting", "queued", "blocked":
