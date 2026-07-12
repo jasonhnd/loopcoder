@@ -74,6 +74,21 @@ key names, field classifications, and permission scope; without a future
 network grant they are skipped and recorded as unknown/unavailable with typed
 gap reasons.
 
+Budget accounting is owned by LoopCoder policy and operator approval, not by
+provider adapters. Adapters may contribute provider/account/model identifiers
+and exact supported quota evidence, but they do not mutate budget balances and
+must not treat budget approval as invocation permission or safety-policy
+approval. Schedulers reserve against machine, project, DeliveryRun, task,
+worker, sub-agent, and provider/account/model policy scopes before launch; the
+reserve, commit, release, cancel, and expiry transitions are local SQLite
+transactions and record actor plus host provenance for every mutation. Soft
+budget policy is still scheduler-owned output: `warn-only` breaches must be
+reported as gap reasons, and `requires-approval` breaches must return typed
+approval-needed budget refusal until an operator approval id is supplied.
+Adapters may attach source usage record ids and authorization fingerprints to a
+reservation request, but those fields are audit provenance only and do not grant
+permission or override safety policy.
+
 Provider output is untrusted. Parser code must reject malformed schemas,
 preserve `unknown` for ambiguous evidence, redact before persistence, and map
 timeouts, cancellation, malformed output, unsupported operations, and schema
