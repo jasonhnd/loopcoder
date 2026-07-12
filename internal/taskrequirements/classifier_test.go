@@ -178,6 +178,41 @@ func TestProviderLaunchOnlyRecordsRule(t *testing.T) {
 	}
 }
 
+func TestRuntimeCommandsRaiseRiskAndSideEffectFloor(t *testing.T) {
+	tests := []struct {
+		name  string
+		scope Scope
+	}{
+		{
+			name:  "runtime flag",
+			scope: Scope{RuntimeCommands: true},
+		},
+		{
+			name:  "command list",
+			scope: Scope{Commands: []string{"go test ./internal/taskrequirements"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := baseInput()
+			input.Scope = tt.scope
+			got, err := Classify(input)
+			if err != nil {
+				t.Fatalf("Classify() error = %v", err)
+			}
+			if riskRanks[got.RiskTier] < riskRanks[RiskMedium] {
+				t.Fatalf("risk = %s, want at least %s", got.RiskTier, RiskMedium)
+			}
+			if sideEffectRanks[got.SideEffectClass] < sideEffectRanks[SideEffectLocalWrite] {
+				t.Fatalf("side effect = %s, want at least %s", got.SideEffectClass, SideEffectLocalWrite)
+			}
+			if !contains(got.ClassificationRules, "scope.local-runtime-write") {
+				t.Fatalf("classification rules = %#v, missing scope.local-runtime-write", got.ClassificationRules)
+			}
+		})
+	}
+}
+
 func TestGitHubReferencesDoNotImplyGitHubWrite(t *testing.T) {
 	input := baseInput()
 	input.Scope = Scope{Issues: []int{733}, PullRequests: []int{815}}
@@ -204,11 +239,39 @@ func TestUnknownCapabilityEvidenceCannotSatisfyHardRequirement(t *testing.T) {
 	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceUnknown, Freshness: providerinventory.FreshnessFresh}}) {
 		t.Fatal("unknown confidence satisfied hard requirement")
 	}
+	if err := CheckHardRequirementsSatisfied([]CapabilityRequirement{req}, CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceUnknown, Freshness: providerinventory.FreshnessFresh}}); !errors.Is(err, ErrCapabilityUnsupported) {
+		t.Fatalf("CheckHardRequirementsSatisfied() error = %v, want ErrCapabilityUnsupported", err)
+	}
 	if req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessStale}}) {
 		t.Fatal("stale evidence satisfied hard requirement")
 	}
+	if err := CheckHardRequirementsSatisfied([]CapabilityRequirement{req}, CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessStale}}); !errors.Is(err, ErrCapabilityUnsupported) {
+		t.Fatalf("CheckHardRequirementsSatisfied() error = %v, want ErrCapabilityUnsupported", err)
+	}
+	freshnessTests := []struct {
+		name      string
+		freshness providerinventory.FreshnessState
+	}{
+		{name: "not applicable", freshness: providerinventory.FreshnessNotApplicable},
+		{name: "zero", freshness: ""},
+		{name: "malformed", freshness: providerinventory.FreshnessState("malformed")},
+	}
+	for _, tt := range freshnessTests {
+		t.Run(tt.name, func(t *testing.T) {
+			evidence := CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: tt.freshness}}
+			if req.SatisfiedBy(evidence) {
+				t.Fatalf("%s freshness satisfied hard requirement", tt.freshness)
+			}
+			if err := CheckHardRequirementsSatisfied([]CapabilityRequirement{req}, evidence); !errors.Is(err, ErrCapabilityUnsupported) {
+				t.Fatalf("CheckHardRequirementsSatisfied() error = %v, want ErrCapabilityUnsupported", err)
+			}
+		})
+	}
 	if !req.SatisfiedBy(CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessFresh}}) {
 		t.Fatal("fresh exact evidence did not satisfy hard requirement")
+	}
+	if err := CheckHardRequirementsSatisfied([]CapabilityRequirement{req}, CapabilityEvidenceSet{CapabilityJSONOutput: {Value: true, Confidence: providerinventory.ConfidenceExact, Freshness: providerinventory.FreshnessFresh}}); err != nil {
+		t.Fatalf("CheckHardRequirementsSatisfied() error = %v, want nil", err)
 	}
 }
 

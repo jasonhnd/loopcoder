@@ -49,6 +49,7 @@ var (
 	ErrRequirementUnknown                = &TypedError{Code: ErrRequirementUnknownCode}
 	ErrNoEligibleCandidate               = &TypedError{Code: ErrNoEligibleCandidateCode}
 	ErrRequirementConfidenceInsufficient = &TypedError{Code: ErrRequirementConfidenceInsufficientCode}
+	ErrCapabilityUnsupported             = &TypedError{Code: ErrCapabilityUnsupportedCode}
 	ErrInvalidRecord                     = &TypedError{Code: ErrInvalidRecordCode}
 	ErrDuplicateRecord                   = &TypedError{Code: ErrDuplicateRecordCode}
 	ErrMissingReference                  = &TypedError{Code: ErrMissingReferenceCode}
@@ -305,6 +306,9 @@ func (req CapabilityRequirement) SatisfiedBy(evidence CapabilityEvidenceSet) boo
 	if fact.Freshness == providerinventory.FreshnessStale || fact.Freshness == providerinventory.FreshnessExpired {
 		return false
 	}
+	if req.FreshnessRequired == providerinventory.FreshnessFresh && fact.Freshness != providerinventory.FreshnessFresh {
+		return false
+	}
 	if fact.Confidence == providerinventory.ConfidenceUnknown || fact.Confidence == providerinventory.ConfidenceUnavailable || fact.Confidence == providerinventory.ConfidenceStale {
 		return false
 	}
@@ -315,12 +319,16 @@ func (req CapabilityRequirement) SatisfiedBy(evidence CapabilityEvidenceSet) boo
 }
 
 func HardRequirementsSatisfied(requirements []CapabilityRequirement, evidence CapabilityEvidenceSet) bool {
+	return CheckHardRequirementsSatisfied(requirements, evidence) == nil
+}
+
+func CheckHardRequirementsSatisfied(requirements []CapabilityRequirement, evidence CapabilityEvidenceSet) error {
 	for _, req := range requirements {
 		if !req.SatisfiedBy(evidence) {
-			return false
+			return typed(ErrCapabilityUnsupportedCode, "hard capability requirement %s is not satisfied", req.Dimension)
 		}
 	}
-	return true
+	return nil
 }
 
 func requiredValueSatisfied(required, actual any) bool {

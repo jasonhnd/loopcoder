@@ -246,7 +246,7 @@ but JSON and tests use the stable code.
 | `ErrDuplicateRecord` | A unique record already exists with different intended identity. |
 | `ErrDuplicateReplay` | Same idempotency key is replayed with different canonical request bytes. |
 | `ErrStaleApproval` | Approval or override fingerprint does not exactly match current plan, policy, and input fingerprints. |
-| `ErrPolicyDenied` | Deterministic policy rejects an operation without an applicable override path. |
+| `ErrNoEligibleCandidate` | Deterministic routing finds no provider or execution path that can satisfy hard policy requirements. |
 | `ErrOverrideRequired` | Policy allows continuation only with an explicit override. |
 | `ErrApprovalRequired` | Work cannot continue until an approval for the exact authorization fingerprint exists. |
 | `ErrExpiredApproval` | Approval or override is past its `expires_at`. |

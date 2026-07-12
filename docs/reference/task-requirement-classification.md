@@ -35,7 +35,7 @@ IDs come from spec 0804, including `scope.docs-only`, `scope.repo-write`,
 Ambiguous high-risk classifications stop with `ErrRequirementUnknown` and add a
 human approval verification requirement instead of defaulting to lower risk.
 Secret material is classified as `critical` and terminally refused with
-`ErrPolicyDenied`.
+`ErrNoEligibleCandidate`.
 
 ## Schema Contract
 

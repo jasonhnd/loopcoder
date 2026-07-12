@@ -199,6 +199,11 @@ func Classify(input ClassificationInput) (TaskRequirement, error) {
 		raiseSideEffect(SideEffectLocalWrite)
 		raiseRisk(RiskMedium)
 	}
+	if scope.RuntimeCommands {
+		applyRule("scope.local-runtime-write")
+		raiseSideEffect(SideEffectLocalWrite)
+		raiseRisk(RiskMedium)
+	}
 	if scope.AllowsProviderLaunch {
 		applyRule("scope.provider-launch")
 		raiseSideEffect(SideEffectProviderLaunch)
@@ -559,6 +564,9 @@ func normalizeScope(scope Scope) Scope {
 	sort.Strings(scope.ExternalServices)
 	sort.Strings(scope.Providers)
 	sort.Strings(scope.RequiredTools)
+	if len(scope.Commands) > 0 {
+		scope.RuntimeCommands = true
+	}
 	return scope
 }
 
