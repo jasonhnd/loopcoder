@@ -1593,6 +1593,7 @@ func TestScheduleNestedRunsRegistersNativeChildAfterClaimBeforeExecute(t *testin
 		t.Fatalf("storage.Open: %v", err)
 	}
 	defer store.Close()
+	seedNativeSchedulerReservation(t, ctx, store, "bres-native")
 
 	executed := false
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
@@ -1613,7 +1614,7 @@ func TestScheduleNestedRunsRegistersNativeChildAfterClaimBeforeExecute(t *testin
 				Required:      true,
 				IncludeReport: true,
 			},
-			Metadata: json.RawMessage(`{"native_subagent":true}`),
+			Metadata: nativeSchedulerMetadata("bres-native"),
 		}},
 		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
 			executed = true
@@ -1656,6 +1657,102 @@ func TestScheduleNestedRunsRegistersNativeChildAfterClaimBeforeExecute(t *testin
 	}
 	if registrationState != storage.AgentStateSucceeded || lockState != storage.OwnershipStateReleased {
 		t.Fatalf("native terminal state/lock = %q/%q, want succeeded/released", registrationState, lockState)
+	}
+}
+
+func TestScheduleNestedRunsNativeChildMissingAuthorityDoesNotExecute(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    t.TempDir(),
+		RootRunID:   "run-native-missing-parent",
+		ParentRunID: "run-native-missing-parent",
+		Store:       store,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Children: []ChildRunPlan{{
+			ChildKey:   "native-missing",
+			Title:      "native missing",
+			Role:       "worker",
+			Permission: "write",
+			Scope:      ChildScope{Repo: ".", Paths: []string{"src/native.go"}},
+			Aggregation: ChildAggregation{
+				Mode:          ChildAggregationCollect,
+				Required:      true,
+				IncludeReport: true,
+			},
+			Metadata: json.RawMessage(`{"native_subagent":true}`),
+		}},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if executed {
+		t.Fatalf("native child executed despite missing authority metadata")
+	}
+	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
+		t.Fatalf("children = %#v, want one needs-human child", report.Children)
+	}
+	if !strings.Contains(report.Children[0].Error, "required") {
+		t.Fatalf("error = %q, want missing authority refusal", report.Children[0].Error)
+	}
+}
+
+func nativeSchedulerMetadata(reservationID string) json.RawMessage {
+	return json.RawMessage(`{
+		"native_subagent": true,
+		"adapter_id": "claude",
+		"project_id": "project-native",
+		"delivery_run_id": "drun-native",
+		"task_id": "task-native",
+		"attempt_id": "attempt-native",
+		"provider_installation_id": "pinst-native",
+		"account_profile_id": "acct-native",
+		"model_capability_id": "mcap-native",
+		"routing_decision_id": "route-native",
+		"provider_session_ref": "session-native",
+		"budget_policy_id": "bpol-native",
+		"budget_reservation_id": "` + reservationID + `",
+		"reservation_scope": "sub-agent",
+		"reserved_quantities_json": "{\"attempts\":1}",
+		"ancestor_budget_refs_json": "[]",
+		"cancellation_channel": "local-cancel",
+		"expected_outputs_json": "{}",
+		"policy_fingerprint": "sha256:native-policy",
+		"capability_evidence": {
+			"adapter_id": "claude",
+			"nested_subagents": true,
+			"cancellation": true,
+			"capability_confidence": "exact",
+			"freshness_state": "fresh"
+		}
+	}`)
+}
+
+func seedNativeSchedulerReservation(t *testing.T, ctx context.Context, store storage.Store, reservationID string) {
+	t.Helper()
+	payload := `{"budget_reservation_id":"` + reservationID + `","state":"reserved","scope_key":"sub-agent","budget_policy_ids":["bpol-native"],"reserved_value":1,"committed_value":0,"released_value":0,"expires_at":"2026-07-10T00:00:00Z","requester_id":"","policy_fingerprint":"sha256:native-policy","reserved_quantities_json":{"attempts":1}}`
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO usage_records(
+				usage_record_id, project_id, delivery_run_id, task_id, attempt_id, worker_id, sub_agent_id,
+				adapter_id, account_profile_id, model_capability_id, event_kind, event_time,
+				quantity_kind, unit, value, value_scale, confidence, idempotency_key, dedupe_key, payload_json)
+			VALUES (?, 'project-native', 'drun-native', 'task-native', 'attempt-native', '', '', 'claude', 'acct-native', 'mcap-native',
+				'reservation-created', '2026-07-09T00:00:00Z', 'attempts', 'attempt', 1, 0, 'exact', ?, '', ?)`,
+			"usage-"+reservationID, "reservation-"+reservationID, payload)
+		return err
+	}); err != nil {
+		t.Fatalf("seed native scheduler reservation: %v", err)
 	}
 }
 

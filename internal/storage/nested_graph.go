@@ -419,6 +419,9 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 			if err == nil && affected == 0 {
 				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
 			}
+			if err := renewClaimFencedOwnershipLocksTx(ctx, tx, childRunID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+				return err
+			}
 			return nil
 		})
 	})
@@ -439,40 +442,7 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 	}
 	return withRetry(ctx, func() error {
 		return store.WithWriteTx(ctx, func(tx Tx) error {
-			result, err := tx.Exec(ctx, `UPDATE run_claims
-				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN ? <> '' THEN ? ELSE provider_receipt END
-				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
-				phase, at, providerReceipt, providerReceipt, childRunID, executorID, claimGeneration)
-			if err != nil {
-				return fmt.Errorf("update child run claim phase: %w", err)
-			}
-			affected, err := result.RowsAffected()
-			if err == nil && affected == 0 {
-				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
-			}
-			status := ""
-			switch phase {
-			case ClaimPhaseLaunching:
-				status = "launching"
-			case ClaimPhaseExecuting:
-				status = "running"
-			}
-			if status != "" {
-				if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
-					RunID:       childRunID,
-					ParentRunID: parentRunID,
-					ChildRunID:  childRunID,
-					Status:      status,
-					UpdatedAt:   at,
-					Reason:      "child claim phase " + phase,
-					Source:      "nested-scheduler",
-				}); err != nil {
-					return err
-				}
-			} else if err := appendClaimPhaseEvent(ctx, tx, childRunID, at, phase, "nested-scheduler"); err != nil {
-				return err
-			}
-			return nil
+			return updateChildRunClaimPhaseTx(ctx, tx, parentRunID, childRunID, executorID, claimGeneration, phase, at, providerReceipt)
 		})
 	})
 }
@@ -518,6 +488,125 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 			})
 		})
 	})
+}
+
+func CompleteClaimedNativeChildRun(ctx context.Context, store Store, parentRunID, childRunID, executorID string, claimGeneration int64, childAgentID, status, updatedAt, reason, providerReceipt string) error {
+	if store == nil {
+		return nil
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	childAgentID = strings.TrimSpace(childAgentID)
+	status = normalizeDurableStatus(status)
+	updatedAt = strings.TrimSpace(updatedAt)
+	reason = strings.TrimSpace(reason)
+	providerReceipt = strings.TrimSpace(providerReceipt)
+	if parentRunID == "" || childRunID == "" || executorID == "" || childAgentID == "" || claimGeneration <= 0 || status == "" || updatedAt == "" {
+		return fmt.Errorf("complete claimed native child run: parent_run_id, child_run_id, executor_id, child_agent_id, claim_generation, status, and updated_at are required")
+	}
+	if !validDurableStatus(status) {
+		return fmt.Errorf("complete claimed native child run: invalid status %q", status)
+	}
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			record, ok, err := loadAgentRegistrationTx(ctx, tx, childAgentID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return federationError(ErrAgentRegistrationRequiredCode, "registration %s is missing", childAgentID)
+			}
+			if record.RunID != childRunID {
+				return federationError(ErrAgentRegistrationConflictCode, "registration %s run mismatch", childAgentID)
+			}
+			result, err := tx.Exec(ctx, `UPDATE run_claims
+				SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN provider_receipt = '' THEN ? ELSE provider_receipt END
+				WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+				ClaimPhaseCompleted, updatedAt, providerReceipt, childRunID, executorID, claimGeneration)
+			if err != nil {
+				return fmt.Errorf("complete claimed native child run: fence claim: %w", err)
+			}
+			affected, err := result.RowsAffected()
+			if err == nil && affected != 1 {
+				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+			}
+			if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+				RunID:       childRunID,
+				ParentRunID: parentRunID,
+				ChildRunID:  childRunID,
+				Status:      status,
+				UpdatedAt:   updatedAt,
+				Reason:      reason,
+				Source:      "nested-scheduler",
+			}); err != nil {
+				return err
+			}
+			action := AgentActionCompleteFailure
+			if status == "succeeded" || status == "succeeded_with_optional_failures" {
+				action = AgentActionCompleteSuccess
+			}
+			return transitionAgentRegistrationTx(ctx, tx, &record, action, executorID, claimGeneration, updatedAt)
+		})
+	})
+}
+
+func updateChildRunClaimPhaseTx(ctx context.Context, tx Tx, parentRunID, childRunID, executorID string, claimGeneration int64, phase, at, providerReceipt string) error {
+	result, err := tx.Exec(ctx, `UPDATE run_claims
+		SET phase = ?, heartbeat_at = ?, provider_receipt = CASE WHEN ? <> '' THEN ? ELSE provider_receipt END
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+		phase, at, providerReceipt, providerReceipt, childRunID, executorID, claimGeneration)
+	if err != nil {
+		return fmt.Errorf("update child run claim phase: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+	}
+	status := ""
+	switch phase {
+	case ClaimPhaseLaunching:
+		status = "launching"
+	case ClaimPhaseExecuting:
+		status = "running"
+	}
+	if status != "" {
+		return transitionRunStatusTx(ctx, tx, RunStatusTransition{
+			RunID:       childRunID,
+			ParentRunID: parentRunID,
+			ChildRunID:  childRunID,
+			Status:      status,
+			UpdatedAt:   at,
+			Reason:      "child claim phase " + phase,
+			Source:      "nested-scheduler",
+		})
+	}
+	return appendClaimPhaseEvent(ctx, tx, childRunID, at, phase, "nested-scheduler")
+}
+
+func renewClaimFencedOwnershipLocksTx(ctx context.Context, tx Tx, childRunID string, claimGeneration int64, heartbeatAt, leaseUntil string) error {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, childRunID)
+	if err != nil {
+		return err
+	}
+	if !ok || record.Permission == PermissionReadOnly {
+		return nil
+	}
+	if len(record.OwnershipLockIDs) == 0 {
+		return federationError(ErrOwnershipRequiredCode, "registration %s has no ownership locks", record.ChildAgentID)
+	}
+	result, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+		SET heartbeat_at = ?, lease_expires_at = ?, lock_generation = lock_generation + 1, updated_at = ?
+		WHERE child_agent_id = ? AND run_id = ? AND claim_generation = ? AND state = ?`,
+		heartbeatAt, leaseUntil, heartbeatAt, record.ChildAgentID, childRunID, claimGeneration, OwnershipStateHeld)
+	if err != nil {
+		return fmt.Errorf("renew ownership locks: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != int64(len(record.OwnershipLockIDs)) {
+		return federationError(ErrOwnershipRequiredCode, "renewed %d ownership locks, want %d", affected, len(record.OwnershipLockIDs))
+	}
+	return nil
 }
 
 func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunID, executorID, now, leaseUntil string) (ClaimResult, error) {

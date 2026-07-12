@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -227,6 +228,64 @@ func TestChildOutputRedactsBeforeTruncatingSecretPrefix(t *testing.T) {
 	}
 }
 
+func TestRegisterAgentRequiresRealAuthoritativeReservation(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM usage_records WHERE json_extract(payload_json, '$.budget_reservation_id') = 'bres-a-child-a'`)
+		return err
+	}); err != nil {
+		t.Fatalf("delete authoritative reservation: %v", err)
+	}
+	if _, err := RegisterAgent(ctx, store, federationRequest(claim)); !errors.Is(err, ErrChildBudgetRequired) {
+		t.Fatalf("RegisterAgent error = %v, want ErrChildBudgetRequired", err)
+	}
+}
+
+func TestRegisterAgentRequiresDurableCapabilityEvidence(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.CapabilityEvidence = ProviderCapabilityEvidence{}
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrUnsupportedNativeSubAgent) {
+		t.Fatalf("missing capability evidence error = %v, want ErrUnsupportedNativeSubAgent", err)
+	}
+	req = federationRequest(claim)
+	req.CapabilityEvidence.FreshnessState = "stale"
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrUnsupportedNativeSubAgent) {
+		t.Fatalf("stale capability evidence error = %v, want ErrUnsupportedNativeSubAgent", err)
+	}
+}
+
+func TestRegisterAgentSideEffectEnumValidation(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.SideEffectClass = "read-only"
+	req.Scope.SideEffectClass = "read-only"
+	req.Scope.SideEffectScope = []string{"read-only"}
+	req.ParentScope.SideEffectClass = "read-only"
+	req.ParentScope.SideEffectScope = []string{"read-only"}
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("read-only side effect class error = %v, want ErrInvalidRecord", err)
+	}
+}
+
 func TestValidateNativeChildLaunchRequiresActiveBudgetReservation(t *testing.T) {
 	ctx := context.Background()
 	for _, tt := range []struct {
@@ -257,6 +316,35 @@ func TestValidateNativeChildLaunchRequiresActiveBudgetReservation(t *testing.T) 
 				t.Fatalf("ValidateNativeChildLaunch error = %v, want ErrChildBudgetRequired", err)
 			}
 		})
+	}
+}
+
+func TestRenewChildRunClaimRenewsFencedOwnershipLocks(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	record, err := RegisterAgent(ctx, store, federationRequest(claim))
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	now := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	lease := now.Add(time.Hour)
+	if err := RenewChildRunClaim(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, now, lease); err != nil {
+		t.Fatalf("RenewChildRunClaim: %v", err)
+	}
+	var lockGeneration int64
+	var heartbeat, expires string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT lock_generation, heartbeat_at, lease_expires_at FROM agent_ownership_locks WHERE child_agent_id = ?`, record.ChildAgentID).Scan(&lockGeneration, &heartbeat, &expires)
+	}); err != nil {
+		t.Fatalf("query lock renewal: %v", err)
+	}
+	if lockGeneration != 2 || heartbeat != formatTimestamp(now) || expires != formatTimestamp(lease) {
+		t.Fatalf("lock renewal = gen %d heartbeat %q expires %q", lockGeneration, heartbeat, expires)
 	}
 }
 
@@ -354,6 +442,78 @@ func TestTransitionAgentRegistrationTerminalReleasesHeldLocks(t *testing.T) {
 	}
 }
 
+func TestCompleteClaimedNativeChildRunRollsBackOnRegistrationFailure(t *testing.T) {
+	ctx := context.Background()
+	baseStore, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer baseStore.Close()
+	claim := createFederationClaim(t, ctx, baseStore, "project-a", "run-root", "run-child", "child-a")
+	record, err := RegisterAgent(ctx, baseStore, federationRequest(claim))
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, baseStore, record.ChildAgentID, AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:02Z"); err != nil {
+		t.Fatalf("launch transition: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, baseStore, record.ChildAgentID, AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:03Z"); err != nil {
+		t.Fatalf("heartbeat transition: %v", err)
+	}
+	if err := UpdateChildRunClaimPhase(ctx, baseStore, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, "2026-01-01T00:00:03Z", ""); err != nil {
+		t.Fatalf("claim executing phase: %v", err)
+	}
+	store := failStorageStore{Store: baseStore, match: func(query string) bool {
+		return strings.Contains(query, "UPDATE agent_registrations")
+	}, err: errors.New("injected registration update failure")}
+	if err := CompleteClaimedNativeChildRun(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, record.ChildAgentID, "succeeded", "2026-01-01T00:00:04Z", "done", "receipt"); err == nil {
+		t.Fatalf("CompleteClaimedNativeChildRun error = nil, want injected failure")
+	}
+	var runStatus, regState, lockState, phase string
+	if err := baseStore.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, claim.RunID).Scan(&runStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, record.ChildAgentID).Scan(&regState); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state FROM agent_ownership_locks WHERE child_agent_id = ?`, record.ChildAgentID).Scan(&lockState); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT phase FROM run_claims WHERE run_id = ?`, claim.RunID).Scan(&phase)
+	}); err != nil {
+		t.Fatalf("query rollback state: %v", err)
+	}
+	if runStatus != "running" || regState != AgentStateRunning || lockState != OwnershipStateHeld || phase != ClaimPhaseExecuting {
+		t.Fatalf("rollback state run/reg/lock/phase = %q/%q/%q/%q", runStatus, regState, lockState, phase)
+	}
+}
+
+type failStorageStore struct {
+	Store
+	match func(string) bool
+	err   error
+}
+
+func (s failStorageStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error {
+	return s.Store.WithWriteTx(ctx, func(tx Tx) error {
+		return fn(failStorageTx{Tx: tx, match: s.match, err: s.err})
+	})
+}
+
+type failStorageTx struct {
+	Tx
+	match func(string) bool
+	err   error
+}
+
+func (tx failStorageTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if tx.match != nil && tx.match(query) {
+		return nil, tx.err
+	}
+	return tx.Tx.Exec(ctx, query, args...)
+}
+
 type federationClaim struct {
 	ParentRunID     string
 	RunID           string
@@ -388,7 +548,25 @@ func createFederationClaim(t *testing.T, ctx context.Context, store Store, proje
 	if err != nil {
 		t.Fatalf("ClaimChildRunExecution: %v", err)
 	}
+	seedAuthoritativeReservation(t, ctx, store, childKey)
 	return federationClaim{ParentRunID: rootRunID, RunID: childRunID, RootRunID: rootRunID, ChildKey: childKey, ExecutorID: claim.ExecutorID, ClaimGeneration: claim.ClaimGeneration, ProviderKey: claim.ProviderKey}
+}
+
+func seedAuthoritativeReservation(t *testing.T, ctx context.Context, store Store, childKey string) {
+	t.Helper()
+	payload := `{"budget_reservation_id":"bres-a-` + childKey + `","state":"reserved","scope_key":"sub-agent","budget_policy_ids":["bpol-a"],"reserved_value":1,"committed_value":0,"released_value":0,"expires_at":"2026-01-03T00:00:00Z","requester_id":"","policy_fingerprint":"sha256:policy","reserved_quantities_json":{"attempts":1}}`
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO usage_records(
+				usage_record_id, project_id, delivery_run_id, task_id, attempt_id, worker_id, sub_agent_id,
+				adapter_id, account_profile_id, model_capability_id, event_kind, event_time,
+				quantity_kind, unit, value, value_scale, confidence, idempotency_key, dedupe_key, payload_json)
+			VALUES (?, 'project-a', 'drun-a', 'task-a', 'attempt-a', '', '', 'claude', 'acct-a', 'mcap-a',
+				'reservation-created', '2026-01-01T00:00:00Z', 'attempts', 'attempt', 1, 0, 'exact', ?, '', ?)`,
+			"usage-reservation-"+childKey, "reservation-"+childKey, payload)
+		return err
+	}); err != nil {
+		t.Fatalf("seed authoritative reservation: %v", err)
+	}
 }
 
 func federationRequest(claim federationClaim) AgentRegistrationRequest {
@@ -403,6 +581,7 @@ func federationRequest(claim federationClaim) AgentRegistrationRequest {
 		NetworkScope:    []string{"none"},
 		CredentialScope: []string{"none"},
 		SideEffectScope: []string{"repo-write"},
+		SideEffectClass: "repo-write",
 		ApprovalScope:   []string{"auth-a"},
 	}
 	return AgentRegistrationRequest{
@@ -447,5 +626,12 @@ func federationRequest(claim federationClaim) AgentRegistrationRequest {
 		PlanFingerprint:        "sha256:plan",
 		PolicyFingerprint:      "sha256:policy",
 		CreatedAt:              "2026-01-01T00:00:01Z",
+		CapabilityEvidence: ProviderCapabilityEvidence{
+			AdapterID:            "claude",
+			NestedSubagents:      true,
+			Cancellation:         true,
+			CapabilityConfidence: "exact",
+			FreshnessState:       "fresh",
+		},
 	}
 }

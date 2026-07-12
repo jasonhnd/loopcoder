@@ -48,6 +48,10 @@ const (
 	PermissionWrite       = "write"
 	PermissionOrchestrate = "orchestrate"
 
+	SideEffectNone      = "none"
+	SideEffectLocalRead = "local-read"
+	SideEffectRepoWrite = "repo-write"
+
 	OwnershipStateRequested = "requested"
 	OwnershipStateHeld      = "held"
 	OwnershipStateReleasing = "releasing"
@@ -397,6 +401,7 @@ type AgentRegistrationRequest struct {
 	Classification           string
 	GapReasons               []string
 	CreatedAt                string
+	CapabilityEvidence       ProviderCapabilityEvidence
 }
 
 type ProviderCapabilityEvidence struct {
@@ -486,6 +491,13 @@ type registrationCanonicalPayload struct {
 	GapReasons        []string                   `json:"gap_reasons"`
 }
 
+type preparedAgentRegistration struct {
+	record   AgentRegistration
+	scope    AgentScopeGrant
+	bindings []AgentBudgetBinding
+	locks    []AgentOwnershipLock
+}
+
 func ValidateProviderNativeSubagent(evidence ProviderCapabilityEvidence) error {
 	adapterID := strings.ToLower(strings.TrimSpace(evidence.AdapterID))
 	if adapterID == "" {
@@ -513,15 +525,109 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 		return AgentRegistration{}, federationError(ErrAgentRegistrationRequiredCode, "store is required")
 	}
 	req = normalizeRegistrationRequest(req)
-	if err := validateRegistrationRequest(req); err != nil {
+	prepared, err := prepareAgentRegistration(req)
+	if err != nil {
 		return AgentRegistration{}, err
 	}
-	if err := ValidateProviderNativeSubagent(ProviderCapabilityEvidence{
-		AdapterID:       req.AdapterID,
-		NestedSubagents: !isUnsupportedNativeAdapter(req.AdapterID),
-		FreshnessState:  "fresh",
-	}); err != nil {
-		return AgentRegistration{}, err
+	record := prepared.record
+	err = withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			inserted, replay, err := insertPreparedAgentRegistrationTx(ctx, tx, prepared, store.Now())
+			if err != nil {
+				return err
+			}
+			if replay {
+				record = inserted
+			}
+			return nil
+		})
+	})
+	return record, err
+}
+
+func ClaimAndStartNativeChild(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, req AgentRegistrationRequest) (ClaimResult, AgentRegistration, error) {
+	if store == nil {
+		return ClaimResult{}, AgentRegistration{}, federationError(ErrAgentRegistrationRequiredCode, "store is required")
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	now = now.UTC()
+	leaseUntil = leaseUntil.UTC()
+	if parentRunID == "" || childRunID == "" || executorID == "" || now.IsZero() || leaseUntil.IsZero() || !leaseUntil.After(now) {
+		return ClaimResult{}, AgentRegistration{}, federationError(ErrInvalidRecordCode, "valid parent, child, executor, now, and lease_until are required")
+	}
+	req = normalizeRegistrationRequest(req)
+	req.ParentRunID = parentRunID
+	req.RunID = childRunID
+	req.ExecutorID = executorID
+	req.CreatedAt = formatTimestamp(now)
+	var claim ClaimResult
+	var record AgentRegistration
+	err := withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			txClaim, err := claimChildRunExecutionTx(ctx, tx, parentRunID, childRunID, executorID, formatTimestamp(now), formatTimestamp(leaseUntil))
+			if err != nil {
+				return err
+			}
+			claim = txClaim
+			switch txClaim.Outcome {
+			case ClaimOutcomeClaimed, ClaimOutcomeStaleClaim:
+			default:
+				return nil
+			}
+			req.ClaimGeneration = txClaim.ClaimGeneration
+			req.ExecutorID = txClaim.ExecutorID
+			req.ProviderIDempotencyKey = txClaim.ProviderKey
+			for i := range req.OwnershipLocks {
+				req.OwnershipLocks[i].LeaseExpiresAt = txClaim.LeaseExpiresAt
+			}
+			prepared, err := prepareAgentRegistration(req)
+			if err != nil {
+				return err
+			}
+			inserted, replay, err := insertPreparedAgentRegistrationTx(ctx, tx, prepared, now)
+			if err != nil {
+				return err
+			}
+			if replay {
+				record = inserted
+			} else {
+				record = prepared.record
+			}
+			if record.RegistrationState != AgentStateRegistered {
+				return federationError(ErrAgentRegistrationRequiredCode, "registration %s is %s, want registered", record.ChildAgentID, record.RegistrationState)
+			}
+			if err := validateActiveBudgetBindingsTx(ctx, tx, record, now); err != nil {
+				return err
+			}
+			if err := validateActiveOwnershipLocksTx(ctx, tx, record, now); err != nil {
+				return err
+			}
+			if err := transitionAgentRegistrationTx(ctx, tx, &record, AgentActionLaunch, txClaim.ExecutorID, txClaim.ClaimGeneration, formatTimestamp(now)); err != nil {
+				return err
+			}
+			if err := updateChildRunClaimPhaseTx(ctx, tx, parentRunID, childRunID, txClaim.ExecutorID, txClaim.ClaimGeneration, ClaimPhaseExecuting, formatTimestamp(now), ""); err != nil {
+				return err
+			}
+			if err := transitionAgentRegistrationTx(ctx, tx, &record, AgentActionHeartbeat, txClaim.ExecutorID, txClaim.ClaimGeneration, formatTimestamp(now)); err != nil {
+				return err
+			}
+			claim.ClaimPhase = ClaimPhaseExecuting
+			claim.RunStatus = "running"
+			claim.EdgeStatus = "running"
+			return nil
+		})
+	})
+	return claim, record, err
+}
+
+func prepareAgentRegistration(req AgentRegistrationRequest) (preparedAgentRegistration, error) {
+	if err := validateRegistrationRequest(req); err != nil {
+		return preparedAgentRegistration{}, err
+	}
+	if err := ValidateProviderNativeSubagent(req.CapabilityEvidence); err != nil {
+		return preparedAgentRegistration{}, err
 	}
 	childAgentID := stableID("agent_", req.ProjectID, req.DeliveryRunID, req.ParentRunID, req.TaskID, req.AttemptID, req.ChildKey, req.PlanFingerprint)
 	scope := req.Scope
@@ -539,20 +645,20 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 	scope.CreatedAt = req.CreatedAt
 	scope.UpdatedAt = req.CreatedAt
 	if err := canonicalizeScope(&scope); err != nil {
-		return AgentRegistration{}, err
+		return preparedAgentRegistration{}, err
 	}
 	if req.ParentScope != nil {
 		parentScope := *req.ParentScope
 		if err := canonicalizeScope(&parentScope); err != nil {
-			return AgentRegistration{}, err
+			return preparedAgentRegistration{}, err
 		}
 		if err := ValidateScopeInheritance(parentScope, scope); err != nil {
-			return AgentRegistration{}, err
+			return preparedAgentRegistration{}, err
 		}
 	}
 	scopeBytes, err := json.Marshal(scopePayload(scope))
 	if err != nil {
-		return AgentRegistration{}, federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
+		return preparedAgentRegistration{}, federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
 	}
 	scope.AgentScopeGrantID = stableID("ascope_", childAgentID, string(scopeBytes), req.PolicyFingerprint)
 	budgetIDs := make([]string, 0, len(req.BudgetBindings))
@@ -648,45 +754,7 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 		CreatedAt:                  req.CreatedAt,
 		UpdatedAt:                  req.CreatedAt,
 	}
-	err = withRetry(ctx, func() error {
-		return store.WithWriteTx(ctx, func(tx Tx) error {
-			existing, ok, err := loadAgentRegistrationTx(ctx, tx, record.ChildAgentID)
-			if err != nil {
-				return err
-			}
-			if ok {
-				if existing.RegistrationPayloadHash == record.RegistrationPayloadHash {
-					record = existing
-					return nil
-				}
-				return federationError(ErrAgentRegistrationConflictCode, "child_agent_id %s replays with different canonical bytes", record.ChildAgentID)
-			}
-			if err := validateRegistrationReferences(ctx, tx, record); err != nil {
-				return err
-			}
-			if err := ensureNoParentAgentCycle(ctx, tx, record.ChildAgentID, record.ParentAgentID, record.ProjectID); err != nil {
-				return err
-			}
-			if err := insertScopeGrantTx(ctx, tx, scope); err != nil {
-				return err
-			}
-			for _, binding := range req.BudgetBindings {
-				if err := insertBudgetBindingTx(ctx, tx, binding); err != nil {
-					return err
-				}
-			}
-			for _, lock := range req.OwnershipLocks {
-				if err := insertOwnershipLockTx(ctx, tx, lock); err != nil {
-					return err
-				}
-			}
-			if err := insertAgentRegistrationTx(ctx, tx, record); err != nil {
-				return err
-			}
-			return appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration.registered", record.CreatedAt, record)
-		})
-	})
-	return record, err
+	return preparedAgentRegistration{record: record, scope: scope, bindings: req.BudgetBindings, locks: req.OwnershipLocks}, nil
 }
 
 func TransitionAgentRegistration(ctx context.Context, store Store, childAgentID, action, actorExecutorID string, claimGeneration int64, at string) (AgentRegistration, error) {
@@ -711,30 +779,7 @@ func TransitionAgentRegistration(ctx context.Context, store Store, childAgentID,
 			if !ok {
 				return federationError(ErrAgentRegistrationRequiredCode, "registration %s is missing", childAgentID)
 			}
-			if actionRequiresClaim(action) {
-				if err := validateRegistrationClaimTx(ctx, tx, record, actorExecutorID, claimGeneration); err != nil {
-					return err
-				}
-			}
-			next, err := nextAgentRegistrationState(record.RegistrationState, action)
-			if err != nil {
-				return err
-			}
-			record.RegistrationState = next
-			record.UpdatedAt = at
-			record.RecordVersion++
-			if isTerminalAgentState(next) {
-				if err := releaseHeldOwnershipLocksTx(ctx, tx, record, at); err != nil {
-					return err
-				}
-			}
-			if _, err := tx.Exec(ctx, `UPDATE agent_registrations
-				SET registration_state = ?, updated_at = ?, record_version = ?
-				WHERE id = ?`,
-				record.RegistrationState, record.UpdatedAt, record.RecordVersion, record.ChildAgentID); err != nil {
-				return fmt.Errorf("transition agent registration: %w", err)
-			}
-			if err := appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration."+action, at, record); err != nil {
+			if err := transitionAgentRegistrationTx(ctx, tx, &record, action, actorExecutorID, claimGeneration, at); err != nil {
 				return err
 			}
 			out = record
@@ -764,7 +809,7 @@ func ValidateNativeChildLaunch(ctx context.Context, store Store, childRunID, exe
 		if len(record.BudgetBindingIDs) == 0 {
 			return federationError(ErrChildBudgetRequiredCode, "registration %s has no budget binding", record.ChildAgentID)
 		}
-		if err := validateActiveBudgetBindingsTx(ctx, tx, record); err != nil {
+		if err := validateActiveBudgetBindingsTx(ctx, tx, record, store.Now()); err != nil {
 			return err
 		}
 		if record.Permission != PermissionReadOnly && len(record.OwnershipLockIDs) == 0 {
@@ -1038,6 +1083,9 @@ func validateRegistrationRequest(req AgentRegistrationRequest) error {
 			return federationError(ErrInvalidRecordCode, "%s is required", field)
 		}
 	}
+	if !validSideEffectClass(req.SideEffectClass) {
+		return federationError(ErrInvalidRecordCode, "side_effect_class %q is invalid", req.SideEffectClass)
+	}
 	if req.ParentRunID == req.RunID || req.RootRunID == req.RunID {
 		return federationError(ErrInvalidRecordCode, "child run cannot equal parent/root run")
 	}
@@ -1108,14 +1156,14 @@ func validateRegistrationClaimTx(ctx context.Context, tx Tx, record AgentRegistr
 	return nil
 }
 
-func validateActiveBudgetBindingsTx(ctx context.Context, tx Tx, record AgentRegistration) error {
+func validateActiveBudgetBindingsTx(ctx context.Context, tx Tx, record AgentRegistration, now time.Time) error {
 	if len(record.BudgetBindingIDs) == 0 {
 		return federationError(ErrChildBudgetRequiredCode, "registration %s has no budget binding", record.ChildAgentID)
 	}
 	for _, id := range record.BudgetBindingIDs {
-		var childAgentID, policyID, reservationID, quantitiesJSON, state string
-		err := tx.QueryRow(ctx, `SELECT child_agent_id, budget_policy_id, budget_reservation_id, reserved_quantities_json, reservation_state
-			FROM agent_budget_bindings WHERE id = ?`, id).Scan(&childAgentID, &policyID, &reservationID, &quantitiesJSON, &state)
+		var childAgentID, policyID, reservationID, scope, quantitiesJSON, state string
+		err := tx.QueryRow(ctx, `SELECT child_agent_id, budget_policy_id, budget_reservation_id, reservation_scope, reserved_quantities_json, reservation_state
+			FROM agent_budget_bindings WHERE id = ?`, id).Scan(&childAgentID, &policyID, &reservationID, &scope, &quantitiesJSON, &state)
 		if err != nil {
 			return federationError(ErrChildBudgetRequiredCode, "budget binding %s is missing", id)
 		}
@@ -1128,8 +1176,115 @@ func validateActiveBudgetBindingsTx(ctx context.Context, tx Tx, record AgentRegi
 		if !hasReservedQuantities(quantitiesJSON) {
 			return federationError(ErrChildBudgetRequiredCode, "budget binding %s has no reserved quantities", id)
 		}
+		if err := validateAuthoritativeReservationTx(ctx, tx, record, policyID, reservationID, scope, quantitiesJSON, now); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateAuthoritativeReservationTx(ctx context.Context, tx Tx, record AgentRegistration, policyID, reservationID, reservationScope, quantitiesJSON string, now time.Time) error {
+	policyID = strings.TrimSpace(policyID)
+	reservationID = strings.TrimSpace(reservationID)
+	if policyID == "" || reservationID == "" {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation authority requires policy and reservation ids")
+	}
+	rows, err := tx.Query(ctx, `SELECT payload_json FROM usage_records
+		WHERE project_id = ?
+			AND delivery_run_id = ?
+			AND task_id = ?
+			AND attempt_id = ?
+			AND adapter_id = ?
+			AND account_profile_id = ?
+			AND model_capability_id = ?
+			AND event_kind = 'reservation-created'
+			AND json_extract(payload_json, '$.budget_reservation_id') = ?
+		ORDER BY event_time DESC, usage_record_id DESC`,
+		record.ProjectID, record.DeliveryRunID, record.TaskID, record.AttemptID, record.AdapterID,
+		record.AccountProfileID, record.ModelCapabilityID, reservationID)
+	if err != nil {
+		return federationError(ErrChildBudgetRequiredCode, "query authoritative reservation %s: %v", reservationID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return federationError(ErrChildBudgetRequiredCode, "scan authoritative reservation %s: %v", reservationID, err)
+		}
+		if authoritativeReservationMatches(raw, record, policyID, reservationID, reservationScope, quantitiesJSON, now) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return federationError(ErrChildBudgetRequiredCode, "read authoritative reservation %s: %v", reservationID, err)
+	}
+	return federationError(ErrChildBudgetRequiredCode, "missing live authoritative reservation %s for policy %s", reservationID, policyID)
+}
+
+func authoritativeReservationMatches(raw string, record AgentRegistration, policyID, reservationID, reservationScope, quantitiesJSON string, now time.Time) bool {
+	var payload struct {
+		BudgetReservationID string          `json:"budget_reservation_id"`
+		State               string          `json:"state"`
+		ScopeKey            string          `json:"scope_key"`
+		BudgetPolicyIDs     []string        `json:"budget_policy_ids"`
+		ReservedValue       int64           `json:"reserved_value"`
+		CommittedValue      int64           `json:"committed_value"`
+		ReleasedValue       int64           `json:"released_value"`
+		ExpiresAt           string          `json:"expires_at"`
+		RequesterID         string          `json:"requester_id"`
+		PolicyFingerprint   string          `json:"policy_fingerprint"`
+		Quantities          json.RawMessage `json:"reserved_quantities_json"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return false
+	}
+	state := strings.ToLower(strings.TrimSpace(payload.State))
+	if payload.BudgetReservationID != reservationID || (state != "reserved" && state != "partially-committed") {
+		return false
+	}
+	if !stringSliceContains(payload.BudgetPolicyIDs, policyID) {
+		return false
+	}
+	if strings.TrimSpace(payload.ScopeKey) != "" && strings.TrimSpace(payload.ScopeKey) != strings.TrimSpace(reservationScope) {
+		return false
+	}
+	if strings.TrimSpace(payload.RequesterID) != "" && strings.TrimSpace(payload.RequesterID) != record.ChildAgentID && strings.TrimSpace(payload.RequesterID) != record.RunID {
+		return false
+	}
+	if strings.TrimSpace(payload.PolicyFingerprint) != "" && strings.TrimSpace(payload.PolicyFingerprint) != record.PolicyFingerprint {
+		return false
+	}
+	if payload.ReservedValue <= 0 || payload.CommittedValue < 0 || payload.ReleasedValue < 0 || payload.CommittedValue+payload.ReleasedValue > payload.ReservedValue {
+		return false
+	}
+	if strings.TrimSpace(payload.ExpiresAt) != "" {
+		expiresAt, err := time.Parse(time.RFC3339Nano, payload.ExpiresAt)
+		if err != nil || (!now.IsZero() && !expiresAt.After(now.UTC())) {
+			return false
+		}
+	}
+	if len(payload.Quantities) > 0 && string(payload.Quantities) != "null" {
+		return canonicalJSONEqual(string(payload.Quantities), quantitiesJSON)
+	}
+	return true
+}
+
+func canonicalJSONEqual(left, right string) bool {
+	var l, r any
+	if json.Unmarshal([]byte(left), &l) != nil || json.Unmarshal([]byte(right), &r) != nil {
+		return strings.TrimSpace(left) == strings.TrimSpace(right)
+	}
+	return digestJSON(l) == digestJSON(r)
+}
+
+func stringSliceContains(values []string, want string) bool {
+	want = strings.TrimSpace(want)
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func validateActiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistration, now time.Time) error {
@@ -1186,11 +1341,16 @@ func releaseHeldOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistr
 	if len(record.OwnershipLockIDs) == 0 {
 		return nil
 	}
-	if _, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+	result, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
 		SET state = ?, updated_at = ?
 		WHERE child_agent_id = ? AND run_id = ? AND claim_generation = ? AND state = ?`,
-		OwnershipStateReleased, at, record.ChildAgentID, record.RunID, record.ClaimGeneration, OwnershipStateHeld); err != nil {
+		OwnershipStateReleased, at, record.ChildAgentID, record.RunID, record.ClaimGeneration, OwnershipStateHeld)
+	if err != nil {
 		return fmt.Errorf("release ownership locks: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && record.Permission != PermissionReadOnly && affected != int64(len(record.OwnershipLockIDs)) {
+		return federationError(ErrOwnershipRequiredCode, "released %d ownership locks, want %d", affected, len(record.OwnershipLockIDs))
 	}
 	return nil
 }
@@ -1301,6 +1461,86 @@ func insertScopeGrantTx(ctx context.Context, tx Tx, scope AgentScopeGrant) error
 		return fmt.Errorf("insert scope grant: %w", err)
 	}
 	return nil
+}
+
+func insertPreparedAgentRegistrationTx(ctx context.Context, tx Tx, prepared preparedAgentRegistration, now time.Time) (AgentRegistration, bool, error) {
+	record := prepared.record
+	existing, ok, err := loadAgentRegistrationTx(ctx, tx, record.ChildAgentID)
+	if err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if ok {
+		if existing.RegistrationPayloadHash == record.RegistrationPayloadHash {
+			return existing, true, nil
+		}
+		return AgentRegistration{}, false, federationError(ErrAgentRegistrationConflictCode, "child_agent_id %s replays with different canonical bytes", record.ChildAgentID)
+	}
+	if err := validateRegistrationReferences(ctx, tx, record); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if err := ensureNoParentAgentCycle(ctx, tx, record.ChildAgentID, record.ParentAgentID, record.ProjectID); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	for _, binding := range prepared.bindings {
+		if err := validateAuthoritativeReservationTx(ctx, tx, record, binding.BudgetPolicyID, binding.BudgetReservationID, binding.ReservationScope, binding.ReservedQuantitiesJSON, now); err != nil {
+			return AgentRegistration{}, false, err
+		}
+	}
+	if err := insertScopeGrantTx(ctx, tx, prepared.scope); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	for _, binding := range prepared.bindings {
+		if err := insertBudgetBindingTx(ctx, tx, binding); err != nil {
+			return AgentRegistration{}, false, err
+		}
+	}
+	for _, lock := range prepared.locks {
+		if err := insertOwnershipLockTx(ctx, tx, lock); err != nil {
+			return AgentRegistration{}, false, err
+		}
+	}
+	if err := insertAgentRegistrationTx(ctx, tx, record); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if err := appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration.registered", record.CreatedAt, record); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	return record, false, nil
+}
+
+func transitionAgentRegistrationTx(ctx context.Context, tx Tx, record *AgentRegistration, action, actorExecutorID string, claimGeneration int64, at string) error {
+	if record == nil {
+		return federationError(ErrAgentRegistrationRequiredCode, "registration is required")
+	}
+	if actionRequiresClaim(action) {
+		if err := validateRegistrationClaimTx(ctx, tx, *record, actorExecutorID, claimGeneration); err != nil {
+			return err
+		}
+	}
+	next, err := nextAgentRegistrationState(record.RegistrationState, action)
+	if err != nil {
+		return err
+	}
+	record.RegistrationState = next
+	record.UpdatedAt = at
+	record.RecordVersion++
+	if isTerminalAgentState(next) {
+		if err := releaseHeldOwnershipLocksTx(ctx, tx, *record, at); err != nil {
+			return err
+		}
+	}
+	result, err := tx.Exec(ctx, `UPDATE agent_registrations
+		SET registration_state = ?, updated_at = ?, record_version = ?
+		WHERE id = ? AND record_version = ?`,
+		record.RegistrationState, record.UpdatedAt, record.RecordVersion, record.ChildAgentID, record.RecordVersion-1)
+	if err != nil {
+		return fmt.Errorf("transition agent registration: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return federationError(ErrStaleClaimCode, "registration %s transition updated %d rows", record.ChildAgentID, affected)
+	}
+	return appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration."+action, at, *record)
 }
 
 func insertBudgetBindingTx(ctx context.Context, tx Tx, binding AgentBudgetBinding) error {
@@ -1519,6 +1759,14 @@ func canonicalizeScope(scope *AgentScopeGrant) error {
 	scope.SideEffectScope = normalizeScopeList(scope.SideEffectScope, false)
 	scope.ApprovalScope = normalizeScopeList(scope.ApprovalScope, false)
 	scope.Permission = normalizePermission(scope.Permission)
+	if !validSideEffectClass(scope.SideEffectClass) {
+		return federationError(ErrInvalidRecordCode, "side_effect_class %q is invalid", scope.SideEffectClass)
+	}
+	for _, value := range scope.SideEffectScope {
+		if !validSideEffectClass(value) {
+			return federationError(ErrInvalidRecordCode, "side_effect_scope %q is invalid", value)
+		}
+	}
 	for _, value := range append(append([]string{}, scope.ReadScope...), append(scope.WriteScope, scope.PathScope...)...) {
 		if _, err := normalizeRepoResource(value); err != nil {
 			return err
@@ -1681,6 +1929,15 @@ func normalizePermission(permission string) string {
 		return PermissionOrchestrate
 	default:
 		return strings.ToLower(strings.TrimSpace(permission))
+	}
+}
+
+func validSideEffectClass(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case SideEffectNone, SideEffectLocalRead, SideEffectRepoWrite:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -102,6 +102,9 @@ agent-federation bridge conformance suite. The adapter may report
 behavior, bounded output, usage/result envelopes, unsupported-operation
 responses, and provider session reference handling are declared. The scheduler
 still requires LoopCoder-owned registration, monotonic scope, one-writer locks,
-budget reservation references, current claim ownership, and plan/policy
-fingerprints before launch; provider-native orchestration never controls global
-policy, budgets, approvals, or final acceptance.
+live authoritative `0803` budget reservation evidence, current claim ownership,
+accepted project/run/task/attempt/provider/routing authority, and plan/policy
+fingerprints before launch. Read-only native children must use side-effect
+classes such as `local-read` or `none`, not the permission value `read-only`.
+Provider-native orchestration never controls global policy, budgets, approvals,
+or final acceptance.
