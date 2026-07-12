@@ -464,6 +464,12 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 	if report.ModelCapabilities == nil {
 		report.ModelCapabilities = []providerinventory.ModelCapability{}
 	}
+	if report.QuotaTelemetrySources == nil {
+		report.QuotaTelemetrySources = []providerinventory.QuotaTelemetrySource{}
+	}
+	if report.QuotaSnapshots == nil {
+		report.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
 	if report.GapReasons == nil {
 		report.GapReasons = []string{}
 	}
@@ -565,6 +571,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	if inventoryCheck.Name != "" {
 		checks = append(checks, inventoryCheck)
 	}
+	checks = append(checks, checkQuotaTelemetry(inventory))
 	checks = append(checks, checkProviders(inventory, configuredProviders(delivery.Config))...)
 	checks = append(checks, checkProviderCompatibility(delivery.Config, host)...)
 
@@ -2203,7 +2210,50 @@ func discoverProviderInventory(ctx context.Context, repoPath string, cfg config.
 		Name:    "provider inventory",
 		Code:    "provider_inventory_refreshed",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), and %d auth readiness record(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness)),
+		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d quota source declaration(s), and %d quota snapshot(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.QuotaTelemetrySources), len(report.QuotaSnapshots)),
+	}
+}
+
+func checkQuotaTelemetry(inventory providerinventory.Report) Check {
+	if len(inventory.QuotaSnapshots) == 0 {
+		return Check{
+			Name:    "quota telemetry",
+			Code:    "quota_telemetry_absent",
+			Status:  StatusWarn,
+			Message: "no quota snapshots are present; quota remains unknown until an allowlisted source is declared",
+		}
+	}
+	parts := make([]string, 0, len(inventory.QuotaSnapshots))
+	for _, snapshot := range inventory.QuotaSnapshots {
+		source := snapshot.QuotaSourceID
+		if len(source) > 18 {
+			source = source[:18] + "..."
+		}
+		gaps := "none"
+		if len(snapshot.GapReasons) > 0 {
+			gaps = strings.Join(snapshot.GapReasons, ",")
+		}
+		reset := string(snapshot.ResetSemantics)
+		if strings.TrimSpace(snapshot.ResetAt) != "" {
+			reset += "@" + snapshot.ResetAt
+		}
+		parts = append(parts, fmt.Sprintf("%s scope=%s unit=%s source=%s confidence=%s freshness=%s reset=%s gaps=%s",
+			firstNonEmpty(snapshot.AdapterID, "provider"),
+			firstNonEmpty(snapshot.ScopeKey, "unknown"),
+			firstNonEmpty(snapshot.Unit, "unknown"),
+			source,
+			snapshot.Confidence,
+			snapshot.FreshnessState,
+			reset,
+			gaps,
+		))
+	}
+	sort.Strings(parts)
+	return Check{
+		Name:    "quota telemetry",
+		Code:    "quota_telemetry_honest",
+		Status:  StatusOK,
+		Message: "quota snapshots: " + strings.Join(parts, "; "),
 	}
 }
 
