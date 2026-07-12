@@ -19,3 +19,8 @@ Additional checks for the loopcoder repository:
 - Confirm audit, dispatch, loopreview, status, and reporter outputs stay on
   local surfaces unless an explicit tracked artifact is part of the command's
   documented contract.
+- Confirm provider-native child launches cannot bypass LoopCoder-owned
+  registration, claim ownership, budget bindings, ownership locks, scope
+  limits, approvals, cancellation, or final acceptance. Raw native child output
+  remains untrusted until bounded, redacted, schema-validated, and accepted by
+  LoopCoder-owned policy.

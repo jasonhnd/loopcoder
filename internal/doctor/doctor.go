@@ -115,6 +115,7 @@ type Report struct {
 	ProviderCompatibility []ProviderCompatibility
 	ProviderInventory     providerinventory.Report
 	QuotaUsageBudget      usageledger.QuotaUsageBudget
+	AgentFederation       AgentFederation
 	Checks                []Check
 }
 
@@ -139,6 +140,35 @@ type ProviderCompatibility struct {
 	RequiredCapabilities []string
 	MissingCapabilities  []string
 	KnownLimitations     []string
+}
+
+type AgentFederation struct {
+	SchemaVersion                string                    `json:"schema_version"`
+	GeneratedAt                  string                    `json:"generated_at"`
+	AgentFederationPolicyVersion string                    `json:"agent_federation_policy_version"`
+	Providers                    []AgentFederationProvider `json:"providers"`
+	ScopePolicy                  AgentFederationScope      `json:"scope_policy"`
+	BudgetPolicy                 AgentFederationBudget     `json:"budget_policy"`
+	GapReasons                   []string                  `json:"gap_reasons"`
+}
+
+type AgentFederationProvider struct {
+	AdapterID            string   `json:"adapter_id"`
+	NestedSubagents      bool     `json:"nested_subagents"`
+	CapabilityConfidence string   `json:"capability_confidence"`
+	Support              string   `json:"support"`
+	GapReasons           []string `json:"gap_reasons"`
+}
+
+type AgentFederationScope struct {
+	MonotonicInheritance      bool `json:"monotonic_inheritance"`
+	CredentialMaterialAllowed bool `json:"credential_material_allowed"`
+	OneWriterRequired         bool `json:"one_writer_required"`
+}
+
+type AgentFederationBudget struct {
+	HierarchicalBudgetsRequired bool `json:"hierarchical_budgets_required"`
+	ChildReservationRequired    bool `json:"child_reservation_required"`
 }
 
 type RuntimeHealth struct {
@@ -359,6 +389,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
 		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
 		QuotaUsageBudget      usageledger.QuotaUsageBudget    `json:"quota_usage_budget"`
+		AgentFederation       AgentFederation                 `json:"agent_federation"`
 		Checks                []renderedCheck                 `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
@@ -379,6 +410,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		ProviderCompatibility: compatibility,
 		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
 		QuotaUsageBudget:      normalizeQuotaUsageBudget(report.QuotaUsageBudget),
+		AgentFederation:       normalizeAgentFederation(report.AgentFederation),
 		Checks:                checks,
 	}
 	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
@@ -511,6 +543,62 @@ func normalizeProviderInventory(report providerinventory.Report) providerinvento
 	}
 	if report.QuotaSnapshots == nil {
 		report.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
+	if report.GapReasons == nil {
+		report.GapReasons = []string{}
+	}
+	return report
+}
+
+func buildAgentFederation(now time.Time) AgentFederation {
+	contract := runtimecap.DefaultContract()
+	providers := make([]AgentFederationProvider, 0, len(contract.Providers))
+	for _, provider := range contract.Providers {
+		entry := AgentFederationProvider{
+			AdapterID:            provider.Name,
+			NestedSubagents:      provider.NestedSubagents,
+			CapabilityConfidence: "exact",
+			Support:              string(runtimecap.SupportSupported),
+			GapReasons:           []string{},
+		}
+		if !provider.NestedSubagents {
+			entry.Support = string(runtimecap.SupportUnsupported)
+			entry.GapReasons = []string{"nested-subagents-unsupported"}
+		}
+		providers = append(providers, entry)
+	}
+	sort.Slice(providers, func(i, j int) bool {
+		return providers[i].AdapterID < providers[j].AdapterID
+	})
+	return AgentFederation{
+		SchemaVersion:                "loopcoder.agent_federation_json.v1",
+		GeneratedAt:                  now.UTC().Format(time.RFC3339Nano),
+		AgentFederationPolicyVersion: "0805.agent_federation.v1",
+		Providers:                    providers,
+		ScopePolicy: AgentFederationScope{
+			MonotonicInheritance:      true,
+			CredentialMaterialAllowed: false,
+			OneWriterRequired:         true,
+		},
+		BudgetPolicy: AgentFederationBudget{
+			HierarchicalBudgetsRequired: true,
+			ChildReservationRequired:    true,
+		},
+		GapReasons: []string{},
+	}
+}
+
+func normalizeAgentFederation(report AgentFederation) AgentFederation {
+	if strings.TrimSpace(report.SchemaVersion) == "" {
+		report = buildAgentFederation(time.Unix(0, 0).UTC())
+	}
+	if report.Providers == nil {
+		report.Providers = []AgentFederationProvider{}
+	}
+	for i := range report.Providers {
+		if report.Providers[i].GapReasons == nil {
+			report.Providers[i].GapReasons = []string{}
+		}
 	}
 	if report.GapReasons == nil {
 		report.GapReasons = []string{}
@@ -652,6 +740,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
 		ProviderInventory:     inventory,
 		QuotaUsageBudget:      usageBudget,
+		AgentFederation:       buildAgentFederation(now),
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -702,6 +791,7 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		ProviderCompatibility: readOnly.ProviderCompatibility,
 		ProviderInventory:     readOnly.ProviderInventory,
 		QuotaUsageBudget:      readOnly.QuotaUsageBudget,
+		AgentFederation:       readOnly.AgentFederation,
 		Checks:                checks,
 	}, repoPath, build)
 }

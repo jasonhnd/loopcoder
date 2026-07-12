@@ -282,13 +282,20 @@ func applyClaimMetadata(repoPath, runID string, node *RunTreeNode) {
 		}
 		var details struct {
 			Result struct {
-				RunID           string `json:"run_id"`
-				ClaimOutcome    string `json:"claim_outcome"`
-				ClaimOwner      string `json:"claim_owner"`
-				ClaimGeneration int64  `json:"claim_generation"`
-				LeaseExpiresAt  string `json:"lease_expires_at"`
-				ClaimPhase      string `json:"claim_phase"`
-				ProviderKey     string `json:"provider_idempotency_key"`
+				RunID             string   `json:"run_id"`
+				ClaimOutcome      string   `json:"claim_outcome"`
+				ClaimOwner        string   `json:"claim_owner"`
+				ClaimGeneration   int64    `json:"claim_generation"`
+				LeaseExpiresAt    string   `json:"lease_expires_at"`
+				ClaimPhase        string   `json:"claim_phase"`
+				ProviderKey       string   `json:"provider_idempotency_key"`
+				ChildAgentID      string   `json:"child_agent_id"`
+				RegistrationState string   `json:"registration_state"`
+				ScopeGrantID      string   `json:"scope_grant_id"`
+				BudgetBindingIDs  []string `json:"budget_binding_ids"`
+				OwnershipLockIDs  []string `json:"ownership_lock_ids"`
+				AgentFingerprint  string   `json:"agent_federation_fingerprint"`
+				GapReasons        []string `json:"gap_reasons"`
 			} `json:"result"`
 		}
 		if err := json.Unmarshal(event.Details, &details); err != nil {
@@ -314,6 +321,27 @@ func applyClaimMetadata(repoPath, runID string, node *RunTreeNode) {
 		}
 		if strings.TrimSpace(details.Result.ProviderKey) != "" {
 			node.ProviderKey = strings.TrimSpace(details.Result.ProviderKey)
+		}
+		if strings.TrimSpace(details.Result.ChildAgentID) != "" {
+			node.ChildAgentID = strings.TrimSpace(details.Result.ChildAgentID)
+		}
+		if strings.TrimSpace(details.Result.RegistrationState) != "" {
+			node.RegistrationState = strings.TrimSpace(details.Result.RegistrationState)
+		}
+		if strings.TrimSpace(details.Result.ScopeGrantID) != "" {
+			node.ScopeGrantID = strings.TrimSpace(details.Result.ScopeGrantID)
+		}
+		if len(details.Result.BudgetBindingIDs) > 0 {
+			node.BudgetBindingIDs = append([]string(nil), details.Result.BudgetBindingIDs...)
+		}
+		if len(details.Result.OwnershipLockIDs) > 0 {
+			node.OwnershipLockIDs = append([]string(nil), details.Result.OwnershipLockIDs...)
+		}
+		if strings.TrimSpace(details.Result.AgentFingerprint) != "" {
+			node.AgentFingerprint = strings.TrimSpace(details.Result.AgentFingerprint)
+		}
+		if len(details.Result.GapReasons) > 0 {
+			node.GapReasons = append([]string(nil), details.Result.GapReasons...)
 		}
 	}
 }

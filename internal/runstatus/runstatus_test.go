@@ -240,6 +240,66 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	}
 }
 
+func TestMarshalJSONIncludesAgentTreeFromNestedEvents(t *testing.T) {
+	repo := t.TempDir()
+	parent := "run-parent"
+	child := "run-child"
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:  "2026-07-09T00:00:00Z",
+		RunID:      parent,
+		State:      state.StateRunning,
+		ChildRunID: child,
+	}); err != nil {
+		t.Fatalf("append parent lifecycle: %v", err)
+	}
+	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
+		Timestamp:   "2026-07-09T00:00:01Z",
+		RunID:       child,
+		ParentRunID: parent,
+		State:       state.StateRunning,
+	}); err != nil {
+		t.Fatalf("append child lifecycle: %v", err)
+	}
+	writeEventLine(t, repo, child, `{"ts":"2026-07-09T00:00:02Z","run_id":"run-child","job_id":"nested-scheduler","phase":"nested-scheduler","status":"running","event":"nested.child.running","details":{"parent_run_id":"run-parent","child":{"run_id":"run-child"},"result":{"run_id":"run-child","child_agent_id":"agent_fixture","registration_state":"active","scope_grant_id":"ascope_fixture","budget_binding_ids":["abudget_fixture"],"ownership_lock_ids":["alock_fixture"],"claim_generation":2,"agent_federation_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","gap_reasons":[]}}}`)
+
+	report, err := Load(Options{RepoPath: repo, RunID: child})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	data, err := MarshalJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		AgentTree struct {
+			SchemaVersion string `json:"schema_version"`
+			RootRunID     string `json:"root_run_id"`
+			Registrations []struct {
+				ChildAgentID      string   `json:"child_agent_id"`
+				RunID             string   `json:"run_id"`
+				RegistrationState string   `json:"registration_state"`
+				ScopeGrantID      string   `json:"scope_grant_id"`
+				BudgetBindingIDs  []string `json:"budget_binding_ids"`
+				OwnershipLockIDs  []string `json:"ownership_lock_ids"`
+				ClaimGeneration   int64    `json:"claim_generation"`
+			} `json:"registrations"`
+		} `json:"agent_tree"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("status JSON did not unmarshal: %v\n%s", err, string(data))
+	}
+	if payload.AgentTree.SchemaVersion != "loopcoder.agent_tree.v1" || payload.AgentTree.RootRunID != parent || len(payload.AgentTree.Registrations) != 1 {
+		t.Fatalf("agent tree = %#v", payload.AgentTree)
+	}
+	registration := payload.AgentTree.Registrations[0]
+	if registration.ChildAgentID != "agent_fixture" || registration.RunID != child || registration.RegistrationState != "active" || registration.ScopeGrantID != "ascope_fixture" || registration.ClaimGeneration != 2 {
+		t.Fatalf("agent tree registration = %#v", registration)
+	}
+	if !containsString(registration.BudgetBindingIDs, "abudget_fixture") || !containsString(registration.OwnershipLockIDs, "alock_fixture") {
+		t.Fatalf("agent tree refs = budget:%#v locks:%#v", registration.BudgetBindingIDs, registration.OwnershipLockIDs)
+	}
+}
+
 func TestLoadAcceptsLifecycleOnlyRun(t *testing.T) {
 	repo := t.TempDir()
 	runID := "run-lifecycle-only"

@@ -28,6 +28,14 @@ Before tagging a release:
 4. Confirm the three surfaces agree on command names, config keys, compatibility aliases, breaking-change wording, and upgrade steps.
 5. Run the release's required local verification, including markdown well-formedness checks when available and `go build ./...` for loopcoder source releases.
 
+For v0.8.x releases that include agent federation, also include evidence that
+the SQLite schema contains the agent registration, scope, budget, ownership,
+and event tables; provider-native child launch refuses without registration;
+unsupported providers refuse before launch; restart/replay reconstructs the
+same agent tree without provider session state; and `doctor --format json` plus
+`status --format json` expose the agent-federation and agent-tree contracts
+without raw provider output or credential material.
+
 ## Staged GitHub Release Flow
 
 The release workflow builds each advertised archive exactly once, generates and

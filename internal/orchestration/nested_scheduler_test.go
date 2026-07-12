@@ -1220,13 +1220,25 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 		return cmd
 	}
 
-	cmdA := startHelper(reportAPath, nestedTestNow().Add(10*time.Hour).Format(time.RFC3339Nano))
+	cmdA := startHelper(reportAPath, nestedTestNow().Add(48*time.Hour).Format(time.RFC3339Nano))
 	var outA strings.Builder
 	cmdA.Stdout = &outA
 	cmdA.Stderr = &outA
 	if err := cmdA.Start(); err != nil {
 		t.Fatalf("start helper A: %v", err)
 	}
+	var waitAOnce sync.Once
+	waitA := func() error {
+		var waitErr error
+		waitAOnce.Do(func() {
+			_ = os.WriteFile(releasePath, []byte("release"), 0o644)
+			waitErr = cmdA.Wait()
+		})
+		return waitErr
+	}
+	t.Cleanup(func() {
+		_ = waitA()
+	})
 	waitForFile(t, activePath)
 
 	cmdB := startHelper(reportBPath, nestedTestNow().Add(48*time.Hour).Format(time.RFC3339Nano))
@@ -1247,7 +1259,7 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	if err := os.WriteFile(releasePath, []byte("release"), 0o644); err != nil {
 		t.Fatalf("write release marker: %v", err)
 	}
-	if err := cmdA.Wait(); err != nil {
+	if err := waitA(); err != nil {
 		t.Fatalf("helper A failed: %v\n%s", err, outA.String())
 	}
 	reportA := readNestedReportFile(t, reportAPath)
@@ -1291,6 +1303,9 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 		t.Fatalf("storage.Open B: %v", err)
 	}
 	defer storeB.Close()
+	var ownerClockUnix atomic.Int64
+	ownerClockUnix.Store(nestedTestNow().UnixNano())
+	ownerClock := func() time.Time { return time.Unix(0, ownerClockUnix.Load()).UTC() }
 
 	planA := durableReplayTestPlan()
 	planA.PlanID = "plan-renew-long-execution"
@@ -1317,8 +1332,8 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 			RepoPath:    repo,
 			MaxChildren: 1,
-			Now:         nestedTestNow(),
-			Clock:       func() time.Time { return nestedTestNow() },
+			Now:         ownerClock(),
+			Clock:       ownerClock,
 			Plan:        &planA,
 			Store:       storeA,
 			RecordEvent: func(string, string, state.Event) error {
@@ -1337,6 +1352,7 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 		}{report: report, err: err}
 	}()
 	waitForNestedSignal(t, executeStarted, "provider execution")
+	ownerClockUnix.Store(nestedTestNow().Add(time.Hour).UnixNano())
 	waitForDurableClaimRenewal(t, ctx, storeB)
 	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
@@ -1405,6 +1421,13 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 
 	executeStarted := make(chan struct{})
 	releaseExecute := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() {
+		releaseOnce.Do(func() {
+			close(releaseExecute)
+		})
+	}
+	t.Cleanup(releaseOwner)
 	var executeCount int64
 	doneA := make(chan struct {
 		report NestedScheduleReport
@@ -1436,7 +1459,7 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 	waitForNestedSignal(t, executeStarted, "provider execution")
 	if err := storeB.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET lease_expires_at = ?`,
-			time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
+			nestedTestNow().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
 		return err
 	}); err != nil {
 		t.Fatalf("force expired executing claim: %v", err)
@@ -1465,7 +1488,7 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 	if got := atomic.LoadInt64(&executeCount); got != 1 {
 		t.Fatalf("execute count while expired owner still active = %d, want 1", got)
 	}
-	close(releaseExecute)
+	releaseOwner()
 	outcomeA := <-doneA
 	if outcomeA.err == nil {
 		t.Fatalf("owner ScheduleNestedRuns returned nil error after needs-human transition, want completion rejection")

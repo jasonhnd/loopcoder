@@ -141,6 +141,16 @@ The `claude` adapter runs `claude --print --dangerously-skip-permissions
 --output-format json ...` with the prompt on stdin, and parses the JSON `result`
 field as the summary.
 
+Provider-native sub-agent federation is a separate launch mode from ordinary
+Worker dispatch. The first bridge implementation allows only providers with
+`nested_subagents` support to host native children; in the current live matrix
+that means `claude`. `codex`, `gemini`, and `antigravity` refuse native
+sub-agent launch with `ErrUnsupportedNativeSubAgent` while remaining available
+for their ordinary Worker or Verifier roles where supported. Native children
+must be registered before provider start and must carry budget and ownership
+refs; ordinary `dispatch` does not grant a provider-native orchestrator control
+over LoopCoder budgets, scopes, approvals, or final acceptance.
+
 The `gemini` adapter runs `gemini --prompt <prompt> --yolo --output-format json
 ...` and parses the JSON response fields, falling back to raw stdout when
 needed. Gemini has no reasoning-effort flag, so a supplied `--effort` is logged

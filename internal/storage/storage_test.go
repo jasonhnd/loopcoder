@@ -33,7 +33,7 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "agent_registrations", "agent_scope_grants", "agent_budget_bindings", "agent_ownership_locks", "agent_events"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
@@ -862,6 +862,96 @@ func TestClaimChildRunExecutionExpiredExecutingClaimNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestAgentRegistrationRequiresActiveRegistrationBeforeLaunch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecution(ctx, store, parent.RunID, children[0].RunID, "executor-native", now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution: %v", err)
+	}
+	_, err = RequireActiveAgentRegistrationForLaunch(ctx, store, children[0].RunID, claim.ExecutorID, claim.ClaimGeneration)
+	if !errors.Is(err, ErrAgentRegistrationRequired) {
+		t.Fatalf("RequireActiveAgentRegistrationForLaunch error = %v, want ErrAgentRegistrationRequired", err)
+	}
+}
+
+func TestClaimAndRegisterNativeChildIsDeterministicAndReplays(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	req := validAgentRegistrationRequest(parent, children[0], plan, edges[0], now)
+	claim, registration, err := ClaimAndRegisterNativeChild(ctx, store, parent.RunID, children[0].RunID, "executor-native", now, now.Add(time.Minute), req)
+	if err != nil {
+		t.Fatalf("ClaimAndRegisterNativeChild: %v", err)
+	}
+	if claim.Outcome != ClaimOutcomeClaimed {
+		t.Fatalf("claim outcome = %q, want claimed", claim.Outcome)
+	}
+	if registration.ChildAgentID == "" || registration.ScopeGrantID == "" || !strings.HasPrefix(registration.AgentFederationFingerprint, "sha256:") {
+		t.Fatalf("registration identifiers incomplete: %#v", registration)
+	}
+	if registration.ChildAgentID != StableChildAgentID(req) {
+		t.Fatalf("child agent id = %q, want stable %q", registration.ChildAgentID, StableChildAgentID(req))
+	}
+	if len(registration.BudgetBindingIDs) != 1 || len(registration.OwnershipLockIDs) != 1 {
+		t.Fatalf("registration refs = budget:%#v locks:%#v", registration.BudgetBindingIDs, registration.OwnershipLockIDs)
+	}
+	if _, err := RequireActiveAgentRegistrationForLaunch(ctx, store, children[0].RunID, claim.ExecutorID, claim.ClaimGeneration); err != nil {
+		t.Fatalf("RequireActiveAgentRegistrationForLaunch after registration: %v", err)
+	}
+
+	req.ExecutorID = claim.ExecutorID
+	req.ClaimGeneration = claim.ClaimGeneration
+	req.ProviderIdempotencyKey = claim.ProviderKey
+	replayed, err := RegisterAgentRegistration(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgentRegistration replay: %v", err)
+	}
+	if replayed.ChildAgentID != registration.ChildAgentID || replayed.AgentFederationFingerprint != registration.AgentFederationFingerprint {
+		t.Fatalf("replayed registration = %#v, want %#v", replayed, registration)
+	}
+	changed := req
+	changed.PolicyFingerprint = "sha256:" + strings.Repeat("b", 64)
+	if _, err := RegisterAgentRegistration(ctx, store, changed); !errors.Is(err, ErrAgentRegistrationConflict) && !errors.Is(err, ErrDuplicateReplay) {
+		t.Fatalf("changed replay error = %v, want registration conflict or duplicate replay", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+	tree, err := LoadAgentTree(ctx, reopened, parent.RootRunID)
+	if err != nil {
+		t.Fatalf("LoadAgentTree: %v", err)
+	}
+	if len(tree.Registrations) != 1 || tree.Registrations[0].ChildAgentID != registration.ChildAgentID {
+		t.Fatalf("agent tree = %#v, want replayed registration", tree)
+	}
+}
+
 func TestWithWriteTxRollbackFailureDiscardsConnection(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
@@ -1173,6 +1263,53 @@ func validChildPlanGraphFixture() (RunNode, []RunNode, ChildPlanRecord, []RunEdg
 		UpdatedAt:       at,
 	}}
 	return parent, children, plan, edges
+}
+
+func validAgentRegistrationRequest(parent RunNode, child RunNode, plan ChildPlanRecord, edge RunEdgeRecord, now time.Time) AgentRegistrationRequest {
+	return AgentRegistrationRequest{
+		ProjectID:              "project-federation",
+		DeliveryRunID:          "delivery-run-federation",
+		RootRunID:              parent.RootRunID,
+		ParentRunID:            parent.RunID,
+		ChildRunID:             child.RunID,
+		TaskID:                 "task-federation",
+		AttemptID:              "attempt-federation",
+		PlanID:                 plan.PlanID,
+		ChildKey:               edge.ChildKey,
+		AdapterID:              "claude",
+		ProviderInstallationID: "pinst-claude",
+		AccountProfileID:       "acct-fixture",
+		ModelCapabilityID:      "mcap-fixture",
+		RoutingDecisionID:      "route-fixture",
+		ProviderSessionRef:     "provider-session-ref-fixture",
+		ScopeJSON:              edge.ScopeJSON,
+		Permission:             edge.Permission,
+		SideEffectClass:        "repo-write",
+		BudgetBindings: []AgentBudgetBindingInput{{
+			BudgetPolicyID:      "budget-policy-fixture",
+			BudgetReservationID: "budget-reservation-fixture",
+			ReservationScope:    "child",
+			ReservedQuantities:  `{"total_tokens":1000}`,
+			AncestorBudgetRefs:  `["root-budget-fixture"]`,
+			ReservationState:    "active",
+		}},
+		OwnershipLocks: []AgentOwnershipLockInput{{
+			ResourceKind:      "repo-path",
+			ResourceKey:       "internal/orchestration",
+			LockMode:          "write",
+			State:             "held",
+			LeaseExpiresAt:    "2026-07-10T00:30:00Z",
+			HeartbeatAt:       "2026-07-10T00:00:01Z",
+			ConflictsWithJSON: `[]`,
+		}},
+		CancellationChannel: "local-context",
+		ExpectedOutputsJSON: `{"kind":"summary"}`,
+		PolicyVersion:       AgentFederationPolicyVersionV1,
+		PlanFingerprint:     "sha256:" + strings.Repeat("a", 64),
+		PolicyFingerprint:   "sha256:" + strings.Repeat("1", 64),
+		Classification:      "internal",
+		Now:                 now,
+	}
 }
 
 func seedRunGraphRows(t *testing.T, ctx context.Context, store Store, runs []RunNode, edges []RunEdgeRecord) {

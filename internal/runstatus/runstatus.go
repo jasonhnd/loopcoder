@@ -58,6 +58,7 @@ type Report struct {
 	InventoryRefs       providerinventory.InventoryRefs  `json:"inventory_refs"`
 	QuotaUsageRefs      providerinventory.QuotaUsageRefs `json:"quota_usage_refs"`
 	RunTree             RunTree                          `json:"run_tree"`
+	AgentTree           AgentTree                        `json:"agent_tree"`
 	Rows                []Row                            `json:"rows"`
 }
 
@@ -86,31 +87,60 @@ type RunTreeSummary struct {
 }
 
 type RunTreeNode struct {
-	ProjectID       string   `json:"project_id"`
-	RunID           string   `json:"run_id"`
-	ParentRunID     string   `json:"parent_run_id,omitempty"`
-	ChildRunIDs     []string `json:"child_run_ids"`
-	Depth           int      `json:"depth"`
-	Issue           int      `json:"issue,omitempty"`
-	PR              string   `json:"pr,omitempty"`
-	Role            string   `json:"role,omitempty"`
-	Provider        string   `json:"provider,omitempty"`
-	Model           string   `json:"model,omitempty"`
-	Effort          string   `json:"effort,omitempty"`
-	Permission      string   `json:"permission,omitempty"`
-	ClaimOutcome    string   `json:"claim_outcome,omitempty"`
-	ClaimOwner      string   `json:"claim_owner,omitempty"`
-	ClaimGeneration int64    `json:"claim_generation,omitempty"`
-	LeaseExpiresAt  string   `json:"lease_expires_at,omitempty"`
-	ClaimPhase      string   `json:"claim_phase,omitempty"`
-	ProviderKey     string   `json:"provider_idempotency_key,omitempty"`
-	LifecycleStatus string   `json:"lifecycle_status"`
-	LifecycleSource string   `json:"lifecycle_source,omitempty"`
-	StartedAt       string   `json:"started_at,omitempty"`
-	UpdatedAt       string   `json:"updated_at,omitempty"`
-	EndedAt         string   `json:"ended_at,omitempty"`
-	LastError       string   `json:"last_error,omitempty"`
-	ReportSummary   string   `json:"report_summary,omitempty"`
+	ProjectID         string   `json:"project_id"`
+	RunID             string   `json:"run_id"`
+	ParentRunID       string   `json:"parent_run_id,omitempty"`
+	ChildRunIDs       []string `json:"child_run_ids"`
+	Depth             int      `json:"depth"`
+	Issue             int      `json:"issue,omitempty"`
+	PR                string   `json:"pr,omitempty"`
+	Role              string   `json:"role,omitempty"`
+	Provider          string   `json:"provider,omitempty"`
+	Model             string   `json:"model,omitempty"`
+	Effort            string   `json:"effort,omitempty"`
+	Permission        string   `json:"permission,omitempty"`
+	ClaimOutcome      string   `json:"claim_outcome,omitempty"`
+	ClaimOwner        string   `json:"claim_owner,omitempty"`
+	ClaimGeneration   int64    `json:"claim_generation,omitempty"`
+	LeaseExpiresAt    string   `json:"lease_expires_at,omitempty"`
+	ClaimPhase        string   `json:"claim_phase,omitempty"`
+	ProviderKey       string   `json:"provider_idempotency_key,omitempty"`
+	ChildAgentID      string   `json:"child_agent_id,omitempty"`
+	RegistrationState string   `json:"registration_state,omitempty"`
+	ScopeGrantID      string   `json:"scope_grant_id,omitempty"`
+	BudgetBindingIDs  []string `json:"budget_binding_ids,omitempty"`
+	OwnershipLockIDs  []string `json:"ownership_lock_ids,omitempty"`
+	AgentFingerprint  string   `json:"agent_federation_fingerprint,omitempty"`
+	GapReasons        []string `json:"gap_reasons,omitempty"`
+	LifecycleStatus   string   `json:"lifecycle_status"`
+	LifecycleSource   string   `json:"lifecycle_source,omitempty"`
+	StartedAt         string   `json:"started_at,omitempty"`
+	UpdatedAt         string   `json:"updated_at,omitempty"`
+	EndedAt           string   `json:"ended_at,omitempty"`
+	LastError         string   `json:"last_error,omitempty"`
+	ReportSummary     string   `json:"report_summary,omitempty"`
+}
+
+type AgentTree struct {
+	SchemaVersion              string            `json:"schema_version"`
+	RootRunID                  string            `json:"root_run_id"`
+	AgentFederationFingerprint string            `json:"agent_federation_fingerprint,omitempty"`
+	Registrations              []AgentTreeRecord `json:"registrations"`
+	Blocked                    []string          `json:"blocked"`
+	NeedsHuman                 []string          `json:"needs_human"`
+}
+
+type AgentTreeRecord struct {
+	ChildAgentID      string   `json:"child_agent_id"`
+	ParentRunID       string   `json:"parent_run_id,omitempty"`
+	RunID             string   `json:"run_id"`
+	AdapterID         string   `json:"adapter_id,omitempty"`
+	RegistrationState string   `json:"registration_state,omitempty"`
+	ScopeGrantID      string   `json:"scope_grant_id,omitempty"`
+	BudgetBindingIDs  []string `json:"budget_binding_ids,omitempty"`
+	OwnershipLockIDs  []string `json:"ownership_lock_ids,omitempty"`
+	ClaimGeneration   int64    `json:"claim_generation,omitempty"`
+	GapReasons        []string `json:"gap_reasons"`
 }
 
 type Row struct {
@@ -253,6 +283,7 @@ func Load(opts Options) (Report, error) {
 		ChildRunIDs:         append([]string(nil), lifecycle.ChildRunIDs...),
 		QuotaUsageRefs:      quotaUsageRefs,
 		RunTree:             runTree,
+		AgentTree:           agentTreeFromRunTree(runTree),
 		Rows:                rows,
 	}, nil
 }
@@ -337,6 +368,12 @@ func Render(report Report) string {
 			}
 			if strings.TrimSpace(node.ProviderKey) != "" {
 				parts = append(parts, "provider_key="+node.ProviderKey)
+			}
+			if strings.TrimSpace(node.ChildAgentID) != "" {
+				parts = append(parts, "child_agent="+node.ChildAgentID)
+			}
+			if strings.TrimSpace(node.RegistrationState) != "" {
+				parts = append(parts, "registration="+node.RegistrationState)
 			}
 			fmt.Fprintf(&out, "%s- %s (%s)\n", indent, node.RunID, strings.Join(parts, " "))
 			if strings.TrimSpace(node.ReportSummary) != "" {
@@ -437,6 +474,9 @@ func normalizeReport(report Report) Report {
 	if report.RunTree.Nodes == nil {
 		report.RunTree.Nodes = []RunTreeNode{}
 	}
+	if report.AgentTree.SchemaVersion == "" {
+		report.AgentTree = agentTreeFromRunTree(report.RunTree)
+	}
 	if report.InventoryRefs.SchemaVersion == "" {
 		report.InventoryRefs = providerinventory.EmptyRefs()
 	}
@@ -447,9 +487,61 @@ func normalizeReport(report Report) Report {
 		if report.RunTree.Nodes[i].ChildRunIDs == nil {
 			report.RunTree.Nodes[i].ChildRunIDs = []string{}
 		}
+		if report.RunTree.Nodes[i].BudgetBindingIDs == nil {
+			report.RunTree.Nodes[i].BudgetBindingIDs = []string{}
+		}
+		if report.RunTree.Nodes[i].OwnershipLockIDs == nil {
+			report.RunTree.Nodes[i].OwnershipLockIDs = []string{}
+		}
+		if report.RunTree.Nodes[i].GapReasons == nil {
+			report.RunTree.Nodes[i].GapReasons = []string{}
+		}
 	}
 	report.RunTree.Summary = summarizeRunTree(report.RunTree.Nodes)
+	if report.AgentTree.Registrations == nil {
+		report.AgentTree.Registrations = []AgentTreeRecord{}
+	}
+	if report.AgentTree.Blocked == nil {
+		report.AgentTree.Blocked = []string{}
+	}
+	if report.AgentTree.NeedsHuman == nil {
+		report.AgentTree.NeedsHuman = []string{}
+	}
 	return report
+}
+
+func agentTreeFromRunTree(runTree RunTree) AgentTree {
+	tree := AgentTree{
+		SchemaVersion: "loopcoder.agent_tree.v1",
+		RootRunID:     runTree.RootRunID,
+		Registrations: []AgentTreeRecord{},
+		Blocked:       []string{},
+		NeedsHuman:    []string{},
+	}
+	for _, node := range runTree.Nodes {
+		if strings.TrimSpace(node.ChildAgentID) == "" {
+			continue
+		}
+		tree.Registrations = append(tree.Registrations, AgentTreeRecord{
+			ChildAgentID:      node.ChildAgentID,
+			ParentRunID:       node.ParentRunID,
+			RunID:             node.RunID,
+			AdapterID:         node.Provider,
+			RegistrationState: node.RegistrationState,
+			ScopeGrantID:      node.ScopeGrantID,
+			BudgetBindingIDs:  append([]string(nil), node.BudgetBindingIDs...),
+			OwnershipLockIDs:  append([]string(nil), node.OwnershipLockIDs...),
+			ClaimGeneration:   node.ClaimGeneration,
+			GapReasons:        append([]string(nil), node.GapReasons...),
+		})
+		if node.AgentFingerprint > tree.AgentFederationFingerprint {
+			tree.AgentFederationFingerprint = node.AgentFingerprint
+		}
+		if node.LifecycleStatus == "needs-human" {
+			tree.NeedsHuman = append(tree.NeedsHuman, node.ChildAgentID)
+		}
+	}
+	return tree
 }
 
 func normalizeNow(now func() time.Time) func() time.Time {

@@ -256,6 +256,17 @@ allow controlled takeover by a new generation, but uncertain external side
 effects still route to receipts/idempotency checks or `needs-human`; loopcoder
 does not claim universal exactly-once side effects across crashes.
 
+Provider-native child execution adds an agent-federation registration gate on
+top of that nested run machinery. A native child must be registered in SQLite
+with a stable `child_agent_id`, parent/child run refs, task and attempt refs,
+scope, permission, budget binding refs, ownership lock refs, provider-session
+reference, route refs, plan fingerprint, policy fingerprint, and the active
+claim owner/generation before provider launch. The registration shares the
+existing `runs`, `run_edges`, `child_plans`, and `run_claims` graph; it does not
+create a second run graph or a second claim system. Replay reconstructs the
+agent tree from durable registration rows and rejects changed canonical replay
+bytes instead of silently launching duplicate or inconsistent child work.
+
 ### Delivery Guardrails
 
 Current built guardrails include readiness checks, open-PR duplicate

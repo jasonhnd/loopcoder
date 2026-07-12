@@ -86,6 +86,8 @@ type ChildRunPlan struct {
 	Title        string           `json:"title,omitempty"`
 	Role         string           `json:"role,omitempty"`
 	RunID        string           `json:"run_id,omitempty"`
+	AdapterID    string           `json:"adapter_id,omitempty"`
+	NativeChild  bool             `json:"native_child,omitempty"`
 	ProviderKey  string           `json:"provider_idempotency_key,omitempty"`
 	Issue        int              `json:"issue,omitempty"`
 	ScopeIssues  []int            `json:"scope_issues,omitempty"`
@@ -138,6 +140,13 @@ type ChildRunResult struct {
 	ClaimPhase          string           `json:"claim_phase,omitempty"`
 	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
 	ProviderReceipt     string           `json:"provider_receipt,omitempty"`
+	ChildAgentID        string           `json:"child_agent_id,omitempty"`
+	RegistrationState   string           `json:"registration_state,omitempty"`
+	ScopeGrantID        string           `json:"scope_grant_id,omitempty"`
+	BudgetBindingIDs    []string         `json:"budget_binding_ids,omitempty"`
+	OwnershipLockIDs    []string         `json:"ownership_lock_ids,omitempty"`
+	AgentFingerprint    string           `json:"agent_federation_fingerprint,omitempty"`
+	GapReasons          []string         `json:"gap_reasons,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -382,7 +391,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		child := children[index]
 		result := childResultFromPlan(child)
 		result.Status = NestedStatusRunning
-		claimAt := time.Now().UTC()
+		claimAt := clock().UTC()
 		claim, err := storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, nestedExecutorID(opts.ParentRunID), claimAt, claimAt.Add(nestedClaimLeaseDuration))
 		if err != nil {
 			setCompleteErr(err)
@@ -418,7 +427,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(fmt.Errorf("claim child run %s returned unknown outcome %q", child.RunID, claim.Outcome))
 			return
 		}
-		phaseAt := time.Now().UTC()
+		phaseAt := clock().UTC()
 		if err := storage.UpdateChildRunClaimPhase(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, state.FormatTimestamp(phaseAt), ""); err != nil {
 			if storage.IsStaleChildRunClaim(err) {
 				result.Status = NestedStatusNeedsHuman
@@ -444,7 +453,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(err)
 		}
 
-		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
+		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, clock)
 		executed, err := opts.Execute(ctx, child)
 		heartbeatErr := stopHeartbeat()
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
@@ -954,6 +963,27 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ProviderReceipt) != "" {
 		base.ProviderReceipt = strings.TrimSpace(result.ProviderReceipt)
 	}
+	if strings.TrimSpace(result.ChildAgentID) != "" {
+		base.ChildAgentID = strings.TrimSpace(result.ChildAgentID)
+	}
+	if strings.TrimSpace(result.RegistrationState) != "" {
+		base.RegistrationState = strings.TrimSpace(result.RegistrationState)
+	}
+	if strings.TrimSpace(result.ScopeGrantID) != "" {
+		base.ScopeGrantID = strings.TrimSpace(result.ScopeGrantID)
+	}
+	if len(result.BudgetBindingIDs) > 0 {
+		base.BudgetBindingIDs = append([]string(nil), result.BudgetBindingIDs...)
+	}
+	if len(result.OwnershipLockIDs) > 0 {
+		base.OwnershipLockIDs = append([]string(nil), result.OwnershipLockIDs...)
+	}
+	if strings.TrimSpace(result.AgentFingerprint) != "" {
+		base.AgentFingerprint = strings.TrimSpace(result.AgentFingerprint)
+	}
+	if len(result.GapReasons) > 0 {
+		base.GapReasons = append([]string(nil), result.GapReasons...)
+	}
 	base.Error = strings.TrimSpace(result.Error)
 	base.Reason = strings.TrimSpace(result.Reason)
 	base.NextAction = strings.TrimSpace(result.NextAction)
@@ -987,9 +1017,29 @@ func applyClaimResult(result ChildRunResult, claim storage.ClaimResult) ChildRun
 	return result
 }
 
-func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64) func() error {
+func applyAgentRegistrationResult(result ChildRunResult, registration storage.AgentRegistrationRecord) ChildRunResult {
+	if strings.TrimSpace(registration.ChildAgentID) == "" {
+		return result
+	}
+	result.ChildAgentID = registration.ChildAgentID
+	result.RegistrationState = registration.RegistrationState
+	result.ScopeGrantID = registration.ScopeGrantID
+	result.BudgetBindingIDs = append([]string(nil), registration.BudgetBindingIDs...)
+	result.OwnershipLockIDs = append([]string(nil), registration.OwnershipLockIDs...)
+	result.AgentFingerprint = registration.AgentFederationFingerprint
+	result.GapReasons = append([]string(nil), registration.GapReasons...)
+	if strings.TrimSpace(result.ProviderKey) == "" {
+		result.ProviderKey = registration.ProviderIdempotencyKey
+	}
+	return result
+}
+
+func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64, clock func() time.Time) func() error {
 	if store == nil || strings.TrimSpace(childRunID) == "" || strings.TrimSpace(executorID) == "" || generation <= 0 {
 		return func() error { return nil }
+	}
+	if clock == nil {
+		clock = store.Now
 	}
 	interval := nestedClaimRenewEvery
 	if interval <= 0 {
@@ -1004,13 +1054,18 @@ func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID strin
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		var lastErr error
+		lastNow := clock().UTC()
 		for {
 			select {
 			case <-stop:
 				done <- lastErr
 				return
 			case <-ticker.C:
-				now := time.Now().UTC()
+				now := clock().UTC()
+				if !now.After(lastNow) {
+					now = lastNow.Add(interval)
+				}
+				lastNow = now
 				renewCtx, cancel := nestedCleanupContext()
 				err := storage.RenewChildRunClaim(renewCtx, store, childRunID, executorID, generation, now, now.Add(nestedClaimLeaseDuration))
 				cancel()

@@ -480,6 +480,61 @@ func TestRunJSONIncludesProviderCompatibilityMatrix(t *testing.T) {
 	}
 }
 
+func TestRunJSONIncludesAgentFederationDiagnostics(t *testing.T) {
+	env := healthyDoctorEnv()
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		AgentFederation struct {
+			SchemaVersion string `json:"schema_version"`
+			Providers     []struct {
+				AdapterID       string   `json:"adapter_id"`
+				NestedSubagents bool     `json:"nested_subagents"`
+				Support         string   `json:"support"`
+				GapReasons      []string `json:"gap_reasons"`
+			} `json:"providers"`
+			ScopePolicy struct {
+				MonotonicInheritance      bool `json:"monotonic_inheritance"`
+				CredentialMaterialAllowed bool `json:"credential_material_allowed"`
+				OneWriterRequired         bool `json:"one_writer_required"`
+			} `json:"scope_policy"`
+			BudgetPolicy struct {
+				HierarchicalBudgetsRequired bool `json:"hierarchical_budgets_required"`
+				ChildReservationRequired    bool `json:"child_reservation_required"`
+			} `json:"budget_policy"`
+		} `json:"agent_federation"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.AgentFederation.SchemaVersion != "loopcoder.agent_federation_json.v1" {
+		t.Fatalf("agent_federation schema = %q", payload.AgentFederation.SchemaVersion)
+	}
+	var claudeOK, codexRefused bool
+	for _, provider := range payload.AgentFederation.Providers {
+		if provider.AdapterID == "claude" && provider.NestedSubagents && provider.Support == "supported" {
+			claudeOK = true
+		}
+		if provider.AdapterID == "codex" && !provider.NestedSubagents && provider.Support == "unsupported" && containsString(provider.GapReasons, "nested-subagents-unsupported") {
+			codexRefused = true
+		}
+	}
+	if !claudeOK || !codexRefused {
+		t.Fatalf("agent federation providers = %#v", payload.AgentFederation.Providers)
+	}
+	if !payload.AgentFederation.ScopePolicy.MonotonicInheritance || payload.AgentFederation.ScopePolicy.CredentialMaterialAllowed || !payload.AgentFederation.ScopePolicy.OneWriterRequired {
+		t.Fatalf("scope policy = %#v", payload.AgentFederation.ScopePolicy)
+	}
+	if !payload.AgentFederation.BudgetPolicy.HierarchicalBudgetsRequired || !payload.AgentFederation.BudgetPolicy.ChildReservationRequired {
+		t.Fatalf("budget policy = %#v", payload.AgentFederation.BudgetPolicy)
+	}
+}
+
 func TestRunWarnsForAmbiguousProjectRegistryIdentity(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.projectShow = func(_ context.Context, opts registry.Options) (registry.ShowResult, error) {

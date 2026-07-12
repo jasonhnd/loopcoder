@@ -214,6 +214,24 @@ remaining visible.
 root. Human-readable doctor checks remain in `checks[]`; no pretty or prose
 host report is written to stdout in JSON mode.
 
+`doctor --format json` also includes an `agent_federation` root object for
+provider-native child execution. It exposes the static nested-subagent support
+facts, the current federation policy version, and the hard policy red lines:
+monotonic scope inheritance, no credential-material grants, mandatory
+one-writer ownership, hierarchical budgets, and child reservations.
+Current provider-native launch eligibility is `claude` only. `codex`,
+`gemini`, and `antigravity` may still run ordinary Worker or Verifier roles
+where otherwise eligible, but native sub-agent launch for those providers
+returns `ErrUnsupportedNativeSubAgent` before provider start.
+
+Provider-native launch is additionally gated by durable registration. A native
+child must have an active AgentRegistration bound to the accepted child plan,
+the existing run edge, the active `run_claims` owner/generation, budget binding
+refs, ownership lock refs, route refs, provider session reference, and plan and
+policy fingerprints. A child that would start without that record returns
+`ErrAgentRegistrationRequired`; a duplicate stable child identity with changed
+canonical bytes returns `ErrAgentRegistrationConflict` or `ErrDuplicateReplay`.
+
 ## Cancellation And Timeout Behavior
 
 Provider invocations are supervised by loopcoder with context cancellation,
