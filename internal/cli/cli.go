@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -96,6 +97,7 @@ var commands = []Command{
 	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
+	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -289,6 +291,8 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "delivery" {
 		return runDelivery(args[1:], stdout, stderr, deps)
+	if command.Name == "budget" {
+		return runBudget(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
@@ -413,6 +417,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "delivery" {
 		printDeliveryHelp(w)
+	if command.Name == "budget" {
+		printBudgetHelp(w)
 		return
 	}
 	if command.Name == "nested" {
@@ -1294,6 +1300,25 @@ func printProvidersHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --help                 show help")
 }
 
+func printBudgetHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder budget smoke [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Run a local-only reserve/commit/release accounting smoke test.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string              repository path (default \".\")")
+	fmt.Fprintln(w, "  --project-id string        project id override (default: registry project or smoke id)")
+	fmt.Fprintln(w, "  --quantity-kind string     total-tokens, requests, wall-ms, concurrency, or local-policy (default \"total-tokens\")")
+	fmt.Fprintln(w, "  --ceiling int              hard project ceiling (default 100)")
+	fmt.Fprintln(w, "  --reserve int              amount to reserve (default 40)")
+	fmt.Fprintln(w, "  --commit int               amount to commit (default 25)")
+	fmt.Fprintln(w, "  --release int              amount to release; 0 releases the remaining reservation")
+	fmt.Fprintln(w, "  --idempotency-key string   stable smoke idempotency key (default \"budget-smoke\")")
+	fmt.Fprintln(w, "  --format string            output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help                     show help")
+}
+
 func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.ProviderInventory == nil {
 		deps.ProviderInventory = DefaultDeps().ProviderInventory
@@ -1387,6 +1412,185 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintln(stdout, "- no provider CLI installations discovered")
 	}
 	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+	return 0
+}
+
+func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	subcommand := "smoke"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		subcommand = strings.TrimSpace(args[0])
+		args = args[1:]
+	}
+	if subcommand != "smoke" {
+		fmt.Fprintf(stderr, "budget: unsupported subcommand %q (want smoke)\n", subcommand)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("budget smoke", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	projectID := ""
+	quantityValue := string(providerinventory.QuantityTotalTokens)
+	format := "text"
+	ceiling := int64(100)
+	reserveValue := int64(40)
+	commitValue := int64(25)
+	releaseValue := int64(0)
+	idempotencyKey := "budget-smoke"
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&projectID, "project-id", "", "project id override")
+	fs.StringVar(&quantityValue, "quantity-kind", string(providerinventory.QuantityTotalTokens), "quantity kind")
+	fs.Int64Var(&ceiling, "ceiling", 100, "hard project ceiling")
+	fs.Int64Var(&reserveValue, "reserve", 40, "reserve amount")
+	fs.Int64Var(&commitValue, "commit", 25, "commit amount")
+	fs.Int64Var(&releaseValue, "release", 0, "release amount")
+	fs.StringVar(&idempotencyKey, "idempotency-key", "budget-smoke", "idempotency key")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "budget smoke: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "budget smoke: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if ceiling < 0 || reserveValue < 0 || commitValue < 0 || releaseValue < 0 {
+		fmt.Fprintln(stderr, "budget smoke: amounts must be non-negative")
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(projectID) == "" {
+		if project, err := registry.Resolve(context.Background(), registry.Options{RepoPath: resolvedRepo}, registry.DefaultDeps()); err == nil {
+			projectID = project.ProjectID
+		}
+	}
+	if strings.TrimSpace(projectID) == "" {
+		projectID = "proj_budget_smoke"
+	}
+	now := deps.Now().UTC()
+	store, err := providerinventory.OpenDefaultStore(context.Background(), providerinventory.DefaultDeps(), func() time.Time { return now })
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: open storage: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	quantity := providerinventory.QuantityKind(strings.TrimSpace(quantityValue))
+	actor := budget.Actor{ActorID: "loopcoder-cli", Role: "operator"}
+	host := budget.Host{HostID: runtime.GOOS + "/" + runtime.GOARCH, Provider: "loopcoder"}
+	projectScope := budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: projectID}
+	machineScope := budget.Scope{ScopeKind: budget.ScopeMachine}
+	machinePolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
+		Scope:         machineScope,
+		QuantityKind:  quantity,
+		WindowKind:    providerinventory.WindowUnbounded,
+		PolicyMode:    budget.PolicyHard,
+		CeilingValue:  ceiling,
+		PolicyVersion: "cli-smoke-v1",
+		Ordinal:       "machine",
+		Actor:         actor,
+		Host:          host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: upsert machine policy: %v\n", err)
+		return 1
+	}
+	projectPolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
+		Scope:         projectScope,
+		QuantityKind:  quantity,
+		WindowKind:    providerinventory.WindowUnbounded,
+		PolicyMode:    budget.PolicyHard,
+		CeilingValue:  ceiling,
+		PolicyVersion: "cli-smoke-v1",
+		Ordinal:       "project",
+		Actor:         actor,
+		Host:          host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: upsert project policy: %v\n", err)
+		return 1
+	}
+	reserved, err := budget.Reserve(context.Background(), store, budget.ReserveRequest{
+		ScopeChain:            []budget.Scope{machineScope, projectScope},
+		QuantityKind:          quantity,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        reserveValue,
+		LeaseExpiresAt:        now.Add(time.Hour),
+		IdempotencyKey:        idempotencyKey + ":reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 actor,
+		Host:                  host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: reserve: %v\n", err)
+		return 1
+	}
+	committed, err := budget.Commit(context.Background(), store, budget.MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: idempotencyKey + ":commit",
+		Generation:     reserved.Reservation.Generation,
+		Value:          commitValue,
+		Actor:          actor,
+		Host:           host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: commit: %v\n", err)
+		return 1
+	}
+	released, err := budget.Release(context.Background(), store, budget.MutationRequest{
+		ReservationID:  committed.Reservation.BudgetReservationID,
+		IdempotencyKey: idempotencyKey + ":release",
+		Generation:     committed.Reservation.Generation,
+		Value:          releaseValue,
+		Actor:          actor,
+		Host:           host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: release: %v\n", err)
+		return 1
+	}
+	summaries, err := budget.Summaries(context.Background(), store, projectID)
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: summaries: %v\n", err)
+		return 1
+	}
+	payload := struct {
+		OK            bool             `json:"ok"`
+		PolicyIDs     []string         `json:"budget_policy_ids"`
+		Reserved      budget.Result    `json:"reserved"`
+		Committed     budget.Result    `json:"committed"`
+		Released      budget.Result    `json:"released"`
+		BudgetSummary []budget.Summary `json:"budget_summary"`
+	}{
+		OK:            true,
+		PolicyIDs:     []string{machinePolicy.BudgetPolicyID, projectPolicy.BudgetPolicyID},
+		Reserved:      reserved,
+		Committed:     committed,
+		Released:      released,
+		BudgetSummary: summaries,
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(payload); err != nil {
+			fmt.Fprintf(stderr, "budget smoke: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "Budget smoke ok: reserved=%d committed=%d released=%d reservation=%s policies=%s\n",
+		reserveValue, commitValue, released.Reservation.ReleasedValue, released.Reservation.BudgetReservationID, strings.Join(payload.PolicyIDs, ","))
 	return 0
 }
 

@@ -225,6 +225,65 @@ func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
 	}
 }
 
+func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Unix(7, 0).UTC()
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_cli",
+		"--ceiling", "50",
+		"--reserve", "20",
+		"--commit", "12",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: func() time.Time { return now }})
+	if exitCode != 0 {
+		t.Fatalf("budget smoke exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		OK        bool     `json:"ok"`
+		PolicyIDs []string `json:"budget_policy_ids"`
+		Released  struct {
+			Reservation struct {
+				State          string `json:"state"`
+				CommittedValue int64  `json:"committed_value"`
+				ReleasedValue  int64  `json:"released_value"`
+				ReservedValue  int64  `json:"reserved_value"`
+			} `json:"reservation"`
+		} `json:"released"`
+		BudgetSummary []struct {
+			BudgetPolicyID   string `json:"budget_policy_id"`
+			CeilingValue     int64  `json:"ceiling_value"`
+			ReservedValue    int64  `json:"reserved_value"`
+			CommittedValue   int64  `json:"committed_value"`
+			AvailableValue   int64  `json:"available_value"`
+			EffectiveCeiling int64  `json:"effective_ceiling"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if !payload.OK || len(payload.PolicyIDs) != 2 || payload.Released.Reservation.State != "released" {
+		t.Fatalf("payload = %#v, want successful smoke release", payload)
+	}
+	if payload.Released.Reservation.CommittedValue != 12 || payload.Released.Reservation.ReleasedValue != 8 || payload.Released.Reservation.ReservedValue != 0 {
+		t.Fatalf("released reservation = %#v", payload.Released.Reservation)
+	}
+	if len(payload.BudgetSummary) != 2 {
+		t.Fatalf("budget summaries = %#v, want machine and project summaries", payload.BudgetSummary)
+	}
+	for _, summary := range payload.BudgetSummary {
+		if summary.CeilingValue != 50 || summary.ReservedValue != 0 || summary.CommittedValue != 12 || summary.AvailableValue != 38 || summary.EffectiveCeiling != 50 {
+			t.Fatalf("summary = %#v, want committed smoke accounting", summary)
+		}
+	}
+}
+
 func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	repo := t.TempDir()
 	record := validDispatchReport()
