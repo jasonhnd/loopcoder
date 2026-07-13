@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -13,6 +14,7 @@ import (
 type deliveryMigrationBackup struct {
 	BackupID                 string
 	SourcePath               string
+	SourceSchemaVersion      int
 	SourceHash               string
 	BackupPath               string
 	CreatedAt                string
@@ -22,11 +24,13 @@ type deliveryMigrationBackup struct {
 func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationBackup, error) {
 	sourcePath = filepath.Clean(sourcePath)
 	if sourcePath == "." || sourcePath == "" {
-		return &deliveryMigrationBackup{
-			BackupID:                 "backup_" + hashStringsStorage("schema-v9-empty-source")[:24],
-			CreatedAt:                createdAt,
-			MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
-		}, nil
+		return prepareDeliveryV10NoSourceMetadata("", createdAt), nil
+	}
+	if _, err := os.Stat(sourcePath); err != nil {
+		if os.IsNotExist(err) {
+			return prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt), nil
+		}
+		return nil, fmt.Errorf("inspect delivery v10 backup source: %w", err)
 	}
 	sourceHash, err := fileSHA256(sourcePath)
 	if err != nil {
@@ -44,11 +48,26 @@ func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationB
 	return &deliveryMigrationBackup{
 		BackupID:                 "backup_" + hashStringsStorage(sourceHash, "schema-v9-to-v10")[:24],
 		SourcePath:               sourcePath,
+		SourceSchemaVersion:      9,
 		SourceHash:               sourceHash,
 		BackupPath:               backupPath,
 		CreatedAt:                createdAt,
 		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
 	}, nil
+}
+
+func prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt string) *deliveryMigrationBackup {
+	sourcePath = filepath.Clean(sourcePath)
+	if sourcePath == "." {
+		sourcePath = ""
+	}
+	return &deliveryMigrationBackup{
+		BackupID:                 "no_source_" + hashStringsStorage(sourcePath, "schema-v9-to-v10-no-source")[:24],
+		SourcePath:               sourcePath,
+		SourceSchemaVersion:      0,
+		CreatedAt:                createdAt,
+		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10", "no-source"),
+	}
 }
 
 func migrateDeliveryRunContracts(ctx context.Context, tx *sql.Tx, backup *deliveryMigrationBackup, createdAt string) error {
@@ -68,9 +87,10 @@ func migrateDeliveryRunContracts(ctx context.Context, tx *sql.Tx, backup *delive
 			created_at,
 			loopcoder_version,
 			migration_plan_fingerprint
-		) VALUES (?, ?, 9, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			backup.BackupID,
 			backup.SourcePath,
+			backup.SourceSchemaVersion,
 			backup.SourceHash,
 			backup.BackupPath,
 			backup.CreatedAt,
@@ -471,23 +491,49 @@ var deliveryContractSchemaStatements = []string{
 }
 
 func fileSHA256(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	defer file.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(src)
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, data, 0o600)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	removeOnError := true
+	defer func() {
+		if removeOnError {
+			_ = os.Remove(dst)
+		}
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	removeOnError = false
+	return nil
 }
 
 func hashStringsStorage(parts ...string) string {

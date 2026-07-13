@@ -52,6 +52,83 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenFreshDatabaseRecordsNoSourceMigrationMetadataIdempotently(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "data", "loopcoder.db")
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh path stat error = %v, want not exist", err)
+	}
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	first := readOnlyDeliveryMigrationBackup(t, ctx, store)
+	assertNoSourceDeliveryMigrationBackup(t, first, path)
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects`, 0)
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM delivery_runs`, 0)
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close first store: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(path), "backups")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup directory stat error = %v, want no backup directory", err)
+	}
+
+	reopened, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("reopen returned error: %v", err)
+	}
+	defer reopened.Close()
+	health, err := reopened.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health returned error: %v", err)
+	}
+	if !health.OK || health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("health = %#v, want schema %d", health, CurrentSchemaVersion)
+	}
+	second := readOnlyDeliveryMigrationBackup(t, ctx, reopened)
+	if second != first {
+		t.Fatalf("backup metadata changed after reopen:\nfirst:  %#v\nsecond: %#v", first, second)
+	}
+	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
+	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM projects`, 0)
+	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM delivery_runs`, 0)
+}
+
+func TestPrepareDeliveryV10BackupTreatsMissingPathFixturesAsNoSource(t *testing.T) {
+	base := t.TempDir()
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "macos", path: filepath.Join(base, "Users", "example", "Library", "Application Support", "loopcoder", "data", "loopcoder.db")},
+		{name: "linux", path: filepath.Join(base, "home", "example", ".loopcoder", "data", "loopcoder.db")},
+		{name: "windows", path: filepath.Join(base, `C:\Users\example\.loopcoder\data\loopcoder.db`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := os.Stat(tt.path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fixture path stat error = %v, want not exist", err)
+			}
+			backup, err := prepareDeliveryV10Backup(tt.path, formatTimestamp(fixedNow()))
+			if err != nil {
+				t.Fatalf("prepareDeliveryV10Backup returned error: %v", err)
+			}
+			assertNoSourceDeliveryMigrationBackup(t, deliveryMigrationBackupRow{
+				BackupID:                 backup.BackupID,
+				SourceDBPath:             backup.SourcePath,
+				SourceSchemaVersion:      backup.SourceSchemaVersion,
+				SourceDBHash:             backup.SourceHash,
+				BackupPath:               backup.BackupPath,
+				CreatedAt:                backup.CreatedAt,
+				LoopcoderVersion:         "0.8.0",
+				MigrationPlanFingerprint: backup.MigrationPlanFingerprint,
+			}, filepath.Clean(tt.path))
+		})
+	}
+}
+
 func TestOpenRerunsRoutingPolicyProfileMigrationIdempotently(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -1069,6 +1146,82 @@ func tableSQLContains(t *testing.T, store Store, table, fragment string) bool {
 		t.Fatalf("query table SQL for %s: %v", table, err)
 	}
 	return strings.Contains(sqlText, fragment)
+}
+
+type deliveryMigrationBackupRow struct {
+	BackupID                 string
+	SourceDBPath             string
+	SourceSchemaVersion      int
+	SourceDBHash             string
+	BackupPath               string
+	CreatedAt                string
+	LoopcoderVersion         string
+	MigrationPlanFingerprint string
+}
+
+func readOnlyDeliveryMigrationBackup(t *testing.T, ctx context.Context, store Store) deliveryMigrationBackupRow {
+	t.Helper()
+	var row deliveryMigrationBackupRow
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT backup_id, source_db_path, source_schema_version, source_db_hash, backup_path, created_at, loopcoder_version, migration_plan_fingerprint FROM delivery_migration_backups`).Scan(
+			&row.BackupID,
+			&row.SourceDBPath,
+			&row.SourceSchemaVersion,
+			&row.SourceDBHash,
+			&row.BackupPath,
+			&row.CreatedAt,
+			&row.LoopcoderVersion,
+			&row.MigrationPlanFingerprint,
+		)
+	}); err != nil {
+		t.Fatalf("query delivery migration backup metadata: %v", err)
+	}
+	return row
+}
+
+func assertNoSourceDeliveryMigrationBackup(t *testing.T, row deliveryMigrationBackupRow, wantPath string) {
+	t.Helper()
+	wantPath = filepath.Clean(wantPath)
+	if wantPath == "." {
+		wantPath = ""
+	}
+	if !strings.HasPrefix(row.BackupID, "no_source_") {
+		t.Fatalf("backup_id = %q, want no_source_ prefix", row.BackupID)
+	}
+	if row.SourceDBPath != wantPath {
+		t.Fatalf("source_db_path = %q, want %q", row.SourceDBPath, wantPath)
+	}
+	if row.SourceSchemaVersion != 0 {
+		t.Fatalf("source_schema_version = %d, want 0 for no source database", row.SourceSchemaVersion)
+	}
+	if row.SourceDBHash != "" {
+		t.Fatalf("source_db_hash = %q, want empty for no source database", row.SourceDBHash)
+	}
+	if row.BackupPath != "" {
+		t.Fatalf("backup_path = %q, want empty for no source database", row.BackupPath)
+	}
+	if row.CreatedAt != formatTimestamp(fixedNow()) {
+		t.Fatalf("created_at = %q, want fixed time", row.CreatedAt)
+	}
+	if row.LoopcoderVersion != "0.8.0" {
+		t.Fatalf("loopcoder_version = %q, want 0.8.0", row.LoopcoderVersion)
+	}
+	if row.MigrationPlanFingerprint == "" {
+		t.Fatal("migration_plan_fingerprint is empty")
+	}
+}
+
+func assertCountInStore(t *testing.T, ctx context.Context, store Store, query string, want int) {
+	t.Helper()
+	var got int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, query).Scan(&got)
+	}); err != nil {
+		t.Fatalf("query count %q: %v", query, err)
+	}
+	if got != want {
+		t.Fatalf("%s = %d, want %d", query, got, want)
+	}
 }
 
 func createRawDB(t *testing.T, path string) *sql.DB {
