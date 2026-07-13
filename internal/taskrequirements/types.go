@@ -52,6 +52,8 @@ var (
 	ErrGraphBoundExceeded                = &TypedError{Code: ErrGraphBoundExceededCode}
 	ErrGraphCycleDetected                = &TypedError{Code: ErrGraphCycleDetectedCode}
 	ErrGraphDisconnected                 = &TypedError{Code: ErrGraphDisconnectedCode}
+	ErrFallbackWouldWeakenPolicy         = &TypedError{Code: ErrFallbackWouldWeakenPolicyCode}
+	ErrReplanRequired                    = &TypedError{Code: ErrReplanRequiredCode}
 	ErrReplanBoundExceeded               = &TypedError{Code: ErrReplanBoundExceededCode}
 	ErrRoutingFingerprintMismatch        = &TypedError{Code: ErrRoutingFingerprintMismatchCode}
 	ErrCapabilityUnsupported             = &TypedError{Code: ErrCapabilityUnsupportedCode}
