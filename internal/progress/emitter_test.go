@@ -49,13 +49,7 @@ func TestEmitterTwentyMinuteFixtureHonorsMaxSilence(t *testing.T) {
 	if len(receipts) != 5 {
 		t.Fatalf("receipt count = %d, want 5", len(receipts))
 	}
-	for i := 1; i < len(receipts); i++ {
-		prev := mustParseReceiptTime(t, receipts[i-1].PersistedAt)
-		next := mustParseReceiptTime(t, receipts[i].PersistedAt)
-		if gap := next.Sub(prev); gap > 5*time.Minute {
-			t.Fatalf("receipt persistence gap %s between %s and %s exceeds policy", gap, receipts[i-1].PersistedAt, receipts[i].PersistedAt)
-		}
-	}
+	assertReceiptGapsWithin(t, receipts, 5*time.Minute)
 	periodic := 0
 	for _, receipt := range receipts[1:] {
 		if containsString(receipt.GapReasons, "max-generation-silence") {
@@ -73,6 +67,69 @@ func TestEmitterTwentyMinuteFixtureHonorsMaxSilence(t *testing.T) {
 	}
 	if receipts[len(receipts)-1].Progress.AgeMillis != int64((20 * time.Minute).Milliseconds()) {
 		t.Fatalf("last progress age = %d, want 20 minutes of no meaningful progress", receipts[len(receipts)-1].Progress.AgeMillis)
+	}
+}
+
+func TestEmitterMaxSilenceRearmsAfterMisalignedStateChange(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	store := newPreciseClockStore(t, ctx, clock)
+	defer store.Close()
+
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_misaligned",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForPreciseTickerCount(t, clock, 1)
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 2)
+
+	clock.Advance(2 * time.Minute)
+	stateChange := runningObservation(clock.Now())
+	stateChange.Phase = "ci_wait"
+	stateChange.Status = KnownWaitingCI
+	stateChange.KnownState = KnownWaitingCI
+	stateChange.Reason = ReasonStateChange
+	stateChange.NextAction = ActionState{State: "wait", Summary: "waiting for CI"}
+	if _, err := emitter.Emit(ctx, stateChange); err != nil {
+		t.Fatalf("Emit misaligned state change: %v", err)
+	}
+
+	clock.Advance(3 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, ctx, store); got != 3 {
+		t.Fatalf("receipt count at old ticker phase = %d, want state-change only", got)
+	}
+	clock.Advance(2 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 4)
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 5)
+	if err := emitter.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	receipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_misaligned"})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	assertReceiptGapsWithin(t, receipts, 5*time.Minute)
+	if receipts[3].PersistedAt != deliveryTimestamp(fixedTime.Add(12*time.Minute)) {
+		t.Fatalf("first rearmed periodic persisted_at = %s, want t+12m", receipts[3].PersistedAt)
+	}
+	if !containsString(receipts[3].GapReasons, ReasonMaxGenerationSilence) || !containsString(receipts[3].GapReasons, KnownWaitingCI) {
+		t.Fatalf("rearmed periodic gap reasons = %#v, want max-silence waiting-for-ci", receipts[3].GapReasons)
 	}
 }
 
@@ -571,6 +628,16 @@ func newClockStore(t *testing.T, ctx context.Context, clock *manualClock) storag
 	return store
 }
 
+func newPreciseClockStore(t *testing.T, ctx context.Context, clock *preciseManualClock) storage.Store {
+	t.Helper()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	insertProject(t, ctx, store)
+	return store
+}
+
 func waitForReceiptCount(t *testing.T, ctx context.Context, store storage.Store, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -590,6 +657,17 @@ func mustParseReceiptTime(t *testing.T, value string) time.Time {
 		t.Fatalf("parse receipt time %q: %v", value, err)
 	}
 	return parsed
+}
+
+func assertReceiptGapsWithin(t *testing.T, receipts []ProgressReceipt, interval time.Duration) {
+	t.Helper()
+	for i := 1; i < len(receipts); i++ {
+		prev := mustParseReceiptTime(t, receipts[i-1].PersistedAt)
+		next := mustParseReceiptTime(t, receipts[i].PersistedAt)
+		if gap := next.Sub(prev); gap > interval {
+			t.Fatalf("receipt persistence gap %s between %s and %s exceeds policy", gap, receipts[i-1].PersistedAt, receipts[i].PersistedAt)
+		}
+	}
 }
 
 type manualClock struct {
@@ -626,6 +704,98 @@ type manualTicker struct {
 
 func (t manualTicker) C() <-chan time.Time { return t.ch }
 func (t manualTicker) Stop()               {}
+
+type preciseManualClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	tickers map[*preciseManualTicker]struct{}
+}
+
+func newPreciseManualClock(now time.Time) *preciseManualClock {
+	return &preciseManualClock{
+		now:     now.UTC(),
+		tickers: map[*preciseManualTicker]struct{}{},
+	}
+}
+
+func (c *preciseManualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *preciseManualClock) NewTicker(interval time.Duration) Ticker {
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ticker := &preciseManualTicker{
+		clock:    c,
+		interval: interval,
+		next:     c.now.Add(interval),
+		ch:       make(chan time.Time, 16),
+	}
+	c.tickers[ticker] = struct{}{}
+	return ticker
+}
+
+func (c *preciseManualClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	now := c.now
+	var due []*preciseManualTicker
+	for ticker := range c.tickers {
+		if !ticker.stopped && !ticker.next.After(now) {
+			due = append(due, ticker)
+			for !ticker.next.After(now) {
+				ticker.next = ticker.next.Add(ticker.interval)
+			}
+		}
+	}
+	c.mu.Unlock()
+	for _, ticker := range due {
+		select {
+		case ticker.ch <- now:
+		default:
+		}
+	}
+}
+
+func waitForPreciseTickerCount(t *testing.T, clock *preciseManualClock, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		clock.mu.Lock()
+		got := len(clock.tickers)
+		clock.mu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	clock.mu.Lock()
+	got := len(clock.tickers)
+	clock.mu.Unlock()
+	t.Fatalf("precise ticker count = %d, want at least %d", got, want)
+}
+
+type preciseManualTicker struct {
+	clock    *preciseManualClock
+	interval time.Duration
+	next     time.Time
+	ch       chan time.Time
+	stopped  bool
+}
+
+func (t *preciseManualTicker) C() <-chan time.Time { return t.ch }
+
+func (t *preciseManualTicker) Stop() {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	t.stopped = true
+	delete(t.clock.tickers, t)
+}
 
 type blockingWriteStore struct {
 	storage.Store

@@ -742,6 +742,36 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	}
 }
 
+func TestEmitNestedChildProgressZeroTimestampUsesInjectedClock(t *testing.T) {
+	injected := nestedTestNow().Add(42 * time.Minute)
+	recorder := &recordingProgressRecorder{}
+	child := ChildRunPlan{
+		ChildKey: "child-clock",
+		RunID:    "run-child-clock",
+		Role:     "worker",
+	}
+	result := ChildRunResult{
+		RunID:       child.RunID,
+		ChildKey:    child.ChildKey,
+		ProviderKey: "provider-child-clock",
+		Status:      NestedStatusRunning,
+	}
+
+	emitNestedChildProgress(context.Background(), NestedScheduleOptions{
+		RootRunID: "run-root-clock",
+		Now:       nestedTestNow(),
+		Clock:     func() time.Time { return injected },
+		Progress:  recorder,
+	}, child, result, NestedEventChildRunning, time.Time{}, false)
+
+	if len(recorder.observations) != 1 {
+		t.Fatalf("progress observation count = %d, want 1", len(recorder.observations))
+	}
+	if got := recorder.observations[0].OccurredAt; !got.Equal(injected) {
+		t.Fatalf("progress occurred_at = %s, want injected clock %s", got, injected)
+	}
+}
+
 func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()

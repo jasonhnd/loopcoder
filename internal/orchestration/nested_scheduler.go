@@ -191,6 +191,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
+	opts.Clock = clock
 	runtimeClock := opts.RuntimeClock
 	if runtimeClock == nil {
 		runtimeClock = clock
@@ -682,7 +683,11 @@ func emitNestedChildProgress(ctx context.Context, opts NestedScheduleOptions, ch
 		return
 	}
 	if at.IsZero() {
-		at = time.Now().UTC()
+		if opts.Clock != nil {
+			at = opts.Clock()
+		} else {
+			at = opts.Now
+		}
 	}
 	known := knownNestedProgressState(result.Status, event)
 	observation := progress.Observation{

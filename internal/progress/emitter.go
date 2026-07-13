@@ -153,6 +153,7 @@ type Emitter struct {
 	startOnce sync.Once
 	stopOnce  sync.Once
 	stopCh    chan struct{}
+	wakeupCh  chan struct{}
 	doneCh    chan struct{}
 }
 
@@ -220,6 +221,7 @@ func newEmitterFromOptions(opts EmitterOptions, requireIdentity bool) (*Emitter,
 		clock:         clock,
 		deliver:       opts.Deliver,
 		stopCh:        make(chan struct{}),
+		wakeupCh:      make(chan struct{}, 1),
 		doneCh:        make(chan struct{}),
 	}, nil
 }
@@ -330,7 +332,7 @@ func (e *Emitter) Terminal(ctx context.Context, observation Observation) (EmitRe
 
 func (e *Emitter) run(ctx context.Context) {
 	defer close(e.doneCh)
-	ticker := e.clock.NewTicker(e.interval)
+	ticker := e.clock.NewTicker(e.nextSilenceDelay())
 	defer ticker.Stop()
 	for {
 		select {
@@ -338,8 +340,13 @@ func (e *Emitter) run(ctx context.Context) {
 			return
 		case <-e.stopCh:
 			return
+		case <-e.wakeupCh:
+			ticker.Stop()
+			ticker = e.clock.NewTicker(e.nextSilenceDelay())
 		case <-ticker.C():
 			_, _ = e.emitPeriodic(ctx)
+			ticker.Stop()
+			ticker = e.clock.NewTicker(e.nextSilenceDelay())
 		}
 	}
 }
@@ -385,6 +392,7 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 		e.lastObservationKey = observationKey(observation)
 	}
 	e.lastDurableAt = now
+	e.wakeSchedulerLocked()
 	out := EmitResult{WriteResult: result, Emitted: result.Inserted}
 	if observation.Terminal {
 		e.closed = true
@@ -394,6 +402,32 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 		out.DeliveryErr = e.deliver(ctx, result.Receipt)
 	}
 	return out, err
+}
+
+func (e *Emitter) nextSilenceDelay() time.Duration {
+	if e == nil {
+		return DefaultMaxSilenceInterval
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.lastDurableAt.IsZero() {
+		return e.interval
+	}
+	delay := e.lastDurableAt.Add(e.interval).Sub(e.clock.Now().UTC())
+	if delay <= 0 {
+		return time.Nanosecond
+	}
+	return delay
+}
+
+func (e *Emitter) wakeSchedulerLocked() {
+	if !e.started {
+		return
+	}
+	select {
+	case e.wakeupCh <- struct{}{}:
+	default:
+	}
 }
 
 func (e *Emitter) receiptFor(observation Observation, now time.Time, periodic bool) ProgressReceipt {
