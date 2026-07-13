@@ -234,28 +234,77 @@ func EmptyQuotaUsageRefs() QuotaUsageRefs {
 }
 
 func unsupportedQuotaTelemetryForAdapter(adapter AdapterDeclaration, now time.Time) (QuotaTelemetrySource, QuotaSnapshot) {
+	return quotaTelemetryFallbackForAdapter(adapter, now, "unsupported-source", "ErrQuotaSourceUnsupported")
+}
+
+func quotaTelemetryFallbackForAdapter(adapter AdapterDeclaration, now time.Time, reason, terminal string) (QuotaTelemetrySource, QuotaSnapshot) {
 	now = now.UTC()
+	sourceKind := QuotaSourceOfficialCLIError
+	sourceKey := "unsupported-quota-v1"
+	sourceSchema := "loopcoder.unsupported_quota.v1"
+	unsupportedReason := "adapter declares no supported official machine-readable quota telemetry source"
+	sourceGaps := []string{"unsupported-source"}
+	supportedQuantities := []QuantityKind{QuantityProviderDefined}
+	supportedWindows := []WindowKind{WindowUnknown}
+	scopeDimensions := []string{"provider"}
+	timeoutMS := int((1 * time.Millisecond).Milliseconds())
+	outputLimits := defaultQuotaOutputLimits()
+	environmentKeys := []string{}
+	classificationRules := []string{"no-raw-provider-output", "no-credential-material", "redacted-diagnostics-only"}
+	if adapter.AdapterID == "codex" {
+		sourceKind = QuotaSourceOfficialCLICommand
+		sourceKey = "codex-app-server-rate-limits-v1"
+		sourceSchema = codexQuotaSourceSchema
+		unsupportedReason = ""
+		sourceGaps = []string{"not-collected"}
+		supportedQuantities = []QuantityKind{QuantityRequests, QuantityProviderDefined}
+		supportedWindows = []WindowKind{WindowRolling, WindowFixedWeek, WindowProviderDefined, WindowUnbounded, WindowUnknown}
+		scopeDimensions = []string{"provider", "account", "scope"}
+		timeoutMS = int(codexQuotaTimeout / time.Millisecond)
+		outputLimits = OutputLimits{StdoutBytes: codexQuotaOutputBytes, StderrBytes: StdoutLimitBytes, CombinedBytes: codexQuotaOutputBytes + StdoutLimitBytes, DecodedBytes: codexQuotaOutputBytes}
+		environmentKeys = allowedProbeEnvKeys()
+		classificationRules = []string{"json-rpc-field-allowlist", "redact-before-truncate", "no-credential-material", "no-login-update-or-provider-work"}
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "not-collected"
+	}
+	if strings.TrimSpace(terminal) == "" {
+		terminal = "ErrQuotaSourceUnsupported"
+	}
 	source := normalizeQuotaTelemetrySource(QuotaTelemetrySource{
 		AdapterID:           adapter.AdapterID,
-		SourceKind:          QuotaSourceOfficialCLIError,
-		SourceKey:           "unsupported-quota-v1",
-		SourceSchemaVersion: "loopcoder.unsupported_quota.v1",
-		SupportedQuantities: []QuantityKind{QuantityProviderDefined},
-		SupportedWindows:    []WindowKind{WindowUnknown},
-		ScopeDimensions:     []string{"provider"},
+		SourceKind:          sourceKind,
+		SourceKey:           sourceKey,
+		SourceSchemaVersion: sourceSchema,
+		SupportedQuantities: supportedQuantities,
+		SupportedWindows:    supportedWindows,
+		ScopeDimensions:     scopeDimensions,
 		ConfidenceContract:  map[string]Confidence{"limit_value": ConfidenceUnavailable, "used_value": ConfidenceUnavailable, "remaining_value": ConfidenceUnavailable, "reset_at": ConfidenceUnavailable},
-		EnvironmentKeys:     []string{},
-		TimeoutMS:           int((1 * time.Millisecond).Milliseconds()),
-		OutputLimits:        defaultQuotaOutputLimits(),
-		ClassificationRules: []string{"no-raw-provider-output", "no-credential-material", "redacted-diagnostics-only"},
-		UnsupportedReason:   "adapter declares no supported official machine-readable quota telemetry source",
+		NetworkDeclared:     adapter.AdapterID == "codex",
+		NetworkPermissionScope: func() string {
+			if adapter.AdapterID == "codex" {
+				return "provider:codex/action:quota-read/side-effect:read/freshness:interactive"
+			}
+			return ""
+		}(),
+		Argv: func() []string {
+			if adapter.AdapterID == "codex" {
+				return []string{"codex", "-s", "read-only", "-a", "untrusted", "app-server"}
+			}
+			return nil
+		}(),
+		EnvironmentKeys:     environmentKeys,
+		TimeoutMS:           timeoutMS,
+		OutputLimits:        outputLimits,
+		ClassificationRules: classificationRules,
+		UnsupportedReason:   unsupportedReason,
 		CreatedAt:           formatTime(now),
 		UpdatedAt:           formatTime(now),
 		PolicyVersion:       PolicyVersion,
-		GapReasons:          []string{"unsupported-source"},
+		GapReasons:          sourceGaps,
 	})
 	snapshot := normalizeQuotaSnapshot(QuotaSnapshot{
-		QuotaSnapshotID:      quotaSnapshotID(adapter.AdapterID, source.QuotaSourceID, "unsupported", formatTime(now)),
+		QuotaSnapshotID:      quotaSnapshotID(adapter.AdapterID, source.QuotaSourceID, reason, formatTime(now)),
 		QuotaSourceID:        source.QuotaSourceID,
 		SourceKind:           source.SourceKind,
 		AdapterID:            adapter.AdapterID,
@@ -275,10 +324,10 @@ func unsupportedQuotaTelemetryForAdapter(adapter AdapterDeclaration, now time.Ti
 		},
 		FreshnessState:      FreshnessNotApplicable,
 		CapturedAt:          formatTime(now),
-		RedactedDiagnostics: "no supported official machine-readable quota source declared for " + adapter.AdapterID,
+		RedactedDiagnostics: "quota telemetry not collected for " + adapter.AdapterID + " due to " + reason,
 		ConflictSet:         []string{},
-		GapReasons:          []string{"unsupported-source", "not-collected"},
-		TerminalErrorCode:   "ErrQuotaSourceUnsupported",
+		GapReasons:          []string{reason, "not-collected"},
+		TerminalErrorCode:   terminal,
 		CreatedAt:           formatTime(now),
 		UpdatedAt:           formatTime(now),
 		PolicyVersion:       PolicyVersion,
