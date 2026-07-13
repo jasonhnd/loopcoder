@@ -161,6 +161,36 @@ plain stdout as the summary and writes stdout/stderr to the normal provider log.
 Antigravity read-only mode is not available or verified, so read-only
 Verifier/audit invocations fail closed before launching `agy`.
 
+The `grok` adapter runs the official Grok Build CLI with a bounded headless
+profile:
+
+```text
+grok --no-auto-update -p <prompt> --cwd <physical-worktree> --output-format streaming-json --no-alt-screen --disable-web-search --no-subagents --no-memory --permission-mode dontAsk ...
+```
+
+For write-mode Workers it adds `--sandbox strict`, allows `Read`, `Grep`, and
+`Edit(**)`, and denies `Bash(*)`, `WebFetch(*)`, and `MCPTool(*)`. For
+read-only Verifier/audit calls it adds `--sandbox read-only`, allows only
+`Read` and `Grep`, and denies `Edit(*)`, `Bash(*)`, `WebFetch(*)`, and
+`MCPTool(*)`.
+
+Before any Grok launch, loopcoder probes `grok version` and `grok --help` with
+the same isolated environment used for execution. Supported versions must be at
+least `0.1.0` and must advertise the required headless, workspace, sandbox, and
+permission flags. Missing support is an actionable fail-closed error before
+the provider starts.
+
+The adapter resolves the worktree to its physical path, passes that path as
+both process directory and `--cwd`, rejects symlinks inside the worktree that
+resolve outside the accepted workspace, replaces user home/config/temp
+directories with private per-attempt roots, and passes only an environment
+allowlist plus `XAI_API_KEY`. It also refuses to run when known project-local
+Claude/Grok settings, hooks, plugins, agents, commands, MCP, or memory files
+are present, because the current official CLI surface does not expose a
+documented flag that proves they are ignored. See
+[`../security/grok-isolation.md`](../security/grok-isolation.md) for the full
+inventory and residual provider-controlled state.
+
 ## Why VCS Stays In The Adapter
 
 The adapter, not Codex, commits, pushes, and opens the PR. This keeps VCS state

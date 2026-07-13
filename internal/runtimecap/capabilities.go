@@ -668,6 +668,8 @@ var staticContract = Contract{
 			},
 			KnownLimitations: []string{
 				"bounded execution requires installed CLI help to advertise the required headless flags",
+				"project-local Claude/Grok settings, hooks, plugins, agents, MCP, or memory files cause fail-closed output because no documented ignore-project-config flag is available",
+				"user home/config/temp roots are replaced with private per-attempt directories; XAI_API_KEY is the only provider credential environment variable passed through",
 				"schema-enforced verifier JSON, MCP configuration injection, native subagents, quota collection, and cross-provider handoff are not implemented",
 				"token usage and cost are recorded only when the CLI streaming output supplies them",
 			},
