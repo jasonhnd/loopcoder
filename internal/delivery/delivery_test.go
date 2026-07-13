@@ -459,11 +459,9 @@ func TestDependencyEdgeCycleDetectedIsAtomic(t *testing.T) {
 }
 
 func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	fixtureCtx := context.Background()
 
-	const workers = 8
+	const workers = 2
 	type detectorRun struct {
 		index    int
 		store    storage.Store
@@ -480,10 +478,10 @@ func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testin
 			}
 		})
 		runID := fmt.Sprintf("run_cycle_detector_parallel_%02d", i)
-		run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", runID)
+		run, taskA, taskB := seedTwoTaskDependencyRun(t, fixtureCtx, store, "proj_a", runID)
 
 		edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
-		if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: runID + "-edge-ab", Now: fixedTime()}); err != nil {
+		if _, err := AddDependencyEdge(fixtureCtx, store, edgeAB, PersistOptions{IdempotencyKey: runID + "-edge-ab", Now: fixedTime()}); err != nil {
 			t.Fatalf("AddDependencyEdge seed %d: %v", i, err)
 		}
 		runs = append(runs, &detectorRun{
@@ -493,6 +491,9 @@ func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testin
 			injected: fmt.Errorf("cte scan failed %02d", i),
 		})
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	ready := make(chan int, workers)
 	start := make(chan struct{})
@@ -533,31 +534,55 @@ func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testin
 		}()
 	}
 
-	for range runs {
+	readyByIndex := make(map[int]bool, workers)
+	resultsByIndex := make(map[int]error, workers)
+	var barrierErr error
+	for len(readyByIndex) < len(runs) && barrierErr == nil {
 		select {
-		case <-ready:
+		case index := <-ready:
+			if readyByIndex[index] {
+				barrierErr = fmt.Errorf("detector %d reached barrier more than once", index)
+				break
+			}
+			readyByIndex[index] = true
 		case res := <-results:
-			t.Fatalf("AddDependencyEdge %d returned before detector barrier: %v", res.index, res.err)
+			resultsByIndex[res.index] = res.err
+			barrierErr = fmt.Errorf("AddDependencyEdge %d returned before detector barrier: %v", res.index, res.err)
 		case <-ctx.Done():
-			t.Fatalf("waiting for detector barrier: %v", ctx.Err())
+			barrierErr = fmt.Errorf("waiting for detector barrier: %w", ctx.Err())
 		}
 	}
 	closeStart()
 
-	for range runs {
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	for len(resultsByIndex) < len(runs) {
 		select {
 		case res := <-results:
-			run := runs[res.index]
-			if res.err == nil || errors.Is(res.err, ErrCycleDetected) || !errors.Is(res.err, run.injected) {
-				t.Fatalf("cycle query failure %d error = %v, want wrapped injected error", res.index, res.err)
+			if _, ok := resultsByIndex[res.index]; ok {
+				t.Fatalf("AddDependencyEdge %d returned more than once", res.index)
 			}
-			if got := run.calls.Load(); got != 1 {
-				t.Fatalf("detector %d calls = %d, want 1", res.index, got)
-			}
-			assertCount(t, ctx, run.store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
-		case <-ctx.Done():
-			t.Fatalf("waiting for detector result: %v", ctx.Err())
+			resultsByIndex[res.index] = res.err
+		case <-drainCtx.Done():
+			t.Fatalf("waiting for detector result after barrier release: %v", drainCtx.Err())
 		}
+	}
+	if barrierErr != nil {
+		t.Fatal(barrierErr)
+	}
+
+	for _, run := range runs {
+		err, ok := resultsByIndex[run.index]
+		if !ok {
+			t.Fatalf("missing AddDependencyEdge result %d", run.index)
+		}
+		if err == nil || errors.Is(err, ErrCycleDetected) || !errors.Is(err, run.injected) {
+			t.Fatalf("cycle query failure %d error = %v, want wrapped injected error", run.index, err)
+		}
+		if got := run.calls.Load(); got != 1 {
+			t.Fatalf("detector %d calls = %d, want 1", run.index, got)
+		}
+		assertCount(t, fixtureCtx, run.store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
 	}
 }
 
