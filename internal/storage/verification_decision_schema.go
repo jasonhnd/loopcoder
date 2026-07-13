@@ -46,4 +46,22 @@ var verificationDecisionSchemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_verification_decisions_run ON verification_decisions(project_id, delivery_run_id, task_id, created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_verification_decisions_worker ON verification_decisions(worker_routing_decision_id, decision_status)`,
 	`CREATE INDEX IF NOT EXISTS idx_verification_decisions_status ON verification_decisions(decision_status, terminal_error_code)`,
+	`CREATE TABLE IF NOT EXISTS verification_decision_members (
+		verification_decision_id TEXT NOT NULL REFERENCES verification_decisions(verification_decision_id) ON DELETE CASCADE,
+		member_ordinal INTEGER NOT NULL,
+		member_id TEXT NOT NULL DEFAULT '',
+		routing_decision_id TEXT NOT NULL REFERENCES routing_decisions(routing_decision_id) ON DELETE RESTRICT,
+		routing_candidate_id TEXT NOT NULL,
+		routing_fingerprint TEXT NOT NULL,
+		candidate_fingerprint TEXT NOT NULL,
+		actual_independence TEXT NOT NULL,
+		payload_json TEXT NOT NULL,
+		PRIMARY KEY(verification_decision_id, member_ordinal),
+		UNIQUE(verification_decision_id, routing_decision_id),
+		UNIQUE(verification_decision_id, routing_candidate_id),
+		UNIQUE(verification_decision_id, routing_fingerprint),
+		CHECK(member_ordinal >= 0),
+		CHECK(json_valid(payload_json))
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_verification_decision_members_route ON verification_decision_members(routing_decision_id)`,
 }

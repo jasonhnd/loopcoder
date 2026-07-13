@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -32,7 +33,10 @@ const (
 	FinalAuthorityHuman             = "human"
 )
 
-const maxCouncilDurationMS = int64(1<<63-1) / int64(time.Millisecond)
+const (
+	maxCouncilDurationMS = int64(1<<63-1) / int64(time.Millisecond)
+	maxAuthorityKeyBytes = 128
+)
 
 type EvidenceRef struct {
 	RecordKind string `json:"record_kind"`
@@ -78,6 +82,15 @@ type CouncilState struct {
 	TerminalErrorCode taskrequirements.ErrorCode `json:"terminal_error_code,omitempty"`
 }
 
+type CouncilMemberAuthority struct {
+	MemberID             string                             `json:"member_id,omitempty"`
+	RoutingDecisionID    string                             `json:"routing_decision_id"`
+	RoutingCandidateID   string                             `json:"routing_candidate_id"`
+	RoutingFingerprint   string                             `json:"routing_fingerprint"`
+	CandidateFingerprint string                             `json:"candidate_fingerprint"`
+	ActualIndependence   taskrequirements.IndependenceLevel `json:"actual_independence"`
+}
+
 type VerificationDecision struct {
 	SchemaVersion             string                             `json:"schema_version"`
 	RecordVersion             int                                `json:"record_version"`
@@ -101,6 +114,7 @@ type VerificationDecision struct {
 	Disagreements             []string                           `json:"disagreements"`
 	EvidenceRefs              []EvidenceRef                      `json:"evidence_refs"`
 	Council                   CouncilState                       `json:"council"`
+	CouncilMemberAuthorities  []CouncilMemberAuthority           `json:"council_member_authorities,omitempty"`
 	Timeout                   bool                               `json:"timeout"`
 	FinalAuthority            string                             `json:"final_authority"`
 	FinalAuthorityFingerprint string                             `json:"final_authority_fingerprint"`
@@ -115,26 +129,33 @@ type VerificationDecision struct {
 }
 
 type VerificationDecisionInput struct {
-	WorkerRoutingDecisionID   string
-	VerifierRoutingDecisionID string
-	DecisionKey               string
-	IdempotencyKey            string
-	VerifierVerdicts          []VerifierVerdict
-	CouncilLimits             CouncilLimits
-	CouncilRoundsUsed         int
-	CouncilBudgetTokensUsed   int64
-	Timeout                   bool
-	AuthorityFingerprint      string
-	DecidedBy                 delivery.Actor
-	Host                      delivery.Host
+	WorkerRoutingDecisionID         string
+	VerifierRoutingDecisionID       string
+	CouncilMemberRoutingDecisionIDs []string
+	DecisionKey                     string
+	IdempotencyKey                  string
+	VerifierVerdicts                []VerifierVerdict
+	CouncilLimits                   CouncilLimits
+	CouncilRoundsUsed               int
+	CouncilBudgetTokensUsed         int64
+	Timeout                         bool
+	AuthorityFingerprint            string
+	DecidedBy                       delivery.Actor
+	Host                            delivery.Host
 }
 
 func DecideAndPersistVerification(ctx context.Context, store storage.Store, input VerificationDecisionInput) (VerificationDecision, error) {
 	if store == nil {
 		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
 	}
-	if strings.TrimSpace(input.WorkerRoutingDecisionID) == "" || strings.TrimSpace(input.DecisionKey) == "" {
+	if strings.TrimSpace(input.WorkerRoutingDecisionID) == "" {
 		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "worker route and decision key are required"}
+	}
+	if err := validateAuthorityKey("decision key", input.DecisionKey, true); err != nil {
+		return VerificationDecision{}, err
+	}
+	if err := validateAuthorityKey("idempotency key", input.IdempotencyKey, false); err != nil {
+		return VerificationDecision{}, err
 	}
 	if err := validateSchedulerActor(input.DecidedBy); err != nil {
 		return VerificationDecision{}, err
@@ -167,20 +188,24 @@ func DecideAndPersistVerification(ctx context.Context, store storage.Store, inpu
 		if !ok {
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "worker route has no selected candidate to verify"}
 		}
-		input.IdempotencyKey = verificationIdempotencyKey(input, workerRoute, verifierRoute)
-		if existing, ok, err := loadVerificationByIdempotency(ctx, tx, workerRoute.DeliveryRunID, workerRoute.TaskID, input.DecisionKey, input.IdempotencyKey); err != nil || ok {
+		required := RequiredVerifierIndependence(req, profile)
+		memberAuthorities, authorityDisagreements, authorityTerminal, err := resolveCouncilMemberAuthoritiesTx(ctx, tx, input, workerRoute, workerCandidate, verifierRoute, verifierCandidate, verifierReq, required)
+		if err != nil {
+			return err
+		}
+		decision, err := buildVerificationDecision(workerRoute, verifierRoute, req, verifierReq, profile, workerCandidate, verifierCandidate, exclusions, memberAuthorities, authorityDisagreements, authorityTerminal, input, store.Now())
+		if err != nil {
+			return err
+		}
+		if existing, ok, err := loadVerificationByIdempotency(ctx, tx, workerRoute.DeliveryRunID, workerRoute.TaskID, decision.DecisionKey, decision.IdempotencyKey); err != nil || ok {
 			if err != nil {
 				return err
 			}
-			if existing.VerificationFingerprint != verificationRequestFingerprint(input, workerRoute, verifierRoute) {
+			if existing.VerificationFingerprint != decision.VerificationFingerprint {
 				return &delivery.TypedError{Code: delivery.ErrDuplicateReplayCode, Message: "verification idempotency key replayed with different request"}
 			}
 			stored = existing
 			return nil
-		}
-		decision, err := buildVerificationDecision(workerRoute, verifierRoute, req, verifierReq, profile, workerCandidate, verifierCandidate, exclusions, input, store.Now())
-		if err != nil {
-			return err
 		}
 		if existing, ok, err := loadVerificationByAuthority(ctx, tx, decision.DeliveryRunID, decision.TaskID, decision.DecisionKey, decision.FinalAuthorityFingerprint); err != nil || ok {
 			if err != nil {
@@ -226,15 +251,16 @@ func RequiredVerifierIndependence(req taskrequirements.TaskRequirement, profile 
 	return required
 }
 
-func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, verifierReq taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {
+func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, verifierReq taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, memberAuthorities []CouncilMemberAuthority, authorityDisagreements []string, authorityTerminal taskrequirements.ErrorCode, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {
 	required := RequiredVerifierIndependence(req, profile)
 	actual := actualIndependence(worker, verifier)
 	verdicts := sanitizeVerifierVerdicts(input.VerifierVerdicts)
-	verdictValidation := validateBoundVerifierVerdicts(input.VerifierVerdicts, verifierRoute, verifier, input.CouncilLimits.Enabled)
+	verdictValidation := validateBoundVerifierVerdicts(input.VerifierVerdicts, verifierRoute, verifier, memberAuthorities, input.CouncilLimits.Enabled)
 	council := aggregateCouncil(input.CouncilLimits, input.CouncilRoundsUsed, input.CouncilBudgetTokensUsed, input.Timeout, verdictValidation.memberCount, verdicts, now)
 	evidence := evidenceRefs(verdicts)
 	disagreements := councilDisagreements(verdicts, council)
 	disagreements = append(disagreements, verdictValidation.disagreements...)
+	disagreements = append(disagreements, authorityDisagreements...)
 	status := VerificationStatusAccepted
 	verdict := VerificationVerdictPass
 	authority := FinalAuthorityAutomatedVerifier
@@ -260,6 +286,8 @@ func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, 
 	} else if !independentEnough(worker, verifier, required) {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrVerifierIndependenceRequiredCode
 		disagreements = append(disagreements, "verifier route is not independent enough from worker route")
+	} else if authorityTerminal != "" {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, authorityTerminal
 	} else if verdictValidation.terminal != "" {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, verdictValidation.terminal
 	} else if council.TerminalErrorCode != "" {
@@ -282,7 +310,11 @@ func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, 
 	if !validFingerprint(authorityFP) {
 		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "verification authority fingerprint must be a sha256 digest"}
 	}
-	fp := verificationRequestFingerprint(input, workerRoute, verifierRoute)
+	input.IdempotencyKey = verificationIdempotencyKey(input, workerRoute, verifierRoute, memberAuthorities)
+	if err := validateAuthorityKey("idempotency key", input.IdempotencyKey, true); err != nil {
+		return VerificationDecision{}, err
+	}
+	fp := verificationRequestFingerprint(input, workerRoute, verifierRoute, memberAuthorities)
 	createdAt := delivery.CanonicalTimestamp(now)
 	decision := VerificationDecision{
 		SchemaVersion:             VerificationDecisionSchema,
@@ -306,6 +338,7 @@ func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, 
 		Disagreements:             nonNilStrings(dedupeStrings(disagreements)),
 		EvidenceRefs:              evidence,
 		Council:                   council,
+		CouncilMemberAuthorities:  memberAuthorities,
 		Timeout:                   input.Timeout || council.TimedOut,
 		FinalAuthority:            authority,
 		FinalAuthorityFingerprint: authorityFP,
@@ -331,10 +364,10 @@ type verdictValidationResult struct {
 	disagreements []string
 }
 
-func validateBoundVerifierVerdicts(verdicts []VerifierVerdict, verifierRoute RoutingDecision, verifier Candidate, councilEnabled bool) verdictValidationResult {
+func validateBoundVerifierVerdicts(verdicts []VerifierVerdict, verifierRoute RoutingDecision, verifier Candidate, authorities []CouncilMemberAuthority, councilEnabled bool) verdictValidationResult {
 	result := verdictValidationResult{}
 	if councilEnabled {
-		result.memberCount = uniqueMemberCount(verdicts)
+		result.memberCount = len(authorities)
 	} else {
 		result.memberCount = len(verdicts)
 	}
@@ -346,25 +379,40 @@ func validateBoundVerifierVerdicts(verdicts []VerifierVerdict, verifierRoute Rou
 		result.disagreements = append(result.disagreements, "non-council verification requires exactly one verifier verdict")
 		return result
 	}
-	seenMembers := map[string]struct{}{}
+	if councilEnabled && len(verdicts) != len(authorities) {
+		result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		result.disagreements = append(result.disagreements, "council verifier verdicts do not match explicit member authorities")
+	}
+	authorityByFingerprint := map[string]CouncilMemberAuthority{}
+	for _, authority := range authorities {
+		authorityByFingerprint[authority.RoutingFingerprint] = authority
+	}
+	seenAuthorities := map[string]struct{}{}
 	for _, verdict := range verdicts {
 		memberID := strings.TrimSpace(verdict.MemberID)
-		switch {
-		case !validVerifierIdentity(memberID):
+		if memberID != "" && !validVerifierIdentity(memberID) {
 			result.disagreements = append(result.disagreements, "verifier member identity is missing or invalid")
 			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
-		case councilEnabled:
-			if _, ok := seenMembers[memberID]; ok {
-				result.disagreements = append(result.disagreements, "duplicate verifier member identity")
-				result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
-			}
-			seenMembers[memberID] = struct{}{}
 		}
-		if strings.TrimSpace(verdict.RoutingCandidateID) != verifierRoute.ChosenCandidateID || strings.TrimSpace(verdict.RoutingCandidateID) != verifier.RoutingCandidateID {
+		verdictCandidateID := strings.TrimSpace(verdict.RoutingCandidateID)
+		verdictFingerprint := strings.TrimSpace(verdict.AuthorityFingerprint)
+		if councilEnabled {
+			authority, ok := authorityByFingerprint[verdictFingerprint]
+			if !ok || authority.RoutingCandidateID != verdictCandidateID {
+				result.disagreements = append(result.disagreements, "verifier verdict is not bound to an explicit council member authority")
+				result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+			} else {
+				if _, duplicate := seenAuthorities[verdictFingerprint]; duplicate {
+					result.disagreements = append(result.disagreements, "duplicate verifier verdict authority")
+					result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+				}
+				seenAuthorities[verdictFingerprint] = struct{}{}
+			}
+		} else if verdictCandidateID != verifierRoute.ChosenCandidateID || verdictCandidateID != verifier.RoutingCandidateID {
 			result.disagreements = append(result.disagreements, "verifier verdict is not bound to selected verifier candidate")
 			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
 		}
-		if strings.TrimSpace(verdict.AuthorityFingerprint) != verifierRoute.RoutingFingerprint || !validFingerprint(strings.TrimSpace(verdict.AuthorityFingerprint)) {
+		if !validFingerprint(verdictFingerprint) || (!councilEnabled && verdictFingerprint != verifierRoute.RoutingFingerprint) {
 			result.disagreements = append(result.disagreements, "verifier verdict authority fingerprint does not match selected verifier route")
 			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
 		}
@@ -383,19 +431,109 @@ func validateBoundVerifierVerdicts(verdicts []VerifierVerdict, verifierRoute Rou
 			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
 		}
 	}
+	if councilEnabled && len(seenAuthorities) != len(authorities) {
+		result.disagreements = append(result.disagreements, "council member authority is missing a verifier verdict")
+		result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+	}
 	return result
 }
 
-func uniqueMemberCount(verdicts []VerifierVerdict) int {
-	seen := map[string]struct{}{}
-	for _, verdict := range verdicts {
-		memberID := strings.TrimSpace(verdict.MemberID)
-		if memberID == "" {
+func resolveCouncilMemberAuthoritiesTx(ctx context.Context, tx storage.Tx, input VerificationDecisionInput, workerRoute RoutingDecision, worker Candidate, verifierRoute RoutingDecision, verifier Candidate, verifierReq taskrequirements.TaskRequirement, required taskrequirements.IndependenceLevel) ([]CouncilMemberAuthority, []string, taskrequirements.ErrorCode, error) {
+	ids := explicitCouncilMemberRouteIDs(input, verifierRoute)
+	if len(ids) == 0 {
+		return nil, nil, "", nil
+	}
+	authorities := make([]CouncilMemberAuthority, 0, len(ids))
+	disagreements := []string{}
+	terminal := taskrequirements.ErrorCode("")
+	seenRoute, seenCandidate, seenFingerprint := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
+	for _, id := range ids {
+		route, candidate, req, _, err := resolveVerifierRouteTx(ctx, tx, id)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if route.ProjectID != workerRoute.ProjectID || route.DeliveryRunID != workerRoute.DeliveryRunID {
+			return nil, nil, "", &taskrequirements.TypedError{Code: taskrequirements.ErrCrossProjectReferenceCode, Message: "council verifier route does not belong to worker delivery run"}
+		}
+		if route.PlanFingerprint != workerRoute.PlanFingerprint {
+			return nil, nil, "", &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "council verifier route does not match worker plan authority"}
+		}
+		duplicateRoute := false
+		if _, ok := seenRoute[route.RoutingDecisionID]; ok {
+			disagreements = append(disagreements, "duplicate council verifier route")
+			terminal = taskrequirements.ErrVerificationDecisionConflictCode
+			duplicateRoute = true
+		}
+		seenRoute[route.RoutingDecisionID] = struct{}{}
+		if _, ok := seenCandidate[candidate.RoutingCandidateID]; candidate.RoutingCandidateID != "" && ok {
+			disagreements = append(disagreements, "duplicate council verifier candidate")
+			terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		if candidate.RoutingCandidateID != "" {
+			seenCandidate[candidate.RoutingCandidateID] = struct{}{}
+		}
+		if _, ok := seenFingerprint[route.RoutingFingerprint]; route.RoutingFingerprint != "" && ok {
+			disagreements = append(disagreements, "duplicate council verifier authority fingerprint")
+			terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		if route.RoutingFingerprint != "" {
+			seenFingerprint[route.RoutingFingerprint] = struct{}{}
+		}
+		switch {
+		case route.DecisionStatus != DecisionStatusSelected || candidate.RoutingCandidateID == "":
+			disagreements = append(disagreements, "council verifier route has no selected candidate")
+			terminal = taskrequirements.ErrNoEligibleCandidateCode
+		case candidate.Permission != taskrequirements.PermissionReadOnly:
+			disagreements = append(disagreements, "council verifier route is not read-only")
+			terminal = taskrequirements.ErrCapabilityUnsupportedCode
+		case !verifierRouteAllowed(req, candidate):
+			disagreements = append(disagreements, "council verifier route is not a read-only verifier route with verification output")
+			terminal = taskrequirements.ErrCapabilityUnsupportedCode
+		case !independentEnough(worker, candidate, required):
+			disagreements = append(disagreements, "council verifier route is not independent enough from worker route")
+			terminal = taskrequirements.ErrVerifierIndependenceRequiredCode
+		}
+		if duplicateRoute || route.DecisionStatus != DecisionStatusSelected || candidate.RoutingCandidateID == "" {
 			continue
 		}
-		seen[memberID] = struct{}{}
+		authorities = append(authorities, CouncilMemberAuthority{
+			RoutingDecisionID:    route.RoutingDecisionID,
+			RoutingCandidateID:   candidate.RoutingCandidateID,
+			RoutingFingerprint:   route.RoutingFingerprint,
+			CandidateFingerprint: candidate.CandidateFingerprint,
+			ActualIndependence:   actualIndependence(worker, candidate),
+		})
 	}
-	return len(seen)
+	if !input.CouncilLimits.Enabled && len(authorities) > 1 {
+		disagreements = append(disagreements, "non-council verification cannot declare multiple member authorities")
+		terminal = taskrequirements.ErrVerificationDecisionConflictCode
+	}
+	if input.CouncilLimits.Enabled && len(authorities) == 0 {
+		disagreements = append(disagreements, "bounded council requires explicit verifier member authority")
+		terminal = taskrequirements.ErrVerificationDecisionConflictCode
+	}
+	sort.Slice(authorities, func(i, j int) bool {
+		if authorities[i].RoutingFingerprint != authorities[j].RoutingFingerprint {
+			return authorities[i].RoutingFingerprint < authorities[j].RoutingFingerprint
+		}
+		return authorities[i].RoutingDecisionID < authorities[j].RoutingDecisionID
+	})
+	return authorities, disagreements, terminal, nil
+}
+
+func explicitCouncilMemberRouteIDs(input VerificationDecisionInput, verifierRoute RoutingDecision) []string {
+	values := input.CouncilMemberRoutingDecisionIDs
+	if len(values) == 0 && verifierRoute.RoutingDecisionID != "" {
+		values = []string{verifierRoute.RoutingDecisionID}
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func validVerifierIdentity(value string) bool {
@@ -531,7 +669,10 @@ func insertVerificationDecisionTx(ctx context.Context, tx storage.Tx, decision V
 	}
 	affected, err := result.RowsAffected()
 	if err != nil || affected != 0 {
-		return err
+		if err != nil {
+			return err
+		}
+		return insertVerificationDecisionMembersTx(ctx, tx, decision)
 	}
 	var existing string
 	if err := tx.QueryRow(ctx, `SELECT payload_json FROM verification_decisions WHERE verification_decision_id = ?`, decision.VerificationDecisionID).Scan(&existing); err != nil {
@@ -539,6 +680,26 @@ func insertVerificationDecisionTx(ctx context.Context, tx storage.Tx, decision V
 	}
 	if existing != string(payload) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrDuplicateRecordCode, Message: "verification decision id already exists with different payload"}
+	}
+	return nil
+}
+
+func insertVerificationDecisionMembersTx(ctx context.Context, tx storage.Tx, decision VerificationDecision) error {
+	for ordinal, member := range canonicalCouncilMemberAuthorities(decision.CouncilMemberAuthorities) {
+		payload, err := canonicalString(member)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO verification_decision_members(
+			verification_decision_id, member_ordinal, member_id, routing_decision_id, routing_candidate_id,
+			routing_fingerprint, candidate_fingerprint, actual_independence, payload_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(verification_decision_id, member_ordinal) DO NOTHING`,
+			decision.VerificationDecisionID, ordinal, member.MemberID, member.RoutingDecisionID, member.RoutingCandidateID,
+			member.RoutingFingerprint, member.CandidateFingerprint, string(member.ActualIndependence), payload)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -739,14 +900,29 @@ func sanitizeVerifierVerdicts(verdicts []VerifierVerdict) []VerifierVerdict {
 }
 
 func redactedVerificationDecision(decision VerificationDecision) VerificationDecision {
+	decision.VerificationDecisionID = sanitizeIdentifier(decision.VerificationDecisionID)
+	decision.ProjectID = sanitizeIdentifier(decision.ProjectID)
+	decision.DeliveryRunID = sanitizeIdentifier(decision.DeliveryRunID)
+	decision.TaskID = sanitizeIdentifier(decision.TaskID)
+	decision.TaskRequirementID = sanitizeIdentifier(decision.TaskRequirementID)
+	decision.DecisionKey = sanitizeIdentifier(decision.DecisionKey)
+	decision.IdempotencyKey = sanitizeIdentifier(decision.IdempotencyKey)
 	decision.DecidedBy.ActorID = sanitizeIdentifier(decision.DecidedBy.ActorID)
 	decision.DecidedBy.Display = sanitizeText(decision.DecidedBy.Display, 80)
 	decision.Host.HostID = sanitizeIdentifier(decision.Host.HostID)
+	decision.Host.SessionID = sanitizeIdentifier(decision.Host.SessionID)
 	decision.WorkerCandidateID = sanitizeIdentifier(decision.WorkerCandidateID)
 	decision.VerifierCandidateID = sanitizeIdentifier(decision.VerifierCandidateID)
 	decision.WorkerRoutingDecisionID = sanitizeIdentifier(decision.WorkerRoutingDecisionID)
 	decision.VerifierRoutingDecisionID = sanitizeIdentifier(decision.VerifierRoutingDecisionID)
 	decision.VerifierVerdicts = sanitizeVerifierVerdicts(decision.VerifierVerdicts)
+	for i := range decision.CouncilMemberAuthorities {
+		decision.CouncilMemberAuthorities[i].MemberID = sanitizeIdentifier(decision.CouncilMemberAuthorities[i].MemberID)
+		decision.CouncilMemberAuthorities[i].RoutingDecisionID = sanitizeIdentifier(decision.CouncilMemberAuthorities[i].RoutingDecisionID)
+		decision.CouncilMemberAuthorities[i].RoutingCandidateID = sanitizeIdentifier(decision.CouncilMemberAuthorities[i].RoutingCandidateID)
+		decision.CouncilMemberAuthorities[i].RoutingFingerprint = sanitizeIdentifier(decision.CouncilMemberAuthorities[i].RoutingFingerprint)
+		decision.CouncilMemberAuthorities[i].CandidateFingerprint = sanitizeIdentifier(decision.CouncilMemberAuthorities[i].CandidateFingerprint)
+	}
 	for i := range decision.Disagreements {
 		decision.Disagreements[i] = sanitizeText(decision.Disagreements[i], 160)
 	}
@@ -761,10 +937,38 @@ func redactedVerificationDecision(decision VerificationDecision) VerificationDec
 
 var secretLikePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`(?i)(github_pat|gh[pousr]_|sk-[a-z0-9_-]{12,}|xox[baprs]-)`),
 	regexp.MustCompile(`(?i)(token|secret|password|api[_-]?key)=\S+`),
 	regexp.MustCompile(`(?i)bearer\s+[a-z0-9._~+/=-]{12,}`),
 	regexp.MustCompile(`[A-Za-z]:\\[^\s"']{8,}`),
 	regexp.MustCompile(`/[A-Za-z0-9._@%+=:,/-]{12,}`),
+}
+
+func validateAuthorityKey(label, value string, required bool) error {
+	if value == "" && !required {
+		return nil
+	}
+	if value == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: label + " is required"}
+	}
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value || len(value) > maxAuthorityKeyBytes {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: label + " has invalid authority-key syntax"}
+	}
+	for _, pattern := range secretLikePatterns {
+		if pattern.MatchString(value) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: label + " has invalid authority-key syntax"}
+		}
+	}
+	for i, r := range value {
+		if i == 0 && !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: label + " has invalid authority-key syntax"}
+		}
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: label + " has invalid authority-key syntax"}
+	}
+	return nil
 }
 
 func sanitizeText(value string, max int) string {
@@ -811,16 +1015,17 @@ func dedupeEvidenceRefs(values []EvidenceRef) []EvidenceRef {
 	return out
 }
 
-func verificationRequestFingerprint(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision) string {
+func verificationRequestFingerprint(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision, memberAuthorities []CouncilMemberAuthority) string {
 	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
 		"schema_version":               "loopcoder.verification_request.v1",
 		"worker_routing_decision_id":   workerRoute.RoutingDecisionID,
 		"worker_routing_fingerprint":   workerRoute.RoutingFingerprint,
 		"verifier_routing_decision_id": verifierRoute.RoutingDecisionID,
 		"verifier_routing_fingerprint": verifierRoute.RoutingFingerprint,
-		"decision_key":                 strings.TrimSpace(input.DecisionKey),
+		"decision_key":                 input.DecisionKey,
 		"authority_fingerprint":        strings.TrimSpace(input.AuthorityFingerprint),
-		"verifier_verdicts":            sanitizeVerifierVerdicts(input.VerifierVerdicts),
+		"verifier_verdicts":            canonicalVerifierVerdicts(input.VerifierVerdicts),
+		"council_member_authorities":   canonicalCouncilMemberAuthorities(memberAuthorities),
 		"council_limits":               input.CouncilLimits,
 		"council_rounds_used":          input.CouncilRoundsUsed,
 		"council_budget_tokens_used":   input.CouncilBudgetTokensUsed,
@@ -832,12 +1037,62 @@ func verificationRequestFingerprint(input VerificationDecisionInput, workerRoute
 	return digest
 }
 
-func verificationIdempotencyKey(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision) string {
-	key := strings.TrimSpace(input.IdempotencyKey)
+func verificationIdempotencyKey(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision, memberAuthorities []CouncilMemberAuthority) string {
+	key := input.IdempotencyKey
 	if key != "" {
 		return key
 	}
-	return "verification-event:" + verificationRequestFingerprint(input, workerRoute, verifierRoute)
+	return "verification-event:" + verificationRequestFingerprint(input, workerRoute, verifierRoute, memberAuthorities)
+}
+
+func canonicalVerifierVerdicts(verdicts []VerifierVerdict) []VerifierVerdict {
+	out := make([]VerifierVerdict, 0, len(verdicts))
+	for _, verdict := range verdicts {
+		verdict.MemberID = strings.ToValidUTF8(strings.TrimSpace(verdict.MemberID), "")
+		verdict.RoutingCandidateID = strings.ToValidUTF8(strings.TrimSpace(verdict.RoutingCandidateID), "")
+		verdict.Verdict = strings.ToValidUTF8(strings.TrimSpace(verdict.Verdict), "")
+		verdict.Message = strings.ToValidUTF8(strings.TrimSpace(verdict.Message), "")
+		verdict.Authority = strings.ToValidUTF8(strings.TrimSpace(verdict.Authority), "")
+		verdict.AuthorityFingerprint = strings.ToValidUTF8(strings.TrimSpace(verdict.AuthorityFingerprint), "")
+		verdict.VerificationStartedAt = strings.ToValidUTF8(strings.TrimSpace(verdict.VerificationStartedAt), "")
+		verdict.VerificationEndedAt = strings.ToValidUTF8(strings.TrimSpace(verdict.VerificationEndedAt), "")
+		for i := range verdict.EvidenceRefs {
+			verdict.EvidenceRefs[i].RecordKind = strings.ToValidUTF8(strings.TrimSpace(verdict.EvidenceRefs[i].RecordKind), "")
+			verdict.EvidenceRefs[i].RecordID = strings.ToValidUTF8(strings.TrimSpace(verdict.EvidenceRefs[i].RecordID), "")
+			verdict.EvidenceRefs[i].Summary = strings.ToValidUTF8(strings.TrimSpace(verdict.EvidenceRefs[i].Summary), "")
+		}
+		sort.Slice(verdict.EvidenceRefs, func(i, j int) bool {
+			if verdict.EvidenceRefs[i].RecordKind != verdict.EvidenceRefs[j].RecordKind {
+				return verdict.EvidenceRefs[i].RecordKind < verdict.EvidenceRefs[j].RecordKind
+			}
+			if verdict.EvidenceRefs[i].RecordID != verdict.EvidenceRefs[j].RecordID {
+				return verdict.EvidenceRefs[i].RecordID < verdict.EvidenceRefs[j].RecordID
+			}
+			return verdict.EvidenceRefs[i].Summary < verdict.EvidenceRefs[j].Summary
+		})
+		out = append(out, verdict)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AuthorityFingerprint != out[j].AuthorityFingerprint {
+			return out[i].AuthorityFingerprint < out[j].AuthorityFingerprint
+		}
+		if out[i].RoutingCandidateID != out[j].RoutingCandidateID {
+			return out[i].RoutingCandidateID < out[j].RoutingCandidateID
+		}
+		return out[i].MemberID < out[j].MemberID
+	})
+	return out
+}
+
+func canonicalCouncilMemberAuthorities(authorities []CouncilMemberAuthority) []CouncilMemberAuthority {
+	out := append([]CouncilMemberAuthority(nil), authorities...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RoutingFingerprint != out[j].RoutingFingerprint {
+			return out[i].RoutingFingerprint < out[j].RoutingFingerprint
+		}
+		return out[i].RoutingDecisionID < out[j].RoutingDecisionID
+	})
+	return out
 }
 
 func verificationDecisionID(projectID, deliveryRunID, taskID, decisionKey, authorityFingerprint, verificationFingerprint string) string {
@@ -893,6 +1148,17 @@ func validateVerificationDecision(decision VerificationDecision) error {
 	}
 	if !validFingerprint(decision.FinalAuthorityFingerprint) || !validFingerprint(decision.VerificationFingerprint) || !validFingerprint(decision.PolicyFingerprint) || !validFingerprint(decision.PlanFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "verification decision fingerprints must be sha256 digests"}
+	}
+	if decision.Council.Enabled && len(decision.CouncilMemberAuthorities) != decision.Council.MemberCount {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "council member authority count must match council member count"}
+	}
+	for _, authority := range decision.CouncilMemberAuthorities {
+		if authority.RoutingDecisionID == "" || authority.RoutingCandidateID == "" || authority.RoutingFingerprint == "" || authority.CandidateFingerprint == "" || authority.ActualIndependence == "" {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "council member authority has missing required fields"}
+		}
+		if !validFingerprint(authority.RoutingFingerprint) || !validFingerprint(authority.CandidateFingerprint) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "council member authority fingerprints must be sha256 digests"}
+		}
 	}
 	switch decision.DecisionStatus {
 	case VerificationStatusAccepted:
