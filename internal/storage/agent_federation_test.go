@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -68,10 +70,10 @@ func TestAgentRegistrationReplayEventsAndTree(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("load events: %v", err)
 	}
-	if len(events) != 3 {
-		t.Fatalf("event count = %d, want register+launch+heartbeat", len(events))
+	if len(events) != 4 {
+		t.Fatalf("event count = %d, want register+refusal+launch+heartbeat", len(events))
 	}
-	if events[0].previous != "" || events[1].previous != events[0].hash || events[2].previous != events[1].hash {
+	if events[0].previous != "" || events[1].previous != events[0].hash || events[2].previous != events[1].hash || events[3].previous != events[2].hash {
 		t.Fatalf("event chain = %#v", events)
 	}
 	for _, event := range events {
@@ -365,6 +367,126 @@ func TestValidateNativeChildLaunchRequiresLiveOwnershipLocks(t *testing.T) {
 	})
 }
 
+func TestValidateNativeChildLaunchRejectsStaleParentAuthority(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	if _, err := RegisterAgent(ctx, store, req); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE delivery_runs SET policy_fingerprint = ? WHERE delivery_run_id = ?`, "sha256:policy-new", req.DeliveryRunID)
+		return err
+	}); err != nil {
+		t.Fatalf("mutate parent authority: %v", err)
+	}
+	if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration); !errors.Is(err, ErrAgentFingerprintMismatch) {
+		t.Fatalf("ValidateNativeChildLaunch error = %v, want ErrAgentFingerprintMismatch", err)
+	}
+}
+
+func TestRegisterAgentRejectsPhysicalScopeEscapeAndLeavesOnlyRefusalEvidence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
+	}
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "escape.go"), []byte("package outside\n"), 0o644); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "linked")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	scope := federationAuthorityScope("project-a")
+	scope.ReadScope = []string{"linked/escape.go"}
+	scope.WriteScope = []string{"linked/escape.go"}
+	scope.PathScope = []string{"linked/escape.go"}
+	if err := updateFederationProjectAndAuthorityScope(ctx, store, "project-a", repo, scope); err != nil {
+		t.Fatalf("update authority scope: %v", err)
+	}
+	req := federationRequest(claim)
+	req.Scope = scope
+	req.ParentScope = &scope
+	req.OwnershipLocks[0].ResourceKey = "linked/escape.go"
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrScopeWidening) {
+		t.Fatalf("RegisterAgent error = %v, want ErrScopeWidening", err)
+	}
+	assertNoCommittedAgentAuthority(t, ctx, store)
+	assertRefusalEvidence(t, ctx, store, ErrScopeWideningCode, "scope")
+}
+
+func TestRegisterAgentRejectsAlternateRepositoryScope(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	scope := federationAuthorityScope("project-a")
+	scope.RepositoryScope = []string{"project-b"}
+	if err := updateFederationProjectAndAuthorityScope(ctx, store, "project-a", t.TempDir(), scope); err != nil {
+		t.Fatalf("update authority scope: %v", err)
+	}
+	req := federationRequest(claim)
+	req.Scope = scope
+	req.ParentScope = &scope
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrCrossProjectReference) {
+		t.Fatalf("RegisterAgent error = %v, want ErrCrossProjectReference", err)
+	}
+	assertNoCommittedAgentAuthority(t, ctx, store)
+	assertRefusalEvidence(t, ctx, store, ErrCrossProjectReferenceCode, "project")
+}
+
+func TestRegisterAgentRejectsDriveQualifiedScopeEscape(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.Scope.ReadScope = []string{"C:/outside.go"}
+	req.Scope.WriteScope = []string{"C:/outside.go"}
+	req.Scope.PathScope = []string{"C:/outside.go"}
+	req.ParentScope = &req.Scope
+	req.OwnershipLocks[0].ResourceKey = "C:/outside.go"
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("RegisterAgent error = %v, want ErrInvalidRecord", err)
+	}
+	assertNoCommittedAgentAuthority(t, ctx, store)
+	assertRefusalEvidence(t, ctx, store, ErrInvalidRecordCode, "record")
+}
+
 func TestTransitionAgentRegistrationReleasesHeldLocksAndAllowsNewWriter(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
@@ -414,6 +536,12 @@ func TestScopeInheritanceAndCrossProjectFailClosed(t *testing.T) {
 		t.Fatalf("permission widening error = %v, want ErrScopeWidening", err)
 	}
 	child.Permission = PermissionWrite
+	child.SideEffectClass = SideEffectExternalWrite
+	parent.SideEffectClass = SideEffectRepoWrite
+	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrScopeWidening) {
+		t.Fatalf("side-effect widening error = %v, want ErrScopeWidening", err)
+	}
+	child.SideEffectClass = SideEffectRepoWrite
 	child.CredentialScope = []string{"ENV_TOKEN"}
 	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrCredentialScopeDenied) {
 		t.Fatalf("credential scope error = %v, want ErrCredentialScopeDenied", err)
@@ -595,6 +723,65 @@ func seedFederationAuthorityTx(ctx context.Context, tx Tx, projectID, rootRunID,
 		return err
 	}
 	return nil
+}
+
+func updateFederationProjectAndAuthorityScope(ctx context.Context, store Store, projectID, repoPath string, scope AgentScopeGrant) error {
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return err
+	}
+	return store.WithWriteTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE projects SET local_path = ?, local_path_canonical = ?, git_root = ? WHERE id = ?`,
+			repoPath, repoPath, repoPath, projectID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE delivery_tasks SET scope_json = ? WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+			string(scopeJSON), projectID, "drun-a", "task-a"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE task_requirements SET scope_json = ? WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+			string(scopeJSON), projectID, "drun-a", "task-a")
+		return err
+	})
+}
+
+func assertNoCommittedAgentAuthority(t *testing.T, ctx context.Context, store Store) {
+	t.Helper()
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		for _, table := range []string{"agent_registrations", "agent_scope_grants", "agent_budget_bindings", "agent_ownership_locks"} {
+			var count int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
+				return err
+			}
+			if count != 0 {
+				t.Fatalf("%s rows = %d, want 0", table, count)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("assert no committed authority: %v", err)
+	}
+}
+
+func assertRefusalEvidence(t *testing.T, ctx context.Context, store Store, code FederationErrorCode, boundary string) {
+	t.Helper()
+	var payload string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM agent_events WHERE event_kind = ? ORDER BY created_at DESC, id DESC LIMIT 1`, "registration.refused").Scan(&payload)
+	}); err != nil {
+		t.Fatalf("load refusal event: %v", err)
+	}
+	var event struct {
+		TerminalErrorCode FederationErrorCode `json:"terminal_error_code"`
+		Boundary          string              `json:"boundary"`
+		Message           string              `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatalf("unmarshal refusal event: %v", err)
+	}
+	if event.TerminalErrorCode != code || event.Boundary != boundary || strings.TrimSpace(event.Message) == "" {
+		t.Fatalf("refusal event = %#v, want code %s boundary %s with message", event, code, boundary)
+	}
 }
 
 func federationRequest(claim federationClaim) AgentRegistrationRequest {

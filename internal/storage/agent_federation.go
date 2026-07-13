@@ -10,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 )
 
 const (
@@ -527,6 +530,7 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 	}
 	req = normalizeRegistrationRequest(req)
 	if err := validateRegistrationRequest(req); err != nil {
+		persistAgentAuthorityRefusal(ctx, store, req, err)
 		return AgentRegistration{}, err
 	}
 	var record AgentRegistration
@@ -537,6 +541,9 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 			return err
 		})
 	})
+	if err != nil {
+		persistAgentAuthorityRefusal(ctx, store, req, err)
+	}
 	return record, err
 }
 
@@ -587,6 +594,9 @@ func ClaimAndRegisterNativeChild(ctx context.Context, store Store, parentRunID, 
 			return nil
 		})
 	})
+	if err != nil {
+		persistAgentAuthorityRefusal(ctx, store, req, err)
+	}
 	return claim, registration, err
 }
 
@@ -736,6 +746,9 @@ func registerAgentTx(ctx context.Context, tx Tx, req AgentRegistrationRequest) (
 	if err := validateAcceptedAuthorityTx(ctx, tx, record, scope); err != nil {
 		return AgentRegistration{}, err
 	}
+	if err := validatePhysicalRepoScopeTx(ctx, tx, record, scope); err != nil {
+		return AgentRegistration{}, err
+	}
 	if err := ensureNoParentAgentCycle(ctx, tx, record.ChildAgentID, record.ParentAgentID, record.ProjectID); err != nil {
 		return AgentRegistration{}, err
 	}
@@ -846,6 +859,19 @@ func ValidateNativeChildLaunch(ctx context.Context, store Store, childRunID, exe
 		record = found
 		if record.RegistrationState != AgentStateRegistered {
 			return federationError(ErrAgentRegistrationRequiredCode, "registration %s is %s, want registered", record.ChildAgentID, record.RegistrationState)
+		}
+		scope, err := loadScopeGrantTx(ctx, tx, record)
+		if err != nil {
+			return err
+		}
+		if err := validateStoredAgentFingerprint(record, scope); err != nil {
+			return err
+		}
+		if err := validateAcceptedAuthorityTx(ctx, tx, record, scope); err != nil {
+			return err
+		}
+		if err := validatePhysicalRepoScopeTx(ctx, tx, record, scope); err != nil {
+			return err
 		}
 		if err := validateLiveBudgetReservationTx(ctx, tx, record, now); err != nil {
 			return err
@@ -971,6 +997,9 @@ func NormalizeChildOutput(raw string, status string, maxBytes int) (ChildOutputE
 func ValidateScopeInheritance(parent, child AgentScopeGrant) error {
 	if permissionRank(child.Permission) > permissionRank(parent.Permission) {
 		return federationError(ErrScopeWideningCode, "permission %s exceeds parent %s", child.Permission, parent.Permission)
+	}
+	if sideEffectRank(child.SideEffectClass) > sideEffectRank(parent.SideEffectClass) {
+		return federationError(ErrScopeWideningCode, "side_effect_class %s exceeds parent %s", child.SideEffectClass, parent.SideEffectClass)
 	}
 	for _, value := range child.CredentialScope {
 		if strings.TrimSpace(value) != "" && strings.TrimSpace(value) != "none" {
@@ -1268,6 +1297,88 @@ func validateAcceptedAuthorityTx(ctx context.Context, tx Tx, record AgentRegistr
 	return nil
 }
 
+func validatePhysicalRepoScopeTx(ctx context.Context, tx Tx, record AgentRegistration, scope AgentScopeGrant) error {
+	for _, repo := range scope.RepositoryScope {
+		repo = strings.TrimSpace(repo)
+		if repo == "" || repo == "." || repo == record.ProjectID {
+			continue
+		}
+		return federationError(ErrCrossProjectReferenceCode, "repository_scope %q is outside project %s", repo, record.ProjectID)
+	}
+	root, err := physicalProjectRootTx(ctx, tx, record.ProjectID)
+	if err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name  string
+		paths []string
+	}{
+		{name: "read_scope", paths: scope.ReadScope},
+		{name: "write_scope", paths: scope.WriteScope},
+		{name: "path_scope", paths: scope.PathScope},
+	} {
+		for _, rel := range item.paths {
+			rel = strings.TrimSpace(rel)
+			if rel == "" {
+				continue
+			}
+			if err := validateRepoRelativePhysicalPath(root, item.name, rel); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func physicalProjectRootTx(ctx context.Context, tx Tx, projectID string) (string, error) {
+	var canonical, localPath, gitRoot string
+	if err := tx.QueryRow(ctx, `SELECT local_path_canonical, local_path, git_root FROM projects WHERE id = ?`, projectID).Scan(&canonical, &localPath, &gitRoot); err != nil {
+		return "", federationError(ErrCrossProjectReferenceCode, "project %s is missing", projectID)
+	}
+	root := firstNonEmptyAgent(gitRoot, canonical, localPath)
+	if strings.TrimSpace(root) == "" {
+		return "", federationError(ErrScopeUnknownCode, "project %s has no physical root", projectID)
+	}
+	identity, err := pathid.Identity(root)
+	if err != nil {
+		return "", federationError(ErrScopeUnknownCode, "project %s physical root is ambiguous: %v", projectID, err)
+	}
+	return filepath.Clean(identity), nil
+}
+
+func validateRepoRelativePhysicalPath(root, dimension, rel string) error {
+	normalized, err := normalizeRepoResource(rel)
+	if err != nil {
+		return err
+	}
+	if normalized == "" {
+		return nil
+	}
+	target := filepath.Join(root, filepath.FromSlash(normalized))
+	identity, err := pathid.Identity(target)
+	if err != nil {
+		return federationError(ErrScopeUnknownCode, "%s %q physical path is ambiguous: %v", dimension, rel, err)
+	}
+	identity = filepath.Clean(identity)
+	if sameOrDescendantPath(root, identity) {
+		return nil
+	}
+	return federationError(ErrScopeWideningCode, "%s %q resolves outside project root", dimension, rel)
+}
+
+func sameOrDescendantPath(root, child string) bool {
+	root = filepath.Clean(root)
+	child = filepath.Clean(child)
+	if child == root {
+		return true
+	}
+	separator := string(filepath.Separator)
+	if strings.HasSuffix(root, separator) {
+		return strings.HasPrefix(child, root)
+	}
+	return strings.HasPrefix(child, root+separator)
+}
+
 func validateRegistrationClaimTx(ctx context.Context, tx Tx, record AgentRegistration, executorID string, claimGeneration int64) error {
 	executorID = strings.TrimSpace(executorID)
 	if executorID == "" || claimGeneration <= 0 {
@@ -1427,17 +1538,9 @@ func validateLiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegist
 }
 
 func loadGrantedWriteScopeTx(ctx context.Context, tx Tx, record AgentRegistration) ([]string, error) {
-	var scopeJSON string
-	if err := tx.QueryRow(ctx, `SELECT scope_json FROM agent_scope_grants
-		WHERE id = ? AND project_id = ? AND delivery_run_id = ? AND child_agent_id = ?`,
-		record.ScopeGrantID, record.ProjectID, record.DeliveryRunID, record.ChildAgentID).Scan(&scopeJSON); err != nil {
-		return nil, federationError(ErrAgentRegistrationRequiredCode, "scope grant %s is missing", record.ScopeGrantID)
-	}
-	var scope struct {
-		WriteScope []string `json:"write_scope"`
-	}
-	if err := json.Unmarshal([]byte(scopeJSON), &scope); err != nil {
-		return nil, federationError(ErrInvalidRecordCode, "scope grant %s has invalid JSON", record.ScopeGrantID)
+	scope, err := loadScopeGrantTx(ctx, tx, record)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]string, 0, len(scope.WriteScope))
 	for _, value := range normalizeScopeList(scope.WriteScope, true) {
@@ -1446,6 +1549,81 @@ func loadGrantedWriteScopeTx(ctx context.Context, tx Tx, record AgentRegistratio
 		}
 	}
 	return out, nil
+}
+
+func loadScopeGrantTx(ctx context.Context, tx Tx, record AgentRegistration) (AgentScopeGrant, error) {
+	var scopeJSON, permission, sideEffectClass, policyFingerprint, planFingerprint, authorizationFingerprint, federationFingerprint string
+	if err := tx.QueryRow(ctx, `SELECT scope_json, permission, side_effect_class, policy_fingerprint, plan_fingerprint, authorization_fingerprint, agent_federation_fingerprint
+		FROM agent_scope_grants
+		WHERE id = ? AND project_id = ? AND delivery_run_id = ? AND child_agent_id = ?`,
+		record.ScopeGrantID, record.ProjectID, record.DeliveryRunID, record.ChildAgentID).Scan(&scopeJSON, &permission, &sideEffectClass, &policyFingerprint, &planFingerprint, &authorizationFingerprint, &federationFingerprint); err != nil {
+		return AgentScopeGrant{}, federationError(ErrAgentRegistrationRequiredCode, "scope grant %s is missing", record.ScopeGrantID)
+	}
+	scope, err := acceptedScopeGrantFromJSON(scopeJSON, permission, sideEffectClass, policyFingerprint, planFingerprint, authorizationFingerprint)
+	if err != nil {
+		return AgentScopeGrant{}, err
+	}
+	scope.SchemaVersion = AgentScopeGrantSchema
+	scope.RecordVersion = 1
+	scope.AgentScopeGrantID = record.ScopeGrantID
+	scope.ProjectID = record.ProjectID
+	scope.DeliveryRunID = record.DeliveryRunID
+	scope.ChildAgentID = record.ChildAgentID
+	scope.AgentFederationFingerprint = federationFingerprint
+	return scope, nil
+}
+
+func validateStoredAgentFingerprint(record AgentRegistration, scope AgentScopeGrant) error {
+	scopeBytes, err := json.Marshal(scopePayload(scope))
+	if err != nil {
+		return federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
+	}
+	input := federationFingerprintInput{
+		SchemaVersion:            AgentRegistrationSchema,
+		ProjectID:                record.ProjectID,
+		DeliveryRunID:            record.DeliveryRunID,
+		RootRunID:                record.RootRunID,
+		ParentRunID:              record.ParentRunID,
+		RunID:                    record.RunID,
+		ParentAgentID:            record.ParentAgentID,
+		TaskID:                   record.TaskID,
+		AttemptID:                record.AttemptID,
+		PlanID:                   record.PlanID,
+		ChildKey:                 record.ChildKey,
+		AdapterID:                record.AdapterID,
+		ProviderInstallationID:   record.ProviderInstallationID,
+		AccountProfileID:         record.AccountProfileID,
+		ModelCapabilityID:        record.ModelCapabilityID,
+		RoutingDecisionID:        record.RoutingDecisionID,
+		ProviderSessionRef:       record.ProviderSessionRef,
+		ScopeCanonicalJSON:       string(scopeBytes),
+		Permission:               record.Permission,
+		SideEffectClass:          record.SideEffectClass,
+		BudgetBindingIDs:         sortedCopyAgent(record.BudgetBindingIDs),
+		OwnershipLockIDs:         sortedCopyAgent(record.OwnershipLockIDs),
+		ClaimGeneration:          record.ClaimGeneration,
+		ExecutorID:               record.ExecutorID,
+		ProviderIDempotencyKey:   record.ProviderIDempotencyKey,
+		CancellationChannel:      record.CancellationChannel,
+		ExpectedOutputsHash:      hashString(record.ExpectedOutputsJSON),
+		PlanFingerprint:          record.PlanFingerprint,
+		PolicyFingerprint:        record.PolicyFingerprint,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+	}
+	fingerprint := digestJSON(input)
+	if fingerprint != record.AgentFederationFingerprint || fingerprint != scope.AgentFederationFingerprint {
+		return federationError(ErrAgentFingerprintMismatchCode, "agent federation fingerprint does not match persisted authority inputs")
+	}
+	payloadHash := digestJSON(registrationCanonicalPayload{
+		FingerprintInput:  input,
+		RegistrationState: AgentStateRegistered,
+		Classification:    record.Classification,
+		GapReasons:        sortedCopyAgent(record.GapReasons),
+	})
+	if payloadHash != record.RegistrationPayloadHash {
+		return federationError(ErrAgentFingerprintMismatchCode, "registration payload hash does not match persisted authority inputs")
+	}
+	return nil
 }
 
 func acceptedScopeGrantFromJSON(raw, permission, sideEffectClass, policyFingerprint, planFingerprint, authorizationFingerprint string) (AgentScopeGrant, error) {
@@ -1937,6 +2115,92 @@ func appendAgentEventTx(ctx context.Context, tx Tx, projectID, deliveryRunID, ch
 	return nil
 }
 
+func persistAgentAuthorityRefusal(ctx context.Context, store Store, req AgentRegistrationRequest, cause error) {
+	if store == nil || cause == nil {
+		return
+	}
+	at := strings.TrimSpace(req.CreatedAt)
+	if requireNonZeroTimestamp(at, "created_at") != nil {
+		at = formatTimestamp(store.Now())
+	}
+	childAgentID := stableID("agent_", req.ProjectID, req.DeliveryRunID, req.ParentRunID, req.TaskID, req.AttemptID, req.ChildKey, req.PlanFingerprint)
+	if strings.TrimSpace(childAgentID) == "agent_" {
+		childAgentID = stableID("agent_refusal_", req.ProjectID, req.DeliveryRunID, req.ParentRunID, req.RunID, req.TaskID, req.AttemptID, req.ChildKey)
+	}
+	code := federationErrorCode(cause)
+	payload := struct {
+		SchemaVersion     string              `json:"schema_version"`
+		ChildAgentID      string              `json:"child_agent_id"`
+		ProjectID         string              `json:"project_id"`
+		DeliveryRunID     string              `json:"delivery_run_id"`
+		ParentRunID       string              `json:"parent_run_id"`
+		RunID             string              `json:"run_id"`
+		TaskID            string              `json:"task_id"`
+		AttemptID         string              `json:"attempt_id"`
+		Boundary          string              `json:"boundary"`
+		TerminalErrorCode FederationErrorCode `json:"terminal_error_code"`
+		Message           string              `json:"message"`
+		Classification    string              `json:"classification"`
+	}{
+		SchemaVersion:     "loopcoder.agent_authority_refusal.v1",
+		ChildAgentID:      childAgentID,
+		ProjectID:         req.ProjectID,
+		DeliveryRunID:     req.DeliveryRunID,
+		ParentRunID:       req.ParentRunID,
+		RunID:             req.RunID,
+		TaskID:            req.TaskID,
+		AttemptID:         req.AttemptID,
+		Boundary:          federationBoundaryForCode(code),
+		TerminalErrorCode: code,
+		Message:           cause.Error(),
+		Classification:    "local-diagnostic",
+	}
+	_ = withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			return appendAgentEventTx(ctx, tx, req.ProjectID, req.DeliveryRunID, childAgentID, "registration.refused", at, payload)
+		})
+	})
+}
+
+func federationErrorCode(err error) FederationErrorCode {
+	var typed *FederationError
+	if errors.As(err, &typed) && typed.Code != "" {
+		return typed.Code
+	}
+	return ErrInvalidRecordCode
+}
+
+func federationBoundaryForCode(code FederationErrorCode) string {
+	switch code {
+	case ErrAgentRegistrationRequiredCode:
+		return "registration"
+	case ErrAgentRegistrationConflictCode:
+		return "registration-identity"
+	case ErrUnsupportedNativeSubAgentCode:
+		return "provider-capability"
+	case ErrScopeWideningCode:
+		return "scope"
+	case ErrScopeUnknownCode:
+		return "scope-unknown"
+	case ErrCredentialScopeDeniedCode:
+		return "credential"
+	case ErrOneWriterConflictCode, ErrOwnershipRequiredCode:
+		return "ownership"
+	case ErrChildBudgetRequiredCode:
+		return "budget"
+	case ErrAgentFingerprintMismatchCode:
+		return "fingerprint"
+	case ErrInvalidTransitionCode, ErrTerminalStateCode:
+		return "lifecycle"
+	case ErrCrossProjectReferenceCode:
+		return "project"
+	case ErrStaleClaimCode:
+		return "claim"
+	default:
+		return "record"
+	}
+}
+
 func normalizeBudgetBinding(binding AgentBudgetBinding, req AgentRegistrationRequest, childAgentID string) AgentBudgetBinding {
 	binding.SchemaVersion = AgentBudgetBindingSchema
 	binding.ProjectID = req.ProjectID
@@ -2242,6 +2506,29 @@ func permissionRank(permission string) int {
 		return 2
 	default:
 		return 3
+	}
+}
+
+func sideEffectRank(value string) int {
+	switch normalizeSideEffectClass(value) {
+	case SideEffectNone:
+		return 0
+	case SideEffectLocalRead:
+		return 1
+	case SideEffectLocalWrite:
+		return 2
+	case SideEffectRepoWrite:
+		return 3
+	case SideEffectGitRemoteWrite:
+		return 4
+	case SideEffectGitHubWrite:
+		return 5
+	case SideEffectProviderLaunch:
+		return 6
+	case SideEffectExternalWrite:
+		return 7
+	default:
+		return 8
 	}
 }
 
