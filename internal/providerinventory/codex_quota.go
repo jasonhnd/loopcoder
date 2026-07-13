@@ -57,12 +57,70 @@ type jsonRPCMessage struct {
 	Params any             `json:"params,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *jsonRPCError   `json:"error,omitempty"`
+
+	idPresent bool
 }
 
 type jsonRPCError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+
+	codePresent    bool
+	messagePresent bool
+}
+
+func (m *jsonRPCMessage) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	type wireMessage struct {
+		ID     any             `json:"id,omitempty"`
+		Method string          `json:"method,omitempty"`
+		Params any             `json:"params,omitempty"`
+		Result json.RawMessage `json:"result,omitempty"`
+		Error  *jsonRPCError   `json:"error,omitempty"`
+	}
+	var wire wireMessage
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&wire); err != nil {
+		return err
+	}
+	*m = jsonRPCMessage{
+		ID:        wire.ID,
+		Method:    wire.Method,
+		Params:    wire.Params,
+		Result:    wire.Result,
+		Error:     wire.Error,
+		idPresent: raw["id"] != nil,
+	}
+	return nil
+}
+
+func (e *jsonRPCError) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	type wireError struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data,omitempty"`
+	}
+	var wire wireError
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*e = jsonRPCError{
+		Code:           wire.Code,
+		Message:        wire.Message,
+		Data:           wire.Data,
+		codePresent:    raw["code"] != nil,
+		messagePresent: raw["message"] != nil,
+	}
+	return nil
 }
 
 func inspectCodexQuota(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
@@ -451,10 +509,15 @@ func decodeCodexJSONLMessage(line string) (jsonRPCMessage, error) {
 }
 
 func validateCodexAppServerEnvelope(msg jsonRPCMessage) error {
-	hasID := jsonRPCID(msg.ID) != ""
+	id, validID := jsonRPCIDValue(msg.ID)
+	if msg.idPresent && !validID {
+		return fmt.Errorf("%w: json-rpc id envelope", ErrCodexQuotaMalformed)
+	}
+	hasID := msg.idPresent && id != ""
 	hasMethod := strings.TrimSpace(msg.Method) != ""
 	hasResult := msg.Result != nil
 	hasError := msg.Error != nil
+	validError := hasError && msg.Error.codePresent && msg.Error.messagePresent && strings.TrimSpace(msg.Error.Message) != ""
 	switch {
 	case hasMethod && hasID && !hasResult && !hasError:
 		return nil
@@ -462,9 +525,9 @@ func validateCodexAppServerEnvelope(msg jsonRPCMessage) error {
 		return nil
 	case hasID && !hasMethod && hasResult && !hasError:
 		return nil
-	case hasID && !hasMethod && !hasResult && hasError && strings.TrimSpace(msg.Error.Message) != "":
+	case hasID && !hasMethod && !hasResult && validError:
 		return nil
-	case hasError && strings.TrimSpace(msg.Error.Message) == "":
+	case hasError && !validError:
 		return fmt.Errorf("%w: json-rpc error envelope", ErrCodexQuotaMalformed)
 	default:
 		return fmt.Errorf("%w: app-server envelope", ErrCodexQuotaMalformed)
@@ -992,16 +1055,51 @@ func codexMapField(fields map[string]any, key string) map[string]any {
 }
 
 func jsonRPCID(id any) string {
-	switch typed := id.(type) {
-	case float64:
-		return strconv.FormatInt(int64(typed), 10)
-	case string:
-		return typed
-	case json.Number:
-		return typed.String()
-	default:
+	value, ok := jsonRPCIDValue(id)
+	if !ok {
 		return ""
 	}
+	return value
+}
+
+func jsonRPCIDValue(id any) (string, bool) {
+	switch typed := id.(type) {
+	case int:
+		return strconv.Itoa(typed), true
+	case int64:
+		return strconv.FormatInt(typed, 10), true
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return "", false
+		}
+		return typed, true
+	case json.Number:
+		value := typed.String()
+		if !jsonNumberIsInteger(value) {
+			return "", false
+		}
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+func jsonNumberIsInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	if value[0] == '-' {
+		value = value[1:]
+	}
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func rawJSONFrames(frames []json.RawMessage) [][]byte {

@@ -203,6 +203,9 @@ func TestCodexQuotaFailureFixturesLeaveUnavailableSnapshot(t *testing.T) {
 		{name: "malformed-frame", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: "Content-Length: nope\r\n\r\n{}", ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{name: "malformed-jsonl", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: "{not-json}\n", ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{name: "oversized-jsonl", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: strings.Repeat("x", codexQuotaLineBytes+1), ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{name: "error-missing-code", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: `{"id":1,"error":{"message":"bad"}}`, ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{name: "fractional-response-id", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: `{"id":1.5,"result":{}}`, ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{name: "exponent-response-id", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: `{"id":1e0,"result":{}}`, ExitCode: 0}, wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{name: "rpc-error", version: "codex 0.9.0", result: CodexAppServerResult{Stdout: codexQuotaRPCErrorFrames(t), ExitCode: 0}, wantCode: "ErrCodexQuotaRPCError", wantGap: "rpc-error"},
 		{name: "timeout", version: "codex 0.9.0", result: CodexAppServerResult{TimedOut: true, Killed: true, ExitCode: -1}, wantCode: "ErrCodexQuotaTimeout", wantGap: "quota-probe-timeout"},
 		{name: "transport-loss", version: "codex 0.9.0", result: CodexAppServerResult{ExitCode: -1}, err: errors.New("eof"), wantCode: "ErrCodexQuotaExecutionFailed", wantGap: "quota-probe-failed"},
@@ -461,6 +464,9 @@ func TestRunCodexAppServerProtocolFailuresUseTypedErrors(t *testing.T) {
 		{mode: "contradictory-envelope", wantErr: ErrCodexQuotaMalformed},
 		{mode: "trailing-json", wantErr: ErrCodexQuotaMalformed},
 		{mode: "malformed-rpc-error", wantErr: ErrCodexQuotaMalformed},
+		{mode: "rpc-error-missing-code", wantErr: ErrCodexQuotaMalformed},
+		{mode: "fractional-response-id", wantErr: ErrCodexQuotaMalformed},
+		{mode: "exponent-response-id", wantErr: ErrCodexQuotaMalformed},
 		{mode: "oversized-line", wantErr: ErrCodexQuotaMalformed},
 		{mode: "unsupported-init", wantErr: ErrCodexQuotaUnsupported},
 	}
@@ -498,6 +504,9 @@ func TestInspectCodexQuotaPreservesRealRunnerProtocolFailures(t *testing.T) {
 		{mode: "contradictory-envelope", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{mode: "trailing-json", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{mode: "malformed-rpc-error", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "rpc-error-missing-code", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "fractional-response-id", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "exponent-response-id", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{mode: "unsupported-init", wantCode: "ErrUnsupportedVersion", wantGap: "unsupported-cli-version"},
 	}
 	for _, tt := range cases {
@@ -539,9 +548,12 @@ func TestCodexAppServerOfficialEnvelopeGoldens(t *testing.T) {
 		line string
 	}{
 		{name: "request", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Method: "initialize", Params: map[string]any{"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion}}})},
+		{name: "request-string-id", line: `{"id":"initialize-1","method":"initialize","params":{}}`},
 		{name: "notification", line: codexQuotaJSONL(t, jsonRPCMessage{Method: "initialized"})},
 		{name: "success-response", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 2, Result: mustRawJSON(t, map[string]any{"requiresOpenaiAuth": false})})},
+		{name: "success-response-string-id", line: `{"id":"account-2","result":{"requiresOpenaiAuth":false}}`},
 		{name: "error-response", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 3, Error: &jsonRPCError{Code: -32000, Message: "rate limited"}})},
+		{name: "error-response-zero-code", line: `{"id":3,"error":{"code":0,"message":"no error code reserved by schema"}}`},
 	}
 	for _, tt := range valid {
 		t.Run(tt.name, func(t *testing.T) {
@@ -564,8 +576,15 @@ func TestCodexAppServerOfficialEnvelopeGoldens(t *testing.T) {
 		{name: "notification-carries-error", line: `{"method":"initialized","error":{"code":-32000,"message":"bad"}}`},
 		{name: "success-carries-method", line: `{"id":2,"method":"account/read","result":{}}`},
 		{name: "response-carries-result-and-error", line: `{"id":3,"result":{},"error":{"code":-32000,"message":"bad"}}`},
+		{name: "error-missing-code", line: `{"id":3,"error":{"message":"bad"}}`},
 		{name: "error-missing-message", line: `{"id":3,"error":{"code":-32000}}`},
 		{name: "error-empty-message", line: `{"id":3,"error":{"code":-32000,"message":"  "}}`},
+		{name: "request-fractional-id", line: `{"id":1.5,"method":"initialize"}`},
+		{name: "request-exponent-id", line: `{"id":1e0,"method":"initialize"}`},
+		{name: "response-fractional-id", line: `{"id":2.5,"result":{}}`},
+		{name: "response-exponent-id", line: `{"id":2e0,"result":{}}`},
+		{name: "response-empty-string-id", line: `{"id":"","result":{}}`},
+		{name: "response-whitespace-string-id", line: `{"id":"  ","result":{}}`},
 		{name: "trailing-json", line: `{"method":"initialized"} {"method":"second"}`},
 	}
 	for _, tt := range malformed {
@@ -793,6 +812,18 @@ func runFakeCodexAppServer() {
 	}
 	if mode == "malformed-rpc-error" {
 		fmt.Println(`{"id":1,"error":{"code":-32000}}`)
+		return
+	}
+	if mode == "rpc-error-missing-code" {
+		fmt.Println(`{"id":1,"error":{"message":"bad"}}`)
+		return
+	}
+	if mode == "fractional-response-id" {
+		fmt.Println(`{"id":1.5,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex-test"}}`)
+		return
+	}
+	if mode == "exponent-response-id" {
+		fmt.Println(`{"id":1e0,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex-test"}}`)
 		return
 	}
 	if mode == "oversized-line" {
