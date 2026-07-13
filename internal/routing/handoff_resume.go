@@ -24,6 +24,8 @@ type HandoffResumeInput struct {
 	Cancelled           bool
 	IsCancelled         func(context.Context) bool
 	BeforeLaunch        func() error
+	AfterPrepare        func() error
+	AfterRegistration   func() error
 	ExecuteSuccessor    HandoffSuccessorExecutor
 	DecidedBy           delivery.Actor
 	Host                delivery.Host
@@ -38,13 +40,23 @@ type HandoffSuccessorExecution struct {
 
 type HandoffSuccessorExecutionResult struct {
 	ProviderReceipt string
+	Outcome         HandoffSuccessorExecutionOutcome
 }
+
+type HandoffSuccessorExecutionOutcome string
+
+const (
+	HandoffSuccessorExecutionStarted    HandoffSuccessorExecutionOutcome = "started"
+	HandoffSuccessorExecutionNotStarted HandoffSuccessorExecutionOutcome = "not-started"
+	HandoffSuccessorExecutionAmbiguous  HandoffSuccessorExecutionOutcome = "ambiguous"
+)
 
 type HandoffResumeResult struct {
 	Handoff         storage.HandoffTransaction
 	RoutingDecision RoutingDecision
 	Reservation     budget.Reservation
 	Successor       storage.HandoffSuccessorLaunch
+	Fallback        FallbackDecision
 	Blocked         bool
 	Replay          bool
 }
@@ -85,6 +97,10 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	if selected.RoutingCandidateID == "" {
 		result.Blocked = true
 		return result, taskrequirements.ErrNoEligibleCandidate
+	}
+	if input.ExecuteSuccessor == nil {
+		result.Blocked = true
+		return result, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "handoff successor executor is required for provider launch"}
 	}
 	childAgentID, err := handoffChildAgentID(ctx, store, handoff.ChildRunID)
 	if err != nil {
@@ -153,36 +169,74 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		return result, err
 	}
 	if !launch.LaunchExposed {
+		if launch.LaunchPhase == storage.ClaimPhaseCompleted && strings.TrimSpace(launch.ProviderReceipt) == "" {
+			result.Blocked = true
+			releaseErr := error(nil)
+			if result.Reservation.BudgetReservationID != "" && result.Reservation.BudgetReservationID != launch.BudgetReservationID {
+				releaseErr = releaseHandoffReservationCleanup(store, result.Reservation, "terminal-replay-reservation-release", input.DecidedBy, input.Host)
+			}
+			return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch previously ended without provider receipt; replay requires human recovery"}, releaseErr)
+		}
 		if handoffLaunchNeedsHuman(launch, store.Now()) {
 			result.Blocked = true
 			return result, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch ownership is ambiguous; human recovery required before replay"}
 		}
 		return result, nil
 	}
+	if input.AfterPrepare != nil {
+		if err := input.AfterPrepare(); err != nil {
+			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-prepare", input.DecidedBy, input.Host)
+			return result, errors.Join(err, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume stopped after successor preparation"})
+		}
+	}
 	if handoffResumeCancelled(ctx, input) {
-		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "cancelled-at-launch-boundary", input.DecidedBy, input.Host)
-		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled at launch boundary"}, releaseErr)
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-at-launch-boundary", input.DecidedBy, input.Host)
+		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled at launch boundary"}, cleanupErr)
 	}
-	if input.ExecuteSuccessor != nil {
-		if err := transitionHandoffSuccessorLaunching(ctx, store, handoff, launch); err != nil {
-			releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-transition-refused", input.DecidedBy, input.Host)
-			return result, errors.Join(err, releaseErr)
+	if err := transitionHandoffSuccessorLaunching(ctx, store, handoff, launch); err != nil {
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-transition-refused", input.DecidedBy, input.Host)
+		return result, errors.Join(err, releaseErr)
+	}
+	if input.AfterRegistration != nil {
+		if err := input.AfterRegistration(); err != nil {
+			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-registration", input.DecidedBy, input.Host)
+			return result, errors.Join(err, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume stopped after successor registration launch"})
 		}
-		if handoffResumeCancelled(ctx, input) {
-			releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "cancelled-before-provider-invocation", input.DecidedBy, input.Host)
-			return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before provider invocation"}, releaseErr)
-		}
-		executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected})
-		if execErr != nil {
-			return result, execErr
-		}
-		if err := markHandoffSuccessorExecuting(store, handoff, launch, executed.ProviderReceipt); err != nil {
-			return result, err
-		}
+	}
+	if handoffResumeCancelled(ctx, input) {
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-before-provider-invocation", input.DecidedBy, input.Host)
+		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before provider invocation"}, cleanupErr)
+	}
+	executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected})
+	if execErr != nil {
 		result.Successor.ProviderReceipt = strings.TrimSpace(executed.ProviderReceipt)
-		result.Successor.LaunchPhase = storage.ClaimPhaseExecuting
+		if handoffExecutionOutcome(executed) == HandoffSuccessorExecutionNotStarted {
+			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-not-started", input.DecidedBy, input.Host)
+			fallback, fallbackErr := HandoffDestinationFailureFallback(ctx, store, result, routeInput.Inputs, FallbackTriggerWorkerFailed, firstActor(input.DecidedBy, routeInput.DecidedBy), firstHost(input.Host, routeInput.Host))
+			result.Fallback = fallback
+			return result, errors.Join(execErr, cleanupErr, fallbackErr)
+		}
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-ambiguous", input.DecidedBy, input.Host)
+		return result, errors.Join(execErr, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch outcome is ambiguous; human reconciliation required"})
 	}
+	if err := markHandoffSuccessorExecuting(store, handoff, launch, executed.ProviderReceipt); err != nil {
+		return result, err
+	}
+	result.Successor.ProviderReceipt = strings.TrimSpace(executed.ProviderReceipt)
+	result.Successor.LaunchPhase = storage.ClaimPhaseExecuting
 	return result, nil
+}
+
+func handoffExecutionOutcome(result HandoffSuccessorExecutionResult) HandoffSuccessorExecutionOutcome {
+	if strings.TrimSpace(result.ProviderReceipt) != "" {
+		return HandoffSuccessorExecutionStarted
+	}
+	switch result.Outcome {
+	case HandoffSuccessorExecutionNotStarted, HandoffSuccessorExecutionStarted, HandoffSuccessorExecutionAmbiguous:
+		return result.Outcome
+	default:
+		return HandoffSuccessorExecutionAmbiguous
+	}
 }
 
 func reserveHandoffBudget(ctx context.Context, store storage.Store, req budget.ReserveRequest) (budget.Result, error) {
@@ -273,6 +327,94 @@ func markHandoffSuccessorExecuting(store storage.Store, handoff storage.HandoffT
 	}
 	_, err = storage.TransitionAgentRegistration(cleanupCtx, store, childAgentID, storage.AgentActionHeartbeat, launch.ExecutorID, launch.ClaimGeneration, delivery.CanonicalTimestamp(store.Now()))
 	return err
+}
+
+func cleanupHandoffLaunchTerminal(store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, reservation budget.Reservation, status string, code taskrequirements.ErrorCode, reason string, actor delivery.Actor, host delivery.Host) error {
+	cleanupCtx, cancel := handoffCleanupContext()
+	defer cancel()
+	releaseErr := releaseHandoffReservation(cleanupCtx, store, reservation, reason, actor, host)
+	terminalErr := terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, status, code, reason)
+	if terminalErr != nil && status != "needs-human" {
+		terminalErr = errors.Join(terminalErr, terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, "needs-human", code, reason+"-cleanup-failed"))
+	}
+	return errors.Join(releaseErr, terminalErr)
+}
+
+func terminalizeHandoffLaunch(ctx context.Context, store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, status string, code taskrequirements.ErrorCode, reason string) error {
+	status = strings.TrimSpace(status)
+	if status != "cancelled" && status != "needs-human" {
+		return fmt.Errorf("terminalize handoff launch: unsupported status %q", status)
+	}
+	at := delivery.CanonicalTimestamp(store.Now())
+	agentState := storage.AgentStateCancelled
+	if status == "needs-human" {
+		agentState = storage.AgentStateNeedsHuman
+	}
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		result, err := tx.Exec(ctx, `UPDATE run_claims
+			SET phase = ?, heartbeat_at = ?
+			WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+			storage.ClaimPhaseCompleted, at, handoff.ChildRunID, launch.ExecutorID, launch.ClaimGeneration)
+		if err != nil {
+			return fmt.Errorf("terminalize handoff launch claim: %w", err)
+		}
+		if err := requireHandoffCleanupRow(result, "claim"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runs
+			SET status = ?, ended_at = COALESCE(ended_at, ?), updated_at = ?
+			WHERE id = ?`,
+			status, at, at, handoff.ChildRunID); err != nil {
+			return fmt.Errorf("terminalize handoff launch run: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE run_edges
+			SET status = ?, updated_at = ?
+			WHERE parent_run_id = ? AND child_run_id = ?`,
+			status, at, handoff.ParentRunID, handoff.ChildRunID); err != nil {
+			return fmt.Errorf("terminalize handoff launch edge: %w", err)
+		}
+		result, err = tx.Exec(ctx, `UPDATE delivery_attempts
+			SET state = ?, ended_at = COALESCE(ended_at, ?), updated_at = ?, terminal_error_code = ?, error_message = ?
+			WHERE attempt_id = ? AND executor_id = ? AND claim_generation = ?`,
+			status, at, at, string(code), reason, launch.AttemptID, launch.ExecutorID, launch.ClaimGeneration)
+		if err != nil {
+			return fmt.Errorf("terminalize handoff launch attempt: %w", err)
+		}
+		if err := requireHandoffCleanupRow(result, "attempt"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE delivery_tasks
+			SET state = ?, ended_at = COALESCE(ended_at, ?), updated_at = ?, terminal_error_code = ?, error_message = ?
+			WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+			status, at, at, string(code), reason, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID); err != nil {
+			return fmt.Errorf("terminalize handoff launch task: %w", err)
+		}
+		result, err = tx.Exec(ctx, `UPDATE agent_registrations
+			SET registration_state = ?, terminal_error_code = ?, updated_at = ?, record_version = record_version + 1
+			WHERE child_run_id = ? AND executor_id = ? AND claim_generation = ?`,
+			agentState, string(code), at, handoff.ChildRunID, launch.ExecutorID, launch.ClaimGeneration)
+		if err != nil {
+			return fmt.Errorf("terminalize handoff launch registration: %w", err)
+		}
+		if err := requireHandoffCleanupRow(result, "registration"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE agent_budget_bindings
+			SET reservation_state = ?, updated_at = ?
+			WHERE budget_reservation_id = ?`,
+			status, at, launch.BudgetReservationID); err != nil {
+			return fmt.Errorf("terminalize handoff launch budget binding: %w", err)
+		}
+		return nil
+	})
+}
+
+func requireHandoffCleanupRow(result interface{ RowsAffected() (int64, error) }, label string) error {
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return fmt.Errorf("terminalize handoff launch %s: updated %d rows, want 1", label, affected)
+	}
+	return nil
 }
 
 func candidatesFromRoutingDecision(decision RoutingDecision) []Candidate {

@@ -194,6 +194,27 @@ func TestResumeApprovedHandoffNoEligiblePersistsBlockedDecision(t *testing.T) {
 	}
 }
 
+func TestResumeApprovedHandoffRequiresExecutorBeforeReservation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		DecidedBy:        routerActor(),
+		Host:             routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+		t.Fatalf("nil executor error = %v, want ErrInvalidRecord", err)
+	}
+	if result.Reservation.BudgetReservationID != "" || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 0 {
+		t.Fatalf("nil executor exposed launch authority: result=%#v attempts=%d", result, countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
 func TestResumeApprovedHandoffCancellationAfterReservationReleasesBeforeLaunch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -213,6 +234,7 @@ func TestResumeApprovedHandoffCancellationAfterReservationReleasesBeforeLaunch(t
 		DecisionInput:    input,
 		ReservationValue: 1,
 		Cancelled:        true,
+		ExecuteSuccessor: executeStarted("unused"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
@@ -227,6 +249,84 @@ func TestResumeApprovedHandoffCancellationAfterReservationReleasesBeforeLaunch(t
 	}
 	if countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 0 {
 		t.Fatalf("cancelled resume launched successor")
+	}
+}
+
+func TestResumeApprovedHandoffCancellationAfterPrepareTerminalizesLaunch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			cancelled = true
+			return nil
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("post-prepare cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("post-prepare cancellation executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("post-prepare reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateCancelled || state.attemptState != "cancelled" || state.taskState != "cancelled" {
+		t.Fatalf("post-prepare durable state = %#v, want cancelled terminal state", state)
+	}
+}
+
+func TestResumeApprovedHandoffCancellationAfterRegistrationTerminalizesLaunch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterRegistration: func() error {
+			cancelled = true
+			return nil
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("post-registration cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("post-registration cancellation executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("post-registration reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateCancelled || state.attemptState != "cancelled" || state.taskState != "cancelled" {
+		t.Fatalf("post-registration durable state = %#v, want cancelled terminal state", state)
 	}
 }
 
@@ -284,6 +384,7 @@ func TestResumeApprovedHandoffStaleGenerationFencePreventsLaunch(t *testing.T) {
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
+		ExecuteSuccessor: executeStarted("unused"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
@@ -306,6 +407,7 @@ func TestResumeApprovedHandoffRejectsUnsafeArtifactRefAndReleasesReservation(t *
 		DecisionInput:       input,
 		ReservationValue:    1,
 		ReusableEvidenceIDs: []string{"provider-session-token"},
+		ExecuteSuccessor:    executeStarted("unused"),
 		DecidedBy:           routerActor(),
 		Host:                routingHost(),
 	})
@@ -335,6 +437,7 @@ func TestResumeApprovedHandoffReplayAfterPreLaunchStopReusesRouteAndLaunches(t *
 		DecisionInput:    input,
 		ReservationValue: 1,
 		BeforeLaunch:     func() error { return stopErr },
+		ExecuteSuccessor: executeStarted("unused"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
@@ -356,6 +459,7 @@ func TestResumeApprovedHandoffReplayAfterPreLaunchStopReusesRouteAndLaunches(t *
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
+		ExecuteSuccessor: executeStarted("receipt-replayed"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
@@ -377,14 +481,16 @@ func TestResumeApprovedHandoffExpiredLaunchOwnerBlocksReplayWithoutDuplicateExec
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
+		AfterPrepare:     func() error { return errors.New("simulated crash after prepare") },
+		ExecuteSuccessor: executeStarted("unused"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
-	if err != nil {
-		t.Fatalf("first ResumeApprovedHandoff: %v", err)
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("first ResumeApprovedHandoff error = %v, want ErrReplanRequired", err)
 	}
 	if !first.Successor.LaunchExposed || first.Successor.LaunchPhase != storage.ClaimPhaseLaunching {
-		t.Fatalf("first successor launch = %#v, want exposed launching owner", first.Successor)
+		t.Fatalf("first successor launch = %#v, want exposed launch before cleanup", first.Successor)
 	}
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET lease_expires_at = ? WHERE run_id = ?`, fixture.now.Add(-time.Minute).Format(time.RFC3339Nano), handoff.ChildRunID)
@@ -432,20 +538,52 @@ func TestResumeApprovedHandoffDestinationFailureUsesBoundedFallback(t *testing.T
 		DecisionInput:    input,
 		ReservationValue: 1,
 		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
-			return HandoffSuccessorExecutionResult{}, launchErr
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionNotStarted}, launchErr
 		},
 		DecidedBy: routerActor(),
 		Host:      routingHost(),
 	})
-	if !errors.Is(err, launchErr) {
-		t.Fatalf("ResumeApprovedHandoff error = %v, want launchErr", err)
-	}
-	fallback, err := HandoffDestinationFailureFallback(ctx, store, result, input.Inputs, FallbackTriggerWorkerFailed, schedulerActor(), routingHost())
 	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
-		t.Fatalf("destination failure fallback error = %v, want bounded ErrReplanRequired; fallback=%#v", err, fallback)
+		t.Fatalf("destination failure resume error = %v, want bounded ErrReplanRequired; result=%#v", err, result)
 	}
+	fallback := result.Fallback
 	if fallback.DecisionStatus != FallbackStatusReplanRequired || fallback.BoundsRemaining.MaxFallbacks == 0 || len(fallback.AttemptLineage) != 2 {
 		t.Fatalf("fallback = %#v, want bounded policy-preserving fallback with lineage", fallback)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("destination failure reservation state = %q, want released", state)
+	}
+}
+
+func TestResumeApprovedHandoffAmbiguousExecutorErrorDoesNotFallback(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	launchErr := errors.New("ambiguous transport error")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionAmbiguous}, launchErr
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) || !errors.Is(err, launchErr) {
+		t.Fatalf("ambiguous launch error = %v, want launchErr joined with ErrReplanRequired", err)
+	}
+	if result.Fallback.FallbackDecisionID != "" {
+		t.Fatalf("ambiguous launch persisted fallback %#v, want none", result.Fallback)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("ambiguous launch reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateNeedsHuman || state.attemptState != "needs-human" || state.taskState != "needs-human" {
+		t.Fatalf("ambiguous launch durable state = %#v, want needs-human", state)
 	}
 }
 
@@ -460,6 +598,7 @@ func TestResumeApprovedHandoffReleasesSourceReservationAfterDestinationBinding(t
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
+		ExecuteSuccessor: executeStarted("receipt-source-release"),
 		DecidedBy:        routerActor(),
 		Host:             routingHost(),
 	})
@@ -486,6 +625,12 @@ func makeClaudeEligibleOnly(input DecisionInput) {
 		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
 			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
 		}
+	}
+}
+
+func executeStarted(receipt string) HandoffSuccessorExecutor {
+	return func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+		return HandoffSuccessorExecutionResult{ProviderReceipt: receipt, Outcome: HandoffSuccessorExecutionStarted}, nil
 	}
 }
 
@@ -746,6 +891,36 @@ func handoffRegistrationState(t *testing.T, ctx context.Context, store storage.S
 			FROM agent_registrations WHERE child_run_id = ?`, childRunID).Scan(&out.attemptID, &out.adapterID, &out.sessionRef, &out.state)
 	}); err != nil {
 		t.Fatalf("handoff registration state: %v", err)
+	}
+	return out
+}
+
+func handoffLaunchDurableState(t *testing.T, ctx context.Context, store storage.Store, childRunID, attemptID string) struct {
+	claimPhase        string
+	registrationState string
+	attemptState      string
+	taskState         string
+} {
+	t.Helper()
+	var out struct {
+		claimPhase        string
+		registrationState string
+		attemptState      string
+		taskState         string
+	}
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT phase FROM run_claims WHERE run_id = ?`, childRunID).Scan(&out.claimPhase); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE child_run_id = ?`, childRunID).Scan(&out.registrationState); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state FROM delivery_attempts WHERE attempt_id = ?`, attemptID).Scan(&out.attemptState); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT state FROM delivery_tasks WHERE active_attempt_id = ?`, attemptID).Scan(&out.taskState)
+	}); err != nil {
+		t.Fatalf("handoff launch durable state: %v", err)
 	}
 	return out
 }

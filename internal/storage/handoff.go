@@ -1051,9 +1051,12 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 	} else if ok {
 		if existing.HandoffID != handoff.HandoffID || existing.HandoffGeneration != handoff.HandoffGeneration ||
 			existing.SourceAttemptID != handoff.SourceAttemptID || existing.RoutingDecisionID != req.RoutingDecisionID ||
-			existing.RoutingCandidateID != req.Candidate.RoutingCandidateID || existing.BudgetReservationID != req.BudgetReservationID ||
+			existing.RoutingCandidateID != req.Candidate.RoutingCandidateID ||
 			existing.ExecutorID != handoff.DestinationExecutorID || existing.ClaimGeneration != handoff.HandoffGeneration {
 			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed handoff payload")
+		}
+		if existing.BudgetReservationID != req.BudgetReservationID && !(existing.LaunchPhase == ClaimPhaseCompleted && strings.TrimSpace(existing.ProviderReceipt) == "") {
+			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed handoff reservation")
 		}
 		existing.Replay = true
 		return existing, nil
