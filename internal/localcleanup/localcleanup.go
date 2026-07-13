@@ -277,6 +277,10 @@ func cleanupRuns(loopRoot string, pending pendingRelayRuns, opts Options, result
 			result.retain(KindRun, run.path, "referenced by pending relay state")
 			continue
 		}
+		if keep, reason := runHasPreservationManifest(run, opts, result); keep {
+			result.retain(KindRun, run.path, reason)
+			continue
+		}
 		if active, reason := runIsActiveOrUnknown(run, opts, result); active {
 			result.retain(KindRun, run.path, reason)
 			continue
@@ -287,6 +291,61 @@ func cleanupRuns(loopRoot string, pending pendingRelayRuns, opts Options, result
 		}
 		result.remove(KindRun, run.path, "outside retention and all attempt records are terminal", true, loopRoot, opts)
 	}
+}
+
+func runHasPreservationManifest(run runDir, opts Options, result *Result) (bool, string) {
+	recoveryRoot := filepath.Join(run.path, "recovery")
+	entries, ok := readDirLimited(recoveryRoot, opts, result)
+	if !ok {
+		if pathExists(recoveryRoot) {
+			return true, "preservation records could not be scanned safely"
+		}
+		return false, ""
+	}
+	for _, entry := range entries {
+		path := filepath.Join(recoveryRoot, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			result.addDiagnostic("%s: skipped symlink preservation record", slash(path))
+			return true, "preservation records include a symlink"
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "-preserved.json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			result.addDiagnostic("%s: %v", slash(path), err)
+			return true, "preservation record could not be scanned safely"
+		}
+		if !fileWithinBounds(path, info, opts, result) {
+			return true, "preservation record exceeds cleanup bounds"
+		}
+		if !validPreservationRecord(path, opts, result) {
+			return true, "preservation record is malformed"
+		}
+		return true, "contains preserved attempt manifest"
+	}
+	return false, ""
+}
+
+func validPreservationRecord(path string, opts Options, result *Result) bool {
+	data, err := readBounded(path, opts.MaxFileBytes)
+	if err != nil {
+		result.addDiagnostic("%s: %v", slash(path), err)
+		return false
+	}
+	var raw struct {
+		Version     int    `json:"version"`
+		RunID       string `json:"run_id"`
+		JobID       string `json:"job_id"`
+		ScratchPath string `json:"scratch_path"`
+		Worktree    string `json:"worktree_path"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		result.addDiagnostic("%s: parse preservation record: %v", slash(path), err)
+		return false
+	}
+	return raw.Version == 1 && strings.TrimSpace(raw.RunID) != "" && strings.TrimSpace(raw.JobID) != "" &&
+		(strings.TrimSpace(raw.ScratchPath) != "" || strings.TrimSpace(raw.Worktree) != "")
 }
 
 func runIsActiveOrUnknown(run runDir, opts Options, result *Result) (bool, string) {

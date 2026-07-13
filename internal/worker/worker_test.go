@@ -1127,6 +1127,11 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	if fakeGit.addAllCalls != 1 || fakeGit.commitCalls != 1 || fakeGit.pushCalls != 0 || fakeGit.forcePushCalls != 1 {
 		t.Fatalf("harvest git calls add=%d commit=%d push=%d forcePush=%d, want add/commit/force only", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGit.forcePushCalls)
 	}
+	if fakeGit.removeCalls != 0 || fakeGit.branchDeleteCalls != 0 {
+		t.Fatalf("harvest cleanup removed preserved artifacts: worktreeRemove=%d branchDelete=%d", fakeGit.removeCalls, fakeGit.branchDeleteCalls)
+	}
+	assertPathExists(t, filepath.Dir(fakeGit.worktreePath))
+	assertPathExists(t, fakeGit.worktreePath)
 	if fakeGit.lastForcePushBranch != "loop/issue-101-retry-2" {
 		t.Fatalf("force push branch = %q", fakeGit.lastForcePushBranch)
 	}
@@ -1174,6 +1179,25 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 	if got.Report == nil || got.Report.Role != reporter.RoleConductor {
 		t.Fatalf("harvest attempt report = %#v, want conductor", got.Report)
+	}
+	manifestPath := state.PreservationManifestPath(repo, "run-test", "job-101-4321")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile preservation manifest: %v", err)
+	}
+	var manifest preservationManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatalf("preservation manifest is invalid JSON: %v\n%s", err, string(manifestData))
+	}
+	if manifest.WorktreePath != fakeGit.worktreePath || manifest.ScratchPath != filepath.Dir(fakeGit.worktreePath) ||
+		manifest.AttemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-4321.attempt.json") ||
+		!strings.Contains(manifest.DisposalGuidance, "run_id and job_id") {
+		t.Fatalf("preservation manifest = %#v", manifest)
+	}
+	for _, want := range []string{"preserved worktree:", "preserved scratch:", "preserved manifest:", "disposal:"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warnings missing %q:\n%s", want, warnings.String())
+		}
 	}
 }
 
@@ -1713,6 +1737,83 @@ func TestDispatchHelperSeamsSuccessPath(t *testing.T) {
 	}
 }
 
+func TestCleanupRefusesUnownedScratchDeletion(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	removedScratch := ""
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/510"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented.", 0),
+		log:       "codex ok\n",
+	}
+
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 510,
+		IssueTitle:  "Guard scratch cleanup",
+		RunID:       "run-ownership",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: func() time.Time {
+			return fixedNow()
+		},
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: func(path string) error {
+			removedScratch = path
+			return os.RemoveAll(path)
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dispatch.scratch, scratchOwnerFile), []byte(`{"version":1,"run_id":"other","job_id":"other","issue":510,"attempt":1}`), 0o600); err != nil {
+		t.Fatalf("tamper scratch owner marker: %v", err)
+	}
+	invocation, err := buildInvocation(ctx, dispatch)
+	if err != nil {
+		t.Fatalf("buildInvocation returned error: %v", err)
+	}
+	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
+	if agentErr != nil {
+		t.Fatalf("runAgent returned error: %v", agentErr)
+	}
+	if _, err := commitAndOpenPR(ctx, dispatch, agentResult); err != nil {
+		t.Fatalf("commitAndOpenPR returned error: %v", err)
+	}
+
+	cleanup(ctx, dispatch, nil)
+	if removedScratch != "" {
+		t.Fatalf("RemoveAll called for unowned scratch %q", removedScratch)
+	}
+	assertPathExists(t, dispatch.scratch)
+	if !strings.Contains(warnings.String(), "scratch owner marker does not match attempt") {
+		t.Fatalf("warnings missing ownership mismatch:\n%s", warnings.String())
+	}
+}
+
 func TestBuildInvocationUsesPerRunTimeoutOverride(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -1898,6 +1999,13 @@ func assertNoReportFootprint(t *testing.T, surface, text string, record reporter
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("%s contains forbidden report text %q:\n%s", surface, forbidden, text)
 		}
+	}
+}
+
+func assertPathExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("%s does not exist: %v", path, err)
 	}
 }
 
