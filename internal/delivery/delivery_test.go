@@ -162,6 +162,98 @@ func TestPersistenceAtomicTypedFailuresAndReplay(t *testing.T) {
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_overrides`, 0)
 }
 
+func TestApprovalAndOverrideReplayAfterRunFingerprintChange(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := storage.Open(ctx, storage.Options{Path: path, Now: fixedTime})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	run, task, _ := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", "run_replay_changed_fingerprint")
+	run.State = RunQueued
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "replay-run-queued", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun queued: %v", err)
+	}
+	task.State = TaskReady
+	if _, err := PersistTask(ctx, store, task, PersistOptions{IdempotencyKey: "replay-task-ready", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistTask ready: %v", err)
+	}
+
+	approval := approvalFixture(run)
+	createdApproval, err := RecordApproval(ctx, store, approval, PersistOptions{IdempotencyKey: "approval-replay-after-fingerprint-change", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("RecordApproval: %v", err)
+	}
+	decision, err := RecordDecision(ctx, store, decisionFixture(run), PersistOptions{IdempotencyKey: "override-replay-decision", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	override := overrideFixture(run, decision.DecisionID)
+	createdOverride, err := RecordOverride(ctx, store, override, PersistOptions{IdempotencyKey: "override-replay-after-fingerprint-change", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("RecordOverride: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	store, err = storage.Open(ctx, storage.Options{Path: path, Now: fixedTime})
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer store.Close()
+
+	changedRun := run
+	changedRun.InputFingerprint = "sha256:" + stringsRepeat("5", 64)
+	changedRun.PolicyFingerprint = "sha256:" + stringsRepeat("6", 64)
+	changedRun.PlanFingerprint = "sha256:" + stringsRepeat("7", 64)
+	changedRun.AuthorizationFingerprint = "sha256:" + stringsRepeat("8", 64)
+	if _, err := PersistDeliveryRun(ctx, store, changedRun, PersistOptions{IdempotencyKey: "replay-run-fingerprint-changed", Now: fixedTime().Add(time.Minute)}); err != nil {
+		t.Fatalf("PersistDeliveryRun changed fingerprint: %v", err)
+	}
+
+	replayedApproval, err := RecordApproval(ctx, store, createdApproval, PersistOptions{IdempotencyKey: "approval-replay-after-fingerprint-change", Now: fixedTime().Add(2 * time.Minute)})
+	if err != nil {
+		t.Fatalf("RecordApproval exact replay after fingerprint change: %v", err)
+	}
+	if replayedApproval.ApprovalID != createdApproval.ApprovalID || replayedApproval.CreatedAt != createdApproval.CreatedAt {
+		t.Fatalf("approval replay = %#v, want original %#v", replayedApproval, createdApproval)
+	}
+	changedApproval := createdApproval
+	changedApproval.ApprovalKind = "continue"
+	_, err = RecordApproval(ctx, store, changedApproval, PersistOptions{IdempotencyKey: "approval-replay-after-fingerprint-change", Now: fixedTime().Add(3 * time.Minute)})
+	assertTypedCode(t, "changed approval replay", err, ErrDuplicateReplayCode)
+	changedApprovalFingerprint := createdApproval
+	changedApprovalFingerprint.AuthorizationFingerprint = changedRun.AuthorizationFingerprint
+	_, err = RecordApproval(ctx, store, changedApprovalFingerprint, PersistOptions{IdempotencyKey: "approval-replay-after-fingerprint-change", Now: fixedTime().Add(4 * time.Minute)})
+	assertTypedCode(t, "changed approval fingerprint replay", err, ErrDuplicateReplayCode)
+	_, err = RecordApproval(ctx, store, createdApproval, PersistOptions{IdempotencyKey: "approval-stale-after-fingerprint-change", Now: fixedTime().Add(5 * time.Minute)})
+	assertTypedCode(t, "fresh stale approval", err, ErrStaleApprovalCode)
+
+	replayedOverride, err := RecordOverride(ctx, store, createdOverride, PersistOptions{IdempotencyKey: "override-replay-after-fingerprint-change", Now: fixedTime().Add(6 * time.Minute)})
+	if err != nil {
+		t.Fatalf("RecordOverride exact replay after fingerprint change: %v", err)
+	}
+	if replayedOverride.OverrideID != createdOverride.OverrideID || replayedOverride.CreatedAt != createdOverride.CreatedAt {
+		t.Fatalf("override replay = %#v, want original %#v", replayedOverride, createdOverride)
+	}
+	changedOverride := createdOverride
+	changedOverride.Justification = "changed justification"
+	_, err = RecordOverride(ctx, store, changedOverride, PersistOptions{IdempotencyKey: "override-replay-after-fingerprint-change", Now: fixedTime().Add(7 * time.Minute)})
+	assertTypedCode(t, "changed override replay", err, ErrDuplicateReplayCode)
+	changedOverrideFingerprint := createdOverride
+	changedOverrideFingerprint.AuthorizationFingerprint = changedRun.AuthorizationFingerprint
+	_, err = RecordOverride(ctx, store, changedOverrideFingerprint, PersistOptions{IdempotencyKey: "override-replay-after-fingerprint-change", Now: fixedTime().Add(8 * time.Minute)})
+	assertTypedCode(t, "changed override fingerprint replay", err, ErrDuplicateReplayCode)
+	_, err = RecordOverride(ctx, store, createdOverride, PersistOptions{IdempotencyKey: "override-stale-after-fingerprint-change", Now: fixedTime().Add(9 * time.Minute)})
+	assertTypedCode(t, "fresh stale override", err, ErrStaleApprovalCode)
+
+	_, err = ClaimTask(ctx, store, run.ProjectID, run.DeliveryRunID, task.TaskID, "executor-stale", actor(), host(), PersistOptions{IdempotencyKey: "claim-after-fingerprint-change", Now: fixedTime().Add(10 * time.Minute)})
+	assertTypedCode(t, "claim with stale task authority", err, ErrStaleApprovalCode)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_overrides`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_attempts`, 0)
+}
+
 func TestDependencyEdgeCycleQueryFailureIsAtomic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -967,6 +1059,17 @@ func assertCount(t *testing.T, ctx context.Context, store storage.Store, query s
 	}
 	if got != want {
 		t.Fatalf("count query %q = %d, want %d", query, got, want)
+	}
+}
+
+func assertTypedCode(t *testing.T, label string, err error, want ErrorCode) {
+	t.Helper()
+	var typedErr *TypedError
+	if !errors.As(err, &typedErr) {
+		t.Fatalf("%s error = %v, want typed code %s", label, err, want)
+	}
+	if typedErr.Code != want {
+		t.Fatalf("%s error code = %s, want %s; err=%v", label, typedErr.Code, want, err)
 	}
 }
 
