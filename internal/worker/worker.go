@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -103,6 +104,9 @@ type Deps struct {
 	Now         func() time.Time
 	PID         func() int
 	MkdirTemp   func(dir, pattern string) (string, error)
+	MkdirAll    func(path string, perm os.FileMode) error
+	WriteFile   func(path string, data []byte, perm os.FileMode) error
+	Stat        func(path string) (os.FileInfo, error)
 	RemoveAll   func(path string) error
 	RepoSkills  func(repoPath string, domainSkills config.DomainSkills) (string, error)
 	OpenStore   func(context.Context, storage.Options) (storage.Store, error)
@@ -121,6 +125,9 @@ func DefaultDeps() Deps {
 		Now:       time.Now,
 		PID:       os.Getpid,
 		MkdirTemp: os.MkdirTemp,
+		MkdirAll:  os.MkdirAll,
+		WriteFile: os.WriteFile,
+		Stat:      os.Stat,
 		RemoveAll: os.RemoveAll,
 		RepoSkills: func(repoPath string, domainSkills config.DomainSkills) (string, error) {
 			return skills.BuildPromptSection(skills.PromptSectionOptions{
@@ -475,9 +482,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			"mode":   harvest.Mode,
 		})
 		dispatch.dispatchSucceeded = true
-		dispatch.preserveArtifacts = true
 		dispatch.preserveReason = "harvested hung/killed worker needs human review"
 		dispatch.cleanupStatus = "needs-human"
+		selectArtifactPreservation(dispatch, dispatch.preserveReason, nil)
 		return Result{
 			OK:          true,
 			Issue:       dispatch.opts.IssueNumber,
@@ -589,6 +596,7 @@ func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error
 	if dispatch == nil || dispatch.tracker == nil || failure == nil {
 		return
 	}
+	selectArtifactPreservation(dispatch, dispatch.failureStatus+" attempt", nil)
 	failurePhase := dispatch.activePhase
 	if failurePhase == "" {
 		failurePhase = dispatch.tracker.phase
@@ -631,6 +639,9 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	defer closeWorkerOwnershipStore(dispatch)
 	if dispatch.dispatchSucceeded {
 		if dispatch.opts.KeepWorktree || dispatch.preserveArtifacts {
+			if !dispatch.preserveArtifacts {
+				selectArtifactPreservation(dispatch, "keep-worktree requested", nil)
+			}
 			dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
 			reason := dispatch.preserveReason
 			if reason == "" {
@@ -642,19 +653,26 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		}
 		if err := validateWorkerOwnership(ctx, dispatch); err != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: refused cleanup without active ownership fence for %s: %v\n", dispatch.worktreePath, err)
+			selectArtifactPreservation(dispatch, "cleanup ownership refused", []string{err.Error()})
 			preserveAttemptArtifacts(dispatch, "cleanup ownership refused", []string{err.Error()})
 			return
 		}
+		selectArtifactCleanup(dispatch, "successful attempt cleanup")
 		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
+		var cleanupErrors []string
 		if cleanupErr := dispatch.deps.Git.WorktreeRemove(context.Background(), dispatch.repoPath, dispatch.worktreePath); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", dispatch.worktreePath, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove worktree %s: %v", dispatch.worktreePath, cleanupErr))
 		}
 		if cleanupErr := dispatch.deps.Git.BranchDelete(context.Background(), dispatch.repoPath, dispatch.opts.Branch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", dispatch.opts.Branch, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("delete local branch %s: %v", dispatch.opts.Branch, cleanupErr))
 		}
 		if cleanupErr := removeOwnedScratch(dispatch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", dispatch.scratch, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove scratch %s: %v", dispatch.scratch, cleanupErr))
 		}
+		completeArtifactCleanup(dispatch, cleanupErrors)
 		releaseWorkerOwnership(dispatch)
 		return
 	}
@@ -785,53 +803,62 @@ func buildPRBody(issueNumber int, summary string) string {
 }
 
 type scratchOwnerRecord struct {
-	Version int    `json:"version"`
-	RunID   string `json:"run_id"`
-	JobID   string `json:"job_id"`
-	Issue   int    `json:"issue"`
-	Attempt int    `json:"attempt"`
-	Branch  string `json:"branch"`
-	Scratch string `json:"scratch"`
+	Version     int    `json:"version"`
+	RunID       string `json:"run_id"`
+	JobID       string `json:"job_id"`
+	Issue       int    `json:"issue"`
+	Attempt     int    `json:"attempt"`
+	Branch      string `json:"branch"`
+	Generation  int    `json:"generation"`
+	OwnerID     string `json:"owner_id"`
+	ScratchRoot string `json:"scratch_root,omitempty"`
+	Scratch     string `json:"scratch"`
 }
 
 type preservationManifest struct {
-	Version             int      `json:"version"`
-	RunID               string   `json:"run_id"`
-	JobID               string   `json:"job_id"`
-	Issue               int      `json:"issue"`
-	Attempt             int      `json:"attempt"`
-	Branch              string   `json:"branch"`
-	Status              string   `json:"status"`
-	Reason              string   `json:"reason"`
-	WorktreePath        string   `json:"worktree_path"`
-	ScratchPath         string   `json:"scratch_path"`
-	LogPath             string   `json:"log_path"`
-	PromptPath          string   `json:"prompt_path"`
-	SummaryPath         string   `json:"summary_path"`
-	AttemptPath         string   `json:"attempt_path"`
-	RecoveryContextPath string   `json:"recovery_context_path"`
-	ManifestPath        string   `json:"manifest_path"`
-	DisposalGuidance    string   `json:"disposal_guidance"`
-	PreservationErrors  []string `json:"preservation_errors,omitempty"`
-	PreservedAt         string   `json:"preserved_at"`
+	Version              int      `json:"version"`
+	RunID                string   `json:"run_id"`
+	JobID                string   `json:"job_id"`
+	Issue                int      `json:"issue"`
+	Attempt              int      `json:"attempt"`
+	Branch               string   `json:"branch"`
+	Status               string   `json:"status"`
+	Reason               string   `json:"reason"`
+	WorktreePath         string   `json:"worktree_path"`
+	ScratchPath          string   `json:"scratch_path"`
+	LogPath              string   `json:"log_path"`
+	PromptPath           string   `json:"prompt_path"`
+	SummaryPath          string   `json:"summary_path"`
+	AttemptPath          string   `json:"attempt_path"`
+	RecoveryContextPath  string   `json:"recovery_context_path"`
+	ManifestPath         string   `json:"manifest_path"`
+	PartialArtifactPaths []string `json:"partial_artifact_paths,omitempty"`
+	DisposalGuidance     string   `json:"disposal_guidance"`
+	PreservationErrors   []string `json:"preservation_errors,omitempty"`
+	PreservedAt          string   `json:"preserved_at"`
 }
 
 func writeScratchOwner(dispatch *dispatchContext) error {
 	record := scratchOwnerRecord{
-		Version: 1,
-		RunID:   dispatch.opts.RunID,
-		JobID:   dispatch.jobID,
-		Issue:   dispatch.opts.IssueNumber,
-		Attempt: dispatch.opts.Attempt,
-		Branch:  dispatch.opts.Branch,
-		Scratch: dispatch.scratch,
+		Version:    1,
+		RunID:      dispatch.opts.RunID,
+		JobID:      dispatch.jobID,
+		Issue:      dispatch.opts.IssueNumber,
+		Attempt:    dispatch.opts.Attempt,
+		Branch:     dispatch.opts.Branch,
+		Generation: 1,
+		OwnerID:    workerOwnershipOwnerID(dispatch),
+		Scratch:    dispatch.scratch,
+	}
+	if dispatch.runtimeRoots.Registered {
+		record.ScratchRoot = dispatch.runtimeRoots.TmpRoot
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("marshal scratch owner marker: %w", err)
 	}
 	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := dispatch.deps.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write scratch owner marker: %w", err)
 	}
 	return nil
@@ -840,6 +867,9 @@ func writeScratchOwner(dispatch *dispatchContext) error {
 func removeOwnedScratch(dispatch *dispatchContext) error {
 	if dispatch == nil || strings.TrimSpace(dispatch.scratch) == "" {
 		return errors.New("scratch path is empty")
+	}
+	if err := validateScratchCleanupDecision(dispatch); err != nil {
+		return err
 	}
 	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
 	data, err := os.ReadFile(path)
@@ -865,6 +895,12 @@ func removeOwnedScratch(dispatch *dispatchContext) error {
 	if dispatchScratch == repoIdentity {
 		return fmt.Errorf("refusing to remove repository root as scratch directory")
 	}
+	if sameOrDescendantPhysicalPath(dispatchScratch, repoIdentity) {
+		return fmt.Errorf("refusing to remove repository ancestor as scratch directory")
+	}
+	if sameOrDescendantPhysicalPath(repoIdentity, dispatchScratch) {
+		return fmt.Errorf("refusing to remove repository descendant as scratch directory")
+	}
 	if dispatch.runtimeRoots.Registered {
 		tmpRoot, err := pathid.Identity(dispatch.runtimeRoots.TmpRoot)
 		if err != nil {
@@ -873,44 +909,96 @@ func removeOwnedScratch(dispatch *dispatchContext) error {
 		if !sameOrDescendantPhysicalPath(tmpRoot, dispatchScratch) || tmpRoot == dispatchScratch {
 			return fmt.Errorf("scratch path is outside registered temp root")
 		}
+		if strings.TrimSpace(record.ScratchRoot) == "" {
+			return fmt.Errorf("scratch owner marker is missing registered scratch root")
+		}
+		recordScratchRoot, err := pathid.Identity(record.ScratchRoot)
+		if err != nil {
+			return fmt.Errorf("resolve scratch owner marker root identity: %w", err)
+		}
+		if subtle.ConstantTimeCompare([]byte(recordScratchRoot), []byte(tmpRoot)) != 1 {
+			return fmt.Errorf("scratch owner marker root does not match registered temp root")
+		}
 	}
 	if record.Version != 1 ||
 		record.Issue != dispatch.opts.IssueNumber ||
 		record.Attempt != dispatch.opts.Attempt ||
+		record.Generation != 1 ||
 		subtle.ConstantTimeCompare([]byte(record.RunID), []byte(dispatch.opts.RunID)) != 1 ||
 		subtle.ConstantTimeCompare([]byte(record.JobID), []byte(dispatch.jobID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(record.OwnerID), []byte(workerOwnershipOwnerID(dispatch))) != 1 ||
 		subtle.ConstantTimeCompare([]byte(recordScratch), []byte(dispatchScratch)) != 1 {
 		return fmt.Errorf("scratch owner marker does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
 	}
 	return dispatch.deps.RemoveAll(dispatch.scratch)
 }
 
+func validateScratchCleanupDecision(dispatch *dispatchContext) error {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return nil
+	}
+	decision := dispatch.tracker.artifactDecision
+	switch decision.State {
+	case artifactDecisionCleanupSelected, artifactDecisionCleanupPartial, artifactDecisionCleanupCompleted:
+	case artifactDecisionPreserveSelected:
+		return fmt.Errorf("refusing scratch cleanup because artifact preservation is selected for %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	default:
+		return fmt.Errorf("refusing scratch cleanup with ambiguous artifact decision state %q", decision.State)
+	}
+	if decision.Generation != 1 ||
+		subtle.ConstantTimeCompare([]byte(decision.OwnerID), []byte(workerOwnershipOwnerID(dispatch))) != 1 ||
+		subtle.ConstantTimeCompare([]byte(decision.ScratchPath), []byte(dispatch.scratch)) != 1 {
+		return fmt.Errorf("artifact cleanup decision does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	}
+	if dispatch.runtimeRoots.Registered {
+		if strings.TrimSpace(decision.ScratchRoot) == "" {
+			return fmt.Errorf("artifact cleanup decision is missing registered scratch root")
+		}
+		decisionRoot, err := pathid.Identity(decision.ScratchRoot)
+		if err != nil {
+			return fmt.Errorf("resolve artifact cleanup decision scratch root: %w", err)
+		}
+		tmpRoot, err := pathid.Identity(dispatch.runtimeRoots.TmpRoot)
+		if err != nil {
+			return fmt.Errorf("resolve registered temp root identity: %w", err)
+		}
+		if subtle.ConstantTimeCompare([]byte(decisionRoot), []byte(tmpRoot)) != 1 {
+			return fmt.Errorf("artifact cleanup decision scratch root does not match registered temp root")
+		}
+	}
+	return nil
+}
+
 func preserveAttemptArtifacts(dispatch *dispatchContext, reason string, preservationErrors []string) {
 	if dispatch == nil {
 		return
 	}
-	manifestPath := state.PreservationManifestPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
-	briefPath := state.RecoveryBriefPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	selectArtifactPreservation(dispatch, reason, preservationErrors)
+	decision := dispatch.tracker.artifactDecision
+	if decision == nil {
+		return
+	}
 	manifest := preservationManifest{
-		Version:             1,
-		RunID:               dispatch.opts.RunID,
-		JobID:               dispatch.jobID,
-		Issue:               dispatch.opts.IssueNumber,
-		Attempt:             dispatch.opts.Attempt,
-		Branch:              dispatch.tracker.branch,
-		Status:              dispatch.tracker.status,
-		Reason:              reason,
-		WorktreePath:        dispatch.worktreePath,
-		ScratchPath:         dispatch.scratch,
-		LogPath:             dispatch.logPath,
-		PromptPath:          dispatch.promptPath,
-		SummaryPath:         dispatch.summaryPath,
-		AttemptPath:         dispatch.attemptPath,
-		RecoveryContextPath: briefPath,
-		ManifestPath:        manifestPath,
-		DisposalGuidance:    "Inspect the preserved worktree and recovery brief before deleting anything. Remove only the listed scratch/worktree paths and branch after confirming the run_id and job_id match this manifest.",
-		PreservationErrors:  append([]string(nil), preservationErrors...),
-		PreservedAt:         state.FormatTimestamp(dispatch.deps.Now()),
+		Version:              1,
+		RunID:                dispatch.opts.RunID,
+		JobID:                dispatch.jobID,
+		Issue:                dispatch.opts.IssueNumber,
+		Attempt:              dispatch.opts.Attempt,
+		Branch:               dispatch.tracker.branch,
+		Status:               dispatch.tracker.status,
+		Reason:               reason,
+		WorktreePath:         decision.WorktreePath,
+		ScratchPath:          decision.ScratchPath,
+		LogPath:              decision.LogPath,
+		PromptPath:           decision.PromptPath,
+		SummaryPath:          decision.SummaryPath,
+		AttemptPath:          decision.AttemptPath,
+		RecoveryContextPath:  decision.RecoveryContextPath,
+		ManifestPath:         decision.ManifestPath,
+		PartialArtifactPaths: append([]string(nil), decision.PartialArtifactPaths...),
+		DisposalGuidance:     "Inspect the preserved worktree and recovery brief before deleting anything. Dispose only with an ownership check that matches this run_id and job_id, generation, owner_id, scratch root, and scratch owner marker.",
+		PreservationErrors:   append([]string(nil), decision.PreservationErrors...),
+		PreservedAt:          state.FormatTimestamp(dispatch.deps.Now()),
 	}
 	if manifest.Branch == "" {
 		manifest.Branch = dispatch.opts.Branch
@@ -918,15 +1006,21 @@ func preserveAttemptArtifacts(dispatch *dispatchContext, reason string, preserva
 	if manifest.Status == "" {
 		manifest.Status = dispatch.cleanupStatus
 	}
-	if err := writePreservationManifest(manifestPath, manifest); err != nil {
+	manifestPath := state.PreservationManifestPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	manifest.ManifestPath = manifestPath
+	if err := writePreservationManifest(dispatch, manifestPath, manifest); err != nil {
 		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write preservation manifest %s: %v\n", manifestPath, err)
 		manifest.PreservationErrors = append(manifest.PreservationErrors, err.Error())
+		manifest.ManifestPath = ""
+		updateArtifactDecisionErrors(dispatch, manifest.PreservationErrors)
+	} else {
+		updateArtifactDecisionManifest(dispatch, manifestPath)
 	}
 	printPreservationManifest(dispatch.warnings, manifest)
 }
 
-func writePreservationManifest(path string, manifest preservationManifest) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+func writePreservationManifest(dispatch *dispatchContext, path string, manifest preservationManifest) error {
+	if err := dispatch.deps.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create preservation directory: %w", err)
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
@@ -934,7 +1028,7 @@ func writePreservationManifest(path string, manifest preservationManifest) error
 		return fmt.Errorf("marshal preservation manifest: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := dispatch.deps.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write preservation manifest: %w", err)
 	}
 	return nil
@@ -972,7 +1066,159 @@ func printPreservationManifest(w io.Writer, manifest preservationManifest) {
 	if len(manifest.PreservationErrors) > 0 {
 		fmt.Fprintf(w, "[loopcoder] preservation incomplete: %s\n", strings.Join(manifest.PreservationErrors, "; "))
 	}
+	if len(manifest.PartialArtifactPaths) > 0 {
+		fmt.Fprintf(w, "[loopcoder] preserved partial artifacts: %s\n", strings.Join(manifest.PartialArtifactPaths, ", "))
+	}
 	fmt.Fprintf(w, "[loopcoder] disposal: %s\n", manifest.DisposalGuidance)
+}
+
+const (
+	artifactDecisionPreserveSelected = "preserve-selected"
+	artifactDecisionCleanupSelected  = "cleanup-selected"
+	artifactDecisionCleanupCompleted = "cleanup-completed"
+	artifactDecisionCleanupPartial   = "cleanup-partial"
+)
+
+func selectArtifactPreservation(dispatch *dispatchContext, reason string, preservationErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil {
+		return
+	}
+	dispatch.preserveArtifacts = true
+	dispatch.preserveReason = firstNonEmpty(reason, dispatch.preserveReason)
+	existing := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	alreadySelected := existing != nil && existing.State == artifactDecisionPreserveSelected
+	decision := buildArtifactDecision(dispatch, artifactDecisionPreserveSelected, dispatch.preserveReason)
+	if alreadySelected {
+		decision.DecidedAt = existing.DecidedAt
+		decision.Generation = existing.Generation
+		decision.ManifestPath = existing.ManifestPath
+	}
+	if existing != nil {
+		decision.PreservationErrors = append(decision.PreservationErrors, existing.PreservationErrors...)
+	}
+	decision.PreservationErrors = sortedUniqueNonEmpty(append(decision.PreservationErrors, preservationErrors...))
+	dispatch.tracker.setArtifactDecision(decision)
+	dispatch.tracker.writeAttempt()
+	if !alreadySelected {
+		dispatch.tracker.appendEvent("artifact_preservation_selected", artifactDecisionPreserveSelected, artifactDecisionEventDetails(decision))
+	}
+}
+
+func selectArtifactCleanup(dispatch *dispatchContext, reason string) {
+	if dispatch == nil || dispatch.tracker == nil {
+		return
+	}
+	decision := buildArtifactDecision(dispatch, artifactDecisionCleanupSelected, reason)
+	dispatch.tracker.setArtifactDecision(decision)
+	dispatch.tracker.writeAttempt()
+	dispatch.tracker.appendEvent("artifact_cleanup_selected", artifactDecisionCleanupSelected, artifactDecisionEventDetails(decision))
+}
+
+func completeArtifactCleanup(dispatch *dispatchContext, cleanupErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	decision.CleanupErrors = append([]string(nil), cleanupErrors...)
+	if len(cleanupErrors) > 0 {
+		decision.State = artifactDecisionCleanupPartial
+	} else {
+		decision.State = artifactDecisionCleanupCompleted
+	}
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+	dispatch.tracker.appendEvent("artifact_cleanup_completed", decision.State, artifactDecisionEventDetails(*decision))
+}
+
+func updateArtifactDecisionManifest(dispatch *dispatchContext, manifestPath string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	if existing, ok := existingArtifactPath(dispatch, "manifest", manifestPath); ok {
+		decision.ManifestPath = existing
+		decision.PartialArtifactPaths = sortedUniqueNonEmpty(append(decision.PartialArtifactPaths, existing))
+	}
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+}
+
+func updateArtifactDecisionErrors(dispatch *dispatchContext, preservationErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	decision.PreservationErrors = sortedUniqueNonEmpty(append(decision.PreservationErrors, preservationErrors...))
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+}
+
+func buildArtifactDecision(dispatch *dispatchContext, stateValue, reason string) state.ArtifactDecision {
+	now := state.FormatTimestamp(dispatch.deps.Now())
+	decision := state.ArtifactDecision{
+		State:      stateValue,
+		Reason:     strings.TrimSpace(reason),
+		Generation: 1,
+		OwnerID:    workerOwnershipOwnerID(dispatch),
+		DecidedAt:  now,
+		UpdatedAt:  now,
+	}
+	if dispatch.runtimeRoots.Registered {
+		decision.ScratchRoot = dispatch.runtimeRoots.TmpRoot
+	}
+	type pathField struct {
+		label string
+		value string
+		set   func(string)
+	}
+	for _, field := range []pathField{
+		{label: "worktree", value: dispatch.worktreePath, set: func(v string) { decision.WorktreePath = v }},
+		{label: "scratch", value: dispatch.scratch, set: func(v string) { decision.ScratchPath = v }},
+		{label: "log", value: dispatch.logPath, set: func(v string) { decision.LogPath = v }},
+		{label: "prompt", value: dispatch.promptPath, set: func(v string) { decision.PromptPath = v }},
+		{label: "summary", value: dispatch.summaryPath, set: func(v string) { decision.SummaryPath = v }},
+		{label: "attempt", value: dispatch.attemptPath, set: func(v string) { decision.AttemptPath = v }},
+		{label: "recovery", value: state.RecoveryBriefPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID), set: func(v string) { decision.RecoveryContextPath = v }},
+	} {
+		existing, ok := existingArtifactPath(dispatch, field.label, field.value)
+		if ok {
+			field.set(existing)
+			decision.PartialArtifactPaths = append(decision.PartialArtifactPaths, existing)
+			continue
+		}
+		if stateValue == artifactDecisionPreserveSelected && strings.TrimSpace(field.value) != "" {
+			decision.PreservationErrors = append(decision.PreservationErrors, fmt.Sprintf("%s path is not preserved because it is absent: %s", field.label, field.value))
+		}
+	}
+	decision.PartialArtifactPaths = sortedUniqueNonEmpty(decision.PartialArtifactPaths)
+	decision.PreservationErrors = sortedUniqueNonEmpty(decision.PreservationErrors)
+	return decision
+}
+
+func existingArtifactPath(dispatch *dispatchContext, _, path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", false
+	}
+	info, err := dispatch.deps.Stat(path)
+	if err != nil || info == nil {
+		return "", false
+	}
+	return path, true
+}
+
+func artifactDecisionEventDetails(decision state.ArtifactDecision) map[string]any {
+	return map[string]any{
+		"state":                  decision.State,
+		"reason":                 decision.Reason,
+		"generation":             decision.Generation,
+		"owner_id":               decision.OwnerID,
+		"scratch_root":           decision.ScratchRoot,
+		"partial_artifact_paths": append([]string(nil), decision.PartialArtifactPaths...),
+	}
 }
 
 type hungHarvestOptions struct {
@@ -1362,6 +1608,15 @@ func withDefaults(deps Deps) Deps {
 	if deps.MkdirTemp == nil {
 		deps.MkdirTemp = defaults.MkdirTemp
 	}
+	if deps.MkdirAll == nil {
+		deps.MkdirAll = defaults.MkdirAll
+	}
+	if deps.WriteFile == nil {
+		deps.WriteFile = defaults.WriteFile
+	}
+	if deps.Stat == nil {
+		deps.Stat = defaults.Stat
+	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = defaults.RemoveAll
 	}
@@ -1521,28 +1776,29 @@ type attemptTrackerOptions struct {
 }
 
 type attemptTracker struct {
-	repoPath       string
-	runID          string
-	jobID          string
-	issue          int
-	attempt        int
-	provider       string
-	pid            int
-	branch         string
-	logPath        string
-	startedAt      string
-	heartbeatAt    string
-	lastProgressAt string
-	phase          string
-	status         string
-	logBytes       int64
-	exitCode       *int
-	errorMessage   *string
-	usage          *reporter.Usage
-	reporter       *reporter.Report
-	now            func() time.Time
-	warnings       io.Writer
-	attemptPath    string
+	repoPath         string
+	runID            string
+	jobID            string
+	issue            int
+	attempt          int
+	provider         string
+	pid              int
+	branch           string
+	logPath          string
+	startedAt        string
+	heartbeatAt      string
+	lastProgressAt   string
+	phase            string
+	status           string
+	logBytes         int64
+	exitCode         *int
+	errorMessage     *string
+	usage            *reporter.Usage
+	reporter         *reporter.Report
+	artifactDecision *state.ArtifactDecision
+	now              func() time.Time
+	warnings         io.Writer
+	attemptPath      string
 }
 
 func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
@@ -1573,6 +1829,10 @@ func (t *attemptTracker) setUsage(usage reporter.Usage) {
 
 func (t *attemptTracker) setReport(record reporter.Report) {
 	t.reporter = cloneReport(&record)
+}
+
+func (t *attemptTracker) setArtifactDecision(decision state.ArtifactDecision) {
+	t.artifactDecision = cloneArtifactDecision(&decision)
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
@@ -1669,23 +1929,24 @@ func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
 
 func (t *attemptTracker) writeAttempt() {
 	record := state.AttemptRecord{
-		Version:        1,
-		JobID:          t.jobID,
-		Issue:          t.issue,
-		Attempt:        t.attempt,
-		Provider:       t.provider,
-		PID:            t.pid,
-		Phase:          t.phase,
-		Status:         t.status,
-		Branch:         t.branch,
-		StartedAt:      t.startedAt,
-		HeartbeatAt:    t.heartbeatAt,
-		LastProgressAt: t.lastProgressAt,
-		LogBytes:       t.logBytes,
-		ExitCode:       t.exitCode,
-		Error:          t.errorMessage,
-		Usage:          cloneUsage(t.usage),
-		Report:         cloneReport(t.reporter),
+		Version:          1,
+		JobID:            t.jobID,
+		Issue:            t.issue,
+		Attempt:          t.attempt,
+		Provider:         t.provider,
+		PID:              t.pid,
+		Phase:            t.phase,
+		Status:           t.status,
+		Branch:           t.branch,
+		StartedAt:        t.startedAt,
+		HeartbeatAt:      t.heartbeatAt,
+		LastProgressAt:   t.lastProgressAt,
+		LogBytes:         t.logBytes,
+		ExitCode:         t.exitCode,
+		Error:            t.errorMessage,
+		Usage:            cloneUsage(t.usage),
+		Report:           cloneReport(t.reporter),
+		ArtifactDecision: cloneArtifactDecision(t.artifactDecision),
 	}
 	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
@@ -1719,6 +1980,32 @@ func cloneUsage(usage *reporter.Usage) *reporter.Usage {
 		clone.TotalTokens = &value
 	}
 	return &clone
+}
+
+func cloneArtifactDecision(decision *state.ArtifactDecision) *state.ArtifactDecision {
+	if decision == nil {
+		return nil
+	}
+	clone := *decision
+	clone.PartialArtifactPaths = append([]string(nil), decision.PartialArtifactPaths...)
+	clone.PreservationErrors = append([]string(nil), decision.PreservationErrors...)
+	clone.CleanupErrors = append([]string(nil), decision.CleanupErrors...)
+	return &clone
+}
+
+func sortedUniqueNonEmpty(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type recoveryBriefOptions struct {
