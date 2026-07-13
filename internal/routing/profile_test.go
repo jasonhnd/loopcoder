@@ -392,6 +392,118 @@ func TestDecideAndPersistRouteRequiresPersistedCurrentPolicyInputs(t *testing.T)
 	}
 }
 
+func TestDecideAndPersistRouteRequiresPersistedProfileBeforeScoring(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	deleteStoredRoutingPolicyProfile(t, ctx, store, profile.RoutingPolicyProfileID)
+
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
+	if _, err := DecideAndPersistRoute(ctx, store, input); !errors.Is(err, taskrequirements.ErrMissingReference) {
+		t.Fatalf("missing profile error = %v, want ErrMissingReference", err)
+	}
+}
+
+func TestDecideAndPersistRouteRejectsStoredProfileMutatedWithOldFingerprint(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	mutated := profile
+	mutated.GraphBounds.MaxTasks++
+	replaceStoredRoutingPolicyProfilePayload(t, ctx, store, mutated)
+
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
+	if _, err := DecideAndPersistRoute(ctx, store, input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("mutated stored profile error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestDecideAndPersistRouteRejectsCallerProfileMutatedWithRecomputedFingerprint(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	stored := BalancedRoutingPolicyProfile(fixture.now)
+	mutated := stored
+	mutated.GraphBounds.MaxTasks++
+	mutated.PolicyFingerprint = ""
+	mutated = normalizeRoutingPolicyProfile(mutated)
+	if err := ValidateRoutingPolicyProfile(mutated); err != nil {
+		t.Fatalf("mutated profile setup should be internally valid: %v", err)
+	}
+
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfile = mutated
+	if _, err := DecideAndPersistRoute(ctx, store, input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("caller-mutated profile error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestDecideAndPersistRouteIDOnlyLoadsStoredProfileSnapshot(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	stored, err := LoadRoutingPolicyProfile(ctx, store, BalancedRoutingPolicyProfile(fixture.now).RoutingPolicyProfileID)
+	if err != nil {
+		t.Fatalf("LoadRoutingPolicyProfile: %v", err)
+	}
+
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfileID = stored.RoutingPolicyProfileID
+	decision, err := DecideAndPersistRoute(ctx, store, input)
+	if err != nil {
+		t.Fatalf("DecideAndPersistRoute id-only: %v", err)
+	}
+	if decision.RoutingPolicyProfile == nil {
+		t.Fatalf("decision missing stored routing policy profile snapshot: %#v", decision)
+	}
+	wantPayload, err := delivery.CanonicalJSON(stored)
+	if err != nil {
+		t.Fatalf("canonical stored profile: %v", err)
+	}
+	gotPayload, err := delivery.CanonicalJSON(*decision.RoutingPolicyProfile)
+	if err != nil {
+		t.Fatalf("canonical decision profile: %v", err)
+	}
+	if string(gotPayload) != string(wantPayload) || decision.PolicyFingerprint != stored.PolicyFingerprint || decision.OptimizationPolicy.PolicyFingerprint != stored.OptimizationPolicy.PolicyFingerprint {
+		t.Fatalf("decision did not use exact stored profile snapshot:\nwant=%s\n got=%s\ndecision=%#v", wantPayload, gotPayload, decision)
+	}
+	loaded, err := LoadRoutingDecision(ctx, store, decision.RoutingDecisionID)
+	if err != nil {
+		t.Fatalf("LoadRoutingDecision: %v", err)
+	}
+	loadedPayload, err := delivery.CanonicalJSON(*loaded.RoutingPolicyProfile)
+	if err != nil {
+		t.Fatalf("canonical loaded decision profile: %v", err)
+	}
+	if string(loadedPayload) != string(wantPayload) {
+		t.Fatalf("persisted decision profile snapshot changed:\nwant=%s\n got=%s", wantPayload, loadedPayload)
+	}
+}
+
 func TestRoleDefinitionPersistenceReplayConflictAndProfileReferences(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -434,4 +546,28 @@ func diagnosticHasCode(diagnostics []PolicyDiagnostic, code taskrequirements.Err
 		}
 	}
 	return false
+}
+
+func deleteStoredRoutingPolicyProfile(t *testing.T, ctx context.Context, store storage.Store, id string) {
+	t.Helper()
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM routing_policy_profiles WHERE routing_policy_profile_id = ?`, id)
+		return err
+	}); err != nil {
+		t.Fatalf("delete stored routing policy profile: %v", err)
+	}
+}
+
+func replaceStoredRoutingPolicyProfilePayload(t *testing.T, ctx context.Context, store storage.Store, profile RoutingPolicyProfile) {
+	t.Helper()
+	payload, err := delivery.CanonicalJSON(profile)
+	if err != nil {
+		t.Fatalf("canonical mutated profile: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE routing_policy_profiles SET payload_json = ?, policy_fingerprint = ? WHERE routing_policy_profile_id = ?`, string(payload), profile.PolicyFingerprint, profile.RoutingPolicyProfileID)
+		return err
+	}); err != nil {
+		t.Fatalf("replace stored routing policy profile payload: %v", err)
+	}
 }

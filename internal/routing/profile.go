@@ -272,15 +272,24 @@ func PersistRoutingPolicyProfile(ctx context.Context, store storage.Store, profi
 }
 
 func LoadRoutingPolicyProfile(ctx context.Context, store storage.Store, id string) (RoutingPolicyProfile, error) {
+	if store == nil {
+		return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
+	}
 	var payload string
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT payload_json FROM routing_policy_profiles WHERE routing_policy_profile_id = ?`, strings.TrimSpace(id)).Scan(&payload)
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "routing policy profile was not persisted"}
+		}
 		return RoutingPolicyProfile{}, err
 	}
 	var profile RoutingPolicyProfile
 	if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+		return RoutingPolicyProfile{}, err
+	}
+	if err := ValidateRoutingPolicyProfile(profile); err != nil {
 		return RoutingPolicyProfile{}, err
 	}
 	return profile, nil

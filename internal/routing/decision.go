@@ -418,29 +418,15 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 		return input, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision authorization fingerprint does not match delivery run"}
 	}
 	input.AuthorizationFingerprint = runAuthorizationFingerprint
-	profile := input.RoutingPolicyProfile
-	if hasRoutingPolicyProfile(profile) {
-		profile = normalizeRoutingPolicyProfile(profile)
-		if err := ValidateRoutingPolicyProfile(profile); err != nil {
-			return input, err
-		}
-		input.RoutingPolicyProfile = profile
-		if strings.TrimSpace(input.RoutingPolicyProfileID) == "" {
-			input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
-		}
-	}
-	policy, err := normalizeOptimizationPolicy(input.OptimizationPolicy, input.RoutingPolicyProfileID)
+	profile, err := resolveStoredDecisionProfile(ctx, store, input)
 	if err != nil {
 		return input, err
 	}
-	activeFingerprint := policy.PolicyFingerprint
-	if hasRoutingPolicyProfile(profile) {
-		activeFingerprint = profile.PolicyFingerprint
+	activeFingerprint := profile.PolicyFingerprint
+	if strings.TrimSpace(input.PolicyFingerprint) != "" && strings.TrimSpace(input.PolicyFingerprint) != activeFingerprint {
+		return input, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller policy fingerprint does not match stored routing policy profile"}
 	}
-	if strings.TrimSpace(input.PolicyFingerprint) != "" {
-		activeFingerprint = strings.TrimSpace(input.PolicyFingerprint)
-	}
-	profileID := firstNonEmpty(input.RoutingPolicyProfileID, policy.RoutingPolicyProfileID)
+	profileID := profile.RoutingPolicyProfileID
 	records, err := LoadActivePolicyInputs(ctx, store, input.ProjectID, input.DeliveryRunID, profileID)
 	if err != nil {
 		return input, err
@@ -452,10 +438,96 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 		return input, err
 	}
 	pins, exclusions := constraintsFromPolicyInputRecords(records)
+	input.RoutingPolicyProfileID = profileID
+	input.RoutingPolicyProfile = profile
+	input.PolicyFingerprint = activeFingerprint
+	input.OptimizationPolicy = profile.OptimizationPolicy
+	input.Inputs.Policy = profile.EligibilityPolicy
 	input.PolicyInputRecords = records
 	input.Inputs.Pins = pins
 	input.Inputs.Exclusions = exclusions
 	return input, nil
+}
+
+func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {
+	profileID := strings.TrimSpace(input.RoutingPolicyProfileID)
+	callerProfile := input.RoutingPolicyProfile
+	if hasRoutingPolicyProfile(callerProfile) {
+		callerProfile = normalizeRoutingPolicyProfile(callerProfile)
+		if err := ValidateRoutingPolicyProfile(callerProfile); err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+		if profileID != "" && profileID != callerProfile.RoutingPolicyProfileID {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile id does not match supplied profile"}
+		}
+		profileID = callerProfile.RoutingPolicyProfileID
+	}
+	if optProfileID := strings.TrimSpace(input.OptimizationPolicy.RoutingPolicyProfileID); optProfileID != "" {
+		if profileID != "" && profileID != optProfileID {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy profile id does not match active profile"}
+		}
+		profileID = optProfileID
+	}
+	if profileID == "" {
+		profileID = defaultStoredRoutingPolicyProfileID(input.Now)
+	}
+	stored, err := LoadRoutingPolicyProfile(ctx, store, profileID)
+	if err != nil {
+		return RoutingPolicyProfile{}, err
+	}
+	if hasRoutingPolicyProfile(callerProfile) {
+		if err := requireSameRoutingPolicyProfile(callerProfile, stored); err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+	}
+	if hasCallerOptimizationPolicy(input.OptimizationPolicy) {
+		if strings.TrimSpace(input.OptimizationPolicy.PolicyFingerprint) != "" && input.OptimizationPolicy.PolicyFingerprint != stored.OptimizationPolicy.PolicyFingerprint {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy fingerprint does not match stored routing policy profile"}
+		}
+		policy, err := normalizeOptimizationPolicy(input.OptimizationPolicy, stored.RoutingPolicyProfileID)
+		if err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+		if policy.PolicyFingerprint != stored.OptimizationPolicy.PolicyFingerprint {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy does not match stored routing policy profile"}
+		}
+	}
+	return stored, nil
+}
+
+func hasCallerOptimizationPolicy(policy OptimizationPolicy) bool {
+	return !isZeroOptimizationPolicy(policy) ||
+		strings.TrimSpace(policy.TieBreakSeed) != "" ||
+		len(policy.LocalAdapterIDs) > 0 ||
+		len(policy.PreferredCandidateIDs) > 0 ||
+		len(policy.DiversityHistory) > 0 ||
+		strings.TrimSpace(policy.PolicyFingerprint) != ""
+}
+
+func requireSameRoutingPolicyProfile(caller, stored RoutingPolicyProfile) error {
+	if caller.RoutingPolicyProfileID != stored.RoutingPolicyProfileID ||
+		caller.ProfileKey != stored.ProfileKey ||
+		caller.ProfileVersion != stored.ProfileVersion ||
+		caller.PolicyVersion != stored.PolicyVersion ||
+		caller.PolicyFingerprint != stored.PolicyFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile identity does not match stored profile"}
+	}
+	callerPayload, err := delivery.CanonicalJSON(caller)
+	if err != nil {
+		return err
+	}
+	storedPayload, err := delivery.CanonicalJSON(stored)
+	if err != nil {
+		return err
+	}
+	if string(callerPayload) != string(storedPayload) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile payload does not match stored profile"}
+	}
+	return nil
+}
+
+func defaultStoredRoutingPolicyProfileID(now time.Time) string {
+	return BalancedRoutingPolicyProfile(now).RoutingPolicyProfileID
 }
 
 func loadRunAuthorizationFingerprint(ctx context.Context, store storage.Store, projectID, deliveryRunID string) (string, error) {
