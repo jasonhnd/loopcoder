@@ -428,6 +428,9 @@ func snapshotsFromCodexBar(source QuotaTelemetrySource, payload codexBarPayload,
 		if !ok {
 			return nil, fmt.Errorf("%w: window_kind", ErrCodexBarMalformed)
 		}
+		if err := validateCodexBarSnapshotValues(snapshot, window); err != nil {
+			return nil, err
+		}
 		confidence, ok := codexBarConfidence(firstNonEmpty(snapshot.Confidence, payload.Source.Confidence))
 		if !ok {
 			return nil, fmt.Errorf("%w: confidence", ErrCodexBarMalformed)
@@ -491,7 +494,7 @@ func snapshotsFromCodexBar(source QuotaTelemetrySource, payload codexBarPayload,
 			UsedValue:            snapshot.UsedValue,
 			RemainingValue:       snapshot.RemainingValue,
 			ReservedValue:        snapshot.ReservedValue,
-			ValueScale:           max(snapshot.ValueScale, 0),
+			ValueScale:           snapshot.ValueScale,
 			Confidence:           confidence,
 			FieldConfidences:     fieldConfidences,
 			FreshnessState:       freshness,
@@ -509,6 +512,26 @@ func snapshotsFromCodexBar(source QuotaTelemetrySource, payload codexBarPayload,
 	return out, nil
 }
 
+func validateCodexBarSnapshotValues(snapshot codexBarSnapshot, window WindowKind) error {
+	if snapshot.ValueScale < 0 {
+		return fmt.Errorf("%w: value_scale", ErrCodexBarMalformed)
+	}
+	for field, value := range map[string]*int64{
+		"limit_value":     snapshot.LimitValue,
+		"used_value":      snapshot.UsedValue,
+		"remaining_value": snapshot.RemainingValue,
+		"reserved_value":  snapshot.ReservedValue,
+	} {
+		if value != nil && *value < 0 {
+			return fmt.Errorf("%w: %s", ErrCodexBarMalformed, field)
+		}
+	}
+	if snapshot.Window.RollingDurationMS < 0 || (window == WindowRolling && snapshot.Window.RollingDurationMS == 0) {
+		return fmt.Errorf("%w: rolling_duration_ms", ErrCodexBarMalformed)
+	}
+	return nil
+}
+
 func runCodexBarQuota(ctx context.Context, req CodexBarRequest) (CodexBarResult, error) {
 	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
 		return CodexBarResult{ExitCode: -1}, errors.New("codexbar argv is empty")
@@ -516,7 +539,7 @@ func runCodexBarQuota(ctx context.Context, req CodexBarRequest) (CodexBarResult,
 	budget := newOutputBudget(req.CombinedLimitBytes)
 	stdout := newBoundedBuffer(req.StdoutLimitBytes, budget)
 	stderr := newBoundedBuffer(req.StderrLimitBytes, budget)
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+	cmd := exec.Command(req.Argv[0], req.Argv[1:]...) // #nosec G204 -- argv is the discovered CodexBar CLI path and fixed quota JSON subcommand.
 	cmd.Dir = firstNonEmpty(req.Cwd, os.TempDir())
 	cmd.Env = append([]string{}, req.Env...)
 	cmd.Stdout = stdout
@@ -617,9 +640,6 @@ func codexBarConfidence(value string) (Confidence, bool) {
 }
 
 func codexBarFreshness(value string) (FreshnessState, bool) {
-	if value == "" || value == "unknown" {
-		return FreshnessFresh, true
-	}
 	switch FreshnessState(value) {
 	case FreshnessFresh, FreshnessStale, FreshnessExpired, FreshnessNotApplicable:
 		return FreshnessState(value), true

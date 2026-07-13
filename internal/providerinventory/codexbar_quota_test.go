@@ -288,6 +288,156 @@ func TestCodexBarFailureFixturesAreTypedAndIsolated(t *testing.T) {
 	}
 }
 
+func TestCodexBarMalformedProviderPayloadsFailClosedAndRemainIsolated(t *testing.T) {
+	exe := writeFakeCodexBar(t)
+	cases := []struct {
+		name   string
+		mutate func(source, snapshot map[string]any)
+	}{
+		{name: "negative-value-scale", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["value_scale"] = -1
+		}},
+		{name: "negative-limit-value", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["limit_value"] = int64(-1)
+		}},
+		{name: "negative-used-value", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["used_value"] = int64(-1)
+		}},
+		{name: "negative-remaining-value", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["remaining_value"] = int64(-1)
+		}},
+		{name: "negative-reserved-value", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["reserved_value"] = int64(-1)
+		}},
+		{name: "negative-rolling-duration", mutate: func(_ map[string]any, snapshot map[string]any) {
+			snapshot["window"] = map[string]any{"kind": "rolling", "rolling_duration_ms": int64(-1), "reset_semantics": "rolling"}
+		}},
+		{name: "absent-freshness", mutate: func(source, snapshot map[string]any) {
+			delete(source, "freshness")
+			delete(snapshot, "freshness_state")
+		}},
+		{name: "unknown-freshness", mutate: func(source, snapshot map[string]any) {
+			source["freshness"] = "unknown"
+			delete(snapshot, "freshness_state")
+		}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			deps := codexBarDeps(t, exe, "codexbar 1.2.3")
+			calls := map[string]int{}
+			deps.RunCodexBar = func(_ context.Context, req CodexBarRequest) (CodexBarResult, error) {
+				provider := req.Argv[indexOfString(req.Argv, "--provider")+1]
+				calls[provider]++
+				switch provider {
+				case "codex":
+					source := map[string]any{"trust_class": "internal-protocol", "confidence": "exact", "freshness": "fresh"}
+					snapshot := codexBarBaseSnapshot()
+					tt.mutate(source, snapshot)
+					return CodexBarResult{Stdout: codexBarPayloadJSONWithSource(t, provider, "codexbar 1.2.3", source, []map[string]any{snapshot}), ExitCode: 0}, nil
+				case "claude":
+					return CodexBarResult{Stdout: codexBarPayloadJSON(t, provider, "credential-delegated", "codexbar 1.2.3", []map[string]any{codexBarSuccessfulSnapshot(7)}), ExitCode: 0}, nil
+				default:
+					t.Fatalf("unexpected provider %q", provider)
+				}
+				return CodexBarResult{}, nil
+			}
+			report, err := Discover(context.Background(), Options{
+				Config: config.Config{ProviderInventory: config.ProviderInventory{CodexBar: config.CodexBar{
+					Enabled: true,
+					Providers: []config.CodexBarProviderOpt{
+						{Provider: "codex", TrustClass: "internal-protocol"},
+						{Provider: "claude", TrustClass: "credential-delegated"},
+					},
+				}}},
+				Now: fixedInventoryNow,
+			}, deps)
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if calls["codex"] != 1 || calls["claude"] != 1 {
+				t.Fatalf("codexbar calls = %#v, want both providers isolated", calls)
+			}
+			bad := codexBarQuotaSnapshot(t, report, "codex")
+			if bad.TerminalErrorCode != "ErrCodexBarMalformedJSON" || bad.Confidence != ConfidenceUnavailable || bad.FreshnessState == FreshnessFresh || !containsString(bad.GapReasons, "codexbar-malformed-json") {
+				t.Fatalf("malformed codex snapshot = %#v", bad)
+			}
+			if bad.LimitValue != nil || bad.UsedValue != nil || bad.RemainingValue != nil || bad.ReservedValue != nil {
+				t.Fatalf("malformed codex snapshot retained values: %#v", bad)
+			}
+			good := codexBarQuotaSnapshot(t, report, "claude")
+			if good.TerminalErrorCode != "" || good.Confidence != ConfidenceExact || good.RemainingValue == nil || *good.RemainingValue != 7 {
+				t.Fatalf("claude success snapshot = %#v", good)
+			}
+
+			storePath := filepath.Join(t.TempDir(), "loopcoder.db")
+			store, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+			if err != nil {
+				t.Fatalf("storage.Open: %v", err)
+			}
+			if err := Refresh(context.Background(), store, report, fixedInventoryNow()); err != nil {
+				store.Close()
+				t.Fatalf("Refresh: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			reopened, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+			if err != nil {
+				t.Fatalf("storage.Open reopened: %v", err)
+			}
+			defer reopened.Close()
+			loaded, err := Load(context.Background(), reopened)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			loadedBad := codexBarQuotaSnapshot(t, loaded, "codex")
+			if loadedBad.TerminalErrorCode != "ErrCodexBarMalformedJSON" || loadedBad.Confidence != ConfidenceUnavailable || loadedBad.FreshnessState == FreshnessFresh || loadedBad.RemainingValue != nil {
+				t.Fatalf("loaded malformed codex snapshot = %#v", loadedBad)
+			}
+			loadedGood := codexBarQuotaSnapshot(t, loaded, "claude")
+			if loadedGood.TerminalErrorCode != "" || loadedGood.RemainingValue == nil || *loadedGood.RemainingValue != 7 {
+				t.Fatalf("loaded claude success snapshot = %#v", loadedGood)
+			}
+		})
+	}
+}
+
+func TestCodexBarValidZeroValuesRemainValid(t *testing.T) {
+	exe := writeFakeCodexBar(t)
+	deps := codexBarDeps(t, exe, "codexbar 1.2.3")
+	deps.RunCodexBar = func(context.Context, CodexBarRequest) (CodexBarResult, error) {
+		return CodexBarResult{Stdout: codexBarPayloadJSON(t, "codex", "internal-protocol", "codexbar 1.2.3", []map[string]any{codexBarSuccessfulSnapshot(0)}), ExitCode: 0}, nil
+	}
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{ProviderInventory: config.ProviderInventory{CodexBar: config.CodexBar{
+			Enabled:   true,
+			Providers: []config.CodexBarProviderOpt{{Provider: "codex", TrustClass: "internal-protocol"}},
+		}}},
+		Now: fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	source := codexBarQuotaSourceFor(t, report, "codex")
+	snapshot := codexBarQuotaSnapshot(t, report, "codex")
+	if snapshot.TerminalErrorCode != "" || snapshot.ValueScale != 0 || snapshot.Confidence != ConfidenceExact {
+		t.Fatalf("zero-value snapshot = %#v", snapshot)
+	}
+	for field, value := range map[string]*int64{
+		"limit_value":     snapshot.LimitValue,
+		"used_value":      snapshot.UsedValue,
+		"remaining_value": snapshot.RemainingValue,
+		"reserved_value":  snapshot.ReservedValue,
+	} {
+		if value == nil || *value != 0 {
+			t.Fatalf("%s = %v, want zero pointer in %#v", field, value, snapshot)
+		}
+	}
+	if err := ValidateQuotaSnapshot(source, snapshot); err != nil {
+		t.Fatalf("ValidateQuotaSnapshot: %v\n%#v", err, snapshot)
+	}
+}
+
 func TestRunCodexBarQuotaTimeoutKillsProcess(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -392,11 +542,16 @@ func writeFakeCodexBar(t *testing.T) string {
 
 func codexBarPayloadJSON(t *testing.T, provider, trustClass, version string, snapshots []map[string]any) string {
 	t.Helper()
+	return codexBarPayloadJSONWithSource(t, provider, version, map[string]any{"trust_class": trustClass, "confidence": "exact", "freshness": "fresh"}, snapshots)
+}
+
+func codexBarPayloadJSONWithSource(t *testing.T, provider, version string, source map[string]any, snapshots []map[string]any) string {
+	t.Helper()
 	payload := map[string]any{
 		"schema_version":   codexBarQuotaSchema,
 		"codexbar_version": version,
 		"provider":         provider,
-		"source":           map[string]any{"trust_class": trustClass, "confidence": "exact", "freshness": "fresh"},
+		"source":           source,
 		"snapshots":        snapshots,
 	}
 	data, err := json.Marshal(payload)
@@ -404,6 +559,31 @@ func codexBarPayloadJSON(t *testing.T, provider, trustClass, version string, sna
 		t.Fatalf("Marshal payload: %v", err)
 	}
 	return string(data)
+}
+
+func codexBarBaseSnapshot() map[string]any {
+	return map[string]any{
+		"quantity_kind":          "requests",
+		"provider_quantity_name": "requests",
+		"unit":                   "requests",
+		"window":                 map[string]any{"kind": "unbounded", "reset_semantics": "none"},
+		"limit_value":            int64(10),
+		"used_value":             int64(3),
+		"remaining_value":        int64(7),
+		"reserved_value":         int64(0),
+		"value_scale":            0,
+		"confidence":             "exact",
+		"freshness_state":        "fresh",
+	}
+}
+
+func codexBarSuccessfulSnapshot(remaining int64) map[string]any {
+	snapshot := codexBarBaseSnapshot()
+	snapshot["limit_value"] = remaining
+	snapshot["used_value"] = int64(0)
+	snapshot["remaining_value"] = remaining
+	snapshot["reserved_value"] = int64(0)
+	return snapshot
 }
 
 func codexBarErrorJSON(t *testing.T, provider, trustClass, version, code string) string {
