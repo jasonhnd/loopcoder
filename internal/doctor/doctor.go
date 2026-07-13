@@ -35,6 +35,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -351,6 +352,16 @@ func RenderJSON(w io.Writer, report Report) error {
 		} `json:"budget_policy"`
 		GapReasons []string `json:"gap_reasons"`
 	}
+	type renderedDecompositionRouting struct {
+		SchemaVersion            string                         `json:"schema_version"`
+		GeneratedAt              string                         `json:"generated_at"`
+		RoutingPolicyProfiles    []routing.RoutingPolicyProfile `json:"routing_policy_profiles"`
+		RoleDefinitions          []routing.RoleDefinition       `json:"role_definitions"`
+		GraphBounds              map[string]any                 `json:"graph_bounds"`
+		EligibilityPolicyVersion string                         `json:"eligibility_policy_version"`
+		FallbackPolicyVersion    string                         `json:"fallback_policy_version"`
+		GapReasons               []string                       `json:"gap_reasons"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
 		surfaces := renderLegacySurfaces(check.LegacySurfaces)
@@ -407,6 +418,19 @@ func RenderJSON(w io.Writer, report Report) error {
 			GapReasons:           gaps,
 		})
 	}
+	decompositionRouting := renderedDecompositionRouting{
+		SchemaVersion:            "loopcoder.decomposition_routing_json.v1",
+		GeneratedAt:              report.Date,
+		RoutingPolicyProfiles:    routing.BuiltInRoutingPolicyProfiles(parseReportTime(report.Date)),
+		RoleDefinitions:          routing.BuiltInRoleDefinitions(),
+		GraphBounds:              map[string]any{},
+		EligibilityPolicyVersion: routing.PolicyVersion,
+		FallbackPolicyVersion:    "0804.fallback.v1",
+		GapReasons:               decompositionRoutingGaps(report),
+	}
+	for _, profile := range decompositionRouting.RoutingPolicyProfiles {
+		decompositionRouting.GraphBounds[profile.ProfileKey] = profile.GraphBounds
+	}
 	payload := struct {
 		RepoPath              string                          `json:"repo_path"`
 		Version               string                          `json:"version"`
@@ -417,6 +441,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		HostNegotiation       runtimecap.HostNegotiation      `json:"host_capability_negotiation"`
 		Runtime               renderedRuntime                 `json:"runtime"`
 		AgentFederation       renderedAgentFederation         `json:"agent_federation"`
+		DecompositionRouting  renderedDecompositionRouting    `json:"decomposition_routing"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
 		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
 		QuotaUsageBudget      usageledger.QuotaUsageBudget    `json:"quota_usage_budget"`
@@ -439,6 +464,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		},
 		HostNegotiation:       normalizeHostNegotiation(report),
 		AgentFederation:       agentFederation,
+		DecompositionRouting:  decompositionRouting,
 		ProviderCompatibility: compatibility,
 		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
 		QuotaUsageBudget:      normalizeQuotaUsageBudget(report.QuotaUsageBudget),
@@ -539,6 +565,51 @@ func normalizeQuotaUsageBudget(report usageledger.QuotaUsageBudget) usageledger.
 		report.GapReasons = []string{}
 	}
 	return report
+}
+
+func parseReportTime(value string) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+		return t.UTC()
+	}
+	return time.Unix(0, 0).UTC()
+}
+
+func decompositionRoutingGaps(report Report) []string {
+	gaps := append([]string(nil), report.ProviderInventory.GapReasons...)
+	if len(report.ProviderInventory.Installations) == 0 {
+		gaps = append(gaps, "provider-inventory-missing")
+	}
+	if len(report.ProviderInventory.ModelCapabilities) == 0 {
+		gaps = append(gaps, "model-capability-inventory-missing")
+	}
+	for _, model := range report.ProviderInventory.ModelCapabilities {
+		if model.FreshnessState == providerinventory.FreshnessStale || model.FreshnessState == providerinventory.FreshnessExpired {
+			gaps = append(gaps, "stale-model-capability")
+			break
+		}
+	}
+	for _, auth := range report.ProviderInventory.AuthReadiness {
+		if auth.ReadinessState != providerinventory.ReadinessReady || auth.FreshnessState == providerinventory.FreshnessStale || auth.FreshnessState == providerinventory.FreshnessExpired {
+			gaps = append(gaps, "stale-or-unready-auth-readiness")
+			break
+		}
+	}
+	sort.Strings(gaps)
+	return dedupeDoctorStrings(gaps)
+}
+
+func dedupeDoctorStrings(values []string) []string {
+	out := values[:0]
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func renderLegacySurfaces(surfaces []LegacySurface) []renderedLegacySurface {

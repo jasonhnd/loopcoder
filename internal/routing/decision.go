@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -89,19 +90,23 @@ type SelectedRouteRef struct {
 }
 
 type DecisionInput struct {
-	ProjectID              string
-	DeliveryRunID          string
-	DecisionKey            string
-	TaskRequirementID      string
-	RoleDefinitionID       string
-	PlanFingerprint        string
-	PolicyFingerprint      string
-	RoutingPolicyProfileID string
-	Inputs                 Inputs
-	OptimizationPolicy     OptimizationPolicy
-	DecidedBy              delivery.Actor
-	Host                   delivery.Host
-	Now                    time.Time
+	ProjectID                string
+	DeliveryRunID            string
+	DecisionKey              string
+	TaskRequirementID        string
+	RoleDefinitionID         string
+	PlanFingerprint          string
+	PolicyFingerprint        string
+	AuthorizationFingerprint string
+	RoutingPolicyProfileID   string
+	RoutingPolicyProfile     RoutingPolicyProfile
+	PolicyInputRecords       []PolicyInputRecord
+	OverrideProvenance       []OverrideProvenance
+	Inputs                   Inputs
+	OptimizationPolicy       OptimizationPolicy
+	DecidedBy                delivery.Actor
+	Host                     delivery.Host
+	Now                      time.Time
 }
 
 type InputRecordRef struct {
@@ -162,6 +167,9 @@ type RoutingDecision struct {
 	UserPinRefs               []string                   `json:"user_pin_refs"`
 	FallbackChain             []string                   `json:"fallback_chain"`
 	BreakerGateRefs           []string                   `json:"breaker_gate_refs"`
+	RoutingPolicyProfile      *RoutingPolicyProfile      `json:"routing_policy_profile,omitempty"`
+	PolicyInputRecords        []PolicyInputRecord        `json:"policy_input_records,omitempty"`
+	OverrideProvenance        []OverrideProvenance       `json:"override_provenance,omitempty"`
 	OptimizationPolicy        OptimizationPolicy         `json:"optimization_policy"`
 	HeuristicComponents       []ComponentScore           `json:"heuristic_components"`
 	DecisionStatus            string                     `json:"decision_status"`
@@ -178,6 +186,11 @@ func DecideAndPersistRoute(ctx context.Context, store storage.Store, input Decis
 		return RoutingDecision{}, errors.New("routing decision: storage store is required")
 	}
 	input.Now = store.Now()
+	prepared, err := prepareDecisionInputFromStore(ctx, store, input)
+	if err != nil {
+		return RoutingDecision{}, err
+	}
+	input = prepared
 	decision, err := BuildRoutingDecision(input)
 	if err != nil {
 		return RoutingDecision{}, err
@@ -199,14 +212,37 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if strings.TrimSpace(input.ProjectID) == "" || strings.TrimSpace(input.DeliveryRunID) == "" || strings.TrimSpace(input.DecisionKey) == "" {
 		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "project_id, delivery_run_id, and decision_key are required"}
 	}
+	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
+		profile := normalizeRoutingPolicyProfile(input.RoutingPolicyProfile)
+		if err := ValidateRoutingPolicyProfile(profile); err != nil {
+			return RoutingDecision{}, err
+		}
+		input.RoutingPolicyProfile = profile
+		if strings.TrimSpace(input.RoutingPolicyProfileID) == "" {
+			input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
+		}
+		if isZeroOptimizationPolicy(input.OptimizationPolicy) {
+			input.OptimizationPolicy = profile.OptimizationPolicy
+		}
+		if isZeroHardPolicy(input.Inputs.Policy) {
+			input.Inputs.Policy = profile.EligibilityPolicy
+		}
+	}
 	policy, err := normalizeOptimizationPolicy(input.OptimizationPolicy, input.RoutingPolicyProfileID)
 	if err != nil {
 		return RoutingDecision{}, err
 	}
+	expectedPolicyFingerprint := policy.PolicyFingerprint
+	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
+		expectedPolicyFingerprint = input.RoutingPolicyProfile.PolicyFingerprint
+	}
 	if strings.TrimSpace(input.PolicyFingerprint) == "" {
-		input.PolicyFingerprint = policy.PolicyFingerprint
-	} else if strings.TrimSpace(input.PolicyFingerprint) != policy.PolicyFingerprint {
-		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "policy fingerprint does not match routing optimization policy"}
+		input.PolicyFingerprint = expectedPolicyFingerprint
+	} else if strings.TrimSpace(input.PolicyFingerprint) != expectedPolicyFingerprint {
+		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "policy fingerprint does not match routing policy profile"}
+	}
+	if diagnostics := ValidateOverrideProvenance(input.OverrideProvenance, input.Now, expectedPolicyFingerprint, input.AuthorizationFingerprint); len(diagnostics) > 0 {
+		return RoutingDecision{}, &taskrequirements.TypedError{Code: diagnostics[0].Code, Message: diagnostics[0].Message}
 	}
 	if err := validateDecisionInput(input, policy); err != nil {
 		return RoutingDecision{}, err
@@ -242,12 +278,18 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 		UserPinRefs:               nonNilStrings(pinIDs(input.Inputs.Pins)),
 		FallbackChain:             []string{},
 		BreakerGateRefs:           nonNilStrings(breakerRefs(eligibility)),
+		PolicyInputRecords:        nonNilPolicyInputRecords(input.PolicyInputRecords),
+		OverrideProvenance:        nonNilOverrideProvenance(input.OverrideProvenance),
 		OptimizationPolicy:        policy,
 		RejectedSummary:           rejectedSummary(eligibility.Rejected),
 		CreatedAt:                 delivery.CanonicalTimestamp(input.Now),
 		UpdatedAt:                 delivery.CanonicalTimestamp(input.Now),
 		DecidedBy:                 input.DecidedBy,
 		Host:                      input.Host,
+	}
+	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
+		profile := input.RoutingPolicyProfile
+		decision.RoutingPolicyProfile = &profile
 	}
 	decision.RoutingDecisionID = routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint)
 	decision.ScoredCandidates = scoreCandidates(eligibility.Eligible, input.Inputs, policy)
@@ -367,6 +409,145 @@ func LoadRoutingDecision(ctx context.Context, store storage.Store, routingDecisi
 	return decision, nil
 }
 
+func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, input DecisionInput) (DecisionInput, error) {
+	runAuthorizationFingerprint, err := loadRunAuthorizationFingerprint(ctx, store, input.ProjectID, input.DeliveryRunID)
+	if err != nil {
+		return input, err
+	}
+	if strings.TrimSpace(input.AuthorizationFingerprint) != "" && input.AuthorizationFingerprint != runAuthorizationFingerprint {
+		return input, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision authorization fingerprint does not match delivery run"}
+	}
+	input.AuthorizationFingerprint = runAuthorizationFingerprint
+	profile, err := resolveStoredDecisionProfile(ctx, store, input)
+	if err != nil {
+		return input, err
+	}
+	activeFingerprint := profile.PolicyFingerprint
+	if strings.TrimSpace(input.PolicyFingerprint) != "" && strings.TrimSpace(input.PolicyFingerprint) != activeFingerprint {
+		return input, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller policy fingerprint does not match stored routing policy profile"}
+	}
+	profileID := profile.RoutingPolicyProfileID
+	records, err := LoadActivePolicyInputs(ctx, store, input.ProjectID, input.DeliveryRunID, profileID)
+	if err != nil {
+		return input, err
+	}
+	if err := validateStoredPolicyInputsForDecision(records, input, profileID, activeFingerprint); err != nil {
+		return input, err
+	}
+	if err := requireCallerInputsPersisted(input.Inputs.Pins, input.Inputs.Exclusions, records); err != nil {
+		return input, err
+	}
+	pins, exclusions := constraintsFromPolicyInputRecords(records)
+	input.RoutingPolicyProfileID = profileID
+	input.RoutingPolicyProfile = profile
+	input.PolicyFingerprint = activeFingerprint
+	input.OptimizationPolicy = profile.OptimizationPolicy
+	input.Inputs.Policy = profile.EligibilityPolicy
+	input.PolicyInputRecords = records
+	input.Inputs.Pins = pins
+	input.Inputs.Exclusions = exclusions
+	return input, nil
+}
+
+func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {
+	profileID := strings.TrimSpace(input.RoutingPolicyProfileID)
+	callerProfile := input.RoutingPolicyProfile
+	if hasRoutingPolicyProfile(callerProfile) {
+		callerProfile = normalizeRoutingPolicyProfile(callerProfile)
+		if err := ValidateRoutingPolicyProfile(callerProfile); err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+		if profileID != "" && profileID != callerProfile.RoutingPolicyProfileID {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile id does not match supplied profile"}
+		}
+		profileID = callerProfile.RoutingPolicyProfileID
+	}
+	if optProfileID := strings.TrimSpace(input.OptimizationPolicy.RoutingPolicyProfileID); optProfileID != "" {
+		if profileID != "" && profileID != optProfileID {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy profile id does not match active profile"}
+		}
+		profileID = optProfileID
+	}
+	if profileID == "" {
+		profileID = defaultStoredRoutingPolicyProfileID(input.Now)
+	}
+	stored, err := LoadRoutingPolicyProfile(ctx, store, profileID)
+	if err != nil {
+		return RoutingPolicyProfile{}, err
+	}
+	if hasRoutingPolicyProfile(callerProfile) {
+		if err := requireSameRoutingPolicyProfile(callerProfile, stored); err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+	}
+	if hasCallerOptimizationPolicy(input.OptimizationPolicy) {
+		if strings.TrimSpace(input.OptimizationPolicy.PolicyFingerprint) != "" && input.OptimizationPolicy.PolicyFingerprint != stored.OptimizationPolicy.PolicyFingerprint {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy fingerprint does not match stored routing policy profile"}
+		}
+		policy, err := normalizeOptimizationPolicy(input.OptimizationPolicy, stored.RoutingPolicyProfileID)
+		if err != nil {
+			return RoutingPolicyProfile{}, err
+		}
+		if policy.PolicyFingerprint != stored.OptimizationPolicy.PolicyFingerprint {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller optimization policy does not match stored routing policy profile"}
+		}
+	}
+	return stored, nil
+}
+
+func hasCallerOptimizationPolicy(policy OptimizationPolicy) bool {
+	return !isZeroOptimizationPolicy(policy) ||
+		strings.TrimSpace(policy.TieBreakSeed) != "" ||
+		len(policy.LocalAdapterIDs) > 0 ||
+		len(policy.PreferredCandidateIDs) > 0 ||
+		len(policy.DiversityHistory) > 0 ||
+		strings.TrimSpace(policy.PolicyFingerprint) != ""
+}
+
+func requireSameRoutingPolicyProfile(caller, stored RoutingPolicyProfile) error {
+	if caller.RoutingPolicyProfileID != stored.RoutingPolicyProfileID ||
+		caller.ProfileKey != stored.ProfileKey ||
+		caller.ProfileVersion != stored.ProfileVersion ||
+		caller.PolicyVersion != stored.PolicyVersion ||
+		caller.PolicyFingerprint != stored.PolicyFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile identity does not match stored profile"}
+	}
+	callerPayload, err := delivery.CanonicalJSON(caller)
+	if err != nil {
+		return err
+	}
+	storedPayload, err := delivery.CanonicalJSON(stored)
+	if err != nil {
+		return err
+	}
+	if string(callerPayload) != string(storedPayload) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "caller routing policy profile payload does not match stored profile"}
+	}
+	return nil
+}
+
+func defaultStoredRoutingPolicyProfileID(now time.Time) string {
+	return BalancedRoutingPolicyProfile(now).RoutingPolicyProfileID
+}
+
+func loadRunAuthorizationFingerprint(ctx context.Context, store storage.Store, projectID, deliveryRunID string) (string, error) {
+	var auth string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT authorization_fingerprint FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`,
+			strings.TrimSpace(projectID), strings.TrimSpace(deliveryRunID)).Scan(&auth)
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "delivery run authorization binding was not found"}
+		}
+		return "", err
+	}
+	if !validFingerprint(auth) {
+		return "", &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "stored delivery run authorization fingerprint is invalid"}
+	}
+	return auth, nil
+}
+
 func ExplainJSON(decision RoutingDecision) ([]byte, error) {
 	return delivery.CanonicalJSON(decision)
 }
@@ -377,6 +558,12 @@ func ExplainHuman(decision RoutingDecision) string {
 		fmt.Fprintf(&b, "selected %s: %s\n", decision.ChosenCandidateID, decision.ChosenReason)
 	} else {
 		fmt.Fprintf(&b, "blocked %s: %s\n", decision.DecisionStatus, decision.TerminalErrorCode)
+	}
+	if decision.RoutingPolicyProfile != nil {
+		fmt.Fprintf(&b, "profile %s version %s fingerprint %s\n", decision.RoutingPolicyProfile.ProfileKey, decision.RoutingPolicyProfile.ProfileVersion, decision.RoutingPolicyProfile.PolicyFingerprint)
+	}
+	for _, override := range decision.OverrideProvenance {
+		fmt.Fprintf(&b, "override %s: %s scope=%s actor=%s expires=%s fingerprint=%s\n", override.OverrideID, override.Reason, override.Scope, override.Actor.ActorID, firstNonEmpty(override.ExpiresAt, "none"), override.PolicyFingerprint)
 	}
 	for _, candidate := range decision.ScoredCandidates {
 		if candidate.RoutingCandidateID == decision.ChosenCandidateID {
@@ -466,7 +653,7 @@ func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (O
 }
 
 func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result Result, refs []InputRecordRef) (string, error) {
-	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
+	payload := map[string]any{
 		"schema_version":      "loopcoder.routing_fingerprint_input.v1",
 		"decision_key":        input.DecisionKey,
 		"project_id":          input.ProjectID,
@@ -484,7 +671,17 @@ func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result R
 		"user_pins":           input.Inputs.Pins,
 		"exclusions":          input.Inputs.Exclusions,
 		"worker_route":        input.Inputs.WorkerRoute,
-	})
+	}
+	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
+		payload["routing_profile"] = input.RoutingPolicyProfile
+	}
+	if len(input.OverrideProvenance) > 0 {
+		payload["override_provenance"] = input.OverrideProvenance
+	}
+	if len(input.PolicyInputRecords) > 0 {
+		payload["policy_input_records"] = input.PolicyInputRecords
+	}
+	digest, _, err := delivery.DigestCanonicalJSON(payload)
 	return digest, err
 }
 
@@ -852,6 +1049,18 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	for _, pin := range input.Inputs.Pins {
 		addRef("user_pin", pin.PinID, "")
 	}
+	for _, exclusion := range input.Inputs.Exclusions {
+		addRef("user_exclusion", exclusion.ExclusionID, "")
+	}
+	for _, record := range input.PolicyInputRecords {
+		addRef("routing_policy_input", record.RoutingPolicyInputID, record.PolicyFingerprint)
+	}
+	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
+		addRef("routing_policy_profile", input.RoutingPolicyProfile.RoutingPolicyProfileID, input.RoutingPolicyProfile.PolicyFingerprint)
+	}
+	for _, override := range input.OverrideProvenance {
+		addRef("override", override.OverrideID, override.PolicyFingerprint)
+	}
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].RecordKind != refs[j].RecordKind {
 			return refs[i].RecordKind < refs[j].RecordKind
@@ -972,6 +1181,45 @@ func nonNilRejectedCandidates(values []RejectedCandidate) []RejectedCandidate {
 	return values
 }
 
+func nonNilOverrideProvenance(values []OverrideProvenance) []OverrideProvenance {
+	if values == nil {
+		return []OverrideProvenance{}
+	}
+	return values
+}
+
+func nonNilPolicyInputRecords(values []PolicyInputRecord) []PolicyInputRecord {
+	if values == nil {
+		return []PolicyInputRecord{}
+	}
+	return values
+}
+
+func hasRoutingPolicyProfile(profile RoutingPolicyProfile) bool {
+	return strings.TrimSpace(profile.RoutingPolicyProfileID) != "" ||
+		strings.TrimSpace(profile.ProfileKey) != "" ||
+		strings.TrimSpace(profile.PolicyFingerprint) != ""
+}
+
+func isZeroOptimizationPolicy(policy OptimizationPolicy) bool {
+	return strings.TrimSpace(policy.SchemaVersion) == "" &&
+		strings.TrimSpace(policy.RoutingPolicyProfileID) == "" &&
+		strings.TrimSpace(policy.ProfileKey) == "" &&
+		strings.TrimSpace(policy.PolicyVersion) == "" &&
+		len(policy.Weights) == 0
+}
+
+func isZeroHardPolicy(policy Policy) bool {
+	return policy.EvidencePolicy == "" &&
+		!policy.RequireExactQuota &&
+		!policy.RequireBudgetEvidence &&
+		!policy.RequireAvailabilityEvidence &&
+		!policy.RequireBoundedScope &&
+		policy.ContextReserveTokens == 0 &&
+		policy.VerifierIndependence == "" &&
+		!policy.AllowHalfOpenBreakerProbe
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1027,8 +1275,12 @@ func validateRoutingDecision(decision RoutingDecision) error {
 	if !validFingerprint(decision.PlanFingerprint) || !validFingerprint(decision.PolicyFingerprint) || !validFingerprint(decision.RoutingFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision fingerprints must be sha256 digests"}
 	}
-	if decision.PolicyFingerprint != decision.OptimizationPolicy.PolicyFingerprint {
-		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision policy fingerprint does not match optimization policy"}
+	expectedPolicyFingerprint := decision.OptimizationPolicy.PolicyFingerprint
+	if decision.RoutingPolicyProfile != nil {
+		expectedPolicyFingerprint = decision.RoutingPolicyProfile.PolicyFingerprint
+	}
+	if decision.PolicyFingerprint != expectedPolicyFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision policy fingerprint does not match active routing policy"}
 	}
 	if decision.RoutingDecisionID != routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision id does not match routing fingerprint"}

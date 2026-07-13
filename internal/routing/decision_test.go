@@ -330,11 +330,18 @@ func TestRouteDecisionWeightChangeCreatesNewPolicyVersionWithoutRewritingHistory
 	seedRoutingDecisionStore(t, ctx, store, fixture.now)
 
 	input := replayDecisionInput(fixture)
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
 	first, err := DecideAndPersistRoute(ctx, store, input)
 	if err != nil {
 		t.Fatalf("DecideAndPersistRoute first: %v", err)
 	}
-	input.OptimizationPolicy.Weights = map[ComponentName]int{
+	changed := profile
+	changed.ProfileVersion = "2"
+	changed.RoutingPolicyProfileID = ""
+	changed.PolicyFingerprint = ""
+	changed.OptimizationPolicy.PolicyVersion = ""
+	changed.OptimizationPolicy.Weights = map[ComponentName]int{
 		ComponentAvailability:   10,
 		ComponentQualityFit:     20,
 		ComponentQuotaHeadroom:  10,
@@ -344,6 +351,11 @@ func TestRouteDecisionWeightChangeCreatesNewPolicyVersionWithoutRewritingHistory
 		ComponentLocality:       20,
 		ComponentUserPreference: 10,
 	}
+	changed, err = PersistRoutingPolicyProfile(ctx, store, changed)
+	if err != nil {
+		t.Fatalf("PersistRoutingPolicyProfile changed version: %v", err)
+	}
+	input.RoutingPolicyProfileID = changed.RoutingPolicyProfileID
 	second, err := DecideAndPersistRoute(ctx, store, input)
 	if err != nil {
 		t.Fatalf("DecideAndPersistRoute changed weights: %v", err)
@@ -468,6 +480,9 @@ func seedRoutingDecisionStore(t *testing.T, ctx context.Context, store storage.S
 	})
 	if err != nil {
 		t.Fatalf("seed storage: %v", err)
+	}
+	if _, err := EnsureBuiltInRoutingPolicyProfiles(ctx, store, now); err != nil {
+		t.Fatalf("seed routing policy profiles: %v", err)
 	}
 }
 

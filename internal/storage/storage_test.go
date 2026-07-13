@@ -33,13 +33,51 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
 	}
+	var migrationName string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 22`).Scan(&migrationName)
+	}); err != nil {
+		t.Fatalf("query migration 22: %v", err)
+	}
+	if migrationName != "versioned routing policy profiles" {
+		t.Fatalf("migration 22 name = %q", migrationName)
+	}
 	if tableColumnExists(t, store, "routing_decisions", "alternatives_json") {
 		t.Fatalf("routing_decisions includes non-v1 alternatives_json column")
+	}
+}
+
+func TestOpenRerunsRoutingPolicyProfileMigrationIdempotently(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close first store: %v", err)
+	}
+	reopened, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("reopen returned error: %v", err)
+	}
+	defer reopened.Close()
+	health, err := reopened.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if !health.OK || health.SchemaVersion != CurrentSchemaVersion {
+		t.Fatalf("health = %#v, want schema %d", health, CurrentSchemaVersion)
+	}
+	for _, table := range []string{"routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings"} {
+		if !tableExists(t, reopened, table) {
+			t.Fatalf("missing table %s after reopen", table)
+		}
 	}
 }
 
