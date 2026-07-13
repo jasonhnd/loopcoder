@@ -389,7 +389,7 @@ func TestEmitterOverlappingInstancesAllocateDistinctSequences(t *testing.T) {
 	}
 }
 
-func TestSupervisorTerminalCorrelationDoesNotCloseSiblingsAndCanRestart(t *testing.T) {
+func TestSupervisorTerminalCorrelationDoesNotCloseSiblings(t *testing.T) {
 	ctx := context.Background()
 	clock := newManualClock(fixedTime)
 	store := newClockStore(t, ctx, clock)
@@ -429,12 +429,12 @@ func TestSupervisorTerminalCorrelationDoesNotCloseSiblingsAndCanRestart(t *testi
 	}
 	taskA.Status = "running-after-terminal"
 	taskA.Phase = "restarted"
-	if _, err := supervisor.Emit(ctx, taskA); err != nil {
-		t.Fatalf("Emit task A after terminal should restart correlation: %v", err)
+	if _, err := supervisor.Emit(ctx, taskA); !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("Emit task A after terminal error = %v, want ErrEmitterClosed", err)
 	}
 
 	clock.Advance(5 * time.Minute)
-	waitForReceiptCount(t, ctx, store, 6)
+	waitForReceiptCount(t, ctx, store, 5)
 	if err := supervisor.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -446,13 +446,65 @@ func TestSupervisorTerminalCorrelationDoesNotCloseSiblingsAndCanRestart(t *testi
 	if err != nil {
 		t.Fatalf("ListReceipts task B: %v", err)
 	}
-	if len(taskAReceipts) < 3 ||
+	if len(taskAReceipts) != 2 ||
 		!receiptsContainStatus(taskAReceipts, "succeeded") ||
-		!receiptsContainStatus(taskAReceipts, "running-after-terminal") {
-		t.Fatalf("task A receipts = %#v, want initial + terminal + restarted state", taskAReceipts)
+		receiptsContainStatus(taskAReceipts, "running-after-terminal") {
+		t.Fatalf("task A receipts = %#v, want initial + terminal only", taskAReceipts)
 	}
 	if len(taskBReceipts) != 3 || !containsString(taskBReceipts[len(taskBReceipts)-1].GapReasons, "max-generation-silence") {
 		t.Fatalf("task B receipts = %#v, want sibling state change and periodic max-silence", taskBReceipts)
+	}
+}
+
+func TestSupervisorTerminalBlocksConcurrentSameCorrelationEmit(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t, ctx)
+	defer base.Close()
+	blocking := newBlockingWriteStoreAfter(base, 0)
+	supervisor, err := NewSupervisor(SupervisorOptions{
+		Store:              blocking,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		MaxSilenceInterval: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+
+	terminalDone := make(chan error, 1)
+	go func() {
+		obs := terminalObservation(fixedTime)
+		obs.CorrelationID = "task:a"
+		obs.TaskID = "a"
+		_, err := supervisor.Terminal(ctx, obs)
+		terminalDone <- err
+	}()
+	<-blocking.entered
+
+	ordinaryDone := make(chan error, 1)
+	go func() {
+		obs := runningObservation(fixedTime.Add(time.Second))
+		obs.CorrelationID = "task:a"
+		obs.TaskID = "a"
+		_, err := supervisor.Emit(ctx, obs)
+		ordinaryDone <- err
+	}()
+
+	select {
+	case err := <-ordinaryDone:
+		t.Fatalf("ordinary emit completed before terminal barrier released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(blocking.release)
+	if err := <-terminalDone; err != nil {
+		t.Fatalf("Terminal: %v", err)
+	}
+	if err := <-ordinaryDone; !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("ordinary emit after terminal error = %v, want ErrEmitterClosed", err)
+	}
+	if got := countReceipts(t, ctx, base); got != 1 {
+		t.Fatalf("receipt count = %d, want terminal only", got)
 	}
 }
 

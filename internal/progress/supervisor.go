@@ -76,20 +76,11 @@ func (s *Supervisor) Terminal(ctx context.Context, observation Observation) (Emi
 	if s == nil {
 		return EmitResult{}, ErrEmitterClosed
 	}
-	correlationID := observationCorrelationID(observation, s.opts.DeliveryRunID)
 	emitter, err := s.emitterFor(ctx, observation)
 	if err != nil {
 		return EmitResult{}, err
 	}
-	result, err := emitter.Terminal(ctx, observation)
-	if err == nil {
-		s.mu.Lock()
-		if s.emitters[correlationID] == emitter {
-			delete(s.emitters, correlationID)
-		}
-		s.mu.Unlock()
-	}
-	return result, err
+	return emitter.Terminal(ctx, observation)
 }
 
 func (s *Supervisor) Stop(ctx context.Context) error {

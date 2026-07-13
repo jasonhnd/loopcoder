@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -192,17 +195,18 @@ func TestTickPreProdHealthProgressCorrelationsArePerItem(t *testing.T) {
 	}
 }
 
-func TestTickPreProdHealthProgressTerminalizesEveryReadOutcome(t *testing.T) {
+func TestTickPreProdHealthProgressTerminalizesOnlyClosedOutcomes(t *testing.T) {
 	now := time.Date(2026, 7, 2, 13, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name       string
 		checks     []gh.Check
 		readErr    error
 		wantStatus string
+		terminal   bool
 	}{
-		{name: "red", checks: []gh.Check{{Name: "verify", Bucket: "fail"}}, wantStatus: PreProdHealthStatusRed},
-		{name: "pending", checks: []gh.Check{{Name: "verify", Bucket: "pending"}}, wantStatus: PreProdHealthStatusPending},
-		{name: "read error", readErr: errors.New("branch checks unavailable"), wantStatus: PreProdHealthStatusUnknown},
+		{name: "red", checks: []gh.Check{{Name: "verify", Bucket: "fail"}}, wantStatus: PreProdHealthStatusRed, terminal: true},
+		{name: "pending", checks: []gh.Check{{Name: "verify", Bucket: "pending"}}, wantStatus: PreProdHealthStatusPending, terminal: false},
+		{name: "read error", readErr: errors.New("branch checks unavailable"), wantStatus: PreProdHealthStatusUnknown, terminal: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -228,8 +232,12 @@ func TestTickPreProdHealthProgressTerminalizesEveryReadOutcome(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Tick returned error: %v", err)
 			}
-			if !progressRecorder.hasTerminal("pre-prod-health", tt.wantStatus) {
-				t.Fatalf("progress observations = %#v, want terminal pre-prod-health status %s", progressRecorder.observations, tt.wantStatus)
+			gotTerminal := progressRecorder.hasTerminal("pre-prod-health", tt.wantStatus)
+			if gotTerminal != tt.terminal {
+				t.Fatalf("progress observations = %#v, terminal(%s) = %t, want %t", progressRecorder.observations, tt.wantStatus, gotTerminal, tt.terminal)
+			}
+			if !tt.terminal && !progressRecorder.hasStatus(tt.wantStatus) {
+				t.Fatalf("progress observations = %#v, want active pre-prod-health status %s", progressRecorder.observations, tt.wantStatus)
 			}
 			for _, observation := range progressRecorder.observations {
 				if observation.Phase == "pre-prod-health" && !observation.OccurredAt.Equal(now) {
@@ -237,6 +245,58 @@ func TestTickPreProdHealthProgressTerminalizesEveryReadOutcome(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTickPreProdHealthPendingStaysActiveUntilGreenTerminal(t *testing.T) {
+	ctx := context.Background()
+	clock := newOrchestrationManualClock(time.Date(2026, 7, 2, 15, 0, 0, 0, time.UTC))
+	store := newOrchestrationProgressStore(t, ctx, clock, "proj_progress")
+	defer store.Close()
+	supervisor, err := progress.NewSupervisor(progress.SupervisorOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run-ci",
+		RunID:              "run-ci",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	defer func() {
+		if err := supervisor.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop supervisor: %v", err)
+		}
+	}()
+
+	correlationID := ciProgressCorrelation("run-ci", 43, "430", "pre-prod-health", "merge-sha")
+	emitCIProgress(ctx, supervisor, clock.Now(), "run-ci", 43, "430", "pre-prod-health", "merge-sha", PreProdHealthStatusPending, progress.KnownWaitingCI, "pre-prod branch checks are still pending", false)
+	clock.Advance(5 * time.Minute)
+	waitForOrchestrationProgressReceipts(t, ctx, store, correlationID, 2)
+	receipts := listOrchestrationProgressReceipts(t, ctx, store, correlationID)
+	if len(receipts) != 2 || receipts[0].Status != PreProdHealthStatusPending || receipts[1].Status != PreProdHealthStatusPending {
+		t.Fatalf("pending receipts = %#v, want state-change plus periodic wait", receipts)
+	}
+	if !orchestrationContainsString(receipts[1].GapReasons, progress.ReasonMaxGenerationSilence) || !orchestrationContainsString(receipts[1].GapReasons, progress.KnownWaitingCI) {
+		t.Fatalf("periodic pending gap reasons = %#v, want max-silence waiting-for-ci", receipts[1].GapReasons)
+	}
+
+	clock.Advance(time.Minute)
+	emitCIProgress(ctx, supervisor, clock.Now(), "run-ci", 43, "430", "pre-prod-health", "merge-sha", PreProdHealthStatusPending, progress.KnownWaitingCI, "pre-prod branch checks are still pending", false)
+	clock.Advance(time.Minute)
+	emitCIProgress(ctx, supervisor, clock.Now(), "run-ci", 43, "430", "pre-prod-health", "merge-sha", PreProdHealthStatusGreen, progress.KnownTerminal, "pre-prod branch checks are green", true)
+	receipts = listOrchestrationProgressReceipts(t, ctx, store, correlationID)
+	if !orchestrationReceiptsContainStatusWithGap(receipts, PreProdHealthStatusGreen, progress.ReasonTerminal) {
+		t.Fatalf("receipts = %#v, want green terminal receipt after repeated pending", receipts)
+	}
+	countAfterGreen := len(receipts)
+
+	clock.Advance(time.Minute)
+	emitCIProgress(ctx, supervisor, clock.Now(), "run-ci", 43, "430", "pre-prod-health", "merge-sha", PreProdHealthStatusPending, progress.KnownWaitingCI, "pre-prod branch checks are still pending", false)
+	receipts = listOrchestrationProgressReceipts(t, ctx, store, correlationID)
+	if len(receipts) != countAfterGreen {
+		t.Fatalf("post-terminal pending persisted receipts = %#v, want count %d", receipts, countAfterGreen)
 	}
 }
 
@@ -1917,4 +1977,99 @@ func (r *recordingProgressRecorder) correlationsFor(phase, status string, termin
 		}
 	}
 	return out
+}
+
+type orchestrationManualClock struct {
+	mu  sync.Mutex
+	now time.Time
+	ch  chan time.Time
+}
+
+func newOrchestrationManualClock(now time.Time) *orchestrationManualClock {
+	return &orchestrationManualClock{now: now.UTC(), ch: make(chan time.Time, 16)}
+}
+
+func (c *orchestrationManualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *orchestrationManualClock) NewTicker(time.Duration) progress.Ticker {
+	return orchestrationManualTicker{ch: c.ch}
+}
+
+func (c *orchestrationManualClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	now := c.now
+	c.mu.Unlock()
+	c.ch <- now
+}
+
+type orchestrationManualTicker struct {
+	ch <-chan time.Time
+}
+
+func (t orchestrationManualTicker) C() <-chan time.Time { return t.ch }
+func (t orchestrationManualTicker) Stop()               {}
+
+func newOrchestrationProgressStore(t *testing.T, ctx context.Context, clock *orchestrationManualClock, projectID string) storage.Store {
+	t.Helper()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at)
+			VALUES (?, '/repo', '/repo', 'repo', 'local-path', '2026-07-02T15:00:00Z', '2026-07-02T15:00:00Z')
+			ON CONFLICT(id) DO NOTHING`, projectID)
+		return err
+	}); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	return store
+}
+
+func listOrchestrationProgressReceipts(t *testing.T, ctx context.Context, store storage.Store, correlationID string) []progress.ProgressReceipt {
+	t.Helper()
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run-ci",
+		CorrelationID: correlationID,
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	return receipts
+}
+
+func waitForOrchestrationProgressReceipts(t *testing.T, ctx context.Context, store storage.Store, correlationID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := len(listOrchestrationProgressReceipts(t, ctx, store, correlationID)); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("receipt count = %d, want at least %d", len(listOrchestrationProgressReceipts(t, ctx, store, correlationID)), want)
+}
+
+func orchestrationReceiptsContainStatusWithGap(receipts []progress.ProgressReceipt, status, gap string) bool {
+	for _, receipt := range receipts {
+		if receipt.Status == status && orchestrationContainsString(receipt.GapReasons, gap) {
+			return true
+		}
+	}
+	return false
+}
+
+func orchestrationContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

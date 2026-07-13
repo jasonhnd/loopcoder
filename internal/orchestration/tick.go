@@ -1118,7 +1118,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 	health.Status, health.Problems = preProdHealthStatus(health.RequiredChecks, health.Checks)
-	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, health.Status, knownPreProdHealthState(health.Status), preProdHealthProgressSummary(health), true)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, health.Status, knownPreProdHealthState(health.Status), preProdHealthProgressSummary(health), health.Status != PreProdHealthStatusPending)
 	tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
 	switch health.Status {
 	case PreProdHealthStatusGreen:
