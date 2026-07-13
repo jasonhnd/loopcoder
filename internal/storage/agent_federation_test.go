@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -483,8 +484,28 @@ func createFederationClaim(t *testing.T, ctx context.Context, store Store, proje
 	return federationClaim{ParentRunID: rootRunID, RunID: childRunID, RootRunID: rootRunID, ChildKey: childKey, ExecutorID: claim.ExecutorID, ClaimGeneration: claim.ClaimGeneration, ProviderKey: claim.ProviderKey}
 }
 
+func federationAuthorityScope(projectID string) AgentScopeGrant {
+	return AgentScopeGrant{
+		Permission:      PermissionWrite,
+		ReadScope:       []string{"src", "src/a.go"},
+		WriteScope:      []string{"src/a.go"},
+		PathScope:       []string{"src/a.go"},
+		RepositoryScope: []string{projectID},
+		WorktreeScope:   []string{"worktree-a"},
+		CommandScope:    []string{"go-test"},
+		NetworkScope:    []string{"none"},
+		CredentialScope: []string{"none"},
+		SideEffectScope: []string{SideEffectRepoWrite},
+		ApprovalScope:   []string{"auth-a"},
+	}
+}
+
 func seedFederationAuthorityTx(ctx context.Context, tx Tx, projectID, rootRunID, childRunID, childKey, at string) error {
 	childAgentID := stableID("agent_", projectID, "drun-a", rootRunID, "task-a", "attempt-a", childKey, "sha256:plan")
+	scopeJSON, err := json.Marshal(federationAuthorityScope(projectID))
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO delivery_runs(
 		delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
 		state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
@@ -501,10 +522,10 @@ func seedFederationAuthorityTx(ctx context.Context, tx Tx, projectID, rootRunID,
 		task_id, schema_version, record_version, project_id, delivery_run_id, task_key, state, title,
 		requirements_json, scope_json, permission, side_effect_class, policy_version, plan_fingerprint,
 		authorization_fingerprint, created_at, updated_at, created_by_json, updated_by_json, host_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')
 		ON CONFLICT(task_id) DO NOTHING`,
 		"task-a", "loopcoder.delivery_task.v1", 1, projectID, "drun-a", "task-a", "approved", "task a",
-		PermissionWrite, SideEffectRepoWrite, "0805.agent_federation.v1", "sha256:plan", "sha256:auth", at, at); err != nil {
+		string(scopeJSON), PermissionWrite, SideEffectRepoWrite, "0805.agent_federation.v1", "sha256:plan", "sha256:auth", at, at); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO task_requirements(
@@ -513,11 +534,11 @@ func seedFederationAuthorityTx(ctx context.Context, tx Tx, projectID, rootRunID,
 		data_classification, network_required, nested_allowed, cancellation_required, quality_floor,
 		provenance_summary, policy_version, plan_fingerprint, created_at, updated_at, created_by_json,
 		updated_by_json, host_json, classification, confidence, heuristic, payload_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}', ?, ?, ?, '{}')
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}', ?, ?, ?, '{}')
 		ON CONFLICT(task_requirement_id) DO NOTHING`,
 		"treq-a", "loopcoder.task_requirement.v1", 1, "sha256:req", projectID, "drun-a",
 		"task-a", "task-a", "worker", "high", PermissionWrite, SideEffectRepoWrite, "json",
-		"internal", "none", 1, 1, "standard", "test", "0805.agent_federation.v1", "sha256:plan",
+		string(scopeJSON), "internal", "none", 1, 1, "standard", "test", "0805.agent_federation.v1", "sha256:plan",
 		at, at, "local-diagnostic", "high", 0); err != nil {
 		return err
 	}
@@ -577,19 +598,7 @@ func seedFederationAuthorityTx(ctx context.Context, tx Tx, projectID, rootRunID,
 }
 
 func federationRequest(claim federationClaim) AgentRegistrationRequest {
-	parentScope := AgentScopeGrant{
-		Permission:      PermissionWrite,
-		ReadScope:       []string{"src", "src/a.go"},
-		WriteScope:      []string{"src/a.go"},
-		PathScope:       []string{"src/a.go"},
-		RepositoryScope: []string{"project-a"},
-		WorktreeScope:   []string{"worktree-a"},
-		CommandScope:    []string{"go-test"},
-		NetworkScope:    []string{"none"},
-		CredentialScope: []string{"none"},
-		SideEffectScope: []string{"repo-write"},
-		ApprovalScope:   []string{"auth-a"},
-	}
+	parentScope := federationAuthorityScope("project-a")
 	return AgentRegistrationRequest{
 		ProjectID:              "project-a",
 		DeliveryRunID:          "drun-a",
@@ -623,13 +632,14 @@ func federationRequest(claim federationClaim) AgentRegistrationRequest {
 			ResourceKey:  "src/a.go",
 			State:        OwnershipStateHeld,
 		}},
-		ClaimGeneration:        claim.ClaimGeneration,
-		ExecutorID:             claim.ExecutorID,
-		ProviderIDempotencyKey: claim.ProviderKey,
-		CancellationChannel:    "local-cancel",
-		ExpectedOutputsJSON:    "{}",
-		PlanFingerprint:        "sha256:plan",
-		PolicyFingerprint:      "sha256:policy",
-		CreatedAt:              "2026-01-01T00:00:01Z",
+		ClaimGeneration:          claim.ClaimGeneration,
+		ExecutorID:               claim.ExecutorID,
+		ProviderIDempotencyKey:   claim.ProviderKey,
+		CancellationChannel:      "local-cancel",
+		ExpectedOutputsJSON:      "{}",
+		PlanFingerprint:          "sha256:plan",
+		PolicyFingerprint:        "sha256:policy",
+		AuthorizationFingerprint: "sha256:auth",
+		CreatedAt:                "2026-01-01T00:00:01Z",
 	}
 }

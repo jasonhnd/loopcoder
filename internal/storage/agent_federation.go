@@ -733,7 +733,7 @@ func registerAgentTx(ctx context.Context, tx Tx, req AgentRegistrationRequest) (
 	if err := validateRegistrationReferences(ctx, tx, record); err != nil {
 		return AgentRegistration{}, err
 	}
-	if err := validateAcceptedAuthorityTx(ctx, tx, record); err != nil {
+	if err := validateAcceptedAuthorityTx(ctx, tx, record, scope); err != nil {
 		return AgentRegistration{}, err
 	}
 	if err := ensureNoParentAgentCycle(ctx, tx, record.ChildAgentID, record.ParentAgentID, record.ProjectID); err != nil {
@@ -1115,6 +1115,7 @@ func validateRegistrationRequest(req AgentRegistrationRequest) error {
 		"executor_id": req.ExecutorID, "provider_idempotency_key": req.ProviderIDempotencyKey,
 		"cancellation_channel": req.CancellationChannel, "expected_outputs_json": req.ExpectedOutputsJSON,
 		"plan_fingerprint": req.PlanFingerprint, "policy_fingerprint": req.PolicyFingerprint,
+		"authorization_fingerprint": req.AuthorizationFingerprint,
 	}
 	for field, value := range required {
 		if strings.TrimSpace(value) == "" {
@@ -1184,31 +1185,52 @@ func validateRegistrationReferences(ctx context.Context, tx Tx, record AgentRegi
 	return nil
 }
 
-func validateAcceptedAuthorityTx(ctx context.Context, tx Tx, record AgentRegistration) error {
-	var runProject string
-	if err := tx.QueryRow(ctx, `SELECT project_id FROM delivery_runs WHERE delivery_run_id = ?`, record.DeliveryRunID).Scan(&runProject); err != nil {
+func validateAcceptedAuthorityTx(ctx context.Context, tx Tx, record AgentRegistration, scope AgentScopeGrant) error {
+	var runProject, runPlanFingerprint, runPolicyFingerprint, runAuthorizationFingerprint string
+	if err := tx.QueryRow(ctx, `SELECT project_id, plan_fingerprint, policy_fingerprint, authorization_fingerprint FROM delivery_runs WHERE delivery_run_id = ?`, record.DeliveryRunID).Scan(&runProject, &runPlanFingerprint, &runPolicyFingerprint, &runAuthorizationFingerprint); err != nil {
 		return federationError(ErrInvalidRecordCode, "delivery run %s is missing", record.DeliveryRunID)
 	}
 	if strings.TrimSpace(runProject) != record.ProjectID {
 		return federationError(ErrCrossProjectReferenceCode, "delivery run %s belongs to %s", record.DeliveryRunID, runProject)
 	}
-	var taskProject, taskRun string
-	if err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id FROM delivery_tasks WHERE task_id = ?`, record.TaskID).Scan(&taskProject, &taskRun); err != nil {
+	if strings.TrimSpace(runPlanFingerprint) != record.PlanFingerprint || strings.TrimSpace(runPolicyFingerprint) != record.PolicyFingerprint || strings.TrimSpace(runAuthorizationFingerprint) != record.AuthorizationFingerprint {
+		return federationError(ErrAgentFingerprintMismatchCode, "delivery run authority fingerprints do not match registration")
+	}
+	var taskProject, taskRun, taskPermission, taskSideEffect, taskPlanFingerprint, taskAuthorizationFingerprint, taskScopeJSON string
+	if err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, permission, side_effect_class, plan_fingerprint, authorization_fingerprint, scope_json FROM delivery_tasks WHERE task_id = ?`, record.TaskID).Scan(&taskProject, &taskRun, &taskPermission, &taskSideEffect, &taskPlanFingerprint, &taskAuthorizationFingerprint, &taskScopeJSON); err != nil {
 		return federationError(ErrInvalidRecordCode, "delivery task %s is missing", record.TaskID)
 	}
 	if taskProject != record.ProjectID || taskRun != record.DeliveryRunID {
 		return federationError(ErrCrossProjectReferenceCode, "delivery task %s is outside registration run", record.TaskID)
 	}
-	var requirementFingerprint, requirementPermission, requirementSideEffect string
-	err := tx.QueryRow(ctx, `SELECT task_requirement_fingerprint, permission_required, side_effect_class
+	if normalizePermission(taskPermission) != record.Permission || normalizeSideEffectClass(taskSideEffect) != record.SideEffectClass ||
+		strings.TrimSpace(taskPlanFingerprint) != record.PlanFingerprint || strings.TrimSpace(taskAuthorizationFingerprint) != record.AuthorizationFingerprint {
+		return federationError(ErrInvalidRecordCode, "delivery task authority does not match registration")
+	}
+	taskScope, err := acceptedScopeGrantFromJSON(taskScopeJSON, taskPermission, taskSideEffect, record.PolicyFingerprint, record.PlanFingerprint, record.AuthorizationFingerprint)
+	if err != nil {
+		return err
+	}
+	if err := ValidateScopeInheritance(taskScope, scope); err != nil {
+		return err
+	}
+	var requirementFingerprint, requirementPermission, requirementSideEffect, requirementScopeJSON string
+	err = tx.QueryRow(ctx, `SELECT task_requirement_fingerprint, permission_required, side_effect_class, scope_json
 		FROM task_requirements
 		WHERE project_id = ? AND delivery_run_id = ? AND task_id = ? AND plan_fingerprint = ?`,
-		record.ProjectID, record.DeliveryRunID, record.TaskID, record.PlanFingerprint).Scan(&requirementFingerprint, &requirementPermission, &requirementSideEffect)
+		record.ProjectID, record.DeliveryRunID, record.TaskID, record.PlanFingerprint).Scan(&requirementFingerprint, &requirementPermission, &requirementSideEffect, &requirementScopeJSON)
 	if err != nil {
 		return federationError(ErrInvalidRecordCode, "accepted task requirement for task %s and plan fingerprint is missing", record.TaskID)
 	}
 	if strings.TrimSpace(requirementFingerprint) == "" || normalizePermission(requirementPermission) != record.Permission || normalizeSideEffectClass(requirementSideEffect) != record.SideEffectClass {
 		return federationError(ErrInvalidRecordCode, "task requirement authority does not match registration")
+	}
+	requirementScope, err := acceptedScopeGrantFromJSON(requirementScopeJSON, requirementPermission, requirementSideEffect, record.PolicyFingerprint, record.PlanFingerprint, record.AuthorizationFingerprint)
+	if err != nil {
+		return err
+	}
+	if err := ValidateScopeInheritance(requirementScope, scope); err != nil {
+		return err
 	}
 	if strings.TrimSpace(record.ProviderInstallationID) == "" || strings.TrimSpace(record.ModelCapabilityID) == "" || strings.TrimSpace(record.AccountProfileID) == "" {
 		return federationError(ErrInvalidRecordCode, "provider installation, account profile, and model capability authority are required")
@@ -1424,6 +1446,66 @@ func loadGrantedWriteScopeTx(ctx context.Context, tx Tx, record AgentRegistratio
 		}
 	}
 	return out, nil
+}
+
+func acceptedScopeGrantFromJSON(raw, permission, sideEffectClass, policyFingerprint, planFingerprint, authorizationFingerprint string) (AgentScopeGrant, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return AgentScopeGrant{}, federationError(ErrScopeUnknownCode, "accepted authority scope is missing")
+	}
+	var scope AgentScopeGrant
+	if err := json.Unmarshal([]byte(raw), &scope); err != nil {
+		return AgentScopeGrant{}, federationError(ErrInvalidRecordCode, "accepted authority scope JSON is invalid")
+	}
+	if scopeAuthorityEmpty(scope) {
+		var legacy struct {
+			Paths    []string `json:"paths"`
+			Read     []string `json:"read"`
+			Write    []string `json:"write"`
+			Repo     string   `json:"repo"`
+			Repos    []string `json:"repos"`
+			Commands []string `json:"commands"`
+			Network  []string `json:"network"`
+		}
+		if err := json.Unmarshal([]byte(raw), &legacy); err != nil {
+			return AgentScopeGrant{}, federationError(ErrInvalidRecordCode, "accepted authority scope JSON is invalid")
+		}
+		scope.ReadScope = append(scope.ReadScope, legacy.Read...)
+		scope.ReadScope = append(scope.ReadScope, legacy.Paths...)
+		scope.PathScope = append(scope.PathScope, legacy.Paths...)
+		scope.WriteScope = append(scope.WriteScope, legacy.Write...)
+		scope.RepositoryScope = append(scope.RepositoryScope, legacy.Repos...)
+		if strings.TrimSpace(legacy.Repo) != "" {
+			scope.RepositoryScope = append(scope.RepositoryScope, legacy.Repo)
+		}
+		scope.CommandScope = append(scope.CommandScope, legacy.Commands...)
+		scope.NetworkScope = append(scope.NetworkScope, legacy.Network...)
+	}
+	scope.Permission = firstNonEmptyAgent(scope.Permission, permission)
+	scope.SideEffectClass = firstNonEmptyAgent(scope.SideEffectClass, sideEffectClass)
+	scope.PolicyFingerprint = firstNonEmptyAgent(scope.PolicyFingerprint, policyFingerprint)
+	scope.PlanFingerprint = firstNonEmptyAgent(scope.PlanFingerprint, planFingerprint)
+	scope.AuthorizationFingerprint = firstNonEmptyAgent(scope.AuthorizationFingerprint, authorizationFingerprint)
+	if err := canonicalizeScope(&scope); err != nil {
+		return AgentScopeGrant{}, err
+	}
+	if scopeAuthorityEmpty(scope) {
+		return AgentScopeGrant{}, federationError(ErrScopeUnknownCode, "accepted authority scope is empty")
+	}
+	return scope, nil
+}
+
+func scopeAuthorityEmpty(scope AgentScopeGrant) bool {
+	return len(scope.ReadScope) == 0 &&
+		len(scope.WriteScope) == 0 &&
+		len(scope.PathScope) == 0 &&
+		len(scope.RepositoryScope) == 0 &&
+		len(scope.WorktreeScope) == 0 &&
+		len(scope.CommandScope) == 0 &&
+		len(scope.NetworkScope) == 0 &&
+		len(scope.CredentialScope) == 0 &&
+		len(scope.SideEffectScope) == 0 &&
+		len(scope.ApprovalScope) == 0
 }
 
 func releaseHeldOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistration, at string) error {

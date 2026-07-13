@@ -1136,15 +1136,17 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 		err    error
 	}
 	done := make(chan outcome, 2)
+	runtimeNow := nestedTestNow().Add(12 * time.Hour)
 	run := func(store storage.Store, plan ChildPlan, now time.Time) {
 		<-start
 		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
-			RepoPath:    repo,
-			MaxChildren: 1,
-			Now:         now,
-			Clock:       func() time.Time { return now },
-			Plan:        &plan,
-			Store:       store,
+			RepoPath:     repo,
+			MaxChildren:  1,
+			Now:          now,
+			Clock:        func() time.Time { return now },
+			RuntimeClock: func() time.Time { return runtimeNow },
+			Plan:         &plan,
+			Store:        store,
 			RecordEvent: func(string, string, state.Event) error {
 				return nil
 			},
@@ -1632,8 +1634,120 @@ func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
 	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
 		t.Fatalf("children = %#v, want needs-human refusal", report.Children)
 	}
-	if !strings.Contains(report.Children[0].Error, "ErrInvalidRecord") {
-		t.Fatalf("native refusal error = %q, want ErrInvalidRecord", report.Children[0].Error)
+	if !strings.Contains(report.Children[0].Error, "missing expected_outputs") {
+		t.Fatalf("native refusal error = %q, want missing expected_outputs", report.Children[0].Error)
+	}
+}
+
+func TestScheduleNestedRunsNativeChildRequiresExplicitAuthorityMetadata(t *testing.T) {
+	ctx := context.Background()
+	now := nestedTestNow()
+	projectID := "project-native-required"
+	deliveryRunID := "drun-native-required"
+	parentRunID := "run-native-required-parent"
+	taskID := "task-native-required"
+	attemptID := "attempt-native-required"
+	childKey := "native-child"
+	planID := "plan-native-required"
+	planFingerprint := "sha256:plan-native-required"
+	childAgentID := nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint)
+
+	tests := []struct {
+		name        string
+		mutate      func(map[string]any)
+		wantError   string
+		wantClaim   bool
+		wantExecute bool
+	}{
+		{name: "missing_scope", mutate: func(m map[string]any) { delete(m, "scope") }, wantError: "missing scope"},
+		{name: "missing_parent_scope", mutate: func(m map[string]any) { delete(m, "parent_scope") }, wantError: "missing parent_scope"},
+		{name: "missing_side_effect", mutate: func(m map[string]any) { delete(m, "side_effect_class") }, wantError: "missing side_effect_class"},
+		{name: "missing_cancellation", mutate: func(m map[string]any) { delete(m, "cancellation_channel") }, wantError: "missing cancellation_channel"},
+		{name: "missing_outputs", mutate: func(m map[string]any) { delete(m, "expected_outputs") }, wantError: "missing expected_outputs"},
+		{name: "missing_budget", mutate: func(m map[string]any) { delete(m, "budget_bindings") }, wantError: "missing budget_bindings"},
+		{name: "missing_write_locks", mutate: func(m map[string]any) { delete(m, "ownership_locks") }, wantError: "missing ownership_locks"},
+		{name: "metadata_scope_widening", mutate: func(m map[string]any) {
+			scope := nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint)
+			scope.WriteScope = append(scope.WriteScope, "src/widened.go")
+			scope.PathScope = append(scope.PathScope, "src/widened.go")
+			m["scope"] = scope
+		}, wantError: "ErrScopeWidening"},
+		{name: "durable_scope_widening", mutate: func(m map[string]any) {
+			scope := nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint)
+			scope.WriteScope = append(scope.WriteScope, "src/widened.go")
+			scope.PathScope = append(scope.PathScope, "src/widened.go")
+			m["scope"] = scope
+			m["parent_scope"] = scope
+			m["ownership_locks"] = []map[string]any{
+				{"resource_kind": "repo-path", "resource_key": "src/native.go", "state": storage.OwnershipStateHeld},
+				{"resource_kind": "repo-path", "resource_key": "src/widened.go", "state": storage.OwnershipStateHeld},
+			}
+		}, wantError: "ErrScopeWidening"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatalf("storage.Open: %v", err)
+			}
+			defer store.Close()
+			if err := seedNativeSchedulerAuthority(ctx, store, projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, childAgentID, planFingerprint, now); err != nil {
+				t.Fatalf("seed native authority: %v", err)
+			}
+			metadata := validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint)
+			tt.mutate(metadata)
+			metadataBytes, err := json.Marshal(metadata)
+			if err != nil {
+				t.Fatalf("marshal metadata: %v", err)
+			}
+			executed := false
+			report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath:    t.TempDir(),
+				RootRunID:   parentRunID,
+				ParentRunID: parentRunID,
+				PlanID:      planID,
+				Store:       store,
+				Now:         now,
+				Clock:       func() time.Time { return now },
+				Children: []ChildRunPlan{{
+					ChildKey:   childKey,
+					Title:      "native child",
+					Permission: storage.PermissionWrite,
+					Scope:      ChildScope{Paths: []string{"src/native.go"}},
+					Aggregation: ChildAggregation{
+						Mode:     ChildAggregationCollect,
+						Required: true,
+					},
+					Metadata: metadataBytes,
+				}},
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					executed = true
+					return ChildRunResult{Status: NestedStatusSucceeded}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("ScheduleNestedRuns: %v", err)
+			}
+			if executed != tt.wantExecute {
+				t.Fatalf("executed = %t, want %t", executed, tt.wantExecute)
+			}
+			if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+				t.Fatalf("status = %q, want needs-human; child=%#v", got, report.Children[0])
+			}
+			if !strings.Contains(report.Children[0].Error, tt.wantError) {
+				t.Fatalf("error = %q, want %q", report.Children[0].Error, tt.wantError)
+			}
+			var claimCount int
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims`).Scan(&claimCount)
+			}); err != nil {
+				t.Fatalf("count claims: %v", err)
+			}
+			if gotClaim := claimCount > 0; gotClaim != tt.wantClaim {
+				t.Fatalf("claim persisted = %t, want %t", gotClaim, tt.wantClaim)
+			}
+		})
 	}
 }
 
@@ -1659,28 +1773,9 @@ func TestScheduleNestedRunsNativeChildRegistersAndTerminalizesAtomically(t *test
 		t.Fatalf("seed native authority: %v", err)
 	}
 
-	metadata := map[string]any{
-		"native_subagent":          true,
-		"project_id":               projectID,
-		"delivery_run_id":          deliveryRunID,
-		"task_id":                  taskID,
-		"attempt_id":               attemptID,
-		"adapter_id":               "claude",
-		"provider_installation_id": "pinst-native",
-		"account_profile_id":       "acct-native",
-		"model_capability_id":      "mcap-native",
-		"routing_decision_id":      "route-native",
-		"provider_session_ref":     "session-ref-native",
-		"plan_fingerprint":         planFingerprint,
-		"policy_fingerprint":       "sha256:policy-native",
-		"side_effect_class":        storage.SideEffectRepoWrite,
-		"budget_bindings": []map[string]any{{
-			"budget_policy_id":          "bpol-native",
-			"budget_reservation_id":     "bres-native",
-			"reserved_quantities_json":  "{}",
-			"ancestor_budget_refs_json": "[]",
-			"reservation_state":         "active",
-		}},
+	metadata := map[string]any{}
+	for key, value := range validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint) {
+		metadata[key] = value
 	}
 	metadataBytes, err := json.Marshal(metadata)
 	if err != nil {
@@ -2176,8 +2271,73 @@ func nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID,
 	return "agent_" + strings.ToLower(encoded)
 }
 
+func validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint string) map[string]any {
+	return map[string]any{
+		"native_subagent":           true,
+		"project_id":                projectID,
+		"delivery_run_id":           deliveryRunID,
+		"task_id":                   taskID,
+		"attempt_id":                attemptID,
+		"adapter_id":                "claude",
+		"provider_installation_id":  "pinst-native",
+		"account_profile_id":        "acct-native",
+		"model_capability_id":       "mcap-native",
+		"routing_decision_id":       "route-native",
+		"provider_session_ref":      "session-ref-native",
+		"plan_fingerprint":          planFingerprint,
+		"policy_fingerprint":        "sha256:policy-native",
+		"authorization_fingerprint": "sha256:auth-native",
+		"side_effect_class":         storage.SideEffectRepoWrite,
+		"cancellation_channel":      "local-cancel",
+		"expected_outputs": map[string]any{
+			"schema": "loopcoder.native_child.output.v1",
+		},
+		"parent_scope": nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint),
+		"scope":        nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint),
+		"budget_bindings": []map[string]any{{
+			"budget_policy_id":          "bpol-native",
+			"budget_reservation_id":     "bres-native",
+			"reserved_quantities_json":  "{}",
+			"ancestor_budget_refs_json": "[]",
+			"reservation_state":         "active",
+		}},
+		"ownership_locks": []map[string]any{{
+			"resource_kind": "repo-path",
+			"resource_key":  "src/native.go",
+			"state":         storage.OwnershipStateHeld,
+		}},
+	}
+}
+
+func nativeSchedulerScope(projectID, deliveryRunID, childAgentID, permission, sideEffectClass, planFingerprint string) storage.AgentScopeGrant {
+	return storage.AgentScopeGrant{
+		ProjectID:                projectID,
+		DeliveryRunID:            deliveryRunID,
+		ChildAgentID:             childAgentID,
+		ReadScope:                []string{"src/native.go"},
+		WriteScope:               []string{"src/native.go"},
+		PathScope:                []string{"src/native.go"},
+		RepositoryScope:          []string{"."},
+		CommandScope:             []string{"go test ./internal/orchestration"},
+		NetworkScope:             []string{"none"},
+		CredentialScope:          []string{"none"},
+		SideEffectScope:          []string{sideEffectClass},
+		ApprovalScope:            []string{"none"},
+		Permission:               permission,
+		SideEffectClass:          sideEffectClass,
+		PolicyVersion:            storage.AgentPolicyVersion,
+		PolicyFingerprint:        "sha256:policy-native",
+		PlanFingerprint:          planFingerprint,
+		AuthorizationFingerprint: "sha256:auth-native",
+	}
+}
+
 func seedNativeSchedulerAuthority(ctx context.Context, store storage.Store, projectID, deliveryRunID, rootRunID, taskID, attemptID, childKey, childAgentID, planFingerprint string, now time.Time) error {
 	at := state.FormatTimestamp(now)
+	scopeJSON, err := json.Marshal(nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint))
+	if err != nil {
+		return err
+	}
 	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
 			projectID, "/tmp/"+projectID, at, at); err != nil {
@@ -2198,9 +2358,9 @@ func seedNativeSchedulerAuthority(ctx context.Context, store storage.Store, proj
 			task_id, schema_version, record_version, project_id, delivery_run_id, task_key, state, title,
 			requirements_json, scope_json, permission, side_effect_class, policy_version, plan_fingerprint,
 			authorization_fingerprint, created_at, updated_at, created_by_json, updated_by_json, host_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')`,
 			taskID, "loopcoder.delivery_task.v1", 1, projectID, deliveryRunID, "task-native", "approved", "native task",
-			storage.PermissionWrite, storage.SideEffectRepoWrite, "0805.agent_federation.v1", planFingerprint, "sha256:auth-native", at, at); err != nil {
+			string(scopeJSON), storage.PermissionWrite, storage.SideEffectRepoWrite, "0805.agent_federation.v1", planFingerprint, "sha256:auth-native", at, at); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO task_requirements(
@@ -2209,10 +2369,10 @@ func seedNativeSchedulerAuthority(ctx context.Context, store storage.Store, proj
 			data_classification, network_required, nested_allowed, cancellation_required, quality_floor,
 			provenance_summary, policy_version, plan_fingerprint, created_at, updated_at, created_by_json,
 			updated_by_json, host_json, classification, confidence, heuristic, payload_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}', ?, ?, ?, '{}')`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}', ?, ?, ?, '{}')`,
 			"treq-native", "loopcoder.task_requirement.v1", 1, "sha256:req-native", projectID, deliveryRunID,
 			taskID, "task-native", "worker", "high", storage.PermissionWrite, storage.SideEffectRepoWrite, "json",
-			"internal", "none", 1, 1, "standard", "test", "0805.agent_federation.v1", planFingerprint,
+			string(scopeJSON), "internal", "none", 1, 1, "standard", "test", "0805.agent_federation.v1", planFingerprint,
 			at, at, "local-diagnostic", "high", 0); err != nil {
 			return err
 		}

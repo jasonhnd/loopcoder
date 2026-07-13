@@ -73,6 +73,7 @@ type NestedScheduleOptions struct {
 	CircuitBreaker   config.GuardrailCircuitBreaker
 	Now              time.Time
 	Clock            func() time.Time
+	RuntimeClock     func() time.Time
 	Plan             *ChildPlan
 	Store            storage.Store
 
@@ -186,6 +187,10 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	clock := opts.Clock
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
+	}
+	runtimeClock := opts.RuntimeClock
+	if runtimeClock == nil {
+		runtimeClock = clock
 	}
 	started := opts.Now
 	if started.IsZero() {
@@ -382,7 +387,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		child := children[index]
 		result := childResultFromPlan(child)
 		result.Status = NestedStatusRunning
-		claimAt := clock().UTC()
+		claimAt := runtimeClock().UTC()
 		executorID := nestedExecutorID(opts.ParentRunID)
 		nativeAgent := childRequiresNativeRegistration(child)
 		var nativeRegistration storage.AgentRegistration
@@ -513,7 +518,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(err)
 		}
 
-		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, clock)
+		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, runtimeClock)
 		executed, err := opts.Execute(ctx, child)
 		heartbeatErr := stopHeartbeat()
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
@@ -1297,44 +1302,34 @@ func nativeRegistrationRequestFromChild(opts NestedScheduleOptions, child ChildR
 	}
 	expectedOutputs := strings.TrimSpace(string(metadata.ExpectedOutputs))
 	if expectedOutputs == "" {
-		expectedOutputs = "{}"
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing expected_outputs")
 	}
-	scope := storage.AgentScopeGrant{}
-	if metadata.Scope != nil {
-		scope = *metadata.Scope
-	} else {
-		scope = storage.AgentScopeGrant{
-			ReadScope:       append([]string{}, child.Scope.Paths...),
-			PathScope:       append([]string{}, child.Scope.Paths...),
-			RepositoryScope: []string{firstNonEmptyChild(child.Scope.Repo, filepath.ToSlash(opts.RepoPath))},
-			CommandScope:    append([]string{}, child.Scope.Commands...),
-			NetworkScope:    []string{"none"},
-			CredentialScope: []string{"none"},
-			ApprovalScope:   []string{"none"},
-		}
-		if child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate {
-			scope.WriteScope = append([]string{}, child.Scope.Paths...)
-		}
+	if !json.Valid([]byte(expectedOutputs)) {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata expected_outputs is invalid")
 	}
+	if metadata.Scope == nil {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing scope")
+	}
+	if metadata.ParentScope == nil {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing parent_scope")
+	}
+	scope := *metadata.Scope
 	sideEffectClass := strings.TrimSpace(metadata.SideEffectClass)
 	if sideEffectClass == "" {
-		sideEffectClass = storage.SideEffectLocalRead
-		if child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate {
-			sideEffectClass = storage.SideEffectRepoWrite
-		}
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing side_effect_class")
 	}
 	if len(scope.SideEffectScope) == 0 {
-		scope.SideEffectScope = []string{sideEffectClass}
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata scope is missing side_effect_scope")
+	}
+	if strings.TrimSpace(metadata.CancellationChannel) == "" {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing cancellation_channel")
+	}
+	if len(metadata.BudgetBindings) == 0 {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing budget_bindings")
 	}
 	locks := append([]storage.AgentOwnershipLock{}, metadata.OwnershipLocks...)
-	if len(locks) == 0 && (child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate) {
-		for _, path := range child.Scope.Paths {
-			locks = append(locks, storage.AgentOwnershipLock{
-				ResourceKind: "repo-path",
-				ResourceKey:  path,
-				State:        storage.OwnershipStateHeld,
-			})
-		}
+	if len(locks) == 0 && (child.Permission == storage.PermissionWrite || child.Permission == storage.PermissionOrchestrate || len(scope.WriteScope) > 0) {
+		return storage.AgentRegistrationRequest{}, fmt.Errorf("native child metadata is missing ownership_locks")
 	}
 	return storage.AgentRegistrationRequest{
 		ProjectID:                metadata.ProjectID,
@@ -1359,7 +1354,7 @@ func nativeRegistrationRequestFromChild(opts NestedScheduleOptions, child ChildR
 		SideEffectClass:          sideEffectClass,
 		BudgetBindings:           metadata.BudgetBindings,
 		OwnershipLocks:           locks,
-		CancellationChannel:      firstNonEmptyChild(metadata.CancellationChannel, "local-cancel"),
+		CancellationChannel:      metadata.CancellationChannel,
 		ExpectedOutputsJSON:      expectedOutputs,
 		PlanFingerprint:          metadata.PlanFingerprint,
 		PolicyFingerprint:        metadata.PolicyFingerprint,
