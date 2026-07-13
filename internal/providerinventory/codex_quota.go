@@ -52,12 +52,11 @@ type CodexAppServerResult struct {
 }
 
 type jsonRPCMessage struct {
-	JSONRPC string          `json:"jsonrpc,omitempty"`
-	ID      any             `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  any             `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *jsonRPCError   `json:"error,omitempty"`
+	ID     any             `json:"id,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Params any             `json:"params,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *jsonRPCError   `json:"error,omitempty"`
 }
 
 type jsonRPCError struct {
@@ -119,6 +118,9 @@ func inspectCodexQuota(ctx context.Context, discovery *discoveryContext, adapter
 	probe.TimedOut = result.TimedOut
 	probe.Killed = result.Killed
 	probe.ExitCode = &result.ExitCode
+	if err != nil && codexQuotaProtocolError(err) {
+		return unavailable(codexQuotaReason(err), codexQuotaTerminal(err))
+	}
 	if err != nil || result.TimedOut || result.Killed {
 		if result.TimedOut {
 			return unavailable("quota-probe-timeout", "ErrCodexQuotaTimeout")
@@ -259,7 +261,7 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 		}
 		out.Stderr += "[loopcoder] codex app-server output truncated"
 	}
-	if protocolErr != nil && err == nil {
+	if protocolErr != nil && (exitCode == 0 || result.Killed) {
 		err = protocolErr
 	}
 	return out, err
@@ -290,7 +292,7 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 		}
 		errCh <- io.EOF
 	}()
-	if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: map[string]any{
+	if err := writeJSONL(stdin, jsonRPCMessage{ID: 1, Method: "initialize", Params: map[string]any{
 		"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion},
 		"capabilities": map[string]any{
 			"experimentalApi":           false,
@@ -320,14 +322,14 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 				if err := validateCodexInitializeResponse(msg.Result); err != nil {
 					return err
 				}
-				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", Method: "initialized"}); err != nil {
+				if err := writeJSONL(stdin, jsonRPCMessage{Method: "initialized"}); err != nil {
 					return err
 				}
 				initialized = true
-				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 2, Method: "account/read", Params: map[string]any{"refreshToken": false}}); err != nil {
+				if err := writeJSONL(stdin, jsonRPCMessage{ID: 2, Method: "account/read", Params: map[string]any{"refreshToken": false}}); err != nil {
 					return err
 				}
-				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 3, Method: "account/rateLimits/read", Params: map[string]any{}}); err != nil {
+				if err := writeJSONL(stdin, jsonRPCMessage{ID: 3, Method: "account/rateLimits/read", Params: map[string]any{}}); err != nil {
 					return err
 				}
 			case "2":
@@ -356,8 +358,11 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 }
 
 func writeJSONL(w io.Writer, message jsonRPCMessage) error {
-	payload, _ := json.Marshal(message)
-	_, err := fmt.Fprintf(w, "%s\n", payload)
+	payload, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s\n", payload)
 	return err
 }
 
@@ -435,10 +440,30 @@ func decodeCodexJSONLMessage(line string) (jsonRPCMessage, error) {
 	if err := dec.Decode(&msg); err != nil {
 		return msg, fmt.Errorf("%w: jsonl message", ErrCodexQuotaMalformed)
 	}
-	if msg.JSONRPC != "2.0" {
-		return msg, fmt.Errorf("%w: unsupported jsonrpc version", ErrCodexQuotaMalformed)
+	if err := validateCodexAppServerEnvelope(msg); err != nil {
+		return msg, err
 	}
 	return msg, nil
+}
+
+func validateCodexAppServerEnvelope(msg jsonRPCMessage) error {
+	hasID := jsonRPCID(msg.ID) != ""
+	hasMethod := strings.TrimSpace(msg.Method) != ""
+	hasResult := msg.Result != nil
+	hasError := msg.Error != nil
+	switch {
+	case hasMethod && hasID:
+		return nil
+	case hasMethod:
+		return nil
+	case hasID && (hasResult || hasError):
+		if hasError && strings.TrimSpace(msg.Error.Message) == "" {
+			return fmt.Errorf("%w: json-rpc error envelope", ErrCodexQuotaMalformed)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: app-server envelope", ErrCodexQuotaMalformed)
+	}
 }
 
 func validateCodexInitializeResponse(result json.RawMessage) error {
@@ -1005,6 +1030,14 @@ func codexQuotaReason(err error) string {
 	default:
 		return "quota-probe-failed"
 	}
+}
+
+func codexQuotaProtocolError(err error) bool {
+	return errors.Is(err, ErrQuotaCredentialMaterial) ||
+		errors.Is(err, ErrCodexQuotaRPC) ||
+		errors.Is(err, ErrCodexQuotaMalformed) ||
+		errors.Is(err, ErrCodexQuotaTimeout) ||
+		errors.Is(err, ErrCodexQuotaUnsupported)
 }
 
 func codexQuotaTerminal(err error) string {

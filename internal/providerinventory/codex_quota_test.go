@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -269,11 +270,11 @@ func TestCodexQuotaCredentialCanaryDoesNotPersist(t *testing.T) {
 func TestCodexQuotaAttemptsOnlyOneCandidate(t *testing.T) {
 	first := writeFakeCodex(t)
 	second := writeFakeCodex(t)
-	stdout := codexQuotaFrames(t,
-		map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"type": "chatgpt", "id": "acct_fixture"}},
-		map[string]any{"rateLimits": map[string]any{"primary": map[string]any{"usedPercent": 1, "windowDurationMins": 300, "resetsAt": fixedInventoryNow().Add(time.Hour).Unix()}}},
-	)
-	deps := codexQuotaDeps(t, first, "codex 0.9.0", CodexAppServerResult{Stdout: stdout, ExitCode: 0}, nil)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	deps := codexQuotaDeps(t, first, "codex 0.9.0", CodexAppServerResult{}, nil)
 	deps.Getenv = func(key string) string {
 		if key == "PATH" {
 			return filepath.Dir(first) + string(os.PathListSeparator) + filepath.Dir(second)
@@ -286,7 +287,14 @@ func TestCodexQuotaAttemptsOnlyOneCandidate(t *testing.T) {
 		if req.Argv[0] != first {
 			t.Fatalf("RunCodexRPC argv[0] = %q, want first candidate %q", req.Argv[0], first)
 		}
-		return CodexAppServerResult{Stdout: stdout, ExitCode: 0}, nil
+		return runCodexAppServer(context.Background(), CodexAppServerRequest{
+			Argv:               []string{exe},
+			Env:                []string{"LOOPCODER_FAKE_APP_SERVER=success"},
+			Timeout:            2 * time.Second,
+			StdoutLimitBytes:   codexQuotaOutputBytes,
+			StderrLimitBytes:   StdoutLimitBytes,
+			CombinedLimitBytes: codexQuotaOutputBytes + StdoutLimitBytes,
+		})
 	}
 	report, err := Discover(context.Background(), Options{
 		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
@@ -338,6 +346,7 @@ func TestRunCodexAppServerUsesJSONLHandshakeAndRefreshTokenFalse(t *testing.T) {
 	}
 	var got []jsonRPCMessage
 	for _, line := range lines {
+		assertNoJSONRPCMember(t, line)
 		msg, err := decodeCodexJSONLMessage(line)
 		if err != nil {
 			t.Fatalf("decode trace: %v", err)
@@ -346,6 +355,15 @@ func TestRunCodexAppServerUsesJSONLHandshakeAndRefreshTokenFalse(t *testing.T) {
 	}
 	if got[0].Method != "initialize" || got[1].Method != "initialized" || got[2].Method != "account/read" || got[3].Method != "account/rateLimits/read" {
 		t.Fatalf("methods = %#v, want initialize/initialized/account/read/account/rateLimits/read", []string{got[0].Method, got[1].Method, got[2].Method, got[3].Method})
+	}
+	initializedCount := 0
+	for _, msg := range got {
+		if msg.Method == "initialized" {
+			initializedCount++
+		}
+	}
+	if initializedCount != 1 {
+		t.Fatalf("initialized notifications = %d, want exactly one", initializedCount)
 	}
 	var accountParams map[string]bool
 	data, _ = json.Marshal(got[2].Params)
@@ -357,6 +375,192 @@ func TestRunCodexAppServerUsesJSONLHandshakeAndRefreshTokenFalse(t *testing.T) {
 	}
 	if strings.Contains(result.Stdout, "Content-Length") {
 		t.Fatalf("stdout retained content-length frame: %q", result.Stdout)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
+		assertNoJSONRPCMember(t, line)
+	}
+}
+
+func TestRunCodexAppServerAcceptsOfficialEnvelopeReorderingAndNotifications(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	trace := filepath.Join(t.TempDir(), "trace.jsonl")
+	result, err := runCodexAppServer(context.Background(), CodexAppServerRequest{
+		Argv:               []string{exe},
+		Env:                []string{"LOOPCODER_FAKE_APP_SERVER=reorder", "LOOPCODER_FAKE_APP_SERVER_TRACE=" + trace},
+		Timeout:            2 * time.Second,
+		StdoutLimitBytes:   codexQuotaOutputBytes,
+		StderrLimitBytes:   StdoutLimitBytes,
+		CombinedLimitBytes: codexQuotaOutputBytes + StdoutLimitBytes,
+	})
+	if err != nil {
+		t.Fatalf("runCodexAppServer: %v, stderr=%s", err, result.Stderr)
+	}
+	if result.ExitCode != 0 || result.TimedOut || result.Killed {
+		t.Fatalf("result = %#v, want clean exit", result)
+	}
+	lines := strings.Split(strings.TrimSpace(result.Stdout), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("stdout lines = %d: %s", len(lines), result.Stdout)
+	}
+	var ids []string
+	for _, line := range lines {
+		assertNoJSONRPCMember(t, line)
+		msg, err := decodeCodexJSONLMessage(line)
+		if err != nil {
+			t.Fatalf("decode stdout: %v", err)
+		}
+		if msg.Method != "" {
+			continue
+		}
+		ids = append(ids, jsonRPCID(msg.ID))
+	}
+	if !sameStrings(ids, []string{"1", "3", "2"}) {
+		t.Fatalf("response ids = %#v, want initialize/rate/account reordering", ids)
+	}
+	traceData, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatalf("ReadFile trace: %v", err)
+	}
+	traceLines := strings.Split(strings.TrimSpace(string(traceData)), "\n")
+	if len(traceLines) != 4 {
+		t.Fatalf("trace lines = %d: %s", len(traceLines), traceData)
+	}
+	for i, line := range traceLines {
+		assertNoJSONRPCMember(t, line)
+		msg, err := decodeCodexJSONLMessage(line)
+		if err != nil {
+			t.Fatalf("decode trace: %v", err)
+		}
+		if i == 0 && msg.Method != "initialize" {
+			t.Fatalf("first request = %s, want initialize", msg.Method)
+		}
+		if i == 1 && msg.Method != "initialized" {
+			t.Fatalf("second request = %s, want initialized notification", msg.Method)
+		}
+		if i == 3 && msg.Method != "account/rateLimits/read" {
+			t.Fatalf("fourth request = %s, want rate-limit request after handshake", msg.Method)
+		}
+	}
+}
+
+func TestRunCodexAppServerProtocolFailuresUseTypedErrors(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	cases := []struct {
+		mode    string
+		wantErr error
+	}{
+		{mode: "eof", wantErr: ErrCodexQuotaMalformed},
+		{mode: "rpc-error", wantErr: ErrCodexQuotaRPC},
+		{mode: "malformed-line", wantErr: ErrCodexQuotaMalformed},
+		{mode: "oversized-line", wantErr: ErrCodexQuotaMalformed},
+		{mode: "unsupported-init", wantErr: ErrCodexQuotaUnsupported},
+	}
+	for _, tt := range cases {
+		t.Run(tt.mode, func(t *testing.T) {
+			result, err := runCodexAppServer(context.Background(), CodexAppServerRequest{
+				Argv:               []string{exe},
+				Env:                []string{"LOOPCODER_FAKE_APP_SERVER=" + tt.mode},
+				Timeout:            2 * time.Second,
+				StdoutLimitBytes:   codexQuotaOutputBytes,
+				StderrLimitBytes:   StdoutLimitBytes,
+				CombinedLimitBytes: codexQuotaOutputBytes + StdoutLimitBytes,
+			})
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("runCodexAppServer err = %v, want %v; result=%#v", err, tt.wantErr, result)
+			}
+		})
+	}
+}
+
+func TestInspectCodexQuotaPreservesRealRunnerProtocolFailures(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	fakeCodex := writeFakeCodex(t)
+	cases := []struct {
+		mode     string
+		wantCode string
+		wantGap  string
+	}{
+		{mode: "rpc-error", wantCode: "ErrCodexQuotaRPCError", wantGap: "rpc-error"},
+		{mode: "malformed-line", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "unsupported-init", wantCode: "ErrUnsupportedVersion", wantGap: "unsupported-cli-version"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.mode, func(t *testing.T) {
+			deps := codexQuotaDeps(t, fakeCodex, "codex 0.9.0", CodexAppServerResult{}, nil)
+			deps.RunCodexRPC = func(ctx context.Context, _ CodexAppServerRequest) (CodexAppServerResult, error) {
+				return runCodexAppServer(ctx, CodexAppServerRequest{
+					Argv:               []string{exe},
+					Env:                []string{"LOOPCODER_FAKE_APP_SERVER=" + tt.mode},
+					Timeout:            2 * time.Second,
+					StdoutLimitBytes:   codexQuotaOutputBytes,
+					StderrLimitBytes:   StdoutLimitBytes,
+					CombinedLimitBytes: codexQuotaOutputBytes + StdoutLimitBytes,
+				})
+			}
+			report, err := Discover(context.Background(), Options{
+				Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+				Now:    fixedInventoryNow,
+				NetworkGrants: []NetworkGrant{{
+					ProviderID: "codex",
+					Purpose:    NetworkPurposeQuotaTelemetry,
+					Scope:      NetworkScopeMachineInventory,
+				}},
+			}, deps)
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			got := onlyQuotaSnapshot(t, report, "codex")
+			if got.TerminalErrorCode != tt.wantCode || !containsString(got.GapReasons, tt.wantGap) {
+				t.Fatalf("snapshot = %#v, want %s/%s", got, tt.wantCode, tt.wantGap)
+			}
+		})
+	}
+}
+
+func TestCodexAppServerOfficialEnvelopeGoldens(t *testing.T) {
+	requests := []jsonRPCMessage{
+		{ID: 1, Method: "initialize", Params: map[string]any{"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion}}},
+		{Method: "initialized"},
+		{ID: 2, Method: "account/read", Params: map[string]any{"refreshToken": false}},
+		{ID: 3, Method: "account/rateLimits/read", Params: map[string]any{}},
+	}
+	for _, request := range requests {
+		line := codexQuotaJSONL(t, request)
+		assertNoJSONRPCMember(t, line)
+		if _, err := decodeCodexJSONLMessage(line); err != nil {
+			t.Fatalf("decode request %s: %v", line, err)
+		}
+	}
+	responses := codexQuotaFrames(t,
+		map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"id": "acct_fixture"}},
+		map[string]any{"rateLimits": map[string]any{"primary": map[string]any{"usedPercent": 1, "windowDurationMins": 300, "resetsAt": fixedInventoryNow().Unix()}}},
+	)
+	for _, line := range strings.Split(strings.TrimSpace(responses), "\n") {
+		assertNoJSONRPCMember(t, line)
+		if _, err := decodeCodexJSONLMessage(line); err != nil {
+			t.Fatalf("decode response %s: %v", line, err)
+		}
+	}
+	if _, err := decodeCodexJSONLMessage(`{"result":{}}`); !errors.Is(err, ErrCodexQuotaMalformed) {
+		t.Fatalf("decode missing required id err = %v, want malformed", err)
+	}
+	if _, err := decodeCodexJSONLMessage(`{"id":1}`); !errors.Is(err, ErrCodexQuotaMalformed) {
+		t.Fatalf("decode missing result/error/method err = %v, want malformed", err)
+	}
+}
+
+func TestWriteJSONLPropagatesMarshalErrors(t *testing.T) {
+	if err := writeJSONL(io.Discard, jsonRPCMessage{Method: "bad", Params: func() {}}); err == nil {
+		t.Fatal("writeJSONL err = nil, want marshal error")
 	}
 }
 
@@ -410,25 +614,25 @@ func writeFakeCodex(t *testing.T) string {
 func codexQuotaFrames(t *testing.T, account, limits map[string]any) string {
 	t.Helper()
 	return strings.Join([]string{
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", Method: "codex/notice", Result: json.RawMessage(`{"ignored":true}`)}),
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 1, Result: mustRawJSON(t, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})}),
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 2, Result: mustRawJSON(t, account)}),
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 3, Result: mustRawJSON(t, limits)}),
+		codexQuotaJSONL(t, jsonRPCMessage{Method: "codex/notice", Params: map[string]any{"ignored": true}}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Result: mustRawJSON(t, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 2, Result: mustRawJSON(t, account)}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 3, Result: mustRawJSON(t, limits)}),
 	}, "\n") + "\n"
 }
 
 func codexQuotaRPCErrorFrames(t *testing.T) string {
 	t.Helper()
 	return strings.Join([]string{
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 1, Result: mustRawJSON(t, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})}),
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 2, Result: mustRawJSON(t, map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"id": "acct_fixture"}})}),
-		codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 3, Error: &jsonRPCError{Code: -32000, Message: "rate limited"}}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Result: mustRawJSON(t, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 2, Result: mustRawJSON(t, map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"id": "acct_fixture"}})}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 3, Error: &jsonRPCError{Code: -32000, Message: "rate limited"}}),
 	}, "\n") + "\n"
 }
 
 func codexQuotaUnsupportedInitialize(t *testing.T) string {
 	t.Helper()
-	return codexQuotaJSONL(t, jsonRPCMessage{JSONRPC: "2.0", ID: 1, Result: mustRawJSON(t, map[string]any{"protocolVersion": "future"})}) + "\n"
+	return codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Result: mustRawJSON(t, map[string]any{"protocolVersion": "future"})}) + "\n"
 }
 
 func codexQuotaJSONL(t *testing.T, message jsonRPCMessage) string {
@@ -447,6 +651,17 @@ func mustRawJSON(t *testing.T, value any) json.RawMessage {
 		t.Fatalf("Marshal: %v", err)
 	}
 	return data
+}
+
+func assertNoJSONRPCMember(t *testing.T, line string) {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(line), &fields); err != nil {
+		t.Fatalf("Unmarshal JSON object: %v", err)
+	}
+	if _, ok := fields["jsonrpc"]; ok {
+		t.Fatalf("jsonrpc member present in official app-server envelope: %s", line)
+	}
 }
 
 func onlyQuotaSnapshot(t *testing.T, report Report, adapterID string) QuotaSnapshot {
@@ -510,7 +725,15 @@ func runFakeCodexAppServer() {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	writeResponse := func(id int, result any) {
-		data, _ := json.Marshal(jsonRPCMessage{JSONRPC: "2.0", ID: id, Result: mustRawJSONNoT(result)})
+		data, _ := json.Marshal(jsonRPCMessage{ID: id, Result: mustRawJSONNoT(result)})
+		fmt.Println(string(data))
+	}
+	writeError := func(id int, code int, message string) {
+		data, _ := json.Marshal(jsonRPCMessage{ID: id, Error: &jsonRPCError{Code: code, Message: message}})
+		fmt.Println(string(data))
+	}
+	writeNotification := func(method string, params any) {
+		data, _ := json.Marshal(jsonRPCMessage{Method: method, Params: params})
 		fmt.Println(string(data))
 	}
 	read := func() jsonRPCMessage {
@@ -534,7 +757,23 @@ func runFakeCodexAppServer() {
 		fmt.Fprintf(os.Stderr, "first method = %s\n", initMsg.Method)
 		os.Exit(5)
 	}
+	if mode == "eof" {
+		return
+	}
+	if mode == "malformed-line" {
+		fmt.Println("{not-json")
+		return
+	}
+	if mode == "oversized-line" {
+		fmt.Println(strings.Repeat("x", codexQuotaLineBytes+1))
+		return
+	}
+	if mode == "unsupported-init" {
+		writeResponse(1, map[string]any{"protocolVersion": "future"})
+		return
+	}
 	writeResponse(1, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})
+	writeNotification("account/rate_limits/updated", map[string]any{"ignored": true})
 	initialized := read()
 	if initialized.Method != "initialized" {
 		fmt.Fprintf(os.Stderr, "second method = %s\n", initialized.Method)
@@ -550,8 +789,19 @@ func runFakeCodexAppServer() {
 		fmt.Fprintf(os.Stderr, "fourth method = %s\n", rateLimits.Method)
 		os.Exit(8)
 	}
+	if mode == "rpc-error" {
+		writeResponse(2, map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"type": "chatgpt", "id": "acct_fixture"}})
+		writeError(3, -32000, "rate limited")
+		return
+	}
+	rateLimitPayload := map[string]any{"rateLimits": map[string]any{"primary": map[string]any{"usedPercent": 10, "windowDurationMins": 300, "resetsAt": fixedInventoryNow().Add(time.Hour).Unix()}}}
+	if mode == "reorder" {
+		writeResponse(3, rateLimitPayload)
+		writeResponse(2, map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"type": "chatgpt", "id": "acct_fixture"}})
+		return
+	}
 	writeResponse(2, map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"type": "chatgpt", "id": "acct_fixture"}})
-	writeResponse(3, map[string]any{"rateLimits": map[string]any{"primary": map[string]any{"usedPercent": 10, "windowDurationMins": 300, "resetsAt": fixedInventoryNow().Add(time.Hour).Unix()}}})
+	writeResponse(3, rateLimitPayload)
 }
 
 func mustRawJSONNoT(value any) json.RawMessage {
