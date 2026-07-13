@@ -1,7 +1,7 @@
 ---
 id: 884
 title: v0.8.0 macOS Apple Silicon Support Contract
-status: draft
+status: accepted
 date: 2026-07-14
 issue: 884
 pr: null
