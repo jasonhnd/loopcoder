@@ -34,8 +34,6 @@ type taskAuthority struct {
 	SideEffectClass          string
 }
 
-var cycleDetectionErrorForTest error
-
 func withWrite(ctx context.Context, store storage.Store, fn func(storage.Tx) error) error {
 	if store == nil {
 		return typed(ErrInvalidRecordCode, "store is required")
@@ -462,9 +460,13 @@ func loadTaskAuthority(ctx context.Context, tx storage.Tx, projectID, runID, tas
 	return task, nil
 }
 
-func wouldCreateCycle(ctx context.Context, tx storage.Tx, runID, fromTaskID, toTaskID string) (bool, error) {
-	if cycleDetectionErrorForTest != nil {
-		return false, fmt.Errorf("inspect dependency cycle: %w", cycleDetectionErrorForTest)
+func wouldCreateCycle(ctx context.Context, tx storage.Tx, detector cycleDetector, runID, fromTaskID, toTaskID string) (bool, error) {
+	if detector != nil {
+		cycle, err := detector(ctx, tx, runID, fromTaskID, toTaskID)
+		if err != nil {
+			return false, fmt.Errorf("inspect dependency cycle: %w", err)
+		}
+		return cycle, nil
 	}
 	rows, err := tx.Query(ctx, `WITH RECURSIVE walk(task_id) AS (
 		SELECT to_task_id FROM delivery_dependency_edges WHERE delivery_run_id = ? AND from_task_id = ?
