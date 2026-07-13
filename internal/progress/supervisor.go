@@ -103,6 +103,7 @@ func (s *Supervisor) RecordProgressDiagnostic(ctx context.Context, diagnostic Di
 	if s == nil || s.opts.Diagnostic == nil {
 		return
 	}
+	diagnostic = sanitizeDiagnostic(diagnostic)
 	s.opts.Diagnostic(ctx, diagnostic)
 }
 
@@ -173,19 +174,26 @@ func ReportDiagnostic(ctx context.Context, recorder Recorder, observation Observ
 	}
 	sink.RecordProgressDiagnostic(ctx, Diagnostic{
 		Code:          "progress-receipt-generation-failed",
-		ProjectID:     observation.ProjectID,
-		DeliveryRunID: observation.DeliveryRunID,
-		CorrelationID: observationCorrelationID(observation, observation.DeliveryRunID),
-		Phase:         observation.Phase,
-		Status:        observation.Status,
+		ProjectID:     sanitizeID(observation.ProjectID),
+		DeliveryRunID: sanitizeID(observation.DeliveryRunID),
+		CorrelationID: sanitizeID(observationCorrelationID(observation, observation.DeliveryRunID)),
+		Phase:         sanitizeID(observation.Phase),
+		Status:        sanitizeID(observation.Status),
 		Error:         boundedDiagnostic(err.Error()),
 	})
 }
 
 func boundedDiagnostic(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) > 240 {
-		return value[:240]
-	}
-	return value
+	return DiagnosticMessage(value)
+}
+
+func sanitizeDiagnostic(diagnostic Diagnostic) Diagnostic {
+	diagnostic.Code = sanitizeID(diagnostic.Code)
+	diagnostic.ProjectID = sanitizeID(diagnostic.ProjectID)
+	diagnostic.DeliveryRunID = sanitizeID(diagnostic.DeliveryRunID)
+	diagnostic.CorrelationID = sanitizeID(diagnostic.CorrelationID)
+	diagnostic.Phase = sanitizeID(diagnostic.Phase)
+	diagnostic.Status = sanitizeID(diagnostic.Status)
+	diagnostic.Error = boundedDiagnostic(diagnostic.Error)
+	return diagnostic
 }

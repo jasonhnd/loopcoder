@@ -99,6 +99,10 @@ type receiptRow struct {
 
 type cursorPayload struct {
 	Version             int    `json:"v"`
+	ProjectID           string `json:"project_id,omitempty"`
+	DeliveryRunID       string `json:"delivery_run_id,omitempty"`
+	CorrelationIDFilter string `json:"correlation_id_filter,omitempty"`
+	TaskIDFilter        string `json:"task_id_filter,omitempty"`
 	OccurredAt          string `json:"occurred_at"`
 	CorrelationID       string `json:"correlation_id"`
 	CorrelationSequence int64  `json:"correlation_sequence"`
@@ -118,6 +122,9 @@ func ReadReceipts(ctx context.Context, store storage.Store, filter ReadFilter, n
 	if err != nil {
 		return ReceiptBatch{}, err
 	}
+	if err := validateCursorScope(after, filter); err != nil {
+		return ReceiptBatch{}, err
+	}
 	rows, err := queryReceiptRows(ctx, store, filter, after)
 	if err != nil {
 		return ReceiptBatch{}, err
@@ -126,6 +133,10 @@ func ReadReceipts(ctx context.Context, store storage.Store, filter ReadFilter, n
 	for _, row := range rows {
 		cursor := encodeCursor(cursorPayload{
 			Version:             1,
+			ProjectID:           projectID,
+			DeliveryRunID:       deliveryRunID,
+			CorrelationIDFilter: strings.TrimSpace(filter.CorrelationID),
+			TaskIDFilter:        strings.TrimSpace(filter.TaskID),
 			OccurredAt:          row.occurredAt,
 			CorrelationID:       row.correlationID,
 			CorrelationSequence: row.correlationSequence,
@@ -148,11 +159,14 @@ func ReadReceipts(ctx context.Context, store storage.Store, filter ReadFilter, n
 }
 
 func FollowReceipts(ctx context.Context, store storage.Store, opts FollowOptions, now func() time.Time, emit func(ReceiptBatch) error) error {
+	if store == nil {
+		return typed(ErrInvalidRecordCode, "store is required")
+	}
 	if emit == nil {
 		return typed(ErrInvalidRecordCode, "emit callback is required")
 	}
 	if now == nil {
-		now = store.Now
+		return typed(ErrInvalidRecordCode, "clock is required")
 	}
 	interval := boundFollowPollInterval(opts.PollInterval)
 	ticker := time.NewTicker(interval)
@@ -160,6 +174,11 @@ func FollowReceipts(ctx context.Context, store storage.Store, opts FollowOptions
 
 	filter := opts.ReadFilter
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		batch, err := ReadReceipts(ctx, store, filter, now().UTC())
 		if err != nil {
 			return err
@@ -320,6 +339,19 @@ func decodeCursor(cursor Cursor) (cursorPayload, error) {
 		return cursorPayload{}, typed(ErrInvalidRecordCode, "invalid progress receipt cursor")
 	}
 	return payload, nil
+}
+
+func validateCursorScope(cursor cursorPayload, filter ReadFilter) error {
+	if cursor.Version == 0 || strings.TrimSpace(cursor.ProjectID) == "" {
+		return nil
+	}
+	if cursor.ProjectID != strings.TrimSpace(filter.ProjectID) ||
+		cursor.DeliveryRunID != strings.TrimSpace(filter.DeliveryRunID) ||
+		cursor.CorrelationIDFilter != strings.TrimSpace(filter.CorrelationID) ||
+		cursor.TaskIDFilter != strings.TrimSpace(filter.TaskID) {
+		return typed(ErrInvalidRecordCode, "progress receipt cursor scope mismatch")
+	}
+	return nil
 }
 
 func receiptClock(occurredAt string, now time.Time) ClockView {

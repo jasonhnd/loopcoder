@@ -54,7 +54,11 @@ func progressSupervisorForStore(store storage.Store, projectID, runID string, di
 		MaxSilenceInterval: progress.DefaultMaxSilenceInterval,
 		Diagnostic: func(_ context.Context, diagnostic progress.Diagnostic) {
 			fmt.Fprintf(diagnostics, "[loopcoder] warning: progress receipt diagnostic code=%s correlation=%s phase=%s status=%s error=%s\n",
-				diagnostic.Code, diagnostic.CorrelationID, diagnostic.Phase, diagnostic.Status, diagnostic.Error)
+				progress.DiagnosticMessage(diagnostic.Code),
+				progress.DiagnosticMessage(diagnostic.CorrelationID),
+				progress.DiagnosticMessage(diagnostic.Phase),
+				progress.DiagnosticMessage(diagnostic.Status),
+				progress.DiagnosticMessage(diagnostic.Error))
 		},
 	})
 	if err != nil {
@@ -72,5 +76,5 @@ func progressDiagnosticWarning(w io.Writer, operation string, err error) {
 	if w == nil || err == nil {
 		return
 	}
-	fmt.Fprintf(w, "[loopcoder] warning: %s: %v\n", operation, err)
+	fmt.Fprintf(w, "[loopcoder] warning: %s: %s\n", progress.DiagnosticMessage(operation), progress.DiagnosticMessage(err.Error()))
 }
