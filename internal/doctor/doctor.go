@@ -113,6 +113,7 @@ type Report struct {
 	Commit                string
 	Date                  string
 	HostProfile           HostProfile
+	HostNegotiation       runtimecap.HostNegotiation
 	Runtime               RuntimeHealth
 	ProviderCompatibility []ProviderCompatibility
 	ProviderInventory     providerinventory.Report
@@ -125,8 +126,12 @@ type HostProfile struct {
 	Source             string
 	Selector           string
 	InvocationStyle    string
+	PreservesStdout    bool
+	PreservesStderr    bool
 	SupportsHooks      bool
 	SupportsJSONOutput bool
+	SupportsTimeouts   bool
+	SupportsCancel     bool
 	DetectedBy         []string
 	KnownLimitations   []string
 }
@@ -409,6 +414,7 @@ func RenderJSON(w io.Writer, report Report) error {
 		Date                  string                          `json:"date"`
 		ExitCode              int                             `json:"exit_code"`
 		Host                  renderedHostProfile             `json:"host_profile"`
+		HostNegotiation       runtimecap.HostNegotiation      `json:"host_capability_negotiation"`
 		Runtime               renderedRuntime                 `json:"runtime"`
 		AgentFederation       renderedAgentFederation         `json:"agent_federation"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
@@ -431,6 +437,7 @@ func RenderJSON(w io.Writer, report Report) error {
 			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
 			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
 		},
+		HostNegotiation:       normalizeHostNegotiation(report),
 		AgentFederation:       agentFederation,
 		ProviderCompatibility: compatibility,
 		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
@@ -471,6 +478,30 @@ func RenderJSON(w io.Writer, report Report) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
+}
+
+func normalizeHostNegotiation(report Report) runtimecap.HostNegotiation {
+	if strings.TrimSpace(report.HostNegotiation.SchemaVersion) != "" {
+		return report.HostNegotiation
+	}
+	return runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host: runtimecap.HostProfileRecord{
+			Name:   report.HostProfile.Name,
+			Source: report.HostProfile.Source,
+		},
+		Capabilities: runtimecap.HostCapabilityDeclarations(runtimecap.HostRuntime{
+			Name:               report.HostProfile.Name,
+			InvocationStyle:    report.HostProfile.InvocationStyle,
+			PreservesStdout:    report.HostProfile.PreservesStdout,
+			PreservesStderr:    report.HostProfile.PreservesStderr,
+			SupportsJSONOutput: report.HostProfile.SupportsJSONOutput,
+			SupportsTimeouts:   report.HostProfile.SupportsTimeouts,
+			SupportsCancel:     report.HostProfile.SupportsCancel,
+			SupportsHooks:      report.HostProfile.SupportsHooks,
+			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
+		}),
+	})
 }
 
 func normalizeQuotaUsageBudget(report usageledger.QuotaUsageBudget) usageledger.QuotaUsageBudget {
@@ -593,6 +624,9 @@ func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 			report.HostProfile = renderHostProfile(resolved)
 		}
 	}
+	if strings.TrimSpace(report.HostNegotiation.SchemaVersion) == "" {
+		report.HostNegotiation = normalizeHostNegotiation(report)
+	}
 	return report
 }
 
@@ -704,6 +738,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	return WithMetadata(Report{
 		HostProfile:           host,
+		HostNegotiation:       normalizeHostNegotiation(Report{HostProfile: host}),
 		Runtime:               runtime,
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
 		ProviderInventory:     inventory,
@@ -2195,8 +2230,12 @@ func renderHostProfile(resolved hostprofile.Resolved) HostProfile {
 		Source:             string(resolved.Source),
 		Selector:           resolved.Selector,
 		InvocationStyle:    resolved.Runtime.InvocationStyle,
+		PreservesStdout:    resolved.Runtime.PreservesStdout,
+		PreservesStderr:    resolved.Runtime.PreservesStderr,
 		SupportsHooks:      resolved.Runtime.SupportsHooks,
 		SupportsJSONOutput: resolved.Runtime.SupportsJSONOutput,
+		SupportsTimeouts:   resolved.Runtime.SupportsTimeouts,
+		SupportsCancel:     resolved.Runtime.SupportsCancel,
 		DetectedBy:         append([]string(nil), resolved.DetectedBy...),
 		KnownLimitations:   append([]string(nil), resolved.Runtime.KnownLimitations...),
 	}

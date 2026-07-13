@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/usageledger"
@@ -202,6 +203,25 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 			Source             string `json:"source"`
 			SupportsJSONOutput bool   `json:"supports_json_output"`
 		} `json:"host_profile"`
+		HostNegotiation struct {
+			SchemaVersion string `json:"schema_version"`
+			Outputs       struct {
+				Format             string `json:"format"`
+				StableJSON         bool   `json:"stable_json"`
+				CredentialBlind    bool   `json:"credential_blind"`
+				IncludesLocalPaths bool   `json:"includes_local_paths"`
+			} `json:"outputs"`
+			Compatibility struct {
+				Outcome        string `json:"outcome"`
+				Code           string `json:"code"`
+				SelectedSchema string `json:"selected_schema"`
+			} `json:"compatibility"`
+			Invocation struct {
+				DiscoveryOnly   bool `json:"discovery_only"`
+				ProviderLaunch  bool `json:"provider_launch"`
+				MachineJSONOnly bool `json:"machine_json_only"`
+			} `json:"invocation"`
+		} `json:"host_capability_negotiation"`
 		Runtime struct {
 			Database struct {
 				Status Status `json:"status"`
@@ -244,6 +264,19 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
 		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
+	}
+	if payload.HostNegotiation.SchemaVersion != runtimecap.HostNegotiationSchemaVersion ||
+		payload.HostNegotiation.Outputs.Format != "json" ||
+		!payload.HostNegotiation.Outputs.StableJSON ||
+		!payload.HostNegotiation.Outputs.CredentialBlind ||
+		payload.HostNegotiation.Outputs.IncludesLocalPaths ||
+		payload.HostNegotiation.Compatibility.Outcome != string(runtimecap.HostNegotiationSupported) ||
+		payload.HostNegotiation.Compatibility.Code != "supported" ||
+		payload.HostNegotiation.Compatibility.SelectedSchema != runtimecap.HostNegotiationSchemaVersion ||
+		!payload.HostNegotiation.Invocation.DiscoveryOnly ||
+		payload.HostNegotiation.Invocation.ProviderLaunch ||
+		!payload.HostNegotiation.Invocation.MachineJSONOnly {
+		t.Fatalf("host_capability_negotiation = %#v", payload.HostNegotiation)
 	}
 	if payload.Runtime.Database.Status != "" || payload.Runtime.ProjectRegistry.Status != "" || payload.Runtime.Migration.Status != "" || payload.Runtime.NestedRuns.Status != "" {
 		t.Fatalf("runtime should be empty for manually constructed report: %#v", payload.Runtime)
