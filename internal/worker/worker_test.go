@@ -9,12 +9,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -272,6 +275,258 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if strings.Contains(fakeAgent.invocation.Prompt, "Repo-local skills") {
 		t.Fatalf("agent prompt unexpectedly included repo skills:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestDispatchRegisteredRunEmitsProgressReceiptsFromTracker(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	clock := newWorkerManualClock(fixedNow())
+	registerWorkerProgressProject(t, ctx, dbPath, repo, clock.Now)
+
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M internal/worker/worker.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented dispatch.", 0),
+		log:       "codex ok\n",
+	}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/101"}
+
+	result, err := Dispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 101,
+		IssueTitle:  "Implement dispatch",
+		IssueBody:   "Body",
+		RunID:       "run-progress",
+		ProviderKey: "child-run:run-progress-child",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: clock.Now,
+		PID: func() int {
+			return 4321
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll:          os.RemoveAll,
+		OpenProgressStore:  storage.Open,
+		ProgressClock:      clock,
+		ProgressMaxSilence: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v\nwarnings:\n%s", err, warnings.String())
+	}
+	if !result.OK {
+		t.Fatalf("result OK = false: %#v", result)
+	}
+
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open progress store: %v", err)
+	}
+	defer store.Close()
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		CorrelationID: "job-101-4321",
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) < 6 {
+		t.Fatalf("receipt count = %d, want lifecycle receipts from Dispatch; warnings:\n%s", len(receipts), warnings.String())
+	}
+	phases := map[string]bool{}
+	for _, receipt := range receipts {
+		phases[receipt.Phase] = true
+		if receipt.Provider.ProviderID != "codex" {
+			t.Fatalf("receipt provider = %q, want codex", receipt.Provider.ProviderID)
+		}
+	}
+	for _, want := range []string{"worktree_created", "prompt_written", "codex_started", "codex_exited", "cleanup"} {
+		if !phases[want] {
+			t.Fatalf("progress receipts missing phase %q: %#v", want, phases)
+		}
+	}
+	last := receipts[len(receipts)-1]
+	if last.Phase != "cleanup" || last.Status != "succeeded" {
+		t.Fatalf("last receipt = %s/%s, want cleanup/succeeded", last.Phase, last.Status)
+	}
+	if last.Provider.ModelID != progress.Unknown {
+		t.Fatalf("receipt model id = %q, want unknown because receipt generation does not consume provider tokens", last.Provider.ModelID)
+	}
+	receiptsJSON := mustWorkerJSON(t, receipts)
+	if strings.Contains(receiptsJSON, "input_tokens") || strings.Contains(receiptsJSON, "output_tokens") {
+		t.Fatalf("progress receipts unexpectedly contain provider token usage: %s", receiptsJSON)
+	}
+}
+
+func TestProgressRecorderTaskCountsTruthfulForAttemptStatuses(t *testing.T) {
+	now := fixedNow()
+	recorder := &progressRecorder{now: func() time.Time { return now }}
+	tests := []struct {
+		status string
+		want   progress.TaskCounts
+	}{
+		{state.StatusPlanned, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusQueued, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusLaunching, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusRunning, progress.TaskCounts{Total: 1, Running: 1}},
+		{state.StatusFinishing, progress.TaskCounts{Total: 1, Running: 1}},
+		{state.StatusWaiting, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{state.StatusSucceeded, progress.TaskCounts{Total: 1, Succeeded: 1}},
+		{state.StatusSucceededWithOptionalFailures, progress.TaskCounts{Total: 1, Succeeded: 1}},
+		{state.StatusFailed, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusCancelled, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusTimedOut, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusAbandoned, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusSkipped, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusHung, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{state.StatusNeedsHuman, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{"unrecognized", progress.TaskCounts{Total: 1, Unknown: 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			obs := recorder.observation(state.AttemptRecord{
+				JobID:          "job-counts",
+				Issue:          828,
+				Attempt:        1,
+				Provider:       "codex",
+				Phase:          "test_phase",
+				Status:         tt.status,
+				StartedAt:      state.FormatTimestamp(now.Add(-time.Minute)),
+				HeartbeatAt:    state.FormatTimestamp(now.Add(-30 * time.Second)),
+				LastProgressAt: state.FormatTimestamp(now.Add(-45 * time.Second)),
+			})
+			if obs.TaskCounts != tt.want {
+				t.Fatalf("TaskCounts for %q = %#v, want %#v", tt.status, obs.TaskCounts, tt.want)
+			}
+			sum := obs.TaskCounts.Ready + obs.TaskCounts.Running + obs.TaskCounts.Succeeded + obs.TaskCounts.Failed + obs.TaskCounts.Blocked + obs.TaskCounts.Unknown
+			if sum != obs.TaskCounts.Total {
+				t.Fatalf("TaskCounts sum = %d, total = %d for %#v", sum, obs.TaskCounts.Total, obs.TaskCounts)
+			}
+		})
+	}
+}
+
+func TestProgressRecorderRetryHonorsStaleWorkerOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	clock := newWorkerManualClock(fixedNow())
+	registerWorkerProgressProject(t, ctx, dbPath, repo, clock.Now)
+
+	ownershipStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open ownership store: %v", err)
+	}
+	defer ownershipStore.Close()
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, ownershipStore, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		RunID:         "run-progress",
+		OwnerID:       "worker:run-progress:job-ownership-retry:1",
+		Now:           clock.Now(),
+		LeaseUntil:    clock.Now().Add(time.Hour),
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease: %v", err)
+	}
+
+	var failing *workerFailingWriteStore
+	validateCalls := 0
+	var validateMu sync.Mutex
+	recorder, err := newProgressRecorder(ctx, Options{
+		IssueNumber: 828,
+		RunID:       "run-progress",
+		Attempt:     1,
+		Provider:    "codex",
+	}, Deps{
+		Now: clock.Now,
+		OpenProgressStore: func(ctx context.Context, opts storage.Options) (storage.Store, error) {
+			store, err := storage.Open(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			failing = &workerFailingWriteStore{Store: store, skip: 1, failures: 100}
+			return failing, nil
+		},
+		ProgressClock:      clock,
+		ProgressMaxSilence: 20 * time.Second,
+	}, runtimepath.Roots{
+		Registered:   true,
+		ProjectID:    "proj_worker_progress",
+		DatabasePath: dbPath,
+	}, "job-ownership-retry", io.Discard, func(ctx context.Context) error {
+		validateMu.Lock()
+		validateCalls++
+		validateMu.Unlock()
+		return storage.ValidateAgentOwnershipFence(ctx, ownershipStore, lease)
+	})
+	if err != nil {
+		t.Fatalf("newProgressRecorder: %v", err)
+	}
+	defer recorder.Stop()
+
+	recorder.RecordAttempt(state.AttemptRecord{
+		JobID:          "job-ownership-retry",
+		Issue:          828,
+		Attempt:        1,
+		Provider:       "codex",
+		Phase:          "codex_started",
+		Status:         state.StatusRunning,
+		StartedAt:      state.FormatTimestamp(clock.Now()),
+		HeartbeatAt:    state.FormatTimestamp(clock.Now()),
+		LastProgressAt: state.FormatTimestamp(clock.Now()),
+	}, false)
+	waitForWorkerWriteAttempts(t, failing, 1)
+
+	clock.Advance(20 * time.Second)
+	waitForWorkerWriteAttempts(t, failing, 2)
+	if err := storage.ReleaseAgentOwnershipLease(ctx, ownershipStore, lease, clock.Now().Add(time.Second)); err != nil {
+		t.Fatalf("ReleaseAgentOwnershipLease: %v", err)
+	}
+	clock.Advance(10 * time.Second)
+	waitForWorkerValidationCalls(t, &validateMu, &validateCalls, 3)
+	if got := failing.Attempts(); got != 2 {
+		t.Fatalf("write attempts after stale retry = %d, want stale ownership to block before persistence", got)
+	}
+
+	verifyStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open verify store: %v", err)
+	}
+	defer verifyStore.Close()
+	receipts, err := progress.ListReceipts(ctx, verifyStore, progress.ListFilter{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		CorrelationID: "job-ownership-retry",
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipt count after stale retry = %d, want only initial durable receipt", len(receipts))
 	}
 }
 
@@ -2276,6 +2531,141 @@ func validWorkerAgentResult(summary string, exitCode int) agent.Result {
 		EndedAt:    "2026-06-28T00:00:42Z",
 		DurationMS: 42000,
 	}
+}
+
+func registerWorkerProgressProject(t *testing.T, ctx context.Context, dbPath, repo string, now func() time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("mkdir db dir: %v", err)
+	}
+	absRepo, err := filepath.Abs(repo)
+	if err != nil {
+		t.Fatalf("abs repo: %v", err)
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: now})
+	if err != nil {
+		t.Fatalf("Open registry store: %v", err)
+	}
+	defer store.Close()
+	ts := state.FormatTimestamp(now())
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at)
+			VALUES (?, ?, ?, 'repo', 'local-path', ?, ?)
+			ON CONFLICT(id) DO UPDATE SET local_path = excluded.local_path, local_path_canonical = excluded.local_path_canonical, detached_at = ''`,
+			"proj_worker_progress", absRepo, absRepo, ts, ts)
+		return err
+	}); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+}
+
+func mustWorkerJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	return string(data)
+}
+
+type workerManualClock struct {
+	mu  sync.Mutex
+	now time.Time
+	ch  chan time.Time
+}
+
+func newWorkerManualClock(now time.Time) *workerManualClock {
+	return &workerManualClock{now: now.UTC(), ch: make(chan time.Time, 16)}
+}
+
+func (c *workerManualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *workerManualClock) NewTicker(time.Duration) progress.Ticker {
+	return workerManualTicker{ch: c.ch}
+}
+
+func (c *workerManualClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	now := c.now
+	c.mu.Unlock()
+	c.ch <- now
+}
+
+type workerManualTicker struct {
+	ch <-chan time.Time
+}
+
+func (t workerManualTicker) C() <-chan time.Time { return t.ch }
+func (t workerManualTicker) Stop()               {}
+
+type workerFailingWriteStore struct {
+	storage.Store
+	mu       sync.Mutex
+	attempts int
+	skip     int
+	failures int
+}
+
+func (s *workerFailingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	shouldFail := attempt > s.skip && s.failures > 0
+	if shouldFail {
+		s.failures--
+	}
+	s.mu.Unlock()
+	if shouldFail {
+		return errors.New("injected progress write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func (s *workerFailingWriteStore) Attempts() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func waitForWorkerWriteAttempts(t *testing.T, store *workerFailingWriteStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if store != nil && store.Attempts() >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if store == nil {
+		t.Fatalf("write attempts = 0, want at least %d", want)
+	}
+	t.Fatalf("write attempts = %d, want at least %d", store.Attempts(), want)
+}
+
+func waitForWorkerValidationCalls(t *testing.T, mu *sync.Mutex, calls *int, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := *calls
+		mu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	got := *calls
+	mu.Unlock()
+	t.Fatalf("ownership validation calls = %d, want at least %d", got, want)
 }
 
 func assertNoReportFootprint(t *testing.T, surface, text string, record reporter.Report) {

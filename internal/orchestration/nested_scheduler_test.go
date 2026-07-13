@@ -19,6 +19,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -709,6 +710,7 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	repo := t.TempDir()
 	now := nestedTestNow()
 	var order []string
+	recorder := &recordingProgressRecorder{}
 	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
 		RepoPath:         repo,
 		ParentRunID:      "run-20260709T000000Z-wave",
@@ -716,6 +718,7 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 		MaxChildren:      2,
 		Now:              now,
 		Clock:            func() time.Time { return now },
+		Progress:         recorder,
 		Children: []ChildRunPlan{
 			{ID: "second", Issue: 2, Permission: "write", Required: true, DependsOn: []string{"first"}},
 			{ID: "first", Issue: 1, Permission: "write", Required: true},
@@ -733,6 +736,39 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	}
 	if !reflect.DeepEqual(order, []string{"first", "second"}) {
 		t.Fatalf("execution order = %#v, want dependency order", order)
+	}
+	if !recorder.hasKnown(progress.KnownDeliveryPending) || !recorder.hasKnown(progress.KnownTerminal) || !recorder.hasStatus(NestedStatusWaiting) {
+		t.Fatalf("nested progress observations = %#v", recorder.observations)
+	}
+}
+
+func TestEmitNestedChildProgressZeroTimestampUsesInjectedClock(t *testing.T) {
+	injected := nestedTestNow().Add(42 * time.Minute)
+	recorder := &recordingProgressRecorder{}
+	child := ChildRunPlan{
+		ChildKey: "child-clock",
+		RunID:    "run-child-clock",
+		Role:     "worker",
+	}
+	result := ChildRunResult{
+		RunID:       child.RunID,
+		ChildKey:    child.ChildKey,
+		ProviderKey: "provider-child-clock",
+		Status:      NestedStatusRunning,
+	}
+
+	emitNestedChildProgress(context.Background(), NestedScheduleOptions{
+		RootRunID: "run-root-clock",
+		Now:       nestedTestNow(),
+		Clock:     func() time.Time { return injected },
+		Progress:  recorder,
+	}, child, result, NestedEventChildRunning, time.Time{}, false)
+
+	if len(recorder.observations) != 1 {
+		t.Fatalf("progress observation count = %d, want 1", len(recorder.observations))
+	}
+	if got := recorder.observations[0].OccurredAt; !got.Equal(injected) {
+		t.Fatalf("progress occurred_at = %s, want injected clock %s", got, injected)
 	}
 }
 

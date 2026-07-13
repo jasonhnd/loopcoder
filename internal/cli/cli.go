@@ -2405,6 +2405,13 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
 
+	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, runID, deps.Now, stderr)
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "tick: progress receipt shutdown: %v\n", err)
+		}
+	}()
+
 	tickReport, err := deps.Tick(context.Background(), orchestration.TickOptions{
 		Reader:             deps.NewGitHubReader(resolvedRepo),
 		IssueWriter:        deps.NewIssueWriter(resolvedRepo),
@@ -2429,6 +2436,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
+		Progress:        progressRecorder,
 		ProcessAlive:    deps.ProcessAlive,
 		Clock:           deps.Now,
 		Stderr:          stderr,

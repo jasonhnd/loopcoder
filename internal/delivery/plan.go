@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -26,6 +27,7 @@ type PlanProposalInput struct {
 	ProjectID       string
 	DeliveryRunID   string
 	HostEnforcement HostEnforcement
+	Progress        progress.Recorder
 }
 
 type PlanProposal struct {
@@ -87,6 +89,7 @@ type DecisionOptions struct {
 	EditedProposalJSON               string
 	Reason                           string
 	HostEnforcement                  HostEnforcement
+	Progress                         progress.Recorder
 }
 
 type DecisionResult struct {
@@ -113,6 +116,7 @@ type ContinueOptions struct {
 	IdempotencyKey                   string
 	Now                              time.Time
 	HostEnforcement                  HostEnforcement
+	Progress                         progress.Recorder
 }
 
 type ContinueResult struct {
@@ -138,6 +142,7 @@ func Plan(ctx context.Context, store storage.Store, input PlanProposalInput) (Pl
 	}
 	invocation, err := enforceHostInvocation(OperationPlan, input.HostEnforcement)
 	if err != nil {
+		emitHostUnavailableProgress(ctx, input.Progress, input.ProjectID, input.DeliveryRunID, OperationPlan, err, time.Time{})
 		return PlanProposal{Invocation: invocation}, err
 	}
 	var proposal PlanProposal
@@ -166,6 +171,7 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 	}
 	invocation, err := enforceHostInvocation(OperationDecide, opts.HostEnforcement)
 	if err != nil {
+		emitHostUnavailableProgress(ctx, opts.Progress, opts.ProjectID, opts.DeliveryRunID, OperationDecide, err, opts.Now)
 		return DecisionResult{Action: opts.Action, ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeUnsupported, Invocation: invocation}, err
 	}
 	if ctx.Err() != nil {
@@ -226,6 +232,22 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 		}
 		return remember(ctx, tx, opts.IdempotencyKey, opts.ProjectID, opts.DeliveryRunID, "delivery_decide", request, out, opts.Now)
 	})
+	if err == nil {
+		emitDeliveryRunProgress(ctx, opts.Progress, DeliveryRun{
+			ProjectID:     out.ProjectID,
+			DeliveryRunID: out.DeliveryRunID,
+			RunID:         out.DeliveryRunID,
+			State:         out.RunState,
+		}, "delivery_decide:"+opts.Action, opts.Now)
+		if out.ApprovalID != "" {
+			emitApprovalProgress(ctx, opts.Progress, Approval{
+				ApprovalID:    out.ApprovalID,
+				ProjectID:     out.ProjectID,
+				DeliveryRunID: out.DeliveryRunID,
+				Status:        "active",
+			}, "delivery_decide:"+opts.Action, opts.Now)
+		}
+	}
 	return out, err
 }
 
@@ -238,6 +260,7 @@ func Continue(ctx context.Context, store storage.Store, opts ContinueOptions) (C
 	}
 	invocation, err := enforceHostInvocation(OperationContinue, opts.HostEnforcement)
 	if err != nil {
+		emitHostUnavailableProgress(ctx, opts.Progress, opts.ProjectID, opts.DeliveryRunID, OperationContinue, err, opts.Now)
 		return ContinueResult{ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeUnsupported, Invocation: invocation}, err
 	}
 	if ctx.Err() != nil {
@@ -303,6 +326,24 @@ func Continue(ctx context.Context, store storage.Store, opts ContinueOptions) (C
 		}
 		return remember(ctx, tx, opts.IdempotencyKey, opts.ProjectID, opts.DeliveryRunID, "delivery_continue", request, out, opts.Now)
 	})
+	if err == nil {
+		emitDeliveryRunProgress(ctx, opts.Progress, DeliveryRun{
+			ProjectID:     out.ProjectID,
+			DeliveryRunID: out.DeliveryRunID,
+			RunID:         out.DeliveryRunID,
+			State:         out.RunState,
+		}, "delivery_continue", opts.Now)
+		for _, task := range out.Proposal.Tasks {
+			if task.State == TaskAwaitingApproval {
+				emitTaskProgress(ctx, opts.Progress, Task{
+					ProjectID:     out.ProjectID,
+					DeliveryRunID: out.DeliveryRunID,
+					TaskID:        task.TaskID,
+					State:         TaskReady,
+				}, "delivery_continue:approval_bound", opts.Now)
+			}
+		}
+	}
 	return out, err
 }
 

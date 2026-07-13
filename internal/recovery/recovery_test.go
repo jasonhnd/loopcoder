@@ -13,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -340,6 +341,40 @@ func TestRecoverBudgetBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
 	}
 	if _, err := os.Stat(guardrails.LedgerPath(repo, "run-test", 103)); err != nil {
 		t.Fatalf("budget ledger was not written: %v", err)
+	}
+}
+
+func TestRecoverRunEmitsRecoveryProgressAndTerminalBlocked(t *testing.T) {
+	repo := t.TempDir()
+	recorder := &recordingRecoveryProgressRecorder{}
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    1,
+		Now:            fixedRecoverTime(),
+		SkipAdoptPR:    true,
+		Progress:       recorder,
+		BackoffSeconds: []int{0},
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return []state.Attempt{{Issue: 103, Attempt: 1, JobID: "job-103-1", Status: "failed"}}, nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			t.Fatal("dispatch should not run after max-attempts block")
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want blocked", result.Action)
+	}
+	if !recorder.hasKnown(progress.KnownRecoveryInProgress) || !recorder.hasTerminal(progress.KnownBlocked) {
+		t.Fatalf("recovery progress observations = %#v", recorder.observations)
 	}
 }
 
@@ -1081,6 +1116,39 @@ func recoverAttempt(repo string, attemptNumber int, jobID, status, errText strin
 
 func fixedRecoverTime() time.Time {
 	return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+}
+
+type recordingRecoveryProgressRecorder struct {
+	observations []progress.Observation
+}
+
+func (r *recordingRecoveryProgressRecorder) Emit(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingRecoveryProgressRecorder) Terminal(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	observation.Terminal = true
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingRecoveryProgressRecorder) hasKnown(known string) bool {
+	for _, observation := range r.observations {
+		if observation.KnownState == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingRecoveryProgressRecorder) hasTerminal(known string) bool {
+	for _, observation := range r.observations {
+		if observation.Terminal && observation.KnownState == known {
+			return true
+		}
+	}
+	return false
 }
 
 func recoverReport(issue int, totalTokens int64) *reporter.Report {

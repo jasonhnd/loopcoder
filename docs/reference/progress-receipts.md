@@ -12,6 +12,17 @@ quota/budget, blocker, next-action, heartbeat, or progress transitions produce
 new rows. Replay is deterministic by `occurred_at`, `correlation_id`,
 `correlation_sequence`, and the SQLite `storage_order` tie-breaker.
 
+LoopCoder-owned supervisors emit receipts through the progress emitter without
+calling provider/model adapters. Consequential supervisor observations emit
+immediately, and active runs default to a five-minute maximum receipt-generation
+silence interval. The interval is configurable only within one second and one
+hour; values outside that range are rejected. Periodic receipts describe only
+known supervisor state, such as alive with no meaningful progress, waiting for
+CI, waiting for approval, quota blocked, fallback in progress, host offline, or
+delivery pending. A generated receipt is not evidence of worker progress, host
+delivery, user visibility, delivery acknowledgment, or renewal of any lease,
+claim, reservation, budget, quota window, or stall watchdog deadline.
+
 Rollback behavior is fail-closed. Schema v25 is committed atomically with its
 migration row, and older binaries that only support v24 reject the database as a
 future schema. Downgrade by restoring a pre-v25 database copy or exporting local

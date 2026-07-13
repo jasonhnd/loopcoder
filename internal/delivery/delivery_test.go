@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -252,6 +253,162 @@ func TestApprovalAndOverrideReplayAfterRunFingerprintChange(t *testing.T) {
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 1)
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_overrides`, 1)
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_attempts`, 0)
+}
+
+func TestDeliveryPublicTransitionsEmitProgressReceipts(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	seedProject(t, ctx, store, "proj_progress_delivery")
+
+	runEmitter := mustDeliveryProgressEmitter(t, store, "proj_progress_delivery", "run_progress_delivery", "delivery-run:run_progress_delivery")
+	run := deliveryRunFixture("proj_progress_delivery", "run_progress_delivery")
+	run.State = RunPlanning
+	run.ApprovalStatus = "required"
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "progress-run-create", Now: fixedTime(), Progress: runEmitter}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	if _, err := TransitionDeliveryRun(ctx, store, run.ProjectID, run.DeliveryRunID, "plan_ready_requires_approval", actor(), host(), PersistOptions{IdempotencyKey: "progress-run-awaiting-approval", Now: fixedTime().Add(time.Minute), Progress: runEmitter}); err != nil {
+		t.Fatalf("TransitionDeliveryRun awaiting approval: %v", err)
+	}
+	if _, err := TransitionDeliveryRun(ctx, store, run.ProjectID, run.DeliveryRunID, "cancel", actor(), host(), PersistOptions{IdempotencyKey: "progress-run-cancelling", Now: fixedTime().Add(2 * time.Minute), Progress: runEmitter}); err != nil {
+		t.Fatalf("TransitionDeliveryRun cancelling: %v", err)
+	}
+	if _, err := TransitionDeliveryRun(ctx, store, run.ProjectID, run.DeliveryRunID, "finish_failure", actor(), host(), PersistOptions{IdempotencyKey: "progress-run-cancelled", Now: fixedTime().Add(3 * time.Minute), Progress: runEmitter}); err != nil {
+		t.Fatalf("TransitionDeliveryRun cancelled: %v", err)
+	}
+	runReceipts := listProgressReceipts(t, ctx, store, "proj_progress_delivery", "run_progress_delivery", "delivery-run:run_progress_delivery")
+	assertReceiptStatusAndGap(t, runReceipts, RunAwaitingApproval, progress.KnownWaitingApproval)
+	assertReceiptStatusAndGap(t, runReceipts, RunCancelling, progress.KnownCancellationInProgress)
+	assertReceiptStatusAndGap(t, runReceipts, RunCancelled, progress.KnownCancellationInProgress)
+
+	taskEmitter := mustDeliveryProgressEmitter(t, store, "proj_progress_delivery", "run_progress_task", "task:task_progress")
+	taskRun := deliveryRunFixture("proj_progress_delivery", "run_progress_task")
+	if _, err := PersistDeliveryRun(ctx, store, taskRun, PersistOptions{IdempotencyKey: "progress-task-run", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun task run: %v", err)
+	}
+	task := taskFixture(taskRun, "progress")
+	task.TaskID = "task_progress"
+	task.State = TaskAwaitingApproval
+	if _, err := PersistTask(ctx, store, task, PersistOptions{IdempotencyKey: "progress-task-create", Now: fixedTime(), Progress: taskEmitter}); err != nil {
+		t.Fatalf("PersistTask awaiting approval: %v", err)
+	}
+	if _, err := TransitionTask(ctx, store, task.ProjectID, task.DeliveryRunID, task.TaskID, "approval_bound", actor(), host(), PersistOptions{IdempotencyKey: "progress-task-ready", Now: fixedTime().Add(time.Minute), Progress: taskEmitter}); err != nil {
+		t.Fatalf("TransitionTask ready: %v", err)
+	}
+	taskReceipts := listProgressReceipts(t, ctx, store, "proj_progress_delivery", "run_progress_task", "task:task_progress")
+	assertReceiptStatusAndGap(t, taskReceipts, TaskAwaitingApproval, progress.KnownWaitingApproval)
+	assertReceiptStatusAndGap(t, taskReceipts, TaskReady, progress.KnownDeliveryPending)
+	if got := taskReceipts[len(taskReceipts)-1].TaskCounts; got.Total != 1 || got.Ready != 1 || got.Running != 0 {
+		t.Fatalf("ready task counts = %#v, want ready=1 and running=0", got)
+	}
+
+	approvalEmitter := mustDeliveryProgressEmitter(t, store, "proj_progress_delivery", "run_progress_claim", "approval:pending")
+	claimRun := deliveryRunFixture("proj_progress_delivery", "run_progress_claim")
+	claimRun.State = RunQueued
+	if _, err := PersistDeliveryRun(ctx, store, claimRun, PersistOptions{IdempotencyKey: "progress-claim-run", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun claim run: %v", err)
+	}
+	claimTask := taskFixture(claimRun, "claim")
+	claimTask.State = TaskReady
+	createdTask, err := PersistTask(ctx, store, claimTask, PersistOptions{IdempotencyKey: "progress-claim-task", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("PersistTask claim task: %v", err)
+	}
+	approval := approvalFixture(claimRun)
+	storedApproval, err := RecordApproval(ctx, store, approval, PersistOptions{IdempotencyKey: "progress-approval", Now: fixedTime(), Progress: approvalEmitter})
+	if err != nil {
+		t.Fatalf("RecordApproval: %v", err)
+	}
+	approvalReceipts := listProgressReceipts(t, ctx, store, "proj_progress_delivery", "run_progress_claim", "approval:"+storedApproval.ApprovalID)
+	if len(approvalReceipts) != 1 || approvalReceipts[0].Phase != "approval" || approvalReceipts[0].Status != "active" {
+		t.Fatalf("approval receipts = %#v, want one active approval receipt", approvalReceipts)
+	}
+
+	attemptEmitter := mustDeliveryProgressEmitter(t, store, "proj_progress_delivery", "run_progress_claim", "attempt:"+stableID("att", createdTask.TaskID, "1"))
+	attempt, err := ClaimTask(ctx, store, claimRun.ProjectID, claimRun.DeliveryRunID, createdTask.TaskID, "executor-progress", actor(), host(), PersistOptions{IdempotencyKey: "progress-claim", Now: fixedTime().Add(time.Minute), Progress: attemptEmitter})
+	if err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	attemptReceipts := listProgressReceipts(t, ctx, store, "proj_progress_delivery", "run_progress_claim", "attempt:"+attempt.AttemptID)
+	if len(attemptReceipts) != 1 || attemptReceipts[0].Status != AttemptClaimed || attemptReceipts[0].TaskCounts.Ready != 1 {
+		t.Fatalf("attempt receipts = %#v, want claimed attempt ready count", attemptReceipts)
+	}
+}
+
+func TestDeliveryProgressSupervisorKeepsIndependentTaskCorrelations(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	seedProject(t, ctx, store, "proj_progress_supervisor")
+	supervisor := mustDeliveryProgressSupervisor(t, store, "proj_progress_supervisor", "run_progress_supervisor")
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := supervisor.Stop(stopCtx); err != nil {
+			t.Fatalf("Stop supervisor: %v", err)
+		}
+	}()
+
+	run := deliveryRunFixture("proj_progress_supervisor", "run_progress_supervisor")
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "supervisor-run", Now: fixedTime(), Progress: supervisor}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	taskA := taskFixture(run, "a")
+	taskA.TaskID = "task_supervisor_a"
+	taskA.State = TaskRunning
+	taskB := taskFixture(run, "b")
+	taskB.TaskID = "task_supervisor_b"
+	var err error
+	taskA, err = PersistTask(ctx, store, taskA, PersistOptions{IdempotencyKey: "supervisor-task-a", Now: fixedTime(), Progress: supervisor})
+	if err != nil {
+		t.Fatalf("PersistTask A: %v", err)
+	}
+	taskB, err = PersistTask(ctx, store, taskB, PersistOptions{IdempotencyKey: "supervisor-task-b", Now: fixedTime(), Progress: supervisor})
+	if err != nil {
+		t.Fatalf("PersistTask B: %v", err)
+	}
+	if _, err := TransitionTask(ctx, store, run.ProjectID, run.DeliveryRunID, taskA.TaskID, "complete_success", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-task-a-terminal", Now: fixedTime().Add(time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionTask A terminal: %v", err)
+	}
+	if _, err := TransitionTask(ctx, store, run.ProjectID, run.DeliveryRunID, taskB.TaskID, "dependencies_ready", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-task-b-ready", Now: fixedTime().Add(2 * time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionTask B after A terminal: %v", err)
+	}
+	if _, err := TransitionDeliveryRun(ctx, store, run.ProjectID, run.DeliveryRunID, "queue", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-run-progress", Now: fixedTime().Add(3 * time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionDeliveryRun after task terminal: %v", err)
+	}
+
+	receiptsA := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "task:"+taskA.TaskID)
+	receiptsB := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "task:"+taskB.TaskID)
+	runReceipts := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "delivery-run:"+run.DeliveryRunID)
+	assertReceiptStatusAndGap(t, receiptsA, TaskSucceeded, progress.KnownTerminal)
+	assertReceiptStatusAndGap(t, receiptsB, TaskReady, progress.KnownDeliveryPending)
+	assertReceiptStatusAndGap(t, runReceipts, RunQueued, progress.KnownDeliveryPending)
+}
+
+func TestDeliveryProgressFailureReportsDiagnosticWithoutRollback(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	seedProject(t, ctx, store, "proj_progress_diag")
+	recorder := &failingProgressRecorder{err: errors.New(strings.Repeat("receipt failure ", 30))}
+	run := deliveryRunFixture("proj_progress_diag", "run_progress_diag")
+	task := taskFixture(run, "diag")
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "diag-run", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	created, err := PersistTask(ctx, store, task, PersistOptions{IdempotencyKey: "diag-task", Now: fixedTime(), Progress: recorder})
+	if err != nil {
+		t.Fatalf("PersistTask with failing progress: %v", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks WHERE task_id = '`+created.TaskID+`'`, 1)
+	if len(recorder.diagnostics) != 1 {
+		t.Fatalf("diagnostics = %#v, want one progress failure diagnostic", recorder.diagnostics)
+	}
+	diag := recorder.diagnostics[0]
+	if diag.Code != "progress-receipt-generation-failed" || diag.CorrelationID != "task:"+created.TaskID || len(diag.Error) > 240 {
+		t.Fatalf("diagnostic = %#v, want bounded typed task diagnostic", diag)
+	}
 }
 
 func TestDependencyEdgeCycleQueryFailureIsAtomic(t *testing.T) {
@@ -836,6 +993,89 @@ func openDeliveryStore(t *testing.T) storage.Store {
 		t.Fatalf("Open: %v", err)
 	}
 	return store
+}
+
+func mustDeliveryProgressEmitter(t *testing.T, store storage.Store, projectID, runID, correlationID string) *progress.Emitter {
+	t.Helper()
+	emitter, err := progress.NewEmitter(progress.EmitterOptions{
+		Store:              store,
+		ProjectID:          projectID,
+		DeliveryRunID:      runID,
+		RunID:              runID,
+		CorrelationID:      correlationID,
+		MaxSilenceInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	return emitter
+}
+
+func mustDeliveryProgressSupervisor(t *testing.T, store storage.Store, projectID, runID string) *progress.Supervisor {
+	t.Helper()
+	supervisor, err := progress.NewSupervisor(progress.SupervisorOptions{
+		Store:              store,
+		ProjectID:          projectID,
+		DeliveryRunID:      runID,
+		RunID:              runID,
+		MaxSilenceInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	return supervisor
+}
+
+type failingProgressRecorder struct {
+	err         error
+	diagnostics []progress.Diagnostic
+}
+
+func (r *failingProgressRecorder) Emit(context.Context, progress.Observation) (progress.EmitResult, error) {
+	return progress.EmitResult{}, r.err
+}
+
+func (r *failingProgressRecorder) Terminal(context.Context, progress.Observation) (progress.EmitResult, error) {
+	return progress.EmitResult{}, r.err
+}
+
+func (r *failingProgressRecorder) RecordProgressDiagnostic(_ context.Context, diagnostic progress.Diagnostic) {
+	r.diagnostics = append(r.diagnostics, diagnostic)
+}
+
+func listProgressReceipts(t *testing.T, ctx context.Context, store storage.Store, projectID, runID, correlationID string) []progress.ProgressReceipt {
+	t.Helper()
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		CorrelationID: correlationID,
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	return receipts
+}
+
+func assertReceiptStatusAndGap(t *testing.T, receipts []progress.ProgressReceipt, status, gap string) {
+	t.Helper()
+	for _, receipt := range receipts {
+		if receipt.Status == status {
+			if containsString(receipt.GapReasons, gap) {
+				return
+			}
+			t.Fatalf("receipt %s gap reasons = %#v, want %q", status, receipt.GapReasons, gap)
+		}
+	}
+	t.Fatalf("missing receipt status %q in %#v", status, receipts)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func seedTwoTaskDependencyRun(t *testing.T, ctx context.Context, store storage.Store, projectID, runID string) (DeliveryRun, Task, Task) {

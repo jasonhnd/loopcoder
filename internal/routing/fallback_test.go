@@ -11,6 +11,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
@@ -22,6 +23,7 @@ func TestFallbackSelectsFreshHardEligibleCandidateAndPersistsReplaySafely(t *tes
 	store := openRoutingStore(t, ctx, fixture.now)
 	defer store.Close()
 	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	emitter := mustRoutingProgressEmitter(t, store, original.ProjectID, original.DeliveryRunID, "fallback:"+original.RoutingDecisionID)
 
 	fallback, err := DecideAndPersistFallback(ctx, store, FallbackInput{
 		RoutingDecisionID: original.RoutingDecisionID,
@@ -32,6 +34,7 @@ func TestFallbackSelectsFreshHardEligibleCandidateAndPersistsReplaySafely(t *tes
 		AttemptLineage:    []string{"att_worker_1"},
 		DecidedBy:         schedulerActor(),
 		Host:              routingHost(),
+		Progress:          emitter,
 	})
 	if err != nil {
 		t.Fatalf("DecideAndPersistFallback: %v", err)
@@ -73,6 +76,19 @@ func TestFallbackSelectsFreshHardEligibleCandidateAndPersistsReplaySafely(t *tes
 	}
 	if loaded.FallbackCandidateID != fallback.FallbackCandidateID || len(loaded.AttemptLineage) != 1 {
 		t.Fatalf("loaded fallback lost persisted route/attempt lineage: %#v", loaded)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     original.ProjectID,
+		DeliveryRunID: original.DeliveryRunID,
+		CorrelationID: "fallback:" + original.RoutingDecisionID,
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 ||
+		!routingContainsString(receipts[0].GapReasons, progress.KnownFallbackInProgress) ||
+		routingContainsString(receipts[0].GapReasons, progress.ReasonTerminal) {
+		t.Fatalf("selected fallback receipts = %#v, want active fallback-in-progress receipt", receipts)
 	}
 }
 
@@ -729,6 +745,7 @@ func TestFallbackNoRouteReplayIgnoresCallerLineageAndAuthorityArrays(t *testing.
 	defer store.Close()
 	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
 	input.Inputs.Candidates = []Candidate{candidateByID(t, input.Inputs.Candidates, original.ChosenCandidateID)}
+	emitter := mustRoutingProgressEmitter(t, store, original.ProjectID, original.DeliveryRunID, "fallback:"+original.RoutingDecisionID)
 
 	first, err := DecideAndPersistFallback(ctx, store, FallbackInput{
 		RoutingDecisionID: original.RoutingDecisionID,
@@ -738,9 +755,24 @@ func TestFallbackNoRouteReplayIgnoresCallerLineageAndAuthorityArrays(t *testing.
 		AttemptLineage:    []string{"attempt-a"},
 		DecidedBy:         schedulerActor(),
 		Host:              routingHost(),
+		Progress:          emitter,
 	})
 	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
 		t.Fatalf("first no-route fallback error = %v, want ErrReplanRequired", err)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     original.ProjectID,
+		DeliveryRunID: original.DeliveryRunID,
+		CorrelationID: "fallback:" + original.RoutingDecisionID,
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 ||
+		receipts[0].Phase != "fallback" ||
+		!routingContainsString(receipts[0].GapReasons, progress.KnownQuotaBlocked) ||
+		!routingContainsString(receipts[0].GapReasons, progress.ReasonTerminal) {
+		t.Fatalf("fallback progress receipts = %#v, want terminal quota-blocked fallback receipt", receipts)
 	}
 	replayed, err := DecideAndPersistFallback(ctx, store, FallbackInput{
 		RoutingDecisionID: original.RoutingDecisionID,
@@ -865,6 +897,22 @@ func openRoutingStore(t *testing.T, ctx context.Context, now time.Time) storage.
 	}
 	seedRoutingDecisionStore(t, ctx, store, now)
 	return store
+}
+
+func mustRoutingProgressEmitter(t *testing.T, store storage.Store, projectID, runID, correlationID string) *progress.Emitter {
+	t.Helper()
+	emitter, err := progress.NewEmitter(progress.EmitterOptions{
+		Store:              store,
+		ProjectID:          projectID,
+		DeliveryRunID:      runID,
+		RunID:              runID,
+		CorrelationID:      correlationID,
+		MaxSilenceInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	return emitter
 }
 
 func persistFallbackOriginalRoute(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture) (RoutingDecision, DecisionInput) {
@@ -1025,6 +1073,15 @@ func schedulerActor() delivery.Actor {
 func hasIllegalLegalityRow(rows []LegalityResult, dimension string) bool {
 	for _, row := range rows {
 		if row.Dimension == dimension && !row.Legal {
+			return true
+		}
+	}
+	return false
+}
+
+func routingContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
 			return true
 		}
 	}
