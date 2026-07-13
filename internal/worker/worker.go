@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,8 @@ const (
 	WorkerHardCap      = lcdefaults.WorkerHardCap
 	WorkerStallTimeout = lcdefaults.WorkerStallTimeout
 )
+
+const scratchOwnerFile = ".loopcoder-attempt.json"
 
 type Options struct {
 	RepoPath        string
@@ -149,6 +152,8 @@ type dispatchContext struct {
 	domainPolicy      domainWorkerPolicy
 	activePhase       string
 	dispatchSucceeded bool
+	preserveArtifacts bool
+	preserveReason    string
 	cleanupStatus     string
 	failureStatus     string
 }
@@ -271,6 +276,9 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
 	dispatch.logPath = filepath.Join(scratch, "codex.log")
 	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	if err := writeScratchOwner(dispatch); err != nil {
+		return err
+	}
 	if dispatch.runtimeRoots.Registered {
 		logDir := filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID)
 		if err := os.MkdirAll(logDir, 0o700); err != nil {
@@ -435,6 +443,8 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			"mode":   harvest.Mode,
 		})
 		dispatch.dispatchSucceeded = true
+		dispatch.preserveArtifacts = true
+		dispatch.preserveReason = "harvested hung/killed worker needs human review"
 		dispatch.cleanupStatus = "needs-human"
 		return Result{
 			OK:          true,
@@ -538,6 +548,7 @@ func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error
 	}
 	errText := failure.Error()
 	dispatch.tracker.transition(failurePhase, dispatch.failureStatus, dispatch.tracker.exitCode, &errText)
+	var preservationErrors []string
 	if briefErr := writeRecoveryBrief(ctx, recoveryBriefOptions{
 		repoPath:     dispatch.repoPath,
 		runID:        dispatch.opts.RunID,
@@ -556,9 +567,11 @@ func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error
 		github:       dispatch.github,
 		warnings:     dispatch.warnings,
 	}); briefErr != nil {
-		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write recovery brief for %s: %v\n", dispatch.jobID, briefErr)
+		msg := fmt.Sprintf("failed to write recovery brief for %s: %v", dispatch.jobID, briefErr)
+		preservationErrors = append(preservationErrors, msg)
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: %s\n", msg)
 	}
-	fmt.Fprintf(dispatch.warnings, "[loopcoder] preserved %s attempt artifacts: %s\n", dispatch.failureStatus, dispatch.scratch)
+	preserveAttemptArtifacts(dispatch, dispatch.failureStatus+" attempt", preservationErrors)
 }
 
 func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
@@ -567,8 +580,12 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	}
 	if dispatch.dispatchSucceeded {
 		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
-		if dispatch.opts.KeepWorktree {
-			fmt.Fprintf(dispatch.warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", dispatch.worktreePath, dispatch.scratch)
+		if dispatch.opts.KeepWorktree || dispatch.preserveArtifacts {
+			reason := dispatch.preserveReason
+			if reason == "" {
+				reason = "keep-worktree requested"
+			}
+			preserveAttemptArtifacts(dispatch, reason, nil)
 			return
 		}
 		if cleanupErr := dispatch.deps.Git.WorktreeRemove(context.Background(), dispatch.repoPath, dispatch.worktreePath); cleanupErr != nil {
@@ -577,7 +594,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		if cleanupErr := dispatch.deps.Git.BranchDelete(context.Background(), dispatch.repoPath, dispatch.opts.Branch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", dispatch.opts.Branch, cleanupErr)
 		}
-		if cleanupErr := dispatch.deps.RemoveAll(dispatch.scratch); cleanupErr != nil {
+		if cleanupErr := removeOwnedScratch(dispatch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", dispatch.scratch, cleanupErr)
 		}
 		return
@@ -684,6 +701,173 @@ func buildCommitMessage(title string, issueNumber int) string {
 
 func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
+}
+
+type scratchOwnerRecord struct {
+	Version int    `json:"version"`
+	RunID   string `json:"run_id"`
+	JobID   string `json:"job_id"`
+	Issue   int    `json:"issue"`
+	Attempt int    `json:"attempt"`
+	Branch  string `json:"branch"`
+	Scratch string `json:"scratch"`
+}
+
+type preservationManifest struct {
+	Version             int      `json:"version"`
+	RunID               string   `json:"run_id"`
+	JobID               string   `json:"job_id"`
+	Issue               int      `json:"issue"`
+	Attempt             int      `json:"attempt"`
+	Branch              string   `json:"branch"`
+	Status              string   `json:"status"`
+	Reason              string   `json:"reason"`
+	WorktreePath        string   `json:"worktree_path"`
+	ScratchPath         string   `json:"scratch_path"`
+	LogPath             string   `json:"log_path"`
+	PromptPath          string   `json:"prompt_path"`
+	SummaryPath         string   `json:"summary_path"`
+	AttemptPath         string   `json:"attempt_path"`
+	RecoveryContextPath string   `json:"recovery_context_path"`
+	ManifestPath        string   `json:"manifest_path"`
+	DisposalGuidance    string   `json:"disposal_guidance"`
+	PreservationErrors  []string `json:"preservation_errors,omitempty"`
+	PreservedAt         string   `json:"preserved_at"`
+}
+
+func writeScratchOwner(dispatch *dispatchContext) error {
+	record := scratchOwnerRecord{
+		Version: 1,
+		RunID:   dispatch.opts.RunID,
+		JobID:   dispatch.jobID,
+		Issue:   dispatch.opts.IssueNumber,
+		Attempt: dispatch.opts.Attempt,
+		Branch:  dispatch.opts.Branch,
+		Scratch: dispatch.scratch,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal scratch owner marker: %w", err)
+	}
+	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write scratch owner marker: %w", err)
+	}
+	return nil
+}
+
+func removeOwnedScratch(dispatch *dispatchContext) error {
+	if dispatch == nil || strings.TrimSpace(dispatch.scratch) == "" {
+		return errors.New("scratch path is empty")
+	}
+	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read scratch owner marker: %w", err)
+	}
+	var record scratchOwnerRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return fmt.Errorf("parse scratch owner marker: %w", err)
+	}
+	if record.Version != 1 ||
+		record.Issue != dispatch.opts.IssueNumber ||
+		record.Attempt != dispatch.opts.Attempt ||
+		subtle.ConstantTimeCompare([]byte(record.RunID), []byte(dispatch.opts.RunID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(record.JobID), []byte(dispatch.jobID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(filepath.Clean(record.Scratch)), []byte(filepath.Clean(dispatch.scratch))) != 1 {
+		return fmt.Errorf("scratch owner marker does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	}
+	return dispatch.deps.RemoveAll(dispatch.scratch)
+}
+
+func preserveAttemptArtifacts(dispatch *dispatchContext, reason string, preservationErrors []string) {
+	if dispatch == nil {
+		return
+	}
+	manifestPath := state.PreservationManifestPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	briefPath := state.RecoveryBriefPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	manifest := preservationManifest{
+		Version:             1,
+		RunID:               dispatch.opts.RunID,
+		JobID:               dispatch.jobID,
+		Issue:               dispatch.opts.IssueNumber,
+		Attempt:             dispatch.opts.Attempt,
+		Branch:              dispatch.tracker.branch,
+		Status:              dispatch.tracker.status,
+		Reason:              reason,
+		WorktreePath:        dispatch.worktreePath,
+		ScratchPath:         dispatch.scratch,
+		LogPath:             dispatch.logPath,
+		PromptPath:          dispatch.promptPath,
+		SummaryPath:         dispatch.summaryPath,
+		AttemptPath:         dispatch.attemptPath,
+		RecoveryContextPath: briefPath,
+		ManifestPath:        manifestPath,
+		DisposalGuidance:    "Inspect the preserved worktree and recovery brief before deleting anything. Remove only the listed scratch/worktree paths and branch after confirming the run_id and job_id match this manifest.",
+		PreservationErrors:  append([]string(nil), preservationErrors...),
+		PreservedAt:         state.FormatTimestamp(dispatch.deps.Now()),
+	}
+	if manifest.Branch == "" {
+		manifest.Branch = dispatch.opts.Branch
+	}
+	if manifest.Status == "" {
+		manifest.Status = dispatch.cleanupStatus
+	}
+	if err := writePreservationManifest(manifestPath, manifest); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write preservation manifest %s: %v\n", manifestPath, err)
+		manifest.PreservationErrors = append(manifest.PreservationErrors, err.Error())
+	}
+	printPreservationManifest(dispatch.warnings, manifest)
+}
+
+func writePreservationManifest(path string, manifest preservationManifest) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create preservation directory: %w", err)
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal preservation manifest: %w", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write preservation manifest: %w", err)
+	}
+	return nil
+}
+
+func printPreservationManifest(w io.Writer, manifest preservationManifest) {
+	if w == nil {
+		return
+	}
+	label := strings.TrimSpace(manifest.Reason)
+	if !strings.HasSuffix(label, "attempt") {
+		label = strings.TrimSpace(manifest.Status) + " attempt"
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "attempt"
+	}
+	fmt.Fprintf(w, "[loopcoder] preserved %s artifacts for %s/%s (%s)\n", label, manifest.RunID, manifest.JobID, manifest.Reason)
+	for _, line := range []struct {
+		label string
+		value string
+	}{
+		{"worktree", manifest.WorktreePath},
+		{"scratch", manifest.ScratchPath},
+		{"log", manifest.LogPath},
+		{"prompt", manifest.PromptPath},
+		{"summary", manifest.SummaryPath},
+		{"attempt", manifest.AttemptPath},
+		{"recovery", manifest.RecoveryContextPath},
+		{"manifest", manifest.ManifestPath},
+	} {
+		if strings.TrimSpace(line.value) != "" {
+			fmt.Fprintf(w, "[loopcoder] preserved %s: %s\n", line.label, line.value)
+		}
+	}
+	if len(manifest.PreservationErrors) > 0 {
+		fmt.Fprintf(w, "[loopcoder] preservation incomplete: %s\n", strings.Join(manifest.PreservationErrors, "; "))
+	}
+	fmt.Fprintf(w, "[loopcoder] disposal: %s\n", manifest.DisposalGuidance)
 }
 
 type hungHarvestOptions struct {

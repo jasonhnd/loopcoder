@@ -323,6 +323,10 @@ func RecoveryBriefPath(repoPath, runID, jobID string) string {
 	return filepath.Join(RecoveryPath(repoPath, runID), jobID+"-context.md")
 }
 
+func PreservationManifestPath(repoPath, runID, jobID string) string {
+	return filepath.Join(RecoveryPath(repoPath, runID), jobID+"-preserved.json")
+}
+
 func RecoveryBriefPathForRead(repoPath, runID, jobID string) string {
 	global := RecoveryBriefPath(repoPath, runID, jobID)
 	if _, err := os.Stat(global); err == nil {
