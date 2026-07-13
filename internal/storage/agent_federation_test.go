@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestAgentRegistrationReplayEventsAndTree(t *testing.T) {
@@ -390,6 +391,77 @@ func TestValidateNativeChildLaunchRejectsStaleParentAuthority(t *testing.T) {
 	if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration); !errors.Is(err, ErrAgentFingerprintMismatch) {
 		t.Fatalf("ValidateNativeChildLaunch error = %v, want ErrAgentFingerprintMismatch", err)
 	}
+	assertRefusalEvidence(t, ctx, store, ErrAgentFingerprintMismatchCode, "fingerprint")
+	var state string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE child_run_id = ?`, claim.RunID).Scan(&state)
+	}); err != nil {
+		t.Fatalf("load registration state: %v", err)
+	}
+	if state != AgentStateRegistered {
+		t.Fatalf("registration state = %q, want registered", state)
+	}
+}
+
+func TestRegisterAgentBindsAcceptedChildIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*AgentRegistrationRequest)
+	}{
+		{name: "plan id", edit: func(req *AgentRegistrationRequest) { req.PlanID = "plan-other" }},
+		{name: "child key", edit: func(req *AgentRegistrationRequest) { req.ChildKey = "child-other" }},
+		{name: "depth", edit: func(req *AgentRegistrationRequest) { req.Depth = 2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+
+			claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+			req := federationRequest(claim)
+			req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+			tc.edit(&req)
+			if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrAgentRegistrationConflict) {
+				t.Fatalf("RegisterAgent error = %v, want ErrAgentRegistrationConflict", err)
+			}
+			assertNoCommittedAgentAuthority(t, ctx, store)
+			assertRefusalEvidence(t, ctx, store, ErrAgentRegistrationConflictCode, "registration-identity")
+		})
+	}
+}
+
+func TestRegisterAgentRejectsUnknownParentAuthorityEnums(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*AgentScopeGrant)
+	}{
+		{name: "permission", edit: func(scope *AgentScopeGrant) { scope.Permission = "future-admin" }},
+		{name: "side effect", edit: func(scope *AgentScopeGrant) { scope.SideEffectClass = "future-write" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+
+			claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+			req := federationRequest(claim)
+			req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+			parentScope := *req.ParentScope
+			tc.edit(&parentScope)
+			req.ParentScope = &parentScope
+			if _, err := RegisterAgent(ctx, store, req); !errors.Is(err, ErrScopeUnknown) {
+				t.Fatalf("RegisterAgent error = %v, want ErrScopeUnknown", err)
+			}
+			assertNoCommittedAgentAuthority(t, ctx, store)
+			assertRefusalEvidence(t, ctx, store, ErrScopeUnknownCode, "scope-unknown")
+		})
+	}
 }
 
 func TestRegisterAgentRejectsPhysicalScopeEscapeAndLeavesOnlyRefusalEvidence(t *testing.T) {
@@ -530,8 +602,8 @@ func TestTransitionAgentRegistrationReleasesHeldLocksAndAllowsNewWriter(t *testi
 }
 
 func TestScopeInheritanceAndCrossProjectFailClosed(t *testing.T) {
-	parent := AgentScopeGrant{Permission: PermissionWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
-	child := AgentScopeGrant{Permission: PermissionOrchestrate, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
+	parent := AgentScopeGrant{Permission: PermissionWrite, SideEffectClass: SideEffectRepoWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
+	child := AgentScopeGrant{Permission: PermissionOrchestrate, SideEffectClass: SideEffectRepoWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
 	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrScopeWidening) {
 		t.Fatalf("permission widening error = %v, want ErrScopeWidening", err)
 	}
@@ -545,6 +617,60 @@ func TestScopeInheritanceAndCrossProjectFailClosed(t *testing.T) {
 	child.CredentialScope = []string{"ENV_TOKEN"}
 	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrCredentialScopeDenied) {
 		t.Fatalf("credential scope error = %v, want ErrCredentialScopeDenied", err)
+	}
+}
+
+func TestScopeInheritanceRejectsUnknownParentEnums(t *testing.T) {
+	parent := AgentScopeGrant{Permission: "future-admin", SideEffectClass: SideEffectRepoWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
+	child := AgentScopeGrant{Permission: PermissionReadOnly, SideEffectClass: SideEffectNone, ReadScope: []string{"src"}, CredentialScope: []string{"none"}}
+	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrScopeUnknown) {
+		t.Fatalf("unknown parent permission error = %v, want ErrScopeUnknown", err)
+	}
+	parent.Permission = PermissionOrchestrate
+	parent.SideEffectClass = "future-write"
+	if err := ValidateScopeInheritance(parent, child); !errors.Is(err, ErrScopeUnknown) {
+		t.Fatalf("unknown parent side effect error = %v, want ErrScopeUnknown", err)
+	}
+}
+
+func TestAgentAuthorityRefusalEvidenceIsBoundedAndRedacted(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	secret := "sk-" + strings.Repeat("runtime", 8)
+	localPath := filepath.Join(t.TempDir(), "repo", "secret", "prompt.txt")
+	longMultiByte := strings.Repeat("界", AgentAuthorityRefusalMessageRunes*2)
+	req := AgentRegistrationRequest{
+		ProjectID:       "project-a",
+		DeliveryRunID:   "drun-a",
+		ParentRunID:     "run-root",
+		RunID:           "run-child",
+		TaskID:          "task-a",
+		AttemptID:       "attempt-a",
+		ChildKey:        "child-a",
+		PlanFingerprint: "sha256:plan",
+		CreatedAt:       "2026-01-01T00:00:01Z",
+		Classification:  "local-diagnostic",
+	}
+	cause := federationError(ErrScopeWideningCode, "path %s leaked %s %s", localPath, secret, longMultiByte)
+	persistAgentAuthorityRefusal(ctx, store, req, cause)
+
+	event := loadLatestRefusalEvent(t, ctx, store)
+	if event.TerminalErrorCode != ErrScopeWideningCode || event.Boundary != "scope" {
+		t.Fatalf("refusal event code/boundary = %s/%s", event.TerminalErrorCode, event.Boundary)
+	}
+	if !utf8.ValidString(event.Message) {
+		t.Fatalf("refusal message is invalid UTF-8: %q", event.Message)
+	}
+	if len([]rune(event.Message)) > AgentAuthorityRefusalMessageRunes {
+		t.Fatalf("refusal message rune length = %d, want <= %d", len([]rune(event.Message)), AgentAuthorityRefusalMessageRunes)
+	}
+	if strings.Contains(event.Message, secret) || strings.Contains(event.Message, localPath) || strings.Contains(event.Message, "prompt.txt") {
+		t.Fatalf("refusal message leaked sensitive material: %q", event.Message)
 	}
 }
 
@@ -615,6 +741,7 @@ func createFederationClaim(t *testing.T, ctx context.Context, store Store, proje
 func federationAuthorityScope(projectID string) AgentScopeGrant {
 	return AgentScopeGrant{
 		Permission:      PermissionWrite,
+		SideEffectClass: SideEffectRepoWrite,
 		ReadScope:       []string{"src", "src/a.go"},
 		WriteScope:      []string{"src/a.go"},
 		PathScope:       []string{"src/a.go"},
@@ -765,6 +892,18 @@ func assertNoCommittedAgentAuthority(t *testing.T, ctx context.Context, store St
 
 func assertRefusalEvidence(t *testing.T, ctx context.Context, store Store, code FederationErrorCode, boundary string) {
 	t.Helper()
+	event := loadLatestRefusalEvent(t, ctx, store)
+	if event.TerminalErrorCode != code || event.Boundary != boundary || strings.TrimSpace(event.Message) == "" {
+		t.Fatalf("refusal event = %#v, want code %s boundary %s with message", event, code, boundary)
+	}
+}
+
+func loadLatestRefusalEvent(t *testing.T, ctx context.Context, store Store) struct {
+	TerminalErrorCode FederationErrorCode `json:"terminal_error_code"`
+	Boundary          string              `json:"boundary"`
+	Message           string              `json:"message"`
+} {
+	t.Helper()
 	var payload string
 	if err := store.WithTx(ctx, func(tx Tx) error {
 		return tx.QueryRow(ctx, `SELECT payload_json FROM agent_events WHERE event_kind = ? ORDER BY created_at DESC, id DESC LIMIT 1`, "registration.refused").Scan(&payload)
@@ -779,9 +918,7 @@ func assertRefusalEvidence(t *testing.T, ctx context.Context, store Store, code 
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
 		t.Fatalf("unmarshal refusal event: %v", err)
 	}
-	if event.TerminalErrorCode != code || event.Boundary != boundary || strings.TrimSpace(event.Message) == "" {
-		t.Fatalf("refusal event = %#v, want code %s boundary %s with message", event, code, boundary)
-	}
+	return event
 }
 
 func federationRequest(claim federationClaim) AgentRegistrationRequest {
