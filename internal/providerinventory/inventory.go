@@ -129,6 +129,7 @@ const (
 	NetworkPurposeAuthReadiness        NetworkPurpose = "auth-readiness"
 	NetworkPurposeModelCatalog         NetworkPurpose = "model-catalog"
 	NetworkPurposeAuthCatalogInventory NetworkPurpose = "auth-catalog-inventory"
+	NetworkPurposeQuotaTelemetry       NetworkPurpose = "quota-telemetry"
 )
 
 type NetworkScope string
@@ -598,6 +599,7 @@ type Deps struct {
 	Abs          func(string) (string, error)
 	EvalSymlinks func(string) (string, error)
 	RunProbe     func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
+	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
 	RandomID     func() string
 }
 
@@ -637,6 +639,7 @@ func DefaultDeps() Deps {
 		Abs:          filepath.Abs,
 		EvalSymlinks: filepath.EvalSymlinks,
 		RunProbe:     runProbeCommand,
+		RunCodexRPC:  runCodexAppServer,
 		RandomID:     randomProbeID,
 	}
 }
@@ -740,9 +743,8 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 
 	for _, adapter := range adapters {
 		quotaSource, quotaSnapshot := unsupportedQuotaTelemetryForAdapter(adapter, now)
-		quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
-		quotaSnapshots = append(quotaSnapshots, quotaSnapshot)
-		gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
+		adapterQuotaCollected := false
+		adapterQuotaAttempted := false
 		snapshot, capabilities, err := staticCatalogForAdapter(adapter, now)
 		if err != nil {
 			return Report{}, err
@@ -762,6 +764,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				authReadiness = append(authReadiness, readiness...)
 				if authProbe != nil {
 					probes = append(probes, *authProbe)
+				}
+				if adapter.AdapterID == "codex" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectCodexQuota(ctx, discovery, adapter, candidate, installation, now, deps)
+					quotaTelemetrySources = append(quotaTelemetrySources, source)
+					quotaSnapshots = append(quotaSnapshots, snapshots...)
+					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
+					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
 			} else {
 				readiness := unsupportedAuthReadiness(adapter, &installation.ProviderInstallationID, now, firstNonEmpty(installation.TerminalErrorCode, "installation-not-usable"))
@@ -783,6 +793,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			probe := absentProbe(adapter, now, deps)
 			probes = append(probes, probe)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
+		}
+		if adapter.AdapterID != "codex" || (!adapterQuotaCollected && !adapterQuotaAttempted) {
+			if adapter.AdapterID == "codex" {
+				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
+			}
+			quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
+			quotaSnapshots = append(quotaSnapshots, quotaSnapshot)
+			gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
 		}
 	}
 	quotaSnapshots = LinkQuotaConflicts(quotaSnapshots)
@@ -3674,6 +3692,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunProbe == nil {
 		deps.RunProbe = defaults.RunProbe
+	}
+	if deps.RunCodexRPC == nil {
+		deps.RunCodexRPC = defaults.RunCodexRPC
 	}
 	if deps.RandomID == nil {
 		deps.RandomID = defaults.RandomID
