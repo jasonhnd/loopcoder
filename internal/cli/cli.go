@@ -2645,11 +2645,15 @@ func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, reco
 		options.PR = formatPRNumber(prNumber)
 	}
 	pretty := prettyReport(record, options)
-	nonce := relaygate.Nonce(runID, prNumber, role)
+	relayRole, ok := relaygate.NormalizeRole(strings.TrimSpace(role))
+	if !ok {
+		return relaygate.Record{}, false, fmt.Errorf("unsupported relay role %q", role)
+	}
+	nonce := relaygate.Nonce(runID, prNumber, relayRole)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
 		RunID:    runID,
-		Role:     role,
+		Role:     relayRole,
 		PRNumber: prNumber,
 		Block:    pretty,
 		Report:   &record,
