@@ -47,6 +47,32 @@ func TestCanonicalizeResolvesWindowsJunctionAliasToSameIdentity(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeResolvesWindowsJunctionBeforeAppendingMissingLeaf(t *testing.T) {
+	root := t.TempDir()
+	physicalRoot := filepath.Join(root, "physical")
+	physicalScope := filepath.Join(physicalRoot, "repo", "src")
+	if err := os.MkdirAll(physicalScope, 0o755); err != nil {
+		t.Fatalf("mkdir physical scope: %v", err)
+	}
+	junctionRoot := filepath.Join(root, "junction")
+	createWindowsJunction(t, junctionRoot, physicalRoot)
+
+	got, err := Canonicalize(filepath.Join(junctionRoot, "repo", "src", "future", "owned.go"))
+	if err != nil {
+		t.Fatalf("Canonicalize junction missing leaf: %v", err)
+	}
+	want, err := Canonicalize(filepath.Join(physicalScope, "future", "owned.go"))
+	if err != nil {
+		t.Fatalf("Canonicalize physical missing leaf: %v", err)
+	}
+	if got.Identity != want.Identity {
+		t.Fatalf("identity = %q, want %q", got.Identity, want.Identity)
+	}
+	if got.Display == want.Display {
+		t.Fatalf("display paths unexpectedly equal; display should preserve user-facing lexical input")
+	}
+}
+
 func createWindowsJunction(t *testing.T, link, target string) {
 	t.Helper()
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:LOOPCODER_JUNCTION_LINK -Target $env:LOOPCODER_JUNCTION_TARGET | Out-Null`)
