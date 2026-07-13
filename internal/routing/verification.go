@@ -184,6 +184,9 @@ func DecideAndPersistVerification(ctx context.Context, store storage.Store, inpu
 		if verifierRoute.RoutingDecisionID != "" && (verifierRoute.ProjectID != workerRoute.ProjectID || verifierRoute.DeliveryRunID != workerRoute.DeliveryRunID) {
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrCrossProjectReferenceCode, Message: "verifier route does not belong to worker delivery run"}
 		}
+		if err := requirePrimaryVerifierPlanAuthority(workerRoute, verifierRoute, verifierReq); err != nil {
+			return err
+		}
 		workerCandidate, ok := chosenCandidate(workerRoute)
 		if !ok {
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "worker route has no selected candidate to verify"}
@@ -249,6 +252,19 @@ func RequiredVerifierIndependence(req taskrequirements.TaskRequirement, profile 
 		}
 	}
 	return required
+}
+
+func requirePrimaryVerifierPlanAuthority(workerRoute, verifierRoute RoutingDecision, verifierReq taskrequirements.TaskRequirement) error {
+	if verifierRoute.RoutingDecisionID == "" {
+		return nil
+	}
+	if verifierRoute.PlanFingerprint != workerRoute.PlanFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "verifier route does not match worker plan authority"}
+	}
+	if verifierReq.TaskRequirementID != "" && verifierReq.PlanFingerprint != workerRoute.PlanFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "verifier task requirement does not match worker plan authority"}
+	}
+	return nil
 }
 
 func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, verifierReq taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, memberAuthorities []CouncilMemberAuthority, authorityDisagreements []string, authorityTerminal taskrequirements.ErrorCode, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {

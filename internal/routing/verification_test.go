@@ -328,6 +328,25 @@ func TestVerificationDecisionBindsVerdictsToSelectedVerifierAuthority(t *testing
 	}
 }
 
+func TestVerificationDecisionRejectsStalePrimaryVerifierPlan(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, worker, _ := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
+	defer store.Close()
+	staleVerifier := persistStaleVerifierRoute(t, ctx, store, fixture, worker, "route-stale-primary", fixture.candidate("claude", "acct-c", "claude-good"))
+
+	decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, staleVerifier, passVerdict(staleVerifier, "stale primary", "ev-stale-primary")))
+	if !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("stale primary verifier error = %v, want ErrRoutingFingerprintMismatch; decision=%#v", err, decision)
+	}
+	if decision.VerificationDecisionID != "" || decision.DecisionStatus == VerificationStatusAccepted {
+		t.Fatalf("stale primary verifier returned accepted/persisted decision: %#v", decision)
+	}
+	if countVerificationDecisions(t, ctx, store, worker.RoutingDecisionID) != 0 {
+		t.Fatalf("stale primary verifier persisted a verification decision")
+	}
+}
+
 func TestVerificationCouncilBoundsTimeoutAndDisagreementAreDurable(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -370,6 +389,34 @@ func TestVerificationCouncilBoundsTimeoutAndDisagreementAreDurable(t *testing.T)
 	}
 	if len(loaded.CouncilMemberAuthorities) != 2 {
 		t.Fatalf("loaded council decision lost member authorities: %#v", loaded.CouncilMemberAuthorities)
+	}
+}
+
+func TestVerificationCouncilRejectsStalePrimaryVerifierPlan(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, worker, _ := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
+	defer store.Close()
+	stalePrimary := persistStaleVerifierRoute(t, ctx, store, fixture, worker, "route-stale-primary", fixture.candidate("claude", "acct-c", "claude-good"))
+	memberA := persistAdditionalVerifierRoute(t, ctx, store, fixture, worker, "route-member-a", fixture.candidate("claude", "acct-c", "claude-good"), nil)
+	memberB := persistAdditionalVerifierRoute(t, ctx, store, fixture, worker, "route-member-b", fixture.candidate("claude", "acct-c", "claude-good"), nil)
+
+	input := verificationInput(worker, stalePrimary, passVerdict(memberA, "member a clean", "ev-member-a"), passVerdict(memberB, "member b clean", "ev-member-b"))
+	input.VerifierVerdicts[1].MemberID = "member-b"
+	input.CouncilMemberRoutingDecisionIDs = []string{memberA.RoutingDecisionID, memberB.RoutingDecisionID}
+	input.CouncilLimits = validCouncilLimits(fixture.now)
+	input.CouncilRoundsUsed = 1
+	input.CouncilBudgetTokensUsed = 10
+
+	decision, err := DecideAndPersistVerification(ctx, store, input)
+	if !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("stale primary council verifier error = %v, want ErrRoutingFingerprintMismatch; decision=%#v", err, decision)
+	}
+	if decision.VerificationDecisionID != "" || decision.DecisionStatus == VerificationStatusAccepted {
+		t.Fatalf("stale primary council verifier returned accepted/persisted decision: %#v", decision)
+	}
+	if countVerificationDecisions(t, ctx, store, worker.RoutingDecisionID) != 0 {
+		t.Fatalf("stale primary council verifier persisted a verification decision")
 	}
 }
 
@@ -779,7 +826,17 @@ func persistVerificationRoutesWithMutators(t *testing.T, ctx context.Context, fi
 
 func persistAdditionalVerifierRoute(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, worker RoutingDecision, decisionKey string, verifierCandidate Candidate, mutateVerifierRoute func(*taskrequirements.TaskRequirement, *Candidate)) RoutingDecision {
 	t.Helper()
-	verifierReq := decisionRequirement(t, fixture, verifierRequirement("task-"+decisionKey), "treq-"+decisionKey, worker.PlanFingerprint)
+	return persistVerifierRouteForPlan(t, ctx, store, fixture, worker, decisionKey, worker.PlanFingerprint, verifierCandidate, mutateVerifierRoute)
+}
+
+func persistStaleVerifierRoute(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, worker RoutingDecision, decisionKey string, verifierCandidate Candidate) RoutingDecision {
+	t.Helper()
+	return persistVerifierRouteForPlan(t, ctx, store, fixture, worker, decisionKey, testFingerprint(decisionKey+"-stale-plan"), verifierCandidate, nil)
+}
+
+func persistVerifierRouteForPlan(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, worker RoutingDecision, decisionKey, planFingerprint string, verifierCandidate Candidate, mutateVerifierRoute func(*taskrequirements.TaskRequirement, *Candidate)) RoutingDecision {
+	t.Helper()
+	verifierReq := decisionRequirement(t, fixture, verifierRequirement("task-"+decisionKey), "treq-"+decisionKey, planFingerprint)
 	verifierReq.ProjectID = worker.ProjectID
 	verifierReq.DeliveryRunID = worker.DeliveryRunID
 	verifierReq.RequiredOutput = taskrequirements.OutputVerificationVerdict
@@ -801,7 +858,7 @@ func persistAdditionalVerifierRoute(t *testing.T, ctx context.Context, store sto
 	input.DecisionKey = decisionKey
 	input.TaskRequirementID = verifierReq.TaskRequirementID
 	input.RoleDefinitionID = "role-verifier"
-	input.PlanFingerprint = worker.PlanFingerprint
+	input.PlanFingerprint = planFingerprint
 	profile := BalancedRoutingPolicyProfile(fixture.now)
 	input.RoutingPolicyProfile = profile
 	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
