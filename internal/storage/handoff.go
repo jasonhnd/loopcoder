@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -188,7 +189,21 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 		}
 	}
 
-	status, nextAction, terminalCode := classifyHandoff(req)
+	effectiveSideEffectState, err := deriveHandoffSideEffectStateTx(ctx, tx, req, task, claim)
+	if err != nil {
+		return HandoffTransaction{}, err
+	}
+	status, nextAction, terminalCode := classifyHandoff(req, effectiveSideEffectState)
+	requestedAt, err := time.Parse(time.RFC3339Nano, req.RequestedAt)
+	if err != nil {
+		return HandoffTransaction{}, federationError(ErrInvalidRecordCode, "requested_at is invalid")
+	}
+	if status == HandoffStatusTransferred {
+		status, nextAction, terminalCode, err = validateHandoffTransferAuthorityTx(ctx, tx, req, requestedAt.UTC())
+		if err != nil {
+			return HandoffTransaction{}, err
+		}
+	}
 	destinationGeneration := claim.ClaimGeneration + 1
 	destinationOwner := strings.TrimSpace(req.DestinationExecutorID)
 	if destinationOwner == "" {
@@ -196,9 +211,7 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 	}
 	lease := strings.TrimSpace(req.DestinationLeaseExpiresAt)
 	if lease == "" {
-		if parsed, err := time.Parse(time.RFC3339Nano, req.RequestedAt); err == nil {
-			lease = formatTimestamp(parsed.UTC().Add(15 * time.Minute))
-		}
+		lease = formatTimestamp(requestedAt.UTC().Add(15 * time.Minute))
 	}
 	if status != HandoffStatusTransferred {
 		destinationOwner = stableID("handoff_needs_human_", req.ProjectID, req.DeliveryRunID, req.TaskID, fmt.Sprint(destinationGeneration))
@@ -222,6 +235,8 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 		"claim_phase":              claim.ClaimPhase,
 		"provider_idempotency_key": claim.ProviderKey,
 		"provider_receipt":         claim.ProviderReceipt,
+		"effective_side_effect":    effectiveSideEffectState,
+		"requested_side_effect":    req.SideEffectState,
 	})
 	if err != nil {
 		return HandoffTransaction{}, err
@@ -251,7 +266,7 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 		AuthorizationFingerprint:    task.authorizationFingerprint,
 		AcceptedTaskFingerprint:     task.acceptedTaskFingerprint,
 		AcceptedTaskSnapshotJSON:    task.acceptedTaskSnapshotJSON,
-		SideEffectState:             req.SideEffectState,
+		SideEffectState:             effectiveSideEffectState,
 		DestinationRoutePlaceholder: route,
 		DestinationExecutorID:       destinationOwner,
 		DestinationClaimGeneration:  destinationGeneration,
@@ -279,6 +294,9 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 		return HandoffTransaction{}, fmt.Errorf("record handoff: fence claim: %w", err)
 	}
 	if err := requireRowsAffected(ctx, tx, req.ChildRunID, record.DestinationExecutorID, record.DestinationClaimGeneration); err != nil {
+		return HandoffTransaction{}, err
+	}
+	if err := reconcileHandoffAgentAuthorityTx(ctx, tx, req, record, status, terminalCode, lease); err != nil {
 		return HandoffTransaction{}, err
 	}
 	if status == HandoffStatusTransferred {
@@ -340,6 +358,12 @@ type handoffTaskSnapshot struct {
 	authorizationFingerprint string
 	acceptedTaskFingerprint  string
 	acceptedTaskSnapshotJSON string
+	taskState                string
+	taskPermission           string
+	taskSideEffect           string
+	attemptState             string
+	attemptProviderReceipt   string
+	attemptSideEffect        string
 }
 
 func loadHandoffTaskSnapshotTx(ctx context.Context, tx Tx, req HandoffRequest) (handoffTaskSnapshot, error) {
@@ -356,10 +380,10 @@ func loadHandoffTaskSnapshotTx(ctx context.Context, tx Tx, req HandoffRequest) (
 	if runProject != req.ProjectID || taskProject != req.ProjectID || taskRun != req.DeliveryRunID || taskPlan != runPlan || taskAuth != runAuth {
 		return handoffTaskSnapshot{}, federationError(ErrHandoffAcceptedTaskStaleCode, "delivery task authority no longer matches accepted run authority")
 	}
-	var attemptTask, attemptRun, attemptProject, attemptExecutor, attemptState string
+	var attemptTask, attemptRun, attemptProject, attemptExecutor, attemptState, attemptProviderReceipt, attemptSideEffect string
 	var attemptGeneration int64
-	if err := tx.QueryRow(ctx, `SELECT task_id, delivery_run_id, project_id, executor_id, claim_generation, state
-		FROM delivery_attempts WHERE attempt_id = ?`, req.SourceAttemptID).Scan(&attemptTask, &attemptRun, &attemptProject, &attemptExecutor, &attemptGeneration, &attemptState); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT task_id, delivery_run_id, project_id, executor_id, claim_generation, state, provider_receipt, side_effect_class
+		FROM delivery_attempts WHERE attempt_id = ?`, req.SourceAttemptID).Scan(&attemptTask, &attemptRun, &attemptProject, &attemptExecutor, &attemptGeneration, &attemptState, &attemptProviderReceipt, &attemptSideEffect); err != nil {
 		return handoffTaskSnapshot{}, federationError(ErrHandoffAcceptedTaskStaleCode, "source attempt %s is missing", req.SourceAttemptID)
 	}
 	if attemptTask != req.TaskID || attemptRun != req.DeliveryRunID || attemptProject != req.ProjectID || attemptExecutor != req.SourceExecutorID || attemptGeneration != req.SourceClaimGeneration {
@@ -410,7 +434,225 @@ func loadHandoffTaskSnapshotTx(ctx context.Context, tx Tx, req HandoffRequest) (
 		authorizationFingerprint: runAuth,
 		acceptedTaskFingerprint:  accepted,
 		acceptedTaskSnapshotJSON: snapshotJSON,
+		taskState:                strings.ToLower(strings.TrimSpace(taskState)),
+		taskPermission:           normalizePermission(taskPermission),
+		taskSideEffect:           normalizeSideEffectClass(taskSideEffect),
+		attemptState:             strings.ToLower(strings.TrimSpace(attemptState)),
+		attemptProviderReceipt:   strings.TrimSpace(attemptProviderReceipt),
+		attemptSideEffect:        normalizeSideEffectClass(attemptSideEffect),
 	}, nil
+}
+
+func deriveHandoffSideEffectStateTx(ctx context.Context, tx Tx, req HandoffRequest, task handoffTaskSnapshot, claim ClaimResult) (string, error) {
+	requested := normalizeHandoffSideEffectState(req.SideEffectState)
+	if !handoffSideEffectSafe(requested) {
+		return requested, nil
+	}
+	if strings.TrimSpace(claim.ProviderReceipt) != "" || strings.TrimSpace(task.attemptProviderReceipt) != "" {
+		return SideEffectStateProviderStart, nil
+	}
+	if registration, ok, err := loadAgentRegistrationByRunTx(ctx, tx, req.ChildRunID); err != nil {
+		return "", err
+	} else if ok {
+		if strings.TrimSpace(registration.ProviderReceipt) != "" {
+			return SideEffectStateProviderStart, nil
+		}
+		switch normalizeAgentRegistrationState(registration.RegistrationState) {
+		case AgentStateRegistered, AgentStatePlanned:
+		case AgentStateLaunching, AgentStateRunning, AgentStateCancelling:
+			return SideEffectStateProviderStart, nil
+		case AgentStateSucceeded, AgentStateFailed, AgentStateCancelled:
+			return SideEffectStateProviderStart, nil
+		case AgentStateNeedsHuman, AgentStateSuperseded:
+			return SideEffectStateAmbiguous, nil
+		default:
+			return SideEffectStateAmbiguous, nil
+		}
+	}
+	switch normalizeClaimPhase(claim.ClaimPhase) {
+	case ClaimPhaseClaimed:
+	case ClaimPhaseLaunching, ClaimPhaseExecuting, ClaimPhaseCompleted:
+		return SideEffectStateProviderStart, nil
+	default:
+		return SideEffectStateAmbiguous, nil
+	}
+	if handoffDeliveryStateImpliesSideEffect(task.attemptState) || handoffDeliveryStateImpliesSideEffect(task.taskState) {
+		return SideEffectStateProviderStart, nil
+	}
+	if task.taskPermission == PermissionReadOnly && sideEffectRank(task.taskSideEffect) <= sideEffectRank(SideEffectLocalRead) && sideEffectRank(task.attemptSideEffect) <= sideEffectRank(SideEffectLocalRead) {
+		return SideEffectStateReadOnly, nil
+	}
+	return SideEffectStateNotStarted, nil
+}
+
+func handoffDeliveryStateImpliesSideEffect(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "succeeded", "failed", "cancelled", "timed_out", "abandoned":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateHandoffTransferAuthorityTx(ctx context.Context, tx Tx, req HandoffRequest, requestedAt time.Time) (string, string, FederationErrorCode, error) {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, req.ChildRunID)
+	if err != nil {
+		return "", "", "", err
+	}
+	if !ok {
+		return HandoffStatusTransferred, "await-successor-route", "", nil
+	}
+	if record.ProjectID != req.ProjectID || record.DeliveryRunID != req.DeliveryRunID || record.TaskID != req.TaskID || record.ParentRunID != req.ParentRunID || record.RunID != req.ChildRunID {
+		return HandoffStatusNeedsHuman, "human-review-authority-state", ErrHandoffAuthorityMismatchCode, nil
+	}
+	if record.ExecutorID != req.SourceExecutorID || record.ClaimGeneration != req.SourceClaimGeneration {
+		return HandoffStatusNeedsHuman, "human-review-authority-state", ErrStaleClaimCode, nil
+	}
+	if normalizeAgentRegistrationState(record.RegistrationState) != AgentStateRegistered {
+		return HandoffStatusNeedsHuman, "human-review-side-effect-state", ErrHandoffSideEffectUnknownCode, nil
+	}
+	if strings.TrimSpace(record.ProviderReceipt) != "" {
+		return HandoffStatusNeedsHuman, "human-review-side-effect-state", ErrHandoffSideEffectUnknownCode, nil
+	}
+	if err := validateLiveBudgetReservationTx(ctx, tx, record, requestedAt); err != nil {
+		return HandoffStatusNeedsHuman, "human-review-budget-state", federationCodeFromError(err, ErrChildBudgetRequiredCode), nil
+	}
+	if record.Permission != PermissionReadOnly {
+		if err := validateLiveOwnershipLocksTx(ctx, tx, record, req.SourceClaimGeneration, requestedAt); err != nil {
+			return HandoffStatusNeedsHuman, "human-review-ownership-state", federationCodeFromError(err, ErrOwnershipRequiredCode), nil
+		}
+	}
+	return HandoffStatusTransferred, "await-successor-route", "", nil
+}
+
+func reconcileHandoffAgentAuthorityTx(ctx context.Context, tx Tx, req HandoffRequest, handoff HandoffTransaction, status string, terminalCode FederationErrorCode, lease string) error {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, req.ChildRunID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	scope, err := loadScopeGrantTx(ctx, tx, record)
+	if err != nil {
+		return err
+	}
+	record.ExecutorID = handoff.DestinationExecutorID
+	record.ClaimGeneration = handoff.HandoffGeneration
+	record.UpdatedAt = req.RequestedAt
+	record.RecordVersion++
+	if status != HandoffStatusTransferred {
+		record.RegistrationState = AgentStateNeedsHuman
+		record.TerminalErrorCode = string(terminalCode)
+	}
+	fingerprint, payloadHash, err := handoffAgentRegistrationFingerprints(record, scope)
+	if err != nil {
+		return err
+	}
+	record.AgentFederationFingerprint = fingerprint
+	record.RegistrationPayloadHash = payloadHash
+	scope.AgentFederationFingerprint = fingerprint
+	result, err := tx.Exec(ctx, `UPDATE agent_registrations
+		SET claim_generation = ?, executor_id = ?, registration_state = ?, agent_federation_fingerprint = ?,
+			registration_payload_hash = ?, terminal_error_code = ?, updated_at = ?, record_version = ?
+		WHERE id = ? AND child_run_id = ?`,
+		record.ClaimGeneration, record.ExecutorID, record.RegistrationState, record.AgentFederationFingerprint,
+		record.RegistrationPayloadHash, record.TerminalErrorCode, record.UpdatedAt, record.RecordVersion,
+		record.ChildAgentID, record.RunID)
+	if err != nil {
+		return fmt.Errorf("record handoff: update agent registration: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected != 1 {
+		return federationError(ErrHandoffAuthorityMismatchCode, "updated %d agent registrations, want 1", affected)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_scope_grants
+		SET agent_federation_fingerprint = ?, updated_at = ?
+		WHERE id = ? AND child_agent_id = ?`,
+		scope.AgentFederationFingerprint, req.RequestedAt, record.ScopeGrantID, record.ChildAgentID); err != nil {
+		return fmt.Errorf("record handoff: update agent scope fingerprint: %w", err)
+	}
+	if status == HandoffStatusTransferred {
+		if record.Permission == PermissionReadOnly || len(record.OwnershipLockIDs) == 0 {
+			return nil
+		}
+		result, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+			SET claim_generation = ?, lease_expires_at = ?, heartbeat_at = ?, lock_generation = lock_generation + 1, updated_at = ?
+			WHERE child_agent_id = ? AND run_id = ? AND claim_generation = ? AND state = ?`,
+			handoff.HandoffGeneration, lease, req.RequestedAt, req.RequestedAt,
+			record.ChildAgentID, req.ChildRunID, req.SourceClaimGeneration, OwnershipStateHeld)
+		if err != nil {
+			return fmt.Errorf("record handoff: transfer ownership locks: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected != int64(len(record.OwnershipLockIDs)) {
+			return federationError(ErrOwnershipRequiredCode, "transferred %d ownership locks, want %d", affected, len(record.OwnershipLockIDs))
+		}
+		return nil
+	}
+	_, err = tx.Exec(ctx, `UPDATE agent_ownership_locks
+		SET state = ?, claim_generation = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+		WHERE child_agent_id = ? AND run_id = ? AND state NOT IN (?, ?, ?, ?)`,
+		OwnershipStateNeedsHuman, handoff.HandoffGeneration, req.RequestedAt, req.RequestedAt, req.RequestedAt,
+		record.ChildAgentID, req.ChildRunID, OwnershipStateReleased, OwnershipStateExpired, OwnershipStateConflict, OwnershipStateNeedsHuman)
+	if err != nil {
+		return fmt.Errorf("record handoff: fence ownership locks to needs-human: %w", err)
+	}
+	return nil
+}
+
+func handoffAgentRegistrationFingerprints(record AgentRegistration, scope AgentScopeGrant) (string, string, error) {
+	scope.AgentFederationFingerprint = ""
+	scopeBytes, err := json.Marshal(scopePayload(scope))
+	if err != nil {
+		return "", "", federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
+	}
+	input := federationFingerprintInput{
+		SchemaVersion:            AgentRegistrationSchema,
+		ProjectID:                record.ProjectID,
+		DeliveryRunID:            record.DeliveryRunID,
+		RootRunID:                record.RootRunID,
+		ParentRunID:              record.ParentRunID,
+		RunID:                    record.RunID,
+		ParentAgentID:            record.ParentAgentID,
+		TaskID:                   record.TaskID,
+		AttemptID:                record.AttemptID,
+		PlanID:                   record.PlanID,
+		ChildKey:                 record.ChildKey,
+		AdapterID:                record.AdapterID,
+		ProviderInstallationID:   record.ProviderInstallationID,
+		AccountProfileID:         record.AccountProfileID,
+		ModelCapabilityID:        record.ModelCapabilityID,
+		RoutingDecisionID:        record.RoutingDecisionID,
+		ProviderSessionRef:       record.ProviderSessionRef,
+		ScopeCanonicalJSON:       string(scopeBytes),
+		Permission:               record.Permission,
+		SideEffectClass:          record.SideEffectClass,
+		BudgetBindingIDs:         sortedCopyAgent(record.BudgetBindingIDs),
+		OwnershipLockIDs:         sortedCopyAgent(record.OwnershipLockIDs),
+		ClaimGeneration:          record.ClaimGeneration,
+		ExecutorID:               record.ExecutorID,
+		ProviderIDempotencyKey:   record.ProviderIDempotencyKey,
+		CancellationChannel:      record.CancellationChannel,
+		ExpectedOutputsHash:      hashString(record.ExpectedOutputsJSON),
+		PlanFingerprint:          record.PlanFingerprint,
+		PolicyFingerprint:        record.PolicyFingerprint,
+		AuthorizationFingerprint: record.AuthorizationFingerprint,
+	}
+	fingerprint := digestJSON(input)
+	payloadHash := digestJSON(registrationCanonicalPayload{
+		FingerprintInput:  input,
+		RegistrationState: AgentStateRegistered,
+		Classification:    record.Classification,
+		GapReasons:        sortedCopyAgent(record.GapReasons),
+	})
+	return fingerprint, payloadHash, nil
+}
+
+func federationCodeFromError(err error, fallback FederationErrorCode) FederationErrorCode {
+	var typed *FederationError
+	if errors.As(err, &typed) && typed.Code != "" {
+		return typed.Code
+	}
+	return fallback
 }
 
 func updateDeliveryAfterHandoffTx(ctx context.Context, tx Tx, req HandoffRequest, status string, terminalCode FederationErrorCode) error {
@@ -439,8 +681,8 @@ func updateDeliveryAfterHandoffTx(ctx context.Context, tx Tx, req HandoffRequest
 	return nil
 }
 
-func classifyHandoff(req HandoffRequest) (string, string, FederationErrorCode) {
-	if !handoffSideEffectSafe(req.SideEffectState) {
+func classifyHandoff(req HandoffRequest, sideEffectState string) (string, string, FederationErrorCode) {
+	if !handoffSideEffectSafe(sideEffectState) {
 		return HandoffStatusNeedsHuman, "human-review-side-effect-state", ErrHandoffSideEffectUnknownCode
 	}
 	for _, reason := range req.ReasonCodes {

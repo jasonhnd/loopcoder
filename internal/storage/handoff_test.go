@@ -32,8 +32,165 @@ func TestRecordHandoffTransactionTransfersOnceAndFencesOldOwner(t *testing.T) {
 	if !errors.Is(err, &FederationError{Code: ErrStaleClaimCode}) {
 		t.Fatalf("old owner completion error = %v, want typed ErrStaleClaim", err)
 	}
-	if err := CompleteClaimedChildRun(ctx, store, claim.ParentRunID, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration, "succeeded", "2026-01-01T00:03:01Z", "handoff owner terminal", "receipt-after-handoff"); err != nil {
+	if err := RenewChildRunClaim(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, fixedNow(), fixedNow().Add(time.Hour)); !IsStaleChildRunClaim(err) {
+		t.Fatalf("old owner renew error = %v, want stale claim", err)
+	}
+	registration, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration)
+	if err != nil {
+		t.Fatalf("handoff owner launch validation: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, registration.ChildAgentID, AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:03:00Z"); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("old owner registration transition error = %v, want stale claim", err)
+	}
+	if registration.ExecutorID != record.DestinationExecutorID || registration.ClaimGeneration != record.HandoffGeneration {
+		t.Fatalf("handoff registration authority = %s/%d, want %s/%d", registration.ExecutorID, registration.ClaimGeneration, record.DestinationExecutorID, record.HandoffGeneration)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, registration.ChildAgentID, AgentActionLaunch, record.DestinationExecutorID, record.HandoffGeneration, "2026-01-01T00:03:00Z"); err != nil {
+		t.Fatalf("handoff owner launch transition: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, registration.ChildAgentID, AgentActionHeartbeat, record.DestinationExecutorID, record.HandoffGeneration, "2026-01-01T00:03:01Z"); err != nil {
+		t.Fatalf("handoff owner heartbeat transition: %v", err)
+	}
+	if err := CompleteClaimedChildRun(ctx, store, claim.ParentRunID, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration, "succeeded", "2026-01-01T00:03:02Z", "handoff owner terminal", "receipt-after-handoff"); err != nil {
 		t.Fatalf("handoff owner completion: %v", err)
+	}
+}
+
+func TestRecordHandoffTransactionStaleOwnershipLockFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store, claim := handoffFixture(t, ctx)
+	defer store.Close()
+
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET claim_generation = claim_generation + 98 WHERE run_id = ?`, claim.RunID)
+		return err
+	}); err != nil {
+		t.Fatalf("stale ownership lock: %v", err)
+	}
+	record, err := RecordHandoffTransaction(ctx, store, handoffRequestFixture(claim))
+	if err != nil {
+		t.Fatalf("RecordHandoffTransaction: %v", err)
+	}
+	if record.HandoffStatus != HandoffStatusNeedsHuman || record.NextAction != "human-review-ownership-state" {
+		t.Fatalf("handoff = %#v, want needs-human ownership review", record)
+	}
+	if err := RenewChildRunClaim(ctx, store, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, fixedNow(), fixedNow().Add(time.Hour)); !IsStaleChildRunClaim(err) {
+		t.Fatalf("old owner renew error = %v, want stale claim", err)
+	}
+	if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration); err == nil {
+		t.Fatalf("needs-human successor launch unexpectedly succeeded")
+	}
+	var lockState string
+	var lockGeneration int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT state, claim_generation FROM agent_ownership_locks WHERE run_id = ?`, claim.RunID).Scan(&lockState, &lockGeneration)
+	}); err != nil {
+		t.Fatalf("query ownership lock: %v", err)
+	}
+	if lockState != OwnershipStateNeedsHuman || lockGeneration != record.HandoffGeneration {
+		t.Fatalf("ownership lock = %s/%d, want needs-human/%d", lockState, lockGeneration, record.HandoffGeneration)
+	}
+}
+
+func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		mutate func(Store, federationClaim)
+	}{
+		{
+			name: "executing phase",
+			mutate: func(store Store, claim federationClaim) {
+				if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, "2026-01-01T00:01:00Z", ""); err != nil {
+					t.Fatalf("set executing phase: %v", err)
+				}
+			},
+		},
+		{
+			name: "claim provider receipt",
+			mutate: func(store Store, claim federationClaim) {
+				if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseClaimed, "2026-01-01T00:01:00Z", "provider-receipt-runtime"); err != nil {
+					t.Fatalf("set claim receipt: %v", err)
+				}
+			},
+		},
+		{
+			name: "attempt provider receipt",
+			mutate: func(store Store, claim federationClaim) {
+				if err := store.WithWriteTx(ctx, func(tx Tx) error {
+					_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = ?`, "attempt-runtime-receipt", "attempt-handoff-a")
+					return err
+				}); err != nil {
+					t.Fatalf("set attempt receipt: %v", err)
+				}
+			},
+		},
+		{
+			name: "ambiguous claim phase",
+			mutate: func(store Store, claim federationClaim) {
+				if err := store.WithWriteTx(ctx, func(tx Tx) error {
+					_, err := tx.Exec(ctx, `UPDATE run_claims SET phase = ? WHERE run_id = ?`, "provider-unknown", claim.RunID)
+					return err
+				}); err != nil {
+					t.Fatalf("set ambiguous claim phase: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, claim := handoffFixture(t, ctx)
+			defer store.Close()
+			tc.mutate(store, claim)
+			req := handoffRequestFixture(claim)
+			req.SideEffectState = SideEffectStateNotStarted
+			record, err := RecordHandoffTransaction(ctx, store, req)
+			if err != nil {
+				t.Fatalf("RecordHandoffTransaction: %v", err)
+			}
+			if record.HandoffStatus != HandoffStatusNeedsHuman || record.NextAction != "human-review-side-effect-state" {
+				t.Fatalf("handoff = %#v, want needs-human side-effect review", record)
+			}
+			if record.SideEffectState == SideEffectStateNotStarted {
+				t.Fatalf("side effect state trusted caller input; got %q", record.SideEffectState)
+			}
+			if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration); err == nil {
+				t.Fatalf("needs-human handoff launch unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestRecordHandoffTransactionDurableSideEffectReplayAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, claim := handoffFixtureAtPath(t, ctx, path)
+	if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, "2026-01-01T00:01:00Z", ""); err != nil {
+		t.Fatalf("set executing phase: %v", err)
+	}
+	req := handoffRequestFixture(claim)
+	req.SideEffectState = SideEffectStateNotStarted
+	first, err := RecordHandoffTransaction(ctx, store, req)
+	if err != nil {
+		t.Fatalf("first handoff: %v", err)
+	}
+	if first.HandoffStatus != HandoffStatusNeedsHuman {
+		t.Fatalf("first handoff status = %q, want needs-human", first.HandoffStatus)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	replayed, err := RecordHandoffTransaction(ctx, reopened, req)
+	if err != nil {
+		t.Fatalf("replay after reopen: %v", err)
+	}
+	if replayed.HandoffID != first.HandoffID || replayed.SideEffectState != first.SideEffectState || replayed.HandoffStatus != HandoffStatusNeedsHuman {
+		t.Fatalf("replayed handoff = %#v, want %#v", replayed, first)
 	}
 }
 
@@ -138,10 +295,20 @@ func TestRecordHandoffTransactionRollbackBeforePersistRecoversOldOwner(t *testin
 	defer store.Close()
 
 	forced := errors.New("forced crash before handoff persistence")
+	var beforeLockState string
+	var beforeLockGeneration int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT state, claim_generation FROM agent_ownership_locks WHERE run_id = ?`, claim.RunID).Scan(&beforeLockState, &beforeLockGeneration)
+	}); err != nil {
+		t.Fatalf("query ownership before rollback: %v", err)
+	}
 	err := store.WithWriteTx(ctx, func(tx Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET executor_id = ?, claim_generation = ? WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
 			"handoff-crash", claim.ClaimGeneration+1, claim.RunID, claim.ExecutorID, claim.ClaimGeneration)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET claim_generation = ? WHERE run_id = ?`, claim.ClaimGeneration+1, claim.RunID); err != nil {
 			return err
 		}
 		return forced
@@ -151,9 +318,14 @@ func TestRecordHandoffTransactionRollbackBeforePersistRecoversOldOwner(t *testin
 	}
 	var owner string
 	var generation int64
+	var afterLockState string
+	var afterLockGeneration int64
 	var handoffCount int
 	if err := store.WithTx(ctx, func(tx Tx) error {
 		if err := tx.QueryRow(ctx, `SELECT executor_id, claim_generation FROM run_claims WHERE run_id = ?`, claim.RunID).Scan(&owner, &generation); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state, claim_generation FROM agent_ownership_locks WHERE run_id = ?`, claim.RunID).Scan(&afterLockState, &afterLockGeneration); err != nil {
 			return err
 		}
 		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM handoff_transactions`).Scan(&handoffCount)
@@ -162,6 +334,9 @@ func TestRecordHandoffTransactionRollbackBeforePersistRecoversOldOwner(t *testin
 	}
 	if owner != claim.ExecutorID || generation != claim.ClaimGeneration || handoffCount != 0 {
 		t.Fatalf("rollback state owner=%s generation=%d handoffs=%d, want original owner and no record", owner, generation, handoffCount)
+	}
+	if afterLockState != beforeLockState || afterLockGeneration != beforeLockGeneration {
+		t.Fatalf("rollback lock state = %s/%d, want %s/%d", afterLockState, afterLockGeneration, beforeLockState, beforeLockGeneration)
 	}
 	if _, err := RecordHandoffTransaction(ctx, store, handoffRequestFixture(claim)); err != nil {
 		t.Fatalf("handoff after rollback: %v", err)
@@ -256,6 +431,9 @@ func handoffFixtureAtPath(t *testing.T, ctx context.Context, path string) (Store
 
 func seedHandoffAttempt(t *testing.T, ctx context.Context, store Store, claim federationClaim) error {
 	t.Helper()
+	if _, err := RegisterAgent(ctx, store, handoffFederationRequest(claim)); err != nil {
+		return err
+	}
 	return store.WithWriteTx(ctx, func(tx Tx) error {
 		_, err := tx.Exec(ctx, `INSERT INTO delivery_attempts(
 			attempt_id, schema_version, record_version, project_id, delivery_run_id, task_id, attempt_ordinal, state,
@@ -270,6 +448,15 @@ func seedHandoffAttempt(t *testing.T, ctx context.Context, store Store, claim fe
 		_, err = tx.Exec(ctx, `UPDATE delivery_tasks SET state = 'running', active_attempt_id = 'attempt-handoff-a', attempt_count = 1 WHERE project_id = 'proj-handoff' AND delivery_run_id = 'drun-a' AND task_id = 'task-a'`)
 		return err
 	})
+}
+
+func handoffFederationRequest(claim federationClaim) AgentRegistrationRequest {
+	req := federationRequest(claim)
+	scope := federationAuthorityScope("proj-handoff")
+	req.ProjectID = "proj-handoff"
+	req.Scope = scope
+	req.ParentScope = &scope
+	return req
 }
 
 func handoffRequestFixture(claim federationClaim) HandoffRequest {
@@ -291,6 +478,6 @@ func handoffRequestFixture(claim federationClaim) HandoffRequest {
 		SideEffectState:             SideEffectStateNotStarted,
 		DestinationRoutePlaceholder: "route-pending",
 		RequestedAt:                 "2026-01-01T00:02:00Z",
-		DestinationLeaseExpiresAt:   time.Date(2026, 1, 1, 0, 17, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DestinationLeaseExpiresAt:   fixedNow().Add(time.Hour).Format(time.RFC3339Nano),
 	}
 }
