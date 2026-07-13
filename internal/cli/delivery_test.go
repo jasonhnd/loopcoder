@@ -74,6 +74,38 @@ func TestDeliveryCLIExitCodesForPendingAndStale(t *testing.T) {
 	}
 }
 
+func TestDeliveryCLIJSONUnsupportedHostOutcome(t *testing.T) {
+	t.Setenv("LOOPCODER_HOST", "unknown-host")
+	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+	seedCLIDeliveryRun(t, dbPath)
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithDeps([]string{"delivery", "plan", "--db", dbPath, "--project-id", "proj_cli", "--run-id", "run_cli", "--format", "json"}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if code != deliveryUnsupportedHostExitCode {
+		t.Fatalf("unsupported host exit = %d, want %d; stderr=%q", code, deliveryUnsupportedHostExitCode, stderr.String())
+	}
+	var outcome struct {
+		Outcome    string `json:"outcome"`
+		ErrorCode  string `json:"error_code"`
+		Invocation struct {
+			Contract struct {
+				Operation       string `json:"operation"`
+				SideEffectClass string `json:"side_effect_class"`
+				Permission      string `json:"permission"`
+			} `json:"contract"`
+		} `json:"invocation"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &outcome); err != nil {
+		t.Fatalf("decode unsupported JSON: %v\n%s", err, stdout.String())
+	}
+	if outcome.Outcome != deliverypkg.OutcomeUnsupported || outcome.ErrorCode != string(deliverypkg.ErrUnsupportedHostCapabilityCode) {
+		t.Fatalf("outcome = %#v, want unsupported ErrUnsupportedHostCapability", outcome)
+	}
+	if outcome.Invocation.Contract.Operation != deliverypkg.OperationPlan || outcome.Invocation.Contract.SideEffectClass != "none" || outcome.Invocation.Contract.Permission != deliverypkg.PermissionReadOnly {
+		t.Fatalf("invocation contract = %#v, want side-effect-free plan contract", outcome.Invocation.Contract)
+	}
+}
+
 func seedCLIDeliveryRun(t *testing.T, dbPath string) {
 	t.Helper()
 	ctx := context.Background()

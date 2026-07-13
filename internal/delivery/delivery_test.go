@@ -8,6 +8,7 @@ import (
 	"math"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -292,18 +293,107 @@ func TestPlanIsSideEffectFreeAndDoesNotMutateStorage(t *testing.T) {
 	store := openDeliveryStore(t)
 	defer store.Close()
 	run := seedApprovalRun(t, ctx, store)
+	for _, enforcement := range []HostEnforcement{
+		{},
+		SupportedHostEnforcement("codex-cli", "fixture"),
+		SupportedHostEnforcement("claude-code", "fixture"),
+		SupportedHostEnforcement("paseo-style", "fixture"),
+		SupportedHostEnforcement("generic-local", "fixture"),
+	} {
+		before := deliveryTableRows(t, ctx, store)
+		proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, HostEnforcement: enforcement})
+		if err != nil {
+			t.Fatalf("Plan with host %#v: %v", enforcement, err)
+		}
+		after := deliveryTableRows(t, ctx, store)
+		if after != before {
+			t.Fatalf("Plan mutated delivery tables for host %#v: before=%d after=%d", enforcement, before, after)
+		}
+		if proposal.AuthorizationFingerprint == "" || proposal.FingerprintStatus != "current" || proposal.TaskCount != 1 || proposal.Invocation.Contract.SideEffectClass != "none" {
+			t.Fatalf("proposal = %#v, want current side-effect-free fingerprinted one-task plan", proposal)
+		}
+	}
+}
+
+func TestUnsupportedHostContractFailsClosedWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	enforcement := SupportedHostEnforcement("bad-host", "fixture")
+	enforcement.StableJSON = false
 	before := deliveryTableRows(t, ctx, store)
-	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID})
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
+	_, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, HostEnforcement: enforcement})
+	if !errors.Is(err, ErrUnsupportedHostCapability) {
+		t.Fatalf("Plan unsupported host error = %v, want ErrUnsupportedHostCapability", err)
 	}
 	after := deliveryTableRows(t, ctx, store)
 	if after != before {
-		t.Fatalf("Plan mutated delivery tables: before=%d after=%d", before, after)
+		t.Fatalf("unsupported Plan mutated delivery tables: before=%d after=%d", before, after)
 	}
-	if proposal.AuthorizationFingerprint == "" || proposal.FingerprintStatus != "current" || proposal.TaskCount != 1 {
-		t.Fatalf("proposal = %#v, want current fingerprinted one-task plan", proposal)
+}
+
+func TestHostInvocationFingerprintMismatchCannotAuthorizeExecution(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	codex := SupportedHostEnforcement("codex-cli", "fixture")
+	proposal, err := Plan(ctx, store, PlanProposalInput{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, HostEnforcement: codex})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
 	}
+	claude := SupportedHostEnforcement("claude-code", "fixture")
+	_, err = Decide(ctx, store, DecisionOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		Action:                           DecisionActionApprove,
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "approve-different-host",
+		Now:                              fixedTime().Add(time.Minute),
+		HostEnforcement:                  claude,
+	})
+	if !errors.Is(err, ErrStaleApproval) {
+		t.Fatalf("Decide with different host contract error = %v, want ErrStaleApproval", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 0)
+}
+
+func TestInterruptedContinueLeavesDurableResumableState(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run := seedApprovalRun(t, ctx, store)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err := Continue(cancelled, store, ContinueOptions{
+		ProjectID:                        run.ProjectID,
+		DeliveryRunID:                    run.DeliveryRunID,
+		ExpectedAuthorizationFingerprint: "sha256:" + stringsRepeat("4", 64),
+		Actor:                            actor(),
+		Host:                             host(),
+		IdempotencyKey:                   "interrupted-continue",
+		Now:                              fixedTime().Add(time.Minute),
+		HostEnforcement:                  SupportedHostEnforcement("codex-cli", "fixture"),
+	})
+	if !errors.Is(err, ErrInvocationInterrupted) {
+		t.Fatalf("Continue interrupted error = %v, want ErrInvocationInterrupted", err)
+	}
+	var state, output string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT state FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`, run.ProjectID, run.DeliveryRunID).Scan(&state); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions WHERE decision_kind = 'terminal-outcome'`).Scan(&output)
+	}); err != nil {
+		t.Fatalf("query interrupted run: %v", err)
+	}
+	if state != RunPaused || !strings.Contains(output, string(ErrInvocationInterruptedCode)) {
+		t.Fatalf("interrupted state/output = %q/%q, want paused terminal outcome decision", state, output)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_decisions WHERE decision_kind = 'terminal-outcome'`, 1)
 }
 
 func TestDecisionApprovalIsBoundToCurrentPlanFingerprint(t *testing.T) {
@@ -391,6 +481,7 @@ func TestDecideApproveAndContinueAreIdempotent(t *testing.T) {
 		t.Fatalf("continue replay = %#v then %#v, want stable queued result", first, second)
 	}
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_plan_fingerprints WHERE fingerprint_id = '`+proposal.AuthorizationFingerprint+`' AND canonical_inputs_json LIKE '%authorized_invocation%'`, 1)
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_attempts`, 0)
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks WHERE state = 'ready'`, 1)
 }

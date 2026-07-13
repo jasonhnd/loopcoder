@@ -13,6 +13,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -21,6 +22,8 @@ const (
 	deliveryStalePlanExitCode       = 11
 	deliveryRejectedExitCode        = 12
 	deliveryPolicyDeniedExitCode    = 13
+	deliveryUnsupportedHostExitCode = 14
+	deliveryInterruptedExitCode     = 15
 )
 
 func printDeliveryHelp(w io.Writer) {
@@ -85,9 +88,13 @@ func runDeliveryPlan(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	defer closeStore()
-	proposal, err := delivery.Plan(context.Background(), store, delivery.PlanProposalInput{ProjectID: common.ProjectID, DeliveryRunID: common.RunID})
+	hostEnforcement := deliveryHostEnforcement()
+	proposal, err := delivery.Plan(context.Background(), store, delivery.PlanProposalInput{ProjectID: common.ProjectID, DeliveryRunID: common.RunID, HostEnforcement: hostEnforcement})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery plan: %v\n", err)
+		if common.Format == "json" {
+			_ = renderDeliveryError(stdout, "delivery.plan", common.ProjectID, common.RunID, hostEnforcement, err)
+		}
 		return deliveryExitCode(err)
 	}
 	return renderDeliveryOutput(stdout, stderr, common.Format, proposal, renderPlanText)
@@ -124,6 +131,7 @@ func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	defer closeStore()
 	now := deps.Now().UTC()
+	hostEnforcement := deliveryHostEnforcement()
 	result, err := delivery.Decide(context.Background(), store, delivery.DecisionOptions{
 		ProjectID:                        common.ProjectID,
 		DeliveryRunID:                    common.RunID,
@@ -136,9 +144,13 @@ func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ExpiresAt:                        expiresAt,
 		EditedProposalJSON:               edited,
 		Reason:                           reason,
+		HostEnforcement:                  hostEnforcement,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery decide: %v\n", err)
+		if common.Format == "json" {
+			_ = renderDeliveryError(stdout, "delivery.decide", common.ProjectID, common.RunID, hostEnforcement, err)
+		}
 		return deliveryExitCode(err)
 	}
 	return renderDeliveryOutput(stdout, stderr, common.Format, result, renderDecisionText)
@@ -166,6 +178,7 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		return 1
 	}
 	defer closeStore()
+	hostEnforcement := deliveryHostEnforcement()
 	result, err := delivery.Continue(context.Background(), store, delivery.ContinueOptions{
 		ProjectID:                        common.ProjectID,
 		DeliveryRunID:                    common.RunID,
@@ -174,9 +187,13 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		Host:                             deliveryHost(deps),
 		IdempotencyKey:                   idempotencyKey,
 		Now:                              deps.Now().UTC(),
+		HostEnforcement:                  hostEnforcement,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery continue: %v\n", err)
+		if common.Format == "json" {
+			_ = renderDeliveryError(stdout, "delivery.continue", common.ProjectID, common.RunID, hostEnforcement, err)
+		}
 		return deliveryExitCode(err)
 	}
 	return renderDeliveryOutput(stdout, stderr, common.Format, result, renderContinueText)
@@ -245,20 +262,24 @@ func renderDeliveryOutput[T any](stdout, stderr io.Writer, format string, value 
 }
 
 func renderPlanText(w io.Writer, proposal delivery.PlanProposal) error {
-	_, err := fmt.Fprintf(w, "DELIVERY PLAN\nrun: %s\nstate: %s\napproval: %s\nfingerprint: %s\ntasks: %d\nedges: %d\n",
-		proposal.DeliveryRunID, proposal.RunState, proposal.ApprovalRequirement, proposal.AuthorizationFingerprint, proposal.TaskCount, proposal.EdgeCount)
+	_, err := fmt.Fprintf(w, "DELIVERY PLAN\nrun: %s\nstate: %s\napproval: %s\nfingerprint: %s\noperation: %s\nside_effect_class: %s\npermission: %s\ntasks: %d\nedges: %d\n",
+		proposal.DeliveryRunID, proposal.RunState, proposal.ApprovalRequirement, proposal.AuthorizationFingerprint,
+		proposal.Invocation.Contract.Operation, proposal.Invocation.Contract.SideEffectClass, proposal.Invocation.Contract.Permission,
+		proposal.TaskCount, proposal.EdgeCount)
 	return err
 }
 
 func renderDecisionText(w io.Writer, result delivery.DecisionResult) error {
-	_, err := fmt.Fprintf(w, "DELIVERY DECISION\nrun: %s\naction: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\n",
-		result.DeliveryRunID, result.Action, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint)
+	_, err := fmt.Fprintf(w, "DELIVERY DECISION\nrun: %s\naction: %s\noutcome: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\noperation: %s\nside_effect_class: %s\npermission: %s\n",
+		result.DeliveryRunID, result.Action, result.Outcome, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint,
+		result.Invocation.Contract.Operation, result.Invocation.Contract.SideEffectClass, result.Invocation.Contract.Permission)
 	return err
 }
 
 func renderContinueText(w io.Writer, result delivery.ContinueResult) error {
-	_, err := fmt.Fprintf(w, "DELIVERY CONTINUE\nrun: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\n",
-		result.DeliveryRunID, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint)
+	_, err := fmt.Fprintf(w, "DELIVERY CONTINUE\nrun: %s\noutcome: %s\nstate: %s\napproval_status: %s\nfingerprint: %s\noperation: %s\nside_effect_class: %s\npermission: %s\n",
+		result.DeliveryRunID, result.Outcome, result.RunState, result.ApprovalStatus, result.AuthorizationFingerprint,
+		result.Invocation.Contract.Operation, result.Invocation.Contract.SideEffectClass, result.Invocation.Contract.Permission)
 	return err
 }
 
@@ -270,6 +291,10 @@ func deliveryExitCode(err error) int {
 		return deliveryStalePlanExitCode
 	case errors.Is(err, delivery.ErrPolicyDenied):
 		return deliveryPolicyDeniedExitCode
+	case errors.Is(err, delivery.ErrUnsupportedHostCapability):
+		return deliveryUnsupportedHostExitCode
+	case errors.Is(err, delivery.ErrInvocationInterrupted):
+		return deliveryInterruptedExitCode
 	case errors.Is(err, delivery.ErrInvalidTransition):
 		if strings.Contains(err.Error(), "rejected") {
 			return deliveryRejectedExitCode
@@ -278,6 +303,55 @@ func deliveryExitCode(err error) int {
 	default:
 		return 1
 	}
+}
+
+type deliveryTerminalOutcome struct {
+	SchemaVersion string                      `json:"schema_version"`
+	Operation     string                      `json:"operation"`
+	ProjectID     string                      `json:"project_id"`
+	DeliveryRunID string                      `json:"delivery_run_id"`
+	Outcome       string                      `json:"outcome"`
+	ErrorCode     string                      `json:"error_code"`
+	ErrorMessage  string                      `json:"error_message"`
+	Invocation    delivery.InvocationEvidence `json:"invocation"`
+}
+
+func renderDeliveryError(w io.Writer, operation, projectID, runID string, enforcement delivery.HostEnforcement, err error) error {
+	invocation, _ := delivery.ContractForOperation(operation)
+	code := ""
+	var typed *delivery.TypedError
+	if errors.As(err, &typed) {
+		code = string(typed.Code)
+	}
+	if code == "" {
+		code = "ErrDeliveryInvocation"
+	}
+	outcome := "failed"
+	switch {
+	case errors.Is(err, delivery.ErrUnsupportedHostCapability):
+		outcome = delivery.OutcomeUnsupported
+	case errors.Is(err, delivery.ErrInvocationInterrupted):
+		outcome = delivery.OutcomeInterrupted
+	case errors.Is(err, delivery.ErrStaleApproval):
+		outcome = delivery.OutcomeStale
+	case errors.Is(err, delivery.ErrPolicyDenied):
+		outcome = delivery.OutcomeDeclined
+	}
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(deliveryTerminalOutcome{
+		SchemaVersion: "loopcoder.delivery_terminal_outcome.v1",
+		Operation:     operation,
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		Outcome:       outcome,
+		ErrorCode:     code,
+		ErrorMessage:  err.Error(),
+		Invocation: delivery.InvocationEvidence{
+			Contract:    invocation,
+			Enforcement: enforcement,
+		},
+	})
 }
 
 func deliveryActor(actorID string) delivery.Actor {
@@ -297,4 +371,17 @@ func deliveryHost(deps Deps) delivery.Host {
 		LoopcoderVersion: normalizeBuildInfo(deps.BuildInfo).Version,
 		Platform:         runtime.GOOS + "-" + runtime.GOARCH,
 	}
+}
+
+func deliveryHostEnforcement() delivery.HostEnforcement {
+	resolved, err := hostprofile.Resolve(hostprofile.Options{Getenv: os.Getenv})
+	if err != nil {
+		return delivery.UnsupportedHostEnforcement(err.Error())
+	}
+	enforcement := delivery.SupportedHostEnforcement(resolved.Name, string(resolved.Source))
+	enforcement.Cancellation = resolved.Runtime.SupportsCancel
+	enforcement.StableJSON = resolved.Runtime.SupportsJSONOutput
+	enforcement.Stdout = resolved.Runtime.PreservesStdout
+	enforcement.Stderr = resolved.Runtime.PreservesStderr
+	return enforcement
 }

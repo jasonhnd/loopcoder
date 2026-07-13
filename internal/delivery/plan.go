@@ -23,8 +23,9 @@ const (
 )
 
 type PlanProposalInput struct {
-	ProjectID     string
-	DeliveryRunID string
+	ProjectID       string
+	DeliveryRunID   string
+	HostEnforcement HostEnforcement
 }
 
 type PlanProposal struct {
@@ -45,6 +46,8 @@ type PlanProposal struct {
 	PolicyVersion            string             `json:"policy_version"`
 	MaxSideEffectClass       string             `json:"max_side_effect_class"`
 	ApprovedScopeJSON        string             `json:"approved_scope_json"`
+	Invocation               InvocationEvidence `json:"invocation"`
+	AuthorizedInvocation     InvocationEvidence `json:"authorized_invocation,omitempty"`
 	TaskCount                int                `json:"task_count"`
 	EdgeCount                int                `json:"edge_count"`
 	Tasks                    []PlanProposalTask `json:"tasks"`
@@ -83,18 +86,22 @@ type DecisionOptions struct {
 	ExpiresAt                        string
 	EditedProposalJSON               string
 	Reason                           string
+	HostEnforcement                  HostEnforcement
 }
 
 type DecisionResult struct {
-	Action                   string       `json:"action"`
-	ProjectID                string       `json:"project_id"`
-	DeliveryRunID            string       `json:"delivery_run_id"`
-	AuthorizationFingerprint string       `json:"authorization_fingerprint"`
-	RunState                 string       `json:"run_state"`
-	ApprovalStatus           string       `json:"approval_status"`
-	DecisionID               string       `json:"decision_id,omitempty"`
-	ApprovalID               string       `json:"approval_id,omitempty"`
-	Proposal                 PlanProposal `json:"proposal"`
+	Action                   string             `json:"action"`
+	ProjectID                string             `json:"project_id"`
+	DeliveryRunID            string             `json:"delivery_run_id"`
+	AuthorizationFingerprint string             `json:"authorization_fingerprint"`
+	RunState                 string             `json:"run_state"`
+	ApprovalStatus           string             `json:"approval_status"`
+	DecisionID               string             `json:"decision_id,omitempty"`
+	ApprovalID               string             `json:"approval_id,omitempty"`
+	Outcome                  string             `json:"outcome"`
+	Invocation               InvocationEvidence `json:"invocation"`
+	AuthorizedInvocation     InvocationEvidence `json:"authorized_invocation,omitempty"`
+	Proposal                 PlanProposal       `json:"proposal"`
 }
 
 type ContinueOptions struct {
@@ -105,15 +112,19 @@ type ContinueOptions struct {
 	Host                             Host
 	IdempotencyKey                   string
 	Now                              time.Time
+	HostEnforcement                  HostEnforcement
 }
 
 type ContinueResult struct {
-	ProjectID                string       `json:"project_id"`
-	DeliveryRunID            string       `json:"delivery_run_id"`
-	AuthorizationFingerprint string       `json:"authorization_fingerprint"`
-	RunState                 string       `json:"run_state"`
-	ApprovalStatus           string       `json:"approval_status"`
-	Proposal                 PlanProposal `json:"proposal"`
+	ProjectID                string             `json:"project_id"`
+	DeliveryRunID            string             `json:"delivery_run_id"`
+	AuthorizationFingerprint string             `json:"authorization_fingerprint"`
+	RunState                 string             `json:"run_state"`
+	ApprovalStatus           string             `json:"approval_status"`
+	Outcome                  string             `json:"outcome"`
+	Invocation               InvocationEvidence `json:"invocation"`
+	AuthorizedInvocation     InvocationEvidence `json:"authorized_invocation,omitempty"`
+	Proposal                 PlanProposal       `json:"proposal"`
 }
 
 func Plan(ctx context.Context, store storage.Store, input PlanProposalInput) (PlanProposal, error) {
@@ -125,10 +136,15 @@ func Plan(ctx context.Context, store storage.Store, input PlanProposalInput) (Pl
 	if input.ProjectID == "" || input.DeliveryRunID == "" {
 		return PlanProposal{}, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
 	}
+	invocation, err := enforceHostInvocation(OperationPlan, input.HostEnforcement)
+	if err != nil {
+		return PlanProposal{Invocation: invocation}, err
+	}
 	var proposal PlanProposal
-	err := store.WithTx(ctx, func(tx storage.Tx) error {
+	err = store.WithTx(ctx, func(tx storage.Tx) error {
 		var err error
-		proposal, err = planInTx(ctx, tx, input.ProjectID, input.DeliveryRunID)
+		proposal, err = planInTx(ctx, tx, input.ProjectID, input.DeliveryRunID, input.HostEnforcement)
+		proposal.Invocation = invocation
 		return err
 	})
 	return proposal, err
@@ -148,8 +164,16 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 	if !validDecisionAction(opts.Action) {
 		return DecisionResult{}, typed(ErrInvalidRecordCode, "unknown decision action %q", opts.Action)
 	}
+	invocation, err := enforceHostInvocation(OperationDecide, opts.HostEnforcement)
+	if err != nil {
+		return DecisionResult{Action: opts.Action, ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeUnsupported, Invocation: invocation}, err
+	}
+	if ctx.Err() != nil {
+		_ = recordInterruptedOutcome(store, opts.ProjectID, opts.DeliveryRunID, OperationDecide, opts.Actor, opts.Host, opts.Now)
+		return DecisionResult{Action: opts.Action, ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeInterrupted, Invocation: invocation}, typed(ErrInvocationInterruptedCode, "%s interrupted before mutation", OperationDecide)
+	}
 	var out DecisionResult
-	err := withWrite(ctx, store, func(tx storage.Tx) error {
+	err = withWrite(ctx, store, func(tx storage.Tx) error {
 		request := map[string]any{
 			"operation":                          "delivery_decide",
 			"project_id":                         opts.ProjectID,
@@ -160,12 +184,13 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 			"edited_proposal_json":               opts.EditedProposalJSON,
 			"reason":                             opts.Reason,
 			"actor":                              opts.Actor,
+			"invocation":                         invocation,
 		}
 		replayed, err := replay(ctx, tx, opts.IdempotencyKey, opts.ProjectID, opts.DeliveryRunID, "delivery_decide", request, &out)
 		if err != nil || replayed {
 			return err
 		}
-		proposal, err := planInTx(ctx, tx, opts.ProjectID, opts.DeliveryRunID)
+		proposal, err := planInTx(ctx, tx, opts.ProjectID, opts.DeliveryRunID, opts.HostEnforcement)
 		if err != nil {
 			return err
 		}
@@ -186,6 +211,9 @@ func Decide(ctx context.Context, store storage.Store, opts DecisionOptions) (Dec
 			AuthorizationFingerprint: proposal.AuthorizationFingerprint,
 			RunState:                 state,
 			ApprovalStatus:           approvalStatus,
+			Outcome:                  decisionOutcome(opts.Action),
+			Invocation:               invocation,
+			AuthorizedInvocation:     proposal.AuthorizedInvocation,
 			Proposal:                 proposal,
 		}
 		decisionID, err := recordDecisionInTx(ctx, tx, proposal, opts)
@@ -208,20 +236,29 @@ func Continue(ctx context.Context, store storage.Store, opts ContinueOptions) (C
 	if opts.Now.IsZero() {
 		return ContinueResult{}, typed(ErrInvalidRecordCode, "now is required")
 	}
+	invocation, err := enforceHostInvocation(OperationContinue, opts.HostEnforcement)
+	if err != nil {
+		return ContinueResult{ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeUnsupported, Invocation: invocation}, err
+	}
+	if ctx.Err() != nil {
+		_ = recordInterruptedOutcome(store, opts.ProjectID, opts.DeliveryRunID, OperationContinue, opts.Actor, opts.Host, opts.Now)
+		return ContinueResult{ProjectID: opts.ProjectID, DeliveryRunID: opts.DeliveryRunID, Outcome: OutcomeInterrupted, Invocation: invocation}, typed(ErrInvocationInterruptedCode, "%s interrupted before mutation", OperationContinue)
+	}
 	var out ContinueResult
-	err := withWrite(ctx, store, func(tx storage.Tx) error {
+	err = withWrite(ctx, store, func(tx storage.Tx) error {
 		request := map[string]any{
 			"operation":                          "delivery_continue",
 			"project_id":                         opts.ProjectID,
 			"delivery_run_id":                    opts.DeliveryRunID,
 			"expected_authorization_fingerprint": opts.ExpectedAuthorizationFingerprint,
 			"actor":                              opts.Actor,
+			"invocation":                         invocation,
 		}
 		replayed, err := replay(ctx, tx, opts.IdempotencyKey, opts.ProjectID, opts.DeliveryRunID, "delivery_continue", request, &out)
 		if err != nil || replayed {
 			return err
 		}
-		proposal, err := planInTx(ctx, tx, opts.ProjectID, opts.DeliveryRunID)
+		proposal, err := planInTx(ctx, tx, opts.ProjectID, opts.DeliveryRunID, opts.HostEnforcement)
 		if err != nil {
 			return err
 		}
@@ -259,6 +296,9 @@ func Continue(ctx context.Context, store storage.Store, opts ContinueOptions) (C
 			AuthorizationFingerprint: proposal.AuthorizationFingerprint,
 			RunState:                 state,
 			ApprovalStatus:           "approved",
+			Outcome:                  OutcomeAccepted,
+			Invocation:               invocation,
+			AuthorizedInvocation:     proposal.AuthorizedInvocation,
 			Proposal:                 proposal,
 		}
 		return remember(ctx, tx, opts.IdempotencyKey, opts.ProjectID, opts.DeliveryRunID, "delivery_continue", request, out, opts.Now)
@@ -266,7 +306,7 @@ func Continue(ctx context.Context, store storage.Store, opts ContinueOptions) (C
 	return out, err
 }
 
-func planInTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) (PlanProposal, error) {
+func planInTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string, enforcement HostEnforcement) (PlanProposal, error) {
 	run, err := loadPlanRun(ctx, tx, projectID, deliveryRunID)
 	if err != nil {
 		return PlanProposal{}, err
@@ -283,12 +323,20 @@ func planInTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID strin
 	if err != nil {
 		return PlanProposal{}, err
 	}
-	inputFingerprint, _, err := DigestCanonicalJSON(map[string]any{
+	authorizedInvocation, err := authorizationInvocationEvidence(enforcement)
+	if err != nil {
+		return PlanProposal{}, err
+	}
+	inputPayload := map[string]any{
 		"schema_version":  "loopcoder.delivery_input.v1",
 		"project_id":      run.ProjectID,
 		"delivery_run_id": run.DeliveryRunID,
 		"intent_summary":  run.IntentSummary,
-	})
+	}
+	if enforcement.Provided {
+		inputPayload["authorized_invocation"] = authorizedInvocation
+	}
+	inputFingerprint, _, err := DigestCanonicalJSON(inputPayload)
 	if err != nil {
 		return PlanProposal{}, err
 	}
@@ -339,6 +387,7 @@ func planInTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID strin
 		PolicyVersion:            run.PolicyVersion,
 		MaxSideEffectClass:       run.MaxSideEffectClass,
 		ApprovedScopeJSON:        string(scopeJSON),
+		AuthorizedInvocation:     authorizedInvocation,
 		TaskCount:                len(tasks),
 		EdgeCount:                len(edges),
 		Tasks:                    tasks,
@@ -396,12 +445,23 @@ func persistProposalAuthority(ctx context.Context, tx storage.Tx, proposal PlanP
 	if err != nil {
 		return err
 	}
+	scope, err := decodeJSONAny(proposal.ApprovedScopeJSON)
+	if err != nil {
+		return err
+	}
+	canonicalInputs, err := CanonicalJSON(map[string]any{
+		"approved_scope":        scope,
+		"authorized_invocation": proposal.AuthorizedInvocation,
+	})
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO delivery_plan_fingerprints(
 			fingerprint_id, schema_version, record_version, project_id, delivery_run_id, input_fingerprint, policy_fingerprint,
 			plan_fingerprint, authorization_fingerprint, canonicalization_version, algorithm, canonical_inputs_json, created_at, created_by_json, host_json
 		) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'sha256', ?, ?, ?, ?)`,
-		proposal.PlanFingerprint, SchemaPlanFingerprint, proposal.ProjectID, proposal.DeliveryRunID, proposal.InputFingerprint, proposal.PolicyFingerprint,
-		proposal.PlanFingerprint, proposal.AuthorizationFingerprint, CanonicalJSONVersion, emptyJSON(proposal.ApprovedScopeJSON), CanonicalTimestamp(now), createdBy, hostJSON); err != nil {
+		proposal.AuthorizationFingerprint, SchemaPlanFingerprint, proposal.ProjectID, proposal.DeliveryRunID, proposal.InputFingerprint, proposal.PolicyFingerprint,
+		proposal.PlanFingerprint, proposal.AuthorizationFingerprint, CanonicalJSONVersion, string(canonicalInputs), CanonicalTimestamp(now), createdBy, hostJSON); err != nil {
 		return fmt.Errorf("persist proposal authority: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE delivery_runs
@@ -775,4 +835,77 @@ func stableApprovalID(proposal PlanProposal, actor Actor) string {
 
 func decisionKey(action, authorizationFingerprint string) string {
 	return "delivery." + action + "." + authorizationFingerprint
+}
+
+func decisionOutcome(action string) string {
+	switch action {
+	case DecisionActionReject:
+		return OutcomeDeclined
+	case DecisionActionEdit, DecisionActionExpire, DecisionActionSupersede:
+		return OutcomeStale
+	default:
+		return OutcomeAccepted
+	}
+}
+
+func recordInterruptedOutcome(store storage.Store, projectID, deliveryRunID, operation string, actor Actor, host Host, now time.Time) error {
+	if store == nil || now.IsZero() {
+		return nil
+	}
+	return withWrite(context.Background(), store, func(tx storage.Tx) error {
+		proposal, err := planInTx(context.Background(), tx, projectID, deliveryRunID, HostEnforcement{})
+		if err != nil {
+			return err
+		}
+		if !RunTerminal(proposal.RunState) {
+			next, transitionErr := DeliveryRunTransition(proposal.RunState, "pause")
+			if transitionErr == nil {
+				actorJSON, err := marshalJSON("interrupted actor", actor)
+				if err != nil {
+					return err
+				}
+				hostJSON, err := marshalJSON("interrupted host", host)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.Exec(context.Background(), `UPDATE delivery_runs
+					SET state = ?, error_message = ?, record_version = record_version + 1,
+						updated_at = ?, updated_by_json = ?, host_json = ?
+					WHERE project_id = ? AND delivery_run_id = ?`,
+					next, operation+" interrupted before completion", CanonicalTimestamp(now),
+					actorJSON, hostJSON, projectID, deliveryRunID); err != nil {
+					return fmt.Errorf("record interrupted run state: %w", err)
+				}
+			}
+		}
+		output, err := CanonicalJSON(map[string]any{
+			"operation":  operation,
+			"outcome":    OutcomeInterrupted,
+			"error_code": string(ErrInvocationInterruptedCode),
+		})
+		if err != nil {
+			return err
+		}
+		actorJSON, err := marshalJSON("interrupted decision actor", actor)
+		if err != nil {
+			return err
+		}
+		hostJSON, err := marshalJSON("interrupted decision host", host)
+		if err != nil {
+			return err
+		}
+		key := "delivery.interrupted." + operation
+		id := stableID("dec", projectID, deliveryRunID, key)
+		_, err = tx.Exec(context.Background(), `INSERT OR IGNORE INTO delivery_decisions(
+				decision_id, schema_version, record_version, project_id, delivery_run_id, decision_key, decision_kind,
+				decided_by_json, inputs_fingerprint, output_json, alternatives_json, heuristic, policy_version,
+				side_effect_class, created_at, created_by_json, host_json
+			) VALUES (?, ?, 1, ?, ?, ?, 'terminal-outcome', ?, ?, ?, 'null', 0, ?, 'none', ?, ?, ?)`,
+			id, SchemaDecision, projectID, deliveryRunID, key, actorJSON, proposal.AuthorizationFingerprint,
+			string(output), proposal.PolicyVersion, CanonicalTimestamp(now), actorJSON, hostJSON)
+		if err != nil {
+			return fmt.Errorf("record interrupted decision: %w", err)
+		}
+		return nil
+	})
 }

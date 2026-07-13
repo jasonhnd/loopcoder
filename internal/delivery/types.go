@@ -9,47 +9,51 @@ import (
 type ErrorCode string
 
 const (
-	ErrInvalidTransitionCode       ErrorCode = "ErrInvalidTransition"
-	ErrTerminalStateCode           ErrorCode = "ErrTerminalState"
-	ErrCycleDetectedCode           ErrorCode = "ErrCycleDetected"
-	ErrCrossProjectReferenceCode   ErrorCode = "ErrCrossProjectReference"
-	ErrMissingReferenceCode        ErrorCode = "ErrMissingReference"
-	ErrDuplicateRecordCode         ErrorCode = "ErrDuplicateRecord"
-	ErrDuplicateReplayCode         ErrorCode = "ErrDuplicateReplay"
-	ErrStaleApprovalCode           ErrorCode = "ErrStaleApproval"
-	ErrPolicyDeniedCode            ErrorCode = "ErrPolicyDenied"
-	ErrOverrideRequiredCode        ErrorCode = "ErrOverrideRequired"
-	ErrApprovalRequiredCode        ErrorCode = "ErrApprovalRequired"
-	ErrExpiredApprovalCode         ErrorCode = "ErrExpiredApproval"
-	ErrSideEffectClassExceededCode ErrorCode = "ErrSideEffectClassExceeded"
-	ErrClaimRequiredCode           ErrorCode = "ErrClaimRequired"
-	ErrClaimConflictCode           ErrorCode = "ErrClaimConflict"
-	ErrStaleClaimCode              ErrorCode = "ErrStaleClaim"
-	ErrAmbiguousLegacyStateCode    ErrorCode = "ErrAmbiguousLegacyState"
-	ErrUnknownRecordVersionCode    ErrorCode = "ErrUnknownRecordVersion"
-	ErrInvalidRecordCode           ErrorCode = "ErrInvalidRecord"
+	ErrInvalidTransitionCode         ErrorCode = "ErrInvalidTransition"
+	ErrTerminalStateCode             ErrorCode = "ErrTerminalState"
+	ErrCycleDetectedCode             ErrorCode = "ErrCycleDetected"
+	ErrCrossProjectReferenceCode     ErrorCode = "ErrCrossProjectReference"
+	ErrMissingReferenceCode          ErrorCode = "ErrMissingReference"
+	ErrDuplicateRecordCode           ErrorCode = "ErrDuplicateRecord"
+	ErrDuplicateReplayCode           ErrorCode = "ErrDuplicateReplay"
+	ErrStaleApprovalCode             ErrorCode = "ErrStaleApproval"
+	ErrPolicyDeniedCode              ErrorCode = "ErrPolicyDenied"
+	ErrOverrideRequiredCode          ErrorCode = "ErrOverrideRequired"
+	ErrApprovalRequiredCode          ErrorCode = "ErrApprovalRequired"
+	ErrExpiredApprovalCode           ErrorCode = "ErrExpiredApproval"
+	ErrSideEffectClassExceededCode   ErrorCode = "ErrSideEffectClassExceeded"
+	ErrClaimRequiredCode             ErrorCode = "ErrClaimRequired"
+	ErrClaimConflictCode             ErrorCode = "ErrClaimConflict"
+	ErrStaleClaimCode                ErrorCode = "ErrStaleClaim"
+	ErrAmbiguousLegacyStateCode      ErrorCode = "ErrAmbiguousLegacyState"
+	ErrUnknownRecordVersionCode      ErrorCode = "ErrUnknownRecordVersion"
+	ErrInvalidRecordCode             ErrorCode = "ErrInvalidRecord"
+	ErrUnsupportedHostCapabilityCode ErrorCode = "ErrUnsupportedHostCapability"
+	ErrInvocationInterruptedCode     ErrorCode = "ErrInvocationInterrupted"
 )
 
 var (
-	ErrInvalidTransition       = &TypedError{Code: ErrInvalidTransitionCode}
-	ErrTerminalState           = &TypedError{Code: ErrTerminalStateCode}
-	ErrCycleDetected           = &TypedError{Code: ErrCycleDetectedCode}
-	ErrCrossProjectReference   = &TypedError{Code: ErrCrossProjectReferenceCode}
-	ErrMissingReference        = &TypedError{Code: ErrMissingReferenceCode}
-	ErrDuplicateRecord         = &TypedError{Code: ErrDuplicateRecordCode}
-	ErrDuplicateReplay         = &TypedError{Code: ErrDuplicateReplayCode}
-	ErrStaleApproval           = &TypedError{Code: ErrStaleApprovalCode}
-	ErrPolicyDenied            = &TypedError{Code: ErrPolicyDeniedCode}
-	ErrOverrideRequired        = &TypedError{Code: ErrOverrideRequiredCode}
-	ErrApprovalRequired        = &TypedError{Code: ErrApprovalRequiredCode}
-	ErrExpiredApproval         = &TypedError{Code: ErrExpiredApprovalCode}
-	ErrSideEffectClassExceeded = &TypedError{Code: ErrSideEffectClassExceededCode}
-	ErrClaimRequired           = &TypedError{Code: ErrClaimRequiredCode}
-	ErrClaimConflict           = &TypedError{Code: ErrClaimConflictCode}
-	ErrStaleClaim              = &TypedError{Code: ErrStaleClaimCode}
-	ErrAmbiguousLegacyState    = &TypedError{Code: ErrAmbiguousLegacyStateCode}
-	ErrUnknownRecordVersion    = &TypedError{Code: ErrUnknownRecordVersionCode}
-	ErrInvalidRecord           = &TypedError{Code: ErrInvalidRecordCode}
+	ErrInvalidTransition         = &TypedError{Code: ErrInvalidTransitionCode}
+	ErrTerminalState             = &TypedError{Code: ErrTerminalStateCode}
+	ErrCycleDetected             = &TypedError{Code: ErrCycleDetectedCode}
+	ErrCrossProjectReference     = &TypedError{Code: ErrCrossProjectReferenceCode}
+	ErrMissingReference          = &TypedError{Code: ErrMissingReferenceCode}
+	ErrDuplicateRecord           = &TypedError{Code: ErrDuplicateRecordCode}
+	ErrDuplicateReplay           = &TypedError{Code: ErrDuplicateReplayCode}
+	ErrStaleApproval             = &TypedError{Code: ErrStaleApprovalCode}
+	ErrPolicyDenied              = &TypedError{Code: ErrPolicyDeniedCode}
+	ErrOverrideRequired          = &TypedError{Code: ErrOverrideRequiredCode}
+	ErrApprovalRequired          = &TypedError{Code: ErrApprovalRequiredCode}
+	ErrExpiredApproval           = &TypedError{Code: ErrExpiredApprovalCode}
+	ErrSideEffectClassExceeded   = &TypedError{Code: ErrSideEffectClassExceededCode}
+	ErrClaimRequired             = &TypedError{Code: ErrClaimRequiredCode}
+	ErrClaimConflict             = &TypedError{Code: ErrClaimConflictCode}
+	ErrStaleClaim                = &TypedError{Code: ErrStaleClaimCode}
+	ErrAmbiguousLegacyState      = &TypedError{Code: ErrAmbiguousLegacyStateCode}
+	ErrUnknownRecordVersion      = &TypedError{Code: ErrUnknownRecordVersionCode}
+	ErrInvalidRecord             = &TypedError{Code: ErrInvalidRecordCode}
+	ErrUnsupportedHostCapability = &TypedError{Code: ErrUnsupportedHostCapabilityCode}
+	ErrInvocationInterrupted     = &TypedError{Code: ErrInvocationInterruptedCode}
 )
 
 type TypedError struct {
