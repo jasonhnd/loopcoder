@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func init() {
@@ -140,6 +141,15 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 	if len(codexSnapshots) != 5 {
 		t.Fatalf("codex quota snapshots = %d: %#v", len(codexSnapshots), report.QuotaSnapshots)
 	}
+	codexSources := quotaSourcesFor(report, "codex")
+	if len(codexSources) != 1 {
+		t.Fatalf("codex quota sources = %d: %#v", len(codexSources), report.QuotaTelemetrySources)
+	}
+	for _, snapshot := range codexSnapshots {
+		if err := ValidateQuotaSnapshot(codexSources[0], snapshot); err != nil {
+			t.Fatalf("ValidateQuotaSnapshot(%s): %v\n%#v", snapshot.ProviderQuantityName, err, snapshot)
+		}
+	}
 	byName := map[string]QuotaSnapshot{}
 	for _, snapshot := range codexSnapshots {
 		byName[snapshot.ProviderQuantityName+"|"+string(snapshot.WindowKind)+"|"+snapshot.ScopeKey] = snapshot
@@ -159,6 +169,9 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 	if weekly.ResetAt != formatTime(time.Unix(resetWeek, 0)) || weekly.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) {
 		t.Fatalf("weekly snapshot = %#v", weekly)
 	}
+	if weekly.WindowStart != formatTime(time.Unix(resetWeek, 0).Add(-7*24*time.Hour)) || weekly.WindowEnd != formatTime(time.Unix(resetWeek, 0)) || weekly.ResetSemantics != ResetWindowBoundary {
+		t.Fatalf("weekly fixed boundary fields = %#v", weekly)
+	}
 	credits := byName["credits_balance|unbounded|provider:codex/account:acct_fixture/scope:codex/detail:credits"]
 	if credits.QuantityKind != QuantityProviderDefined || credits.RemainingValue == nil || *credits.RemainingValue != 4275 || credits.ValueScale != 2 {
 		t.Fatalf("credits snapshot = %#v", credits)
@@ -170,6 +183,36 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 	resetCredits := byName["rate_limit_reset_credits|unbounded|provider:codex/account:acct_fixture/scope:default/detail:reset_credits"]
 	if resetCredits.RemainingValue == nil || *resetCredits.RemainingValue != 2 || resetCredits.ValidUntil != formatTime(time.Unix(resetCreditExpiry, 0)) {
 		t.Fatalf("reset credits snapshot = %#v", resetCredits)
+	}
+
+	storePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	if err := Refresh(context.Background(), store, report, fixedInventoryNow()); err != nil {
+		store.Close()
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close store: %v", err)
+	}
+	reopened, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open reopened: %v", err)
+	}
+	defer reopened.Close()
+	loaded, err := Load(context.Background(), reopened)
+	if err != nil {
+		t.Fatalf("Load reopened: %v", err)
+	}
+	loadedFive := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowRolling, defaultPrimaryScope)
+	if loadedFive.RollingDurationMS != int64((5*time.Hour).Milliseconds()) || loadedFive.ResetAt != formatTime(time.Unix(resetFiveHour, 0)) || loadedFive.ResetSemantics != ResetRolling || loadedFive.WindowStart != "" || loadedFive.WindowEnd != "" {
+		t.Fatalf("loaded five-hour fields = %#v", loadedFive)
+	}
+	loadedWeekly := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowFixedWeek, "provider:codex/account:acct_fixture/scope:codex/detail:secondary")
+	if loadedWeekly.WindowStart != formatTime(time.Unix(resetWeek, 0).Add(-7*24*time.Hour)) || loadedWeekly.WindowEnd != formatTime(time.Unix(resetWeek, 0)) || loadedWeekly.ResetAt != formatTime(time.Unix(resetWeek, 0)) || loadedWeekly.ResetSemantics != ResetWindowBoundary || loadedWeekly.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) {
+		t.Fatalf("loaded weekly fields = %#v", loadedWeekly)
 	}
 }
 
@@ -187,6 +230,109 @@ func TestCodexQuotaAbsentFieldsRemainUnknown(t *testing.T) {
 	}
 	if !containsString(got.GapReasons, "missing-used-percent") || !containsString(got.GapReasons, "missing-reset-at") {
 		t.Fatalf("gap reasons = %#v, want missing fields", got.GapReasons)
+	}
+}
+
+func TestCodexQuotaInvalidWindowInputsPersistAsNonFixed(t *testing.T) {
+	exe := writeFakeCodex(t)
+	now := fixedInventoryNow()
+	weekReset := now.Add(7 * 24 * time.Hour).Unix()
+	overflowMinutes := int64(1<<63-1)/int64(time.Minute) + 1
+	stdout := codexQuotaFramesReordered(t,
+		map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"type": "chatgpt", "planType": "pro", "id": "acct_mixed"}},
+		map[string]any{
+			"rateLimits": map[string]any{
+				"limitId":   "codex",
+				"primary":   map[string]any{"usedPercent": 30, "windowDurationMins": 10080, "resetsAt": weekReset},
+				"secondary": map[string]any{"usedPercent": 40, "windowDurationMins": 0, "resetsAt": weekReset},
+			},
+			"rateLimitsByLimitId": map[string]any{
+				"negative": map[string]any{
+					"limitId": "negative",
+					"primary": map[string]any{"usedPercent": 50, "windowDurationMins": -5, "resetsAt": weekReset},
+				},
+				"noreset": map[string]any{
+					"limitId": "noreset",
+					"primary": map[string]any{"usedPercent": 60, "windowDurationMins": 10080},
+				},
+				"overflow": map[string]any{
+					"limitId": "overflow",
+					"primary": map[string]any{"usedPercent": 70, "windowDurationMins": overflowMinutes, "resetsAt": weekReset},
+				},
+				"outofrange": map[string]any{
+					"limitId": "outofrange",
+					"primary": map[string]any{"usedPercent": 80, "windowDurationMins": 10080, "resetsAt": int64(1 << 62)},
+				},
+			},
+		},
+	)
+	deps := codexQuotaDeps(t, exe, "codex 0.9.0", CodexAppServerResult{Stdout: stdout, ExitCode: 0}, nil)
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Now:    fixedInventoryNow,
+		NetworkGrants: []NetworkGrant{{
+			ProviderID: "codex",
+			Purpose:    NetworkPurposeQuotaTelemetry,
+			Scope:      NetworkScopeMachineInventory,
+		}},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	codexSources := quotaSourcesFor(report, "codex")
+	if len(codexSources) != 1 {
+		t.Fatalf("codex quota sources = %d: %#v", len(codexSources), report.QuotaTelemetrySources)
+	}
+	for _, snapshot := range quotaSnapshotsFor(report, "codex") {
+		if err := ValidateQuotaSnapshot(codexSources[0], snapshot); err != nil {
+			t.Fatalf("ValidateQuotaSnapshot(%s %s): %v\n%#v", snapshot.ScopeKey, snapshot.WindowKind, err, snapshot)
+		}
+	}
+	storePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	store, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	if err := Refresh(context.Background(), store, report, fixedInventoryNow()); err != nil {
+		store.Close()
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close store: %v", err)
+	}
+	reopened, err := storage.Open(context.Background(), storage.Options{Path: storePath, Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open reopened: %v", err)
+	}
+	defer reopened.Close()
+	loaded, err := Load(context.Background(), reopened)
+	if err != nil {
+		t.Fatalf("Load reopened: %v", err)
+	}
+
+	validWeekly := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowFixedWeek, "provider:codex/account:acct_mixed/scope:codex/detail:primary")
+	if validWeekly.WindowStart != formatTime(time.Unix(weekReset, 0).Add(-7*24*time.Hour)) || validWeekly.WindowEnd != formatTime(time.Unix(weekReset, 0)) {
+		t.Fatalf("valid weekly fields = %#v", validWeekly)
+	}
+	noReset := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct_mixed/scope:noreset/detail:primary")
+	if noReset.WindowStart != "" || noReset.WindowEnd != "" || noReset.ResetAt != "" || noReset.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) || !containsString(noReset.GapReasons, "missing-reset-at") {
+		t.Fatalf("no-reset weekly fields = %#v", noReset)
+	}
+	zero := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:codex/detail:secondary")
+	if zero.RollingDurationMS != 0 || zero.WindowStart != "" || zero.WindowEnd != "" || !containsString(zero.GapReasons, "invalid-window-duration") {
+		t.Fatalf("zero-duration fields = %#v", zero)
+	}
+	negative := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:negative/detail:primary")
+	if negative.RollingDurationMS != 0 || !containsString(negative.GapReasons, "invalid-window-duration") {
+		t.Fatalf("negative-duration fields = %#v", negative)
+	}
+	overflow := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:overflow/detail:primary")
+	if overflow.RollingDurationMS != 0 || !containsString(overflow.GapReasons, "invalid-window-duration") {
+		t.Fatalf("overflow-duration fields = %#v", overflow)
+	}
+	outOfRange := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct_mixed/scope:outofrange/detail:primary")
+	if outOfRange.WindowStart != "" || outOfRange.WindowEnd != "" || outOfRange.ResetAt != "" || !containsString(outOfRange.GapReasons, "invalid-reset-at") {
+		t.Fatalf("out-of-range reset fields = %#v", outOfRange)
 	}
 }
 
@@ -659,6 +805,17 @@ func codexQuotaFrames(t *testing.T, account, limits map[string]any) string {
 	}, "\n") + "\n"
 }
 
+func codexQuotaFramesReordered(t *testing.T, account, limits map[string]any) string {
+	t.Helper()
+	return strings.Join([]string{
+		codexQuotaJSONL(t, jsonRPCMessage{Method: "codex/notice", Params: map[string]any{"ignored": true}}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Result: mustRawJSON(t, map[string]any{"codexHome": "/tmp/codex", "platformFamily": "unix", "platformOs": "linux", "userAgent": "codex-test"})}),
+		codexQuotaJSONL(t, jsonRPCMessage{Method: "account/rate_limits/updated", Params: map[string]any{"ignored": true}}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 3, Result: mustRawJSON(t, limits)}),
+		codexQuotaJSONL(t, jsonRPCMessage{ID: 2, Result: mustRawJSON(t, account)}),
+	}, "\n") + "\n"
+}
+
 func codexQuotaRPCErrorFrames(t *testing.T) string {
 	t.Helper()
 	return strings.Join([]string{
@@ -730,6 +887,17 @@ func quotaSourcesFor(report Report, adapterID string) []QuotaTelemetrySource {
 		}
 	}
 	return sources
+}
+
+func quotaSnapshotByKey(t *testing.T, report Report, providerName string, windowKind WindowKind, scope string) QuotaSnapshot {
+	t.Helper()
+	for _, snapshot := range report.QuotaSnapshots {
+		if snapshot.ProviderQuantityName == providerName && snapshot.WindowKind == windowKind && snapshot.ScopeKey == scope {
+			return snapshot
+		}
+	}
+	t.Fatalf("quota snapshot %s/%s/%s missing in %#v", providerName, windowKind, scope, report.QuotaSnapshots)
+	return QuotaSnapshot{}
 }
 
 func sameStrings(a, b []string) bool {

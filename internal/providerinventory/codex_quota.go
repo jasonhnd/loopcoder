@@ -676,8 +676,23 @@ func snapshotsFromCodexRateLimitSnapshot(source QuotaTelemetrySource, installati
 }
 
 func codexWindowSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope, scopeLabel, windowName string, window *codexRateLimitWindow, rawHash string, now time.Time) QuotaSnapshot {
-	windowKind, rolling := codexWindowKindFromDuration(window.WindowDurationMins)
-	resetAt := codexUnixSecondsTime(window.ResetsAt)
+	durationMS, durationOK := codexWindowDurationMS(window.WindowDurationMins)
+	resetTime, resetAt, resetOK := codexUnixSecondsTimestamp(window.ResetsAt)
+	windowKind := codexWindowKindFromDuration(window.WindowDurationMins, resetOK)
+	windowStart := ""
+	windowEnd := ""
+	invalidBoundary := false
+	if fixedQuotaWindow(windowKind) && durationOK {
+		duration := time.Duration(durationMS) * time.Millisecond
+		windowStart = codexFormatParseableTime(resetTime.Add(-duration))
+		windowEnd = resetAt
+		if windowStart == "" || windowEnd == "" {
+			windowKind = WindowProviderDefined
+			windowStart = ""
+			windowEnd = ""
+			invalidBoundary = true
+		}
+	}
 	used, usedOK := boundedPercent(window.UsedPercent)
 	var remaining *int64
 	remainingConfidence := ConfidenceUnknown
@@ -692,6 +707,10 @@ func codexWindowSnapshot(source QuotaTelemetrySource, installationID *string, cl
 	}
 	if window.WindowDurationMins == nil {
 		gaps = append(gaps, "missing-window-duration")
+	} else if !durationOK {
+		gaps = append(gaps, "invalid-window-duration")
+	} else if invalidBoundary {
+		gaps = append(gaps, "invalid-window-boundary")
 	}
 	fieldConf := map[string]Confidence{
 		"limit_value":     ConfidenceUnknown,
@@ -705,7 +724,11 @@ func codexWindowSnapshot(source QuotaTelemetrySource, installationID *string, cl
 	if resetAt != "" {
 		fieldConf["reset_at"] = ConfidenceExact
 	} else {
-		gaps = append(gaps, "missing-reset-at")
+		if window.ResetsAt == nil {
+			gaps = append(gaps, "missing-reset-at")
+		} else {
+			gaps = append(gaps, "invalid-reset-at")
+		}
 	}
 	confidence := ConfidenceExact
 	if !usedOK && resetAt == "" && window.WindowDurationMins == nil {
@@ -726,7 +749,9 @@ func codexWindowSnapshot(source QuotaTelemetrySource, installationID *string, cl
 		ProviderQuantityName:   providerName,
 		Unit:                   "percent",
 		WindowKind:             windowKind,
-		RollingDurationMS:      rolling,
+		WindowStart:            windowStart,
+		WindowEnd:              windowEnd,
+		RollingDurationMS:      durationMS,
 		ResetAt:                resetAt,
 		ResetSemantics:         codexResetSemantics(resetAt, windowKind),
 		UsedValue:              used,
@@ -879,26 +904,64 @@ func codexIndividualLimitSnapshot(source QuotaTelemetrySource, installationID *s
 	})
 }
 
-func codexWindowKindFromDuration(minutes *int64) (WindowKind, int64) {
-	if minutes == nil || *minutes <= 0 {
-		return WindowUnknown, 0
+func codexWindowKindFromDuration(minutes *int64, hasReset bool) WindowKind {
+	if _, ok := codexWindowDurationMS(minutes); !ok {
+		return WindowUnknown
 	}
-	duration := time.Duration(*minutes) * time.Minute
 	switch *minutes {
 	case 300:
-		return WindowRolling, int64(duration.Milliseconds())
+		return WindowRolling
 	case 10080:
-		return WindowFixedWeek, int64(duration.Milliseconds())
+		if hasReset {
+			return WindowFixedWeek
+		}
+		return WindowProviderDefined
 	default:
-		return WindowProviderDefined, int64(duration.Milliseconds())
+		return WindowProviderDefined
 	}
 }
 
 func codexUnixSecondsTime(value *int64) string {
-	if value == nil || *value <= 0 {
+	_, formatted, ok := codexUnixSecondsTimestamp(value)
+	if !ok {
 		return ""
 	}
-	return formatTime(time.Unix(*value, 0))
+	return formatted
+}
+
+func codexWindowDurationMS(minutes *int64) (int64, bool) {
+	if minutes == nil || *minutes <= 0 {
+		return 0, false
+	}
+	const maxDurationMinutes = int64(1<<63-1) / int64(time.Minute)
+	if *minutes > maxDurationMinutes {
+		return 0, false
+	}
+	return int64((time.Duration(*minutes) * time.Minute).Milliseconds()), true
+}
+
+func codexUnixSecondsTimestamp(value *int64) (time.Time, string, bool) {
+	if value == nil || *value <= 0 {
+		return time.Time{}, "", false
+	}
+	t := time.Unix(*value, 0).UTC()
+	formatted := codexFormatParseableTime(t)
+	if formatted == "" {
+		return time.Time{}, "", false
+	}
+	return t, formatted, true
+}
+
+func codexFormatParseableTime(t time.Time) string {
+	formatted := formatTime(t)
+	if _, err := time.Parse(time.RFC3339Nano, formatted); err != nil {
+		return ""
+	}
+	return formatted
+}
+
+func fixedQuotaWindow(kind WindowKind) bool {
+	return kind == WindowFixedHour || kind == WindowFixedDay || kind == WindowFixedWeek
 }
 
 func boundedPercent(value *int64) (*int64, bool) {
@@ -988,6 +1051,9 @@ func codexResetSemantics(resetAt string, windowKind WindowKind) ResetSemantics {
 	}
 	if windowKind == WindowRolling {
 		return ResetRolling
+	}
+	if fixedQuotaWindow(windowKind) {
+		return ResetWindowBoundary
 	}
 	return ResetProviderDefined
 }
