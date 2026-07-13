@@ -1563,6 +1563,22 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if len(report.Installations) == 0 {
 		fmt.Fprintln(stdout, "- no provider CLI installations discovered")
 	}
+	for _, probe := range report.ProbeResults {
+		if probe.ProbeKind != "install" || probe.Outcome != providerinventory.OutcomeNotInstalled {
+			continue
+		}
+		executableName := strings.TrimSpace(probe.Source.ExecutableName)
+		if executableName == "" {
+			executableName = "provider-cli"
+		}
+		fmt.Fprintf(stdout, "- %s %s state=not-installed confidence=%s freshness=%s gaps=%s\n",
+			probe.AdapterID,
+			executableName,
+			probe.Confidence,
+			probe.FreshnessState,
+			strings.Join(probe.GapReasons, ","),
+		)
+	}
 	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
 	return 0
 }

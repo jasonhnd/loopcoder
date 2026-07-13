@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,17 +25,20 @@ func TestStaticCatalogSnapshotPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
-	if len(report.ModelCatalogSnapshots) < 4 {
-		t.Fatalf("model catalog snapshots = %d, want at least four provider static snapshots", len(report.ModelCatalogSnapshots))
+	if len(report.ModelCatalogSnapshots) < 5 {
+		t.Fatalf("model catalog snapshots = %d, want at least five provider static snapshots", len(report.ModelCatalogSnapshots))
 	}
 	seenSnapshot := map[string]bool{}
 	for _, snapshot := range report.ModelCatalogSnapshots {
+		if snapshot.CatalogSourceKind != CatalogSourceAdapterDeclared {
+			continue
+		}
 		seenSnapshot[snapshot.AdapterID] = true
-		if snapshot.CatalogSourceKind != CatalogSourceAdapterDeclared || snapshot.InventoryFingerprint == "" {
+		if snapshot.InventoryFingerprint == "" {
 			t.Fatalf("snapshot missing static provenance/fingerprint: %#v", snapshot)
 		}
 	}
-	for _, provider := range []string{"antigravity", "claude", "codex", "gemini"} {
+	for _, provider := range []string{"antigravity", "claude", "codex", "gemini", "grok"} {
 		if !seenSnapshot[provider] {
 			t.Fatalf("missing static catalog snapshot for %s in %#v", provider, report.ModelCatalogSnapshots)
 		}
@@ -49,8 +53,8 @@ func TestStaticCatalogSnapshotPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(loaded.ModelCatalogSnapshots) != len(report.ModelCatalogSnapshots) || len(loaded.ModelCapabilities) != len(report.ModelCapabilities) {
-		t.Fatalf("loaded catalog counts = %d/%d, want %d/%d", len(loaded.ModelCatalogSnapshots), len(loaded.ModelCapabilities), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities))
+	if len(loaded.ModelCatalogSnapshots) < len(seenSnapshot) || len(loaded.ModelCapabilities) != len(report.ModelCapabilities) {
+		t.Fatalf("loaded catalog counts = %d/%d, want at least %d snapshots and %d capabilities", len(loaded.ModelCatalogSnapshots), len(loaded.ModelCapabilities), len(seenSnapshot), len(report.ModelCapabilities))
 	}
 	for _, capability := range loaded.ModelCapabilities {
 		if capability.ModelCatalogSnapshotID == "" || capability.ModelCapabilityID == "" || len(capability.EntrySources) == 0 {
@@ -191,6 +195,234 @@ func TestNetworkDeclaredCatalogListingSkippedByDefault(t *testing.T) {
 	}
 	if !seenCodexCapability {
 		t.Fatalf("network-declared catalog skip removed unrelated static catalog capabilities: %#v", report.ModelCapabilities)
+	}
+}
+
+func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	accessKeyCanary := "AKIA" + strings.Repeat("A", 16)
+	tokenCanary := "xai_token=" + strings.Repeat("b", 24)
+	unrelatedCanary := "unrelated-" + strings.Repeat("c", 16)
+
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return dir
+		case "XAI_API_KEY":
+			return accessKeyCanary
+		case "UNRELATED_SECRET_VALUE":
+			return unrelatedCanary
+		default:
+			return ""
+		}
+	}
+	var sawVersion, sawModels bool
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		for _, env := range req.Env {
+			if strings.Contains(env, accessKeyCanary) || strings.Contains(env, unrelatedCanary) || strings.Contains(env, "XAI_API_KEY") || strings.Contains(env, "UNRELATED_SECRET_VALUE") {
+				t.Fatalf("secret or unrelated env reached grok probe: %q", env)
+			}
+		}
+		joined := strings.Join(req.Argv, " ")
+		for _, forbidden := range []string{"login", "update", "inspect", "plugin", "-p", "--prompt"} {
+			if strings.Contains(joined, forbidden) {
+				t.Fatalf("grok probe used forbidden argv %q in %#v", forbidden, req.Argv)
+			}
+		}
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			sawVersion = true
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			sawModels = true
+			return ProbeExecutionResult{
+				Stdout:   `{"models":[{"id":"grok-4.5","name":"Grok 4.5","aliases":["grok-build","default"]},{"id":"openai-main/gpt-5.4","name":"GPT 5.4","alias":"tfy-gpt","provider":"openai","base_url":"https://gateway.example.test/v1","custom":true}]}`,
+				Stderr:   tokenCanary,
+				ExitCode: 0,
+			}, nil
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !sawVersion || !sawModels {
+		t.Fatalf("probe coverage version=%v models=%v", sawVersion, sawModels)
+	}
+	installation := installationForAdapter(t, report, "grok")
+	if installation.InstallationState != InstallationInstalled || installation.Version != "grok 0.1.211" {
+		t.Fatalf("grok installation = %#v", installation)
+	}
+	readiness := latestAuthReadinessFor(t, report, "grok")
+	if readiness.ReadinessState != ReadinessReady || readiness.EvidenceKind != EvidenceStatusCommand || !contains(readiness.GapReasons, "authorization-scope-unknown") {
+		t.Fatalf("grok readiness = %#v", readiness)
+	}
+	xai := capabilityForAdapterModel(t, report, "grok", "grok-4.5")
+	if len(xai.Aliases) != 2 || xai.EntrySources[0].SourceReference != "grok-models:xai" {
+		t.Fatalf("xai capability aliases/source = %#v", xai)
+	}
+	custom := capabilityForAdapterModel(t, report, "grok", "openai-main/gpt-5.4")
+	if len(custom.EntrySources) == 0 || custom.EntrySources[0].SourceReference != "grok-models:custom:openai" || !contains(custom.Constraints, "provider_attribution=custom-non-xai:openai") {
+		t.Fatalf("custom capability attribution = %#v", custom)
+	}
+	catalogProbe := findProbe(t, report, "grok", "catalog")
+	if catalogProbe.Outcome != OutcomeInstalled || catalogProbe.ParsedFields["model_count"] != "2" || catalogProbe.SecretFindingCount == 0 {
+		t.Fatalf("catalog probe = %#v", catalogProbe)
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal report: %v", err)
+	}
+	for _, forbidden := range []string{accessKeyCanary, tokenCanary, unrelatedCanary} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("provider inventory persisted secret canary %q in %s", forbidden, payload)
+		}
+	}
+}
+
+func TestDiscoverGrokBuildNotInstalledDoesNotRunProbe(t *testing.T) {
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(string) string { return "" }
+	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
+		t.Fatal("RunProbe called for absent grok executable")
+		return ProbeExecutionResult{}, nil
+	}
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	for _, installation := range report.Installations {
+		if installation.AdapterID == "grok" {
+			t.Fatalf("grok installation discovered on empty PATH: %#v", installation)
+		}
+	}
+	probe := findProbe(t, report, "grok", "install")
+	if probe.Outcome != OutcomeNotInstalled || probe.ProbeMethod != ProbeMethodLookPath || !contains(probe.GapReasons, "executable-not-found") {
+		t.Fatalf("absent grok probe = %#v", probe)
+	}
+}
+
+func TestDiscoverGrokBuildFailureBranches(t *testing.T) {
+	tests := []struct {
+		name            string
+		versionStdout   string
+		modelsStdout    string
+		modelsExitCode  int
+		modelsTimedOut  bool
+		wantInstall     InstallationState
+		wantInstallCode string
+		wantCatalogCode string
+		wantCatalogGap  string
+		wantModelsCall  bool
+	}{
+		{
+			name:            "unsupported old version",
+			versionStdout:   "grok 0.0.9\n",
+			wantInstall:     InstallationInstalledUnusable,
+			wantInstallCode: "ErrUnsupportedVersion",
+			wantCatalogCode: "ErrUnsupportedVersion",
+			wantCatalogGap:  "installation-not-usable",
+		},
+		{
+			name:            "malformed version output",
+			versionStdout:   "definitely not a grok build version\n",
+			wantInstall:     InstallationInstalledUnusable,
+			wantInstallCode: "ErrProbeUnparseableVersion",
+			wantCatalogCode: "ErrProbeUnparseableVersion",
+			wantCatalogGap:  "installation-not-usable",
+		},
+		{
+			name:            "malformed catalog",
+			versionStdout:   "grok 0.1.211\n",
+			modelsStdout:    "{malformed",
+			wantInstall:     InstallationInstalled,
+			wantCatalogCode: "ErrCatalogMalformedOutput",
+			wantCatalogGap:  "catalog-output-malformed",
+			wantModelsCall:  true,
+		},
+		{
+			name:            "network unavailable",
+			versionStdout:   "grok 0.1.211\n",
+			modelsStdout:    "network timeout connecting to cli-chat-proxy.grok.com",
+			modelsExitCode:  1,
+			wantInstall:     InstallationInstalled,
+			wantCatalogCode: "ErrCatalogNetworkUnavailable",
+			wantCatalogGap:  "catalog-network-unavailable",
+			wantModelsCall:  true,
+		},
+		{
+			name:            "timeout",
+			versionStdout:   "grok 0.1.211\n",
+			modelsTimedOut:  true,
+			wantInstall:     InstallationInstalled,
+			wantCatalogCode: "ErrCatalogProbeTimeout",
+			wantCatalogGap:  "catalog-probe-timeout",
+			wantModelsCall:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			exe := filepath.Join(dir, executableName("grok"))
+			writeExecutable(t, exe)
+			deps := fakeDeps(t, nil)
+			deps.Getenv = func(key string) string {
+				if key == "PATH" {
+					return dir
+				}
+				return ""
+			}
+			modelsCalls := 0
+			deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+				switch {
+				case len(req.Argv) == 2 && req.Argv[1] == "version":
+					return ProbeExecutionResult{Stdout: tt.versionStdout, ExitCode: 0}, nil
+				case len(req.Argv) == 2 && req.Argv[1] == "models":
+					modelsCalls++
+					if tt.modelsTimedOut {
+						return ProbeExecutionResult{TimedOut: true, Killed: true, ExitCode: -1}, nil
+					}
+					return ProbeExecutionResult{Stdout: tt.modelsStdout, ExitCode: tt.modelsExitCode}, nil
+				default:
+					t.Fatalf("unexpected probe argv: %#v", req.Argv)
+					return ProbeExecutionResult{ExitCode: 2}, nil
+				}
+			}
+			report, err := Discover(context.Background(), Options{
+				Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+				Now:    fixedInventoryNow,
+			}, deps)
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			installation := installationForAdapter(t, report, "grok")
+			if installation.InstallationState != tt.wantInstall || installation.TerminalErrorCode != tt.wantInstallCode {
+				t.Fatalf("installation = %#v", installation)
+			}
+			if tt.wantModelsCall && modelsCalls == 0 {
+				t.Fatal("grok models was not called")
+			}
+			if !tt.wantModelsCall && modelsCalls != 0 {
+				t.Fatalf("grok models calls = %d, want zero", modelsCalls)
+			}
+			catalogProbe := findProbe(t, report, "grok", "catalog")
+			if catalogProbe.TerminalErrorCode != tt.wantCatalogCode || !contains(catalogProbe.GapReasons, tt.wantCatalogGap) {
+				t.Fatalf("catalog probe = %#v, want code=%s gap=%s", catalogProbe, tt.wantCatalogCode, tt.wantCatalogGap)
+			}
+		})
 	}
 }
 

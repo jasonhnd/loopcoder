@@ -225,6 +225,67 @@ func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
 	}
 }
 
+func TestProvidersRefreshTextRendersNotInstalledProbe(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	report := providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now.Format(time.RFC3339),
+		InventoryFingerprint:  "sha256:test",
+		Confidence:            providerinventory.ConfidenceUnavailable,
+		Installations:         []providerinventory.ProviderInstallation{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		ProbeResults: []providerinventory.ProbeResult{{
+			SchemaVersion:        providerinventory.ProbeResultSchema,
+			RecordVersion:        1,
+			ProbeResultID:        "probe_grok_absent",
+			AdapterID:            "grok",
+			ProbeKind:            "install",
+			ProbeMethod:          providerinventory.ProbeMethodLookPath,
+			Outcome:              providerinventory.OutcomeNotInstalled,
+			Confidence:           providerinventory.ConfidenceUnavailable,
+			FreshnessState:       providerinventory.FreshnessNotApplicable,
+			NetworkPermission:    providerinventory.NetworkNotNeeded,
+			Source:               providerinventory.SourceDescriptor{Kind: "path-lookup", AdapterID: "grok", ExecutableName: "grok"},
+			Evidence:             providerinventory.EvidenceSummary{Kind: "declared-executable-not-found", CommandBounded: true, NoShell: true},
+			GapReasons:           []string{"executable-not-found"},
+			EnvironmentKeys:      []string{},
+			CreatedAt:            now.Format(time.RFC3339),
+			UpdatedAt:            now.Format(time.RFC3339),
+			CapturedAt:           now.Format(time.RFC3339),
+			PolicyVersion:        providerinventory.PolicyVersion,
+			SideEffectClass:      "local-read",
+			Classification:       "provider-output-untrusted",
+			AdapterDeclarationID: "adapter_grok",
+		}},
+		GapReasons: []string{"provider-grok-not-installed"},
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "refresh", "--repo", repo}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderInventory: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			return report, nil
+		},
+		ProviderInventoryRefresh: func(context.Context, providerinventory.Report, time.Time) error {
+			return nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"- no provider CLI installations discovered",
+		"- grok grok state=not-installed confidence=unavailable freshness=not-applicable gaps=executable-not-found",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
 func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	repo := t.TempDir()

@@ -16,7 +16,7 @@ func TestDefaultContractInvariants(t *testing.T) {
 }
 
 func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
-	if got, want := runtimecap.ProviderNames(), []string{"antigravity", "claude", "codex", "gemini"}; !reflect.DeepEqual(got, want) {
+	if got, want := runtimecap.ProviderNames(), []string{"antigravity", "claude", "codex", "gemini", "grok"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ProviderNames = %#v, want %#v", got, want)
 	}
 
@@ -32,6 +32,7 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 		{provider: "claude", executable: "claude", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "gemini", executable: "gemini", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "antigravity", executable: "agy", readOnly: false, mcp: false, json: false, usage: false},
+		{provider: "grok", executable: "grok", readOnly: false, mcp: false, json: false, usage: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -80,6 +81,12 @@ func TestDefaultContractDeclaresCredentialBlindAuthReadiness(t *testing.T) {
 			parser:   "agy-models",
 			network:  true,
 		},
+		{
+			provider: "grok",
+			command:  []string{"grok", "models"},
+			parser:   "grok-models",
+			envNames: []string{"XAI_API_KEY"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -116,6 +123,16 @@ func TestDefaultContractDeclaresCatalogProbeProvenance(t *testing.T) {
 	}
 	if antigravity.CatalogProbeParser != "agy-models" || !antigravity.CatalogProbeMayNetwork {
 		t.Fatalf("catalog probe declaration = %#v, want agy-models network declared", antigravity)
+	}
+	grok, ok := runtimecap.LookupProvider("grok")
+	if !ok {
+		t.Fatal("LookupProvider(\"grok\") returned false")
+	}
+	if !reflect.DeepEqual(grok.CatalogProbeCommand, []string{"grok", "models"}) {
+		t.Fatalf("CatalogProbeCommand = %#v, want grok models", grok.CatalogProbeCommand)
+	}
+	if grok.CatalogProbeParser != "grok-models" || grok.CatalogProbeMayNetwork {
+		t.Fatalf("grok catalog probe declaration = %#v, want grok-models without declared network", grok)
 	}
 }
 

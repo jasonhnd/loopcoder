@@ -2428,7 +2428,7 @@ func discoverProviderInventory(ctx context.Context, repoPath string, cfg config.
 		Name:    "provider inventory",
 		Code:    "provider_inventory_refreshed",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d quota source declaration(s), and %d quota snapshot(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.QuotaTelemetrySources), len(report.QuotaSnapshots)),
+		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), %d quota source declaration(s), and %d quota snapshot(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), len(report.QuotaTelemetrySources), len(report.QuotaSnapshots)),
 	}
 }
 
