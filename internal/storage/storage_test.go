@@ -38,6 +38,9 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 			t.Fatalf("missing table %s", table)
 		}
 	}
+	if tableColumnExists(t, store, "routing_decisions", "alternatives_json") {
+		t.Fatalf("routing_decisions includes non-v1 alternatives_json column")
+	}
 }
 
 func TestBudgetReservationIdempotencyIndexScopedByPrimaryPolicy(t *testing.T) {
