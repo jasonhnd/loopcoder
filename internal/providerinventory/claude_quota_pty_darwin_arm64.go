@@ -132,9 +132,9 @@ func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResu
 		case wr = <-waitCh:
 			waitDone = true
 			if !readDone {
-				closeMaster()
 				continue
 			}
+			closeMaster()
 			return claudePTYResultFrom(output, wr, rr, false, killed), claudePTYWaitError(wr)
 		case rr = <-readCh:
 			readDone = true
@@ -152,6 +152,7 @@ func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResu
 			if !waitDone {
 				continue
 			}
+			closeMaster()
 			return claudePTYResultFrom(output, wr, rr, false, killed), claudePTYWaitError(wr)
 		case <-timer.C:
 			killProcessTree()

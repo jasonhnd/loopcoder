@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 )
 
 const claudePTYHelperEnv = "LOOPCODER_CLAUDE_PTY_HELPER"
+const claudePTYTailSentinel = "LOOPCODER_CLAUDE_PTY_TAIL_SENTINEL_END"
 
 func TestRunClaudeUsagePTYUsesRealTerminalSizeAndInteractiveInput(t *testing.T) {
 	req := claudePTYTestRequest(t, "interactive")
@@ -105,6 +107,30 @@ func TestRunClaudeUsagePTYEarlyExitReturnsExitCode(t *testing.T) {
 	}
 }
 
+func TestRunClaudeUsagePTYDrainsTailAfterImmediateExit(t *testing.T) {
+	beforeGoroutines := runtime.NumGoroutine()
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		req := claudePTYTestRequest(t, "tail-sentinel")
+		req.Input = ""
+		req.Timeout = 2 * time.Second
+		result, err := runClaudeUsagePTY(context.Background(), req)
+		if err != nil {
+			t.Fatalf("iteration %d: runClaudeUsagePTY: %v\nresult=%#v", i, err, result)
+		}
+		if result.ExitCode != 0 || result.TimedOut || result.Killed || result.Truncated {
+			t.Fatalf("iteration %d: result = %#v, want clean complete tail capture", i, result)
+		}
+		if !strings.HasSuffix(result.Output, claudePTYTailSentinel) {
+			t.Fatalf("iteration %d: output length %d missing final sentinel %q", i, len(result.Output), claudePTYTailSentinel)
+		}
+		if len(result.Output) <= 4096 {
+			t.Fatalf("iteration %d: output length = %d, want larger than one reader buffer", i, len(result.Output))
+		}
+	}
+	waitForGoroutineCountNear(t, beforeGoroutines, 16)
+}
+
 func TestClaudePTYProductionRunnerHelper(t *testing.T) {
 	mode := os.Getenv(claudePTYHelperEnv)
 	if mode == "" {
@@ -124,6 +150,8 @@ func TestClaudePTYProductionRunnerHelper(t *testing.T) {
 		runClaudePTYFloodHelper()
 	case "early-exit":
 		runClaudePTYEarlyExitHelper()
+	case "tail-sentinel":
+		runClaudePTYTailSentinelHelper()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
@@ -206,6 +234,15 @@ func runClaudePTYEarlyExitHelper() {
 	os.Exit(7)
 }
 
+func runClaudePTYTailSentinelHelper() {
+	payload := strings.Repeat("tail-drain-fixture-0123456789\n", 256) + claudePTYTailSentinel
+	if _, err := os.Stdout.WriteString(payload); err != nil {
+		fmt.Fprintf(os.Stderr, "write tail fixture: %v\n", err)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
 func childPIDFromOutput(t *testing.T, output string) int {
 	t.Helper()
 	match := regexp.MustCompile(`CHILD_PID=(\d+)`).FindStringSubmatch(output)
@@ -237,6 +274,19 @@ func processAlive(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+func waitForGoroutineCountNear(t *testing.T, baseline, tolerance int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline+tolerance {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("goroutine count = %d, want at most %d", runtime.NumGoroutine(), baseline+tolerance)
 }
 
 func sleepForever() {
