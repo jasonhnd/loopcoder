@@ -14,6 +14,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -25,6 +26,7 @@ func TestTickHappyPass(t *testing.T) {
 	repo := t.TempDir()
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
 	var order []string
+	progressRecorder := &recordingProgressRecorder{}
 
 	report, err := Tick(context.Background(), TickOptions{
 		Reader:           cleanRiskReader(77, "README.md"),
@@ -36,6 +38,7 @@ func TestTickHappyPass(t *testing.T) {
 		WorkerProvider:   "codex",
 		VerifierProvider: "claude",
 		RequiredChecks:   []string{"verify"},
+		Progress:         progressRecorder,
 		Clock: func() time.Time {
 			return now
 		},
@@ -120,6 +123,9 @@ func TestTickHappyPass(t *testing.T) {
 	}
 	if !reflect.DeepEqual(order, []string{"compile", "ready-set", "dispatch-wave", "loopreview", "risk-gate", "pre-prod-merge", "state-push"}) {
 		t.Fatalf("call order = %#v", order)
+	}
+	if !progressRecorder.hasKnown(progress.KnownWaitingCI) {
+		t.Fatalf("tick did not emit waiting-for-ci progress observation: %#v", progressRecorder.observations)
 	}
 	if report.Summary.DispatchedPRCount != 1 || report.Summary.ReviewPassCount != 1 || report.Summary.RiskGateCleanCount != 1 || report.Summary.PreProdMergeCount != 1 || report.Summary.FailureCount != 0 {
 		t.Fatalf("summary = %#v", report.Summary)
@@ -1717,4 +1723,37 @@ func (r tickReaderWithoutBranchChecks) PRDiff(ctx context.Context, number int) (
 
 func (r tickReaderWithoutBranchChecks) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) {
 	return r.fake.PRDiffNameOnly(ctx, number)
+}
+
+type recordingProgressRecorder struct {
+	observations []progress.Observation
+}
+
+func (r *recordingProgressRecorder) Emit(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingProgressRecorder) Terminal(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	observation.Terminal = true
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingProgressRecorder) hasKnown(known string) bool {
+	for _, observation := range r.observations {
+		if observation.KnownState == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingProgressRecorder) hasStatus(status string) bool {
+	for _, observation := range r.observations {
+		if observation.Status == status {
+			return true
+		}
+	}
+	return false
 }

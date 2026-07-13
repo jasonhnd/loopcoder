@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -86,6 +87,7 @@ type TickOptions struct {
 	Thresholds             config.ResilienceWorker
 	Budget                 config.GuardrailBudget
 	CircuitBreaker         config.GuardrailCircuitBreaker
+	Progress               progress.Recorder
 	AdditionalRiskRedLines []RiskRedLine
 	ProcessAlive           ProcessAliveFunc
 	Clock                  func() time.Time
@@ -690,6 +692,7 @@ func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *Ti
 		ConfigFromBase:   opts.ConfigFromBase,
 		Budget:           opts.Budget,
 		CircuitBreaker:   opts.CircuitBreaker,
+		Progress:         opts.Progress,
 		Now:              opts.Clock(),
 		Stderr:           opts.Stderr,
 	})
@@ -937,6 +940,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		return
 	}
 
+	emitCIWaitProgress(ctx, opts.Progress, opts.RunID, item.Issue, item.PR, "risk-gate", fmt.Sprintf("pr-%d", prNumber), "waiting for PR checks", false)
 	decision, err := opts.RiskGate(ctx, RiskGateOptions{
 		Reader:             gateReader,
 		PRNumber:           prNumber,
@@ -1082,6 +1086,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 
+	emitCIWaitProgress(ctx, opts.Progress, opts.RunID, item.Issue, item.PR, "pre-prod-health", opts.PreProdBranch, "waiting for pre-prod branch checks", false)
 	branchChecks, err := healthReader.BranchChecks(ctx, opts.PreProdBranch)
 	health := TickPreProdHealthResult{
 		Issue:          item.Issue,

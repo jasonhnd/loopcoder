@@ -55,7 +55,10 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 		now:      deps.Now,
 		warnings: warnings,
 	}
-	emitter.Start(context.Background())
+	if _, err := emitter.Start(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("start progress receipt emitter: %w", err)
+	}
 	return recorder, nil
 }
 

@@ -10,7 +10,6 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/home"
@@ -90,7 +89,7 @@ func runDeliveryPlan(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	defer closeStore()
-	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery plan: progress receipts unavailable: %v\n", err)
 		return 1
@@ -142,7 +141,7 @@ func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	defer closeStore()
-	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery decide: progress receipts unavailable: %v\n", err)
 		return 1
@@ -201,7 +200,7 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		return 1
 	}
 	defer closeStore()
-	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery continue: progress receipts unavailable: %v\n", err)
 		return 1
@@ -278,23 +277,8 @@ func openDeliveryStoreForCLI(ctx context.Context, dbPath string, deps Deps) (sto
 	return store, func() { _ = store.Close() }, nil
 }
 
-func deliveryProgressSupervisorForCLI(store storage.Store, projectID, runID string) (progress.Recorder, func() error, error) {
-	supervisor, err := progress.NewSupervisor(progress.SupervisorOptions{
-		Store:              store,
-		ProjectID:          projectID,
-		DeliveryRunID:      runID,
-		RunID:              runID,
-		MaxSilenceInterval: progress.DefaultMaxSilenceInterval,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	stop := func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return supervisor.Stop(ctx)
-	}
-	return supervisor, stop, nil
+func deliveryProgressSupervisorForCLI(store storage.Store, projectID, runID string, diagnostics io.Writer) (progress.Recorder, func() error, error) {
+	return progressSupervisorForStore(store, projectID, runID, diagnostics)
 }
 
 func renderDeliveryOutput[T any](stdout, stderr io.Writer, format string, value T, text func(io.Writer, T) error) int {

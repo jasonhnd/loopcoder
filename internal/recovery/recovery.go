@@ -19,6 +19,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -86,6 +87,7 @@ type Options struct {
 	VerifierTimeout  time.Duration
 	Budget           config.GuardrailBudget
 	CircuitBreaker   config.GuardrailCircuitBreaker
+	Progress         progress.Recorder
 	Now              time.Time
 	Stderr           io.Writer
 }
@@ -291,6 +293,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	emitRecoveryProgress(ctx, opts, "recovery-started", "", false)
 
 	attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, err := loadRecoverySnapshot(repoPath, opts, deps)
 	if err != nil {
@@ -330,6 +333,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				}, nil
 			}
 		}
+		emitRecoveryProgress(ctx, opts, "recovery-adopted", adopted.URL, true)
 		return Result{
 			Action:    ActionAdopt,
 			Report:    renderAdoptReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, *adopted),
@@ -365,11 +369,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath))
 			}
 			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, blockReason))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", "max attempts reached", true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
 		if blocked, blockedReport := evaluateRecoverGuardrails(repoPath, opts, attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText); blocked {
 			report.WriteString(blockedReport)
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", "guardrail blocked recovery", true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -404,6 +410,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			record.FinishedAt = state.FormatTimestamp(recoverNow(opts))
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
+			emitRecoveryProgress(context.Background(), opts, "recovery-failed", err.Error(), true)
 			return Result{Action: ActionRetry, Report: report.String(), RecoveryAttempts: recoveryAttempts}, err
 		}
 
@@ -442,6 +449,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 					recoveryAttempts = append(recoveryAttempts, record)
 					attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, _ = loadRecoverySnapshot(repoPath, opts, deps)
 					report.WriteString(renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision))
+					emitRecoveryProgress(ctx, opts, "recovery-blocked", "circuit breaker blocked recovery", true)
 					return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 				}
 			}
@@ -460,6 +468,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -473,9 +482,11 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			recoveryAttempts = append(recoveryAttempts, record)
 			data, marshalErr := json.Marshal(dispatchResult)
 			if marshalErr != nil {
+				emitRecoveryProgress(ctx, opts, "recovery-failed", marshalErr.Error(), true)
 				return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, marshalErr
 			}
 			report.WriteString(string(data) + "\n")
+			emitRecoveryProgress(ctx, opts, "recovery-retried", dispatchResult.Status, true)
 			return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -486,6 +497,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 		reviewResult, reviewErr := deps.Review(ctx, loopreview.Options{
@@ -507,6 +519,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewErr.Error()))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", reviewErr.Error(), true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 		switch reviewResult.Verdict.Verdict {
@@ -515,6 +528,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewResultReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewResult))
+			emitRecoveryProgress(ctx, opts, "recovery-succeeded", dispatchResult.PR, true)
 			return Result{Action: ActionSucceeded, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		case loopreview.VerdictFail:
 			record.Status = "failed"
@@ -530,9 +544,82 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 	}
+}
+
+func emitRecoveryProgress(ctx context.Context, opts Options, status, detail string, terminal bool) {
+	if opts.Progress == nil {
+		return
+	}
+	now := recoverNow(opts)
+	known := progress.KnownRecoveryInProgress
+	if terminal {
+		known = progress.KnownTerminal
+		if strings.Contains(status, "blocked") {
+			known = progress.KnownBlocked
+		}
+	}
+	observation := progress.Observation{
+		DeliveryRunID: opts.RunID,
+		RunID:         opts.RunID,
+		TaskID:        fmt.Sprintf("issue-%d", opts.IssueNumber),
+		CorrelationID: fmt.Sprintf("recovery:issue-%d", opts.IssueNumber),
+		Phase:         "recovery",
+		Status:        strings.TrimSpace(status),
+		KnownState:    known,
+		Reason:        progress.ReasonStateChange,
+		TaskCounts:    recoveryProgressCounts(known),
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "recovery-run",
+			RecordID:       fmt.Sprintf("%s:issue-%d", opts.RunID, opts.IssueNumber),
+			Summary:        "recovery state changed",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		OccurredAt: now,
+		Terminal:   terminal,
+	}
+	if detail != "" {
+		observation.NextAction = progress.ActionState{State: "recover", Summary: boundedRecoveryProgressText(detail)}
+		if strings.Contains(status, "blocked") || strings.Contains(status, "failed") {
+			observation.Blocker = progress.ActionState{State: "blocked", Summary: boundedRecoveryProgressText(detail)}
+		}
+	}
+	var err error
+	if terminal {
+		_, err = opts.Progress.Terminal(ctx, observation)
+	} else {
+		_, err = opts.Progress.Emit(ctx, observation)
+	}
+	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
+		progress.ReportDiagnostic(ctx, opts.Progress, observation, err)
+	}
+}
+
+func recoveryProgressCounts(known string) progress.TaskCounts {
+	counts := progress.TaskCounts{Total: 1}
+	switch known {
+	case progress.KnownRecoveryInProgress:
+		counts.Running = 1
+	case progress.KnownBlocked:
+		counts.Blocked = 1
+	case progress.KnownTerminal:
+		counts.Succeeded = 1
+	default:
+		counts.Unknown = 1
+	}
+	return counts
+}
+
+func boundedRecoveryProgressText(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 180 {
+		return value[:180]
+	}
+	return value
 }
 
 func withRecoverDefaults(deps Deps) Deps {

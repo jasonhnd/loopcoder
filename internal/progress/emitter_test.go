@@ -50,17 +50,64 @@ func TestEmitterTwentyMinuteFixtureHonorsMaxSilence(t *testing.T) {
 		t.Fatalf("receipt count = %d, want 5", len(receipts))
 	}
 	for i := 1; i < len(receipts); i++ {
-		prev := mustParseReceiptTime(t, receipts[i-1].OccurredAt)
-		next := mustParseReceiptTime(t, receipts[i].OccurredAt)
+		prev := mustParseReceiptTime(t, receipts[i-1].PersistedAt)
+		next := mustParseReceiptTime(t, receipts[i].PersistedAt)
 		if gap := next.Sub(prev); gap > 5*time.Minute {
-			t.Fatalf("receipt gap %s between %s and %s exceeds policy", gap, receipts[i-1].OccurredAt, receipts[i].OccurredAt)
+			t.Fatalf("receipt persistence gap %s between %s and %s exceeds policy", gap, receipts[i-1].PersistedAt, receipts[i].PersistedAt)
 		}
+	}
+	periodic := 0
+	for _, receipt := range receipts[1:] {
+		if containsString(receipt.GapReasons, "max-generation-silence") {
+			periodic++
+		}
+		if receipt.OccurredAt != receipts[0].OccurredAt {
+			t.Fatalf("periodic occurred_at = %s, want original observation time %s", receipt.OccurredAt, receipts[0].OccurredAt)
+		}
+	}
+	if periodic != 4 {
+		t.Fatalf("periodic max-silence receipts = %d, want 4", periodic)
 	}
 	if !containsString(receipts[len(receipts)-1].GapReasons, "max-generation-silence") {
 		t.Fatalf("last periodic gap reasons = %#v, want max-generation-silence", receipts[len(receipts)-1].GapReasons)
 	}
 	if receipts[len(receipts)-1].Progress.AgeMillis != int64((20 * time.Minute).Milliseconds()) {
 		t.Fatalf("last progress age = %d, want 20 minutes of no meaningful progress", receipts[len(receipts)-1].Progress.AgeMillis)
+	}
+}
+
+func TestSupervisorTickerOutlivesCallerContextUntilOwnerStops(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	clock := newManualClock(fixedTime)
+	store := newClockStore(t, context.Background(), clock)
+	defer store.Close()
+	supervisor, err := NewSupervisor(SupervisorOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	if _, err := supervisor.Emit(callerCtx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	cancelCaller()
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, context.Background(), store, 2)
+	if got := countReceipts(t, context.Background(), store); got != 2 {
+		t.Fatalf("receipt count after caller cancellation = %d, want initial + detached periodic", got)
+	}
+	if err := supervisor.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	clock.Advance(5 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, context.Background(), store); got != 2 {
+		t.Fatalf("receipt count after owner stop = %d, want no further ticker receipts", got)
 	}
 }
 

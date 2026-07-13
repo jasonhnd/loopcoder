@@ -3,13 +3,16 @@ package orchestration
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
@@ -125,6 +128,46 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 		decision.Status = RiskGateStatusNeedsHuman
 	}
 	return decision, nil
+}
+
+func emitCIWaitProgress(ctx context.Context, recorder progress.Recorder, runID string, issue int, pr, phase, recordID, summary string, terminal bool) {
+	if recorder == nil {
+		return
+	}
+	now := time.Now().UTC()
+	taskID := ""
+	if issue > 0 {
+		taskID = fmt.Sprintf("issue-%d", issue)
+	}
+	observation := progress.Observation{
+		DeliveryRunID: runID,
+		RunID:         runID,
+		TaskID:        taskID,
+		CorrelationID: "ci:" + strings.TrimSpace(firstNonEmpty(recordID, pr, runID)),
+		Phase:         strings.TrimSpace(phase),
+		Status:        progress.KnownWaitingCI,
+		KnownState:    progress.KnownWaitingCI,
+		Reason:        progress.ReasonStateChange,
+		TaskCounts:    progress.TaskCounts{Total: 1, Blocked: 1},
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "ci-check-wait",
+			RecordID:       strings.TrimSpace(firstNonEmpty(recordID, pr, runID)),
+			Summary:        strings.TrimSpace(firstNonEmpty(summary, "waiting for CI checks")),
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		OccurredAt: now,
+		Terminal:   terminal,
+	}
+	var err error
+	if terminal {
+		_, err = recorder.Terminal(ctx, observation)
+	} else {
+		_, err = recorder.Emit(ctx, observation)
+	}
+	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
+		progress.ReportDiagnostic(ctx, recorder, observation, err)
+	}
 }
 
 func normalizeRequiredChecks(checks []string) []string {

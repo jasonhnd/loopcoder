@@ -19,6 +19,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -709,6 +710,7 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	repo := t.TempDir()
 	now := nestedTestNow()
 	var order []string
+	recorder := &recordingProgressRecorder{}
 	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
 		RepoPath:         repo,
 		ParentRunID:      "run-20260709T000000Z-wave",
@@ -716,6 +718,7 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 		MaxChildren:      2,
 		Now:              now,
 		Clock:            func() time.Time { return now },
+		Progress:         recorder,
 		Children: []ChildRunPlan{
 			{ID: "second", Issue: 2, Permission: "write", Required: true, DependsOn: []string{"first"}},
 			{ID: "first", Issue: 1, Permission: "write", Required: true},
@@ -733,6 +736,9 @@ func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	}
 	if !reflect.DeepEqual(order, []string{"first", "second"}) {
 		t.Fatalf("execution order = %#v, want dependency order", order)
+	}
+	if !recorder.hasKnown(progress.KnownDeliveryPending) || !recorder.hasKnown(progress.KnownTerminal) || !recorder.hasStatus(NestedStatusWaiting) {
+		t.Fatalf("nested progress observations = %#v", recorder.observations)
 	}
 }
 

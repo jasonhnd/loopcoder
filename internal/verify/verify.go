@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -37,6 +38,7 @@ type Options struct {
 	PRNumber   int
 	Branch     string
 	BaseBranch string
+	Progress   progress.Recorder
 }
 
 type Result struct {
@@ -159,6 +161,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Result {
 		return Result{Summary: summary, ExitCode: 0}
 	}
 	summary.LocalCommandGates = "configured"
+	emitVerifyCIWait(ctx, opts, deps.Now())
 
 	var scratchPath string
 	if scratchPath, err = deps.MkdirTemp("", "loopcoder-verify-local-*"); err != nil {
@@ -202,6 +205,36 @@ func Run(ctx context.Context, opts Options, deps Deps) Result {
 	cleanup()
 
 	return Result{Summary: summary, ExitCode: exitCodeForVerdict(summary.Verdict)}
+}
+
+func emitVerifyCIWait(ctx context.Context, opts Options, at time.Time) {
+	if opts.Progress == nil {
+		return
+	}
+	target := strings.TrimSpace(opts.Branch)
+	if target == "" && opts.PRNumber > 0 {
+		target = fmt.Sprintf("pr-%d", opts.PRNumber)
+	}
+	observation := progress.Observation{
+		RunID:         target,
+		CorrelationID: "verify-local:" + target,
+		Phase:         "verify-local",
+		Status:        progress.KnownWaitingCI,
+		KnownState:    progress.KnownWaitingCI,
+		Reason:        progress.ReasonStateChange,
+		TaskCounts:    progress.TaskCounts{Total: 1, Blocked: 1},
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "local-verification",
+			RecordID:       target,
+			Summary:        "waiting for local verification commands",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		OccurredAt: at.UTC(),
+	}
+	if _, err := opts.Progress.Emit(ctx, observation); err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
+		progress.ReportDiagnostic(ctx, opts.Progress, observation, err)
+	}
 }
 
 func Render(w io.Writer, result Result) error {

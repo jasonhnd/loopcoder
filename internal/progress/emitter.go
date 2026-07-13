@@ -12,10 +12,6 @@ import (
 )
 
 const (
-	DefaultMaxGenerationSilence = 5 * time.Minute
-	MinMaxGenerationSilence     = time.Second
-	MaxMaxGenerationSilence     = time.Hour
-
 	ReasonStateChange          = "state-change"
 	ReasonMaxGenerationSilence = "max-generation-silence"
 	ReasonTerminal             = "terminal"
@@ -41,6 +37,10 @@ const (
 	// rejected so a bad config cannot busy-loop or silently disable receipts.
 	MinMaxSilenceInterval = time.Second
 	MaxMaxSilenceInterval = time.Hour
+
+	DefaultMaxGenerationSilence = DefaultMaxSilenceInterval
+	MinMaxGenerationSilence     = MinMaxSilenceInterval
+	MaxMaxGenerationSilence     = MaxMaxSilenceInterval
 )
 
 var (

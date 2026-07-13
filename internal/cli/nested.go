@@ -277,6 +277,12 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if opts.Provider == nestedTestSubprocessProvider {
 		executor = nestedSubprocessExecutor(opts, deps, warnings)
 	}
+	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, plan.RootRunID, deps.Now, stderr)
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "nested run: progress receipt shutdown: %v\n", err)
+		}
+	}()
 
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
 		RepoPath:         resolvedRepo,
@@ -287,6 +293,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
 		ConcurrencyLimit: plan.MaxConcurrency,
 		MaxDepth:         plan.MaxDepth,
+		Progress:         progressRecorder,
 		Execute:          executor,
 	})
 	if err != nil {
