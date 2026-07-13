@@ -544,6 +544,12 @@ func reconcileHandoffAgentAuthorityTx(ctx context.Context, tx Tx, req HandoffReq
 	if status != HandoffStatusTransferred {
 		record.RegistrationState = AgentStateNeedsHuman
 		record.TerminalErrorCode = string(terminalCode)
+	} else if record.Permission != PermissionReadOnly {
+		var err error
+		record, err = ensureHandoffProviderReceiptOwnershipTx(ctx, tx, req, record, lease)
+		if err != nil {
+			return err
+		}
 	}
 	fingerprint, payloadHash, err := handoffAgentRegistrationFingerprints(record, scope)
 	if err != nil {
@@ -553,10 +559,10 @@ func reconcileHandoffAgentAuthorityTx(ctx context.Context, tx Tx, req HandoffReq
 	record.RegistrationPayloadHash = payloadHash
 	scope.AgentFederationFingerprint = fingerprint
 	result, err := tx.Exec(ctx, `UPDATE agent_registrations
-		SET claim_generation = ?, executor_id = ?, registration_state = ?, agent_federation_fingerprint = ?,
+		SET ownership_lock_ids_json = ?, claim_generation = ?, executor_id = ?, registration_state = ?, agent_federation_fingerprint = ?,
 			registration_payload_hash = ?, terminal_error_code = ?, updated_at = ?, record_version = ?
 		WHERE id = ? AND child_run_id = ?`,
-		record.ClaimGeneration, record.ExecutorID, record.RegistrationState, record.AgentFederationFingerprint,
+		mustJSONList(record.OwnershipLockIDs), record.ClaimGeneration, record.ExecutorID, record.RegistrationState, record.AgentFederationFingerprint,
 		record.RegistrationPayloadHash, record.TerminalErrorCode, record.UpdatedAt, record.RecordVersion,
 		record.ChildAgentID, record.RunID)
 	if err != nil {
@@ -597,6 +603,49 @@ func reconcileHandoffAgentAuthorityTx(ctx context.Context, tx Tx, req HandoffReq
 		return fmt.Errorf("record handoff: fence ownership locks to needs-human: %w", err)
 	}
 	return nil
+}
+
+func ensureHandoffProviderReceiptOwnershipTx(ctx context.Context, tx Tx, req HandoffRequest, record AgentRegistration, lease string) (AgentRegistration, error) {
+	resourceKind := "provider-receipt"
+	resourceKey := canonicalResourceKey(resourceKind, record.RunID)
+	var existingID string
+	err := tx.QueryRow(ctx, `SELECT id FROM agent_ownership_locks
+		WHERE child_agent_id = ? AND run_id = ? AND resource_kind = ? AND resource_key = ?
+			AND state NOT IN (?, ?, ?, ?)
+		ORDER BY id LIMIT 1`,
+		record.ChildAgentID, record.RunID, resourceKind, resourceKey,
+		OwnershipStateReleased, OwnershipStateExpired, OwnershipStateConflict, OwnershipStateNeedsHuman).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return AgentRegistration{}, fmt.Errorf("record handoff: inspect provider receipt ownership: %w", err)
+	}
+	if existingID == "" {
+		lock := AgentOwnershipLock{
+			SchemaVersion:        AgentOwnershipLockSchema,
+			AgentOwnershipLockID: stableID("alock_", record.ProjectID, resourceKind, resourceKey, record.ChildAgentID),
+			ProjectID:            record.ProjectID,
+			DeliveryRunID:        record.DeliveryRunID,
+			ChildAgentID:         record.ChildAgentID,
+			RunID:                record.RunID,
+			ClaimGeneration:      req.SourceClaimGeneration,
+			LockGeneration:       1,
+			ResourceKind:         resourceKind,
+			ResourceKey:          resourceKey,
+			LockMode:             "write",
+			State:                OwnershipStateHeld,
+			LeaseExpiresAt:       lease,
+			HeartbeatAt:          req.RequestedAt,
+			CreatedAt:            req.RequestedAt,
+			UpdatedAt:            req.RequestedAt,
+		}
+		if err := insertOwnershipLockTx(ctx, tx, lock); err != nil {
+			return AgentRegistration{}, fmt.Errorf("record handoff: add provider receipt ownership: %w", err)
+		}
+		existingID = lock.AgentOwnershipLockID
+	}
+	if !stringSetAgent(record.OwnershipLockIDs)[existingID] {
+		record.OwnershipLockIDs = sortedCopyAgent(append(record.OwnershipLockIDs, existingID))
+	}
+	return record, nil
 }
 
 func handoffAgentRegistrationFingerprints(record AgentRegistration, scope AgentScopeGrant) (string, string, error) {

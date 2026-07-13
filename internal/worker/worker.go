@@ -18,11 +18,13 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -103,6 +105,7 @@ type Deps struct {
 	MkdirTemp   func(dir, pattern string) (string, error)
 	RemoveAll   func(path string) error
 	RepoSkills  func(repoPath string, domainSkills config.DomainSkills) (string, error)
+	OpenStore   func(context.Context, storage.Options) (storage.Store, error)
 }
 
 func DefaultDeps() Deps {
@@ -128,6 +131,7 @@ func DefaultDeps() Deps {
 				BudgetBytes:         domainSkills.PromptBudgetBytes,
 			})
 		},
+		OpenStore: storage.Open,
 	}
 }
 
@@ -139,15 +143,17 @@ type dispatchContext struct {
 	github   GitHubClient
 	agentRun agent.Runner
 
-	scratch      string
-	worktreePath string
-	promptPath   string
-	summaryPath  string
-	logPath      string
-	runtimeRoots runtimepath.Roots
-	jobID        string
-	attemptPath  string
-	tracker      *attemptTracker
+	scratch        string
+	worktreePath   string
+	promptPath     string
+	summaryPath    string
+	logPath        string
+	runtimeRoots   runtimepath.Roots
+	ownershipStore storage.Store
+	ownershipLease *storage.AgentOwnershipLease
+	jobID          string
+	attemptPath    string
+	tracker        *attemptTracker
 
 	domainPolicy      domainWorkerPolicy
 	activePhase       string
@@ -306,6 +312,16 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.cleanupStatus = "succeeded"
 	dispatch.failureStatus = "failed"
 
+	if err := acquireWorkerOwnership(ctx, dispatch); err != nil {
+		return err
+	}
+	ownershipPrepared := false
+	defer func() {
+		if !ownershipPrepared {
+			releaseWorkerOwnership(dispatch)
+			closeWorkerOwnershipStore(dispatch)
+		}
+	}()
 	if err := dispatch.deps.Git.FetchOriginBase(ctx, dispatch.repoPath, dispatch.opts.BaseBranch); err != nil {
 		return fmt.Errorf("git fetch origin %s: %w", dispatch.opts.BaseBranch, err)
 	}
@@ -313,10 +329,14 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 		return err
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	ownershipPrepared = true
 	return nil
 }
 
 func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invocation, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agent.Invocation{}, err
+	}
 	dispatch.activePhase = "prompt_written"
 	cfg, err := config.LoadForRepo(ctx, dispatch.repoPath, config.LoadOptions{
 		BaseBranch:     dispatch.opts.BaseBranch,
@@ -379,7 +399,13 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 }
 
 func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.Invocation) (agent.Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agent.Result{}, err
+	}
 	agentResult, agentErr := dispatch.agentRun.Run(ctx, invocation)
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agentResult, err
+	}
 	dispatch.activePhase = "codex_exited"
 	var exitCodePtr *int
 	if agentResult.ExitCode >= 0 {
@@ -391,6 +417,9 @@ func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.I
 }
 
 func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return hungResult(dispatch, agentResult), err
+	}
 	dispatch.failureStatus = "hung"
 	hungErr := workerHungError(dispatch.opts.Provider, agentResult.HungReason, dispatch.logPath)
 	// The deferred failure handler records the "hung" transition (phase +
@@ -427,6 +456,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 		github:       dispatch.github,
 		now:          dispatch.deps.Now,
 		warnings:     dispatch.warnings,
+		validateOwnership: func(ctx context.Context) error {
+			return validateWorkerOwnership(ctx, dispatch)
+		},
 	})
 	if harvestErr != nil {
 		return hungResult(dispatch, agentResult), fmt.Errorf("%s; harvest failed: %w", hungErr, harvestErr)
@@ -466,6 +498,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 }
 
 func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	reportRecord := buildWorkerReport(dispatch.opts, agentResult)
 	reportRecord.Worktree = dispatch.worktreePath
 	dispatch.tracker.setReport(reportRecord)
@@ -485,6 +520,9 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	}
 
 	dispatch.activePhase = "dirty_checked"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	dirty, err := dispatch.deps.Git.StatusPorcelain(ctx, dispatch.worktreePath)
 	if err != nil {
 		return Result{}, fmt.Errorf("git status --porcelain: %w", err)
@@ -494,22 +532,34 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.AddAll(ctx, dispatch.worktreePath); err != nil {
 		return Result{}, fmt.Errorf("git add -A: %w", err)
 	}
 	dispatch.activePhase = "committed"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.Commit(ctx, dispatch.worktreePath, buildCommitMessage(dispatch.opts.IssueTitle, dispatch.opts.IssueNumber)); err != nil {
 		return Result{}, fmt.Errorf("git commit: %w", err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
 	dispatch.activePhase = "pushed"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.PushUpstream(ctx, dispatch.worktreePath, dispatch.opts.Branch); err != nil {
 		return Result{}, fmt.Errorf("git push -u origin %s: %w", dispatch.opts.Branch, err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
 	dispatch.activePhase = "pr_opened"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	body := buildPRBody(dispatch.opts.IssueNumber, summary)
 	prURL, err := dispatch.github.CreatePR(ctx, dispatch.opts.Branch, dispatch.opts.BaseBranch, dispatch.opts.IssueTitle, body)
 	if err != nil {
@@ -578,16 +628,24 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	if dispatch == nil || dispatch.tracker == nil {
 		return
 	}
+	defer closeWorkerOwnershipStore(dispatch)
 	if dispatch.dispatchSucceeded {
-		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
 		if dispatch.opts.KeepWorktree || dispatch.preserveArtifacts {
+			dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
 			reason := dispatch.preserveReason
 			if reason == "" {
 				reason = "keep-worktree requested"
 			}
 			preserveAttemptArtifacts(dispatch, reason, nil)
+			releaseWorkerOwnership(dispatch)
 			return
 		}
+		if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: refused cleanup without active ownership fence for %s: %v\n", dispatch.worktreePath, err)
+			preserveAttemptArtifacts(dispatch, "cleanup ownership refused", []string{err.Error()})
+			return
+		}
+		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
 		if cleanupErr := dispatch.deps.Git.WorktreeRemove(context.Background(), dispatch.repoPath, dispatch.worktreePath); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", dispatch.worktreePath, cleanupErr)
 		}
@@ -597,15 +655,18 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		if cleanupErr := removeOwnedScratch(dispatch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", dispatch.scratch, cleanupErr)
 		}
+		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if failure == nil {
+		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if dispatch.failureStatus == state.StatusFailed {
 		dispatch.failureStatus = state.FailureStatus(failure)
 	}
 	writeRecovery(ctx, dispatch, failure)
+	releaseWorkerOwnership(dispatch)
 }
 
 func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
@@ -789,12 +850,36 @@ func removeOwnedScratch(dispatch *dispatchContext) error {
 	if err := json.Unmarshal(data, &record); err != nil {
 		return fmt.Errorf("parse scratch owner marker: %w", err)
 	}
+	recordScratch, err := pathid.Identity(record.Scratch)
+	if err != nil {
+		return fmt.Errorf("resolve scratch owner marker identity: %w", err)
+	}
+	dispatchScratch, err := pathid.Identity(dispatch.scratch)
+	if err != nil {
+		return fmt.Errorf("resolve scratch identity: %w", err)
+	}
+	repoIdentity, err := pathid.Identity(dispatch.repoPath)
+	if err != nil {
+		return fmt.Errorf("resolve repository identity: %w", err)
+	}
+	if dispatchScratch == repoIdentity {
+		return fmt.Errorf("refusing to remove repository root as scratch directory")
+	}
+	if dispatch.runtimeRoots.Registered {
+		tmpRoot, err := pathid.Identity(dispatch.runtimeRoots.TmpRoot)
+		if err != nil {
+			return fmt.Errorf("resolve registered temp root identity: %w", err)
+		}
+		if !sameOrDescendantPhysicalPath(tmpRoot, dispatchScratch) || tmpRoot == dispatchScratch {
+			return fmt.Errorf("scratch path is outside registered temp root")
+		}
+	}
 	if record.Version != 1 ||
 		record.Issue != dispatch.opts.IssueNumber ||
 		record.Attempt != dispatch.opts.Attempt ||
 		subtle.ConstantTimeCompare([]byte(record.RunID), []byte(dispatch.opts.RunID)) != 1 ||
 		subtle.ConstantTimeCompare([]byte(record.JobID), []byte(dispatch.jobID)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(filepath.Clean(record.Scratch)), []byte(filepath.Clean(dispatch.scratch))) != 1 {
+		subtle.ConstantTimeCompare([]byte(recordScratch), []byte(dispatchScratch)) != 1 {
 		return fmt.Errorf("scratch owner marker does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
 	}
 	return dispatch.deps.RemoveAll(dispatch.scratch)
@@ -891,19 +976,20 @@ func printPreservationManifest(w io.Writer, manifest preservationManifest) {
 }
 
 type hungHarvestOptions struct {
-	repoPath     string
-	runID        string
-	jobID        string
-	worktreePath string
-	logPath      string
-	summaryPath  string
-	opts         Options
-	agentResult  agent.Result
-	errorMessage string
-	git          GitClient
-	github       GitHubClient
-	now          func() time.Time
-	warnings     io.Writer
+	repoPath          string
+	runID             string
+	jobID             string
+	worktreePath      string
+	logPath           string
+	summaryPath       string
+	opts              Options
+	agentResult       agent.Result
+	errorMessage      string
+	git               GitClient
+	github            GitHubClient
+	now               func() time.Time
+	warnings          io.Writer
+	validateOwnership func(context.Context) error
 }
 
 type hungHarvestResult struct {
@@ -916,6 +1002,9 @@ type hungHarvestResult struct {
 }
 
 func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHarvestResult, error) {
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	dirty, err := opts.git.StatusPorcelain(ctx, opts.worktreePath)
 	if err != nil {
 		return nil, fmt.Errorf("git status --porcelain before harvest: %w", err)
@@ -970,11 +1059,20 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		}, nil
 	}
 
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := opts.git.AddAll(ctx, opts.worktreePath); err != nil {
 		return nil, fmt.Errorf("git add -A for harvest: %w", err)
 	}
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := opts.git.Commit(ctx, opts.worktreePath, buildHarvestCommitMessage(opts.opts.IssueTitle, opts.opts.IssueNumber)); err != nil {
 		return nil, fmt.Errorf("git commit harvest: %w", err)
+	}
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
 	}
 	if err := opts.git.PushUpstreamForceWithLease(ctx, opts.worktreePath, harvestBranch); err != nil {
 		return nil, fmt.Errorf("git push --force-with-lease origin %s: %w", harvestBranch, err)
@@ -986,6 +1084,9 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		return nil, fmt.Errorf("validate harvest conductor report: %w", err)
 	}
 	body := buildHarvestPRBody(opts.opts, opts.agentResult, briefText)
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	prURL, err := opts.github.CreatePR(ctx, harvestBranch, opts.opts.BaseBranch, buildHarvestPRTitle(opts.opts.IssueTitle, opts.opts.IssueNumber), body)
 	if err != nil {
 		return nil, fmt.Errorf("gh pr create harvest: %w", err)
@@ -998,6 +1099,13 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		Mode:    "created-pr",
 		Report:  record,
 	}, nil
+}
+
+func validateHarvestOwnership(ctx context.Context, opts hungHarvestOptions) error {
+	if opts.validateOwnership == nil {
+		return nil
+	}
+	return opts.validateOwnership(ctx)
 }
 
 func harvestBranchName(issueNumber, attempt int) string {
@@ -1260,6 +1368,9 @@ func withDefaults(deps Deps) Deps {
 	if deps.RepoSkills == nil {
 		deps.RepoSkills = defaults.RepoSkills
 	}
+	if deps.OpenStore == nil {
+		deps.OpenStore = defaults.OpenStore
+	}
 	return deps
 }
 
@@ -1295,6 +1406,102 @@ func addWorktreeWithLock(ctx context.Context, deps Deps, repoPath, branch, workt
 		return releaseErr
 	}
 	return nil
+}
+
+func acquireWorkerOwnership(ctx context.Context, dispatch *dispatchContext) error {
+	if dispatch == nil || !dispatch.runtimeRoots.Registered {
+		return nil
+	}
+	if dispatch.ownershipLease != nil {
+		return nil
+	}
+	store, err := dispatch.deps.OpenStore(ctx, storage.Options{Path: dispatch.runtimeRoots.DatabasePath, Now: dispatch.deps.Now})
+	if err != nil {
+		return fmt.Errorf("open ownership store: %w", err)
+	}
+	dispatch.ownershipStore = store
+	worktreeIdentity, err := pathid.Identity(dispatch.worktreePath)
+	if err != nil {
+		closeWorkerOwnershipStore(dispatch)
+		return fmt.Errorf("resolve worktree identity: %w", err)
+	}
+	now := dispatch.deps.Now().UTC()
+	leaseDuration := WorkerHardCap
+	if dispatch.opts.Timeout > leaseDuration {
+		leaseDuration = dispatch.opts.Timeout
+	}
+	leaseUntil := now.Add(leaseDuration + 30*time.Minute)
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, store, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     dispatch.runtimeRoots.ProjectID,
+		DeliveryRunID: dispatch.opts.RunID,
+		RunID:         dispatch.opts.RunID,
+		OwnerID:       workerOwnershipOwnerID(dispatch),
+		Now:           now,
+		LeaseUntil:    leaseUntil,
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+			{ResourceKind: "worktree", ResourceKey: worktreeIdentity},
+			{ResourceKind: "git-ref", ResourceKey: dispatch.opts.Branch},
+			{ResourceKind: "runtime-run", ResourceKey: dispatch.opts.RunID},
+		},
+	})
+	if err != nil {
+		closeWorkerOwnershipStore(dispatch)
+		return fmt.Errorf("acquire worker ownership: %w", err)
+	}
+	dispatch.ownershipLease = &lease
+	return nil
+}
+
+func validateWorkerOwnership(ctx context.Context, dispatch *dispatchContext) error {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return nil
+	}
+	if err := storage.ValidateAgentOwnershipFence(ctx, dispatch.ownershipStore, *dispatch.ownershipLease); err != nil {
+		if errors.Is(err, storage.ErrOwnershipStale) {
+			dispatch.failureStatus = "needs-human"
+		}
+		return fmt.Errorf("worker ownership fence: %w", err)
+	}
+	return nil
+}
+
+func releaseWorkerOwnership(dispatch *dispatchContext) {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return
+	}
+	if err := storage.ReleaseAgentOwnershipLease(context.Background(), dispatch.ownershipStore, *dispatch.ownershipLease, dispatch.deps.Now()); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to release ownership lease for %s/%s: %v\n", dispatch.opts.RunID, dispatch.jobID, err)
+		return
+	}
+	dispatch.ownershipLease = nil
+}
+
+func closeWorkerOwnershipStore(dispatch *dispatchContext) {
+	if dispatch == nil || dispatch.ownershipStore == nil {
+		return
+	}
+	if err := dispatch.ownershipStore.Close(); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to close ownership store: %v\n", err)
+	}
+	dispatch.ownershipStore = nil
+}
+
+func workerOwnershipOwnerID(dispatch *dispatchContext) string {
+	if dispatch == nil {
+		return ""
+	}
+	return fmt.Sprintf("worker:%s:%s:%d", strings.TrimSpace(dispatch.opts.RunID), strings.TrimSpace(dispatch.jobID), dispatch.opts.Attempt)
+}
+
+func sameOrDescendantPhysicalPath(root, child string) bool {
+	root = filepath.Clean(root)
+	child = filepath.Clean(child)
+	if root == child {
+		return true
+	}
+	separator := string(filepath.Separator)
+	return strings.HasPrefix(child, strings.TrimSuffix(root, separator)+separator)
 }
 
 type attemptTrackerOptions struct {

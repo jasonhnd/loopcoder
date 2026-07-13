@@ -578,6 +578,9 @@ func claimChildRunExecutionTx(ctx context.Context, tx Tx, parentRunID, childRunI
 		}); err != nil {
 			return ClaimResult{}, err
 		}
+		if err := markAgentRegistrationNeedsHumanForRunTx(ctx, tx, childRunID, now, fmt.Sprintf("expired child execution claim in %s phase requires human recovery", normalizeClaimPhase(claim.ClaimPhase))); err != nil {
+			return ClaimResult{}, err
+		}
 		claim.Outcome = ClaimOutcomeBlocked
 		claim.RunStatus = "needs-human"
 		claim.EdgeStatus = "needs-human"
