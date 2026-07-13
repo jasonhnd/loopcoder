@@ -58,6 +58,9 @@ const (
 	ReasonOpenBreaker                 ReasonCode = "open-breaker"
 	ReasonMissingHardCapability       ReasonCode = "missing-hard-capability"
 	ReasonInstallationUnavailable     ReasonCode = "installation-unavailable"
+	ReasonCooldownElapsed             ReasonCode = "cooldown-elapsed"
+	ReasonRecoverySucceeded           ReasonCode = "recovery-succeeded"
+	ReasonProbeLeaseActive            ReasonCode = "probe-lease-active"
 )
 
 type BreakerKind string
@@ -146,22 +149,26 @@ type Score struct {
 }
 
 type CircuitBreaker struct {
-	SchemaVersion       string       `json:"schema_version"`
-	CircuitBreakerID    string       `json:"circuit_breaker_id"`
-	BreakerKind         BreakerKind  `json:"breaker_kind"`
-	State               BreakerState `json:"state"`
-	ScopeKey            string       `json:"scope_key"`
-	Scope               Scope        `json:"scope"`
-	OpenedAt            string       `json:"opened_at,omitempty"`
-	OpenUntil           string       `json:"open_until,omitempty"`
-	HalfOpenProbeBudget int          `json:"half_open_probe_budget"`
-	HalfOpenProbeCount  int          `json:"half_open_probe_count"`
-	FailureCount        int          `json:"failure_count"`
-	SuccessCount        int          `json:"success_count"`
-	LastObservationID   string       `json:"last_observation_id,omitempty"`
-	StateReason         ReasonCode   `json:"state_reason"`
-	PolicyVersion       string       `json:"policy_version"`
-	RecordVersion       int          `json:"record_version"`
+	SchemaVersion        string       `json:"schema_version"`
+	CircuitBreakerID     string       `json:"circuit_breaker_id"`
+	BreakerKind          BreakerKind  `json:"breaker_kind"`
+	State                BreakerState `json:"state"`
+	ScopeKey             string       `json:"scope_key"`
+	Scope                Scope        `json:"scope"`
+	OpenedAt             string       `json:"opened_at,omitempty"`
+	OpenUntil            string       `json:"open_until,omitempty"`
+	HalfOpenProbeBudget  int          `json:"half_open_probe_budget"`
+	HalfOpenProbeCount   int          `json:"half_open_probe_count"`
+	FailureCount         int          `json:"failure_count"`
+	SuccessCount         int          `json:"success_count"`
+	LastObservationID    string       `json:"last_observation_id,omitempty"`
+	LastObservationAt    string       `json:"last_observation_at,omitempty"`
+	StateReason          ReasonCode   `json:"state_reason"`
+	PolicyVersion        string       `json:"policy_version"`
+	RecordVersion        int          `json:"record_version"`
+	ProbeLeaseOwner      string       `json:"probe_lease_owner,omitempty"`
+	ProbeLeaseExpiresAt  string       `json:"probe_lease_expires_at,omitempty"`
+	ProbeLeaseGeneration int          `json:"probe_lease_generation,omitempty"`
 }
 
 type Policy struct {
@@ -170,6 +177,13 @@ type Policy struct {
 	RecentFailureWindow         time.Duration
 	FailureThreshold            int
 	HardRequirement             providerinventory.HardRequirement
+	BaseCooldown                time.Duration
+	MaxCooldown                 time.Duration
+	Jitter                      time.Duration
+	RandomSeed                  string
+	HalfOpenProbeBudget         int
+	RequiredSuccessCount        int
+	ProbeLeaseDuration          time.Duration
 }
 
 type Inputs struct {

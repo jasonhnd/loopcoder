@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 18
+	CurrentSchemaVersion = 19
 
 	driverName = "sqlite"
 
@@ -330,6 +330,11 @@ var migrations = []migration{
 		version:    18,
 		name:       "availability read model",
 		statements: availabilitySchemaStatements,
+	},
+	{
+		version: 19,
+		name:    "bounded circuit breaker recovery",
+		apply:   migrateCircuitBreakerRecovery,
 	},
 }
 

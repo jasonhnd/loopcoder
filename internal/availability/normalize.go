@@ -41,6 +41,39 @@ func ValidateScore(score Score) error {
 	return nil
 }
 
+func ValidateBreaker(breaker CircuitBreaker) error {
+	if breaker.SchemaVersion != BreakerSchema || !strings.HasPrefix(breaker.CircuitBreakerID, "breaker_") {
+		return fmt.Errorf("%w: invalid breaker identity", ErrAvailabilityRecord)
+	}
+	if !knownBreakerKind(breaker.BreakerKind) || !knownBreakerState(breaker.State) || breaker.ScopeKey == "" || breaker.PolicyVersion == "" {
+		return fmt.Errorf("%w: breaker kind, state, scope, and policy version are required", ErrAvailabilityRecord)
+	}
+	if breaker.RecordVersion <= 0 || breaker.HalfOpenProbeBudget < 0 || breaker.HalfOpenProbeCount < 0 || breaker.FailureCount < 0 || breaker.SuccessCount < 0 {
+		return fmt.Errorf("%w: breaker counters must be non-negative", ErrAvailabilityRecord)
+	}
+	if breaker.OpenedAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, breaker.OpenedAt); err != nil {
+			return fmt.Errorf("%w: opened_at must be RFC3339", ErrAvailabilityRecord)
+		}
+	}
+	if breaker.OpenUntil != "" {
+		if _, err := time.Parse(time.RFC3339Nano, breaker.OpenUntil); err != nil {
+			return fmt.Errorf("%w: open_until must be RFC3339", ErrAvailabilityRecord)
+		}
+	}
+	if breaker.LastObservationAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, breaker.LastObservationAt); err != nil {
+			return fmt.Errorf("%w: last_observation_at must be RFC3339", ErrAvailabilityRecord)
+		}
+	}
+	if breaker.ProbeLeaseExpiresAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, breaker.ProbeLeaseExpiresAt); err != nil {
+			return fmt.Errorf("%w: probe_lease_expires_at must be RFC3339", ErrAvailabilityRecord)
+		}
+	}
+	return nil
+}
+
 func normalizeObservation(observation Observation) Observation {
 	observation.Scope = normalizeScope(observation.Scope)
 	if observation.SchemaVersion == "" {
@@ -102,12 +135,68 @@ func normalizeScore(score Score) Score {
 	return score
 }
 
+func normalizeBreaker(breaker CircuitBreaker) CircuitBreaker {
+	breaker.Scope = normalizeScope(breaker.Scope)
+	if breaker.SchemaVersion == "" {
+		breaker.SchemaVersion = BreakerSchema
+	}
+	if breaker.RecordVersion == 0 {
+		breaker.RecordVersion = 1
+	}
+	if breaker.PolicyVersion == "" {
+		breaker.PolicyVersion = PolicyVersion
+	}
+	if breaker.State == "" {
+		breaker.State = BreakerClosed
+	}
+	if breaker.ScopeKey == "" {
+		breaker.ScopeKey = scopeKey(breaker.Scope)
+	}
+	if breaker.HalfOpenProbeBudget < 0 {
+		breaker.HalfOpenProbeBudget = 0
+	}
+	if breaker.HalfOpenProbeCount < 0 {
+		breaker.HalfOpenProbeCount = 0
+	}
+	if breaker.FailureCount < 0 {
+		breaker.FailureCount = 0
+	}
+	if breaker.SuccessCount < 0 {
+		breaker.SuccessCount = 0
+	}
+	if breaker.StateReason == "" {
+		breaker.StateReason = ReasonUnknownTelemetry
+	}
+	if breaker.CircuitBreakerID == "" && breaker.BreakerKind != "" {
+		breaker.CircuitBreakerID = breakerID(breaker.BreakerKind, breaker.Scope)
+	}
+	return breaker
+}
+
 func normalizePolicy(policy Policy) Policy {
 	if policy.RecentFailureWindow <= 0 {
 		policy.RecentFailureWindow = 30 * time.Minute
 	}
 	if policy.FailureThreshold <= 0 {
 		policy.FailureThreshold = 3
+	}
+	if policy.BaseCooldown <= 0 {
+		policy.BaseCooldown = 5 * time.Minute
+	}
+	if policy.MaxCooldown <= 0 {
+		policy.MaxCooldown = time.Hour
+	}
+	if policy.MaxCooldown < policy.BaseCooldown {
+		policy.MaxCooldown = policy.BaseCooldown
+	}
+	if policy.HalfOpenProbeBudget <= 0 {
+		policy.HalfOpenProbeBudget = 1
+	}
+	if policy.RequiredSuccessCount <= 0 {
+		policy.RequiredSuccessCount = 1
+	}
+	if policy.ProbeLeaseDuration <= 0 {
+		policy.ProbeLeaseDuration = 2 * time.Minute
 	}
 	return policy
 }
@@ -163,6 +252,11 @@ func scoreID(score Score) string {
 		Evidence: score.EvidenceRecordIDs, Policy: score.PolicyVersion, Captured: score.CapturedAt, Component: score.Components,
 	}
 	return "avscore_" + hashBase32(mustJSON(payload))[:26]
+}
+
+func breakerID(kind BreakerKind, scope Scope) string {
+	scope = normalizeScope(scope)
+	return "breaker_" + hashBase32(scopeKey(scope), string(kind), scope.AdapterID, scope.ModelCapabilityID)[:26]
 }
 
 func hashBase32(parts ...string) string {
