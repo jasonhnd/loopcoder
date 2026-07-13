@@ -302,6 +302,33 @@ func BuildQuotaUsageBudget(records []UsageRecord, observedAt time.Time, gapReaso
 	return budget
 }
 
+func FinalizeQuotaUsageBudget(budget QuotaUsageBudget) QuotaUsageBudget {
+	if budget.SchemaVersion == "" {
+		budget.SchemaVersion = QuotaUsageBudgetSchema
+	}
+	if budget.QuotaSources == nil {
+		budget.QuotaSources = []providerinventory.QuotaTelemetrySource{}
+	}
+	if budget.QuotaSnapshots == nil {
+		budget.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
+	if budget.UsageSummary == nil {
+		budget.UsageSummary = []UsageSummary{}
+	}
+	if budget.BudgetSummary == nil {
+		budget.BudgetSummary = []any{}
+	}
+	if budget.AvailabilityScores == nil {
+		budget.AvailabilityScores = []any{}
+	}
+	if budget.CircuitBreakers == nil {
+		budget.CircuitBreakers = []any{}
+	}
+	budget.GapReasons = dedupeStrings(budget.GapReasons)
+	budget.QuotaUsageFingerprint = fingerprintBudget(budget)
+	return budget
+}
+
 func QuotaUsageRefs(records []UsageRecord, confidence providerinventory.Confidence, gapReasons []string) providerinventory.QuotaUsageRefs {
 	ids := make([]string, 0, len(records))
 	for _, record := range records {

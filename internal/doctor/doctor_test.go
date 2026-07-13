@@ -281,7 +281,7 @@ func TestRenderJSONIncludesQuotaUsageBudgetFallbackContract(t *testing.T) {
 		t.Fatalf("WriteAttempt: %v", err)
 	}
 
-	budget, check := buildQuotaUsageBudget(context.Background(), repo, "proj_test", now)
+	budget, check := buildQuotaUsageBudget(context.Background(), repo, "proj_test", providerinventory.Report{}, now)
 	if check.Status != StatusOK {
 		t.Fatalf("quota usage check = %#v, want OK", check)
 	}
