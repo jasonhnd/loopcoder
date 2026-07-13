@@ -1099,7 +1099,14 @@ func expectedModelsOutput() string {
 		"  - claude-opus-4-8[1m]\n" +
 		"    depths: low, medium, high, max*\n" +
 		"\n" +
-		expectedAntigravityModelsOutput()
+		expectedAntigravityModelsOutput() +
+		"\n" +
+		"provider: grok\n" +
+		"vendor: xAI\n" +
+		"cli: grok\n" +
+		"default: (provider default) / (none)\n" +
+		"models:\n" +
+		"  (dynamic inventory required)\n"
 }
 
 func expectedAntigravityModelsOutput() string {

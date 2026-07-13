@@ -444,7 +444,7 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionReadOnly,
-		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
+		Action:      providerAttributedReviewAction(fmt.Sprintf("review PR #%d", opts.PRNumber), workID, result),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
 		EndedAt:     result.EndedAt,
@@ -452,6 +452,26 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 		Usage:       result.Usage,
 		Verified:    true,
 	}
+}
+
+func providerAttributedReviewAction(action, attempt string, result agent.Result) string {
+	var parts []string
+	if strings.TrimSpace(result.AdapterVersion) != "" {
+		parts = append(parts, "adapter="+strings.TrimSpace(result.AdapterVersion))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) == "" && len(parts) == 0 {
+		return action
+	}
+	if strings.TrimSpace(attempt) != "" {
+		parts = append(parts, "attempt="+strings.TrimSpace(attempt))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) != "" {
+		parts = append(parts, "session="+strings.TrimSpace(result.ExternalSessionRef))
+	}
+	if len(parts) == 0 {
+		return action
+	}
+	return action + " [" + strings.Join(parts, " ") + "]"
 }
 
 func resultWithReport(verdict Verdict, record reporter.Report) Result {

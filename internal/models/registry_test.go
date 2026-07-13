@@ -85,11 +85,44 @@ func TestDefaultRegistryStaticRows(t *testing.T) {
 					},
 				},
 			},
+			{
+				Name:        "grok",
+				DisplayName: "Grok Build",
+				Vendor:      "xAI",
+				CLI:         "grok",
+			},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DefaultRegistry mismatch:\ngot:  %#v\nwant: %#v", got, want)
 	}
+}
+
+func TestGrokStaticRegistryRequiresDynamicInventory(t *testing.T) {
+	provider, ok := models.LookupProvider("grok")
+	if !ok {
+		t.Fatal("LookupProvider grok returned false")
+	}
+	if provider.DefaultModel != "" || len(provider.Models) != 0 {
+		t.Fatalf("grok provider = %#v, want provider default with no static model catalog", provider)
+	}
+	absent := models.ValidateSelection(models.Selection{
+		Role:     "worker",
+		Provider: "grok",
+	}, models.ValidationOptions{Strict: true})
+	if len(absent.Diagnostics) != 0 || absent.Selection.Model != "" {
+		t.Fatalf("absent Grok selection = %#v diagnostics=%#v, want provider default pass-through", absent.Selection, absent.Diagnostics)
+	}
+	configured := models.ValidateSelection(models.Selection{
+		Role:     "worker",
+		Provider: "grok",
+		Model:    "grok-custom",
+	}, models.ValidationOptions{Strict: true})
+	requireDiagnostic(t, configured, models.SeverityReject, models.ReasonUnknownModel, []string{
+		`provider "grok"`,
+		`model "grok-custom"`,
+		"not listed",
+	})
 }
 
 func TestDefaultRegistryInvariants(t *testing.T) {
@@ -99,7 +132,7 @@ func TestDefaultRegistryInvariants(t *testing.T) {
 }
 
 func TestLookupHelpers(t *testing.T) {
-	if got, want := models.ProviderNames(), []string{"codex", "claude", "antigravity"}; !reflect.DeepEqual(got, want) {
+	if got, want := models.ProviderNames(), []string{"codex", "claude", "antigravity", "grok"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ProviderNames = %#v, want %#v", got, want)
 	}
 

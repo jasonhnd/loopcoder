@@ -637,13 +637,16 @@ var staticContract = Contract{
 			},
 		},
 		{
-			Name:           "grok",
-			AdapterVersion: "v1",
-			DisplayName:    "Grok Build",
-			Vendor:         "xAI",
-			Executable:     "grok",
-			VersionArgv:    []string{"version"},
-			Cancellation:   true,
+			Name:                "grok",
+			AdapterVersion:      "v1",
+			DisplayName:         "Grok Build",
+			Vendor:              "xAI",
+			Executable:          "grok",
+			VersionArgv:         []string{"version"},
+			ReadOnly:            true,
+			JSONOutput:          true,
+			Cancellation:        true,
+			TokenUsageReporting: true,
 			// `grok models` is the documented read-only inventory surface for
 			// Grok Build. It may require account/network reachability, but it
 			// does not launch an agent session, open login, install updates, or
@@ -664,15 +667,12 @@ var staticContract = Contract{
 				"XAI_API_KEY",
 			},
 			KnownLimitations: []string{
-				"inventory-only adapter; loopcoder does not launch Grok Build work",
-				"native subagents, quota collection, and cross-provider handoff are not implemented",
-				"model capabilities are unknown unless the CLI reports them explicitly",
+				"bounded execution requires installed CLI help to advertise the required headless flags",
+				"schema-enforced verifier JSON, MCP configuration injection, native subagents, quota collection, and cross-provider handoff are not implemented",
+				"token usage and cost are recorded only when the CLI streaming output supplies them",
 			},
 			UnsupportedSuggestions: map[ProviderCapability]string{
-				ProviderReadOnly:   "use Grok Build only as provider inventory until an execution adapter is explicitly implemented",
-				ProviderMCPConfig:  "do not select Grok Build for MCP-injected loopcoder worker or verifier dispatch",
-				ProviderJSONOutput: "do not select Grok Build for schema-enforced JSON verifier output",
-				ProviderTokenUsage: "treat Grok Build token usage as not reported",
+				ProviderMCPConfig: "do not select Grok Build for MCP-injected loopcoder worker or verifier dispatch",
 			},
 		},
 	},

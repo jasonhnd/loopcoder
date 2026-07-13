@@ -32,7 +32,7 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 		{provider: "claude", executable: "claude", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "gemini", executable: "gemini", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "antigravity", executable: "agy", readOnly: false, mcp: false, json: false, usage: false},
-		{provider: "grok", executable: "grok", readOnly: false, mcp: false, json: false, usage: false},
+		{provider: "grok", executable: "grok", readOnly: true, mcp: false, json: true, usage: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {

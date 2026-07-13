@@ -321,9 +321,13 @@ func staticCatalogForAdapter(adapter AdapterDeclaration, now time.Time) (ModelCa
 	}
 	if len(adapter.StaticCatalogEntries) > 0 {
 		source.Entries = append(source.Entries, adapter.StaticCatalogEntries...)
-	} else if provider, ok := models.LookupProvider(adapter.AdapterID); ok {
-		for _, model := range provider.Models {
-			source.Entries = append(source.Entries, catalogEntryFromModel(adapter.AdapterID, model))
+	} else if adapter.AdapterID != "grok" {
+		if provider, ok := models.LookupProvider(adapter.AdapterID); ok {
+			for _, model := range provider.Models {
+				source.Entries = append(source.Entries, catalogEntryFromModel(adapter.AdapterID, model))
+			}
+		} else {
+			source.Gaps = append(source.Gaps, "adapter-static-catalog-empty")
 		}
 	} else {
 		source.Gaps = append(source.Gaps, "adapter-static-catalog-empty")

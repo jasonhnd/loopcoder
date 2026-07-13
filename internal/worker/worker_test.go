@@ -865,6 +865,31 @@ func TestBuildWorkerReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerReportIncludesGrokAdapterAttribution(t *testing.T) {
+	record := buildWorkerReport(Options{
+		IssueNumber: 834,
+		Provider:    "grok",
+		Branch:      "loop/issue-834",
+		RunID:       "run-834",
+	}, agent.Result{
+		ExitCode:           0,
+		Model:              "grok-4.5",
+		AdapterVersion:     "0.1.211",
+		ExternalSessionRef: "session-abc",
+		StartedAt:          "2026-07-13T00:00:00Z",
+		EndedAt:            "2026-07-13T00:00:01Z",
+		DurationMS:         1000,
+	})
+
+	want := "implement issue #834 [adapter=0.1.211 attempt=run-834 session=session-abc]"
+	if record.Action != want {
+		t.Fatalf("Action = %q, want %q", record.Action, want)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
 func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()

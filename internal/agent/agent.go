@@ -43,16 +43,18 @@ type MCPServer = config.MCPServer
 type MCPAuth = config.MCPAuth
 
 type Result struct {
-	ExitCode   int
-	Summary    string
-	Model      string
-	Effort     string
-	Usage      reporter.Usage
-	StartedAt  string
-	EndedAt    string
-	DurationMS int64
-	Hung       bool
-	HungReason string
+	ExitCode           int
+	Summary            string
+	Model              string
+	Effort             string
+	Usage              reporter.Usage
+	StartedAt          string
+	EndedAt            string
+	DurationMS         int64
+	Hung               bool
+	HungReason         string
+	AdapterVersion     string
+	ExternalSessionRef string
 }
 
 type Runner interface {

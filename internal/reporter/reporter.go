@@ -236,7 +236,9 @@ func (r Report) Validate() error {
 }
 
 func (r Report) allowsAbsentUsage() bool {
-	if strings.TrimSpace(r.Provider) != "antigravity" {
+	switch strings.TrimSpace(r.Provider) {
+	case "antigravity", "grok":
+	default:
 		return false
 	}
 	return r.Role == RoleWorker || r.Role == RoleVerifier
