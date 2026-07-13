@@ -431,12 +431,12 @@ func RecordApproval(ctx context.Context, store storage.Store, approval Approval,
 	}
 	var out Approval
 	err := withWrite(ctx, store, func(tx storage.Tx) error {
-		if err := ensureCurrentFingerprint(ctx, tx, approval.ProjectID, approval.DeliveryRunID, approval.AuthorizationFingerprint, approval.InputFingerprint, approval.PolicyFingerprint, approval.PlanFingerprint); err != nil {
-			return err
-		}
 		request := map[string]any{"operation": "record_approval", "record": approval}
 		replayed, err := replay(ctx, tx, opts.IdempotencyKey, approval.ProjectID, approval.DeliveryRunID, "record_approval", request, &out)
 		if err != nil || replayed {
+			return err
+		}
+		if err := ensureCurrentFingerprint(ctx, tx, approval.ProjectID, approval.DeliveryRunID, approval.AuthorizationFingerprint, approval.InputFingerprint, approval.PolicyFingerprint, approval.PlanFingerprint); err != nil {
 			return err
 		}
 		approvedBy, err := marshalJSON("approval approved_by", approval.ApprovedBy)
@@ -482,15 +482,15 @@ func RecordOverride(ctx context.Context, store storage.Store, override Override,
 	}
 	var out Override
 	err := withWrite(ctx, store, func(tx storage.Tx) error {
+		request := map[string]any{"operation": "record_override", "record": override}
+		replayed, err := replay(ctx, tx, opts.IdempotencyKey, override.ProjectID, override.DeliveryRunID, "record_override", request, &out)
+		if err != nil || replayed {
+			return err
+		}
 		if err := ensureCurrentFingerprint(ctx, tx, override.ProjectID, override.DeliveryRunID, override.AuthorizationFingerprint, override.InputFingerprint, override.PolicyFingerprint, override.PlanFingerprint); err != nil {
 			return err
 		}
 		if err := ensureDecisionProject(ctx, tx, override.ProjectID, override.DeliveryRunID, override.PolicyDecisionID); err != nil {
-			return err
-		}
-		request := map[string]any{"operation": "record_override", "record": override}
-		replayed, err := replay(ctx, tx, opts.IdempotencyKey, override.ProjectID, override.DeliveryRunID, "record_override", request, &out)
-		if err != nil || replayed {
 			return err
 		}
 		overriddenBy, err := marshalJSON("override overridden_by", override.OverriddenBy)

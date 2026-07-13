@@ -419,7 +419,9 @@ Schema version: `loopcoder.approval.v1`.
 
 An approval authorizes only the exact authorization fingerprint and only up to
 its approved side-effect class and scope. If any fingerprint input changes, the
-approval is stale and cannot be used.
+approval is stale and cannot be used. Exact idempotency replay of the original
+approval request may return the historical approval record, but that replay does
+not refresh authority for the current run fingerprint.
 
 ### Override
 
@@ -443,7 +445,10 @@ Schema version: `loopcoder.override.v1`.
 | `created_by` / `updated_by` / `host` | yes | Provenance. |
 
 Overrides cannot change user intent silently. They only permit continuation
-inside explicit replacement limits for the exact fingerprint-bound work.
+inside explicit replacement limits for the exact fingerprint-bound work. Exact
+idempotency replay of the original override request may return the historical
+override record, but that replay does not refresh authority for the current run
+fingerprint.
 
 ### Immutable Plan Fingerprint
 
@@ -696,12 +701,17 @@ bytes and the resulting record IDs.
 Replay rules:
 
 - Same idempotency key and same canonical request bytes returns the existing
-  result without changing lifecycle timestamps.
+  result without changing lifecycle timestamps. This replay check is evaluated
+  before current-fingerprint freshness for approval and override records, and
+  returns only the historical result.
 - Same idempotency key and different canonical request bytes fails with
   `ErrDuplicateReplay`.
 - A replay that would recreate the same task, decision, approval, override, or
   edge by stable identity returns the existing record only when the canonical
   payload is identical.
+- A fresh approval or override request whose fingerprint no longer matches the
+  current run fails with `ErrStaleApproval`; changed payloads cannot regain
+  authority by reusing an old idempotency key.
 - A replay that would create a duplicate side effect must stop before the side
   effect and return the existing durable result or `ErrDuplicateReplay`.
 - Side effects may start only after durable intent, policy checks,

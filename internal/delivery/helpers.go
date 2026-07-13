@@ -508,7 +508,12 @@ func dependenciesSatisfied(ctx context.Context, tx storage.Tx, runID, taskID str
 }
 
 func authoritySatisfied(ctx context.Context, tx storage.Tx, run runAuthority, task taskAuthority, now time.Time) error {
-	auth := firstNonEmpty(task.AuthorizationFingerprint, run.AuthorizationFingerprint)
+	runAuth := strings.TrimSpace(run.AuthorizationFingerprint)
+	taskAuth := strings.TrimSpace(task.AuthorizationFingerprint)
+	if runAuth != "" && taskAuth != "" && runAuth != taskAuth {
+		return typed(ErrStaleApprovalCode, "task authorization fingerprint does not match current run")
+	}
+	auth := firstNonEmpty(taskAuth, runAuth)
 	if auth == "" {
 		return nil
 	}
