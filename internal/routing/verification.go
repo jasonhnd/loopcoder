@@ -1,0 +1,799 @@
+package routing
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
+)
+
+const (
+	VerificationDecisionSchema = "loopcoder.verification_decision.v1"
+
+	VerificationStatusAccepted   = "accepted"
+	VerificationStatusRejected   = "rejected"
+	VerificationStatusNeedsHuman = "needs-human"
+
+	VerificationVerdictPass       = "pass"
+	VerificationVerdictFail       = "fail"
+	VerificationVerdictNeedsHuman = "needs-human"
+
+	FinalAuthorityAutomatedVerifier = "automated-verifier"
+	FinalAuthorityCouncil           = "bounded-council"
+	FinalAuthorityHuman             = "human"
+)
+
+type EvidenceRef struct {
+	RecordKind string `json:"record_kind"`
+	RecordID   string `json:"record_id"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+type VerifierVerdict struct {
+	MemberID              string                     `json:"member_id"`
+	RoutingCandidateID    string                     `json:"routing_candidate_id"`
+	Verdict               string                     `json:"verdict"`
+	EvidenceRefs          []EvidenceRef              `json:"evidence_refs"`
+	Message               string                     `json:"message,omitempty"`
+	Authority             string                     `json:"authority"`
+	AuthorityFingerprint  string                     `json:"authority_fingerprint"`
+	VerificationStartedAt string                     `json:"verification_started_at,omitempty"`
+	VerificationEndedAt   string                     `json:"verification_ended_at,omitempty"`
+	TerminalErrorCode     taskrequirements.ErrorCode `json:"terminal_error_code,omitempty"`
+}
+
+type CouncilLimits struct {
+	Enabled         bool   `json:"enabled"`
+	MaxMembers      int    `json:"max_members"`
+	MaxRounds       int    `json:"max_rounds"`
+	MaxDurationMS   int64  `json:"max_duration_ms"`
+	MaxBudgetTokens int64  `json:"max_budget_tokens"`
+	StartedAt       string `json:"started_at,omitempty"`
+	DeadlineAt      string `json:"deadline_at,omitempty"`
+}
+
+type CouncilState struct {
+	Enabled           bool                       `json:"enabled"`
+	MaxMembers        int                        `json:"max_members,omitempty"`
+	MaxRounds         int                        `json:"max_rounds,omitempty"`
+	MaxDurationMS     int64                      `json:"max_duration_ms,omitempty"`
+	MaxBudgetTokens   int64                      `json:"max_budget_tokens,omitempty"`
+	MemberCount       int                        `json:"member_count"`
+	RoundsUsed        int                        `json:"rounds_used"`
+	BudgetTokensUsed  int64                      `json:"budget_tokens_used"`
+	TimedOut          bool                       `json:"timed_out"`
+	BoundExceeded     string                     `json:"bound_exceeded,omitempty"`
+	Outcome           string                     `json:"outcome"`
+	TerminalErrorCode taskrequirements.ErrorCode `json:"terminal_error_code,omitempty"`
+}
+
+type VerificationDecision struct {
+	SchemaVersion             string                             `json:"schema_version"`
+	RecordVersion             int                                `json:"record_version"`
+	VerificationDecisionID    string                             `json:"verification_decision_id"`
+	ProjectID                 string                             `json:"project_id"`
+	DeliveryRunID             string                             `json:"delivery_run_id"`
+	TaskID                    string                             `json:"task_id"`
+	TaskRequirementID         string                             `json:"task_requirement_id"`
+	WorkerRoutingDecisionID   string                             `json:"worker_routing_decision_id"`
+	VerifierRoutingDecisionID string                             `json:"verifier_routing_decision_id,omitempty"`
+	DecisionKey               string                             `json:"decision_key"`
+	IdempotencyKey            string                             `json:"idempotency_key"`
+	DecisionStatus            string                             `json:"decision_status"`
+	Verdict                   string                             `json:"verdict"`
+	RequiredIndependence      taskrequirements.IndependenceLevel `json:"required_independence"`
+	ActualIndependence        taskrequirements.IndependenceLevel `json:"actual_independence"`
+	EligibilityExclusions     []RejectionReason                  `json:"eligibility_exclusions"`
+	WorkerCandidateID         string                             `json:"worker_candidate_id"`
+	VerifierCandidateID       string                             `json:"verifier_candidate_id,omitempty"`
+	VerifierVerdicts          []VerifierVerdict                  `json:"verifier_verdicts"`
+	Disagreements             []string                           `json:"disagreements"`
+	EvidenceRefs              []EvidenceRef                      `json:"evidence_refs"`
+	Council                   CouncilState                       `json:"council"`
+	Timeout                   bool                               `json:"timeout"`
+	FinalAuthority            string                             `json:"final_authority"`
+	FinalAuthorityFingerprint string                             `json:"final_authority_fingerprint"`
+	VerificationFingerprint   string                             `json:"verification_fingerprint"`
+	PolicyFingerprint         string                             `json:"policy_fingerprint"`
+	PlanFingerprint           string                             `json:"plan_fingerprint"`
+	CreatedAt                 string                             `json:"created_at"`
+	UpdatedAt                 string                             `json:"updated_at"`
+	DecidedBy                 delivery.Actor                     `json:"decided_by"`
+	Host                      delivery.Host                      `json:"host"`
+	TerminalErrorCode         taskrequirements.ErrorCode         `json:"terminal_error_code,omitempty"`
+}
+
+type VerificationDecisionInput struct {
+	WorkerRoutingDecisionID   string
+	VerifierRoutingDecisionID string
+	DecisionKey               string
+	IdempotencyKey            string
+	VerifierVerdicts          []VerifierVerdict
+	CouncilLimits             CouncilLimits
+	CouncilRoundsUsed         int
+	CouncilBudgetTokensUsed   int64
+	Timeout                   bool
+	AuthorityFingerprint      string
+	DecidedBy                 delivery.Actor
+	Host                      delivery.Host
+}
+
+func DecideAndPersistVerification(ctx context.Context, store storage.Store, input VerificationDecisionInput) (VerificationDecision, error) {
+	if store == nil {
+		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
+	}
+	if strings.TrimSpace(input.WorkerRoutingDecisionID) == "" || strings.TrimSpace(input.DecisionKey) == "" {
+		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "worker route and decision key are required"}
+	}
+	if err := validateSchedulerActor(input.DecidedBy); err != nil {
+		return VerificationDecision{}, err
+	}
+	if err := validateHost(input.Host); err != nil {
+		return VerificationDecision{}, err
+	}
+	var stored VerificationDecision
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		workerRoute, err := loadRoutingDecisionTx(ctx, tx, input.WorkerRoutingDecisionID)
+		if err != nil {
+			return err
+		}
+		req, err := loadTaskRequirementTx(ctx, tx, workerRoute.TaskRequirementID)
+		if err != nil {
+			return err
+		}
+		profile, err := loadRoutingPolicyProfileTx(ctx, tx, workerRoute.RoutingPolicyProfileID)
+		if err != nil {
+			return err
+		}
+		verifierRoute, verifierCandidate, exclusions, err := resolveVerifierRouteTx(ctx, tx, input.VerifierRoutingDecisionID)
+		if err != nil {
+			return err
+		}
+		if verifierRoute.RoutingDecisionID != "" && (verifierRoute.ProjectID != workerRoute.ProjectID || verifierRoute.DeliveryRunID != workerRoute.DeliveryRunID) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrCrossProjectReferenceCode, Message: "verifier route does not belong to worker delivery run"}
+		}
+		workerCandidate, ok := chosenCandidate(workerRoute)
+		if !ok {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "worker route has no selected candidate to verify"}
+		}
+		input.IdempotencyKey = verificationIdempotencyKey(input, workerRoute, verifierRoute)
+		if existing, ok, err := loadVerificationByIdempotency(ctx, tx, workerRoute.DeliveryRunID, workerRoute.TaskID, input.DecisionKey, input.IdempotencyKey); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			if existing.VerificationFingerprint != verificationRequestFingerprint(input, workerRoute, verifierRoute) {
+				return &delivery.TypedError{Code: delivery.ErrDuplicateReplayCode, Message: "verification idempotency key replayed with different request"}
+			}
+			stored = existing
+			return nil
+		}
+		decision, err := buildVerificationDecision(workerRoute, verifierRoute, req, profile, workerCandidate, verifierCandidate, exclusions, input, store.Now())
+		if err != nil {
+			return err
+		}
+		if existing, ok, err := loadVerificationByAuthority(ctx, tx, decision.DeliveryRunID, decision.TaskID, decision.DecisionKey, decision.FinalAuthorityFingerprint); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			if existing.VerificationFingerprint != decision.VerificationFingerprint {
+				return taskrequirements.ErrVerificationDecisionConflict
+			}
+			stored = existing
+			return nil
+		}
+		if err := insertVerificationDecisionTx(ctx, tx, decision); err != nil {
+			return err
+		}
+		stored = decision
+		return nil
+	})
+	if err != nil {
+		return VerificationDecision{}, err
+	}
+	if stored.TerminalErrorCode != "" {
+		return stored, verificationTerminalError(stored.TerminalErrorCode)
+	}
+	return stored, nil
+}
+
+func RequiredVerifierIndependence(req taskrequirements.TaskRequirement, profile RoutingPolicyProfile) taskrequirements.IndependenceLevel {
+	required := profile.EligibilityPolicy.VerifierIndependence
+	if required == "" {
+		required = taskrequirements.IndependenceNone
+	}
+	if risk, ok := profile.RiskPolicy[req.RiskTier]; ok {
+		required = strongerIndependence(required, risk.IndependenceLevel)
+	}
+	if level, ok := profile.VerifierSeparation[req.RiskTier]; ok {
+		required = strongerIndependence(required, level)
+	}
+	for _, verification := range req.VerificationRequirements {
+		if riskApplies(req.RiskTier, verification.RequiredForRiskTiers) {
+			required = strongerIndependence(required, verification.IndependenceLevel)
+		}
+	}
+	return required
+}
+
+func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {
+	required := RequiredVerifierIndependence(req, profile)
+	actual := actualIndependence(worker, verifier)
+	council := aggregateCouncil(input.CouncilLimits, input.CouncilRoundsUsed, input.CouncilBudgetTokensUsed, input.Timeout, input.VerifierVerdicts, now)
+	verdicts := sanitizeVerifierVerdicts(input.VerifierVerdicts)
+	evidence := evidenceRefs(verdicts)
+	disagreements := councilDisagreements(verdicts, council)
+	status := VerificationStatusAccepted
+	verdict := VerificationVerdictPass
+	authority := FinalAuthorityAutomatedVerifier
+	terminal := taskrequirements.ErrorCode("")
+
+	if input.CouncilLimits.Enabled {
+		authority = FinalAuthorityCouncil
+	}
+	if required == taskrequirements.IndependenceHuman {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrVerifierIndependenceRequiredCode
+		disagreements = append(disagreements, "human independence is required by policy")
+	} else if verifier.RoutingCandidateID == "" || verifierRoute.DecisionStatus != DecisionStatusSelected {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrNoEligibleCandidateCode
+	} else if verifier.Permission != taskrequirements.PermissionReadOnly {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrCapabilityUnsupportedCode
+		disagreements = append(disagreements, "verifier route is not read-only")
+	} else if !verificationOutputAllowed(req, profile) {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrCapabilityUnsupportedCode
+		disagreements = append(disagreements, "verifier output contract is not verification-verdict or json-schema")
+	} else if !independentEnough(worker, verifier, required) {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrVerifierIndependenceRequiredCode
+		disagreements = append(disagreements, "verifier route is not independent enough from worker route")
+	} else if council.TerminalErrorCode != "" {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, council.TerminalErrorCode
+	} else if len(verdicts) == 0 {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrRequirementConfidenceInsufficientCode
+		disagreements = append(disagreements, "no verifier verdict was returned")
+	} else if council.Outcome == VerificationVerdictFail {
+		status, verdict, terminal = VerificationStatusRejected, VerificationVerdictFail, taskrequirements.ErrVerificationDecisionConflictCode
+	} else if council.Outcome == VerificationVerdictNeedsHuman {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrVerificationDecisionConflictCode
+	} else {
+		terminal = ""
+	}
+
+	authorityFP := strings.TrimSpace(input.AuthorityFingerprint)
+	if authorityFP == "" {
+		authorityFP = workerRoute.RoutingFingerprint
+	}
+	if !validFingerprint(authorityFP) {
+		return VerificationDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "verification authority fingerprint must be a sha256 digest"}
+	}
+	fp := verificationRequestFingerprint(input, workerRoute, verifierRoute)
+	createdAt := delivery.CanonicalTimestamp(now)
+	decision := VerificationDecision{
+		SchemaVersion:             VerificationDecisionSchema,
+		RecordVersion:             1,
+		ProjectID:                 workerRoute.ProjectID,
+		DeliveryRunID:             workerRoute.DeliveryRunID,
+		TaskID:                    workerRoute.TaskID,
+		TaskRequirementID:         req.TaskRequirementID,
+		WorkerRoutingDecisionID:   workerRoute.RoutingDecisionID,
+		VerifierRoutingDecisionID: verifierRoute.RoutingDecisionID,
+		DecisionKey:               strings.TrimSpace(input.DecisionKey),
+		IdempotencyKey:            strings.TrimSpace(input.IdempotencyKey),
+		DecisionStatus:            status,
+		Verdict:                   verdict,
+		RequiredIndependence:      required,
+		ActualIndependence:        actual,
+		EligibilityExclusions:     nonNilRejectionReasons(exclusions),
+		WorkerCandidateID:         worker.RoutingCandidateID,
+		VerifierCandidateID:       verifier.RoutingCandidateID,
+		VerifierVerdicts:          verdicts,
+		Disagreements:             nonNilStrings(dedupeStrings(disagreements)),
+		EvidenceRefs:              evidence,
+		Council:                   council,
+		Timeout:                   input.Timeout || council.TimedOut,
+		FinalAuthority:            authority,
+		FinalAuthorityFingerprint: authorityFP,
+		VerificationFingerprint:   fp,
+		PolicyFingerprint:         profile.PolicyFingerprint,
+		PlanFingerprint:           workerRoute.PlanFingerprint,
+		CreatedAt:                 createdAt,
+		UpdatedAt:                 createdAt,
+		DecidedBy:                 input.DecidedBy,
+		Host:                      input.Host,
+		TerminalErrorCode:         terminal,
+	}
+	decision.VerificationDecisionID = verificationDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.TaskID, decision.DecisionKey, decision.FinalAuthorityFingerprint, decision.VerificationFingerprint)
+	if err := validateVerificationDecision(decision); err != nil {
+		return VerificationDecision{}, err
+	}
+	return decision, nil
+}
+
+func aggregateCouncil(limits CouncilLimits, roundsUsed int, budgetUsed int64, timedOut bool, verdicts []VerifierVerdict, now time.Time) CouncilState {
+	state := CouncilState{
+		Enabled:          limits.Enabled,
+		MaxMembers:       limits.MaxMembers,
+		MaxRounds:        limits.MaxRounds,
+		MaxDurationMS:    limits.MaxDurationMS,
+		MaxBudgetTokens:  limits.MaxBudgetTokens,
+		MemberCount:      len(verdicts),
+		RoundsUsed:       roundsUsed,
+		BudgetTokensUsed: budgetUsed,
+		Outcome:          VerificationVerdictPass,
+	}
+	if !limits.Enabled {
+		if len(verdicts) == 0 {
+			state.Outcome = VerificationVerdictNeedsHuman
+			return state
+		}
+		return aggregateVerdicts(state, verdicts)
+	}
+	switch {
+	case limits.MaxMembers <= 0 || len(verdicts) > limits.MaxMembers:
+		state.BoundExceeded, state.TerminalErrorCode = "members", taskrequirements.ErrVerifierCouncilBoundExceededCode
+	case limits.MaxRounds <= 0 || roundsUsed <= 0 || roundsUsed > limits.MaxRounds:
+		state.BoundExceeded, state.TerminalErrorCode = "rounds", taskrequirements.ErrVerifierCouncilBoundExceededCode
+	case limits.MaxBudgetTokens <= 0 || budgetUsed > limits.MaxBudgetTokens:
+		state.BoundExceeded, state.TerminalErrorCode = "budget", taskrequirements.ErrVerifierCouncilBoundExceededCode
+	case limits.MaxDurationMS <= 0:
+		state.BoundExceeded, state.TerminalErrorCode = "time", taskrequirements.ErrVerifierCouncilBoundExceededCode
+	}
+	if deadline, ok := parseCouncilDeadline(limits); timedOut || (ok && now.After(deadline)) {
+		state.TimedOut = true
+		state.BoundExceeded = "time"
+		state.TerminalErrorCode = taskrequirements.ErrVerifierCouncilBoundExceededCode
+	}
+	if state.TerminalErrorCode != "" {
+		state.Outcome = VerificationVerdictNeedsHuman
+		return state
+	}
+	return aggregateVerdicts(state, verdicts)
+}
+
+func aggregateVerdicts(state CouncilState, verdicts []VerifierVerdict) CouncilState {
+	if len(verdicts) == 0 {
+		state.Outcome = VerificationVerdictNeedsHuman
+		return state
+	}
+	sawFail, sawNeedsHuman, sawPass := false, false, false
+	for _, verdict := range verdicts {
+		switch verdict.Verdict {
+		case VerificationVerdictPass:
+			sawPass = true
+		case VerificationVerdictFail:
+			sawFail = true
+		default:
+			sawNeedsHuman = true
+		}
+	}
+	switch {
+	case sawNeedsHuman || (sawFail && sawPass):
+		state.Outcome = VerificationVerdictNeedsHuman
+	case sawFail:
+		state.Outcome = VerificationVerdictFail
+	default:
+		state.Outcome = VerificationVerdictPass
+	}
+	return state
+}
+
+func insertVerificationDecisionTx(ctx context.Context, tx storage.Tx, decision VerificationDecision) error {
+	payload, err := delivery.CanonicalJSON(decision)
+	if err != nil {
+		return err
+	}
+	disagreements, err := canonicalString(decision.Disagreements)
+	if err != nil {
+		return err
+	}
+	evidence, err := canonicalString(decision.EvidenceRefs)
+	if err != nil {
+		return err
+	}
+	council, err := canonicalString(decision.Council)
+	if err != nil {
+		return err
+	}
+	actor, err := canonicalString(decision.DecidedBy)
+	if err != nil {
+		return err
+	}
+	host, err := canonicalString(decision.Host)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(ctx, `INSERT INTO verification_decisions(
+		verification_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id,
+		task_requirement_id, worker_routing_decision_id, verifier_routing_decision_id, decision_key, idempotency_key,
+		decision_status, verdict, required_independence, actual_independence, final_authority,
+		final_authority_fingerprint, terminal_error_code, verification_fingerprint, policy_fingerprint, plan_fingerprint,
+		disagreements_json, evidence_refs_json, council_json, payload_json, created_at, updated_at, decided_by_json, host_json
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(verification_decision_id) DO NOTHING`,
+		decision.VerificationDecisionID, decision.SchemaVersion, decision.RecordVersion, decision.ProjectID, decision.DeliveryRunID, decision.TaskID,
+		decision.TaskRequirementID, decision.WorkerRoutingDecisionID, decision.VerifierRoutingDecisionID, decision.DecisionKey, decision.IdempotencyKey,
+		decision.DecisionStatus, decision.Verdict, string(decision.RequiredIndependence), string(decision.ActualIndependence), decision.FinalAuthority,
+		decision.FinalAuthorityFingerprint, string(decision.TerminalErrorCode), decision.VerificationFingerprint, decision.PolicyFingerprint, decision.PlanFingerprint,
+		disagreements, evidence, council, string(payload), decision.CreatedAt, decision.UpdatedAt, actor, host)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 0 {
+		return err
+	}
+	var existing string
+	if err := tx.QueryRow(ctx, `SELECT payload_json FROM verification_decisions WHERE verification_decision_id = ?`, decision.VerificationDecisionID).Scan(&existing); err != nil {
+		return err
+	}
+	if existing != string(payload) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrDuplicateRecordCode, Message: "verification decision id already exists with different payload"}
+	}
+	return nil
+}
+
+func LoadVerificationDecision(ctx context.Context, store storage.Store, id string) (VerificationDecision, error) {
+	var payload string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM verification_decisions WHERE verification_decision_id = ?`, strings.TrimSpace(id)).Scan(&payload)
+	})
+	if err != nil {
+		return VerificationDecision{}, err
+	}
+	var decision VerificationDecision
+	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+		return VerificationDecision{}, err
+	}
+	return decision, nil
+}
+
+func ExplainVerificationJSON(decision VerificationDecision) ([]byte, error) {
+	return delivery.CanonicalJSON(redactedVerificationDecision(decision))
+}
+
+func ExplainVerificationHuman(decision VerificationDecision) string {
+	d := redactedVerificationDecision(decision)
+	var b strings.Builder
+	fmt.Fprintf(&b, "verification %s: verdict=%s final_authority=%s\n", d.DecisionStatus, d.Verdict, d.FinalAuthority)
+	fmt.Fprintf(&b, "independence required=%s actual=%s worker=%s verifier=%s\n", d.RequiredIndependence, d.ActualIndependence, d.WorkerCandidateID, d.VerifierCandidateID)
+	if d.Council.Enabled {
+		fmt.Fprintf(&b, "council members=%d/%d rounds=%d/%d budget=%d/%d outcome=%s timeout=%t\n", d.Council.MemberCount, d.Council.MaxMembers, d.Council.RoundsUsed, d.Council.MaxRounds, d.Council.BudgetTokensUsed, d.Council.MaxBudgetTokens, d.Council.Outcome, d.Council.TimedOut)
+	}
+	for _, disagreement := range d.Disagreements {
+		fmt.Fprintf(&b, "- disagreement: %s\n", disagreement)
+	}
+	for _, rejected := range d.EligibilityExclusions {
+		fmt.Fprintf(&b, "- exclusion: %s %s\n", rejected.Code, sanitizeText(rejected.Message, 160))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func resolveVerifierRouteTx(ctx context.Context, tx storage.Tx, verifierRoutingDecisionID string) (RoutingDecision, Candidate, []RejectionReason, error) {
+	if strings.TrimSpace(verifierRoutingDecisionID) == "" {
+		return RoutingDecision{}, Candidate{}, nil, nil
+	}
+	route, err := loadRoutingDecisionTx(ctx, tx, verifierRoutingDecisionID)
+	if err != nil {
+		return RoutingDecision{}, Candidate{}, nil, err
+	}
+	candidate, _ := chosenCandidate(route)
+	var exclusions []RejectionReason
+	for _, rejected := range route.RejectedCandidates {
+		exclusions = append(exclusions, rejected.Reasons...)
+	}
+	return route, candidate, exclusions, nil
+}
+
+func chosenCandidate(decision RoutingDecision) (Candidate, bool) {
+	for _, candidate := range decision.EligibleCandidates {
+		if candidate.RoutingCandidateID == decision.ChosenCandidateID {
+			return candidate, true
+		}
+	}
+	for _, scored := range decision.ScoredCandidates {
+		if scored.RoutingCandidateID == decision.ChosenCandidateID {
+			return scored.Candidate, true
+		}
+	}
+	return Candidate{}, false
+}
+
+func actualIndependence(worker, verifier Candidate) taskrequirements.IndependenceLevel {
+	if verifier.RoutingCandidateID == "" {
+		return taskrequirements.IndependenceNone
+	}
+	if worker.AdapterID != verifier.AdapterID {
+		return taskrequirements.IndependenceDifferentProvider
+	}
+	if worker.AccountProfileID != verifier.AccountProfileID {
+		return taskrequirements.IndependenceDifferentAccount
+	}
+	if worker.ModelCapabilityID != verifier.ModelCapabilityID {
+		return taskrequirements.IndependenceDifferentModel
+	}
+	return taskrequirements.IndependenceNone
+}
+
+func strongerIndependence(a, b taskrequirements.IndependenceLevel) taskrequirements.IndependenceLevel {
+	if independenceRank(b) > independenceRank(a) {
+		return b
+	}
+	return a
+}
+
+func verificationOutputAllowed(req taskrequirements.TaskRequirement, profile RoutingPolicyProfile) bool {
+	requiredOutput := taskrequirements.OutputVerificationVerdict
+	if risk, ok := profile.RiskPolicy[req.RiskTier]; ok && risk.VerificationOutput != "" {
+		requiredOutput = risk.VerificationOutput
+	}
+	for _, verification := range req.VerificationRequirements {
+		if riskApplies(req.RiskTier, verification.RequiredForRiskTiers) && verification.OutputContract != "" {
+			requiredOutput = verification.OutputContract
+			break
+		}
+	}
+	return requiredOutput == taskrequirements.OutputVerificationVerdict || requiredOutput == taskrequirements.OutputJSONSchema
+}
+
+func evidenceRefs(verdicts []VerifierVerdict) []EvidenceRef {
+	var refs []EvidenceRef
+	for _, verdict := range verdicts {
+		refs = append(refs, verdict.EvidenceRefs...)
+	}
+	for i := range refs {
+		refs[i].Summary = sanitizeText(refs[i].Summary, 160)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].RecordKind != refs[j].RecordKind {
+			return refs[i].RecordKind < refs[j].RecordKind
+		}
+		return refs[i].RecordID < refs[j].RecordID
+	})
+	if len(refs) > 32 {
+		refs = refs[:32]
+	}
+	return refs
+}
+
+func councilDisagreements(verdicts []VerifierVerdict, council CouncilState) []string {
+	var out []string
+	if council.BoundExceeded != "" {
+		out = append(out, "council "+council.BoundExceeded+" bound expired or was exceeded")
+	}
+	first := ""
+	for _, verdict := range verdicts {
+		if first == "" {
+			first = verdict.Verdict
+			continue
+		}
+		if verdict.Verdict != first {
+			out = append(out, "verifier verdicts disagree")
+			break
+		}
+	}
+	for _, verdict := range verdicts {
+		if verdict.Verdict == VerificationVerdictNeedsHuman || verdict.TerminalErrorCode != "" {
+			out = append(out, sanitizeText(firstNonEmpty(verdict.Message, string(verdict.TerminalErrorCode)), 160))
+		}
+	}
+	return out
+}
+
+func sanitizeVerifierVerdicts(verdicts []VerifierVerdict) []VerifierVerdict {
+	out := make([]VerifierVerdict, 0, len(verdicts))
+	for _, verdict := range verdicts {
+		verdict.MemberID = sanitizeIdentifier(verdict.MemberID)
+		verdict.RoutingCandidateID = strings.TrimSpace(verdict.RoutingCandidateID)
+		verdict.Message = sanitizeText(verdict.Message, 256)
+		verdict.Authority = sanitizeIdentifier(verdict.Authority)
+		verdict.EvidenceRefs = evidenceRefs([]VerifierVerdict{verdict})
+		out = append(out, verdict)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].MemberID != out[j].MemberID {
+			return out[i].MemberID < out[j].MemberID
+		}
+		return out[i].RoutingCandidateID < out[j].RoutingCandidateID
+	})
+	return out
+}
+
+func redactedVerificationDecision(decision VerificationDecision) VerificationDecision {
+	decision.DecidedBy.ActorID = sanitizeIdentifier(decision.DecidedBy.ActorID)
+	decision.DecidedBy.Display = sanitizeText(decision.DecidedBy.Display, 80)
+	decision.Host.HostID = sanitizeIdentifier(decision.Host.HostID)
+	decision.VerifierVerdicts = sanitizeVerifierVerdicts(decision.VerifierVerdicts)
+	for i := range decision.Disagreements {
+		decision.Disagreements[i] = sanitizeText(decision.Disagreements[i], 160)
+	}
+	for i := range decision.EligibilityExclusions {
+		decision.EligibilityExclusions[i].Message = sanitizeText(decision.EligibilityExclusions[i].Message, 160)
+		decision.EligibilityExclusions[i].EvidenceRecordIDs = boundedSanitizedIDs(decision.EligibilityExclusions[i].EvidenceRecordIDs, 16)
+		decision.EligibilityExclusions[i].SnapshotIDs = boundedSanitizedIDs(decision.EligibilityExclusions[i].SnapshotIDs, 16)
+	}
+	decision.EvidenceRefs = evidenceRefs([]VerifierVerdict{{EvidenceRefs: decision.EvidenceRefs}})
+	return decision
+}
+
+var secretLikePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`(?i)(token|secret|password|api[_-]?key)=\S+`),
+	regexp.MustCompile(`(?i)bearer\s+[a-z0-9._~+/=-]{12,}`),
+	regexp.MustCompile(`/[A-Za-z0-9._@%+=:,/-]{12,}`),
+}
+
+func sanitizeText(value string, max int) string {
+	value = strings.TrimSpace(value)
+	for _, pattern := range secretLikePatterns {
+		value = pattern.ReplaceAllString(value, "[REDACTED]")
+	}
+	if max > 0 && len(value) > max {
+		return value[:max]
+	}
+	return value
+}
+
+func sanitizeIdentifier(value string) string {
+	return sanitizeText(value, 80)
+}
+
+func boundedSanitizedIDs(values []string, max int) []string {
+	values = dedupeStrings(values)
+	if len(values) > max {
+		values = values[:max]
+	}
+	for i := range values {
+		values[i] = sanitizeIdentifier(values[i])
+	}
+	return values
+}
+
+func verificationRequestFingerprint(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision) string {
+	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
+		"schema_version":               "loopcoder.verification_request.v1",
+		"worker_routing_decision_id":   workerRoute.RoutingDecisionID,
+		"worker_routing_fingerprint":   workerRoute.RoutingFingerprint,
+		"verifier_routing_decision_id": verifierRoute.RoutingDecisionID,
+		"verifier_routing_fingerprint": verifierRoute.RoutingFingerprint,
+		"decision_key":                 strings.TrimSpace(input.DecisionKey),
+		"authority_fingerprint":        strings.TrimSpace(input.AuthorityFingerprint),
+		"verifier_verdicts":            sanitizeVerifierVerdicts(input.VerifierVerdicts),
+		"council_limits":               input.CouncilLimits,
+		"council_rounds_used":          input.CouncilRoundsUsed,
+		"council_budget_tokens_used":   input.CouncilBudgetTokensUsed,
+		"timeout":                      input.Timeout,
+	})
+	if err != nil {
+		return ""
+	}
+	return digest
+}
+
+func verificationIdempotencyKey(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision) string {
+	key := strings.TrimSpace(input.IdempotencyKey)
+	if key != "" {
+		return key
+	}
+	return "verification-event:" + verificationRequestFingerprint(input, workerRoute, verifierRoute)
+}
+
+func verificationDecisionID(projectID, deliveryRunID, taskID, decisionKey, authorityFingerprint, verificationFingerprint string) string {
+	return "vdec_" + digestBase32(projectID, deliveryRunID, taskID, decisionKey, authorityFingerprint, verificationFingerprint)
+}
+
+func loadVerificationByIdempotency(ctx context.Context, tx storage.Tx, deliveryRunID, taskID, decisionKey, key string) (VerificationDecision, bool, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM verification_decisions
+		WHERE delivery_run_id = ? AND task_id = ? AND decision_key = ? AND idempotency_key = ?`,
+		strings.TrimSpace(deliveryRunID), strings.TrimSpace(taskID), strings.TrimSpace(decisionKey), strings.TrimSpace(key)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VerificationDecision{}, false, nil
+	}
+	if err != nil {
+		return VerificationDecision{}, false, err
+	}
+	var decision VerificationDecision
+	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+		return VerificationDecision{}, false, err
+	}
+	return decision, true, nil
+}
+
+func loadVerificationByAuthority(ctx context.Context, tx storage.Tx, deliveryRunID, taskID, decisionKey, authorityFingerprint string) (VerificationDecision, bool, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM verification_decisions
+		WHERE delivery_run_id = ? AND task_id = ? AND decision_key = ? AND final_authority_fingerprint = ?
+		ORDER BY created_at, verification_decision_id LIMIT 1`,
+		strings.TrimSpace(deliveryRunID), strings.TrimSpace(taskID), strings.TrimSpace(decisionKey), strings.TrimSpace(authorityFingerprint)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VerificationDecision{}, false, nil
+	}
+	if err != nil {
+		return VerificationDecision{}, false, err
+	}
+	var decision VerificationDecision
+	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+		return VerificationDecision{}, false, err
+	}
+	return decision, true, nil
+}
+
+func validateVerificationDecision(decision VerificationDecision) error {
+	if decision.SchemaVersion != VerificationDecisionSchema || decision.RecordVersion != 1 ||
+		decision.VerificationDecisionID == "" || decision.ProjectID == "" || decision.DeliveryRunID == "" ||
+		decision.TaskID == "" || decision.TaskRequirementID == "" || decision.WorkerRoutingDecisionID == "" ||
+		decision.DecisionKey == "" || decision.IdempotencyKey == "" || decision.DecisionStatus == "" ||
+		decision.Verdict == "" || decision.RequiredIndependence == "" || decision.ActualIndependence == "" ||
+		decision.FinalAuthority == "" || decision.FinalAuthorityFingerprint == "" || decision.VerificationFingerprint == "" ||
+		decision.PolicyFingerprint == "" || decision.PlanFingerprint == "" || decision.CreatedAt == "" || decision.UpdatedAt == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "verification decision has missing required fields"}
+	}
+	if !validFingerprint(decision.FinalAuthorityFingerprint) || !validFingerprint(decision.VerificationFingerprint) || !validFingerprint(decision.PolicyFingerprint) || !validFingerprint(decision.PlanFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "verification decision fingerprints must be sha256 digests"}
+	}
+	switch decision.DecisionStatus {
+	case VerificationStatusAccepted:
+		if decision.Verdict != VerificationVerdictPass || decision.TerminalErrorCode != "" || decision.FinalAuthority == FinalAuthorityHuman {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "accepted verification decision must be automated pass without terminal error"}
+		}
+	case VerificationStatusRejected:
+		if decision.Verdict != VerificationVerdictFail || decision.TerminalErrorCode == "" {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "rejected verification decision must carry fail verdict and terminal error"}
+		}
+	case VerificationStatusNeedsHuman:
+		if decision.Verdict != VerificationVerdictNeedsHuman || decision.FinalAuthority != FinalAuthorityHuman || decision.TerminalErrorCode == "" {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "needs-human verification decision must carry human authority and terminal error"}
+		}
+	default:
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown verification decision status"}
+	}
+	return nil
+}
+
+func verificationTerminalError(code taskrequirements.ErrorCode) error {
+	switch code {
+	case taskrequirements.ErrNoEligibleCandidateCode:
+		return taskrequirements.ErrNoEligibleCandidate
+	case taskrequirements.ErrVerifierIndependenceRequiredCode:
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrVerifierIndependenceRequiredCode}
+	case taskrequirements.ErrVerifierCouncilBoundExceededCode:
+		return taskrequirements.ErrVerifierCouncilBoundExceeded
+	case taskrequirements.ErrVerificationDecisionConflictCode:
+		return taskrequirements.ErrVerificationDecisionConflict
+	case taskrequirements.ErrRequirementConfidenceInsufficientCode:
+		return taskrequirements.ErrRequirementConfidenceInsufficient
+	case taskrequirements.ErrCapabilityUnsupportedCode:
+		return taskrequirements.ErrCapabilityUnsupported
+	default:
+		return &taskrequirements.TypedError{Code: code}
+	}
+}
+
+func parseCouncilDeadline(limits CouncilLimits) (time.Time, bool) {
+	if strings.TrimSpace(limits.DeadlineAt) != "" {
+		t, err := time.Parse(time.RFC3339Nano, limits.DeadlineAt)
+		return t, err == nil
+	}
+	if strings.TrimSpace(limits.StartedAt) == "" || limits.MaxDurationMS <= 0 {
+		return time.Time{}, false
+	}
+	started, err := time.Parse(time.RFC3339Nano, limits.StartedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return started.Add(time.Duration(limits.MaxDurationMS) * time.Millisecond), true
+}
+
+func nonNilRejectionReasons(values []RejectionReason) []RejectionReason {
+	if values == nil {
+		return []RejectionReason{}
+	}
+	return values
+}

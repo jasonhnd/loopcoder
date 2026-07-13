@@ -34,6 +34,8 @@ const (
 	ErrRoleUnsupportedCode                   ErrorCode = "ErrRoleUnsupported"
 	ErrCapabilityUnsupportedCode             ErrorCode = "ErrCapabilityUnsupported"
 	ErrVerifierIndependenceRequiredCode      ErrorCode = "ErrVerifierIndependenceRequired"
+	ErrVerifierCouncilBoundExceededCode      ErrorCode = "ErrVerifierCouncilBoundExceeded"
+	ErrVerificationDecisionConflictCode      ErrorCode = "ErrVerificationDecisionConflict"
 	ErrFallbackWouldWeakenPolicyCode         ErrorCode = "ErrFallbackWouldWeakenPolicy"
 	ErrReplanRequiredCode                    ErrorCode = "ErrReplanRequired"
 	ErrReplanBoundExceededCode               ErrorCode = "ErrReplanBoundExceeded"
@@ -57,6 +59,9 @@ var (
 	ErrReplanBoundExceeded               = &TypedError{Code: ErrReplanBoundExceededCode}
 	ErrRoutingFingerprintMismatch        = &TypedError{Code: ErrRoutingFingerprintMismatchCode}
 	ErrCapabilityUnsupported             = &TypedError{Code: ErrCapabilityUnsupportedCode}
+	ErrVerifierIndependenceRequired      = &TypedError{Code: ErrVerifierIndependenceRequiredCode}
+	ErrVerifierCouncilBoundExceeded      = &TypedError{Code: ErrVerifierCouncilBoundExceededCode}
+	ErrVerificationDecisionConflict      = &TypedError{Code: ErrVerificationDecisionConflictCode}
 	ErrInvalidRecord                     = &TypedError{Code: ErrInvalidRecordCode}
 	ErrDuplicateRecord                   = &TypedError{Code: ErrDuplicateRecordCode}
 	ErrMissingReference                  = &TypedError{Code: ErrMissingReferenceCode}
