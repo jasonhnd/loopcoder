@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,19 +37,19 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions", "nested_scheduler_resource_reservations"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
 	}
 	var migrationName string
 	if err := store.WithTx(ctx, func(tx Tx) error {
-		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 26`).Scan(&migrationName)
+		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 27`).Scan(&migrationName)
 	}); err != nil {
-		t.Fatalf("query migration 26: %v", err)
+		t.Fatalf("query migration 27: %v", err)
 	}
-	if migrationName != "durable handoff transactions" {
-		t.Fatalf("migration 26 name = %q", migrationName)
+	if migrationName != "nested scheduler resource reservations" {
+		t.Fatalf("migration 27 name = %q", migrationName)
 	}
 	if tableColumnExists(t, store, "routing_decisions", "alternatives_json") {
 		t.Fatalf("routing_decisions includes non-v1 alternatives_json column")
@@ -1433,6 +1434,236 @@ func TestRenewChildRunClaimExtendsLeaseAndFencesOwner(t *testing.T) {
 	}
 }
 
+func TestClaimChildRunExecutionWithReservationsRejectsZeroBudgetAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	req := nestedSchedulerStorageBudgetRequest(children[0].RunID)
+	req.BudgetRequestedValue = 0
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	_, err = ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(time.Minute), req)
+	if err == nil || !strings.Contains(err.Error(), string(ErrChildBudgetRequiredCode)) {
+		t.Fatalf("ClaimChildRunExecutionWithReservations error = %v, want child budget required", err)
+	}
+	var claims, resources, reservations int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ?`, children[0].RunID).Scan(&resources); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&reservations)
+	}); err != nil {
+		t.Fatalf("query rollback counts: %v", err)
+	}
+	if claims != 0 || resources != 0 || reservations != 0 {
+		t.Fatalf("partial rows claims/resources/budgets = %d/%d/%d, want 0/0/0", claims, resources, reservations)
+	}
+}
+
+func TestClaimChildRunExecutionWithReservationsRequiredAuthorityEmptyRollsBack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	_, err = ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(time.Minute), SchedulerResourceReservationRequest{
+		RequireBudgetAuthority: true,
+	})
+	if !errors.Is(err, ErrChildBudgetRequired) {
+		t.Fatalf("ClaimChildRunExecutionWithReservations error = %v, want ErrChildBudgetRequired", err)
+	}
+	var claims, resources, reservations int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ?`, children[0].RunID).Scan(&resources); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&reservations)
+	}); err != nil {
+		t.Fatalf("query rollback counts: %v", err)
+	}
+	if claims != 0 || resources != 0 || reservations != 0 {
+		t.Fatalf("partial rows claims/resources/budgets = %d/%d/%d, want 0/0/0", claims, resources, reservations)
+	}
+}
+
+func TestClaimChildRunExecutionWithReservationsRejectsMismatchedChosenCandidate(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	req := nestedSchedulerStorageBudgetRequest(children[0].RunID)
+	if err := seedNestedSchedulerStorageBudgetAuthority(ctx, store, req, "claude", true); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	_, err = ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(time.Minute), req)
+	if err == nil || !strings.Contains(err.Error(), "does not match requested provider route") {
+		t.Fatalf("ClaimChildRunExecutionWithReservations error = %v, want chosen-candidate route mismatch", err)
+	}
+}
+
+func TestClaimChildRunExecutionWithReservationsMissingAggregateRollsBack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	req := nestedSchedulerStorageBudgetRequest(children[0].RunID)
+	if err := seedNestedSchedulerStorageBudgetAuthority(ctx, store, req, req.AdapterID, false); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	_, err = ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(time.Minute), req)
+	if err == nil || !strings.Contains(err.Error(), "budget aggregate") {
+		t.Fatalf("ClaimChildRunExecutionWithReservations error = %v, want missing aggregate", err)
+	}
+	var claims, reservations int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&claims); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&reservations)
+	}); err != nil {
+		t.Fatalf("query rollback counts: %v", err)
+	}
+	if claims != 0 || reservations != 0 {
+		t.Fatalf("partial rows claims/budgets = %d/%d, want 0/0", claims, reservations)
+	}
+}
+
+func TestRenewChildRunClaimFailsAtomicallyWhenNestedAuthorityMissing(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	req := nestedSchedulerStorageBudgetRequest(children[0].RunID)
+	if err := seedNestedSchedulerStorageBudgetAuthority(ctx, store, req, req.AdapterID, true); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(2*time.Minute), req)
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecutionWithReservations: %v", err)
+	}
+	var oldHeartbeat, oldClaimLease, oldBudgetLease string
+	var oldBudgetGeneration int64
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT heartbeat_at, lease_expires_at FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&oldHeartbeat, &oldClaimLease); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT generation, lease_expires_at FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&oldBudgetGeneration, &oldBudgetLease); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM nested_scheduler_resource_reservations WHERE run_id = ? AND resource_kind = 'provider'`, children[0].RunID)
+		return err
+	}); err != nil {
+		t.Fatalf("delete resource reservation: %v", err)
+	}
+	err = RenewChildRunClaim(ctx, store, children[0].RunID, claim.ExecutorID, claim.ClaimGeneration, now.Add(30*time.Second), now.Add(3*time.Minute))
+	if err == nil || !strings.Contains(err.Error(), string(ErrChildBudgetRequiredCode)) {
+		t.Fatalf("RenewChildRunClaim error = %v, want child budget required", err)
+	}
+	var heartbeat, claimLease, budgetLease string
+	var budgetGeneration int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT heartbeat_at, lease_expires_at FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&heartbeat, &claimLease); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT generation, lease_expires_at FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&budgetGeneration, &budgetLease)
+	}); err != nil {
+		t.Fatalf("query renewal state: %v", err)
+	}
+	if heartbeat != oldHeartbeat || claimLease != oldClaimLease || budgetGeneration != oldBudgetGeneration || budgetLease != oldBudgetLease {
+		t.Fatalf("renew mutated state heartbeat=%q/%q claimLease=%q/%q budget=%d/%d budgetLease=%q/%q",
+			heartbeat, oldHeartbeat, claimLease, oldClaimLease, budgetGeneration, oldBudgetGeneration, budgetLease, oldBudgetLease)
+	}
+}
+
+func TestCompleteClaimedChildRunReconcilesNestedBudgetOnce(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	req := nestedSchedulerStorageBudgetRequest(children[0].RunID)
+	if err := seedNestedSchedulerStorageBudgetAuthority(ctx, store, req, req.AdapterID, true); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(2*time.Minute), req)
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecutionWithReservations: %v", err)
+	}
+	if err := CompleteClaimedChildRun(ctx, store, parent.RunID, children[0].RunID, claim.ExecutorID, claim.ClaimGeneration, "succeeded", formatTimestamp(now.Add(time.Minute)), "done", ""); err != nil {
+		t.Fatalf("CompleteClaimedChildRun first: %v", err)
+	}
+	var committedBefore int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT committed_value FROM budget_aggregates WHERE budget_policy_id = 'bpol-storage-project'`).Scan(&committedBefore)
+	}); err != nil {
+		t.Fatalf("query committed before replay: %v", err)
+	}
+	err = CompleteClaimedChildRun(ctx, store, parent.RunID, children[0].RunID, claim.ExecutorID, claim.ClaimGeneration, "succeeded", formatTimestamp(now.Add(90*time.Second)), "done again", "")
+	if err == nil || !strings.Contains(err.Error(), string(ErrChildBudgetRequiredCode)) {
+		t.Fatalf("CompleteClaimedChildRun replay error = %v, want child budget required", err)
+	}
+	var committedAfter int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT committed_value FROM budget_aggregates WHERE budget_policy_id = 'bpol-storage-project'`).Scan(&committedAfter)
+	}); err != nil {
+		t.Fatalf("query committed after replay: %v", err)
+	}
+	if committedBefore != req.BudgetRequestedValue || committedAfter != committedBefore {
+		t.Fatalf("committed before/after = %d/%d, want exactly one commit of %d", committedBefore, committedAfter, req.BudgetRequestedValue)
+	}
+}
+
 func TestClaimChildRunExecutionExpiredExecutingClaimNeedsHuman(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
@@ -1972,4 +2203,114 @@ func seedRunGraphRows(t *testing.T, ctx context.Context, store Store, runs []Run
 
 func fixedNow() time.Time {
 	return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+}
+
+func nestedSchedulerStorageBudgetRequest(childRunID string) SchedulerResourceReservationRequest {
+	return SchedulerResourceReservationRequest{
+		RootRunID:                "run-parent",
+		ProviderKey:              "route-storage:codex:acct-storage:mcap-storage",
+		RootMaxConcurrency:       3,
+		ParentMaxConcurrency:     3,
+		ProviderMaxConcurrency:   3,
+		ProjectID:                "proj-storage-budget",
+		DeliveryRunID:            "drun-storage-budget",
+		TaskID:                   "task-storage-budget",
+		SubAgentID:               childRunID,
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-storage",
+		ModelCapabilityID:        "mcap-storage",
+		RoutingDecisionID:        "route-storage-budget",
+		RoutingFingerprint:       "sha256:route-storage-budget",
+		PlanFingerprint:          "sha256:plan-storage-budget",
+		PolicyFingerprint:        "sha256:policy-storage-budget",
+		AuthorizationFingerprint: "sha256:auth-storage-budget",
+		BudgetRequestedValue:     25,
+		BudgetQuantityKind:       "local-policy",
+		BudgetUnit:               "local-policy-unit",
+		BudgetWindowKind:         "unbounded",
+	}
+}
+
+func seedNestedSchedulerStorageBudgetAuthority(ctx context.Context, store Store, req SchedulerResourceReservationRequest, candidateAdapter string, withAggregates bool) error {
+	at := formatTimestamp(fixedNow())
+	projectScope, err := nestedSchedulerBudgetScopeKey(nestedBudgetScope{ScopeKind: "project", ProjectID: req.ProjectID})
+	if err != nil {
+		return err
+	}
+	providerScope, err := nestedSchedulerBudgetScopeKey(nestedBudgetScope{
+		ScopeKind:         "provider-scope",
+		ProjectID:         req.ProjectID,
+		AdapterID:         req.AdapterID,
+		AccountProfileID:  req.AccountProfileID,
+		ModelCapabilityID: req.ModelCapabilityID,
+	})
+	if err != nil {
+		return err
+	}
+	candidates, err := json.Marshal([]map[string]any{{
+		"routing_candidate_id":   "candidate-storage-budget",
+		"task_id":                req.TaskID,
+		"adapter_id":             candidateAdapter,
+		"account_profile_id":     req.AccountProfileID,
+		"model_capability_id":    req.ModelCapabilityID,
+		"candidate_fingerprint":  "sha256:candidate-storage-budget",
+		"invocation_profile_key": "default",
+		"budget_policy_ids":      []string{"bpol-storage-project", "bpol-storage-provider"},
+	}})
+	if err != nil {
+		return err
+	}
+	return store.WithWriteTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			req.ProjectID, "/tmp/"+req.ProjectID, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO delivery_runs(
+			delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
+			state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+			policy_version, max_side_effect_class, approval_status, override_status, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, 'loopcoder.delivery_run.v1', 1, ?, 'run-parent', '', 'approved', 'storage budget test',
+				'sha256:input-storage-budget', ?, ?, ?, '0805.agent_federation.v1', 'repo-write', 'approved', 'none',
+				?, ?, '{}', '{}', '{}')`,
+			req.DeliveryRunID, "run-storage-delivery", req.ProjectID, req.PolicyFingerprint, req.PlanFingerprint, req.AuthorizationFingerprint, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO routing_decisions(
+			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
+			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
+			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
+			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json,
+			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
+			VALUES (?, 'loopcoder.routing_decision.v1', 1, ?, ?, ?, 'treq-storage-budget', 'route-storage-budget', 'routing',
+				'rprofile-storage-budget', '', ?, ?, ?, 'full', 'selected', 'candidate-storage-budget', '',
+				'[]', ?, '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
+			req.RoutingDecisionID, req.ProjectID, req.DeliveryRunID, req.TaskID, req.PlanFingerprint, req.PolicyFingerprint, req.RoutingFingerprint, string(candidates), at, at); err != nil {
+			return err
+		}
+		for _, policy := range []struct {
+			id    string
+			scope string
+		}{
+			{id: "bpol-storage-project", scope: projectScope},
+			{id: "bpol-storage-provider", scope: providerScope},
+		} {
+			if _, err := tx.Exec(ctx, `INSERT INTO budget_policies(
+				budget_policy_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+				model_capability_id, scope_kind, scope_key, quantity_kind, unit, window_kind, policy_mode,
+				ceiling_value, active, policy_version, payload_json)
+				VALUES (?, ?, '', '', '', ?, ?, ?, '', ?, 'local-policy', 'local-policy-unit', 'unbounded', 'hard',
+					100, 1, '0805.agent_federation.v1', '{}')`,
+				policy.id, req.ProjectID, req.AdapterID, req.AccountProfileID, req.ModelCapabilityID, policy.scope); err != nil {
+				return err
+			}
+			if withAggregates {
+				if _, err := tx.Exec(ctx, `INSERT INTO budget_aggregates(budget_policy_id, reserved_value, committed_value, updated_at) VALUES (?, 0, 0, ?)`,
+					policy.id, at); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }

@@ -592,7 +592,16 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 	return record, err
 }
 
+func ChildAgentIDForRegistration(req AgentRegistrationRequest) string {
+	req = normalizeRegistrationRequest(req)
+	return stableID("agent_", req.ProjectID, req.DeliveryRunID, req.ParentRunID, req.TaskID, req.AttemptID, req.ChildKey, req.PlanFingerprint)
+}
+
 func ClaimAndRegisterNativeChild(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, req AgentRegistrationRequest) (ClaimResult, AgentRegistration, error) {
+	return ClaimAndRegisterNativeChildWithReservations(ctx, store, parentRunID, childRunID, executorID, now, leaseUntil, req, SchedulerResourceReservationRequest{})
+}
+
+func ClaimAndRegisterNativeChildWithReservations(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, req AgentRegistrationRequest, reservation SchedulerResourceReservationRequest) (ClaimResult, AgentRegistration, error) {
 	if store == nil {
 		return ClaimResult{}, AgentRegistration{}, federationError(ErrAgentRegistrationRequiredCode, "store is required")
 	}
@@ -623,6 +632,18 @@ func ClaimAndRegisterNativeChild(ctx context.Context, store Store, parentRunID, 
 			}
 			switch claim.Outcome {
 			case ClaimOutcomeClaimed, ClaimOutcomeStaleClaim:
+				if err := reserveNestedSchedulerResourcesTx(ctx, tx, claim, parentRunID, reservation, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+					return err
+				}
+				if len(req.BudgetBindings) == 0 {
+					bindings, err := reserveNestedSchedulerBudgetTx(ctx, tx, claim, reservation, formatTimestamp(now), formatTimestamp(leaseUntil))
+					if err != nil {
+						return err
+					}
+					if len(bindings) > 0 {
+						req.BudgetBindings = append(req.BudgetBindings, bindings...)
+					}
+				}
 			default:
 				return nil
 			}

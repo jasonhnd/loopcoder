@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 26
+	CurrentSchemaVersion = 27
 
 	driverName = "sqlite"
 
@@ -396,6 +396,11 @@ var migrations = []migration{
 		name:       "durable handoff transactions",
 		statements: handoffSchemaStatements,
 	},
+	{
+		version:    27,
+		name:       "nested scheduler resource reservations",
+		statements: nestedSchedulerReservationSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -451,6 +456,7 @@ var requiredTables = []string{
 	"verification_decisions",
 	"progress_receipts",
 	"handoff_transactions",
+	"nested_scheduler_resource_reservations",
 	"agent_scope_grants",
 	"agent_registrations",
 	"agent_ownership_locks",

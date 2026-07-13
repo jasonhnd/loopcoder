@@ -5457,6 +5457,7 @@ func TestNestedRunReplaysSamePlanFileWithOmittedChildRunIDsIdempotently(t *testi
 			nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
 		},
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	planData, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
@@ -6694,6 +6695,193 @@ func readRepoFile(t *testing.T, rel string) string {
 	return string(data)
 }
 
+type cliNestedSchedulerAuthority struct {
+	ProjectID                string `json:"project_id"`
+	DeliveryRunID            string `json:"delivery_run_id"`
+	TaskID                   string `json:"task_id"`
+	AdapterID                string `json:"adapter_id"`
+	AccountProfileID         string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID        string `json:"model_capability_id,omitempty"`
+	RoutingDecisionID        string `json:"routing_decision_id"`
+	RoutingFingerprint       string `json:"routing_fingerprint"`
+	PlanFingerprint          string `json:"plan_fingerprint"`
+	PolicyFingerprint        string `json:"policy_fingerprint"`
+	AuthorizationFingerprint string `json:"authorization_fingerprint"`
+	BudgetRequestedValue     int64  `json:"budget_requested_value"`
+	BudgetQuantityKind       string `json:"budget_quantity_kind,omitempty"`
+	BudgetUnit               string `json:"budget_unit,omitempty"`
+	BudgetWindowKind         string `json:"budget_window_kind,omitempty"`
+}
+
+type cliNestedBudgetScope struct {
+	ScopeKind         string `json:"scope_kind"`
+	ProjectID         string `json:"project_id,omitempty"`
+	DeliveryRunID     string `json:"delivery_run_id,omitempty"`
+	TaskID            string `json:"task_id,omitempty"`
+	WorkerID          string `json:"worker_id,omitempty"`
+	SubAgentID        string `json:"sub_agent_id,omitempty"`
+	AdapterID         string `json:"adapter_id,omitempty"`
+	AccountProfileID  string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID string `json:"model_capability_id,omitempty"`
+}
+
+func seedAndApplyCLINestedSchedulerAuthority(t *testing.T, plan *orchestration.ChildPlan) {
+	t.Helper()
+	loopHome := strings.TrimSpace(os.Getenv("LOOPCODER_HOME"))
+	if loopHome == "" {
+		return
+	}
+	authority := cliNestedSchedulerAuthorityForPlan(plan.PlanID)
+	metadata := mustCLINestedSchedulerAuthorityJSON(t, authority)
+	for i := range plan.Items {
+		plan.Items[i].Metadata = metadata
+	}
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(loopHome, "data", "loopcoder.db"), Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("storage.Open authority seed: %v", err)
+	}
+	defer store.Close()
+	if err := seedCLINestedSchedulerAuthority(context.Background(), store, authority, 100); err != nil {
+		t.Fatalf("seed nested scheduler authority: %v", err)
+	}
+}
+
+func mustCLINestedSchedulerAuthorityJSON(t *testing.T, authority cliNestedSchedulerAuthority) json.RawMessage {
+	t.Helper()
+	if authority.BudgetQuantityKind == "" {
+		authority.BudgetQuantityKind = "local-policy"
+	}
+	if authority.BudgetUnit == "" {
+		authority.BudgetUnit = "local-policy-unit"
+	}
+	if authority.BudgetWindowKind == "" {
+		authority.BudgetWindowKind = "unbounded"
+	}
+	data, err := json.Marshal(authority)
+	if err != nil {
+		t.Fatalf("marshal scheduler authority: %v", err)
+	}
+	return data
+}
+
+func cliNestedSchedulerAuthorityForPlan(planID string) cliNestedSchedulerAuthority {
+	suffix := strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		case r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, planID), "-")
+	if suffix == "" {
+		suffix = "default"
+	}
+	return cliNestedSchedulerAuthority{
+		ProjectID:                "proj-" + suffix,
+		DeliveryRunID:            "drun-" + suffix,
+		TaskID:                   "task-" + suffix,
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-" + suffix,
+		ModelCapabilityID:        "mcap-" + suffix,
+		RoutingDecisionID:        "route-" + suffix,
+		RoutingFingerprint:       "sha256:route-" + suffix,
+		PlanFingerprint:          "sha256:plan-" + suffix,
+		PolicyFingerprint:        "sha256:policy-" + suffix,
+		AuthorizationFingerprint: "sha256:auth-" + suffix,
+		BudgetRequestedValue:     1,
+	}
+}
+
+func seedCLINestedSchedulerAuthority(ctx context.Context, store storage.Store, authority cliNestedSchedulerAuthority, ceiling int64) error {
+	at := state.FormatTimestamp(fixedCLINow())
+	candidates, err := json.Marshal([]map[string]any{{
+		"routing_candidate_id":   "candidate-cli",
+		"task_id":                authority.TaskID,
+		"adapter_id":             authority.AdapterID,
+		"account_profile_id":     authority.AccountProfileID,
+		"model_capability_id":    authority.ModelCapabilityID,
+		"candidate_fingerprint":  "sha256:candidate-cli",
+		"invocation_profile_key": "default",
+	}})
+	if err != nil {
+		return err
+	}
+	projectScope := mustCLIBudgetScopeKey(cliNestedBudgetScope{ScopeKind: "project", ProjectID: authority.ProjectID})
+	providerScope := mustCLIBudgetScopeKey(cliNestedBudgetScope{
+		ScopeKind:         "provider-scope",
+		ProjectID:         authority.ProjectID,
+		AdapterID:         authority.AdapterID,
+		AccountProfileID:  authority.AccountProfileID,
+		ModelCapabilityID: authority.ModelCapabilityID,
+	})
+	policySuffix := strings.TrimPrefix(authority.ProjectID, "proj-")
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			authority.ProjectID, "/tmp/"+authority.ProjectID, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO delivery_runs(
+			delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
+			state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+			policy_version, max_side_effect_class, approval_status, override_status, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, 'loopcoder.delivery_run.v1', 1, ?, 'root-cli', '', 'approved', 'cli nested scheduler test',
+				'sha256:input-cli', ?, ?, ?, '0805.agent_federation.v1', 'repo-write', 'approved', 'none',
+				?, ?, '{}', '{}', '{}')`,
+			authority.DeliveryRunID, "delivery-cli", authority.ProjectID, authority.PolicyFingerprint,
+			authority.PlanFingerprint, authority.AuthorizationFingerprint, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO routing_decisions(
+			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
+			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
+			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
+			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json,
+			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
+			VALUES (?, 'loopcoder.routing_decision.v1', 1, ?, ?, ?, 'treq-cli', 'route-cli', 'routing',
+				'rprofile-cli', '', ?, ?, ?, 'full', 'selected', 'candidate-cli', '',
+				'[]', ?, '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
+			authority.RoutingDecisionID, authority.ProjectID, authority.DeliveryRunID, authority.TaskID,
+			authority.PlanFingerprint, authority.PolicyFingerprint, authority.RoutingFingerprint, string(candidates), at, at); err != nil {
+			return err
+		}
+		for _, policy := range []struct {
+			id    string
+			scope string
+		}{
+			{id: "bpol-cli-project-" + policySuffix, scope: projectScope},
+			{id: "bpol-cli-provider-" + policySuffix, scope: providerScope},
+		} {
+			if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO budget_policies(
+				budget_policy_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+				model_capability_id, scope_kind, scope_key, quantity_kind, unit, window_kind, policy_mode,
+				ceiling_value, active, policy_version, payload_json)
+				VALUES (?, ?, '', '', '', ?, ?, ?, '', ?, 'local-policy', 'local-policy-unit', 'unbounded', 'hard',
+					?, 1, '0805.agent_federation.v1', '{}')`,
+				policy.id, authority.ProjectID, authority.AdapterID, authority.AccountProfileID, authority.ModelCapabilityID, policy.scope, ceiling); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO budget_aggregates(budget_policy_id, reserved_value, committed_value, updated_at) VALUES (?, 0, 0, ?)`,
+				policy.id, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func mustCLIBudgetScopeKey(scope cliNestedBudgetScope) string {
+	data, err := json.Marshal(scope)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
 func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.ChildRunPlan, maxConcurrency int) string {
 	t.Helper()
 	for i := range items {
@@ -6711,6 +6899,7 @@ func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.Chi
 		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
 		Items:          items,
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	data, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
@@ -6741,6 +6930,7 @@ func writeNestedPlanFixtureWithIDs(t *testing.T, repo, parentRunID, rootRunID st
 		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
 		Items:          items,
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	data, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
