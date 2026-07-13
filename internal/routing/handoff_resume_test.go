@@ -331,6 +331,88 @@ func TestResumeApprovedHandoffCancellationAfterRegistrationTerminalizesLaunch(t 
 	}
 }
 
+func TestResumeApprovedHandoffCancellationAfterPrepareReleasesDestinationOwnership(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			cancelled = true
+			return nil
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("post-prepare cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("post-prepare cancellation executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("post-prepare reservation state = %q, want released", state)
+	}
+	assertNoDestinationHeldLocks(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration)
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration, storage.OwnershipStateReleased)
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateCancelled || state.attemptState != "cancelled" || state.taskState != "cancelled" {
+		t.Fatalf("post-prepare durable state = %#v, want cancelled terminal state", state)
+	}
+}
+
+func TestResumeApprovedHandoffCancellationAfterRegistrationReleasesDestinationOwnership(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterRegistration: func() error {
+			cancelled = true
+			return nil
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("post-registration cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("post-registration cancellation executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("post-registration reservation state = %q, want released", state)
+	}
+	assertNoDestinationHeldLocks(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration)
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration, storage.OwnershipStateReleased)
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateCancelled || state.attemptState != "cancelled" || state.taskState != "cancelled" {
+		t.Fatalf("post-registration durable state = %#v, want cancelled terminal state", state)
+	}
+}
+
 func TestResumeApprovedHandoffLiveCancellationAtLaunchBoundaryDoesNotExecute(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -745,6 +827,196 @@ func TestResumeApprovedHandoffNilErrorExplicitAmbiguousNeedsHumanWithoutFallback
 	}
 }
 
+func TestResumeApprovedHandoffNotStartedReleasesDestinationOwnership(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionNotStarted}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("not-started outcome error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("not-started executions = %d, want 1", executions.Load())
+	}
+	if result.Fallback.FallbackDecisionID == "" || countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID) != 1 {
+		t.Fatalf("not-started fallback result=%#v count=%d, want bounded fallback", result.Fallback, countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID))
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("not-started reservation state = %q, want released", state)
+	}
+	assertNoDestinationHeldLocks(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration)
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration, storage.OwnershipStateReleased)
+}
+
+func TestResumeApprovedHandoffAmbiguousFencesDestinationOwnershipNeedsHuman(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionAmbiguous}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("ambiguous outcome error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("ambiguous executions = %d, want 1", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("ambiguous reservation state = %q, want released", state)
+	}
+	assertNoDestinationHeldLocks(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration)
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration, storage.OwnershipStateNeedsHuman)
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(replayErr, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("ambiguous replay error = %v, want ErrReplanRequired", replayErr)
+	}
+	if executions.Load() != 1 || !replayed.Blocked || replayed.Successor.LaunchExposed {
+		t.Fatalf("ambiguous replay result=%#v executions=%d, want blocked observe-only replay", replayed, executions.Load())
+	}
+}
+
+func TestResumeApprovedHandoffTerminalCleanupStaleOwnershipRollsBack(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterRegistration: func() error {
+			cancelled = true
+			return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+				_, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET claim_generation = claim_generation + 10 WHERE run_id = ? AND claim_generation = ?`, handoff.ChildRunID, handoff.HandoffGeneration)
+				return err
+			})
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, storage.ErrOwnershipStale) {
+		t.Fatalf("stale ownership cleanup error = %v, want ErrOwnershipStale", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("stale ownership cleanup executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("stale ownership cleanup reservation state = %q, want active rollback", state)
+	}
+	if count := destinationHeldLockCount(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration); count != 0 {
+		t.Fatalf("stale ownership cleanup held locks at original generation = %d, want 0", count)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseLaunching || state.registrationState != storage.AgentStateLaunching || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("stale ownership cleanup durable state = %#v, want rollback to launching/claimed", state)
+	}
+}
+
+func TestResumeApprovedHandoffTerminalCleanupCommitFailureRollsBackReservationAndOwnership(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	path := tempDB(t)
+	seedStore, handoff, input := handoffResumeOwnershipFixtureAtPath(t, ctx, fixture, path)
+	makeClaudeEligibleOnly(input)
+	if err := seedStore.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+	commitErr := errors.New("terminal cleanup commit failed")
+	var failCleanupCommit atomic.Bool
+	store, err := storage.Open(ctx, storage.Options{
+		Path: path,
+		Now:  func() time.Time { return fixture.now },
+		WriteTxCommitHookForTest: func(commitCtx context.Context, _ storage.Tx, commit func(context.Context) error) error {
+			if failCleanupCommit.Load() {
+				return commitErr
+			}
+			return commit(commitCtx)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open storage with commit hook: %v", err)
+	}
+	defer store.Close()
+	cancelled := false
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterRegistration: func() error {
+			failCleanupCommit.Store(true)
+			cancelled = true
+			return nil
+		},
+		IsCancelled: func(context.Context) bool { return cancelled },
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, commitErr) || !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("cleanup commit error = %v, want commitErr and ErrReplanRequired", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("cleanup commit failure executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("cleanup commit failure reservation state = %q, want active rollback", state)
+	}
+	if count := destinationHeldLockCount(t, ctx, store, handoff.ChildRunID, result.Successor.ClaimGeneration); count == 0 {
+		t.Fatalf("cleanup commit failure held locks = %d, want rollback to held launch authority", count)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseLaunching || state.registrationState != storage.AgentStateLaunching || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("cleanup commit failure durable state = %#v, want rollback to launching/claimed", state)
+	}
+}
+
 func TestResumeApprovedHandoffStartedOutcomeWithoutReceiptMarksExecuting(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -1080,6 +1352,21 @@ func handoffResumeFixture(t *testing.T, ctx context.Context, fixture hardFixture
 
 func handoffResumeFixtureAtPath(t *testing.T, ctx context.Context, fixture hardFixture, path string) (storage.Store, storage.HandoffTransaction, DecisionInput) {
 	t.Helper()
+	return handoffResumeFixtureAtPathWithOwnership(t, ctx, fixture, path, false)
+}
+
+func handoffResumeOwnershipFixture(t *testing.T, ctx context.Context, fixture hardFixture) (storage.Store, storage.HandoffTransaction, DecisionInput) {
+	t.Helper()
+	return handoffResumeOwnershipFixtureAtPath(t, ctx, fixture, tempDB(t))
+}
+
+func handoffResumeOwnershipFixtureAtPath(t *testing.T, ctx context.Context, fixture hardFixture, path string) (storage.Store, storage.HandoffTransaction, DecisionInput) {
+	t.Helper()
+	return handoffResumeFixtureAtPathWithOwnership(t, ctx, fixture, path, true)
+}
+
+func handoffResumeFixtureAtPathWithOwnership(t *testing.T, ctx context.Context, fixture hardFixture, path string, withOwnership bool) (storage.Store, storage.HandoffTransaction, DecisionInput) {
+	t.Helper()
 	store, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
 	if err != nil {
 		t.Fatalf("Open storage: %v", err)
@@ -1090,12 +1377,20 @@ func handoffResumeFixtureAtPath(t *testing.T, ctx context.Context, fixture hardF
 	input.Inputs.Requirement.SideEffectClass = taskrequirements.SideEffectLocalRead
 	input.Inputs.Requirement.RoleKey = RoleKeyLuna
 	input.Inputs.Requirement.ScopeJSON = `{"paths":["README.md"],"repo":"proj-routing"}`
+	if withOwnership {
+		input.Inputs.Requirement.PermissionRequired = taskrequirements.PermissionWrite
+		input.Inputs.Requirement.SideEffectClass = taskrequirements.SideEffectLocalWrite
+	}
 	for i := range input.Inputs.Candidates {
 		input.Inputs.Candidates[i].Permission = taskrequirements.PermissionReadOnly
 		input.Inputs.Candidates[i].LaunchSideEffectClass = taskrequirements.SideEffectLocalRead
 		input.Inputs.Candidates[i].RoleKey = RoleKeyLuna
 		input.Inputs.Candidates[i].RoutingCandidateID = ""
 		input.Inputs.Candidates[i].CandidateFingerprint = ""
+		if withOwnership {
+			input.Inputs.Candidates[i].Permission = taskrequirements.PermissionWrite
+			input.Inputs.Candidates[i].LaunchSideEffectClass = taskrequirements.SideEffectLocalWrite
+		}
 	}
 	input.Inputs.Requirement = persistFallbackTaskRequirement(t, ctx, store, input.Inputs.Requirement, fixture.now)
 	input.TaskRequirementID = input.Inputs.Requirement.TaskRequirementID
@@ -1112,7 +1407,7 @@ func handoffResumeFixtureAtPath(t *testing.T, ctx context.Context, fixture hardF
 	if err != nil {
 		t.Fatalf("ClaimChildRunExecution: %v", err)
 	}
-	seedHandoffAgentAuthority(t, ctx, store, fixture, claim)
+	seedHandoffAgentAuthority(t, ctx, store, fixture, claim, input, withOwnership)
 	handoff, err := storage.RecordHandoffTransaction(ctx, store, storage.HandoffRequest{
 		IdempotencyKey:            "handoff-quota-a",
 		ProjectID:                 "proj-routing",
@@ -1141,11 +1436,23 @@ func handoffResumeFixtureAtPath(t *testing.T, ctx context.Context, fixture hardF
 func seedHandoffRuntime(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, input DecisionInput) {
 	t.Helper()
 	at := delivery.CanonicalTimestamp(fixture.now)
+	permission := input.Inputs.Requirement.PermissionRequired
+	if permission == "" {
+		permission = taskrequirements.PermissionReadOnly
+	}
+	sideEffect := input.Inputs.Requirement.SideEffectClass
+	if sideEffect == "" {
+		sideEffect = taskrequirements.SideEffectLocalRead
+	}
+	scopeJSON := strings.TrimSpace(input.Inputs.Requirement.ScopeJSON)
+	if scopeJSON == "" {
+		scopeJSON = `{"paths":["README.md"],"repo":"proj-routing"}`
+	}
 	if err := storage.PersistChildPlanGraph(ctx, store,
 		storage.RunNode{RunID: "run-routing", ProjectID: "proj-routing", RootRunID: "run-routing", Depth: 0, Origin: "test", Status: "running", CreatedAt: at, UpdatedAt: at},
 		[]storage.RunNode{{RunID: "run-routing-child", ProjectID: "proj-routing", ParentRunID: "run-routing", RootRunID: "run-routing", Depth: 1, Origin: "handoff", Status: "planned", CreatedAt: at, UpdatedAt: at}},
 		storage.ChildPlanRecord{PlanID: "plan-child", ParentRunID: "run-routing", RootRunID: "run-routing", SchemaVersion: "loopcoder.child_plan.v1", MaxDepth: 2, MaxConcurrency: 1, PlanJSON: "{}", CreatedAt: at},
-		[]storage.RunEdgeRecord{{ParentRunID: "run-routing", ChildRunID: "run-routing-child", RootRunID: "run-routing", PlanID: "plan-child", ChildKey: "worker", Depth: 1, Ordinal: 0, ScopeJSON: "{}", Permission: storage.PermissionReadOnly, AggregationJSON: "{}", Status: "planned", CreatedAt: at, UpdatedAt: at}},
+		[]storage.RunEdgeRecord{{ParentRunID: "run-routing", ChildRunID: "run-routing-child", RootRunID: "run-routing", PlanID: "plan-child", ChildKey: "worker", Depth: 1, Ordinal: 0, ScopeJSON: scopeJSON, Permission: string(permission), AggregationJSON: "{}", Status: "planned", CreatedAt: at, UpdatedAt: at}},
 	); err != nil {
 		t.Fatalf("PersistChildPlanGraph: %v", err)
 	}
@@ -1157,12 +1464,12 @@ func seedHandoffRuntime(t *testing.T, ctx context.Context, store storage.Store, 
 			created_by_json, updated_by_json, host_json)
 			VALUES ('attempt-source', 'loopcoder.attempt.v1', 1, 'proj-routing', 'drun-routing', 'task-a', 1, 'running',
 			1, 'executor-source', 'provider-source-key', ?, ?, ?, ?, '{}', '{}', '{}')`,
-			taskrequirements.SideEffectLocalRead, at, at, at)
+			sideEffect, at, at, at)
 		if err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `UPDATE delivery_tasks SET state = 'running', permission = ?, side_effect_class = ?, scope_json = ?, active_attempt_id = 'attempt-source', attempt_count = 1 WHERE task_id = 'task-a'`,
-			taskrequirements.PermissionReadOnly, taskrequirements.SideEffectLocalRead, `{"paths":["README.md"],"repo":"proj-routing"}`)
+			permission, sideEffect, scopeJSON)
 		return err
 	}); err != nil {
 		t.Fatalf("seed source attempt: %v", err)
@@ -1234,7 +1541,7 @@ func seedProviderInventoryRows(t *testing.T, ctx context.Context, store storage.
 	}
 }
 
-func seedHandoffAgentAuthority(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, claim storage.ClaimResult) {
+func seedHandoffAgentAuthority(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, claim storage.ClaimResult, input DecisionInput, withOwnership bool) {
 	t.Helper()
 	sourceScope := budget.Scope{ScopeKind: budget.ScopeSubAgent, ProjectID: "proj-routing", DeliveryRunID: "drun-routing", TaskID: "task-a", SubAgentID: "agent-source", AdapterID: "codex", AccountProfileID: "acct-a", ModelCapabilityID: "codex-good"}
 	sourcePolicy, err := budget.UpsertPolicy(ctx, store, budget.PolicyInput{
@@ -1255,14 +1562,30 @@ func seedHandoffAgentAuthority(t *testing.T, ctx context.Context, store storage.
 		t.Fatalf("reserve source policy: %v", err)
 	}
 	at := delivery.CanonicalTimestamp(fixture.now)
+	permission := input.Inputs.Requirement.PermissionRequired
+	if permission == "" {
+		permission = taskrequirements.PermissionReadOnly
+	}
+	sideEffect := input.Inputs.Requirement.SideEffectClass
+	if sideEffect == "" {
+		sideEffect = taskrequirements.SideEffectLocalRead
+	}
+	scopeJSON := strings.TrimSpace(input.Inputs.Requirement.ScopeJSON)
+	if scopeJSON == "" {
+		scopeJSON = `{"paths":["README.md"],"repo":"proj-routing"}`
+	}
+	ownershipLockIDsJSON := `[]`
+	if withOwnership {
+		ownershipLockIDsJSON = `["lock-source"]`
+	}
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO agent_scope_grants(
 			id, project_id, delivery_run_id, child_agent_id, schema_version, record_version, scope_json, permission,
 			side_effect_class, policy_version, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
 			agent_federation_fingerprint, created_at, updated_at)
 			VALUES ('scope-source', 'proj-routing', 'drun-routing', 'agent-source', 'loopcoder.agent_scope_grant.v1', 1, ?, ?, ?, 'test', ?, ?, ?, 'seed-fp', ?, ?)`,
-			`{"paths":["README.md"],"repo":"proj-routing"}`,
-			storage.PermissionReadOnly, string(taskrequirements.SideEffectLocalRead), testFingerprint("delivery-policy"), testFingerprint("plan-routing"), testFingerprint("auth"), at, at); err != nil {
+			scopeJSON,
+			permission, sideEffect, testFingerprint("delivery-policy"), testFingerprint("plan-routing"), testFingerprint("auth"), at, at); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO agent_budget_bindings(
@@ -1271,6 +1594,16 @@ func seedHandoffAgentAuthority(t *testing.T, ctx context.Context, store storage.
 			VALUES ('binding-source', 'proj-routing', 'drun-routing', 'agent-source', ?, ?, 'sub-agent', '{}', '[]', 'active', ?, ?)`,
 			sourcePolicy.BudgetPolicyID, sourceReservation.Reservation.BudgetReservationID, at, at); err != nil {
 			return err
+		}
+		if withOwnership {
+			if _, err := tx.Exec(ctx, `INSERT INTO agent_ownership_locks(
+				id, project_id, delivery_run_id, child_agent_id, run_id, claim_generation, lock_generation,
+				resource_kind, resource_key, lock_mode, state, lease_expires_at, heartbeat_at, conflicts_with_json, created_at, updated_at)
+				VALUES ('lock-source', 'proj-routing', 'drun-routing', 'agent-source', 'run-routing-child', ?, 1,
+				'repo-path', 'README.md', 'write', ?, ?, ?, '[]', ?, ?)`,
+				claim.ClaimGeneration, storage.OwnershipStateHeld, fixture.now.Add(time.Hour).Format(time.RFC3339Nano), at, at, at); err != nil {
+				return err
+			}
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO agent_registrations(
 			id, record_version, project_id, delivery_run_id, root_run_id, parent_run_id, child_run_id, task_id, attempt_id,
@@ -1281,8 +1614,8 @@ func seedHandoffAgentAuthority(t *testing.T, ctx context.Context, store storage.
 			authorization_fingerprint, agent_federation_fingerprint, registration_payload_hash, created_at, updated_at)
 			VALUES ('agent-source', 1, 'proj-routing', 'drun-routing', 'run-routing', 'run-routing', 'run-routing-child', 'task-a', 'attempt-source',
 			'plan-child', 'worker', 'codex', 'pinst-codex', 'acct-a', 'codex-good', '', '', 'scope-source', ?, ?, '["binding-source"]',
-			'[]', ?, ?, ?, 'cancel', '{}', 'registered', 1, 'test', ?, ?, ?, 'seed-fp', 'seed-payload', ?, ?)`,
-			storage.PermissionReadOnly, string(taskrequirements.SideEffectLocalRead), claim.ClaimGeneration, claim.ExecutorID, claim.ProviderKey,
+			?, ?, ?, ?, 'cancel', '{}', 'registered', 1, 'test', ?, ?, ?, 'seed-fp', 'seed-payload', ?, ?)`,
+			permission, sideEffect, ownershipLockIDsJSON, claim.ClaimGeneration, claim.ExecutorID, claim.ProviderKey,
 			testFingerprint("plan-routing"), testFingerprint("delivery-policy"), testFingerprint("auth"), at, at)
 		return err
 	}); err != nil {
@@ -1310,6 +1643,58 @@ func reservationState(t *testing.T, ctx context.Context, store storage.Store, re
 		t.Fatalf("reservation state: %v", err)
 	}
 	return state
+}
+
+func assertNoDestinationHeldLocks(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64) {
+	t.Helper()
+	if count := destinationHeldLockCount(t, ctx, store, childRunID, claimGeneration); count != 0 {
+		t.Fatalf("destination held locks for %s generation %d = %d, want 0", childRunID, claimGeneration, count)
+	}
+}
+
+func destinationHeldLockCount(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64) int {
+	t.Helper()
+	var count int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM agent_ownership_locks
+			WHERE run_id = ? AND claim_generation = ? AND state = ?`,
+			childRunID, claimGeneration, storage.OwnershipStateHeld).Scan(&count)
+	}); err != nil {
+		t.Fatalf("destination held lock count: %v", err)
+	}
+	return count
+}
+
+func assertDestinationLockState(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64, want string) {
+	t.Helper()
+	var states []string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT state FROM agent_ownership_locks
+			WHERE run_id = ? AND claim_generation = ?
+			ORDER BY id`, childRunID, claimGeneration)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var state string
+			if err := rows.Scan(&state); err != nil {
+				return err
+			}
+			states = append(states, state)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("destination lock states: %v", err)
+	}
+	if len(states) == 0 {
+		t.Fatalf("destination lock states empty for %s generation %d", childRunID, claimGeneration)
+	}
+	for _, state := range states {
+		if state != want {
+			t.Fatalf("destination lock states = %v, want all %q", states, want)
+		}
+	}
 }
 
 func handoffRegistrationState(t *testing.T, ctx context.Context, store storage.Store, childRunID string) struct {

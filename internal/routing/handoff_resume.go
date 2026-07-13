@@ -2,6 +2,8 @@ package routing
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -49,6 +51,13 @@ const (
 	HandoffSuccessorExecutionStarted    HandoffSuccessorExecutionOutcome = "started"
 	HandoffSuccessorExecutionNotStarted HandoffSuccessorExecutionOutcome = "not-started"
 	HandoffSuccessorExecutionAmbiguous  HandoffSuccessorExecutionOutcome = "ambiguous"
+)
+
+type handoffTerminalOwnershipAction string
+
+const (
+	handoffTerminalOwnershipRelease    handoffTerminalOwnershipAction = "release"
+	handoffTerminalOwnershipNeedsHuman handoffTerminalOwnershipAction = "needs-human"
 )
 
 type HandoffResumeResult struct {
@@ -185,12 +194,12 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	}
 	if input.AfterPrepare != nil {
 		if err := input.AfterPrepare(); err != nil {
-			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-prepare", input.DecidedBy, input.Host)
+			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-prepare", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 			return result, errors.Join(err, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume stopped after successor preparation"})
 		}
 	}
 	if handoffResumeCancelled(ctx, input) {
-		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-at-launch-boundary", input.DecidedBy, input.Host)
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-at-launch-boundary", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled at launch boundary"}, cleanupErr)
 	}
 	if err := transitionHandoffSuccessorLaunching(ctx, store, handoff, launch); err != nil {
@@ -199,12 +208,12 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	}
 	if input.AfterRegistration != nil {
 		if err := input.AfterRegistration(); err != nil {
-			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-registration", input.DecidedBy, input.Host)
+			cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "stopped-after-registration", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 			return result, errors.Join(err, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume stopped after successor registration launch"})
 		}
 	}
 	if handoffResumeCancelled(ctx, input) {
-		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-before-provider-invocation", input.DecidedBy, input.Host)
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-before-provider-invocation", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before provider invocation"}, cleanupErr)
 	}
 	executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected})
@@ -218,12 +227,12 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		result.Successor.LaunchPhase = storage.ClaimPhaseExecuting
 		return result, startedErr
 	case HandoffSuccessorExecutionNotStarted:
-		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-not-started", input.DecidedBy, input.Host)
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-not-started", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 		fallback, fallbackErr := HandoffDestinationFailureFallback(ctx, store, result, routeInput.Inputs, FallbackTriggerWorkerFailed, firstActor(input.DecidedBy, routeInput.DecidedBy), firstHost(input.Host, routeInput.Host))
 		result.Fallback = fallback
 		return result, errors.Join(execErr, cleanupErr, fallbackErr)
 	default:
-		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-ambiguous", input.DecidedBy, input.Host)
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-ambiguous", handoffTerminalOwnershipNeedsHuman, input.DecidedBy, input.Host)
 		return result, errors.Join(execErr, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch outcome is ambiguous; human reconciliation required"})
 	}
 }
@@ -337,18 +346,17 @@ func markHandoffSuccessorExecuting(store storage.Store, handoff storage.HandoffT
 	return err
 }
 
-func cleanupHandoffLaunchTerminal(store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, reservation budget.Reservation, status string, code taskrequirements.ErrorCode, reason string, actor delivery.Actor, host delivery.Host) error {
+func cleanupHandoffLaunchTerminal(store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, reservation budget.Reservation, status string, code taskrequirements.ErrorCode, reason string, ownershipAction handoffTerminalOwnershipAction, actor delivery.Actor, host delivery.Host) error {
 	cleanupCtx, cancel := handoffCleanupContext()
 	defer cancel()
-	releaseErr := releaseHandoffReservation(cleanupCtx, store, reservation, reason, actor, host)
-	terminalErr := terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, status, code, reason)
+	terminalErr := terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, reservation, status, code, reason, ownershipAction, actor, host)
 	if terminalErr != nil && status != "needs-human" {
-		terminalErr = errors.Join(terminalErr, terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, "needs-human", code, reason+"-cleanup-failed"))
+		terminalErr = errors.Join(terminalErr, terminalizeHandoffLaunch(cleanupCtx, store, handoff, launch, reservation, "needs-human", code, reason+"-cleanup-failed", ownershipAction, actor, host))
 	}
-	return errors.Join(releaseErr, terminalErr)
+	return terminalErr
 }
 
-func terminalizeHandoffLaunch(ctx context.Context, store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, status string, code taskrequirements.ErrorCode, reason string) error {
+func terminalizeHandoffLaunch(ctx context.Context, store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, reservation budget.Reservation, status string, code taskrequirements.ErrorCode, reason string, ownershipAction handoffTerminalOwnershipAction, actor delivery.Actor, host delivery.Host) error {
 	status = strings.TrimSpace(status)
 	if status != "cancelled" && status != "needs-human" {
 		return fmt.Errorf("terminalize handoff launch: unsupported status %q", status)
@@ -359,6 +367,20 @@ func terminalizeHandoffLaunch(ctx context.Context, store storage.Store, handoff 
 		agentState = storage.AgentStateNeedsHuman
 	}
 	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if reservation.BudgetReservationID != "" && reservation.Generation > 0 {
+			if _, err := budget.ReleaseTx(ctx, tx, store.Now(), budget.MutationRequest{
+				ReservationID:  reservation.BudgetReservationID,
+				IdempotencyKey: reason,
+				Generation:     reservation.Generation,
+				Actor:          budget.Actor{ActorID: actor.ActorID, Role: actor.ActorKind},
+				Host:           budget.Host{HostID: host.HostID, Provider: host.HostKind},
+			}); err != nil {
+				return fmt.Errorf("terminalize handoff launch reservation: %w", err)
+			}
+		}
+		if err := terminalizeHandoffOwnershipLocksTx(ctx, tx, handoff, launch, ownershipAction, at); err != nil {
+			return err
+		}
 		result, err := tx.Exec(ctx, `UPDATE run_claims
 			SET phase = ?, heartbeat_at = ?
 			WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
@@ -415,6 +437,113 @@ func terminalizeHandoffLaunch(ctx context.Context, store storage.Store, handoff 
 		}
 		return nil
 	})
+}
+
+func terminalizeHandoffOwnershipLocksTx(ctx context.Context, tx storage.Tx, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, action handoffTerminalOwnershipAction, at string) error {
+	if action != handoffTerminalOwnershipRelease && action != handoffTerminalOwnershipNeedsHuman {
+		return fmt.Errorf("terminalize handoff launch ownership: unsupported action %q", action)
+	}
+	var childAgentID, projectID, deliveryRunID, permission, rawLockIDs string
+	err := tx.QueryRow(ctx, `SELECT id, project_id, delivery_run_id, permission, ownership_lock_ids_json
+		FROM agent_registrations
+		WHERE child_run_id = ? AND executor_id = ? AND claim_generation = ?`,
+		handoff.ChildRunID, launch.ExecutorID, launch.ClaimGeneration).Scan(&childAgentID, &projectID, &deliveryRunID, &permission, &rawLockIDs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination registration ownership is missing"}
+	}
+	if err != nil {
+		return fmt.Errorf("terminalize handoff launch ownership registration: %w", err)
+	}
+	var lockIDs []string
+	if err := json.Unmarshal([]byte(rawLockIDs), &lockIDs); err != nil {
+		return &storage.FederationError{Code: storage.ErrInvalidRecordCode, Message: "destination registration ownership locks are invalid"}
+	}
+	lockIDs = dedupeStrings(lockIDs)
+	if len(lockIDs) == 0 {
+		if strings.TrimSpace(permission) == storage.PermissionReadOnly {
+			return nil
+		}
+		return &storage.FederationError{Code: storage.ErrOwnershipRequiredCode, Message: "destination registration has no ownership locks"}
+	}
+	args := []any{projectID, deliveryRunID, childAgentID, handoff.ChildRunID}
+	args = append(args, stringsToAny(lockIDs)...)
+	rows, err := tx.Query(ctx, `SELECT id, run_id, claim_generation, state
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
+			AND id IN (`+handoffPlaceholders(len(lockIDs))+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("terminalize handoff launch ownership locks: %w", err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var id, runID, state string
+		var claimGeneration int64
+		if err := rows.Scan(&id, &runID, &claimGeneration, &state); err != nil {
+			return fmt.Errorf("terminalize handoff launch ownership row: %w", err)
+		}
+		seen[id] = true
+		if runID != handoff.ChildRunID || claimGeneration != launch.ClaimGeneration {
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is not fenced to terminal generation"}
+		}
+		if state != storage.OwnershipStateHeld {
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is " + state}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("terminalize handoff launch ownership rows: %w", err)
+	}
+	for _, id := range lockIDs {
+		if !seen[id] {
+			return &storage.FederationError{Code: storage.ErrOwnershipRequiredCode, Message: "destination ownership lock " + id + " is missing"}
+		}
+	}
+	nextState := storage.OwnershipStateReleased
+	if action == handoffTerminalOwnershipNeedsHuman {
+		nextState = storage.OwnershipStateNeedsHuman
+	}
+	args = []any{nextState, at}
+	if action == handoffTerminalOwnershipNeedsHuman {
+		args = []any{nextState, at, at, at}
+	}
+	args = append(args, projectID, deliveryRunID, childAgentID, handoff.ChildRunID, launch.ClaimGeneration, storage.OwnershipStateHeld)
+	args = append(args, stringsToAny(lockIDs)...)
+	query := `UPDATE agent_ownership_locks
+		SET state = ?, updated_at = ?
+		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
+			AND claim_generation = ? AND state = ?
+			AND id IN (` + handoffPlaceholders(len(lockIDs)) + `)`
+	if action == handoffTerminalOwnershipNeedsHuman {
+		query = `UPDATE agent_ownership_locks
+			SET state = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+			WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
+				AND claim_generation = ? AND state = ?
+				AND id IN (` + handoffPlaceholders(len(lockIDs)) + `)`
+	}
+	result, err := tx.Exec(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("terminalize handoff launch ownership update: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != int64(len(lockIDs)) {
+		return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: fmt.Sprintf("terminalized %d destination ownership locks, want %d", affected, len(lockIDs))}
+	}
+	return nil
+}
+
+func handoffPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+func stringsToAny(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
 }
 
 func requireHandoffCleanupRow(result interface{ RowsAffected() (int64, error) }, label string) error {
