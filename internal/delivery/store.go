@@ -10,9 +10,13 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
+type cycleDetector func(context.Context, storage.Tx, string, string, string) (bool, error)
+
 type PersistOptions struct {
 	IdempotencyKey string
 	Now            time.Time
+
+	cycleDetector cycleDetector
 }
 
 func PersistDeliveryRun(ctx context.Context, store storage.Store, run DeliveryRun, opts PersistOptions) (DeliveryRun, error) {
@@ -241,7 +245,7 @@ func AddDependencyEdge(ctx context.Context, store storage.Store, edge Dependency
 		if edge.FromTaskID == edge.ToTaskID {
 			return typed(ErrCycleDetectedCode, "self dependency %s", edge.FromTaskID)
 		}
-		cycle, err := wouldCreateCycle(ctx, tx, edge.DeliveryRunID, edge.FromTaskID, edge.ToTaskID)
+		cycle, err := wouldCreateCycle(ctx, tx, opts.cycleDetector, edge.DeliveryRunID, edge.FromTaskID, edge.ToTaskID)
 		if err != nil {
 			return err
 		}

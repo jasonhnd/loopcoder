@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -101,47 +100,15 @@ func TestPersistenceAtomicTypedFailuresAndReplay(t *testing.T) {
 	ctx := context.Background()
 	store := openDeliveryStore(t)
 	defer store.Close()
-	seedProject(t, ctx, store, "proj_a")
 	seedProject(t, ctx, store, "proj_b")
 
-	run := deliveryRunFixture("proj_a", "run_a")
-	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "run-create", Now: fixedTime()}); err != nil {
-		t.Fatalf("PersistDeliveryRun: %v", err)
-	}
-	fp := fingerprintFixture(run)
-	if _, err := PersistPlanFingerprint(ctx, store, fp, PersistOptions{IdempotencyKey: "fp-create", Now: fixedTime()}); err != nil {
-		t.Fatalf("PersistPlanFingerprint: %v", err)
-	}
-	taskA := taskFixture(run, "a")
-	taskB := taskFixture(run, "b")
-	taskA, err := PersistTask(ctx, store, taskA, PersistOptions{IdempotencyKey: "task-a", Now: fixedTime()})
-	if err != nil {
-		t.Fatalf("PersistTask a: %v", err)
-	}
-	taskB, err = PersistTask(ctx, store, taskB, PersistOptions{IdempotencyKey: "task-b", Now: fixedTime()})
-	if err != nil {
-		t.Fatalf("PersistTask b: %v", err)
-	}
+	run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", "run_a")
 	edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
 	if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: "edge-ab", Now: fixedTime()}); err != nil {
 		t.Fatalf("AddDependencyEdge: %v", err)
 	}
 	if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: "edge-ab-duplicate", Now: fixedTime()}); !errors.Is(err, ErrDuplicateRecord) {
 		t.Fatalf("duplicate edge error = %v, want ErrDuplicateRecord", err)
-	}
-	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
-
-	cycleDetectionErrorForTest = fmt.Errorf("cte scan failed")
-	badEdge := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, EdgeKind: "orders-after", PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
-	if _, err := AddDependencyEdge(ctx, store, badEdge, PersistOptions{IdempotencyKey: "edge-cycle-error", Now: fixedTime()}); err == nil || errors.Is(err, ErrCycleDetected) {
-		t.Fatalf("cycle query failure error = %v, want wrapped infrastructure error", err)
-	}
-	cycleDetectionErrorForTest = nil
-	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
-
-	edgeBA := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
-	if _, err := AddDependencyEdge(ctx, store, edgeBA, PersistOptions{IdempotencyKey: "edge-ba", Now: fixedTime()}); !errors.Is(err, ErrCycleDetected) {
-		t.Fatalf("cycle error = %v, want ErrCycleDetected", err)
 	}
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
 
@@ -191,6 +158,51 @@ func TestPersistenceAtomicTypedFailuresAndReplay(t *testing.T) {
 		t.Fatalf("stale override plan error = %v, want ErrStaleApproval", err)
 	}
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_overrides`, 0)
+}
+
+func TestDependencyEdgeCycleQueryFailureIsAtomic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", "run_cycle_query_failure")
+
+	edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+	if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: "edge-ab", Now: fixedTime()}); err != nil {
+		t.Fatalf("AddDependencyEdge: %v", err)
+	}
+
+	injected := errors.New("cte scan failed")
+	badEdge := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, EdgeKind: "orders-after", PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+	opts := PersistOptions{
+		IdempotencyKey: "edge-cycle-query-failure",
+		Now:            fixedTime(),
+		cycleDetector: func(context.Context, storage.Tx, string, string, string) (bool, error) {
+			return false, injected
+		},
+	}
+	if _, err := AddDependencyEdge(ctx, store, badEdge, opts); err == nil || errors.Is(err, ErrCycleDetected) || !errors.Is(err, injected) {
+		t.Fatalf("cycle query failure error = %v, want wrapped infrastructure error", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+}
+
+func TestDependencyEdgeCycleDetectedIsAtomic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", "run_cycle_detected")
+
+	edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+	if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: "edge-ab", Now: fixedTime()}); err != nil {
+		t.Fatalf("AddDependencyEdge: %v", err)
+	}
+	edgeBA := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+	if _, err := AddDependencyEdge(ctx, store, edgeBA, PersistOptions{IdempotencyKey: "edge-ba", Now: fixedTime()}); !errors.Is(err, ErrCycleDetected) {
+		t.Fatalf("cycle error = %v, want ErrCycleDetected", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
 }
 
 func TestClaimTaskIsIdempotentAndFenced(t *testing.T) {
@@ -514,6 +526,27 @@ func openDeliveryStore(t *testing.T) storage.Store {
 		t.Fatalf("Open: %v", err)
 	}
 	return store
+}
+
+func seedTwoTaskDependencyRun(t *testing.T, ctx context.Context, store storage.Store, projectID, runID string) (DeliveryRun, Task, Task) {
+	t.Helper()
+	seedProject(t, ctx, store, projectID)
+	run := deliveryRunFixture(projectID, runID)
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: runID + "-create", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	if _, err := PersistPlanFingerprint(ctx, store, fingerprintFixture(run), PersistOptions{IdempotencyKey: runID + "-fingerprint", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistPlanFingerprint: %v", err)
+	}
+	taskA, err := PersistTask(ctx, store, taskFixture(run, "a"), PersistOptions{IdempotencyKey: runID + "-task-a", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("PersistTask a: %v", err)
+	}
+	taskB, err := PersistTask(ctx, store, taskFixture(run, "b"), PersistOptions{IdempotencyKey: runID + "-task-b", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("PersistTask b: %v", err)
+	}
+	return run, taskA, taskB
 }
 
 func seedProject(t *testing.T, ctx context.Context, store storage.Store, projectID string) {
