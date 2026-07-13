@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -484,6 +485,45 @@ func TestCancellationOmittedReservationIDDiscoversActiveRunReservation(t *testin
 	}
 	if active := activeReservationIDsForRun(t, ctx, store, original.ProjectID, original.DeliveryRunID); len(active) != 0 {
 		t.Fatalf("active reservations after cancellation = %#v, want none", active)
+	}
+}
+
+func TestFallbackCancellationWithChangedAuthorityCancelsHeldReservationBeforeRefusal(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	reservation := reserveCancellationBudget(t, ctx, store, fixture.now)
+
+	_, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID:         original.RoutingDecisionID,
+		Trigger:                   FallbackTriggerRequirementsChanged,
+		PriorCandidateID:          original.ChosenCandidateID,
+		Inputs:                    input.Inputs,
+		ChangedAuthorityInputs:    []ChangedAuthorityInput{{InputKind: "scope", Previous: "a", Current: "b"}},
+		ApprovalRequired:          true,
+		Cancelled:                 true,
+		HeldBudgetReservationID:   reservation.BudgetReservationID,
+		HeldReservationGeneration: reservation.Generation,
+		DecidedBy:                 schedulerActor(),
+		Host:                      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("cancelled fallback error = %v, want ErrReplanRequired", err)
+	}
+	var typed *taskrequirements.TypedError
+	if !errors.As(err, &typed) || !strings.Contains(typed.Message, "cancellation") {
+		t.Fatalf("cancelled fallback typed error = %#v, want cancellation stop", err)
+	}
+	if countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 0 {
+		t.Fatalf("cancelled fallback persisted a decision")
+	}
+	if got := budgetReservationState(t, ctx, store, reservation.BudgetReservationID); got != budget.StateCancelled {
+		t.Fatalf("reservation state = %s, want cancelled", got)
+	}
+	if active := activeReservationIDsForRun(t, ctx, store, original.ProjectID, original.DeliveryRunID); len(active) != 0 {
+		t.Fatalf("active reservations after cancelled fallback = %#v, want none", active)
 	}
 }
 

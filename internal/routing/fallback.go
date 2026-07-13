@@ -197,9 +197,6 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 	if err := validateHost(input.Host); err != nil {
 		return FallbackDecision{}, err
 	}
-	if input.ApprovalRequired || len(input.ChangedAuthorityInputs) > 0 {
-		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback cannot continue with changed authority or pending approval"}
-	}
 	original, err := LoadRoutingDecision(ctx, store, input.RoutingDecisionID)
 	if err != nil {
 		return FallbackDecision{}, err
@@ -219,6 +216,9 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 			return FallbackDecision{}, err
 		}
 		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by durable cancellation before route selection"}
+	}
+	if input.ApprovalRequired || len(input.ChangedAuthorityInputs) > 0 {
+		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback cannot continue with changed authority or pending approval"}
 	}
 	var stored FallbackDecision
 	cancelledInTx := false
