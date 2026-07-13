@@ -20,6 +20,7 @@ import (
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/availability"
 	budgetpkg "github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -655,7 +656,7 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks := make([]Check, 0, 10)
 	host, hostCheck := resolveHostProfile(delivery, deps)
 	runtime := runtimeHealth(ctx, repoPath, deps)
-	usageBudget, usageCheck := buildQuotaUsageBudget(ctx, repoPath, runtime.ProjectRegistry.ProjectID, now)
+	usageBudget, usageCheck := buildQuotaUsageBudget(ctx, repoPath, runtime.ProjectRegistry.ProjectID, inventory, now)
 
 	gitCheck, gitPresent := checkGit(deps)
 	checks = append(checks, gitCheck)
@@ -2369,7 +2370,7 @@ func checkQuotaTelemetry(inventory providerinventory.Report) Check {
 	}
 }
 
-func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now time.Time) (usageledger.QuotaUsageBudget, Check) {
+func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, inventory providerinventory.Report, now time.Time) (usageledger.QuotaUsageBudget, Check) {
 	store := storage.Store(nil)
 	layout, layoutErr := home.Resolve(home.DefaultDeps())
 	if layoutErr == nil {
@@ -2391,9 +2392,13 @@ func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now 
 		}
 	}
 	budget = normalizeQuotaUsageBudget(budget)
+	budget.QuotaSources = inventory.QuotaTelemetrySources
+	budget.QuotaSnapshots = inventory.QuotaSnapshots
+	var typedBudgetSummaries []budgetpkg.Summary
 	if store != nil {
 		summaries, summaryErr := budgetpkg.Summaries(ctx, store, projectID)
 		if summaryErr == nil && len(summaries) > 0 {
+			typedBudgetSummaries = summaries
 			budget.BudgetSummary = make([]any, 0, len(summaries))
 			for _, summary := range summaries {
 				budget.BudgetSummary = append(budget.BudgetSummary, summary)
@@ -2401,8 +2406,36 @@ func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now 
 			budget.GapReasons = append(budget.GapReasons, "operator-configured-budget-policy")
 			budget.Confidence = providerinventory.ConfidenceEstimated
 		}
+		loaded, loadErr := availability.Load(ctx, store)
+		if loadErr == nil {
+			derived := availability.Derive(availability.Inputs{
+				Inventory:       inventory,
+				UsageSummaries:  budget.UsageSummary,
+				BudgetSummaries: typedBudgetSummaries,
+				Observations:    loaded.Observations,
+				CircuitBreakers: loaded.CircuitBreakers,
+				Policy: availability.Policy{
+					ExactQuotaRequired: true,
+				},
+				Now: now,
+			})
+			_ = availability.Persist(ctx, store, derived)
+			budget.AvailabilityScores = make([]any, 0, len(derived.Scores))
+			for _, score := range derived.Scores {
+				budget.AvailabilityScores = append(budget.AvailabilityScores, score)
+			}
+			budget.CircuitBreakers = make([]any, 0, len(derived.CircuitBreakers))
+			for _, breaker := range derived.CircuitBreakers {
+				budget.CircuitBreakers = append(budget.CircuitBreakers, breaker)
+			}
+			if len(derived.Scores) > 0 {
+				budget.GapReasons = append(budget.GapReasons, "availability-read-model-derived")
+				budget.Confidence = providerinventory.ConfidenceEstimated
+			}
+		}
 	}
-	if len(budget.UsageSummary) == 0 && len(budget.BudgetSummary) == 0 {
+	budget = usageledger.FinalizeQuotaUsageBudget(normalizeQuotaUsageBudget(budget))
+	if len(budget.UsageSummary) == 0 && len(budget.BudgetSummary) == 0 && len(budget.AvailabilityScores) == 0 {
 		return budget, Check{
 			Name:    "quota usage budget",
 			Code:    "quota_usage_budget_empty",
@@ -2410,12 +2443,20 @@ func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, now 
 			Message: "no local usage records found; quota remains unknown and no provider-wide usage is inferred",
 		}
 	}
+	if len(budget.AvailabilityScores) > 0 && len(budget.BudgetSummary) == 0 && len(budget.UsageSummary) == 0 {
+		return budget, Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_availability_state",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("availability read model derived %d score(s), confidence=%s; gaps=%s", len(budget.AvailabilityScores), budget.Confidence, strings.Join(budget.GapReasons, ",")),
+		}
+	}
 	if len(budget.BudgetSummary) > 0 {
 		return budget, Check{
 			Name:    "quota usage budget",
 			Code:    "quota_usage_budget_policy_state",
 			Status:  StatusOK,
-			Message: fmt.Sprintf("local budget accounting summarized %d budget scope(s), %d usage scope(s), confidence=%s; gaps=%s", len(budget.BudgetSummary), len(budget.UsageSummary), budget.Confidence, strings.Join(budget.GapReasons, ",")),
+			Message: fmt.Sprintf("local budget accounting summarized %d budget scope(s), %d usage scope(s), %d availability score(s), confidence=%s; gaps=%s", len(budget.BudgetSummary), len(budget.UsageSummary), len(budget.AvailabilityScores), budget.Confidence, strings.Join(budget.GapReasons, ",")),
 		}
 	}
 	return budget, Check{

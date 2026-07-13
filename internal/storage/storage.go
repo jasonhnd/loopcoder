@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 17
+	CurrentSchemaVersion = 18
 
 	driverName = "sqlite"
 
@@ -326,6 +326,11 @@ var migrations = []migration{
 		name:       "agent federation registration",
 		statements: agentFederationSchemaStatements,
 	},
+	{
+		version:    18,
+		name:       "availability read model",
+		statements: availabilitySchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -373,6 +378,9 @@ var requiredTables = []string{
 	"agent_ownership_locks",
 	"agent_budget_bindings",
 	"agent_events",
+	"availability_observations",
+	"availability_scores",
+	"circuit_breakers",
 }
 
 type migration struct {
