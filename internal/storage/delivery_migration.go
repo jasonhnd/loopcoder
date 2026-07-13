@@ -6,9 +6,12 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
+
+const deliveryV10BackupStreamBufferSize = 128 * 1024
 
 type deliveryMigrationBackup struct {
 	BackupID                 string
@@ -20,11 +23,24 @@ type deliveryMigrationBackup struct {
 	MigrationPlanFingerprint string
 }
 
-func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationBackup, error) {
-	return prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt, deliveryV10SourceExists)
+type deliveryV10BackupOptions struct {
+	sourceExists  func(string) (bool, error)
+	hook          deliveryV10BackupHookForTest
+	bufferFactory func() []byte
 }
 
 func prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt string, sourceExists func(string) (bool, error)) (*deliveryMigrationBackup, error) {
+	return prepareDeliveryV10Backup(context.Background(), nil, sourcePath, createdAt, deliveryV10BackupOptions{sourceExists: sourceExists})
+}
+
+func prepareDeliveryV10Backup(ctx context.Context, db *sql.DB, sourcePath, createdAt string, opts deliveryV10BackupOptions) (*deliveryMigrationBackup, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sourceExists := opts.sourceExists
+	if sourceExists == nil {
+		sourceExists = deliveryV10SourceExists
+	}
 	sourcePath = filepath.Clean(sourcePath)
 	if sourcePath == "." || sourcePath == "" {
 		return prepareDeliveryV10NoSourceMetadata("", createdAt), nil
@@ -36,18 +52,12 @@ func prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt string, sourc
 	if !exists {
 		return prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt), nil
 	}
-	sourceHash, err := fileSHA256(sourcePath)
-	if err != nil {
-		return nil, fmt.Errorf("prepare delivery v10 backup hash: %w", err)
+	if db == nil {
+		return nil, fmt.Errorf("prepare delivery v10 backup image: sqlite connection is required")
 	}
-	backupPath := filepath.Join(filepath.Dir(sourcePath), "backups", "schema-v9-"+sourceHash[:16]+".db")
-	if _, err := os.Stat(backupPath); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("inspect delivery v10 backup image: %w", err)
-		}
-		if err := copyFile(sourcePath, backupPath); err != nil {
-			return nil, fmt.Errorf("prepare delivery v10 backup image: %w", err)
-		}
+	sourceHash, backupPath, err := createDeliveryV10BackupImage(ctx, db, sourcePath, opts)
+	if err != nil {
+		return nil, fmt.Errorf("prepare delivery v10 backup image: %w", err)
 	}
 	return &deliveryMigrationBackup{
 		BackupID:                 "backup_" + hashStringsStorage(sourceHash, "schema-v9-to-v10")[:24],
@@ -58,6 +68,136 @@ func prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt string, sourc
 		CreatedAt:                createdAt,
 		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
 	}, nil
+}
+
+func createDeliveryV10BackupImage(ctx context.Context, db *sql.DB, sourcePath string, opts deliveryV10BackupOptions) (string, string, error) {
+	backupDir := filepath.Join(filepath.Dir(sourcePath), "backups")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return "", "", err
+	}
+	backupRoot, err := os.OpenRoot(backupDir)
+	if err != nil {
+		return "", "", err
+	}
+	defer backupRoot.Close()
+
+	temp, err := os.CreateTemp(backupDir, ".schema-v9-*.tmp")
+	if err != nil {
+		return "", "", err
+	}
+	tempPath := temp.Name()
+	tempName, err := backupRootName(backupDir, tempPath)
+	if err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return "", "", err
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return "", "", err
+	}
+	if err := backupRoot.Remove(tempName); err != nil {
+		return "", "", err
+	}
+	defer backupRoot.Remove(tempName)
+
+	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseBeforeVacuum, tempPath); err != nil {
+		return "", "", err
+	}
+	if err := vacuumInto(ctx, db, tempPath); err != nil {
+		return "", "", err
+	}
+	if err := backupRoot.Chmod(tempName, 0o600); err != nil {
+		return "", "", err
+	}
+	if err := syncFile(backupRoot, tempName); err != nil {
+		return "", "", err
+	}
+	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseAfterVacuum, tempPath); err != nil {
+		return "", "", err
+	}
+
+	sourceHash, err := fileSHA256(ctx, backupRoot, tempName, opts.bufferFactory)
+	if err != nil {
+		return "", "", err
+	}
+	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseAfterHash, tempPath); err != nil {
+		return "", "", err
+	}
+
+	backupName := "schema-v9-" + sourceHash[:16] + ".db"
+	if err := validateBackupRootName(backupName); err != nil {
+		return "", "", err
+	}
+	backupPath := filepath.Join(backupDir, backupName)
+	if _, err := backupRoot.Stat(backupName); err == nil {
+		existingHash, err := fileSHA256(ctx, backupRoot, backupName, opts.bufferFactory)
+		if err != nil {
+			return "", "", err
+		}
+		if existingHash != sourceHash {
+			return "", "", fmt.Errorf("existing backup %s checksum %s does not match snapshot checksum %s", backupPath, existingHash, sourceHash)
+		}
+		return sourceHash, backupPath, nil
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("inspect delivery v10 backup image: %w", err)
+	}
+
+	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseBeforeRename, tempPath); err != nil {
+		return "", "", err
+	}
+	if err := backupRoot.Rename(tempName, backupName); err != nil {
+		return "", "", err
+	}
+	return sourceHash, backupPath, nil
+}
+
+func backupRootName(backupDir, path string) (string, error) {
+	name, err := filepath.Rel(backupDir, path)
+	if err != nil {
+		return "", err
+	}
+	if err := validateBackupRootName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func validateBackupRootName(name string) error {
+	if name == "" || name == "." || !filepath.IsLocal(name) || filepath.Dir(name) != "." {
+		return fmt.Errorf("backup path %q is outside the verified backup directory", name)
+	}
+	return nil
+}
+
+func runDeliveryV10BackupHook(ctx context.Context, hook deliveryV10BackupHookForTest, phase deliveryV10BackupPhase, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if hook == nil {
+		return nil
+	}
+	if err := hook(ctx, phase, path); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func vacuumInto(ctx context.Context, db *sql.DB, path string) error {
+	_, err := db.ExecContext(ctx, "VACUUM main INTO ?", path)
+	return err
+}
+
+func syncFile(root *os.Root, name string) error {
+	if err := validateBackupRootName(name); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
 }
 
 func deliveryV10SourceExists(path string) (bool, error) {
@@ -504,24 +644,48 @@ var deliveryContractSchemaStatements = []string{
 	)`,
 }
 
-func fileSHA256(path string) (string, error) {
-	data, err := os.ReadFile(path)
+func fileSHA256(ctx context.Context, root *os.Root, name string, bufferFactory func() []byte) (string, error) {
+	if err := validateBackupRootName(name); err != nil {
+		return "", err
+	}
+	file, err := root.Open(name)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	defer file.Close()
+	return readerSHA256(ctx, file, backupHashBuffer(bufferFactory))
 }
 
-func copyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
+func readerSHA256(ctx context.Context, reader io.Reader, buffer []byte) (string, error) {
+	if len(buffer) == 0 {
+		buffer = make([]byte, deliveryV10BackupStreamBufferSize)
 	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
+	hash := sha256.New()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			if _, writeErr := hash.Write(buffer[:n]); writeErr != nil {
+				return "", writeErr
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			return hex.EncodeToString(hash.Sum(nil)), nil
+		}
+		return "", err
 	}
-	return os.WriteFile(dst, data, 0o600)
+}
+
+func backupHashBuffer(bufferFactory func() []byte) []byte {
+	if bufferFactory == nil {
+		return make([]byte, deliveryV10BackupStreamBufferSize)
+	}
+	return bufferFactory()
 }
 
 func hashStringsStorage(parts ...string) string {
