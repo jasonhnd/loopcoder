@@ -1,0 +1,82 @@
+{
+  "schema_version": "loopcoder.progress_receipt.v1",
+  "record_version": 1,
+  "progress_receipt_id": "",
+  "project_id": "proj_fixture",
+  "delivery_run_id": "run_fixture",
+  "run_id": "run_fixture",
+  "task_id": "task_fixture",
+  "attempt_id": "att_fixture_1",
+  "attempt_ordinal": 1,
+  "correlation_id": "corr_fixture",
+  "correlation_sequence": 1,
+  "phase": "running",
+  "status": "running",
+  "task_counts": {
+    "total": 3,
+    "ready": 1,
+    "running": 1,
+    "succeeded": 1,
+    "failed": 0,
+    "blocked": 0,
+    "unknown": 0
+  },
+  "provider": {
+    "provider_id": "codex",
+    "model_id": "gpt-5.5",
+    "account_profile_id": "unknown",
+    "model_capability_id": "unknown",
+    "provider_confidence": "exact",
+    "provider_installation_id": "unknown"
+  },
+  "heartbeat": {
+    "state": "exact",
+    "observed_at": "2026-07-13T12:00:00Z",
+    "age_millis": 5000
+  },
+  "progress": {
+    "state": "exact",
+    "observed_at": "2026-07-13T12:00:03Z",
+    "age_millis": 2000
+  },
+  "evidence": [
+    {
+      "record_kind": "attempt-sidecar",
+      "record_id": "attempt_fixture",
+      "summary": "phase advanced to running",
+      "classification": "local-diagnostic",
+      "confidence": "exact"
+    }
+  ],
+  "quota_budget": {
+    "state": "unknown",
+    "confidence": "unknown",
+    "budget_policy_id": "unknown",
+    "budget_reservation_id": "unknown",
+    "remaining_quantity": -1,
+    "unit": "unknown",
+    "gap_reasons": [
+      "not-collected"
+    ]
+  },
+  "blocker": {
+    "state": "none",
+    "summary": ""
+  },
+  "next_action": {
+    "state": "continue",
+    "summary": "wait for next durable progress"
+  },
+  "redaction": {
+    "redacted": false,
+    "truncated": false,
+    "markers": [],
+    "secret_finding_count": 0,
+    "original_bytes": 0,
+    "persisted_bytes": 0
+  },
+  "gap_reasons": [],
+  "occurred_at": "2026-07-13T12:00:05Z",
+  "persisted_at": "2026-07-13T12:00:05Z",
+  "semantic_fingerprint": ""
+}
