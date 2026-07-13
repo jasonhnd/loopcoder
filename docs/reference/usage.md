@@ -267,6 +267,11 @@ consumers. Each node includes `project_id`,
 role, provider, model, effort, permission, claim owner/lease fields, lifecycle
 status/source, timestamps, last error, and report summary when those fields are
 present in local records.
+When provider-native children are registered, JSON output also includes an
+additive `agent_tree` object from machine-local SQLite. That tree, not opaque
+provider session state, is the restart/replay authority for child agent IDs,
+parent/run/task/attempt references, budget reservation IDs, ownership locks,
+claim generation, registration state, and federation fingerprints.
 The output is read-only and local-only: for registered projects it reads the
 global project payload root first, then legacy repo-local `.loopcoder/` only as
 a compatibility fallback. It must not be copied into PR bodies, issues,

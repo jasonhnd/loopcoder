@@ -419,6 +419,9 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 			if err == nil && affected == 0 {
 				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
 			}
+			if err := renewClaimFencedOwnershipLocksTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+				return err
+			}
 			return nil
 		})
 	})
@@ -507,7 +510,7 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 			if err == nil && affected == 0 {
 				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
 			}
-			return transitionRunStatusTx(ctx, tx, RunStatusTransition{
+			if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
 				RunID:       childRunID,
 				ParentRunID: parentRunID,
 				ChildRunID:  childRunID,
@@ -515,7 +518,10 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 				UpdatedAt:   updatedAt,
 				Reason:      reason,
 				Source:      "nested-scheduler",
-			})
+			}); err != nil {
+				return err
+			}
+			return completeNativeRegistrationForRunTx(ctx, tx, childRunID, executorID, claimGeneration, status, updatedAt, providerReceipt)
 		})
 	})
 }

@@ -2,7 +2,9 @@ package orchestration
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"os"
@@ -1134,15 +1136,17 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 		err    error
 	}
 	done := make(chan outcome, 2)
+	runtimeNow := nestedTestNow().Add(12 * time.Hour)
 	run := func(store storage.Store, plan ChildPlan, now time.Time) {
 		<-start
 		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
-			RepoPath:    repo,
-			MaxChildren: 1,
-			Now:         now,
-			Clock:       func() time.Time { return now },
-			Plan:        &plan,
-			Store:       store,
+			RepoPath:     repo,
+			MaxChildren:  1,
+			Now:          now,
+			Clock:        func() time.Time { return now },
+			RuntimeClock: func() time.Time { return runtimeNow },
+			Plan:         &plan,
+			Store:        store,
 			RecordEvent: func(string, string, state.Event) error {
 				return nil
 			},
@@ -1229,7 +1233,7 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	}
 	waitForFile(t, activePath)
 
-	cmdB := startHelper(reportBPath, nestedTestNow().Add(48*time.Hour).Format(time.RFC3339Nano))
+	cmdB := startHelper(reportBPath, nestedTestNow().Add(10*time.Hour+time.Minute).Format(time.RFC3339Nano))
 	outB, err := cmdB.CombinedOutput()
 	if err != nil {
 		t.Fatalf("helper B failed: %v\n%s", err, string(outB))
@@ -1309,6 +1313,7 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 	}
 	t.Cleanup(releaseOwner)
 	var executeCount int64
+	var ownerClockTicks int64
 	doneA := make(chan struct {
 		report NestedScheduleReport
 		err    error
@@ -1318,9 +1323,11 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 			RepoPath:    repo,
 			MaxChildren: 1,
 			Now:         nestedTestNow(),
-			Clock:       func() time.Time { return nestedTestNow() },
-			Plan:        &planA,
-			Store:       storeA,
+			Clock: func() time.Time {
+				return nestedTestNow().Add(time.Duration(atomic.AddInt64(&ownerClockTicks, 1)) * time.Second)
+			},
+			Plan:  &planA,
+			Store: storeA,
 			RecordEvent: func(string, string, state.Event) error {
 				return nil
 			},
@@ -1341,8 +1348,8 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
 		MaxChildren: 1,
-		Now:         nestedTestNow().Add(time.Hour),
-		Clock:       func() time.Time { return nestedTestNow().Add(time.Hour) },
+		Now:         nestedTestNow().Add(2 * time.Second),
+		Clock:       func() time.Time { return nestedTestNow().Add(2 * time.Second) },
 		Plan:        &planB,
 		Store:       storeB,
 		RecordEvent: func(string, string, state.Event) error {
@@ -1436,7 +1443,7 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 	waitForNestedSignal(t, executeStarted, "provider execution")
 	if err := storeB.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET lease_expires_at = ?`,
-			time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
+			nestedTestNow().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
 		return err
 	}); err != nil {
 		t.Fatalf("force expired executing claim: %v", err)
@@ -1583,6 +1590,256 @@ func TestScheduleNestedRunsPassesIdempotencyKeyAndPersistsOnlyRealReceipt(t *tes
 	}
 	if receipt != "receipt:"+executedRunID {
 		t.Fatalf("provider_receipt = %q, want real execution receipt", receipt)
+	}
+}
+
+func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    t.TempDir(),
+		RootRunID:   "run-native-parent",
+		ParentRunID: "run-native-parent",
+		Store:       store,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Children: []ChildRunPlan{{
+			ChildKey:   "native-child",
+			Title:      "native child",
+			Permission: "write",
+			Scope:      ChildScope{Paths: []string{"src/native.go"}},
+			Aggregation: ChildAggregation{
+				Mode:     ChildAggregationCollect,
+				Required: true,
+			},
+			Metadata: json.RawMessage(`{"native_subagent":true}`),
+		}},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if executed {
+		t.Fatalf("native child executor was called without registration")
+	}
+	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
+		t.Fatalf("children = %#v, want needs-human refusal", report.Children)
+	}
+	if !strings.Contains(report.Children[0].Error, "missing expected_outputs") {
+		t.Fatalf("native refusal error = %q, want missing expected_outputs", report.Children[0].Error)
+	}
+}
+
+func TestScheduleNestedRunsNativeChildRequiresExplicitAuthorityMetadata(t *testing.T) {
+	ctx := context.Background()
+	now := nestedTestNow()
+	projectID := "project-native-required"
+	deliveryRunID := "drun-native-required"
+	parentRunID := "run-native-required-parent"
+	taskID := "task-native-required"
+	attemptID := "attempt-native-required"
+	childKey := "native-child"
+	planID := "plan-native-required"
+	planFingerprint := "sha256:plan-native-required"
+	childAgentID := nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint)
+
+	tests := []struct {
+		name        string
+		mutate      func(map[string]any)
+		wantError   string
+		wantClaim   bool
+		wantExecute bool
+	}{
+		{name: "missing_scope", mutate: func(m map[string]any) { delete(m, "scope") }, wantError: "missing scope"},
+		{name: "missing_parent_scope", mutate: func(m map[string]any) { delete(m, "parent_scope") }, wantError: "missing parent_scope"},
+		{name: "missing_side_effect", mutate: func(m map[string]any) { delete(m, "side_effect_class") }, wantError: "missing side_effect_class"},
+		{name: "missing_cancellation", mutate: func(m map[string]any) { delete(m, "cancellation_channel") }, wantError: "missing cancellation_channel"},
+		{name: "missing_outputs", mutate: func(m map[string]any) { delete(m, "expected_outputs") }, wantError: "missing expected_outputs"},
+		{name: "missing_budget", mutate: func(m map[string]any) { delete(m, "budget_bindings") }, wantError: "missing budget_bindings"},
+		{name: "missing_write_locks", mutate: func(m map[string]any) { delete(m, "ownership_locks") }, wantError: "missing ownership_locks"},
+		{name: "metadata_scope_widening", mutate: func(m map[string]any) {
+			scope := nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint)
+			scope.WriteScope = append(scope.WriteScope, "src/widened.go")
+			scope.PathScope = append(scope.PathScope, "src/widened.go")
+			m["scope"] = scope
+		}, wantError: "ErrScopeWidening"},
+		{name: "durable_scope_widening", mutate: func(m map[string]any) {
+			scope := nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint)
+			scope.WriteScope = append(scope.WriteScope, "src/widened.go")
+			scope.PathScope = append(scope.PathScope, "src/widened.go")
+			m["scope"] = scope
+			m["parent_scope"] = scope
+			m["ownership_locks"] = []map[string]any{
+				{"resource_kind": "repo-path", "resource_key": "src/native.go", "state": storage.OwnershipStateHeld},
+				{"resource_kind": "repo-path", "resource_key": "src/widened.go", "state": storage.OwnershipStateHeld},
+			}
+		}, wantError: "ErrScopeWidening"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatalf("storage.Open: %v", err)
+			}
+			defer store.Close()
+			if err := seedNativeSchedulerAuthority(ctx, store, projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, childAgentID, planFingerprint, now); err != nil {
+				t.Fatalf("seed native authority: %v", err)
+			}
+			metadata := validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint)
+			tt.mutate(metadata)
+			metadataBytes, err := json.Marshal(metadata)
+			if err != nil {
+				t.Fatalf("marshal metadata: %v", err)
+			}
+			executed := false
+			report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath:    t.TempDir(),
+				RootRunID:   parentRunID,
+				ParentRunID: parentRunID,
+				PlanID:      planID,
+				Store:       store,
+				Now:         now,
+				Clock:       func() time.Time { return now },
+				Children: []ChildRunPlan{{
+					ChildKey:   childKey,
+					Title:      "native child",
+					Permission: storage.PermissionWrite,
+					Scope:      ChildScope{Paths: []string{"src/native.go"}},
+					Aggregation: ChildAggregation{
+						Mode:     ChildAggregationCollect,
+						Required: true,
+					},
+					Metadata: metadataBytes,
+				}},
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					executed = true
+					return ChildRunResult{Status: NestedStatusSucceeded}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("ScheduleNestedRuns: %v", err)
+			}
+			if executed != tt.wantExecute {
+				t.Fatalf("executed = %t, want %t", executed, tt.wantExecute)
+			}
+			if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+				t.Fatalf("status = %q, want needs-human; child=%#v", got, report.Children[0])
+			}
+			if !strings.Contains(report.Children[0].Error, tt.wantError) {
+				t.Fatalf("error = %q, want %q", report.Children[0].Error, tt.wantError)
+			}
+			var claimCount int
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims`).Scan(&claimCount)
+			}); err != nil {
+				t.Fatalf("count claims: %v", err)
+			}
+			if gotClaim := claimCount > 0; gotClaim != tt.wantClaim {
+				t.Fatalf("claim persisted = %t, want %t", gotClaim, tt.wantClaim)
+			}
+		})
+	}
+}
+
+func TestScheduleNestedRunsNativeChildRegistersAndTerminalizesAtomically(t *testing.T) {
+	ctx := context.Background()
+	now := nestedTestNow()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	projectID := "project-native"
+	deliveryRunID := "drun-native"
+	parentRunID := "run-native-parent"
+	taskID := "task-native"
+	attemptID := "attempt-native"
+	childKey := "native-child"
+	planID := "plan-native"
+	planFingerprint := "sha256:plan-native"
+	childAgentID := nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint)
+	if err := seedNativeSchedulerAuthority(ctx, store, projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, childAgentID, planFingerprint, now); err != nil {
+		t.Fatalf("seed native authority: %v", err)
+	}
+
+	metadata := map[string]any{}
+	for key, value := range validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint) {
+		metadata[key] = value
+	}
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    t.TempDir(),
+		RootRunID:   parentRunID,
+		ParentRunID: parentRunID,
+		PlanID:      planID,
+		Store:       store,
+		Now:         now,
+		Clock:       func() time.Time { return now },
+		Children: []ChildRunPlan{{
+			ChildKey:   childKey,
+			Title:      "native child",
+			Permission: storage.PermissionWrite,
+			Scope:      ChildScope{Paths: []string{"src/native.go"}},
+			Aggregation: ChildAggregation{
+				Mode:     ChildAggregationCollect,
+				Required: true,
+			},
+			Metadata: metadataBytes,
+		}},
+		Execute: func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			var state string
+			if err := store.WithTx(ctx, func(tx storage.Tx) error {
+				return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, childAgentID).Scan(&state)
+			}); err != nil {
+				t.Fatalf("query registration during execute: %v", err)
+			}
+			if state != storage.AgentStateRunning {
+				t.Fatalf("registration state during execute = %q, want running", state)
+			}
+			return ChildRunResult{Status: NestedStatusSucceeded, ProviderReceipt: "receipt-native"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if !executed {
+		t.Fatalf("native child executor was not called; children=%#v", report.Children)
+	}
+	if got := report.Children[0].Status; got != NestedStatusSucceeded {
+		t.Fatalf("native child status = %q, want succeeded", got)
+	}
+	var registrationState, lockState, reservationState, receipt string
+	var reservedValue, committedValue int64
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT registration_state, provider_receipt FROM agent_registrations WHERE id = ?`, childAgentID).Scan(&registrationState, &receipt); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state FROM agent_ownership_locks WHERE child_agent_id = ?`, childAgentID).Scan(&lockState); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT state, reserved_value, committed_value FROM budget_reservations WHERE budget_reservation_id = 'bres-native'`).Scan(&reservationState, &reservedValue, &committedValue)
+	}); err != nil {
+		t.Fatalf("query terminal native state: %v", err)
+	}
+	if registrationState != storage.AgentStateSucceeded || lockState != storage.OwnershipStateReleased || reservationState != "committed" || reservedValue != 0 || committedValue != 100 || receipt != "receipt-native" {
+		t.Fatalf("terminal native state registration=%q lock=%q reservation=%q reserved=%d committed=%d receipt=%q", registrationState, lockState, reservationState, reservedValue, committedValue, receipt)
 	}
 }
 
@@ -2006,6 +2263,160 @@ func countNestedDurableRows(t *testing.T, ctx context.Context, store storage.Sto
 		t.Fatalf("query durable rows: %v", err)
 	}
 	return plans, runs, edges, orphans
+}
+
+func nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint}, "\x00")))
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
+	return "agent_" + strings.ToLower(encoded)
+}
+
+func validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint string) map[string]any {
+	return map[string]any{
+		"native_subagent":           true,
+		"project_id":                projectID,
+		"delivery_run_id":           deliveryRunID,
+		"task_id":                   taskID,
+		"attempt_id":                attemptID,
+		"adapter_id":                "claude",
+		"provider_installation_id":  "pinst-native",
+		"account_profile_id":        "acct-native",
+		"model_capability_id":       "mcap-native",
+		"routing_decision_id":       "route-native",
+		"provider_session_ref":      "session-ref-native",
+		"plan_fingerprint":          planFingerprint,
+		"policy_fingerprint":        "sha256:policy-native",
+		"authorization_fingerprint": "sha256:auth-native",
+		"side_effect_class":         storage.SideEffectRepoWrite,
+		"cancellation_channel":      "local-cancel",
+		"expected_outputs": map[string]any{
+			"schema": "loopcoder.native_child.output.v1",
+		},
+		"parent_scope": nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint),
+		"scope":        nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint),
+		"budget_bindings": []map[string]any{{
+			"budget_policy_id":          "bpol-native",
+			"budget_reservation_id":     "bres-native",
+			"reserved_quantities_json":  "{}",
+			"ancestor_budget_refs_json": "[]",
+			"reservation_state":         "active",
+		}},
+		"ownership_locks": []map[string]any{{
+			"resource_kind": "repo-path",
+			"resource_key":  "src/native.go",
+			"state":         storage.OwnershipStateHeld,
+		}},
+	}
+}
+
+func nativeSchedulerScope(projectID, deliveryRunID, childAgentID, permission, sideEffectClass, planFingerprint string) storage.AgentScopeGrant {
+	return storage.AgentScopeGrant{
+		ProjectID:                projectID,
+		DeliveryRunID:            deliveryRunID,
+		ChildAgentID:             childAgentID,
+		ReadScope:                []string{"src/native.go"},
+		WriteScope:               []string{"src/native.go"},
+		PathScope:                []string{"src/native.go"},
+		RepositoryScope:          []string{"."},
+		CommandScope:             []string{"go test ./internal/orchestration"},
+		NetworkScope:             []string{"none"},
+		CredentialScope:          []string{"none"},
+		SideEffectScope:          []string{sideEffectClass},
+		ApprovalScope:            []string{"none"},
+		Permission:               permission,
+		SideEffectClass:          sideEffectClass,
+		PolicyVersion:            storage.AgentPolicyVersion,
+		PolicyFingerprint:        "sha256:policy-native",
+		PlanFingerprint:          planFingerprint,
+		AuthorizationFingerprint: "sha256:auth-native",
+	}
+}
+
+func seedNativeSchedulerAuthority(ctx context.Context, store storage.Store, projectID, deliveryRunID, rootRunID, taskID, attemptID, childKey, childAgentID, planFingerprint string, now time.Time) error {
+	at := state.FormatTimestamp(now)
+	scopeJSON, err := json.Marshal(nativeSchedulerScope(projectID, deliveryRunID, childAgentID, storage.PermissionWrite, storage.SideEffectRepoWrite, planFingerprint))
+	if err != nil {
+		return err
+	}
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			projectID, "/tmp/"+projectID, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO delivery_runs(
+			delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
+			state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+			policy_version, max_side_effect_class, approval_status, override_status, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')`,
+			deliveryRunID, "delivery-"+childKey, "loopcoder.delivery_run.v1", 1, projectID, rootRunID, "",
+			"approved", "native scheduler test", "sha256:input-native", "sha256:policy-native", planFingerprint, "sha256:auth-native",
+			"0805.agent_federation.v1", storage.SideEffectRepoWrite, "approved", "none", at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO delivery_tasks(
+			task_id, schema_version, record_version, project_id, delivery_run_id, task_key, state, title,
+			requirements_json, scope_json, permission, side_effect_class, policy_version, plan_fingerprint,
+			authorization_fingerprint, created_at, updated_at, created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')`,
+			taskID, "loopcoder.delivery_task.v1", 1, projectID, deliveryRunID, "task-native", "approved", "native task",
+			string(scopeJSON), storage.PermissionWrite, storage.SideEffectRepoWrite, "0805.agent_federation.v1", planFingerprint, "sha256:auth-native", at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO task_requirements(
+			task_requirement_id, schema_version, record_version, task_requirement_fingerprint, project_id, delivery_run_id,
+			task_id, task_key, role_key, risk_tier, permission_required, side_effect_class, required_output, scope_json,
+			data_classification, network_required, nested_allowed, cancellation_required, quality_floor,
+			provenance_summary, policy_version, plan_fingerprint, created_at, updated_at, created_by_json,
+			updated_by_json, host_json, classification, confidence, heuristic, payload_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}', ?, ?, ?, '{}')`,
+			"treq-native", "loopcoder.task_requirement.v1", 1, "sha256:req-native", projectID, deliveryRunID,
+			taskID, "task-native", "worker", "high", storage.PermissionWrite, storage.SideEffectRepoWrite, "json",
+			string(scopeJSON), "internal", "none", 1, 1, "standard", "test", "0805.agent_federation.v1", planFingerprint,
+			at, at, "local-diagnostic", "high", 0); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO provider_installations(
+			provider_installation_id, schema_version, record_version, scope, project_id, adapter_id, adapter_declaration_id,
+			provider_display_name, executable_name, executable_identity_json, canonical_path_redacted, discovery_source,
+			discovery_order, platform, version_confidence, installation_state, usable_for_invocation, created_at,
+			updated_at, captured_at, freshness_state, confidence, side_effect_class, classification, payload_json)
+			VALUES ('pinst-native', 'loopcoder.provider_installation.v1', 1, 'project', ?, 'claude', 'adecl-native',
+			'Claude', 'claude', '{}', 'claude', 'test', 1, 'test', 'high', 'active', 'yes', ?, ?, ?, 'fresh', 'high', ?, 'local-diagnostic', '{}')`,
+			projectID, at, at, at, storage.SideEffectLocalRead); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO account_profiles(account_profile_id, adapter_id, provider_installation_id, payload_json) VALUES ('acct-native', 'claude', 'pinst-native', '{}')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO model_catalog_snapshots(model_catalog_snapshot_id, adapter_id, provider_installation_id, payload_json) VALUES ('snap-native', 'claude', 'pinst-native', '{}')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO model_capabilities(model_capability_id, model_catalog_snapshot_id, adapter_id, payload_json) VALUES ('mcap-native', 'snap-native', 'claude', '{}')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO budget_policies(
+			budget_policy_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+			model_capability_id, scope_kind, scope_key, quantity_kind, unit, window_kind, policy_mode,
+			ceiling_value, active, policy_version, payload_json)
+			VALUES ('bpol-native', ?, ?, ?, ?, 'claude', 'acct-native', 'mcap-native', 'sub-agent', ?, 'local-policy', 'unit', 'run', 'hard', 1000, 1, '0805.agent_federation.v1', '{}')`,
+			projectID, deliveryRunID, taskID, childAgentID, "sub-agent:"+childAgentID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO budget_aggregates(budget_policy_id, reserved_value, committed_value, updated_at) VALUES ('bpol-native', 100, 0, ?)`, at); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO budget_reservations(
+			budget_reservation_id, idempotency_key, request_fingerprint, requester_id, authorization_fingerprint,
+			project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id, model_capability_id,
+			quantity_kind, unit, requested_value, reserved_value, state, generation, lease_expires_at, scope_key,
+			policy_ids_json, payload_json, created_at, updated_at)
+			VALUES ('bres-native', 'idem-native', 'sha256:budget-native', 'test', 'sha256:auth-native',
+			?, ?, ?, ?, 'claude', 'acct-native', 'mcap-native', 'local-policy', 'unit', 100, 100, 'active', 1, ?, ?, '["bpol-native"]',
+			'{"reserved_value":100,"committed_value":0,"released_value":0,"state":"active","generation":1}', ?, ?)`,
+			projectID, deliveryRunID, taskID, childAgentID, state.FormatTimestamp(now.Add(time.Hour)), "sub-agent:"+childAgentID, at, at)
+		return err
+	})
 }
 
 func nestedTestNow() time.Time {
