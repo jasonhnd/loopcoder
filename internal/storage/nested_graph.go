@@ -41,6 +41,7 @@ type SchedulerResourceReservationRequest struct {
 	TaskID                   string
 	SubAgentID               string
 	AdapterID                string
+	ProviderInstallationID   string
 	AccountProfileID         string
 	ModelCapabilityID        string
 	RoutingDecisionID        string
@@ -1203,16 +1204,17 @@ func nestedSchedulerResources(childRunID, parentRunID string, req SchedulerResou
 }
 
 type nestedBudgetPolicy struct {
-	id           string
-	scopeKey     string
-	mode         string
-	ceiling      int64
-	reserved     int64
-	committed    int64
-	quantityKind string
-	unit         string
-	valueScale   int
-	windowKind   string
+	id            string
+	scopeKey      string
+	mode          string
+	ceiling       int64
+	reserved      int64
+	committed     int64
+	recordVersion int64
+	quantityKind  string
+	unit          string
+	valueScale    int
+	windowKind    string
 }
 
 type nestedBudgetScope struct {
@@ -1228,10 +1230,13 @@ type nestedBudgetScope struct {
 }
 
 func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResult, req SchedulerResourceReservationRequest, now, leaseUntil string) ([]AgentBudgetBinding, error) {
+	req = normalizeNestedSchedulerBudgetRequest(req, claim.RunID)
 	if req.BudgetRequestedValue <= 0 {
+		if nestedSchedulerBudgetAuthorityRequired(req) {
+			return nil, federationError(ErrChildBudgetRequiredCode, "positive child budget reservation is required for route %s", req.RoutingDecisionID)
+		}
 		return nil, nil
 	}
-	req = normalizeNestedSchedulerBudgetRequest(req, claim.RunID)
 	if err := validateNestedSchedulerBudgetAuthorityTx(ctx, tx, req); err != nil {
 		return nil, err
 	}
@@ -1267,6 +1272,7 @@ func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResul
 		"task_id":                   req.TaskID,
 		"sub_agent_id":              req.SubAgentID,
 		"adapter_id":                req.AdapterID,
+		"provider_installation_id":  req.ProviderInstallationID,
 		"account_profile_id":        req.AccountProfileID,
 		"model_capability_id":       req.ModelCapabilityID,
 		"routing_decision_id":       req.RoutingDecisionID,
@@ -1283,7 +1289,7 @@ func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResul
 		"policy_ids":                policyIDs,
 	})
 	reservationID := stableID("bres_", idempotencyKey, policyIDs[0], req.SubAgentID, fingerprint)
-	existing, replay, err := nestedSchedulerBudgetReplayTx(ctx, tx, idempotencyKey, policyIDs[0], fingerprint)
+	existing, replay, err := nestedSchedulerBudgetReplayTx(ctx, tx, claim, req, idempotencyKey, policyIDs[0], fingerprint, policyIDs, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1300,38 +1306,39 @@ func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResul
 	}
 	emptyJSON, _ := json.Marshal([]string{})
 	payload := map[string]any{
-		"schema_version":                "loopcoder.budget_reservation.v1",
-		"record_version":                1,
-		"budget_reservation_id":         reservationID,
-		"idempotency_key":               idempotencyKey,
-		"request_fingerprint":           fingerprint,
-		"requester_id":                  req.SubAgentID,
-		"authorization_fingerprint":     req.AuthorizationFingerprint,
-		"scope":                         terminalScope,
-		"scope_key":                     scopeKey,
-		"quantity_kind":                 req.BudgetQuantityKind,
-		"unit":                          req.BudgetUnit,
-		"value_scale":                   req.BudgetValueScale,
-		"requested_value":               req.BudgetRequestedValue,
-		"reserved_value":                req.BudgetRequestedValue,
-		"committed_value":               0,
-		"released_value":                0,
-		"state":                         BudgetReservationStateActive,
-		"generation":                    1,
-		"lease_expires_at":              leaseUntil,
-		"budget_policy_ids":             policyIDs,
-		"requirement_confidence":        "exact",
-		"created_at":                    now,
-		"updated_at":                    now,
-		"created_by":                    map[string]string{"actor_id": "nested-scheduler", "role": "scheduler"},
-		"updated_by":                    map[string]string{"actor_id": "nested-scheduler", "role": "scheduler"},
-		"host":                          map[string]string{"provider": "loopcoder", "model": "nested-scheduler"},
-		"gap_reasons":                   []string{},
-		"scheduler_executor_id":         claim.ExecutorID,
-		"scheduler_claim_generation":    claim.ClaimGeneration,
-		"scheduler_provider_key":        req.ProviderKey,
-		"scheduler_routing_decision_id": req.RoutingDecisionID,
-		"scheduler_routing_fingerprint": req.RoutingFingerprint,
+		"schema_version":                     "loopcoder.budget_reservation.v1",
+		"record_version":                     1,
+		"budget_reservation_id":              reservationID,
+		"idempotency_key":                    idempotencyKey,
+		"request_fingerprint":                fingerprint,
+		"requester_id":                       req.SubAgentID,
+		"authorization_fingerprint":          req.AuthorizationFingerprint,
+		"scope":                              terminalScope,
+		"scope_key":                          scopeKey,
+		"quantity_kind":                      req.BudgetQuantityKind,
+		"unit":                               req.BudgetUnit,
+		"value_scale":                        req.BudgetValueScale,
+		"requested_value":                    req.BudgetRequestedValue,
+		"reserved_value":                     req.BudgetRequestedValue,
+		"committed_value":                    0,
+		"released_value":                     0,
+		"state":                              BudgetReservationStateActive,
+		"generation":                         1,
+		"lease_expires_at":                   leaseUntil,
+		"budget_policy_ids":                  policyIDs,
+		"requirement_confidence":             "exact",
+		"created_at":                         now,
+		"updated_at":                         now,
+		"created_by":                         map[string]string{"actor_id": "nested-scheduler", "role": "scheduler"},
+		"updated_by":                         map[string]string{"actor_id": "nested-scheduler", "role": "scheduler"},
+		"host":                               map[string]string{"provider": "loopcoder", "model": "nested-scheduler"},
+		"gap_reasons":                        []string{},
+		"scheduler_executor_id":              claim.ExecutorID,
+		"scheduler_claim_generation":         claim.ClaimGeneration,
+		"scheduler_provider_key":             req.ProviderKey,
+		"scheduler_provider_installation_id": req.ProviderInstallationID,
+		"scheduler_routing_decision_id":      req.RoutingDecisionID,
+		"scheduler_routing_fingerprint":      req.RoutingFingerprint,
 	}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -1354,13 +1361,40 @@ func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResul
 		return nil, fmt.Errorf("reserve nested scheduler budget: %w", err)
 	}
 	for _, policyID := range policyIDs {
-		if _, err := tx.Exec(ctx, `UPDATE budget_aggregates
+		policy := nestedSchedulerPolicyByID(policies, policyID)
+		result, err := tx.Exec(ctx, `UPDATE budget_aggregates
 			SET reserved_value = reserved_value + ?, record_version = record_version + 1, updated_at = ?
-			WHERE budget_policy_id = ?`, req.BudgetRequestedValue, now, policyID); err != nil {
+			WHERE budget_policy_id = ?
+				AND record_version = ?
+				AND reserved_value + ? >= 0
+				AND committed_value >= 0
+				AND (? <> 'hard' OR reserved_value + committed_value + ? <= ?)`,
+			req.BudgetRequestedValue, now, policyID, policy.recordVersion, req.BudgetRequestedValue, policy.mode, req.BudgetRequestedValue, policy.ceiling)
+		if err != nil {
 			return nil, fmt.Errorf("reserve nested scheduler budget aggregate %s: %w", policyID, err)
+		}
+		affected, err := result.RowsAffected()
+		if err == nil && affected != 1 {
+			return nil, federationError(ErrChildBudgetRequiredCode, "reserved %d aggregate rows for %s, want 1", affected, policyID)
 		}
 	}
 	return nestedSchedulerBudgetBindings(req, reservationID, policyIDs, now), nil
+}
+
+func nestedSchedulerBudgetAuthorityRequired(req SchedulerResourceReservationRequest) bool {
+	return strings.TrimSpace(req.ProjectID) != "" ||
+		strings.TrimSpace(req.DeliveryRunID) != "" ||
+		strings.TrimSpace(req.TaskID) != "" ||
+		strings.TrimSpace(req.AdapterID) != "" ||
+		strings.TrimSpace(req.ProviderInstallationID) != "" ||
+		strings.TrimSpace(req.AccountProfileID) != "" ||
+		strings.TrimSpace(req.ModelCapabilityID) != "" ||
+		strings.TrimSpace(req.RoutingDecisionID) != "" ||
+		strings.TrimSpace(req.RoutingFingerprint) != "" ||
+		strings.TrimSpace(req.PlanFingerprint) != "" ||
+		strings.TrimSpace(req.PolicyFingerprint) != "" ||
+		strings.TrimSpace(req.AuthorizationFingerprint) != "" ||
+		req.AttachBudgetBinding
 }
 
 func normalizeNestedSchedulerBudgetRequest(req SchedulerResourceReservationRequest, childRunID string) SchedulerResourceReservationRequest {
@@ -1369,6 +1403,7 @@ func normalizeNestedSchedulerBudgetRequest(req SchedulerResourceReservationReque
 	req.TaskID = strings.TrimSpace(req.TaskID)
 	req.SubAgentID = firstNonEmptyNestedGraph(strings.TrimSpace(req.SubAgentID), strings.TrimSpace(childRunID))
 	req.AdapterID = strings.ToLower(strings.TrimSpace(req.AdapterID))
+	req.ProviderInstallationID = strings.TrimSpace(req.ProviderInstallationID)
 	req.AccountProfileID = strings.TrimSpace(req.AccountProfileID)
 	req.ModelCapabilityID = strings.TrimSpace(req.ModelCapabilityID)
 	req.RoutingDecisionID = strings.TrimSpace(req.RoutingDecisionID)
@@ -1387,10 +1422,10 @@ func validateNestedSchedulerBudgetAuthorityTx(ctx context.Context, tx Tx, req Sc
 		req.RoutingDecisionID == "" || req.RoutingFingerprint == "" || req.PlanFingerprint == "" || req.PolicyFingerprint == "" || req.AuthorizationFingerprint == "" {
 		return federationError(ErrChildBudgetRequiredCode, "accepted route, provider, policy, authorization, and child budget authority are required")
 	}
-	var projectID, deliveryRunID, taskID, planFingerprint, policyFingerprint, routingFingerprint, status, chosen string
-	err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, task_id, plan_fingerprint, policy_fingerprint, routing_fingerprint, decision_status, chosen_candidate_id
+	var projectID, deliveryRunID, taskID, planFingerprint, policyFingerprint, routingFingerprint, status, chosen, eligibleJSON, scoredJSON string
+	err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, task_id, plan_fingerprint, policy_fingerprint, routing_fingerprint, decision_status, chosen_candidate_id, eligible_candidates_json, scored_candidates_json
 		FROM routing_decisions WHERE routing_decision_id = ?`, req.RoutingDecisionID).Scan(
-		&projectID, &deliveryRunID, &taskID, &planFingerprint, &policyFingerprint, &routingFingerprint, &status, &chosen)
+		&projectID, &deliveryRunID, &taskID, &planFingerprint, &policyFingerprint, &routingFingerprint, &status, &chosen, &eligibleJSON, &scoredJSON)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return federationError(ErrChildBudgetRequiredCode, "accepted routing decision %s is missing", req.RoutingDecisionID)
@@ -1402,7 +1437,63 @@ func validateNestedSchedulerBudgetAuthorityTx(ctx context.Context, tx Tx, req Sc
 		status != "selected" || strings.TrimSpace(chosen) == "" {
 		return federationError(ErrChildBudgetRequiredCode, "routing decision %s is not accepted for this child budget", req.RoutingDecisionID)
 	}
+	candidate, ok := nestedSchedulerChosenCandidate(chosen, eligibleJSON, scoredJSON)
+	if !ok {
+		return federationError(ErrChildBudgetRequiredCode, "routing decision %s chosen candidate %s is not persisted", req.RoutingDecisionID, chosen)
+	}
+	if !nestedSchedulerCandidateMatchesRequest(candidate, req) {
+		return federationError(ErrChildBudgetRequiredCode, "routing decision %s chosen candidate %s does not match requested provider route", req.RoutingDecisionID, chosen)
+	}
 	return nil
+}
+
+type nestedSchedulerRouteCandidate struct {
+	RoutingCandidateID     string `json:"routing_candidate_id"`
+	TaskID                 string `json:"task_id"`
+	AdapterID              string `json:"adapter_id"`
+	ProviderInstallationID string `json:"provider_installation_id"`
+	AccountProfileID       string `json:"account_profile_id"`
+	ModelCapabilityID      string `json:"model_capability_id"`
+	InvocationProfileKey   string `json:"invocation_profile_key"`
+	CandidateFingerprint   string `json:"candidate_fingerprint"`
+}
+
+type nestedSchedulerScoredCandidate struct {
+	RoutingCandidateID string                        `json:"routing_candidate_id"`
+	Candidate          nestedSchedulerRouteCandidate `json:"candidate"`
+}
+
+func nestedSchedulerChosenCandidate(chosen, eligibleJSON, scoredJSON string) (nestedSchedulerRouteCandidate, bool) {
+	chosen = strings.TrimSpace(chosen)
+	var eligible []nestedSchedulerRouteCandidate
+	if err := json.Unmarshal([]byte(firstNonEmptyNestedGraph(eligibleJSON, "[]")), &eligible); err == nil {
+		for _, candidate := range eligible {
+			if strings.TrimSpace(candidate.RoutingCandidateID) == chosen {
+				return candidate, true
+			}
+		}
+	}
+	var scored []nestedSchedulerScoredCandidate
+	if err := json.Unmarshal([]byte(firstNonEmptyNestedGraph(scoredJSON, "[]")), &scored); err == nil {
+		for _, scoredCandidate := range scored {
+			candidate := scoredCandidate.Candidate
+			if strings.TrimSpace(candidate.RoutingCandidateID) == "" {
+				candidate.RoutingCandidateID = scoredCandidate.RoutingCandidateID
+			}
+			if strings.TrimSpace(candidate.RoutingCandidateID) == chosen {
+				return candidate, true
+			}
+		}
+	}
+	return nestedSchedulerRouteCandidate{}, false
+}
+
+func nestedSchedulerCandidateMatchesRequest(candidate nestedSchedulerRouteCandidate, req SchedulerResourceReservationRequest) bool {
+	return strings.TrimSpace(candidate.TaskID) == req.TaskID &&
+		strings.EqualFold(strings.TrimSpace(candidate.AdapterID), req.AdapterID) &&
+		strings.TrimSpace(candidate.ProviderInstallationID) == req.ProviderInstallationID &&
+		strings.TrimSpace(candidate.AccountProfileID) == req.AccountProfileID &&
+		strings.TrimSpace(candidate.ModelCapabilityID) == req.ModelCapabilityID
 }
 
 func nestedSchedulerBudgetScopes(req SchedulerResourceReservationRequest) ([]nestedBudgetScope, nestedBudgetScope, error) {
@@ -1444,9 +1535,9 @@ func loadNestedSchedulerBudgetPoliciesTx(ctx context.Context, tx Tx, scopes []ne
 			return nil, err
 		}
 		rows, err := tx.Query(ctx, `SELECT p.budget_policy_id, p.scope_key, p.policy_mode, p.ceiling_value,
-				a.reserved_value, a.committed_value, p.quantity_kind, p.unit, p.value_scale, p.window_kind
+				a.reserved_value, a.committed_value, p.quantity_kind, p.unit, p.value_scale, p.window_kind, a.record_version
 			FROM budget_policies p
-			JOIN budget_aggregates a ON a.budget_policy_id = p.budget_policy_id
+			LEFT JOIN budget_aggregates a ON a.budget_policy_id = p.budget_policy_id
 			WHERE p.scope_key = ? AND p.quantity_kind = ? AND p.window_kind = ? AND p.active = 1
 			ORDER BY p.budget_policy_id`, key, quantityKind, windowKind)
 		if err != nil {
@@ -1454,10 +1545,22 @@ func loadNestedSchedulerBudgetPoliciesTx(ctx context.Context, tx Tx, scopes []ne
 		}
 		for rows.Next() {
 			var policy nestedBudgetPolicy
-			if err := rows.Scan(&policy.id, &policy.scopeKey, &policy.mode, &policy.ceiling, &policy.reserved, &policy.committed, &policy.quantityKind, &policy.unit, &policy.valueScale, &policy.windowKind); err != nil {
+			var reserved, committed, recordVersion sql.NullInt64
+			if err := rows.Scan(&policy.id, &policy.scopeKey, &policy.mode, &policy.ceiling, &reserved, &committed, &policy.quantityKind, &policy.unit, &policy.valueScale, &policy.windowKind, &recordVersion); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
+			if !reserved.Valid || !committed.Valid || !recordVersion.Valid {
+				_ = rows.Close()
+				return nil, federationError(ErrChildBudgetRequiredCode, "budget aggregate for policy %s is missing", policy.id)
+			}
+			if reserved.Int64 < 0 || committed.Int64 < 0 || recordVersion.Int64 <= 0 {
+				_ = rows.Close()
+				return nil, federationError(ErrChildBudgetRequiredCode, "budget aggregate for policy %s is invalid", policy.id)
+			}
+			policy.reserved = reserved.Int64
+			policy.committed = committed.Int64
+			policy.recordVersion = recordVersion.Int64
 			if seen[policy.id] {
 				continue
 			}
@@ -1477,12 +1580,27 @@ func loadNestedSchedulerBudgetPoliciesTx(ctx context.Context, tx Tx, scopes []ne
 	return policies, nil
 }
 
-func nestedSchedulerBudgetReplayTx(ctx context.Context, tx Tx, idempotencyKey, primaryPolicyID, fingerprint string) (string, bool, error) {
-	var reservationID, existingFingerprint, policyIDsJSON, state string
-	err := tx.QueryRow(ctx, `SELECT budget_reservation_id, request_fingerprint, policy_ids_json, state
+func nestedSchedulerPolicyByID(policies []nestedBudgetPolicy, policyID string) nestedBudgetPolicy {
+	for _, policy := range policies {
+		if policy.id == policyID {
+			return policy
+		}
+	}
+	return nestedBudgetPolicy{id: policyID}
+}
+
+func nestedSchedulerBudgetReplayTx(ctx context.Context, tx Tx, claim ClaimResult, req SchedulerResourceReservationRequest, idempotencyKey, primaryPolicyID, fingerprint string, policyIDs []string, now string) (string, bool, error) {
+	var reservation nestedSchedulerHeldBudgetReservation
+	var existingFingerprint, state, policyIDsJSON, payloadJSON string
+	err := tx.QueryRow(ctx, `SELECT budget_reservation_id, request_fingerprint, policy_ids_json, state,
+			project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id, model_capability_id, authorization_fingerprint,
+			quantity_kind, unit, value_scale, requested_value, generation, lease_expires_at, payload_json
 		FROM budget_reservations
 		WHERE idempotency_key = ? AND COALESCE(json_extract(policy_ids_json, '$[0]'), '') = ?`,
-		idempotencyKey, primaryPolicyID).Scan(&reservationID, &existingFingerprint, &policyIDsJSON, &state)
+		idempotencyKey, primaryPolicyID).Scan(
+		&reservation.id, &existingFingerprint, &policyIDsJSON, &state,
+		&reservation.projectID, &reservation.deliveryRunID, &reservation.taskID, &reservation.subAgentID, &reservation.adapterID, &reservation.accountProfileID, &reservation.modelCapabilityID, &reservation.authorizationFingerprint,
+		&reservation.quantityKind, &reservation.unit, &reservation.valueScale, &reservation.requested, &reservation.generation, &reservation.leaseExpiresAt, &payloadJSON)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", false, nil
@@ -1493,10 +1611,22 @@ func nestedSchedulerBudgetReplayTx(ctx context.Context, tx Tx, idempotencyKey, p
 		return "", false, federationError(ErrDuplicateReplayCode, "budget reservation idempotency key replayed with different request")
 	}
 	if state != BudgetReservationStateActive && state != BudgetReservationStatePartiallyCommitted {
-		return "", false, federationError(ErrChildBudgetRequiredCode, "budget reservation %s is %s", reservationID, state)
+		return "", false, federationError(ErrChildBudgetRequiredCode, "budget reservation %s is %s", reservation.id, state)
 	}
-	_ = policyIDsJSON
-	return reservationID, true, nil
+	reservation.policyIDs = decodeStringList(policyIDsJSON)
+	if !sameStringSet(reservation.policyIDs, policyIDs) {
+		return "", false, federationError(ErrChildBudgetRequiredCode, "budget reservation %s policy set does not match route", reservation.id)
+	}
+	if !claimLeaseActive(reservation.leaseExpiresAt, now) {
+		return "", false, federationError(ErrChildBudgetRequiredCode, "budget reservation %s lease is not live", reservation.id)
+	}
+	if err := reservation.loadSchedulerPayload(payloadJSON); err != nil {
+		return "", false, err
+	}
+	if err := validateNestedSchedulerHeldBudgetReservation(ctx, tx, reservation, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, req, now); err != nil {
+		return "", false, err
+	}
+	return reservation.id, true, nil
 }
 
 func nestedSchedulerBudgetBindings(req SchedulerResourceReservationRequest, reservationID string, policyIDs []string, at string) []AgentBudgetBinding {
@@ -1525,60 +1655,261 @@ func nestedSchedulerBudgetBindings(req SchedulerResourceReservationRequest, rese
 	return bindings
 }
 
-func renewNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, now, leaseUntil string) error {
-	result, err := tx.Exec(ctx, `UPDATE budget_reservations
-		SET lease_expires_at = ?,
-			generation = generation + 1,
-			updated_at = ?,
-			payload_json = json_set(payload_json,
-				'$.lease_expires_at', ?,
-				'$.generation', generation + 1,
-				'$.updated_at', ?)
+type nestedSchedulerHeldBudgetReservation struct {
+	id                       string
+	projectID                string
+	deliveryRunID            string
+	taskID                   string
+	subAgentID               string
+	adapterID                string
+	providerInstallationID   string
+	accountProfileID         string
+	modelCapabilityID        string
+	authorizationFingerprint string
+	quantityKind             string
+	unit                     string
+	valueScale               int
+	requested                int64
+	reserved                 int64
+	committed                int64
+	released                 int64
+	generation               int64
+	leaseExpiresAt           string
+	policyIDs                []string
+	schedulerExecutorID      string
+	schedulerClaimGeneration int64
+	schedulerProviderKey     string
+	schedulerRoutingID       string
+	schedulerRoutingFP       string
+}
+
+func (r *nestedSchedulerHeldBudgetReservation) loadSchedulerPayload(payloadJSON string) error {
+	var payload struct {
+		SchedulerExecutorID         string `json:"scheduler_executor_id"`
+		SchedulerClaimGeneration    int64  `json:"scheduler_claim_generation"`
+		SchedulerProviderKey        string `json:"scheduler_provider_key"`
+		SchedulerProviderInstallID  string `json:"scheduler_provider_installation_id"`
+		SchedulerRoutingDecisionID  string `json:"scheduler_routing_decision_id"`
+		SchedulerRoutingFingerprint string `json:"scheduler_routing_fingerprint"`
+	}
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		return fmt.Errorf("nested scheduler budget payload: %w", err)
+	}
+	r.schedulerExecutorID = strings.TrimSpace(payload.SchedulerExecutorID)
+	r.schedulerClaimGeneration = payload.SchedulerClaimGeneration
+	r.schedulerProviderKey = strings.TrimSpace(payload.SchedulerProviderKey)
+	r.providerInstallationID = strings.TrimSpace(payload.SchedulerProviderInstallID)
+	r.schedulerRoutingID = strings.TrimSpace(payload.SchedulerRoutingDecisionID)
+	r.schedulerRoutingFP = strings.TrimSpace(payload.SchedulerRoutingFingerprint)
+	return nil
+}
+
+func (r nestedSchedulerHeldBudgetReservation) request() SchedulerResourceReservationRequest {
+	return SchedulerResourceReservationRequest{
+		ProviderKey:              r.schedulerProviderKey,
+		ProjectID:                r.projectID,
+		DeliveryRunID:            r.deliveryRunID,
+		TaskID:                   r.taskID,
+		SubAgentID:               r.subAgentID,
+		AdapterID:                r.adapterID,
+		ProviderInstallationID:   r.providerInstallationID,
+		AccountProfileID:         r.accountProfileID,
+		ModelCapabilityID:        r.modelCapabilityID,
+		RoutingDecisionID:        r.schedulerRoutingID,
+		RoutingFingerprint:       r.schedulerRoutingFP,
+		AuthorizationFingerprint: r.authorizationFingerprint,
+		BudgetRequestedValue:     r.requested,
+		BudgetQuantityKind:       r.quantityKind,
+		BudgetUnit:               r.unit,
+		BudgetValueScale:         r.valueScale,
+	}
+}
+
+func validateNestedSchedulerHeldBudgetReservation(ctx context.Context, tx Tx, item nestedSchedulerHeldBudgetReservation, childRunID, executorID string, claimGeneration int64, req SchedulerResourceReservationRequest, now string) error {
+	if item.subAgentID != childRunID || item.schedulerExecutorID != executorID || item.schedulerClaimGeneration != claimGeneration {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation %s is not fenced to this scheduler claim", item.id)
+	}
+	if item.requested <= 0 || item.reserved < 0 || item.committed < 0 || item.released < 0 || len(item.policyIDs) == 0 {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation %s has invalid accounting authority", item.id)
+	}
+	if !claimLeaseActive(item.leaseExpiresAt, now) {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation %s lease is not live", item.id)
+	}
+	if req.ProjectID != item.projectID || req.DeliveryRunID != item.deliveryRunID || req.TaskID != item.taskID ||
+		req.SubAgentID != item.subAgentID || !strings.EqualFold(req.AdapterID, item.adapterID) ||
+		req.ProviderInstallationID != item.providerInstallationID || req.AccountProfileID != item.accountProfileID ||
+		req.ModelCapabilityID != item.modelCapabilityID || req.AuthorizationFingerprint != item.authorizationFingerprint ||
+		req.BudgetRequestedValue != item.requested || req.BudgetQuantityKind != item.quantityKind ||
+		req.BudgetUnit != item.unit || req.BudgetValueScale != item.valueScale {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation %s does not match requested authority", item.id)
+	}
+	if req.RoutingDecisionID != item.schedulerRoutingID || req.RoutingFingerprint != item.schedulerRoutingFP {
+		return federationError(ErrChildBudgetRequiredCode, "budget reservation %s route binding does not match scheduler claim", item.id)
+	}
+	req.PolicyFingerprint = strings.TrimSpace(req.PolicyFingerprint)
+	req.PlanFingerprint = strings.TrimSpace(req.PlanFingerprint)
+	if req.PolicyFingerprint == "" || req.PlanFingerprint == "" {
+		var planFingerprint, policyFingerprint string
+		if err := tx.QueryRow(ctx, `SELECT plan_fingerprint, policy_fingerprint FROM routing_decisions WHERE routing_decision_id = ?`, req.RoutingDecisionID).Scan(&planFingerprint, &policyFingerprint); err != nil {
+			if err == sql.ErrNoRows {
+				return federationError(ErrChildBudgetRequiredCode, "accepted routing decision %s is missing", req.RoutingDecisionID)
+			}
+			return err
+		}
+		req.PlanFingerprint = planFingerprint
+		req.PolicyFingerprint = policyFingerprint
+	}
+	return validateNestedSchedulerBudgetAuthorityTx(ctx, tx, req)
+}
+
+func loadNestedSchedulerHeldBudgetReservationsTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, now string, unboundOnly bool) ([]nestedSchedulerHeldBudgetReservation, error) {
+	notBound := ""
+	if unboundOnly {
+		notBound = `AND NOT EXISTS (SELECT 1 FROM agent_budget_bindings b WHERE b.budget_reservation_id = r.budget_reservation_id)`
+	}
+	rows, err := tx.Query(ctx, `SELECT budget_reservation_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id,
+			account_profile_id, model_capability_id, authorization_fingerprint, quantity_kind, unit, value_scale,
+			requested_value, reserved_value, committed_value, released_value, generation, lease_expires_at, policy_ids_json, payload_json
+		FROM budget_reservations r
 		WHERE sub_agent_id = ?
 			AND state IN ('active', 'partially-committed')
+			AND lease_expires_at > ?
 			AND json_extract(payload_json, '$.scheduler_executor_id') = ?
-			AND json_extract(payload_json, '$.scheduler_claim_generation') = ?`,
-		leaseUntil, now, leaseUntil, now, childRunID, executorID, claimGeneration)
+			AND json_extract(payload_json, '$.scheduler_claim_generation') = ? `+notBound+`
+		ORDER BY budget_reservation_id`, childRunID, now, executorID, claimGeneration)
+	if err != nil {
+		return nil, err
+	}
+	var held []nestedSchedulerHeldBudgetReservation
+	for rows.Next() {
+		var item nestedSchedulerHeldBudgetReservation
+		var policyIDsJSON, payloadJSON string
+		if err := rows.Scan(&item.id, &item.projectID, &item.deliveryRunID, &item.taskID, &item.subAgentID, &item.adapterID,
+			&item.accountProfileID, &item.modelCapabilityID, &item.authorizationFingerprint, &item.quantityKind, &item.unit, &item.valueScale,
+			&item.requested, &item.reserved, &item.committed, &item.released, &item.generation, &item.leaseExpiresAt, &policyIDsJSON, &payloadJSON); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		item.policyIDs = decodeStringList(policyIDsJSON)
+		if err := item.loadSchedulerPayload(payloadJSON); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		held = append(held, item)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return held, nil
+}
+
+func nestedSchedulerBudgetHistoryCountTx(ctx context.Context, tx Tx, childRunID string, claimGeneration int64) (int64, error) {
+	var count int64
+	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations
+		WHERE sub_agent_id = ? AND json_extract(payload_json, '$.scheduler_claim_generation') = ?`, childRunID, claimGeneration).Scan(&count)
+	return count, err
+}
+
+func nestedSchedulerUnboundBudgetHistoryCountTx(ctx context.Context, tx Tx, childRunID string, claimGeneration int64) (int64, error) {
+	var count int64
+	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations r
+		WHERE sub_agent_id = ?
+			AND json_extract(payload_json, '$.scheduler_claim_generation') = ?
+			AND NOT EXISTS (SELECT 1 FROM agent_budget_bindings b WHERE b.budget_reservation_id = r.budget_reservation_id)`,
+		childRunID, claimGeneration).Scan(&count)
+	return count, err
+}
+
+func nestedSchedulerResourceHistoryCountTx(ctx context.Context, tx Tx, childRunID string, claimGeneration int64) (int64, error) {
+	var count int64
+	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ? AND claim_generation = ?`, childRunID, claimGeneration).Scan(&count)
+	return count, err
+}
+
+func nestedSchedulerBudgetAggregateVersionTx(ctx context.Context, tx Tx, policyID string) (int64, error) {
+	var recordVersion int64
+	err := tx.QueryRow(ctx, `SELECT record_version FROM budget_aggregates WHERE budget_policy_id = ?`, policyID).Scan(&recordVersion)
+	if err == sql.ErrNoRows {
+		return 0, federationError(ErrChildBudgetRequiredCode, "budget aggregate for policy %s is missing", policyID)
+	}
+	return recordVersion, err
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftCopy := append([]string(nil), left...)
+	rightCopy := append([]string(nil), right...)
+	sort.Strings(leftCopy)
+	sort.Strings(rightCopy)
+	for i := range leftCopy {
+		if leftCopy[i] != rightCopy[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func renewNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, now, leaseUntil string) error {
+	expected, err := nestedSchedulerBudgetHistoryCountTx(ctx, tx, childRunID, claimGeneration)
 	if err != nil {
 		return fmt.Errorf("renew nested scheduler budget: %w", err)
 	}
-	_, _ = result.RowsAffected()
+	if expected == 0 {
+		return nil
+	}
+	held, err := loadNestedSchedulerHeldBudgetReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, now, false)
+	if err != nil {
+		return fmt.Errorf("renew nested scheduler budget: %w", err)
+	}
+	if int64(len(held)) != expected {
+		return federationError(ErrChildBudgetRequiredCode, "renewed %d budget reservation rows for %s generation %d, want %d", len(held), childRunID, claimGeneration, expected)
+	}
+	for _, item := range held {
+		if err := validateNestedSchedulerHeldBudgetReservation(ctx, tx, item, childRunID, executorID, claimGeneration, item.request(), now); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `UPDATE budget_reservations
+			SET lease_expires_at = ?,
+				generation = generation + 1,
+				updated_at = ?,
+				payload_json = json_set(payload_json,
+					'$.lease_expires_at', ?,
+					'$.generation', generation + 1,
+					'$.updated_at', ?)
+			WHERE budget_reservation_id = ?
+				AND generation = ?
+				AND state IN ('active', 'partially-committed')
+				AND lease_expires_at > ?
+				AND json_extract(payload_json, '$.scheduler_executor_id') = ?
+				AND json_extract(payload_json, '$.scheduler_claim_generation') = ?`,
+			leaseUntil, now, leaseUntil, now, item.id, item.generation, now, executorID, claimGeneration)
+		if err != nil {
+			return fmt.Errorf("renew nested scheduler budget reservation %s: %w", item.id, err)
+		}
+		affected, err := result.RowsAffected()
+		if err == nil && affected != 1 {
+			return federationError(ErrChildBudgetRequiredCode, "renewed %d budget reservation rows for %s, want 1", affected, item.id)
+		}
+	}
 	return nil
 }
 
 func releaseNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, status, at string) error {
-	rows, err := tx.Query(ctx, `SELECT budget_reservation_id, reserved_value, committed_value, released_value, generation, policy_ids_json
-		FROM budget_reservations r
-		WHERE sub_agent_id = ?
-			AND state IN ('active', 'partially-committed')
-			AND json_extract(payload_json, '$.scheduler_executor_id') = ?
-			AND json_extract(payload_json, '$.scheduler_claim_generation') = ?
-			AND NOT EXISTS (SELECT 1 FROM agent_budget_bindings b WHERE b.budget_reservation_id = r.budget_reservation_id)`,
-		childRunID, executorID, claimGeneration)
+	expected, err := nestedSchedulerUnboundBudgetHistoryCountTx(ctx, tx, childRunID, claimGeneration)
 	if err != nil {
 		return fmt.Errorf("release nested scheduler budget: %w", err)
 	}
-	type heldReservation struct {
-		id         string
-		reserved   int64
-		committed  int64
-		released   int64
-		generation int64
-		policyIDs  []string
+	if expected == 0 {
+		return nil
 	}
-	var held []heldReservation
-	for rows.Next() {
-		var item heldReservation
-		var policyIDsJSON string
-		if err := rows.Scan(&item.id, &item.reserved, &item.committed, &item.released, &item.generation, &policyIDsJSON); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("release nested scheduler budget row: %w", err)
-		}
-		item.policyIDs = decodeStringList(policyIDsJSON)
-		held = append(held, item)
+	held, err := loadNestedSchedulerHeldBudgetReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, at, true)
+	if err != nil {
+		return fmt.Errorf("release nested scheduler budget: %w", err)
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	if int64(len(held)) != expected {
+		return federationError(ErrChildBudgetRequiredCode, "released %d budget reservation rows for %s generation %d, want %d", len(held), childRunID, claimGeneration, expected)
 	}
 	commit := status == "succeeded" || status == "succeeded_with_optional_failures"
 	finalState := "cancelled"
@@ -1586,6 +1917,9 @@ func releaseNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, exec
 		finalState = "committed"
 	}
 	for _, item := range held {
+		if err := validateNestedSchedulerHeldBudgetReservation(ctx, tx, item, childRunID, executorID, claimGeneration, item.request(), at); err != nil {
+			return err
+		}
 		nextCommitted := item.committed
 		nextReleased := item.released
 		deltaCommitted := int64(0)
@@ -1612,11 +1946,13 @@ func releaseNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, exec
 			WHERE budget_reservation_id = ?
 				AND generation = ?
 				AND reserved_value = ?
+				AND state IN ('active', 'partially-committed')
+				AND lease_expires_at > ?
 				AND json_extract(payload_json, '$.scheduler_executor_id') = ?
 				AND json_extract(payload_json, '$.scheduler_claim_generation') = ?`,
 			nextCommitted, nextReleased, finalState, at,
 			nextCommitted, nextReleased, finalState, at,
-			item.id, item.generation, item.reserved, executorID, claimGeneration)
+			item.id, item.generation, item.reserved, at, executorID, claimGeneration)
 		if err != nil {
 			return fmt.Errorf("release nested scheduler budget reservation %s: %w", item.id, err)
 		}
@@ -1625,11 +1961,23 @@ func releaseNestedSchedulerBudgetTx(ctx context.Context, tx Tx, childRunID, exec
 			return federationError(ErrChildBudgetRequiredCode, "budget reservation %s release affected %d rows", item.id, affected)
 		}
 		for _, policyID := range item.policyIDs {
-			if _, err := tx.Exec(ctx, `UPDATE budget_aggregates
+			recordVersion, err := nestedSchedulerBudgetAggregateVersionTx(ctx, tx, policyID)
+			if err != nil {
+				return err
+			}
+			result, err := tx.Exec(ctx, `UPDATE budget_aggregates
 				SET reserved_value = reserved_value - ?, committed_value = committed_value + ?, record_version = record_version + 1, updated_at = ?
-				WHERE budget_policy_id = ?`,
-				item.reserved, deltaCommitted, at, policyID); err != nil {
+				WHERE budget_policy_id = ?
+					AND record_version = ?
+					AND reserved_value - ? >= 0
+					AND committed_value + ? >= 0`,
+				item.reserved, deltaCommitted, at, policyID, recordVersion, item.reserved, deltaCommitted)
+			if err != nil {
 				return fmt.Errorf("release nested scheduler budget aggregate %s: %w", policyID, err)
+			}
+			affected, err := result.RowsAffected()
+			if err == nil && affected != 1 {
+				return federationError(ErrChildBudgetRequiredCode, "released %d aggregate rows for %s, want 1", affected, policyID)
 			}
 		}
 	}
@@ -1652,29 +2000,66 @@ func nestedBudgetUnit(quantityKind string) string {
 }
 
 func renewNestedSchedulerReservationsTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, now, leaseUntil string) error {
+	expected, err := nestedSchedulerResourceHistoryCountTx(ctx, tx, childRunID, claimGeneration)
+	if err != nil {
+		return fmt.Errorf("renew nested scheduler reservations: %w", err)
+	}
+	budgetHistory, err := nestedSchedulerBudgetHistoryCountTx(ctx, tx, childRunID, claimGeneration)
+	if err != nil {
+		return fmt.Errorf("renew nested scheduler reservations: %w", err)
+	}
+	if expected == 0 {
+		if budgetHistory > 0 {
+			return federationError(ErrChildBudgetRequiredCode, "missing concurrency reservation authority for %s generation %d", childRunID, claimGeneration)
+		}
+		return nil
+	}
+	if budgetHistory > 0 && expected != 3 {
+		return federationError(ErrChildBudgetRequiredCode, "found %d concurrency reservation authority rows for %s generation %d, want 3", expected, childRunID, claimGeneration)
+	}
 	result, err := tx.Exec(ctx, `UPDATE nested_scheduler_resource_reservations
 		SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
-		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ?`,
-		now, leaseUntil, now, childRunID, executorID, claimGeneration, schedulerReservationStateActive)
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ? AND lease_expires_at > ?`,
+		now, leaseUntil, now, childRunID, executorID, claimGeneration, schedulerReservationStateActive, now)
 	if err != nil {
 		return fmt.Errorf("renew nested scheduler reservations: %w", err)
 	}
 	affected, err := result.RowsAffected()
-	if err == nil && affected == 0 {
-		return nil
+	if err == nil && affected != expected {
+		return federationError(ErrChildBudgetRequiredCode, "renewed %d concurrency reservation rows for %s generation %d, want %d", affected, childRunID, claimGeneration, expected)
 	}
 	return nil
 }
 
 func releaseNestedSchedulerReservationsTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, at string) error {
-	result, err := tx.Exec(ctx, `UPDATE nested_scheduler_resource_reservations
-		SET state = ?, heartbeat_at = ?, updated_at = ?
-		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ?`,
-		schedulerReservationStateReleased, at, at, childRunID, executorID, claimGeneration, schedulerReservationStateActive)
+	expected, err := nestedSchedulerResourceHistoryCountTx(ctx, tx, childRunID, claimGeneration)
 	if err != nil {
 		return fmt.Errorf("release nested scheduler reservations: %w", err)
 	}
-	_, _ = result.RowsAffected()
+	budgetHistory, err := nestedSchedulerBudgetHistoryCountTx(ctx, tx, childRunID, claimGeneration)
+	if err != nil {
+		return fmt.Errorf("release nested scheduler reservations: %w", err)
+	}
+	if expected == 0 {
+		if budgetHistory > 0 {
+			return federationError(ErrChildBudgetRequiredCode, "missing concurrency reservation authority for %s generation %d", childRunID, claimGeneration)
+		}
+		return nil
+	}
+	if budgetHistory > 0 && expected != 3 {
+		return federationError(ErrChildBudgetRequiredCode, "found %d concurrency reservation authority rows for %s generation %d, want 3", expected, childRunID, claimGeneration)
+	}
+	result, err := tx.Exec(ctx, `UPDATE nested_scheduler_resource_reservations
+		SET state = ?, heartbeat_at = ?, updated_at = ?
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ? AND lease_expires_at > ?`,
+		schedulerReservationStateReleased, at, at, childRunID, executorID, claimGeneration, schedulerReservationStateActive, at)
+	if err != nil {
+		return fmt.Errorf("release nested scheduler reservations: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != expected && budgetHistory > 0 {
+		return federationError(ErrChildBudgetRequiredCode, "released %d concurrency reservation rows for %s generation %d, want %d", affected, childRunID, claimGeneration, expected)
+	}
 	return nil
 }
 

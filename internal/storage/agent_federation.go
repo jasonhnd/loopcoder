@@ -635,12 +635,14 @@ func ClaimAndRegisterNativeChildWithReservations(ctx context.Context, store Stor
 				if err := reserveNestedSchedulerResourcesTx(ctx, tx, claim, parentRunID, reservation, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
 					return err
 				}
-				bindings, err := reserveNestedSchedulerBudgetTx(ctx, tx, claim, reservation, formatTimestamp(now), formatTimestamp(leaseUntil))
-				if err != nil {
-					return err
-				}
-				if len(bindings) > 0 {
-					req.BudgetBindings = append(req.BudgetBindings, bindings...)
+				if len(req.BudgetBindings) == 0 {
+					bindings, err := reserveNestedSchedulerBudgetTx(ctx, tx, claim, reservation, formatTimestamp(now), formatTimestamp(leaseUntil))
+					if err != nil {
+						return err
+					}
+					if len(bindings) > 0 {
+						req.BudgetBindings = append(req.BudgetBindings, bindings...)
+					}
 				}
 			default:
 				return nil

@@ -1254,6 +1254,7 @@ func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRu
 		authority.TaskID = native.TaskID
 		authority.SubAgentID = storage.ChildAgentIDForRegistration(native)
 		authority.AdapterID = native.AdapterID
+		authority.ProviderInstallationID = native.ProviderInstallationID
 		authority.AccountProfileID = native.AccountProfileID
 		authority.ModelCapabilityID = native.ModelCapabilityID
 		authority.RoutingDecisionID = native.RoutingDecisionID
@@ -1272,6 +1273,7 @@ func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRu
 		TaskID:                   authority.TaskID,
 		SubAgentID:               authority.SubAgentID,
 		AdapterID:                authority.AdapterID,
+		ProviderInstallationID:   authority.ProviderInstallationID,
 		AccountProfileID:         authority.AccountProfileID,
 		ModelCapabilityID:        authority.ModelCapabilityID,
 		RoutingDecisionID:        authority.RoutingDecisionID,
@@ -1306,6 +1308,7 @@ func nestedSchedulerProviderRoute(child ChildRunPlan, authority schedulerAuthori
 	parts := []string{
 		strings.TrimSpace(authority.RoutingDecisionID),
 		strings.TrimSpace(authority.AdapterID),
+		strings.TrimSpace(authority.ProviderInstallationID),
 		strings.TrimSpace(authority.AccountProfileID),
 		strings.TrimSpace(authority.ModelCapabilityID),
 	}
@@ -1560,6 +1563,7 @@ type schedulerAuthorityMetadata struct {
 	TaskID                   string `json:"task_id"`
 	SubAgentID               string `json:"sub_agent_id"`
 	AdapterID                string `json:"adapter_id"`
+	ProviderInstallationID   string `json:"provider_installation_id"`
 	AccountProfileID         string `json:"account_profile_id"`
 	ModelCapabilityID        string `json:"model_capability_id"`
 	RoutingDecisionID        string `json:"routing_decision_id"`

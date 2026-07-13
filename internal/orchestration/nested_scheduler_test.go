@@ -2706,6 +2706,20 @@ func mustNestedSchedulerAuthorityJSON(t *testing.T, authority nestedSchedulerBud
 
 func seedNestedSchedulerBudgetAuthority(ctx context.Context, store storage.Store, authority nestedSchedulerBudgetAuthority, ceiling int64) error {
 	at := state.FormatTimestamp(nestedTestNow())
+	candidate := []map[string]any{{
+		"routing_candidate_id":   "candidate-budget",
+		"task_id":                authority.TaskID,
+		"adapter_id":             authority.AdapterID,
+		"account_profile_id":     authority.AccountProfileID,
+		"model_capability_id":    authority.ModelCapabilityID,
+		"budget_policy_ids":      []string{"bpol-project-budget", "bpol-provider-budget"},
+		"candidate_fingerprint":  "sha256:candidate-budget",
+		"invocation_profile_key": "default",
+	}}
+	candidateJSON, err := json.Marshal(candidate)
+	if err != nil {
+		return err
+	}
 	projectScope := mustNestedBudgetScopeKey(nestedBudgetTestScope{ScopeKind: "project", ProjectID: authority.ProjectID})
 	providerScope := mustNestedBudgetScopeKey(nestedBudgetTestScope{
 		ScopeKind:         "provider-scope",
@@ -2739,9 +2753,9 @@ func seedNestedSchedulerBudgetAuthority(ctx context.Context, store storage.Store
 			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
 			VALUES (?, 'loopcoder.routing_decision.v1', 1, ?, ?, ?, 'treq-budget', 'route-budget', 'routing',
 				'rprofile-budget', '', ?, ?, ?, 'full', 'selected', 'candidate-budget', '',
-				'[]', '[]', '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
+				'[]', ?, '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
 			authority.RoutingDecisionID, authority.ProjectID, authority.DeliveryRunID, authority.TaskID,
-			authority.PlanFingerprint, authority.PolicyFingerprint, authority.RoutingFingerprint, at, at); err != nil {
+			authority.PlanFingerprint, authority.PolicyFingerprint, authority.RoutingFingerprint, string(candidateJSON), at, at); err != nil {
 			return err
 		}
 		for _, policy := range []struct {
