@@ -2469,6 +2469,29 @@ func TestVerifierReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
 	}
 }
 
+func TestVerifierReportIncludesGrokAdapterAttribution(t *testing.T) {
+	record := verifierReport(Options{
+		PRNumber: 834,
+		Provider: "grok",
+	}, agent.Result{
+		ExitCode:           0,
+		Model:              "grok-4.5",
+		AdapterVersion:     "0.1.211",
+		ExternalSessionRef: "session-abc",
+		StartedAt:          "2026-07-13T00:00:00Z",
+		EndedAt:            "2026-07-13T00:00:01Z",
+		DurationMS:         1000,
+	}, reviewInputs{}, reviewRefs{}, "", "loopreview-834")
+
+	want := "review PR #834 [adapter=0.1.211 attempt=loopreview-834 session=session-abc]"
+	if record.Action != want {
+		t.Fatalf("Action = %q, want %q", record.Action, want)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
 func TestRunSurfacesFailVerdict(t *testing.T) {
 	result := runWithAgentSummary(t, `{"verdict":"fail","findings":[{"severity":"error","file":"file.go","note":"bug"}],"evidence":"bug in diff","spec_conformance":"fail"}`, nil)
 	if result.Verdict.Verdict != VerdictFail || result.ExitCode != 1 {

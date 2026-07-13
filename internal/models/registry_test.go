@@ -85,6 +85,18 @@ func TestDefaultRegistryStaticRows(t *testing.T) {
 					},
 				},
 			},
+			{
+				Name:         "grok",
+				DisplayName:  "Grok Build",
+				Vendor:       "xAI",
+				CLI:          "grok",
+				DefaultModel: "grok-4.5",
+				Models: []models.Model{
+					{
+						Name: "grok-4.5",
+					},
+				},
+			},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -99,7 +111,7 @@ func TestDefaultRegistryInvariants(t *testing.T) {
 }
 
 func TestLookupHelpers(t *testing.T) {
-	if got, want := models.ProviderNames(), []string{"codex", "claude", "antigravity"}; !reflect.DeepEqual(got, want) {
+	if got, want := models.ProviderNames(), []string{"codex", "claude", "antigravity", "grok"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ProviderNames = %#v, want %#v", got, want)
 	}
 

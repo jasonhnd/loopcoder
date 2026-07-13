@@ -685,7 +685,7 @@ func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionWrite,
-		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),
+		Action:      providerAttributedAction(fmt.Sprintf("implement issue #%d", opts.IssueNumber), opts.RunID, result),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
 		EndedAt:     result.EndedAt,
@@ -693,6 +693,26 @@ func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 		Usage:       result.Usage,
 		Verified:    true,
 	}
+}
+
+func providerAttributedAction(action, attempt string, result agent.Result) string {
+	var parts []string
+	if strings.TrimSpace(result.AdapterVersion) != "" {
+		parts = append(parts, "adapter="+strings.TrimSpace(result.AdapterVersion))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) == "" && len(parts) == 0 {
+		return action
+	}
+	if strings.TrimSpace(attempt) != "" {
+		parts = append(parts, "attempt="+strings.TrimSpace(attempt))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) != "" {
+		parts = append(parts, "session="+strings.TrimSpace(result.ExternalSessionRef))
+	}
+	if len(parts) == 0 {
+		return action
+	}
+	return action + " [" + strings.Join(parts, " ") + "]"
 }
 
 func buildCommitMessage(title string, issueNumber int) string {

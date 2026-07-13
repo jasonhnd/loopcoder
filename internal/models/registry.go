@@ -151,6 +151,18 @@ var staticRegistry = Registry{
 				},
 			},
 		},
+		{
+			Name:         "grok",
+			DisplayName:  "Grok Build",
+			Vendor:       "xAI",
+			CLI:          "grok",
+			DefaultModel: "grok-4.5",
+			Models: []Model{
+				{
+					Name: "grok-4.5",
+				},
+			},
+		},
 	},
 }
 
