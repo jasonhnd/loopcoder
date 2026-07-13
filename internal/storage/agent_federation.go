@@ -435,12 +435,22 @@ type AgentOwnershipFence struct {
 }
 
 type ProviderCapabilityEvidence struct {
-	AdapterID            string   `json:"adapter_id"`
-	NestedSubagents      bool     `json:"nested_subagents"`
-	Cancellation         bool     `json:"cancellation"`
-	CapabilityConfidence string   `json:"capability_confidence"`
-	FreshnessState       string   `json:"freshness_state"`
-	GapReasons           []string `json:"gap_reasons"`
+	AdapterID                        string   `json:"adapter_id"`
+	NestedSubagents                  bool     `json:"nested_subagents"`
+	Cancellation                     bool     `json:"cancellation"`
+	CapabilityConfidence             string   `json:"capability_confidence"`
+	FreshnessState                   string   `json:"freshness_state"`
+	NativeFederation                 bool     `json:"native_federation"`
+	ProtocolVersion                  string   `json:"protocol_version,omitempty"`
+	ExecutableFingerprint            string   `json:"executable_fingerprint,omitempty"`
+	DurableChildIdentityRegistration bool     `json:"durable_child_identity_registration"`
+	ExactParentRunTaskScope          bool     `json:"exact_parent_run_task_scope"`
+	OwnershipGenerationLeaseFencing  bool     `json:"ownership_generation_lease_fencing"`
+	AcceptedBudgetAuthority          bool     `json:"accepted_budget_authority"`
+	CancellationAcknowledgement      bool     `json:"cancellation_acknowledgement"`
+	TerminalState                    bool     `json:"terminal_state"`
+	RecoveryReplaySignals            bool     `json:"recovery_replay_signals"`
+	GapReasons                       []string `json:"gap_reasons"`
 }
 
 type ChildOutputEnvelope struct {
@@ -558,6 +568,9 @@ func ValidateProviderNativeSubagent(evidence ProviderCapabilityEvidence) error {
 	if !evidence.NestedSubagents {
 		return federationError(ErrUnsupportedNativeSubAgentCode, "%s lacks nested_subagents evidence", adapterID)
 	}
+	if !evidence.NativeFederation {
+		return federationError(ErrUnsupportedNativeSubAgentCode, "%s lacks native federation lifecycle evidence", adapterID)
+	}
 	switch strings.ToLower(strings.TrimSpace(evidence.FreshnessState)) {
 	case "", "fresh", "current", "not-applicable":
 	default:
@@ -565,6 +578,29 @@ func ValidateProviderNativeSubagent(evidence ProviderCapabilityEvidence) error {
 	}
 	if strings.EqualFold(evidence.CapabilityConfidence, "unknown") || strings.EqualFold(evidence.CapabilityConfidence, "unavailable") {
 		return federationError(ErrUnsupportedNativeSubAgentCode, "%s capability confidence is %s", adapterID, evidence.CapabilityConfidence)
+	}
+	if strings.TrimSpace(evidence.ProtocolVersion) == "" {
+		return federationError(ErrUnsupportedNativeSubAgentCode, "%s native federation protocol version is missing", adapterID)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(evidence.ExecutableFingerprint), "sha256:") {
+		return federationError(ErrUnsupportedNativeSubAgentCode, "%s executable fingerprint is missing", adapterID)
+	}
+	missingControls := []struct {
+		ok   bool
+		name string
+	}{
+		{evidence.DurableChildIdentityRegistration, "durable_child_identity_registration"},
+		{evidence.ExactParentRunTaskScope, "exact_parent_run_task_scope"},
+		{evidence.OwnershipGenerationLeaseFencing, "ownership_generation_lease_fencing"},
+		{evidence.AcceptedBudgetAuthority, "accepted_budget_authority"},
+		{evidence.CancellationAcknowledgement, "cancellation_acknowledgement"},
+		{evidence.TerminalState, "terminal_state"},
+		{evidence.RecoveryReplaySignals, "recovery_replay_signals"},
+	}
+	for _, control := range missingControls {
+		if !control.ok {
+			return federationError(ErrUnsupportedNativeSubAgentCode, "%s native federation missing %s", adapterID, control.name)
+		}
 	}
 	return nil
 }

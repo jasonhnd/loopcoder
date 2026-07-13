@@ -1604,6 +1604,23 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 			strings.Join(probe.GapReasons, ","),
 		)
 	}
+	for _, probe := range report.ProbeResults {
+		if probe.ProbeKind != "native-federation" {
+			continue
+		}
+		state := "unsupported"
+		if probe.Outcome == providerinventory.OutcomeInstalled {
+			state = "supported"
+		}
+		fmt.Fprintf(stdout, "- %s native-federation state=%s confidence=%s freshness=%s terminal_error_code=%s gaps=%s\n",
+			probe.AdapterID,
+			state,
+			probe.Confidence,
+			probe.FreshnessState,
+			probe.TerminalErrorCode,
+			strings.Join(probe.GapReasons, ","),
+		)
+	}
 	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
 	return 0
 }

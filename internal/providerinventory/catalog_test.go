@@ -214,6 +214,8 @@ func TestDiscoverGrokBuildDefaultNetworkDeniedDoesNotRunModels(t *testing.T) {
 		switch {
 		case len(req.Argv) == 2 && req.Argv[1] == "version":
 			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case isGrokNativeFederationHelp(req.Argv):
+			return ProbeExecutionResult{Stdout: "Grok agent stdio help\n", ExitCode: 0}, nil
 		case len(req.Argv) == 2 && req.Argv[1] == "models":
 			modelsCalls++
 			t.Fatal("grok models ran without explicit network grant")
@@ -298,6 +300,8 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 		case len(req.Argv) == 2 && req.Argv[1] == "version":
 			sawVersion = true
 			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case isGrokNativeFederationHelp(req.Argv):
+			return ProbeExecutionResult{Stdout: "Grok agent stdio help\n", ExitCode: 0}, nil
 		case len(req.Argv) == 2 && req.Argv[1] == "models":
 			modelsCalls++
 			return ProbeExecutionResult{
@@ -375,6 +379,154 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 	loadedXAI := capabilityForAdapterModel(t, loaded, "grok", "grok-4.5")
 	if len(loadedXAI.Aliases) != 2 || len(loadedXAI.EntrySources) == 0 || loadedXAI.EntrySources[0].SourceReference != "grok-models:xai" {
 		t.Fatalf("loaded xAI capability = %#v", loadedXAI)
+	}
+}
+
+func TestDiscoverGrokNativeFederationConformantProbe(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case isGrokNativeFederationHelp(req.Argv):
+			return ProbeExecutionResult{Stdout: conformantGrokNativeFederationJSON("sha256:" + strings.Repeat("a", 64)), ExitCode: 0}, nil
+		default:
+			t.Fatalf("unexpected grok native federation probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	installation := installationForAdapter(t, report, "grok")
+	if installation.InstallationState != InstallationInstalled {
+		t.Fatalf("grok installation = %#v, want installed", installation)
+	}
+	probe := findProbe(t, report, "grok", "native-federation")
+	if probe.Outcome != OutcomeInstalled || probe.ParsedFields["native_federation"] != "true" || probe.ParsedFields["protocol_version"] != grokNativeFederationProtocol {
+		t.Fatalf("native federation probe = %#v, want supported scoped evidence", probe)
+	}
+	if probe.ParsedFields["provider_cli_version"] != "grok 0.1.211" || !strings.HasPrefix(probe.ParsedFields["executable_fingerprint"], "sha256:") {
+		t.Fatalf("native federation scoped fields = %#v", probe.ParsedFields)
+	}
+}
+
+func TestDiscoverGrokNativeFederationPartialHostileDoesNotDisableGrokOrOtherAdapters(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	secretCanary := "AKIA" + strings.Repeat("B", 16)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case isGrokNativeFederationHelp(req.Argv):
+			return ProbeExecutionResult{
+				Stdout:   `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"grok-native-agent.v2","native_subagents":true,"controls":{"durable_child_identity_registration":true}}` + secretCanary,
+				Stderr:   "token=" + strings.Repeat("c", 24),
+				ExitCode: 0,
+			}, nil
+		default:
+			t.Fatalf("unexpected grok native federation probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	installation := installationForAdapter(t, report, "grok")
+	if installation.InstallationState != InstallationInstalled || installation.Version != "grok 0.1.211" {
+		t.Fatalf("unsupported native federation changed ordinary grok install: %#v", installation)
+	}
+	probe := findProbe(t, report, "grok", "native-federation")
+	if probe.Outcome != OutcomeInstalledUnusable || probe.TerminalErrorCode != "ErrGrokNativeFederationCredentialMaterial" || !contains(probe.GapReasons, "credential-material-redacted") {
+		t.Fatalf("hostile native federation probe = %#v, want credential fail closed", probe)
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal report: %v", err)
+	}
+	if strings.Contains(string(payload), secretCanary) || strings.Contains(string(payload), strings.Repeat("c", 24)) {
+		t.Fatalf("native federation report leaked provider output: %s", payload)
+	}
+	seenCodex := false
+	for _, capability := range report.ModelCapabilities {
+		if capability.AdapterID == "codex" {
+			seenCodex = true
+			break
+		}
+	}
+	if !seenCodex {
+		t.Fatalf("grok native federation failure removed unrelated adapter capabilities: %#v", report.ModelCapabilities)
+	}
+}
+
+func TestGrokOpaqueMultiAgentModelMetadataRemainsModelCapabilityOnly(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case isGrokNativeFederationHelp(req.Argv):
+			return ProbeExecutionResult{Stdout: "Grok agent stdio help\n", ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			return ProbeExecutionResult{Stdout: `{"models":[{"id":"grok-4.5-multi-agent","name":"Grok Multi","provider":"xai","native_subagents":true,"parallelism":"provider-opaque","agents":["planner","coder"]}]}`, ExitCode: 0}, nil
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config:        config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:           fixedInventoryNow,
+		NetworkGrants: []NetworkGrant{{ProviderID: "grok", Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	capability := capabilityForAdapterModel(t, report, "grok", "grok-4.5-multi-agent")
+	if capability.NestedSubagents != CapabilityFalse || containsCatalogRole(capability.RolesSupported, CatalogRoleNestedSubagents) {
+		t.Fatalf("opaque Grok model metadata became child-agent authority: %#v", capability)
+	}
+	nativeProbe := findProbe(t, report, "grok", "native-federation")
+	if nativeProbe.Outcome == OutcomeInstalled {
+		t.Fatalf("opaque model metadata unexpectedly advertised native federation: %#v", nativeProbe)
 	}
 }
 
@@ -478,6 +630,8 @@ func TestDiscoverGrokBuildFailureBranches(t *testing.T) {
 				switch {
 				case len(req.Argv) == 2 && req.Argv[1] == "version":
 					return ProbeExecutionResult{Stdout: tt.versionStdout, ExitCode: 0}, nil
+				case isGrokNativeFederationHelp(req.Argv):
+					return ProbeExecutionResult{Stdout: "Grok agent stdio help\n", ExitCode: 0}, nil
 				case len(req.Argv) == 2 && req.Argv[1] == "models":
 					modelsCalls++
 					if tt.modelsTimedOut {
@@ -553,4 +707,21 @@ func TestCatalogSnapshotMarksExpiredEntriesStale(t *testing.T) {
 	if len(capabilities) != 1 || capabilities[0].FreshnessState != FreshnessStale || capabilities[0].Confidence != ConfidenceStale {
 		t.Fatalf("capabilities freshness = %#v", capabilities)
 	}
+}
+
+func isGrokNativeFederationHelp(argv []string) bool {
+	return len(argv) == 4 && argv[1] == "agent" && argv[2] == "stdio" && argv[3] == "--help"
+}
+
+func conformantGrokNativeFederationJSON(fingerprint string) string {
+	return `{"schema_version":"` + grokNativeFederationSourceSchema + `","protocol_version":"` + grokNativeFederationProtocol + `","executable_fingerprint":"` + fingerprint + `","native_subagents":true,"controls":{"durable_child_identity_registration":true,"exact_parent_run_task_scope":true,"ownership_generation_lease_fencing":true,"accepted_budget_authority":true,"cancellation_acknowledgement":true,"terminal_state":true,"recovery_replay_signals":true}}`
+}
+
+func containsCatalogRole(values []CatalogRole, want CatalogRole) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

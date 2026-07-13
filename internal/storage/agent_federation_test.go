@@ -386,12 +386,15 @@ func TestProviderCapabilityFixtures(t *testing.T) {
 		input   ProviderCapabilityEvidence
 		wantErr bool
 	}{
-		{name: "claude-supported", input: ProviderCapabilityEvidence{AdapterID: "claude", NestedSubagents: true, FreshnessState: "fresh", CapabilityConfidence: "exact"}},
-		{name: "codex-unsupported", input: ProviderCapabilityEvidence{AdapterID: "codex", NestedSubagents: true, FreshnessState: "fresh"}, wantErr: true},
-		{name: "gemini-unsupported", input: ProviderCapabilityEvidence{AdapterID: "gemini", NestedSubagents: true, FreshnessState: "fresh"}, wantErr: true},
-		{name: "antigravity-unsupported", input: ProviderCapabilityEvidence{AdapterID: "antigravity", NestedSubagents: true, FreshnessState: "fresh"}, wantErr: true},
-		{name: "future-provider-supported", input: ProviderCapabilityEvidence{AdapterID: "future-provider", NestedSubagents: true, FreshnessState: "fresh", CapabilityConfidence: "exact"}},
-		{name: "future-provider-stale", input: ProviderCapabilityEvidence{AdapterID: "future-provider", NestedSubagents: true, FreshnessState: "stale", CapabilityConfidence: "exact"}, wantErr: true},
+		{name: "claude-supported", input: nativeCapabilityEvidence("claude")},
+		{name: "grok-supported-only-with-native-controls", input: nativeCapabilityEvidence("grok")},
+		{name: "grok-model-metadata-not-native-federation", input: ProviderCapabilityEvidence{AdapterID: "grok", NestedSubagents: true, FreshnessState: "fresh", CapabilityConfidence: "exact"}, wantErr: true},
+		{name: "grok-partial-native-controls", input: partialNativeCapabilityEvidence("grok"), wantErr: true},
+		{name: "codex-unsupported", input: nativeCapabilityEvidence("codex"), wantErr: true},
+		{name: "gemini-unsupported", input: nativeCapabilityEvidence("gemini"), wantErr: true},
+		{name: "antigravity-unsupported", input: nativeCapabilityEvidence("antigravity"), wantErr: true},
+		{name: "future-provider-supported", input: nativeCapabilityEvidence("future-provider")},
+		{name: "future-provider-stale", input: staleNativeCapabilityEvidence("future-provider"), wantErr: true},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1504,4 +1507,36 @@ func federationRequest(claim federationClaim) AgentRegistrationRequest {
 		AuthorizationFingerprint: "sha256:auth",
 		CreatedAt:                "2026-01-01T00:00:01Z",
 	}
+}
+
+func nativeCapabilityEvidence(adapterID string) ProviderCapabilityEvidence {
+	return ProviderCapabilityEvidence{
+		AdapterID:                        adapterID,
+		NestedSubagents:                  true,
+		Cancellation:                     true,
+		CapabilityConfidence:             "exact",
+		FreshnessState:                   "fresh",
+		NativeFederation:                 true,
+		ProtocolVersion:                  "provider-native-agent.v1",
+		ExecutableFingerprint:            "sha256:" + strings.Repeat("a", 64),
+		DurableChildIdentityRegistration: true,
+		ExactParentRunTaskScope:          true,
+		OwnershipGenerationLeaseFencing:  true,
+		AcceptedBudgetAuthority:          true,
+		CancellationAcknowledgement:      true,
+		TerminalState:                    true,
+		RecoveryReplaySignals:            true,
+	}
+}
+
+func partialNativeCapabilityEvidence(adapterID string) ProviderCapabilityEvidence {
+	evidence := nativeCapabilityEvidence(adapterID)
+	evidence.RecoveryReplaySignals = false
+	return evidence
+}
+
+func staleNativeCapabilityEvidence(adapterID string) ProviderCapabilityEvidence {
+	evidence := nativeCapabilityEvidence(adapterID)
+	evidence.FreshnessState = "stale"
+	return evidence
 }
