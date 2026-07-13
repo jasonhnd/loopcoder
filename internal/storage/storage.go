@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 21
+	CurrentSchemaVersion = 22
 
 	driverName = "sqlite"
 
@@ -345,6 +345,11 @@ var migrations = []migration{
 		name:       "explainable routing decisions",
 		statements: routingDecisionSchemaStatements,
 	},
+	{
+		version:    22,
+		name:       "versioned routing policy profiles",
+		statements: routingPolicyProfileSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -390,6 +395,11 @@ var requiredTables = []string{
 	"task_graph_validations",
 	"accepted_task_graph_versions",
 	"routing_decisions",
+	"role_definitions",
+	"routing_policy_profiles",
+	"routing_policy_inputs",
+	"routing_legacy_model_mappings",
+	"routing_events",
 	"agent_scope_grants",
 	"agent_registrations",
 	"agent_ownership_locks",
