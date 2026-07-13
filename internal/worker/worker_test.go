@@ -240,12 +240,19 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if attempts[0].Report.Header() != result.Report.Header() {
 		t.Fatalf("attempt report header = %q, want %q", attempts[0].Report.Header(), result.Report.Header())
 	}
+	if attempts[0].ArtifactDecision == nil ||
+		attempts[0].ArtifactDecision.State != artifactDecisionCleanupCompleted ||
+		attempts[0].ArtifactDecision.OwnerID != "worker:run-test:job-101-4321:1" ||
+		attempts[0].ArtifactDecision.Generation != 1 ||
+		len(attempts[0].ArtifactDecision.CleanupErrors) != 0 {
+		t.Fatalf("artifact decision = %#v, want completed cleanup decision", attempts[0].ArtifactDecision)
+	}
 	eventCount, err := state.CountEvents(repo, "run-test")
 	if err != nil {
 		t.Fatalf("CountEvents returned error: %v", err)
 	}
-	if eventCount != 9 {
-		t.Fatalf("event count = %d, want 9", eventCount)
+	if eventCount != 11 {
+		t.Fatalf("event count = %d, want 11", eventCount)
 	}
 	lifecycle, err := state.LoadLifecycle(repo, "run-test")
 	if err != nil {
@@ -982,6 +989,80 @@ func TestDispatchFailureWritesRecoveryBriefAndPreservesArtifacts(t *testing.T) {
 	if got.ExitCode == nil || *got.ExitCode != 7 {
 		t.Fatalf("failed attempt exit code = %#v, want 7", got.ExitCode)
 	}
+	if got.ArtifactDecision == nil || got.ArtifactDecision.State != artifactDecisionPreserveSelected ||
+		got.ArtifactDecision.WorktreePath == "" || got.ArtifactDecision.ScratchPath == "" ||
+		got.ArtifactDecision.AttemptPath == "" || got.ArtifactDecision.ManifestPath == "" {
+		t.Fatalf("failed artifact decision = %#v, want preserve-selected with existing paths", got.ArtifactDecision)
+	}
+}
+
+func TestPreservationManifestWriteFailureReportsPartialWithoutClaimingManifest(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Could not finish.", 7),
+		log:       "last line\n",
+	}
+
+	_, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 121,
+		IssueTitle:  "Preserve failed attempt",
+		RunID:       "run-preserve-partial",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 7777
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			if strings.HasSuffix(path, "-preserved.json") {
+				return errors.New("deterministic Windows open-file fixture: file is in use")
+			}
+			return os.WriteFile(path, data, perm)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err == nil {
+		t.Fatal("Dispatch returned nil error, want failure")
+	}
+	if !strings.Contains(warnings.String(), "failed to write preservation manifest") ||
+		!strings.Contains(warnings.String(), "preservation incomplete") {
+		t.Fatalf("warnings missing partial preservation failure:\n%s", warnings.String())
+	}
+	if strings.Contains(warnings.String(), "preserved manifest:") {
+		t.Fatalf("warnings claimed failed manifest was preserved:\n%s", warnings.String())
+	}
+	assertPathMissing(t, state.PreservationManifestPath(repo, "run-preserve-partial", "job-121-7777"))
+	attempts, err := state.LoadAttempts(repo, "run-preserve-partial")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].ArtifactDecision == nil {
+		t.Fatalf("attempts = %#v, want artifact decision", attempts)
+	}
+	decision := attempts[0].ArtifactDecision
+	if decision.State != artifactDecisionPreserveSelected || decision.ManifestPath != "" ||
+		!strings.Contains(strings.Join(decision.PreservationErrors, "\n"), "file is in use") {
+		t.Fatalf("artifact decision = %#v, want partial preserve without manifest path", decision)
+	}
 }
 
 func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoReport(t *testing.T) {
@@ -1076,6 +1157,77 @@ func TestDispatchHungWithEmptyWorktreeWritesHungStateAndNoReport(t *testing.T) {
 		if !strings.Contains(string(events), want) {
 			t.Fatalf("events missing %q:\n%s", want, string(events))
 		}
+	}
+}
+
+func TestCleanupPartialFailuresPersistDecisionAndLeaveEvidence(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{
+		status:            " M internal/worker/worker.go\n",
+		worktreeRemoveErr: errors.New("unix permission fixture: permission denied"),
+		branchDeleteErr:   errors.New("branch is checked out elsewhere"),
+	}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented dispatch.", 0),
+		log:       "codex ok\n",
+	}
+	removeErr := errors.New("deterministic Windows open-file fixture: file is in use")
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 122,
+		IssueTitle:  "Cleanup partial failures",
+		RunID:       "run-cleanup-partial",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/122"}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 8888
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: func(string) error {
+			return removeErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if !result.OK || result.Status != "succeeded" {
+		t.Fatalf("result = %#v, want succeeded despite cleanup warning", result)
+	}
+	for _, want := range []string{"failed to remove worktree", "failed to delete local branch", "failed to remove scratch directory"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Fatalf("warnings missing %q:\n%s", want, warnings.String())
+		}
+	}
+	assertPathExists(t, fakeGit.worktreePath)
+	attempts, err := state.LoadAttempts(repo, "run-cleanup-partial")
+	if err != nil {
+		t.Fatalf("LoadAttempts returned error: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].ArtifactDecision == nil {
+		t.Fatalf("attempts = %#v, want artifact cleanup decision", attempts)
+	}
+	decision := attempts[0].ArtifactDecision
+	if decision.State != artifactDecisionCleanupPartial || len(decision.CleanupErrors) != 3 ||
+		decision.OwnerID != "worker:run-cleanup-partial:job-122-8888:1" {
+		t.Fatalf("artifact cleanup decision = %#v, want partial cleanup with three errors", decision)
 	}
 }
 
@@ -1206,6 +1358,14 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	if got.Report == nil || got.Report.Role != reporter.RoleConductor {
 		t.Fatalf("harvest attempt report = %#v, want conductor", got.Report)
 	}
+	if got.ArtifactDecision == nil || got.ArtifactDecision.State != artifactDecisionPreserveSelected ||
+		got.ArtifactDecision.OwnerID != "worker:run-test:job-101-4321:2" ||
+		got.ArtifactDecision.Generation != 1 ||
+		got.ArtifactDecision.WorktreePath != fakeGit.worktreePath ||
+		got.ArtifactDecision.ScratchPath != filepath.Dir(fakeGit.worktreePath) ||
+		got.ArtifactDecision.ManifestPath == "" {
+		t.Fatalf("harvest artifact decision = %#v, want preserve-selected exact paths", got.ArtifactDecision)
+	}
 	manifestPath := state.PreservationManifestPath(repo, "run-test", "job-101-4321")
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -1217,10 +1377,11 @@ func TestDispatchHungWithDirtyWorktreeHarvestsNeedsHumanPR(t *testing.T) {
 	}
 	if manifest.WorktreePath != fakeGit.worktreePath || manifest.ScratchPath != filepath.Dir(fakeGit.worktreePath) ||
 		manifest.AttemptPath != filepath.Join(repo, ".loopcoder", "runs", "run-test", "workers", "job-101-4321.attempt.json") ||
+		len(manifest.PartialArtifactPaths) == 0 ||
 		!strings.Contains(manifest.DisposalGuidance, "run_id and job_id") {
 		t.Fatalf("preservation manifest = %#v", manifest)
 	}
-	for _, want := range []string{"preserved worktree:", "preserved scratch:", "preserved manifest:", "disposal:"} {
+	for _, want := range []string{"preserved worktree:", "preserved scratch:", "preserved manifest:", "preserved partial artifacts:", "disposal:"} {
 		if !strings.Contains(warnings.String(), want) {
 			t.Fatalf("warnings missing %q:\n%s", want, warnings.String())
 		}
@@ -2137,6 +2298,13 @@ func assertPathExists(t *testing.T, path string) {
 	}
 }
 
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s exists or returned unexpected error: %v", path, err)
+	}
+}
+
 func attachReleasedWorkerOwnership(t *testing.T, ctx context.Context, dispatch *dispatchContext) (storage.Store, storage.AgentOwnershipLease) {
 	t.Helper()
 	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
@@ -2180,6 +2348,8 @@ type workerFakeGit struct {
 	status              string
 	err                 error
 	worktreeSetup       func(worktreePath string) error
+	worktreeRemoveErr   error
+	branchDeleteErr     error
 	remoteBranchExists  bool
 	fetchCalls          int
 	fetchBase           string
@@ -2225,7 +2395,7 @@ func (f *workerFakeGit) WorktreeAdd(_ context.Context, _, branch, worktreePath, 
 func (f *workerFakeGit) WorktreeRemove(_ context.Context, _, worktreePath string) error {
 	f.removeCalls++
 	f.removePath = worktreePath
-	return nil
+	return f.worktreeRemoveErr
 }
 
 func (f *workerFakeGit) StatusPorcelain(context.Context, string) (string, error) {
@@ -2263,7 +2433,7 @@ func (f *workerFakeGit) PushUpstreamForceWithLease(_ context.Context, _, branch 
 func (f *workerFakeGit) BranchDelete(_ context.Context, _, branch string) error {
 	f.branchDeleteCalls++
 	f.deletedBranch = branch
-	return nil
+	return f.branchDeleteErr
 }
 
 type workerFakeGitHub struct {

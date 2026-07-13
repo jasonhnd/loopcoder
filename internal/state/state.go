@@ -42,49 +42,72 @@ const (
 )
 
 type Attempt struct {
-	Version             int              `json:"version,omitempty"`
-	JobID               string           `json:"job_id"`
-	Issue               int              `json:"issue"`
-	Attempt             int              `json:"attempt"`
-	Provider            string           `json:"provider,omitempty"`
-	PID                 *int             `json:"pid,omitempty"`
-	Phase               string           `json:"phase,omitempty"`
-	Status              string           `json:"status,omitempty"`
-	Branch              string           `json:"branch,omitempty"`
-	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
-	StartedAt           string           `json:"started_at,omitempty"`
-	HeartbeatAt         string           `json:"heartbeat_at,omitempty"`
-	LastProgressAt      string           `json:"last_progress_at,omitempty"`
-	LogBytes            *int64           `json:"log_bytes,omitempty"`
-	ExitCode            *int             `json:"exit_code,omitempty"`
-	Error               string           `json:"error,omitempty"`
-	Usage               *reporter.Usage  `json:"usage,omitempty"`
-	Report              *reporter.Report `json:"report,omitempty"`
-	CostUSD             *float64         `json:"cost_usd,omitempty"`
-	Path                string           `json:"path,omitempty"`
-	LastWriteUTC        time.Time        `json:"-"`
+	Version             int               `json:"version,omitempty"`
+	JobID               string            `json:"job_id"`
+	Issue               int               `json:"issue"`
+	Attempt             int               `json:"attempt"`
+	Provider            string            `json:"provider,omitempty"`
+	PID                 *int              `json:"pid,omitempty"`
+	Phase               string            `json:"phase,omitempty"`
+	Status              string            `json:"status,omitempty"`
+	Branch              string            `json:"branch,omitempty"`
+	RecoveryContextPath string            `json:"recovery_context_path,omitempty"`
+	StartedAt           string            `json:"started_at,omitempty"`
+	HeartbeatAt         string            `json:"heartbeat_at,omitempty"`
+	LastProgressAt      string            `json:"last_progress_at,omitempty"`
+	LogBytes            *int64            `json:"log_bytes,omitempty"`
+	ExitCode            *int              `json:"exit_code,omitempty"`
+	Error               string            `json:"error,omitempty"`
+	Usage               *reporter.Usage   `json:"usage,omitempty"`
+	Report              *reporter.Report  `json:"report,omitempty"`
+	CostUSD             *float64          `json:"cost_usd,omitempty"`
+	ArtifactDecision    *ArtifactDecision `json:"artifact_decision,omitempty"`
+	Path                string            `json:"path,omitempty"`
+	LastWriteUTC        time.Time         `json:"-"`
 }
 
 type AttemptRecord struct {
-	Version             int              `json:"version"`
-	JobID               string           `json:"job_id"`
-	Issue               int              `json:"issue"`
-	Attempt             int              `json:"attempt"`
-	Provider            string           `json:"provider"`
-	PID                 int              `json:"pid"`
-	Phase               string           `json:"phase"`
-	Status              string           `json:"status"`
-	Branch              string           `json:"branch,omitempty"`
-	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
-	StartedAt           string           `json:"started_at"`
-	HeartbeatAt         string           `json:"heartbeat_at"`
-	LastProgressAt      string           `json:"last_progress_at"`
-	LogBytes            int64            `json:"log_bytes"`
-	ExitCode            *int             `json:"exit_code"`
-	Error               *string          `json:"error"`
-	Usage               *reporter.Usage  `json:"usage,omitempty"`
-	Report              *reporter.Report `json:"report,omitempty"`
-	CostUSD             *float64         `json:"cost_usd,omitempty"`
+	Version             int               `json:"version"`
+	JobID               string            `json:"job_id"`
+	Issue               int               `json:"issue"`
+	Attempt             int               `json:"attempt"`
+	Provider            string            `json:"provider"`
+	PID                 int               `json:"pid"`
+	Phase               string            `json:"phase"`
+	Status              string            `json:"status"`
+	Branch              string            `json:"branch,omitempty"`
+	RecoveryContextPath string            `json:"recovery_context_path,omitempty"`
+	StartedAt           string            `json:"started_at"`
+	HeartbeatAt         string            `json:"heartbeat_at"`
+	LastProgressAt      string            `json:"last_progress_at"`
+	LogBytes            int64             `json:"log_bytes"`
+	ExitCode            *int              `json:"exit_code"`
+	Error               *string           `json:"error"`
+	Usage               *reporter.Usage   `json:"usage,omitempty"`
+	Report              *reporter.Report  `json:"report,omitempty"`
+	CostUSD             *float64          `json:"cost_usd,omitempty"`
+	ArtifactDecision    *ArtifactDecision `json:"artifact_decision,omitempty"`
+}
+
+type ArtifactDecision struct {
+	State                string   `json:"state"`
+	Reason               string   `json:"reason,omitempty"`
+	Generation           int      `json:"generation,omitempty"`
+	OwnerID              string   `json:"owner_id,omitempty"`
+	DecidedAt            string   `json:"decided_at,omitempty"`
+	UpdatedAt            string   `json:"updated_at,omitempty"`
+	ScratchRoot          string   `json:"scratch_root,omitempty"`
+	WorktreePath         string   `json:"worktree_path,omitempty"`
+	ScratchPath          string   `json:"scratch_path,omitempty"`
+	LogPath              string   `json:"log_path,omitempty"`
+	PromptPath           string   `json:"prompt_path,omitempty"`
+	SummaryPath          string   `json:"summary_path,omitempty"`
+	AttemptPath          string   `json:"attempt_path,omitempty"`
+	RecoveryContextPath  string   `json:"recovery_context_path,omitempty"`
+	ManifestPath         string   `json:"manifest_path,omitempty"`
+	PartialArtifactPaths []string `json:"partial_artifact_paths,omitempty"`
+	PreservationErrors   []string `json:"preservation_errors,omitempty"`
+	CleanupErrors        []string `json:"cleanup_errors,omitempty"`
 }
 
 type Event struct {
@@ -515,26 +538,27 @@ func legacyRecoveryBriefPath(repoPath, runID, jobID string) string {
 }
 
 type attemptJSON struct {
-	Version             int              `json:"version"`
-	JobID               string           `json:"job_id"`
-	Issue               json.RawMessage  `json:"issue"`
-	Attempt             json.RawMessage  `json:"attempt"`
-	Provider            string           `json:"provider"`
-	PID                 json.RawMessage  `json:"pid"`
-	Phase               string           `json:"phase"`
-	Status              string           `json:"status"`
-	Branch              string           `json:"branch"`
-	RecoveryContextPath string           `json:"recovery_context_path"`
-	StartedAt           string           `json:"started_at"`
-	HeartbeatAt         string           `json:"heartbeat_at"`
-	LastProgressAt      string           `json:"last_progress_at"`
-	LogBytes            json.RawMessage  `json:"log_bytes"`
-	ExitCode            json.RawMessage  `json:"exit_code"`
-	Error               string           `json:"error"`
-	Usage               *reporter.Usage  `json:"usage"`
-	Report              *reporter.Report `json:"report"`
-	LegacyReport        *reporter.Report `json:"attestation"`
-	CostUSD             json.RawMessage  `json:"cost_usd"`
+	Version             int               `json:"version"`
+	JobID               string            `json:"job_id"`
+	Issue               json.RawMessage   `json:"issue"`
+	Attempt             json.RawMessage   `json:"attempt"`
+	Provider            string            `json:"provider"`
+	PID                 json.RawMessage   `json:"pid"`
+	Phase               string            `json:"phase"`
+	Status              string            `json:"status"`
+	Branch              string            `json:"branch"`
+	RecoveryContextPath string            `json:"recovery_context_path"`
+	StartedAt           string            `json:"started_at"`
+	HeartbeatAt         string            `json:"heartbeat_at"`
+	LastProgressAt      string            `json:"last_progress_at"`
+	LogBytes            json.RawMessage   `json:"log_bytes"`
+	ExitCode            json.RawMessage   `json:"exit_code"`
+	Error               string            `json:"error"`
+	Usage               *reporter.Usage   `json:"usage"`
+	Report              *reporter.Report  `json:"report"`
+	LegacyReport        *reporter.Report  `json:"attestation"`
+	CostUSD             json.RawMessage   `json:"cost_usd"`
+	ArtifactDecision    *ArtifactDecision `json:"artifact_decision"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -602,9 +626,21 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		Usage:               cloneUsage(raw.Usage),
 		Report:              cloneReport(report),
 		CostUSD:             rawFloat64Ptr(raw.CostUSD),
+		ArtifactDecision:    cloneArtifactDecision(raw.ArtifactDecision),
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func cloneArtifactDecision(decision *ArtifactDecision) *ArtifactDecision {
+	if decision == nil {
+		return nil
+	}
+	clone := *decision
+	clone.PartialArtifactPaths = append([]string(nil), decision.PartialArtifactPaths...)
+	clone.PreservationErrors = append([]string(nil), decision.PreservationErrors...)
+	clone.CleanupErrors = append([]string(nil), decision.CleanupErrors...)
+	return &clone
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {
