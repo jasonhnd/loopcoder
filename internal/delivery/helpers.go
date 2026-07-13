@@ -566,6 +566,25 @@ func ensureDependencyEdgeAbsent(ctx context.Context, tx storage.Tx, edge Depende
 	return typed(ErrDuplicateRecordCode, "dependency edge already exists as %s", existing)
 }
 
+func classifyDependencyEdgeInsertConflict(ctx context.Context, tx storage.Tx, key string, edge DependencyEdge, request any, out *DependencyEdge, insertErr error) error {
+	replayed, err := replay(ctx, tx, key, edge.ProjectID, edge.DeliveryRunID, "add_dependency_edge", request, out)
+	if err != nil || replayed {
+		return err
+	}
+	if err := ensureDependencyEdgeAbsent(ctx, tx, edge); err != nil {
+		return err
+	}
+	var existing string
+	err = tx.QueryRow(ctx, `SELECT edge_id FROM delivery_dependency_edges WHERE edge_id = ?`, edge.EdgeID).Scan(&existing)
+	if err == nil {
+		return typed(ErrDuplicateRecordCode, "dependency edge id already exists as %s", existing)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect dependency edge id duplicate: %w", err)
+	}
+	return fmt.Errorf("persist dependency edge: %w", insertErr)
+}
+
 func replay(ctx context.Context, tx storage.Tx, key, projectID, runID, op string, request any, out any) (bool, error) {
 	key, err := idempotencyKey(key, op, request)
 	if err != nil {

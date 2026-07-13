@@ -266,6 +266,9 @@ func AddDependencyEdge(ctx context.Context, store storage.Store, edge Dependency
 			) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			edge.EdgeID, edge.SchemaVersion, edge.ProjectID, edge.DeliveryRunID, edge.FromTaskID, edge.ToTaskID, edge.EdgeKind, edge.Ordinal,
 			edge.PlanFingerprint, edge.CreatedAt, edge.UpdatedAt, createdBy, host); err != nil {
+			if storage.IsConstraint(err) {
+				return classifyDependencyEdgeInsertConflict(ctx, tx, opts.IdempotencyKey, edge, request, &out, err)
+			}
 			return fmt.Errorf("persist dependency edge: %w", err)
 		}
 		out = edge

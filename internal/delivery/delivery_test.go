@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +205,132 @@ func TestDependencyEdgeCycleDetectedIsAtomic(t *testing.T) {
 		t.Fatalf("cycle error = %v, want ErrCycleDetected", err)
 	}
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+}
+
+func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, tt := range []struct {
+		name      string
+		winnerKey string
+		loserKey  string
+		wantErr   error
+	}{
+		{
+			name:      "same idempotency key replays",
+			winnerKey: "edge-race-same-key",
+			loserKey:  "edge-race-same-key",
+		},
+		{
+			name:      "different idempotency keys conflict",
+			winnerKey: "edge-race-winner-key",
+			loserKey:  "edge-race-loser-key",
+			wantErr:   ErrDuplicateRecord,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+			seedStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedTime})
+			if err != nil {
+				t.Fatalf("Open seed store: %v", err)
+			}
+			run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, seedStore, "proj_a", "run_edge_race")
+			if err := seedStore.Close(); err != nil {
+				t.Fatalf("close seed store: %v", err)
+			}
+
+			gate := newDependencyEdgeInsertRaceGate()
+			winnerStore := openDependencyEdgeRaceStore(t, dbPath, dependencyEdgeRaceWinner, gate)
+			defer winnerStore.Close()
+			loserStore := openDependencyEdgeRaceStore(t, dbPath, dependencyEdgeRaceLoser, gate)
+			defer loserStore.Close()
+
+			edge := DependencyEdge{
+				ProjectID:       run.ProjectID,
+				DeliveryRunID:   run.DeliveryRunID,
+				FromTaskID:      taskA.TaskID,
+				ToTaskID:        taskB.TaskID,
+				PlanFingerprint: run.PlanFingerprint,
+				CreatedBy:       actor(),
+				Host:            host(),
+			}
+			winnerDone := make(chan dependencyEdgeRaceResult, 1)
+			loserDone := make(chan dependencyEdgeRaceResult, 1)
+			go func() {
+				edge, err := AddDependencyEdge(ctx, winnerStore, edge, PersistOptions{IdempotencyKey: tt.winnerKey, Now: fixedTime()})
+				winnerDone <- dependencyEdgeRaceResult{edge: edge, err: err}
+			}()
+			go func() {
+				edge, err := AddDependencyEdge(ctx, loserStore, edge, PersistOptions{IdempotencyKey: tt.loserKey, Now: fixedTime()})
+				loserDone <- dependencyEdgeRaceResult{edge: edge, err: err}
+			}()
+
+			winner := <-winnerDone
+			if winner.err != nil {
+				t.Fatalf("winner AddDependencyEdge: %v", winner.err)
+			}
+			gate.releaseLoser()
+			loser := <-loserDone
+			if !errors.Is(loser.err, tt.wantErr) {
+				t.Fatalf("loser AddDependencyEdge error = %v, want %v", loser.err, tt.wantErr)
+			}
+			if loser.err != nil {
+				errText := loser.err.Error()
+				if strings.Contains(errText, "UNIQUE") || strings.Contains(strings.ToLower(errText), "constraint") || strings.Contains(strings.ToLower(errText), "sqlite") {
+					t.Fatalf("typed duplicate leaked sqlite text: %v", loser.err)
+				}
+			} else if loser.edge.EdgeID != winner.edge.EdgeID || loser.edge.CreatedAt != winner.edge.CreatedAt {
+				t.Fatalf("idempotent loser edge = %#v, want replay of %#v", loser.edge, winner.edge)
+			}
+
+			verifyStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedTime})
+			if err != nil {
+				t.Fatalf("Open verify store: %v", err)
+			}
+			defer verifyStore.Close()
+			assertCount(t, ctx, verifyStore, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+
+			cycleEdge := DependencyEdge{
+				ProjectID:       run.ProjectID,
+				DeliveryRunID:   run.DeliveryRunID,
+				FromTaskID:      taskB.TaskID,
+				ToTaskID:        taskA.TaskID,
+				PlanFingerprint: run.PlanFingerprint,
+				CreatedBy:       actor(),
+				Host:            host(),
+			}
+			if _, err := AddDependencyEdge(ctx, verifyStore, cycleEdge, PersistOptions{IdempotencyKey: tt.name + "-cycle", Now: fixedTime()}); !errors.Is(err, ErrCycleDetected) {
+				t.Fatalf("cycle after race error = %v, want ErrCycleDetected", err)
+			}
+			assertCount(t, ctx, verifyStore, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+		})
+	}
+}
+
+func TestDependencyEdgeInsertInfrastructureFailureIsPreserved(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", "run_edge_insert_failure")
+
+	injected := errors.New("disk write failed")
+	edge := DependencyEdge{
+		ProjectID:       run.ProjectID,
+		DeliveryRunID:   run.DeliveryRunID,
+		FromTaskID:      taskA.TaskID,
+		ToTaskID:        taskB.TaskID,
+		PlanFingerprint: run.PlanFingerprint,
+		CreatedBy:       actor(),
+		Host:            host(),
+	}
+	_, err := AddDependencyEdge(ctx, dependencyEdgeInsertFailureStore{Store: store, err: injected}, edge, PersistOptions{IdempotencyKey: "edge-insert-infra-failure", Now: fixedTime()})
+	if err == nil || !errors.Is(err, injected) || errors.Is(err, ErrDuplicateRecord) {
+		t.Fatalf("insert infrastructure failure = %v, want original non-duplicate error", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 0)
 }
 
 func TestClaimTaskIsIdempotentAndFenced(t *testing.T) {
@@ -841,6 +968,161 @@ func assertCount(t *testing.T, ctx context.Context, store storage.Store, query s
 	if got != want {
 		t.Fatalf("count query %q = %d, want %d", query, got, want)
 	}
+}
+
+type dependencyEdgeRaceRole string
+
+const (
+	dependencyEdgeRaceWinner dependencyEdgeRaceRole = "winner"
+	dependencyEdgeRaceLoser  dependencyEdgeRaceRole = "loser"
+)
+
+type dependencyEdgeRaceResult struct {
+	edge DependencyEdge
+	err  error
+}
+
+type dependencyEdgeInsertRaceGate struct {
+	loserReady       chan struct{}
+	loserRelease     chan struct{}
+	loserReadyOnce   sync.Once
+	loserReleaseOnce sync.Once
+}
+
+func newDependencyEdgeInsertRaceGate() *dependencyEdgeInsertRaceGate {
+	return &dependencyEdgeInsertRaceGate{
+		loserReady:   make(chan struct{}),
+		loserRelease: make(chan struct{}),
+	}
+}
+
+func (g *dependencyEdgeInsertRaceGate) beforeInsert(ctx context.Context, role dependencyEdgeRaceRole) error {
+	switch role {
+	case dependencyEdgeRaceWinner:
+		select {
+		case <-g.loserReady:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case dependencyEdgeRaceLoser:
+		g.loserReadyOnce.Do(func() { close(g.loserReady) })
+		select {
+		case <-g.loserRelease:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	default:
+		return nil
+	}
+}
+
+func (g *dependencyEdgeInsertRaceGate) releaseLoser() {
+	g.loserReleaseOnce.Do(func() { close(g.loserRelease) })
+}
+
+type dependencyEdgeRaceStore struct {
+	path string
+	db   *sql.DB
+	role dependencyEdgeRaceRole
+	gate *dependencyEdgeInsertRaceGate
+}
+
+func openDependencyEdgeRaceStore(t *testing.T, path string, role dependencyEdgeRaceRole, gate *dependencyEdgeInsertRaceGate) *dependencyEdgeRaceStore {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open race sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	for _, statement := range []string{
+		`PRAGMA foreign_keys = ON`,
+		`PRAGMA busy_timeout = 5000`,
+	} {
+		if _, err := db.ExecContext(context.Background(), statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("configure race sqlite: %v", err)
+		}
+	}
+	return &dependencyEdgeRaceStore{path: path, db: db, role: role, gate: gate}
+}
+
+func (s *dependencyEdgeRaceStore) Close() error { return s.db.Close() }
+
+func (s *dependencyEdgeRaceStore) Path() string { return s.path }
+
+func (s *dependencyEdgeRaceStore) Now() time.Time { return fixedTime() }
+
+func (s *dependencyEdgeRaceStore) Health(context.Context) (storage.Health, error) {
+	return storage.Health{Path: s.path, Exists: true, SchemaVersion: storage.CurrentSchemaVersion, OK: true}, nil
+}
+
+func (s *dependencyEdgeRaceStore) WithTx(ctx context.Context, fn func(storage.Tx) error) error {
+	return s.withConn(ctx, fn)
+}
+
+func (s *dependencyEdgeRaceStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	return s.withConn(ctx, fn)
+}
+
+func (s *dependencyEdgeRaceStore) withConn(ctx context.Context, fn func(storage.Tx) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return fn(dependencyEdgeRaceTx{conn: conn, role: s.role, gate: s.gate})
+}
+
+type dependencyEdgeRaceTx struct {
+	conn *sql.Conn
+	role dependencyEdgeRaceRole
+	gate *dependencyEdgeInsertRaceGate
+}
+
+func (tx dependencyEdgeRaceTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if isDependencyEdgeInsert(query) {
+		if err := tx.gate.beforeInsert(ctx, tx.role); err != nil {
+			return nil, err
+		}
+	}
+	return tx.conn.ExecContext(ctx, query, args...)
+}
+
+func (tx dependencyEdgeRaceTx) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return tx.conn.QueryContext(ctx, query, args...)
+}
+
+func (tx dependencyEdgeRaceTx) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.conn.QueryRowContext(ctx, query, args...)
+}
+
+type dependencyEdgeInsertFailureStore struct {
+	storage.Store
+	err error
+}
+
+func (s dependencyEdgeInsertFailureStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	return s.Store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		return fn(dependencyEdgeInsertFailureTx{Tx: tx, err: s.err})
+	})
+}
+
+type dependencyEdgeInsertFailureTx struct {
+	storage.Tx
+	err error
+}
+
+func (tx dependencyEdgeInsertFailureTx) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if isDependencyEdgeInsert(query) {
+		return nil, tx.err
+	}
+	return tx.Tx.Exec(ctx, query, args...)
+}
+
+func isDependencyEdgeInsert(query string) bool {
+	return strings.Contains(query, "INSERT INTO delivery_dependency_edges")
 }
 
 func createV9Fixture(t *testing.T, ctx context.Context, db *sql.DB) {
