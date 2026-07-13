@@ -49,6 +49,10 @@ var (
 	ErrRequirementUnknown                = &TypedError{Code: ErrRequirementUnknownCode}
 	ErrNoEligibleCandidate               = &TypedError{Code: ErrNoEligibleCandidateCode}
 	ErrRequirementConfidenceInsufficient = &TypedError{Code: ErrRequirementConfidenceInsufficientCode}
+	ErrGraphBoundExceeded                = &TypedError{Code: ErrGraphBoundExceededCode}
+	ErrGraphCycleDetected                = &TypedError{Code: ErrGraphCycleDetectedCode}
+	ErrGraphDisconnected                 = &TypedError{Code: ErrGraphDisconnectedCode}
+	ErrReplanBoundExceeded               = &TypedError{Code: ErrReplanBoundExceededCode}
 	ErrCapabilityUnsupported             = &TypedError{Code: ErrCapabilityUnsupportedCode}
 	ErrInvalidRecord                     = &TypedError{Code: ErrInvalidRecordCode}
 	ErrDuplicateRecord                   = &TypedError{Code: ErrDuplicateRecordCode}
