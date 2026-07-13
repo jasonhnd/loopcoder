@@ -587,6 +587,247 @@ func TestResumeApprovedHandoffAmbiguousExecutorErrorDoesNotFallback(t *testing.T
 	}
 }
 
+func TestResumeApprovedHandoffNilErrorNotStartedFallsBackAndBlocksReplay(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionNotStarted}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("nil-error not-started error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("nil-error not-started executions = %d, want 1", executions.Load())
+	}
+	if result.Fallback.DecisionStatus != FallbackStatusReplanRequired || result.Fallback.FallbackDecisionID == "" {
+		t.Fatalf("nil-error not-started fallback = %#v, want durable bounded fallback", result.Fallback)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("nil-error not-started reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateNeedsHuman || state.attemptState != "needs-human" || state.taskState != "needs-human" {
+		t.Fatalf("nil-error not-started durable state = %#v, want needs-human", state)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(replayErr, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("nil-error not-started replay error = %v, want ErrReplanRequired", replayErr)
+	}
+	if executions.Load() != 1 || !replayed.Blocked || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+		t.Fatalf("nil-error not-started replay result=%#v executions=%d attempts=%d, want blocked observe-only replay", replayed, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+	if replayed.Reservation.BudgetReservationID != "" {
+		if state := reservationState(t, ctx, store, replayed.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+			t.Fatalf("nil-error not-started replay reservation state = %q, want released", state)
+		}
+	}
+	if got := countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID); got != 1 {
+		t.Fatalf("nil-error not-started fallback decisions = %d, want 1", got)
+	}
+}
+
+func TestResumeApprovedHandoffNilErrorZeroOutcomeNeedsHumanWithoutFallback(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("nil-error zero outcome error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("nil-error zero outcome executions = %d, want 1", executions.Load())
+	}
+	if result.Fallback.FallbackDecisionID != "" || countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID) != 0 {
+		t.Fatalf("nil-error zero outcome fallback result=%#v count=%d, want none", result.Fallback, countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID))
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("nil-error zero outcome reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateNeedsHuman || state.attemptState != "needs-human" || state.taskState != "needs-human" {
+		t.Fatalf("nil-error zero outcome durable state = %#v, want needs-human", state)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(replayErr, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("nil-error zero outcome replay error = %v, want ErrReplanRequired", replayErr)
+	}
+	if executions.Load() != 1 || !replayed.Blocked || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+		t.Fatalf("nil-error zero outcome replay result=%#v executions=%d attempts=%d, want blocked observe-only replay", replayed, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+	if replayed.Reservation.BudgetReservationID != "" {
+		if state := reservationState(t, ctx, store, replayed.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+			t.Fatalf("nil-error zero outcome replay reservation state = %q, want released", state)
+		}
+	}
+}
+
+func TestResumeApprovedHandoffNilErrorExplicitAmbiguousNeedsHumanWithoutFallback(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionAmbiguous}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("nil-error ambiguous outcome error = %v, want ErrReplanRequired", err)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("nil-error ambiguous outcome executions = %d, want 1", executions.Load())
+	}
+	if result.Fallback.FallbackDecisionID != "" || countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID) != 0 {
+		t.Fatalf("nil-error ambiguous outcome fallback result=%#v count=%d, want none", result.Fallback, countFallbackDecisions(t, ctx, store, result.RoutingDecision.RoutingDecisionID))
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("nil-error ambiguous outcome reservation state = %q, want released", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateNeedsHuman || state.attemptState != "needs-human" || state.taskState != "needs-human" {
+		t.Fatalf("nil-error ambiguous outcome durable state = %#v, want needs-human", state)
+	}
+}
+
+func TestResumeApprovedHandoffStartedOutcomeWithoutReceiptMarksExecuting(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionStarted}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("started without receipt error = %v", err)
+	}
+	if executions.Load() != 1 || result.Successor.ProviderReceipt != "" || result.Successor.LaunchPhase != storage.ClaimPhaseExecuting || result.Fallback.FallbackDecisionID != "" {
+		t.Fatalf("started without receipt result=%#v executions=%d, want executing without fallback", result, executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("started without receipt reservation state = %q, want active", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseExecuting || state.registrationState != storage.AgentStateRunning || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("started without receipt durable state = %#v, want executing/running launch", state)
+	}
+}
+
+func TestResumeApprovedHandoffReceiptOverridesAmbiguousOutcome(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-authoritative", Outcome: HandoffSuccessorExecutionAmbiguous}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("receipt precedence error = %v", err)
+	}
+	if executions.Load() != 1 || result.Successor.ProviderReceipt != "receipt-authoritative" || result.Successor.LaunchPhase != storage.ClaimPhaseExecuting || result.Fallback.FallbackDecisionID != "" {
+		t.Fatalf("receipt precedence result=%#v executions=%d, want executing with receipt and no fallback", result, executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("receipt precedence reservation state = %q, want active", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseExecuting || state.registrationState != storage.AgentStateRunning || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("receipt precedence durable state = %#v, want executing/running launch", state)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if replayErr != nil {
+		t.Fatalf("receipt precedence replay error = %v", replayErr)
+	}
+	if executions.Load() != 1 || replayed.Successor.LaunchExposed {
+		t.Fatalf("receipt precedence replay result=%#v executions=%d, want observe-only replay", replayed, executions.Load())
+	}
+}
+
 func TestResumeApprovedHandoffReleasesSourceReservationAfterDestinationBinding(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
