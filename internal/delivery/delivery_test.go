@@ -336,6 +336,81 @@ func TestDeliveryPublicTransitionsEmitProgressReceipts(t *testing.T) {
 	}
 }
 
+func TestDeliveryProgressSupervisorKeepsIndependentTaskCorrelations(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	seedProject(t, ctx, store, "proj_progress_supervisor")
+	supervisor := mustDeliveryProgressSupervisor(t, store, "proj_progress_supervisor", "run_progress_supervisor")
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := supervisor.Stop(stopCtx); err != nil {
+			t.Fatalf("Stop supervisor: %v", err)
+		}
+	}()
+
+	run := deliveryRunFixture("proj_progress_supervisor", "run_progress_supervisor")
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "supervisor-run", Now: fixedTime(), Progress: supervisor}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	taskA := taskFixture(run, "a")
+	taskA.TaskID = "task_supervisor_a"
+	taskA.State = TaskRunning
+	taskB := taskFixture(run, "b")
+	taskB.TaskID = "task_supervisor_b"
+	var err error
+	taskA, err = PersistTask(ctx, store, taskA, PersistOptions{IdempotencyKey: "supervisor-task-a", Now: fixedTime(), Progress: supervisor})
+	if err != nil {
+		t.Fatalf("PersistTask A: %v", err)
+	}
+	taskB, err = PersistTask(ctx, store, taskB, PersistOptions{IdempotencyKey: "supervisor-task-b", Now: fixedTime(), Progress: supervisor})
+	if err != nil {
+		t.Fatalf("PersistTask B: %v", err)
+	}
+	if _, err := TransitionTask(ctx, store, run.ProjectID, run.DeliveryRunID, taskA.TaskID, "complete_success", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-task-a-terminal", Now: fixedTime().Add(time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionTask A terminal: %v", err)
+	}
+	if _, err := TransitionTask(ctx, store, run.ProjectID, run.DeliveryRunID, taskB.TaskID, "dependencies_ready", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-task-b-ready", Now: fixedTime().Add(2 * time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionTask B after A terminal: %v", err)
+	}
+	if _, err := TransitionDeliveryRun(ctx, store, run.ProjectID, run.DeliveryRunID, "queue", actor(), host(), PersistOptions{IdempotencyKey: "supervisor-run-progress", Now: fixedTime().Add(3 * time.Minute), Progress: supervisor}); err != nil {
+		t.Fatalf("TransitionDeliveryRun after task terminal: %v", err)
+	}
+
+	receiptsA := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "task:"+taskA.TaskID)
+	receiptsB := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "task:"+taskB.TaskID)
+	runReceipts := listProgressReceipts(t, ctx, store, run.ProjectID, run.DeliveryRunID, "delivery-run:"+run.DeliveryRunID)
+	assertReceiptStatusAndGap(t, receiptsA, TaskSucceeded, progress.KnownTerminal)
+	assertReceiptStatusAndGap(t, receiptsB, TaskReady, progress.KnownDeliveryPending)
+	assertReceiptStatusAndGap(t, runReceipts, RunQueued, progress.KnownDeliveryPending)
+}
+
+func TestDeliveryProgressFailureReportsDiagnosticWithoutRollback(t *testing.T) {
+	ctx := context.Background()
+	store := openDeliveryStore(t)
+	defer store.Close()
+	seedProject(t, ctx, store, "proj_progress_diag")
+	recorder := &failingProgressRecorder{err: errors.New(strings.Repeat("receipt failure ", 30))}
+	run := deliveryRunFixture("proj_progress_diag", "run_progress_diag")
+	task := taskFixture(run, "diag")
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "diag-run", Now: fixedTime()}); err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	created, err := PersistTask(ctx, store, task, PersistOptions{IdempotencyKey: "diag-task", Now: fixedTime(), Progress: recorder})
+	if err != nil {
+		t.Fatalf("PersistTask with failing progress: %v", err)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks WHERE task_id = '`+created.TaskID+`'`, 1)
+	if len(recorder.diagnostics) != 1 {
+		t.Fatalf("diagnostics = %#v, want one progress failure diagnostic", recorder.diagnostics)
+	}
+	diag := recorder.diagnostics[0]
+	if diag.Code != "progress-receipt-generation-failed" || diag.CorrelationID != "task:"+created.TaskID || len(diag.Error) > 240 {
+		t.Fatalf("diagnostic = %#v, want bounded typed task diagnostic", diag)
+	}
+}
+
 func TestDependencyEdgeCycleQueryFailureIsAtomic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -934,6 +1009,38 @@ func mustDeliveryProgressEmitter(t *testing.T, store storage.Store, projectID, r
 		t.Fatalf("NewEmitter: %v", err)
 	}
 	return emitter
+}
+
+func mustDeliveryProgressSupervisor(t *testing.T, store storage.Store, projectID, runID string) *progress.Supervisor {
+	t.Helper()
+	supervisor, err := progress.NewSupervisor(progress.SupervisorOptions{
+		Store:              store,
+		ProjectID:          projectID,
+		DeliveryRunID:      runID,
+		RunID:              runID,
+		MaxSilenceInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	return supervisor
+}
+
+type failingProgressRecorder struct {
+	err         error
+	diagnostics []progress.Diagnostic
+}
+
+func (r *failingProgressRecorder) Emit(context.Context, progress.Observation) (progress.EmitResult, error) {
+	return progress.EmitResult{}, r.err
+}
+
+func (r *failingProgressRecorder) Terminal(context.Context, progress.Observation) (progress.EmitResult, error) {
+	return progress.EmitResult{}, r.err
+}
+
+func (r *failingProgressRecorder) RecordProgressDiagnostic(_ context.Context, diagnostic progress.Diagnostic) {
+	r.diagnostics = append(r.diagnostics, diagnostic)
 }
 
 func listProgressReceipts(t *testing.T, ctx context.Context, store storage.Store, projectID, runID, correlationID string) []progress.ProgressReceipt {

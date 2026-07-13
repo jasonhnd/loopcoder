@@ -342,6 +342,69 @@ func TestEmitterOverlappingInstancesAllocateDistinctSequences(t *testing.T) {
 	}
 }
 
+func TestSupervisorTerminalCorrelationDoesNotCloseSiblings(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(fixedTime)
+	store := newClockStore(t, ctx, clock)
+	defer store.Close()
+	supervisor, err := NewSupervisor(SupervisorOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	taskA := runningObservation(clock.Now())
+	taskA.CorrelationID = "task:a"
+	taskA.TaskID = "a"
+	taskB := runningObservation(clock.Now())
+	taskB.CorrelationID = "task:b"
+	taskB.TaskID = "b"
+	if _, err := supervisor.Emit(ctx, taskA); err != nil {
+		t.Fatalf("Emit task A: %v", err)
+	}
+	if _, err := supervisor.Emit(ctx, taskB); err != nil {
+		t.Fatalf("Emit task B: %v", err)
+	}
+	terminalA := terminalObservation(clock.Now().Add(time.Minute))
+	terminalA.CorrelationID = "task:a"
+	terminalA.TaskID = "a"
+	if _, err := supervisor.Terminal(ctx, terminalA); err != nil {
+		t.Fatalf("Terminal task A: %v", err)
+	}
+	taskB.Status = "running-after-a-terminal"
+	if _, err := supervisor.Emit(ctx, taskB); err != nil {
+		t.Fatalf("Emit task B after task A terminal: %v", err)
+	}
+	if _, err := supervisor.Emit(ctx, taskA); !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("Emit task A after terminal error = %v, want ErrEmitterClosed", err)
+	}
+
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 5)
+	if err := supervisor.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	taskAReceipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "task:a"})
+	if err != nil {
+		t.Fatalf("ListReceipts task A: %v", err)
+	}
+	taskBReceipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "task:b"})
+	if err != nil {
+		t.Fatalf("ListReceipts task B: %v", err)
+	}
+	if len(taskAReceipts) != 2 || taskAReceipts[len(taskAReceipts)-1].Status != "succeeded" {
+		t.Fatalf("task A receipts = %#v, want initial + terminal only", taskAReceipts)
+	}
+	if len(taskBReceipts) != 3 || !containsString(taskBReceipts[len(taskBReceipts)-1].GapReasons, "max-generation-silence") {
+		t.Fatalf("task B receipts = %#v, want sibling state change and periodic max-silence", taskBReceipts)
+	}
+}
+
 func mustEmitter(t *testing.T, store storage.Store, clock Clock, correlation string) *Emitter {
 	t.Helper()
 	emitter, err := NewEmitter(EmitterOptions{

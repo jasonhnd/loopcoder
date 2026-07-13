@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	deliverypkg "github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -54,6 +55,22 @@ func TestDeliveryCLIPlanDecideContinueJSON(t *testing.T) {
 	if continued.RunState != deliverypkg.RunQueued {
 		t.Fatalf("continue = %#v, want queued", continued)
 	}
+	store, err := storage.Open(context.Background(), storage.Options{Path: dbPath, Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("storage.Open receipts: %v", err)
+	}
+	defer store.Close()
+	runReceipts, err := progress.ListReceipts(context.Background(), store, progress.ListFilter{ProjectID: "proj_cli", DeliveryRunID: "run_cli", CorrelationID: "delivery-run:run_cli"})
+	if err != nil {
+		t.Fatalf("ListReceipts run: %v", err)
+	}
+	approvalReceipts, err := progress.ListReceipts(context.Background(), store, progress.ListFilter{ProjectID: "proj_cli", DeliveryRunID: "run_cli", CorrelationID: "approval:" + decision.ApprovalID})
+	if err != nil {
+		t.Fatalf("ListReceipts approval: %v", err)
+	}
+	if len(runReceipts) < 2 || len(approvalReceipts) != 1 || !cliContainsString(approvalReceipts[0].GapReasons, progress.KnownWaitingApproval) {
+		t.Fatalf("CLI progress receipts run=%#v approval=%#v, want run receipts and active approval wait", runReceipts, approvalReceipts)
+	}
 }
 
 func TestDeliveryCLIPlanFreshDatabaseNoSourceMigrationOutputTruthful(t *testing.T) {
@@ -96,6 +113,15 @@ func TestDeliveryCLIExitCodesForPendingAndStale(t *testing.T) {
 	if code != deliveryStalePlanExitCode {
 		t.Fatalf("stale decide exit = %d, want %d; stderr=%q", code, deliveryStalePlanExitCode, stderr.String())
 	}
+}
+
+func cliContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDeliveryCLIJSONUnsupportedHostOutcome(t *testing.T) {

@@ -10,10 +10,12 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -88,8 +90,18 @@ func runDeliveryPlan(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	defer closeStore()
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery plan: progress receipts unavailable: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "delivery plan: progress receipt shutdown: %v\n", err)
+		}
+	}()
 	hostEnforcement := deliveryHostEnforcement()
-	proposal, err := delivery.Plan(context.Background(), store, delivery.PlanProposalInput{ProjectID: common.ProjectID, DeliveryRunID: common.RunID, HostEnforcement: hostEnforcement})
+	proposal, err := delivery.Plan(context.Background(), store, delivery.PlanProposalInput{ProjectID: common.ProjectID, DeliveryRunID: common.RunID, HostEnforcement: hostEnforcement, Progress: progressRecorder})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery plan: %v\n", err)
 		if common.Format == "json" {
@@ -130,6 +142,16 @@ func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	defer closeStore()
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery decide: progress receipts unavailable: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "delivery decide: progress receipt shutdown: %v\n", err)
+		}
+	}()
 	now := deps.Now().UTC()
 	hostEnforcement := deliveryHostEnforcement()
 	result, err := delivery.Decide(context.Background(), store, delivery.DecisionOptions{
@@ -145,6 +167,7 @@ func runDeliveryDecide(args []string, stdout, stderr io.Writer, deps Deps) int {
 		EditedProposalJSON:               edited,
 		Reason:                           reason,
 		HostEnforcement:                  hostEnforcement,
+		Progress:                         progressRecorder,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery decide: %v\n", err)
@@ -178,6 +201,16 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		return 1
 	}
 	defer closeStore()
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery continue: progress receipts unavailable: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "delivery continue: progress receipt shutdown: %v\n", err)
+		}
+	}()
 	hostEnforcement := deliveryHostEnforcement()
 	result, err := delivery.Continue(context.Background(), store, delivery.ContinueOptions{
 		ProjectID:                        common.ProjectID,
@@ -188,6 +221,7 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		IdempotencyKey:                   idempotencyKey,
 		Now:                              deps.Now().UTC(),
 		HostEnforcement:                  hostEnforcement,
+		Progress:                         progressRecorder,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "delivery continue: %v\n", err)
@@ -242,6 +276,25 @@ func openDeliveryStoreForCLI(ctx context.Context, dbPath string, deps Deps) (sto
 		return nil, nil, err
 	}
 	return store, func() { _ = store.Close() }, nil
+}
+
+func deliveryProgressSupervisorForCLI(store storage.Store, projectID, runID string) (progress.Recorder, func() error, error) {
+	supervisor, err := progress.NewSupervisor(progress.SupervisorOptions{
+		Store:              store,
+		ProjectID:          projectID,
+		DeliveryRunID:      runID,
+		RunID:              runID,
+		MaxSilenceInterval: progress.DefaultMaxSilenceInterval,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	stop := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return supervisor.Stop(ctx)
+	}
+	return supervisor, stop, nil
 }
 
 func renderDeliveryOutput[T any](stdout, stderr io.Writer, format string, value T, text func(io.Writer, T) error) int {

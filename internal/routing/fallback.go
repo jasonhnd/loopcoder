@@ -159,7 +159,7 @@ type FallbackInput struct {
 	HeldReservationGeneration int64
 	DecidedBy                 delivery.Actor
 	Host                      delivery.Host
-	Progress                  *progress.Emitter
+	Progress                  progress.Recorder
 }
 
 type ReplanInput struct {

@@ -9,7 +9,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/progress"
 )
 
-func emitFallbackProgress(ctx context.Context, emitter *progress.Emitter, decision FallbackDecision, now time.Time) {
+func emitFallbackProgress(ctx context.Context, emitter progress.Recorder, decision FallbackDecision, now time.Time) {
 	if emitter == nil {
 		return
 	}
@@ -43,6 +43,7 @@ func emitFallbackProgress(ctx context.Context, emitter *progress.Emitter, decisi
 	}
 	_, err := emitter.Emit(ctx, observation)
 	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
+		progress.ReportDiagnostic(ctx, emitter, observation, err)
 		return
 	}
 }

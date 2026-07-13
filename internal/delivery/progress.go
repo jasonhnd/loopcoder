@@ -9,7 +9,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/progress"
 )
 
-func emitDeliveryRunProgress(ctx context.Context, emitter *progress.Emitter, run DeliveryRun, event string, now time.Time) {
+func emitDeliveryRunProgress(ctx context.Context, emitter progress.Recorder, run DeliveryRun, event string, now time.Time) {
 	if emitter == nil {
 		return
 	}
@@ -36,7 +36,7 @@ func emitDeliveryRunProgress(ctx context.Context, emitter *progress.Emitter, run
 	emitProgressObservation(ctx, emitter, observation)
 }
 
-func emitTaskProgress(ctx context.Context, emitter *progress.Emitter, task Task, event string, now time.Time) {
+func emitTaskProgress(ctx context.Context, emitter progress.Recorder, task Task, event string, now time.Time) {
 	if emitter == nil {
 		return
 	}
@@ -65,7 +65,7 @@ func emitTaskProgress(ctx context.Context, emitter *progress.Emitter, task Task,
 	emitProgressObservation(ctx, emitter, observation)
 }
 
-func emitAttemptProgress(ctx context.Context, emitter *progress.Emitter, attempt Attempt, event string, now time.Time) {
+func emitAttemptProgress(ctx context.Context, emitter progress.Recorder, attempt Attempt, event string, now time.Time) {
 	if emitter == nil {
 		return
 	}
@@ -96,7 +96,7 @@ func emitAttemptProgress(ctx context.Context, emitter *progress.Emitter, attempt
 	emitProgressObservation(ctx, emitter, observation)
 }
 
-func emitApprovalProgress(ctx context.Context, emitter *progress.Emitter, approval Approval, event string, now time.Time) {
+func emitApprovalProgress(ctx context.Context, emitter progress.Recorder, approval Approval, event string, now time.Time) {
 	if emitter == nil {
 		return
 	}
@@ -118,13 +118,38 @@ func emitApprovalProgress(ctx context.Context, emitter *progress.Emitter, approv
 		}},
 		OccurredAt: now,
 	}
-	if state != "active" {
+	if state == "active" {
 		observation.KnownState = progress.KnownWaitingApproval
 	}
 	emitProgressObservation(ctx, emitter, observation)
 }
 
-func emitProgressObservation(ctx context.Context, emitter *progress.Emitter, observation progress.Observation) {
+func emitHostUnavailableProgress(ctx context.Context, emitter progress.Recorder, projectID, deliveryRunID, operation string, cause error, now time.Time) {
+	if emitter == nil {
+		return
+	}
+	observation := progress.Observation{
+		ProjectID:     projectID,
+		DeliveryRunID: deliveryRunID,
+		RunID:         deliveryRunID,
+		CorrelationID: "host:" + strings.TrimSpace(operation),
+		Phase:         "host",
+		Status:        "unsupported-host",
+		KnownState:    progress.KnownHostOffline,
+		Reason:        progress.ReasonStateChange,
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "host-invocation",
+			RecordID:       strings.TrimSpace(operation),
+			Summary:        "host cannot represent operation: " + boundedProgressSummary(cause),
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		OccurredAt: now,
+	}
+	emitProgressObservation(ctx, emitter, observation)
+}
+
+func emitProgressObservation(ctx context.Context, emitter progress.Recorder, observation progress.Observation) {
 	var err error
 	if observation.Terminal {
 		_, err = emitter.Terminal(ctx, observation)
@@ -132,8 +157,7 @@ func emitProgressObservation(ctx context.Context, emitter *progress.Emitter, obs
 		_, err = emitter.Emit(ctx, observation)
 	}
 	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
-		// Receipt generation is best-effort at this layer. Durable delivery state
-		// is already committed and must not be rolled back by a reporting failure.
+		progress.ReportDiagnostic(ctx, emitter, observation, err)
 		return
 	}
 }
@@ -232,4 +256,15 @@ func attemptTerminal(state string) bool {
 	default:
 		return false
 	}
+}
+
+func boundedProgressSummary(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	value := strings.TrimSpace(err.Error())
+	if len(value) > 180 {
+		return value[:180]
+	}
+	return value
 }

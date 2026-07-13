@@ -16,7 +16,7 @@ type cycleDetector func(context.Context, storage.Tx, string, string, string) (bo
 type PersistOptions struct {
 	IdempotencyKey string
 	Now            time.Time
-	Progress       *progress.Emitter
+	Progress       progress.Recorder
 
 	cycleDetector cycleDetector
 }
