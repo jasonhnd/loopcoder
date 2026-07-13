@@ -1470,6 +1470,42 @@ func TestClaimChildRunExecutionWithReservationsRejectsZeroBudgetAndRollsBack(t *
 	}
 }
 
+func TestClaimChildRunExecutionWithReservationsRequiredAuthorityEmptyRollsBack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	_, err = ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, children[0].RunID, "executor-budget", now, now.Add(time.Minute), SchedulerResourceReservationRequest{
+		RequireBudgetAuthority: true,
+	})
+	if !errors.Is(err, ErrChildBudgetRequired) {
+		t.Fatalf("ClaimChildRunExecutionWithReservations error = %v, want ErrChildBudgetRequired", err)
+	}
+	var claims, resources, reservations int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, children[0].RunID).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ?`, children[0].RunID).Scan(&resources); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ?`, children[0].RunID).Scan(&reservations)
+	}); err != nil {
+		t.Fatalf("query rollback counts: %v", err)
+	}
+	if claims != 0 || resources != 0 || reservations != 0 {
+		t.Fatalf("partial rows claims/resources/budgets = %d/%d/%d, want 0/0/0", claims, resources, reservations)
+	}
+}
+
 func TestClaimChildRunExecutionWithReservationsRejectsMismatchedChosenCandidate(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})

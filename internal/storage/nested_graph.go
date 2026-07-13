@@ -55,6 +55,7 @@ type SchedulerResourceReservationRequest struct {
 	BudgetValueScale         int
 	BudgetWindowKind         string
 	AttachBudgetBinding      bool
+	RequireBudgetAuthority   bool
 }
 
 // RunNode describes the durable run graph metadata required for nested runs.
@@ -1232,7 +1233,7 @@ type nestedBudgetScope struct {
 func reserveNestedSchedulerBudgetTx(ctx context.Context, tx Tx, claim ClaimResult, req SchedulerResourceReservationRequest, now, leaseUntil string) ([]AgentBudgetBinding, error) {
 	req = normalizeNestedSchedulerBudgetRequest(req, claim.RunID)
 	if req.BudgetRequestedValue <= 0 {
-		if nestedSchedulerBudgetAuthorityRequired(req) {
+		if req.RequireBudgetAuthority || nestedSchedulerBudgetAuthorityRequired(req) {
 			return nil, federationError(ErrChildBudgetRequiredCode, "positive child budget reservation is required for route %s", req.RoutingDecisionID)
 		}
 		return nil, nil

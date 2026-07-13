@@ -1287,6 +1287,7 @@ func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRu
 		BudgetValueScale:         authority.BudgetValueScale,
 		BudgetWindowKind:         authority.BudgetWindowKind,
 		AttachBudgetBinding:      strings.TrimSpace(native.AdapterID) != "",
+		RequireBudgetAuthority:   true,
 	}
 }
 

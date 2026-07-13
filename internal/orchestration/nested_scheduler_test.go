@@ -796,6 +796,7 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
 			Aggregation: ChildAggregation{Mode: ChildAggregationCollect, Required: true, IncludeReport: true},
 		}},
 	}
+	seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	executions := 0
 	var reports []NestedScheduleReport
 	run := func() {
@@ -896,6 +897,7 @@ func TestScheduleNestedRunsPersistsOptionalCollectFailureParentStatus(t *testing
 			},
 		},
 	}
+	seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	parentDoneSawDurableTerminal := false
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
@@ -965,6 +967,7 @@ func TestScheduleNestedRunsResumesDurableNonTerminalChildUnderPersistedRunID(t *
 	defer store.Close()
 
 	plan := durableReplayTestPlan()
+	seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	persistedRunID := "run-20260709T000000Z-child-0-resume-child"
 	storedPlan := plan
 	storedPlan.Items = cloneChildPlans(plan.Items)
@@ -1032,6 +1035,7 @@ func TestScheduleNestedRunsRejectsPlanMutationWithoutChangingSQLState(t *testing
 	defer store.Close()
 
 	plan := durableReplayTestPlan()
+	authority := seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	if _, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
 		MaxChildren: 1,
@@ -1048,6 +1052,7 @@ func TestScheduleNestedRunsRejectsPlanMutationWithoutChangingSQLState(t *testing
 	beforePlans, beforeRuns, beforeEdges, beforeOrphans := countNestedDurableRows(t, ctx, store, plan.RootRunID, plan.PlanID)
 
 	mutated := durableReplayTestPlan()
+	applyNestedSchedulerAuthority(t, &mutated, authority)
 	mutated.Items[0].Title = "Changed title"
 	_, err = ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
@@ -1097,6 +1102,7 @@ func TestScheduleNestedRunsReplayPolicyForDurableStatuses(t *testing.T) {
 
 			plan := durableReplayTestPlan()
 			plan.PlanID = "plan-replay-policy-" + tt.name
+			seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 			persistedRunID := "run-20260709T000000Z-child-0-" + strings.ReplaceAll(tt.name, "_", "-")
 			seedDurableReplayPlan(t, ctx, store, plan, persistedRunID, tt.durableStatus)
 
@@ -1161,6 +1167,8 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 	planB.Items[0].ChildKey = "race-child"
 	planB.Items[0].ID = ""
 	planB.Items[0].Title = "Race child"
+	authority := seedAndApplyNestedSchedulerAuthority(t, ctx, storeA, &planA, 100)
+	applyNestedSchedulerAuthority(t, &planB, authority)
 
 	start := make(chan struct{})
 	executeStarted := make(chan struct{})
@@ -1198,7 +1206,7 @@ func TestScheduleNestedRunsConcurrentReplayUsesPlanCreatedAtIdentityTime(t *test
 		done <- outcome{report: report, err: err}
 	}
 	go run(storeA, planA, nestedTestNow().Add(10*time.Hour))
-	go run(storeB, planB, nestedTestNow().Add(48*time.Hour))
+	go run(storeB, planB, nestedTestNow().Add(10*time.Hour+time.Minute))
 	close(start)
 	waitForNestedSignal(t, executeStarted, "first provider execution")
 	first := receiveNestedTestValue(t, done, "active-owner observer")
@@ -1258,6 +1266,18 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 			"LOOPCODER_NESTED_REPLAY_NOW="+now,
 		)
 		return cmd
+	}
+	seedStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open seed: %v", err)
+	}
+	seedPlan := durableReplayTestPlan()
+	seedPlan.PlanID = "plan-concurrent-replay"
+	if err := seedNestedSchedulerBudgetAuthority(ctx, seedStore, acceptedNestedSchedulerAuthorityForPlan(seedPlan.PlanID, 1), 100); err != nil {
+		t.Fatalf("seed helper authority: %v", err)
+	}
+	if err := seedStore.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
 	}
 
 	cmdA := startHelper(reportAPath, nestedTestNow().Add(10*time.Hour).Format(time.RFC3339Nano))
@@ -1333,6 +1353,8 @@ func TestScheduleNestedRunsGlobalReservationsPreventConcurrentProviderOversubscr
 	planB.RootRunID = "run-20260709T000001Z-wave"
 	planB.Items[0].ChildKey = "global-b"
 	planB.Items[0].Title = "global-b"
+	authority := seedAndApplyNestedSchedulerAuthority(t, ctx, storeA, &planA, 100)
+	applyNestedSchedulerAuthority(t, &planB, authority)
 
 	executeStarted := make(chan struct{})
 	releaseExecute := make(chan struct{})
@@ -1596,6 +1618,158 @@ func TestScheduleNestedRunsMissingAcceptedBudgetRouteFailsBeforeExecute(t *testi
 	}
 }
 
+func TestScheduleNestedRunsRequiresAcceptedAuthorityMetadataBeforeExecute(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	tests := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{name: "empty_metadata"},
+		{name: "malformed_metadata_type", metadata: json.RawMessage(`"not-authority-metadata"`)},
+		{name: "missing_route_and_budget_authority", metadata: json.RawMessage(`{}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+			if err != nil {
+				t.Fatalf("storage.Open: %v", err)
+			}
+			defer store.Close()
+			plan := durableReplayTestPlan()
+			plan.PlanID = "plan-authority-required-" + tt.name
+			plan.Items[0].ChildKey = "authority-required-" + tt.name
+			plan.Items[0].Metadata = tt.metadata
+			executed := false
+			report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+				RepoPath:         repo,
+				MaxChildren:      1,
+				ConcurrencyLimit: 1,
+				Now:              nestedTestNow(),
+				Clock:            func() time.Time { return nestedTestNow() },
+				Plan:             &plan,
+				Store:            store,
+				RecordEvent:      func(string, string, state.Event) error { return nil },
+				Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+					executed = true
+					return ChildRunResult{Status: NestedStatusSucceeded}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+			}
+			if executed {
+				t.Fatal("child executed without complete accepted authority metadata")
+			}
+			if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+				t.Fatalf("child status = %q, want needs-human", got)
+			}
+			if !strings.Contains(report.Children[0].Error, string(storage.ErrChildBudgetRequiredCode)) {
+				t.Fatalf("child error = %q, want %s", report.Children[0].Error, storage.ErrChildBudgetRequiredCode)
+			}
+			assertNestedSchedulerRejectedAuthorityState(t, ctx, store, report.Children[0].RunID)
+		})
+	}
+}
+
+func TestScheduleNestedRunsAcceptedAuthorityExecutesOnceWithFencedClaim(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	authority := nestedSchedulerBudgetAuthority{
+		ProjectID:                "proj-authority-control",
+		DeliveryRunID:            "drun-authority-control",
+		TaskID:                   "task-authority-control",
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-authority-control",
+		ModelCapabilityID:        "mcap-authority-control",
+		RoutingDecisionID:        "route-authority-control",
+		RoutingFingerprint:       "sha256:route-authority-control",
+		PlanFingerprint:          "sha256:plan-authority-control",
+		PolicyFingerprint:        "sha256:policy-authority-control",
+		AuthorizationFingerprint: "sha256:auth-authority-control",
+		BudgetRequestedValue:     1,
+	}
+	if err := seedNestedSchedulerBudgetAuthority(ctx, store, authority, 5); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-authority-control"
+	plan.Items[0].ChildKey = "authority-control"
+	plan.Items[0].Metadata = mustNestedSchedulerAuthorityJSON(t, authority)
+	var executeCount int
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:         repo,
+		MaxChildren:      1,
+		ConcurrencyLimit: 1,
+		Now:              nestedTestNow(),
+		Clock:            func() time.Time { return nestedTestNow() },
+		Plan:             &plan,
+		Store:            store,
+		RecordEvent:      func(string, string, state.Event) error { return nil },
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executeCount++
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if executeCount != 1 {
+		t.Fatalf("execute count = %d, want 1", executeCount)
+	}
+	if got := report.Children[0].Status; got != NestedStatusSucceeded {
+		t.Fatalf("child status = %q, want succeeded", got)
+	}
+	var claims, generation, committedBudgets int
+	var phase string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*), COALESCE(MAX(claim_generation), 0), COALESCE(MAX(phase), '') FROM run_claims WHERE run_id = ?`, report.Children[0].RunID).Scan(&claims, &generation, &phase); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ? AND state = 'committed'`, report.Children[0].RunID).Scan(&committedBudgets)
+	}); err != nil {
+		t.Fatalf("query durable control state: %v", err)
+	}
+	if claims != 1 || generation != 1 || phase != storage.ClaimPhaseCompleted || committedBudgets != 1 {
+		t.Fatalf("control state claims/generation/phase/budgets = %d/%d/%q/%d, want 1/1/%q/1", claims, generation, phase, committedBudgets, storage.ClaimPhaseCompleted)
+	}
+}
+
+func assertNestedSchedulerRejectedAuthorityState(t *testing.T, ctx context.Context, store storage.Store, childRunID string) {
+	t.Helper()
+	var claims, resourceReservations, budgetReservations, heldOwnershipLocks int
+	var childStatus string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims WHERE run_id = ?`, childRunID).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ?`, childRunID).Scan(&resourceReservations); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE sub_agent_id = ?`, childRunID).Scan(&budgetReservations); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM agent_ownership_locks WHERE state = ?`, storage.OwnershipStateHeld).Scan(&heldOwnershipLocks); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, childRunID).Scan(&childStatus)
+	}); err != nil {
+		t.Fatalf("query rejected authority state: %v", err)
+	}
+	if claims != 0 || resourceReservations != 0 || budgetReservations != 0 || heldOwnershipLocks != 0 {
+		t.Fatalf("rejected authority durable rows claims/resources/budgets/held_locks = %d/%d/%d/%d, want 0/0/0/0",
+			claims, resourceReservations, budgetReservations, heldOwnershipLocks)
+	}
+	if childStatus != NestedStatusNeedsHuman {
+		t.Fatalf("durable child status = %q, want needs-human", childStatus)
+	}
+}
+
 func TestScheduleNestedRunsRollsBackClaimWhenReservationPersistenceFails(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -1686,6 +1860,8 @@ func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 	planB := durableReplayTestPlan()
 	planB.PlanID = planA.PlanID
 	planB.Items[0].ChildKey = "renew-child"
+	authority := seedAndApplyNestedSchedulerAuthority(t, ctx, storeA, &planA, 100)
+	applyNestedSchedulerAuthority(t, &planB, authority)
 
 	executeStarted := make(chan struct{})
 	releaseExecute := make(chan struct{})
@@ -1793,6 +1969,8 @@ func TestScheduleNestedRunsExpiredExecutingOwnerNeedsHumanWithoutDuplicateExecut
 	planB := durableReplayTestPlan()
 	planB.PlanID = planA.PlanID
 	planB.Items[0].ChildKey = "expired-child"
+	authority := seedAndApplyNestedSchedulerAuthority(t, ctx, storeA, &planA, 100)
+	applyNestedSchedulerAuthority(t, &planB, authority)
 
 	executeStarted := make(chan struct{})
 	releaseExecute := make(chan struct{})
@@ -1931,6 +2109,7 @@ func TestScheduleNestedRunsPassesIdempotencyKeyAndPersistsOnlyRealReceipt(t *tes
 
 	plan := durableReplayTestPlan()
 	plan.PlanID = "plan-provider-key-receipt"
+	seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	var executedRunID, executedProviderKey string
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
@@ -2248,6 +2427,7 @@ func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 	plan := durableReplayTestPlan()
 	plan.PlanID = "plan-stale-owner-events"
 	plan.Items[0].ChildKey = "stale-child"
+	seedAndApplyNestedSchedulerAuthority(t, ctx, store, &plan, 100)
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
 		MaxChildren: 1,
@@ -2304,6 +2484,7 @@ func TestScheduleNestedRunsSuppressesParentDoneAfterChildCompletionPersistenceFa
 
 	plan := durableReplayTestPlan()
 	plan.PlanID = "plan-complete-failure-suppresses-parent"
+	seedAndApplyNestedSchedulerAuthority(t, ctx, baseStore, &plan, 100)
 	var eventsMu sync.Mutex
 	var events []state.Event
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
@@ -2354,6 +2535,7 @@ func TestScheduleNestedRunsCancellationPersistsTerminalStatusWithCleanupContext(
 	plan := durableReplayTestPlan()
 	plan.PlanID = "plan-cancel-cleanup"
 	plan.Items[0].ChildKey = "cancel-child"
+	seedAndApplyNestedSchedulerAuthority(t, context.Background(), store, &plan, 100)
 	executeStarted := make(chan struct{})
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    repo,
@@ -2410,6 +2592,7 @@ func TestNestedReplayHelperProcess(t *testing.T) {
 	plan.Items[0].ChildKey = "race-child"
 	plan.Items[0].ID = ""
 	plan.Items[0].Title = "Race child"
+	applyNestedSchedulerAuthority(t, &plan, acceptedNestedSchedulerAuthorityForPlan(plan.PlanID, 1))
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    os.Getenv("LOOPCODER_NESTED_REPLAY_REPO"),
 		MaxChildren: 1,
@@ -2702,6 +2885,56 @@ func mustNestedSchedulerAuthorityJSON(t *testing.T, authority nestedSchedulerBud
 		t.Fatalf("marshal scheduler authority: %v", err)
 	}
 	return data
+}
+
+func seedAndApplyNestedSchedulerAuthority(t *testing.T, ctx context.Context, store storage.Store, plan *ChildPlan, ceiling int64) nestedSchedulerBudgetAuthority {
+	t.Helper()
+	authority := acceptedNestedSchedulerAuthorityForPlan(plan.PlanID, 1)
+	if err := seedNestedSchedulerBudgetAuthority(ctx, store, authority, ceiling); err != nil {
+		t.Fatalf("seed nested scheduler authority: %v", err)
+	}
+	applyNestedSchedulerAuthority(t, plan, authority)
+	return authority
+}
+
+func applyNestedSchedulerAuthority(t *testing.T, plan *ChildPlan, authority nestedSchedulerBudgetAuthority) {
+	t.Helper()
+	metadata := mustNestedSchedulerAuthorityJSON(t, authority)
+	for i := range plan.Items {
+		plan.Items[i].Metadata = metadata
+	}
+}
+
+func acceptedNestedSchedulerAuthorityForPlan(planID string, requestedValue int64) nestedSchedulerBudgetAuthority {
+	suffix := strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		case r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, planID), "-")
+	if suffix == "" {
+		suffix = "default"
+	}
+	return nestedSchedulerBudgetAuthority{
+		ProjectID:                "proj-" + suffix,
+		DeliveryRunID:            "drun-" + suffix,
+		TaskID:                   "task-" + suffix,
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-" + suffix,
+		ModelCapabilityID:        "mcap-" + suffix,
+		RoutingDecisionID:        "route-" + suffix,
+		RoutingFingerprint:       "sha256:route-" + suffix,
+		PlanFingerprint:          "sha256:plan-" + suffix,
+		PolicyFingerprint:        "sha256:policy-" + suffix,
+		AuthorizationFingerprint: "sha256:auth-" + suffix,
+		BudgetRequestedValue:     requestedValue,
+	}
 }
 
 func seedNestedSchedulerBudgetAuthority(ctx context.Context, store storage.Store, authority nestedSchedulerBudgetAuthority, ceiling int64) error {
