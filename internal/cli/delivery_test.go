@@ -56,6 +56,30 @@ func TestDeliveryCLIPlanDecideContinueJSON(t *testing.T) {
 	}
 }
 
+func TestDeliveryCLIPlanFreshDatabaseNoSourceMigrationOutputTruthful(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "data", "loopcoder.db")
+
+	var stdout, stderr bytes.Buffer
+	code := RunWithDeps([]string{"delivery", "plan", "--db", dbPath, "--project-id", "proj_missing", "--run-id", "run_missing", "--format", "json"}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if code != 1 {
+		t.Fatalf("delivery plan exit = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	assertDeliveryPlanMissingRunErrorVisible(t, stdout.String(), "run_missing")
+	assertNoBackupClaimInCLIOutput(t, stdout.String(), stderr.String())
+	assertFreshNoSourceMigrationMetadata(t, ctx, dbPath)
+
+	stdout.Reset()
+	stderr.Reset()
+	code = RunWithDeps([]string{"delivery", "plan", "--db", dbPath, "--project-id", "proj_missing", "--run-id", "run_missing", "--format", "json"}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if code != 1 {
+		t.Fatalf("repeat delivery plan exit = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	assertDeliveryPlanMissingRunErrorVisible(t, stdout.String(), "run_missing")
+	assertNoBackupClaimInCLIOutput(t, stdout.String(), stderr.String())
+	assertFreshNoSourceMigrationMetadata(t, ctx, dbPath)
+}
+
 func TestDeliveryCLIExitCodesForPendingAndStale(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
 	seedCLIDeliveryRun(t, dbPath)
@@ -156,5 +180,67 @@ func seedCLIDeliveryRun(t *testing.T, dbPath string) {
 	}
 	if _, err := deliverypkg.PersistTask(ctx, store, task, deliverypkg.PersistOptions{IdempotencyKey: "cli-task", Now: fixedCLINow()}); err != nil {
 		t.Fatalf("PersistTask: %v", err)
+	}
+}
+
+func assertNoBackupClaimInCLIOutput(t *testing.T, stdout, stderr string) {
+	t.Helper()
+	output := strings.ToLower(stdout + "\n" + stderr)
+	for _, forbidden := range []string{"backed up", "backup created", "copied backup", "source_db_hash"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("operator output contains %q, want no backup claim:\nstdout=%s\nstderr=%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func assertDeliveryPlanMissingRunErrorVisible(t *testing.T, stdout, runID string) {
+	t.Helper()
+	var outcome struct {
+		Operation   string `json:"operation"`
+		DeliveryRun string `json:"delivery_run_id"`
+		ErrorCode   string `json:"error_code"`
+		Error       string `json:"error_message"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &outcome); err != nil {
+		t.Fatalf("decode delivery plan error JSON: %v\n%s", err, stdout)
+	}
+	if outcome.Operation != "delivery.plan" || outcome.DeliveryRun != runID {
+		t.Fatalf("outcome identity = %#v, want delivery.plan/%s", outcome, runID)
+	}
+	if outcome.ErrorCode == "" || outcome.Error == "" {
+		t.Fatalf("outcome error is not typed and visible: %#v", outcome)
+	}
+}
+
+func assertFreshNoSourceMigrationMetadata(t *testing.T, ctx context.Context, dbPath string) {
+	t.Helper()
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health.SchemaVersion != storage.CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, storage.CurrentSchemaVersion)
+	}
+	var count int
+	var backupID, sourcePath, sourceHash, backupPath string
+	var sourceSchemaVersion int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM delivery_migration_backups`).Scan(&count); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT backup_id, source_db_path, source_schema_version, source_db_hash, backup_path FROM delivery_migration_backups`).Scan(&backupID, &sourcePath, &sourceSchemaVersion, &sourceHash, &backupPath)
+	}); err != nil {
+		t.Fatalf("query no-source migration metadata: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("delivery_migration_backups count = %d, want 1", count)
+	}
+	if !strings.HasPrefix(backupID, "no_source_") || sourcePath != filepath.Clean(dbPath) || sourceSchemaVersion != 0 || sourceHash != "" || backupPath != "" {
+		t.Fatalf("migration metadata = id:%q source:%q version:%d hash:%q backup:%q, want no-source metadata", backupID, sourcePath, sourceSchemaVersion, sourceHash, backupPath)
 	}
 }

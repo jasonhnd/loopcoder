@@ -73,6 +73,7 @@ type sqliteStore struct {
 	db                       *sql.DB
 	now                      func() time.Time
 	writeTxCommitHookForTest WriteTxCommitHookForTest
+	sourceExistedBeforeOpen  bool
 }
 
 type sqlTx struct {
@@ -459,6 +460,14 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, errors.New("open storage: path is required")
 	}
 	path = filepath.Clean(path)
+	sourceExistedBeforeOpen := true
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			sourceExistedBeforeOpen = false
+		} else {
+			return nil, fmt.Errorf("open storage: inspect source database %s: %w", path, err)
+		}
+	}
 
 	var store *sqliteStore
 	err := withOwnerOnlyUmask(func() error {
@@ -470,7 +479,13 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 			return fmt.Errorf("open storage %s: %w", path, err)
 		}
 		db.SetMaxOpenConns(1)
-		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now), writeTxCommitHookForTest: opts.WriteTxCommitHookForTest}
+		opened := &sqliteStore{
+			path:                     path,
+			db:                       db,
+			now:                      normalizeNow(opts.Now),
+			writeTxCommitHookForTest: opts.WriteTxCommitHookForTest,
+			sourceExistedBeforeOpen:  sourceExistedBeforeOpen,
+		}
 		if err := opened.configure(ctx); err != nil {
 			_ = db.Close()
 			return err
@@ -747,8 +762,13 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 		return unsupportedVersionError(version)
 	}
 	var deliveryV10Backup *deliveryMigrationBackup
-	if version == 9 && CurrentSchemaVersion >= 10 {
-		deliveryV10Backup, err = prepareDeliveryV10Backup(s.path, formatTimestamp(s.now()))
+	if CurrentSchemaVersion >= 10 {
+		switch {
+		case version == 9:
+			deliveryV10Backup, err = prepareDeliveryV10Backup(s.path, formatTimestamp(s.now()))
+		case version < 10 && !s.sourceExistedBeforeOpen:
+			deliveryV10Backup = prepareDeliveryV10NoSourceMetadata(s.path, formatTimestamp(s.now()))
+		}
 		if err != nil {
 			return err
 		}

@@ -13,6 +13,7 @@ import (
 type deliveryMigrationBackup struct {
 	BackupID                 string
 	SourcePath               string
+	SourceSchemaVersion      int
 	SourceHash               string
 	BackupPath               string
 	CreatedAt                string
@@ -20,13 +21,20 @@ type deliveryMigrationBackup struct {
 }
 
 func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationBackup, error) {
+	return prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt, deliveryV10SourceExists)
+}
+
+func prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt string, sourceExists func(string) (bool, error)) (*deliveryMigrationBackup, error) {
 	sourcePath = filepath.Clean(sourcePath)
 	if sourcePath == "." || sourcePath == "" {
-		return &deliveryMigrationBackup{
-			BackupID:                 "backup_" + hashStringsStorage("schema-v9-empty-source")[:24],
-			CreatedAt:                createdAt,
-			MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
-		}, nil
+		return prepareDeliveryV10NoSourceMetadata("", createdAt), nil
+	}
+	exists, err := sourceExists(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect delivery v10 backup source: %w", err)
+	}
+	if !exists {
+		return prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt), nil
 	}
 	sourceHash, err := fileSHA256(sourcePath)
 	if err != nil {
@@ -44,11 +52,36 @@ func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationB
 	return &deliveryMigrationBackup{
 		BackupID:                 "backup_" + hashStringsStorage(sourceHash, "schema-v9-to-v10")[:24],
 		SourcePath:               sourcePath,
+		SourceSchemaVersion:      9,
 		SourceHash:               sourceHash,
 		BackupPath:               backupPath,
 		CreatedAt:                createdAt,
 		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
 	}, nil
+}
+
+func deliveryV10SourceExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt string) *deliveryMigrationBackup {
+	sourcePath = filepath.Clean(sourcePath)
+	if sourcePath == "." {
+		sourcePath = ""
+	}
+	return &deliveryMigrationBackup{
+		BackupID:                 "no_source_" + hashStringsStorage(sourcePath, "schema-v9-to-v10-no-source")[:24],
+		SourcePath:               sourcePath,
+		SourceSchemaVersion:      0,
+		CreatedAt:                createdAt,
+		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10", "no-source"),
+	}
 }
 
 func migrateDeliveryRunContracts(ctx context.Context, tx *sql.Tx, backup *deliveryMigrationBackup, createdAt string) error {
@@ -68,9 +101,10 @@ func migrateDeliveryRunContracts(ctx context.Context, tx *sql.Tx, backup *delive
 			created_at,
 			loopcoder_version,
 			migration_plan_fingerprint
-		) VALUES (?, ?, 9, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			backup.BackupID,
 			backup.SourcePath,
+			backup.SourceSchemaVersion,
 			backup.SourceHash,
 			backup.BackupPath,
 			backup.CreatedAt,
