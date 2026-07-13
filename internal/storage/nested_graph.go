@@ -137,6 +137,10 @@ func IsStaleChildRunClaim(err error) bool {
 	return errors.Is(err, ErrStaleChildRunClaim)
 }
 
+func staleChildRunClaimError(runID string, claimGeneration int64) error {
+	return fmt.Errorf("%w: %w for run %q generation %d", federationError(ErrStaleClaimCode, "current owner/generation does not match"), ErrStaleChildRunClaim, runID, claimGeneration)
+}
+
 // LoadChildPlanReplayRecord loads the authoritative durable child identity for
 // a plan_id. Missing records are reported with ok=false.
 func LoadChildPlanReplayRecord(ctx context.Context, store Store, planID string) (ChildPlanReplayRecord, bool, error) {
@@ -417,7 +421,7 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 			}
 			affected, err := result.RowsAffected()
 			if err == nil && affected == 0 {
-				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+				return staleChildRunClaimError(childRunID, claimGeneration)
 			}
 			if err := renewClaimFencedOwnershipLocksTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
 				return err
@@ -451,7 +455,7 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 			}
 			affected, err := result.RowsAffected()
 			if err == nil && affected == 0 {
-				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+				return staleChildRunClaimError(childRunID, claimGeneration)
 			}
 			status := ""
 			switch phase {
@@ -508,7 +512,7 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 			}
 			affected, err := result.RowsAffected()
 			if err == nil && affected == 0 {
-				return fmt.Errorf("%w for run %q generation %d", ErrStaleChildRunClaim, childRunID, claimGeneration)
+				return staleChildRunClaimError(childRunID, claimGeneration)
 			}
 			if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
 				RunID:       childRunID,
