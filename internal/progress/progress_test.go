@@ -270,8 +270,8 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if health.SchemaVersion != 25 {
-		t.Fatalf("schema version = %d, want 25", health.SchemaVersion)
+	if health.SchemaVersion != storage.CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", health.SchemaVersion, storage.CurrentSchemaVersion)
 	}
 	var migrationName string
 	if err := store.WithTx(ctx, func(tx storage.Tx) error {
@@ -287,7 +287,10 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 		if _, err := tx.Exec(ctx, `DROP TABLE progress_receipts`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version = 25`)
+		if _, err := tx.Exec(ctx, `DROP TABLE handoff_transactions`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version IN (25, 26)`)
 		return err
 	}); err != nil {
 		t.Fatalf("simulate v24 database: %v", err)
