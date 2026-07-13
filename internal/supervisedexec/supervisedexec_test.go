@@ -183,11 +183,11 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 
 func TestRunSilentProcessTreeActivityDoesNotStall(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
-	cmd := helperCommand(t, "silent-child-churn", logPath, "25ms", "9", "175ms", "0")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
 
 	result, err := Run(context.Background(), cmd, Options{
 		HardCap:      10 * time.Second,
-		StallTimeout: 600 * time.Millisecond,
+		StallTimeout: 1500 * time.Millisecond,
 		LogPath:      logPath,
 	})
 	if err != nil {
@@ -199,8 +199,8 @@ func TestRunSilentProcessTreeActivityDoesNotStall(t *testing.T) {
 	if result.Killed {
 		t.Fatal("Killed = true, want false")
 	}
-	if result.Elapsed < time.Second {
-		t.Fatalf("Elapsed = %s, want >= 1s so process-tree activity crossed the stall window", result.Elapsed)
+	if result.Elapsed < 2*time.Second {
+		t.Fatalf("Elapsed = %s, want >= 2s so process-tree activity crossed the stall window", result.Elapsed)
 	}
 }
 
@@ -270,11 +270,11 @@ func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
 
 func TestRunLogOnlyIgnoresProcessTreeActivity(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
-	cmd := helperCommand(t, "silent-child-churn", logPath, "25ms", "9", "175ms", "0")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
 
 	result, err := Run(context.Background(), cmd, Options{
 		HardCap:      10 * time.Second,
-		StallTimeout: 300 * time.Millisecond,
+		StallTimeout: 400 * time.Millisecond,
 		LogPath:      logPath,
 		LivenessMode: LivenessModeLogOnly,
 	})
@@ -682,6 +682,7 @@ func TestHelperProcess(t *testing.T) {
 		childDuration := parseDuration(args[3])
 		code := parseInt(args[4])
 		appendLog(logPath, "first")
+		children := make([]*exec.Cmd, 0, count)
 		for i := 0; i < count; i++ {
 			child := helperCommandForProcess("sleep-exit", childDuration.String(), "0")
 			child.Stdout = io.Discard
@@ -690,11 +691,14 @@ func TestHelperProcess(t *testing.T) {
 				fmt.Fprintf(os.Stderr, "start silent child: %v\n", err)
 				os.Exit(2)
 			}
+			children = append(children, child)
+			time.Sleep(interval)
+		}
+		for _, child := range children {
 			if err := child.Wait(); err != nil {
 				fmt.Fprintf(os.Stderr, "wait silent child: %v\n", err)
 				os.Exit(2)
 			}
-			time.Sleep(interval)
 		}
 		os.Exit(code)
 	case "assert-arg":
