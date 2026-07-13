@@ -2030,10 +2030,12 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	called := false
 	repo := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
 
 	exitCode := RunWithDeps([]string{
 		"init",
 		"-Repo", repo,
+		"--yes",
 		"-Gate", "auto",
 		"-Force",
 		"-WorkerModel", "gpt-5",
@@ -2075,6 +2077,45 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "[loopcoder] warning: gh label setup skipped") {
 		t.Fatalf("stderr missing warning:\n%s", stderr.String())
+	}
+}
+
+func TestInitDefaultJSONDeclinesWithoutMutation(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/setup.git")
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+	t.Setenv("PATH", "")
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"init", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Stdin: strings.NewReader(""),
+		Now:   fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("init preview exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload struct {
+		Outcome   string `json:"outcome"`
+		Applied   bool   `json:"applied"`
+		Mutations []struct {
+			Name   string `json:"name"`
+			Action string `json:"action"`
+			Path   string `json:"path"`
+		} `json:"mutations"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("init JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.Outcome != "declined" || payload.Applied {
+		t.Fatalf("payload = %#v, want declined without apply", payload)
+	}
+	if len(payload.Mutations) == 0 {
+		t.Fatalf("mutations = %#v, want planned mutations", payload.Mutations)
+	}
+	for _, path := range []string{filepath.Join(repo, ".delivery.yml"), filepath.Join(repo, "ROADMAP.md"), filepath.Join(homeDir, "data", "loopcoder.db")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat err = %v, want not exist", path, err)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -527,6 +528,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
 		fmt.Fprintln(w, "  --repo string               repository path (default \".\")")
 		fmt.Fprintln(w, "  --gate string               generated promotion gate: human-merge or auto (default \"human-merge\")")
+		fmt.Fprintln(w, "  --yes                       apply the planned setup without an interactive prompt")
+		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --worker-model string       optional first-run worker model to persist")
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
@@ -1723,6 +1726,12 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Init == nil {
 		deps.Init = DefaultDeps().Init
 	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	if deps.Stdin == nil {
+		deps.Stdin = DefaultDeps().Stdin
+	}
 
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1735,6 +1744,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var workerEffortAlias string
 	var verifierModelAlias string
 	var verifierEffortAlias string
+	var yes bool
+	var format string
 
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing files")
@@ -1750,6 +1761,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
 	fs.StringVar(&opts.VerifierEffort, "verifier-effort", "", "verifier reasoning effort")
 	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier reasoning effort")
+	fs.BoolVar(&yes, "yes", false, "apply without prompting")
+	fs.StringVar(&format, "format", "text", "output format: text or json")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1779,6 +1792,14 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "init: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
+	format = strings.TrimSpace(format)
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "init: invalid --format %q; want text or json\n", format)
+		return 2
+	}
 
 	resolvedRepo, err := resolveRepo(opts.RepoPath)
 	if err != nil {
@@ -1786,11 +1807,55 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	opts.RepoPath = resolvedRepo
+	opts.Now = deps.Now
 
-	result, err := deps.Init(context.Background(), opts)
+	preview, err := scaffold.Preview(context.Background(), opts, scaffold.DefaultDeps())
 	if err != nil {
 		fmt.Fprintf(stderr, "init: %v\n", err)
 		return 1
+	}
+	if preview.Outcome == scaffold.OutcomeBlocked {
+		if format == "json" {
+			if code := writeProjectJSON(stdout, stderr, "init", preview); code != 0 {
+				return code
+			}
+			return 1
+		}
+		renderInitResult(stdout, stderr, preview)
+		return 1
+	}
+	if !yes {
+		if format == "json" {
+			preview.Outcome = scaffold.OutcomeDeclined
+			return writeProjectJSON(stdout, stderr, "init", preview)
+		}
+		renderInitResult(stdout, stderr, preview)
+		if !confirmInit(deps.Stdin, stdout) {
+			preview.Outcome = scaffold.OutcomeDeclined
+			fmt.Fprintln(stdout, "loopcoder init declined; no changes applied")
+			return 0
+		}
+	}
+
+	opts.Apply = true
+	result, err := deps.Init(context.Background(), opts)
+	if err != nil {
+		var blocked *scaffold.BlockedError
+		if errors.As(err, &blocked) {
+			if format == "json" {
+				if code := writeProjectJSON(stdout, stderr, "init", result); code != 0 {
+					return code
+				}
+				return 1
+			}
+			renderInitResult(stdout, stderr, result)
+			return 1
+		}
+		fmt.Fprintf(stderr, "init: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "init", result)
 	}
 	renderInitResult(stdout, stderr, result)
 	return 0
@@ -2833,7 +2898,53 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 }
 
 func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
-	fmt.Fprintln(stdout, "loopcoder init complete")
+	switch result.Outcome {
+	case scaffold.OutcomePlanned:
+		fmt.Fprintln(stdout, "loopcoder init plan")
+	case scaffold.OutcomeBlocked:
+		fmt.Fprintln(stdout, "loopcoder init blocked")
+	case scaffold.OutcomeDeclined:
+		fmt.Fprintln(stdout, "loopcoder init declined")
+	case scaffold.OutcomeAlreadyConfigured:
+		fmt.Fprintln(stdout, "loopcoder init already configured")
+	default:
+		fmt.Fprintln(stdout, "loopcoder init complete")
+	}
+	if result.Project != nil {
+		fmt.Fprintf(stdout, "  project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+		fmt.Fprintf(stdout, "  path %s\n", result.Project.LocalPath)
+	}
+	if result.Registry != nil {
+		fmt.Fprintf(stdout, "  registry %s %s\n", result.Registry.Status, result.Registry.DatabasePath)
+	}
+	if result.Blocked != nil {
+		fmt.Fprintf(stdout, "  blocked %s: %s\n", result.Blocked.Code, result.Blocked.Message)
+	}
+	for _, conflict := range result.Conflicts {
+		fmt.Fprintf(stdout, "  conflict project %s path=%s identity=%s\n", conflict.ProjectID, conflict.LocalPath, conflict.IdentitySource)
+	}
+	if result.Dirty != nil && result.Dirty.Dirty {
+		fmt.Fprintln(stdout, "  dirty repository warning: uncommitted changes detected")
+		if strings.TrimSpace(result.Dirty.Porcelain) != "" {
+			for _, line := range strings.Split(result.Dirty.Porcelain, "\n") {
+				fmt.Fprintf(stdout, "    %s\n", line)
+			}
+		}
+	}
+	if len(result.Mutations) > 0 {
+		label := "planned mutations"
+		if result.Applied {
+			label = "completed mutations"
+		}
+		fmt.Fprintf(stdout, "  %s:\n", label)
+		for _, mutation := range result.Mutations {
+			target := mutation.Path
+			if target == "" {
+				target = mutation.Name
+			}
+			fmt.Fprintf(stdout, "    - %s %s %s\n", mutation.Action, mutation.Name, target)
+		}
+	}
 	for _, file := range result.Files {
 		switch file.Status {
 		case scaffold.FileCreated:
@@ -2862,6 +2973,20 @@ func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
+}
+
+func confirmInit(stdin io.Reader, stdout io.Writer) bool {
+	if stdin == nil {
+		return false
+	}
+	fmt.Fprint(stdout, "Apply these setup changes? [y/N] ")
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return false
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes"
 }
 
 func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {

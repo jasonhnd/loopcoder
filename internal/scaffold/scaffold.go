@@ -4,6 +4,7 @@ package scaffold
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +14,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/execresult"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -35,17 +41,25 @@ var (
 type Options struct {
 	RepoPath       string
 	Force          bool
+	Apply          bool
 	Gate           string
 	WorkerModel    string
 	WorkerEffort   string
 	VerifierModel  string
 	VerifierEffort string
+	Now            func() time.Time
 }
 
 type Deps struct {
 	FS                FileSystem
 	GitHub            GitHubRunner
 	ProtectLocalState func(context.Context, string) (gitlocal.ProtectResult, error)
+	InspectLocalState func(context.Context, string) (*LocalStateResult, *Mutation, error)
+	RunGit            func(context.Context, string, ...string) (string, error)
+	Getenv            func(string) string
+	UserHomeDir       func() (string, error)
+	ResolveProject    func(context.Context, registry.Options) (registry.Project, error)
+	RegisterProject   func(context.Context, registry.Options) (registry.RegisterResult, error)
 }
 
 type FileSystem interface {
@@ -66,8 +80,8 @@ const (
 )
 
 type FileResult struct {
-	Path   string
-	Status FileStatus
+	Path   string     `json:"path"`
+	Status FileStatus `json:"status"`
 }
 
 type LabelStatus string
@@ -78,20 +92,87 @@ const (
 )
 
 type LabelResult struct {
-	Name   string
-	Status LabelStatus
+	Name   string      `json:"name"`
+	Status LabelStatus `json:"status"`
 }
 
 type Result struct {
-	Files             []FileResult
-	Labels            []LabelResult
-	LocalStateExclude *LocalStateResult
-	Warnings          []string
+	Outcome           Outcome            `json:"outcome,omitempty"`
+	Applied           bool               `json:"applied"`
+	RepoPath          string             `json:"repo_path,omitempty"`
+	Files             []FileResult       `json:"files"`
+	Labels            []LabelResult      `json:"labels"`
+	LocalStateExclude *LocalStateResult  `json:"local_state_exclude,omitempty"`
+	Project           *registry.Project  `json:"project,omitempty"`
+	Registry          *RegistryResult    `json:"registry,omitempty"`
+	RuntimeDirs       []RuntimeDirResult `json:"runtime_dirs,omitempty"`
+	Mutations         []Mutation         `json:"mutations"`
+	Conflicts         []registry.Project `json:"conflicts,omitempty"`
+	Dirty             *DirtyResult       `json:"dirty,omitempty"`
+	Blocked           *BlockedResult     `json:"blocked,omitempty"`
+	Warnings          []string           `json:"warnings"`
+}
+
+type Outcome string
+
+const (
+	OutcomePlanned           Outcome = "planned"
+	OutcomeCreated           Outcome = "created"
+	OutcomeAlreadyConfigured Outcome = "already-configured"
+	OutcomeDeclined          Outcome = "declined"
+	OutcomeBlocked           Outcome = "blocked"
+)
+
+type Mutation struct {
+	Name   string `json:"name"`
+	Action string `json:"action"`
+	Path   string `json:"path,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+type RegistryResult struct {
+	DatabasePath string `json:"database_path"`
+	Status       string `json:"status"`
+	ProjectID    string `json:"project_id,omitempty"`
+}
+
+type RuntimeDirResult struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+type DirtyResult struct {
+	Dirty     bool   `json:"dirty"`
+	Porcelain string `json:"porcelain,omitempty"`
+}
+
+type BlockedResult struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type BlockedError struct {
+	Code string
+	Err  error
+}
+
+func (e *BlockedError) Error() string {
+	if e == nil || e.Err == nil {
+		return "setup blocked"
+	}
+	return e.Err.Error()
+}
+
+func (e *BlockedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 type LocalStateResult struct {
-	Path   string
-	Status gitlocal.ProtectStatus
+	Path   string                 `json:"path"`
+	Status gitlocal.ProtectStatus `json:"status"`
 }
 
 type LabelSpec struct {
@@ -129,10 +210,30 @@ func DefaultDeps() Deps {
 		FS:                osFileSystem{},
 		GitHub:            execGitHubRunner{},
 		ProtectLocalState: gitlocal.ProtectLoopcoderState,
+		InspectLocalState: planLocalState,
+		RunGit:            runGit,
+		Getenv:            os.Getenv,
+		UserHomeDir:       os.UserHomeDir,
+		ResolveProject: func(ctx context.Context, opts registry.Options) (registry.Project, error) {
+			return registry.Resolve(ctx, opts, registry.DefaultDeps())
+		},
+		RegisterProject: func(ctx context.Context, opts registry.Options) (registry.RegisterResult, error) {
+			return registry.Register(ctx, opts, registry.DefaultDeps())
+		},
 	}
 }
 
 func Init(ctx context.Context, opts Options, deps Deps) (Result, error) {
+	opts.Apply = true
+	return Setup(ctx, opts, deps)
+}
+
+func Preview(ctx context.Context, opts Options, deps Deps) (Result, error) {
+	opts.Apply = false
+	return Setup(ctx, opts, deps)
+}
+
+func Setup(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	defaults := DefaultDeps()
 	if deps.FS == nil {
 		deps.FS = defaults.FS
@@ -143,6 +244,24 @@ func Init(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if deps.ProtectLocalState == nil {
 		deps.ProtectLocalState = defaults.ProtectLocalState
 	}
+	if deps.InspectLocalState == nil {
+		deps.InspectLocalState = defaults.InspectLocalState
+	}
+	if deps.RunGit == nil {
+		deps.RunGit = defaults.RunGit
+	}
+	if deps.Getenv == nil {
+		deps.Getenv = defaults.Getenv
+	}
+	if deps.UserHomeDir == nil {
+		deps.UserHomeDir = defaults.UserHomeDir
+	}
+	if deps.ResolveProject == nil {
+		deps.ResolveProject = defaults.ResolveProject
+	}
+	if deps.RegisterProject == nil {
+		deps.RegisterProject = defaults.RegisterProject
+	}
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		opts.RepoPath = "."
 	}
@@ -150,37 +269,186 @@ func Init(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		return Result{}, err
 	}
 
+	result, err := plan(ctx, opts, deps)
+	if err != nil {
+		return result, err
+	}
+	if !opts.Apply {
+		return result, nil
+	}
+	if result.Blocked != nil {
+		return result, &BlockedError{Code: result.Blocked.Code, Err: errors.New(result.Blocked.Message)}
+	}
+	applied, err := apply(ctx, opts, deps, result)
+	if err != nil {
+		return applied, err
+	}
+	return applied, nil
+}
+
+func plan(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	var result Result
+	result.Outcome = OutcomePlanned
+	result.RepoPath = opts.RepoPath
 	deliveryPath := filepath.Join(opts.RepoPath, DeliveryFilename)
-	deliveryResult, err := writeFile(deps.FS, deliveryPath, []byte(DeliveryTemplate(opts)), opts.Force)
+	deliveryResult, err := planFile(deps.FS, deliveryPath, opts.Force)
 	if err != nil {
 		return Result{}, err
 	}
 	result.Files = append(result.Files, deliveryResult)
+	addFileMutation(&result, deliveryResult)
 
 	roadmapPath := filepath.Join(opts.RepoPath, RoadmapFilename)
-	roadmapResult, err := writeFile(deps.FS, roadmapPath, []byte(RoadmapTemplate), opts.Force)
+	roadmapResult, err := planFile(deps.FS, roadmapPath, opts.Force)
 	if err != nil {
 		return Result{}, err
 	}
 	result.Files = append(result.Files, roadmapResult)
+	addFileMutation(&result, roadmapResult)
+
+	labels, warnings := planLabels(ctx, opts.RepoPath, deps.GitHub)
+	result.Labels = labels
+	result.Warnings = append(result.Warnings, warnings...)
+	for _, label := range labels {
+		if label.Status == LabelCreated {
+			result.Mutations = append(result.Mutations, Mutation{Name: "github label", Action: "create", Path: label.Name, Status: string(label.Status)})
+		}
+	}
+
+	localState, localStateMutation, err := deps.InspectLocalState(ctx, opts.RepoPath)
+	if err != nil && errors.Is(err, gitlocal.ErrNotGitRepository) {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayRepoPath(opts.RepoPath), err))
+	} else if err != nil {
+		return Result{}, err
+	} else {
+		result.LocalStateExclude = localState
+		if localStateMutation != nil {
+			result.Mutations = append(result.Mutations, *localStateMutation)
+		}
+	}
+
+	if dirty, err := dirtyStatus(ctx, opts.RepoPath, deps.RunGit); err == nil && dirty.Dirty {
+		result.Dirty = &dirty
+		result.Warnings = append(result.Warnings, "repository has uncommitted changes; setup will not modify tracked files before confirmation")
+	} else if err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("dirty check skipped: %v", err))
+	}
+
+	project, err := deps.ResolveProject(ctx, registry.Options{RepoPath: opts.RepoPath, Now: opts.Now})
+	if err != nil {
+		return Result{}, err
+	}
+	result.Project = &project
+	registryPlan, conflicts, err := planRegistry(ctx, opts, deps, project)
+	if err != nil {
+		return Result{}, err
+	}
+	result.Registry = &registryPlan
+	result.Conflicts = conflicts
+	if len(conflicts) > 0 {
+		result.Blocked = &BlockedResult{Code: "project-registry-conflict", Message: fmt.Sprintf("project registry has %d other row(s) for canonical local path %s", len(conflicts), project.LocalPathCanonical)}
+		result.Outcome = OutcomeBlocked
+		return result, nil
+	}
+	if registryPlan.Status != "registered" {
+		result.Mutations = append(result.Mutations, Mutation{Name: "project registry", Action: registryPlan.Status, Path: registryPlan.DatabasePath, Status: registryPlan.Status})
+	}
+	result.RuntimeDirs = planRuntimeDirs(opts, deps, project.ProjectID)
+	for _, dir := range result.RuntimeDirs {
+		if dir.Status != "exists" {
+			result.Mutations = append(result.Mutations, Mutation{Name: "runtime directory", Action: "create", Path: dir.Path, Status: dir.Status})
+		}
+	}
+	if len(result.Mutations) == 0 {
+		result.Outcome = OutcomeAlreadyConfigured
+	}
+	return result, nil
+}
+
+func apply(ctx context.Context, opts Options, deps Deps, planned Result) (Result, error) {
+	result := planned
+	result.Applied = true
+	result.Mutations = nil
+
+	if err := ensureRuntimeDirs(result.RuntimeDirs); err != nil {
+		return block(result, "runtime-root-permission", fmt.Errorf("create runtime directories: %w", err))
+	}
+
+	deliveryPath := filepath.Join(opts.RepoPath, DeliveryFilename)
+	deliveryResult, err := writeFile(deps.FS, deliveryPath, []byte(DeliveryTemplate(opts)), opts.Force)
+	if err != nil {
+		return block(result, "repository-write-failed", err)
+	}
+	result.Files[0] = deliveryResult
+	addFileMutation(&result, deliveryResult)
+
+	roadmapPath := filepath.Join(opts.RepoPath, RoadmapFilename)
+	roadmapResult, err := writeFile(deps.FS, roadmapPath, []byte(RoadmapTemplate), opts.Force)
+	if err != nil {
+		return block(result, "repository-write-failed", err)
+	}
+	result.Files[1] = roadmapResult
+	addFileMutation(&result, roadmapResult)
 
 	labels, warnings := ensureLabels(ctx, opts.RepoPath, deps.GitHub)
 	result.Labels = labels
-	result.Warnings = append(result.Warnings, warnings...)
+	result.Warnings = appendWarningsUnique(result.Warnings, warnings...)
+	for _, label := range labels {
+		if label.Status == LabelCreated {
+			result.Mutations = append(result.Mutations, Mutation{Name: "github label", Action: "create", Path: label.Name, Status: string(label.Status)})
+		}
+	}
 
 	localState, err := deps.ProtectLocalState(ctx, opts.RepoPath)
 	if err != nil {
 		if errors.Is(err, gitlocal.ErrNotGitRepository) {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("local .loopcoder/ exclude was not installed for %s: %v", displayRepoPath(opts.RepoPath), err))
 		} else {
-			return Result{}, fmt.Errorf("protect local loopcoder state: %w", err)
+			return block(result, "local-state-protection-failed", fmt.Errorf("protect local loopcoder state: %w", err))
 		}
 	} else {
 		result.LocalStateExclude = &LocalStateResult{
 			Path:   localState.ExcludePath,
 			Status: localState.Status,
 		}
+		if localState.Status != gitlocal.ProtectUnchanged {
+			result.Mutations = append(result.Mutations, Mutation{Name: "local-state exclude", Action: string(localState.Status), Path: localState.ExcludePath, Status: string(localState.Status)})
+		}
+	}
+
+	if result.Registry == nil || result.Registry.Status != "registered" {
+		registered, err := deps.RegisterProject(ctx, registry.Options{RepoPath: opts.RepoPath, Now: opts.Now})
+		if err != nil {
+			return block(result, "project-registry-apply-failed", err)
+		}
+		result.Project = &registered.Project
+		if result.Registry != nil {
+			result.Registry.ProjectID = registered.Project.ProjectID
+			switch {
+			case registered.Created:
+				result.Registry.Status = "created"
+			case registered.Reactivated:
+				result.Registry.Status = "reactivated"
+			case registered.Updated:
+				result.Registry.Status = "updated"
+			default:
+				result.Registry.Status = "registered"
+			}
+			if result.Registry.Status != "registered" {
+				result.Mutations = append(result.Mutations, Mutation{Name: "project registry", Action: result.Registry.Status, Path: result.Registry.DatabasePath, Status: result.Registry.Status})
+			}
+		}
+	}
+	for _, dir := range result.RuntimeDirs {
+		if dir.Status != "exists" {
+			result.Mutations = append(result.Mutations, Mutation{Name: "runtime directory", Action: "create", Path: dir.Path, Status: "created"})
+		}
+	}
+	result.Blocked = nil
+	if len(result.Mutations) == 0 {
+		result.Outcome = OutcomeAlreadyConfigured
+	} else {
+		result.Outcome = OutcomeCreated
 	}
 	return result, nil
 }
@@ -206,6 +474,261 @@ func writeFile(fsys FileSystem, path string, data []byte, force bool) (FileResul
 		return FileResult{}, fmt.Errorf("write %s: %w", path, err)
 	}
 	return FileResult{Path: filepath.Base(path), Status: FileCreated}, nil
+}
+
+func planFile(fsys FileSystem, path string, force bool) (FileResult, error) {
+	info, err := fsys.Stat(path)
+	if err == nil {
+		if info.IsDir() {
+			return FileResult{}, fmt.Errorf("%s is a directory", path)
+		}
+		if force {
+			return FileResult{Path: filepath.Base(path), Status: FileOverwritten}, nil
+		}
+		return FileResult{Path: filepath.Base(path), Status: FileExists}, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, os.ErrNotExist) {
+		return FileResult{}, fmt.Errorf("stat %s: %w", path, err)
+	}
+	return FileResult{Path: filepath.Base(path), Status: FileCreated}, nil
+}
+
+func addFileMutation(result *Result, file FileResult) {
+	switch file.Status {
+	case FileCreated, FileOverwritten:
+		result.Mutations = append(result.Mutations, Mutation{Name: "repository file", Action: string(file.Status), Path: file.Path, Status: string(file.Status)})
+	}
+}
+
+func planLabels(ctx context.Context, repoPath string, runner GitHubRunner) ([]LabelResult, []string) {
+	output, err := runner.Run(ctx, repoPath, "label", "list", "--limit", strconv.Itoa(lcdefaults.GitHubListLimit), "--json", "name")
+	if err != nil {
+		return nil, []string{"gh label setup skipped: " + commandError(err, output)}
+	}
+
+	var labels []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(output, &labels); err != nil {
+		return nil, []string{fmt.Sprintf("gh label setup skipped: parse label list: %v", err)}
+	}
+
+	existing := make(map[string]bool, len(labels))
+	for _, label := range labels {
+		if strings.TrimSpace(label.Name) != "" {
+			existing[label.Name] = true
+		}
+	}
+
+	results := make([]LabelResult, 0, len(defaultLabels))
+	for _, label := range defaultLabels {
+		if existing[label.Name] {
+			results = append(results, LabelResult{Name: label.Name, Status: LabelExists})
+			continue
+		}
+		results = append(results, LabelResult{Name: label.Name, Status: LabelCreated})
+	}
+	return results, nil
+}
+
+func planLocalState(ctx context.Context, repoPath string) (*LocalStateResult, *Mutation, error) {
+	excludePath, err := gitlocal.ResolveExcludePath(ctx, repoPath, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	current, err := os.ReadFile(excludePath)
+	status := gitlocal.ProtectUpdated
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("read git exclude %s: %w", excludePath, err)
+		}
+		status = gitlocal.ProtectCreated
+	}
+	result := &LocalStateResult{Path: excludePath, Status: status}
+	if gitlocal.ExcludesLoopcoderState(current) {
+		result.Status = gitlocal.ProtectUnchanged
+		return result, nil, nil
+	}
+	return result, &Mutation{Name: "local-state exclude", Action: string(status), Path: excludePath, Status: string(status)}, nil
+}
+
+func dirtyStatus(ctx context.Context, repoPath string, runGit func(context.Context, string, ...string) (string, error)) (DirtyResult, error) {
+	out, err := runGit(ctx, repoPath, "status", "--porcelain")
+	if err != nil {
+		return DirtyResult{}, err
+	}
+	out = strings.TrimRight(out, "\r\n")
+	return DirtyResult{Dirty: strings.TrimSpace(out) != "", Porcelain: out}, nil
+}
+
+func planRegistry(ctx context.Context, opts Options, deps Deps, project registry.Project) (RegistryResult, []registry.Project, error) {
+	dbPath, err := setupDatabasePath(deps)
+	if err != nil {
+		return RegistryResult{}, nil, err
+	}
+	result := RegistryResult{DatabasePath: dbPath, Status: "create", ProjectID: project.ProjectID}
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return result, nil, nil
+		}
+		return RegistryResult{}, nil, fmt.Errorf("inspect project registry database: %w", err)
+	}
+	health, err := storage.CheckHealth(ctx, dbPath)
+	if err != nil {
+		return RegistryResult{}, nil, err
+	}
+	if !health.OK {
+		return RegistryResult{}, nil, fmt.Errorf("project registry database is not healthy: %s", health.Message)
+	}
+	registered, detached, conflicts, err := inspectRegistryRows(ctx, dbPath, project)
+	if err != nil {
+		return RegistryResult{}, nil, err
+	}
+	switch {
+	case registered && !detached:
+		result.Status = "registered"
+	case registered && detached:
+		result.Status = "reactivate"
+	default:
+		result.Status = "create"
+	}
+	if registered && !detached {
+		result.ProjectID = project.ProjectID
+	}
+	return result, conflicts, nil
+}
+
+func setupDatabasePath(deps Deps) (string, error) {
+	layout, err := home.Resolve(home.Deps{Getenv: deps.Getenv, UserHomeDir: deps.UserHomeDir})
+	if err != nil {
+		return "", err
+	}
+	return layout.DatabasePath(), nil
+}
+
+func inspectRegistryRows(ctx context.Context, dbPath string, project registry.Project) (registered bool, detached bool, conflicts []registry.Project, err error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return false, false, nil, fmt.Errorf("open project registry read-only: %w", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return false, false, nil, fmt.Errorf("enable project registry read-only mode: %w", err)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT id, display_name, local_path, local_path_canonical, git_root, identity_source, detached_at FROM projects ORDER BY id`)
+	if err != nil {
+		return false, false, nil, fmt.Errorf("inspect project registry rows: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row registry.Project
+		var source string
+		if err := rows.Scan(&row.ProjectID, &row.DisplayName, &row.LocalPath, &row.LocalPathCanonical, &row.GitRoot, &source, &row.DetachedAt); err != nil {
+			return false, false, nil, err
+		}
+		row.IdentitySource = registry.IdentitySource(source)
+		if row.ProjectID == project.ProjectID {
+			registered = true
+			detached = strings.TrimSpace(row.DetachedAt) != ""
+		}
+		if row.ProjectID != project.ProjectID && sameCanonicalPath(row, project.LocalPathCanonical) {
+			conflicts = append(conflicts, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, false, nil, err
+	}
+	return registered, detached, conflicts, nil
+}
+
+func sameCanonicalPath(project registry.Project, canonical string) bool {
+	canonical = strings.TrimSpace(canonical)
+	if canonical == "" {
+		return false
+	}
+	for _, value := range []string{project.LocalPathCanonical, project.GitRoot, project.LocalPath} {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if identity, err := pathid.Identity(value); err == nil && identity == canonical {
+			return true
+		}
+		if filepath.Clean(value) == canonical {
+			return true
+		}
+	}
+	return false
+}
+
+func planRuntimeDirs(opts Options, deps Deps, projectID string) []RuntimeDirResult {
+	layout, err := home.Resolve(home.Deps{Getenv: deps.Getenv, UserHomeDir: deps.UserHomeDir})
+	if err != nil || strings.TrimSpace(projectID) == "" {
+		return nil
+	}
+	paths := []string{
+		filepath.Join(layout.ProjectDir(projectID), "runs"),
+		filepath.Join(layout.ProjectDir(projectID), "relay"),
+		filepath.Join(layout.ProjectDir(projectID), "recovery"),
+		filepath.Join(layout.ProjectDir(projectID), "audit"),
+		layout.LogsDir(),
+		layout.TmpDir(),
+	}
+	out := make([]RuntimeDirResult, 0, len(paths))
+	for _, path := range paths {
+		status := "create"
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			status = "exists"
+		}
+		out = append(out, RuntimeDirResult{Path: path, Status: status})
+	}
+	return out
+}
+
+func ensureRuntimeDirs(dirs []RuntimeDirResult) error {
+	for _, dir := range dirs {
+		if strings.TrimSpace(dir.Path) == "" || dir.Status == "exists" {
+			continue
+		}
+		if err := os.MkdirAll(dir.Path, 0o700); err != nil {
+			return fmt.Errorf("%s: %w", dir.Path, err)
+		}
+	}
+	return nil
+}
+
+func block(result Result, code string, err error) (Result, error) {
+	result.Outcome = OutcomeBlocked
+	result.Applied = false
+	result.Blocked = &BlockedResult{Code: code, Message: err.Error()}
+	return result, &BlockedError{Code: code, Err: err}
+}
+
+func appendWarningsUnique(existing []string, warnings ...string) []string {
+	seen := make(map[string]bool, len(existing)+len(warnings))
+	for _, warning := range existing {
+		seen[warning] = true
+	}
+	for _, warning := range warnings {
+		if strings.TrimSpace(warning) == "" || seen[warning] {
+			continue
+		}
+		existing = append(existing, warning)
+		seen[warning] = true
+	}
+	return existing
+}
+
+func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := cmd.Run()
+	return output.String(), err
 }
 
 func DeliveryTemplate(opts Options) string {
