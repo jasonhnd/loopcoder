@@ -1,5 +1,11 @@
 package storage
 
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
 var availabilitySchemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS availability_observations (
 		availability_observation_id TEXT PRIMARY KEY,
@@ -59,4 +65,68 @@ var availabilitySchemaStatements = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_circuit_breakers_scope_state ON circuit_breakers(scope_key, state)`,
 	`CREATE INDEX IF NOT EXISTS idx_circuit_breakers_adapter_kind ON circuit_breakers(adapter_id, breaker_kind, state)`,
+}
+
+var circuitBreakerRecoveryColumns = []struct {
+	name string
+	def  string
+}{
+	{name: "opened_at", def: "TEXT NOT NULL DEFAULT ''"},
+	{name: "half_open_probe_budget", def: "INTEGER NOT NULL DEFAULT 0"},
+	{name: "half_open_probe_count", def: "INTEGER NOT NULL DEFAULT 0"},
+	{name: "failure_count", def: "INTEGER NOT NULL DEFAULT 0"},
+	{name: "success_count", def: "INTEGER NOT NULL DEFAULT 0"},
+	{name: "last_observation_at", def: "TEXT NOT NULL DEFAULT ''"},
+	{name: "probe_lease_owner", def: "TEXT NOT NULL DEFAULT ''"},
+	{name: "probe_lease_expires_at", def: "TEXT NOT NULL DEFAULT ''"},
+	{name: "probe_lease_generation", def: "INTEGER NOT NULL DEFAULT 0"},
+}
+
+func migrateCircuitBreakerRecovery(ctx context.Context, tx *sql.Tx) error {
+	cols, err := tableColumns(ctx, tx, "circuit_breakers")
+	if err != nil {
+		return err
+	}
+	for _, col := range circuitBreakerRecoveryColumns {
+		if cols[col.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE circuit_breakers ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+			return fmt.Errorf("add circuit_breakers.%s: %w", col.name, err)
+		}
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_circuit_breakers_open_until ON circuit_breakers(state, open_until)`,
+		`CREATE INDEX IF NOT EXISTS idx_circuit_breakers_probe_lease ON circuit_breakers(probe_lease_expires_at, probe_lease_owner)`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cols, nil
 }

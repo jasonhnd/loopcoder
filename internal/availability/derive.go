@@ -18,11 +18,14 @@ func Derive(inputs Inputs) Result {
 	observations = append(observations, deriveInventoryObservations(inputs.Inventory, now)...)
 	observations = dedupeObservations(observations)
 	sortObservations(observations)
+	breakers := deriveCircuitBreakers(inputs.CircuitBreakers, observations, policy, now)
+	scoringInputs := inputs
+	scoringInputs.CircuitBreakers = breakers
 
 	scopes := scoreScopes(inputs.Inventory, inputs.BudgetSummaries)
 	scores := make([]Score, 0, len(scopes))
 	for _, scope := range scopes {
-		score := scoreScope(scope, inputs, observations, policy, now)
+		score := scoreScope(scope, scoringInputs, observations, policy, now)
 		scores = append(scores, score)
 	}
 	sort.Slice(scores, func(i, j int) bool {
@@ -31,8 +34,6 @@ func Derive(inputs Inputs) Result {
 		}
 		return scores[i].ScopeKey < scores[j].ScopeKey
 	})
-	breakers := append([]CircuitBreaker(nil), inputs.CircuitBreakers...)
-	sort.Slice(breakers, func(i, j int) bool { return breakers[i].CircuitBreakerID < breakers[j].CircuitBreakerID })
 	return Result{Observations: observations, Scores: scores, CircuitBreakers: breakers}
 }
 

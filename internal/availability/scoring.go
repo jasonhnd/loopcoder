@@ -86,7 +86,7 @@ func scoreScope(scope Scope, inputs Inputs, observations []Observation, policy P
 	}
 	for _, breaker := range relevantBreakers {
 		evidence = append(evidence, breaker.CircuitBreakerID)
-		if breaker.State == BreakerOpen {
+		if breaker.State == BreakerOpen || breaker.State == BreakerHalfOpen {
 			hard = append(hard, ReasonOpenBreaker, breaker.StateReason)
 		}
 	}
@@ -282,12 +282,12 @@ func scoreQuota(scope Scope, snapshots []providerinventory.QuotaSnapshot, budget
 func scoreRateLimit(observations []Observation, breakers []CircuitBreaker) Component {
 	component := Component{Name: "rate_limit", MaxScore: 15, Score: 15, Confidence: providerinventory.ConfidenceEstimated, FreshnessState: providerinventory.FreshnessFresh, Explanation: "no active rate-limit evidence"}
 	for _, breaker := range breakers {
-		if breaker.BreakerKind == BreakerRateLimit && breaker.State == BreakerOpen {
+		if breaker.BreakerKind == BreakerRateLimit && (breaker.State == BreakerOpen || breaker.State == BreakerHalfOpen) {
 			component.Score = 0
 			component.Hard = true
 			component.ReasonCodes = []ReasonCode{ReasonRateLimited429, ReasonOpenBreaker}
 			component.EvidenceRecordIDs = append(component.EvidenceRecordIDs, breaker.CircuitBreakerID)
-			component.Explanation = "rate-limit breaker is open"
+			component.Explanation = "rate-limit breaker blocks normal launch"
 			return component
 		}
 	}

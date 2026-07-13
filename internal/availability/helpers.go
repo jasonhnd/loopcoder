@@ -89,6 +89,24 @@ func knownObservationKind(kind ObservationKind) bool {
 	}
 }
 
+func knownBreakerKind(kind BreakerKind) bool {
+	switch kind {
+	case BreakerQuota, BreakerRateLimit, BreakerAuth, BreakerHealth, BreakerModel, BreakerTransport:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownBreakerState(state BreakerState) bool {
+	switch state {
+	case BreakerClosed, BreakerOpen, BreakerHalfOpen:
+		return true
+	default:
+		return false
+	}
+}
+
 func containsReason(values []string, reason ReasonCode) bool {
 	for _, value := range values {
 		if NormalizeReasonCode(value) == reason {
