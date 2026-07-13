@@ -4,17 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 const (
@@ -26,11 +22,12 @@ const (
 )
 
 var (
-	ErrClaudeQuotaGrantRequired = errors.New("ErrQuotaCollectionGrantRequired")
-	ErrClaudeQuotaUnsupported   = errors.New("ErrUnsupportedVersion")
-	ErrClaudeQuotaMalformed     = errors.New("ErrClaudeQuotaMalformedSurface")
-	ErrClaudeQuotaTimeout       = errors.New("ErrClaudeQuotaTimeout")
-	ErrClaudeQuotaTruncated     = errors.New("ErrClaudeQuotaOutputTruncated")
+	ErrClaudeQuotaGrantRequired  = errors.New("ErrQuotaCollectionGrantRequired")
+	ErrClaudeQuotaUnsupported    = errors.New("ErrUnsupportedVersion")
+	ErrClaudeQuotaMalformed      = errors.New("ErrClaudeQuotaMalformedSurface")
+	ErrClaudeQuotaTimeout        = errors.New("ErrClaudeQuotaTimeout")
+	ErrClaudeQuotaTruncated      = errors.New("ErrClaudeQuotaOutputTruncated")
+	ErrClaudeQuotaPTYUnsupported = errors.New("ErrClaudeQuotaPTYUnsupported")
 
 	ansiPattern              = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 	claudeUsageHeaderPattern = regexp.MustCompile(`(?i)\b(claude\s+code\s+)?usage\b`)
@@ -142,6 +139,12 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	probe.TimedOut = result.TimedOut
 	probe.Killed = result.Killed
 	probe.ExitCode = &result.ExitCode
+	if result.Truncated {
+		return unavailable("quota-output-truncated", "ErrClaudeQuotaOutputTruncated")
+	}
+	if errors.Is(runErr, ErrClaudeQuotaPTYUnsupported) {
+		return unavailable("quota-pty-unavailable", "ErrClaudeQuotaPTYUnsupported")
+	}
 	if runErr != nil || result.TimedOut || result.Killed {
 		if result.TimedOut {
 			return unavailable("quota-probe-timeout", "ErrClaudeQuotaTimeout")
@@ -150,9 +153,6 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	}
 	if result.ExitCode != 0 {
 		return unavailable("quota-probe-nonzero-exit", "ErrClaudeQuotaNonZeroExit")
-	}
-	if result.Truncated {
-		return unavailable("quota-output-truncated", "ErrClaudeQuotaOutputTruncated")
 	}
 	if credentialMaterialLike(result.Output) || credentialMaterialLike(result.Stderr) {
 		return unavailable("credential-material-redacted", "ErrQuotaCredentialMaterial")
@@ -307,50 +307,6 @@ func claudeQuotaEnvironment(getenv func(string) string, root string) []string {
 		}
 	}
 	return env
-}
-
-func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResult, error) {
-	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
-		return ClaudePTYResult{ExitCode: -1}, errors.New("claude pty argv is empty")
-	}
-	budget := newOutputBudget(req.CombinedLimitBytes)
-	output := newBoundedBuffer(req.StdoutLimitBytes, budget)
-	stderr := newBoundedBuffer(req.StderrLimitBytes, budget)
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
-	cmd.Dir = req.Cwd
-	cmd.Env = append([]string{}, req.Env...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return ClaudePTYResult{ExitCode: -1}, err
-	}
-	cmd.Stdout = output
-	cmd.Stderr = stderr
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		_, _ = io.WriteString(stdin, req.Input)
-		_ = stdin.Close()
-	}()
-	supervision, runErr := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "claude-quota-pty"})
-	exitCode := supervision.ExitCode
-	if (runErr != nil || supervision.Outcome == supervisedexec.OutcomeDeadline || supervision.Killed) && exitCode == 0 {
-		exitCode = -1
-	}
-	out := ClaudePTYResult{
-		Output:    output.String(),
-		Stderr:    stderr.String(),
-		ExitCode:  exitCode,
-		TimedOut:  supervision.Outcome == supervisedexec.OutcomeDeadline,
-		Killed:    supervision.Killed,
-		Truncated: output.Truncated() || stderr.Truncated(),
-	}
-	if out.Truncated && out.Stderr != "" {
-		out.Stderr += "\n"
-	}
-	if out.Truncated {
-		out.Stderr += "[loopcoder] claude usage PTY output truncated"
-	}
-	return out, runErr
 }
 
 func parseClaudeUsageSurface(output, cliVersion, locale string, width int, now time.Time) (claudeQuotaSurface, error) {
