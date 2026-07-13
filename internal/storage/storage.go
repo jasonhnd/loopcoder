@@ -464,6 +464,8 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			sourceExistedBeforeOpen = false
+		} else {
+			return nil, fmt.Errorf("open storage: inspect source database %s: %w", path, err)
 		}
 	}
 

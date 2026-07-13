@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 )
@@ -22,15 +21,20 @@ type deliveryMigrationBackup struct {
 }
 
 func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationBackup, error) {
+	return prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt, deliveryV10SourceExists)
+}
+
+func prepareDeliveryV10BackupWithSourceProbe(sourcePath, createdAt string, sourceExists func(string) (bool, error)) (*deliveryMigrationBackup, error) {
 	sourcePath = filepath.Clean(sourcePath)
 	if sourcePath == "." || sourcePath == "" {
 		return prepareDeliveryV10NoSourceMetadata("", createdAt), nil
 	}
-	if _, err := os.Stat(sourcePath); err != nil {
-		if os.IsNotExist(err) {
-			return prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt), nil
-		}
+	exists, err := sourceExists(sourcePath)
+	if err != nil {
 		return nil, fmt.Errorf("inspect delivery v10 backup source: %w", err)
+	}
+	if !exists {
+		return prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt), nil
 	}
 	sourceHash, err := fileSHA256(sourcePath)
 	if err != nil {
@@ -54,6 +58,16 @@ func prepareDeliveryV10Backup(sourcePath, createdAt string) (*deliveryMigrationB
 		CreatedAt:                createdAt,
 		MigrationPlanFingerprint: "sha256:" + hashStringsStorage("loopcoder.delivery.migration.v1", "9", "10"),
 	}, nil
+}
+
+func deliveryV10SourceExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func prepareDeliveryV10NoSourceMetadata(sourcePath, createdAt string) *deliveryMigrationBackup {
@@ -491,49 +505,23 @@ var deliveryContractSchemaStatements = []string{
 }
 
 func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	sum := sha256.New()
-	if _, err := io.Copy(sum, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(sum.Sum(nil)), nil
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	in, err := os.Open(src)
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil
-		}
-		return err
-	}
-	removeOnError := true
-	defer func() {
-		if removeOnError {
-			_ = os.Remove(dst)
-		}
-	}()
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	removeOnError = false
-	return nil
+	return os.WriteFile(dst, data, 0o600)
 }
 
 func hashStringsStorage(parts ...string) string {

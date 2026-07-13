@@ -97,23 +97,27 @@ func TestOpenFreshDatabaseRecordsNoSourceMigrationMetadataIdempotently(t *testin
 }
 
 func TestPrepareDeliveryV10BackupTreatsMissingPathFixturesAsNoSource(t *testing.T) {
-	base := t.TempDir()
 	tests := []struct {
 		name string
 		path string
 	}{
-		{name: "macos", path: filepath.Join(base, "Users", "example", "Library", "Application Support", "loopcoder", "data", "loopcoder.db")},
-		{name: "linux", path: filepath.Join(base, "home", "example", ".loopcoder", "data", "loopcoder.db")},
-		{name: "windows", path: filepath.Join(base, `C:\Users\example\.loopcoder\data\loopcoder.db`)},
+		{name: "macos", path: "/Users/example/Library/Application Support/loopcoder/data/loopcoder.db"},
+		{name: "linux", path: "/home/example/.loopcoder/data/loopcoder.db"},
+		{name: "windows-drive", path: `C:\Users\example\.loopcoder\data\loopcoder.db`},
+		{name: "windows-unc", path: `\\server\share\loopcoder\data\loopcoder.db`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := os.Stat(tt.path); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("fixture path stat error = %v, want not exist", err)
-			}
-			backup, err := prepareDeliveryV10Backup(tt.path, formatTimestamp(fixedNow()))
+			var probedPath string
+			backup, err := prepareDeliveryV10BackupWithSourceProbe(tt.path, formatTimestamp(fixedNow()), func(path string) (bool, error) {
+				probedPath = path
+				return false, nil
+			})
 			if err != nil {
 				t.Fatalf("prepareDeliveryV10Backup returned error: %v", err)
+			}
+			if probedPath != filepath.Clean(tt.path) {
+				t.Fatalf("source probe path = %q, want cleaned fixture %q", probedPath, filepath.Clean(tt.path))
 			}
 			assertNoSourceDeliveryMigrationBackup(t, deliveryMigrationBackupRow{
 				BackupID:                 backup.BackupID,
@@ -126,6 +130,43 @@ func TestPrepareDeliveryV10BackupTreatsMissingPathFixturesAsNoSource(t *testing.
 				MigrationPlanFingerprint: backup.MigrationPlanFingerprint,
 			}, filepath.Clean(tt.path))
 		})
+	}
+}
+
+func TestPrepareDeliveryV10BackupProbeErrorsFailClosed(t *testing.T) {
+	probeErr := errors.New("permission denied")
+	_, err := prepareDeliveryV10BackupWithSourceProbe(filepath.Join(t.TempDir(), "loopcoder.db"), formatTimestamp(fixedNow()), func(string) (bool, error) {
+		return false, probeErr
+	})
+	if !errors.Is(err, probeErr) || !strings.Contains(err.Error(), "inspect delivery v10 backup source") {
+		t.Fatalf("prepareDeliveryV10Backup error = %v, want visible source probe error", err)
+	}
+}
+
+func TestDeliveryV10CopyFilePreservesExistingOverwriteSemantics(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.db")
+	dst := filepath.Join(dir, "backups", "source.db")
+	want := []byte("current source bytes")
+	if err := os.WriteFile(src, want, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatalf("mkdir backup dir: %v", err)
+	}
+	if err := os.WriteFile(dst, []byte("stale backup bytes"), 0o600); err != nil {
+		t.Fatalf("write stale backup: %v", err)
+	}
+
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile returned error: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("backup bytes = %q, want overwritten source bytes %q", got, want)
 	}
 }
 
@@ -318,6 +359,57 @@ func TestOpenMigratesExistingEmptyDatabase(t *testing.T) {
 	if !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want migrated schema %d", health, CurrentSchemaVersion)
 	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM delivery_migration_backups`, 0)
+}
+
+func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV9NestedClaimLifecycleSchema(t, raw)
+	closeRawDB(t, raw)
+	sourceHash, err := fileSHA256(path)
+	if err != nil {
+		t.Fatalf("hash source before migration: %v", err)
+	}
+	sourceBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read source before migration: %v", err)
+	}
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	first := readOnlyDeliveryMigrationBackup(t, ctx, store)
+	wantBackupPath := filepath.Join(filepath.Dir(path), "backups", "schema-v9-"+sourceHash[:16]+".db")
+	if first.BackupID == "" || !strings.HasPrefix(first.BackupID, "backup_") {
+		t.Fatalf("backup_id = %q, want real backup prefix", first.BackupID)
+	}
+	if first.SourceDBPath != filepath.Clean(path) || first.SourceSchemaVersion != 9 || first.SourceDBHash != sourceHash || first.BackupPath != wantBackupPath {
+		t.Fatalf("backup metadata = %#v, want real v9 source metadata with backup path %q and hash %q", first, wantBackupPath, sourceHash)
+	}
+	backupBytes, err := os.ReadFile(wantBackupPath)
+	if err != nil {
+		t.Fatalf("read backup image: %v", err)
+	}
+	if string(backupBytes) != string(sourceBytes) {
+		t.Fatal("backup image bytes differ from pre-migration source database")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close first store: %v", err)
+	}
+
+	reopened, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("reopen returned error: %v", err)
+	}
+	defer reopened.Close()
+	second := readOnlyDeliveryMigrationBackup(t, ctx, reopened)
+	if second != first {
+		t.Fatalf("backup metadata changed after reopen:\nfirst:  %#v\nsecond: %#v", first, second)
+	}
+	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
 }
 
 func TestOpenMigratesProjectIdentityColumns(t *testing.T) {
@@ -1350,6 +1442,32 @@ func createV8NestedClaimsSchema(t *testing.T, db *sql.DB) {
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("exec v8 fixture statement: %v\n%s", err, statement)
+		}
+	}
+}
+
+func createV9NestedClaimLifecycleSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	createV8NestedClaimsSchema(t, db)
+	for _, statement := range []string{
+		`ALTER TABLE run_claims ADD COLUMN phase TEXT NOT NULL DEFAULT 'claimed'`,
+		`ALTER TABLE run_claims ADD COLUMN provider_idempotency_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE run_claims ADD COLUMN provider_receipt TEXT NOT NULL DEFAULT ''`,
+		`UPDATE run_claims
+			SET phase = CASE
+				WHEN EXISTS (
+					SELECT 1 FROM runs r
+					WHERE r.id = run_claims.run_id
+						AND LOWER(TRIM(COALESCE(r.status, ''))) IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked')
+				) THEN 'completed'
+				ELSE 'executing'
+			END
+			WHERE phase = '' OR phase = 'claimed'`,
+		`INSERT INTO migrations(version, name, applied_at) VALUES (9, 'nested child claim lifecycle phase', '2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("exec v9 fixture statement: %v\n%s", err, statement)
 		}
 	}
 }
