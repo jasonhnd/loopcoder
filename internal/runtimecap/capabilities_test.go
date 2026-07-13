@@ -85,6 +85,7 @@ func TestDefaultContractDeclaresCredentialBlindAuthReadiness(t *testing.T) {
 			provider: "grok",
 			command:  []string{"grok", "models"},
 			parser:   "grok-models",
+			network:  true,
 			envNames: []string{"XAI_API_KEY"},
 		},
 	}
@@ -131,8 +132,8 @@ func TestDefaultContractDeclaresCatalogProbeProvenance(t *testing.T) {
 	if !reflect.DeepEqual(grok.CatalogProbeCommand, []string{"grok", "models"}) {
 		t.Fatalf("CatalogProbeCommand = %#v, want grok models", grok.CatalogProbeCommand)
 	}
-	if grok.CatalogProbeParser != "grok-models" || grok.CatalogProbeMayNetwork {
-		t.Fatalf("grok catalog probe declaration = %#v, want grok-models without declared network", grok)
+	if grok.CatalogProbeParser != "grok-models" || !grok.CatalogProbeMayNetwork {
+		t.Fatalf("grok catalog probe declaration = %#v, want grok-models with declared network", grok)
 	}
 }
 

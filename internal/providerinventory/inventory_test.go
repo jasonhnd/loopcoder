@@ -882,7 +882,7 @@ func TestAuthReadinessExpiredRefreshLoadRoundTrip(t *testing.T) {
 	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
 		return ProbeExecutionResult{Stdout: "profile alice expired refresh required\n", ExitCode: 0}, nil
 	}
-	profiles, readiness, authProbe := inspectAuthReadiness(ctx, adapter, candidate{path: exe, source: DiscoveryPath}, installation.ProviderInstallationID, fixedInventoryNow(), deps)
+	profiles, readiness, authProbe := inspectAuthReadiness(ctx, nil, adapter, candidate{path: exe, source: DiscoveryPath}, installation.ProviderInstallationID, fixedInventoryNow(), deps)
 	report.AccountProfiles = profiles
 	report.AuthReadiness = readiness
 	report.ProbeResults = append(report.ProbeResults, *authProbe)
@@ -920,7 +920,7 @@ func TestAuthProbeTimeoutYieldsUnknownReadiness(t *testing.T) {
 		return ProbeExecutionResult{ExitCode: -1, TimedOut: true, Killed: true}, nil
 	}
 	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", ExecutableNames: []string{"custom"}, AuthProbeCommand: []string{"custom", "auth", "status"}}
-	_, readiness, probe := inspectAuthReadiness(context.Background(), adapter, candidate{path: exe, source: DiscoveryPath}, "pinst_custom", fixedInventoryNow(), deps)
+	_, readiness, probe := inspectAuthReadiness(context.Background(), nil, adapter, candidate{path: exe, source: DiscoveryPath}, "pinst_custom", fixedInventoryNow(), deps)
 	if probe == nil || !probe.TimedOut || probe.TerminalErrorCode != "ErrAuthProbeTimeout" {
 		t.Fatalf("auth probe = %#v, want timeout terminal error", probe)
 	}
@@ -935,7 +935,7 @@ func TestInaccessibleAuthArtifactYieldsTypedUnknown(t *testing.T) {
 		return nil, os.ErrPermission
 	}
 	adapter := AdapterDeclaration{AdapterID: "custom", DisplayName: "custom", AuthArtifactPaths: []string{filepath.Join(t.TempDir(), "auth.json")}}
-	_, readiness, _ := inspectAuthReadiness(context.Background(), adapter, candidate{}, "pinst_custom", fixedInventoryNow(), deps)
+	_, readiness, _ := inspectAuthReadiness(context.Background(), nil, adapter, candidate{}, "pinst_custom", fixedInventoryNow(), deps)
 	if len(readiness) != 1 {
 		t.Fatalf("readiness count = %d, want 1", len(readiness))
 	}

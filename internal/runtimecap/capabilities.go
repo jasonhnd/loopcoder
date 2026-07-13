@@ -653,11 +653,13 @@ var staticContract = Contract{
 				"models",
 			},
 			AuthProbeParser: "grok-models",
+			MayNetwork:      true,
 			CatalogProbeCommand: []string{
 				"grok",
 				"models",
 			},
-			CatalogProbeParser: "grok-models",
+			CatalogProbeParser:     "grok-models",
+			CatalogProbeMayNetwork: true,
 			AuthEnvironmentNames: []string{
 				"XAI_API_KEY",
 			},

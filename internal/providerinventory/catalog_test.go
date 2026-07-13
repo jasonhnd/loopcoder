@@ -198,6 +198,67 @@ func TestNetworkDeclaredCatalogListingSkippedByDefault(t *testing.T) {
 	}
 }
 
+func TestDiscoverGrokBuildDefaultNetworkDeniedDoesNotRunModels(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	modelsCalls := 0
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			modelsCalls++
+			t.Fatal("grok models ran without explicit network grant")
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{ExitCode: 2}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if modelsCalls != 0 {
+		t.Fatalf("grok models calls = %d, want zero", modelsCalls)
+	}
+	authProbe := findProbe(t, report, "grok", "auth-readiness")
+	if !authProbe.NetworkDeclared || authProbe.NetworkPermission != NetworkDenied || authProbe.TerminalErrorCode != "ErrNetworkPermissionDenied" || !contains(authProbe.GapReasons, "network-permission-denied") {
+		t.Fatalf("auth probe = %#v, want network denied", authProbe)
+	}
+	readiness := latestAuthReadinessFor(t, report, "grok")
+	if readiness.ReadinessState != ReadinessUnknown || readiness.Confidence != ConfidenceUnknown || readiness.TerminalErrorCode != "ErrNetworkPermissionDenied" || !contains(readiness.GapReasons, "network-permission-denied") {
+		t.Fatalf("readiness = %#v, want unknown network denied", readiness)
+	}
+	catalogProbe := findProbe(t, report, "grok", "catalog")
+	if !catalogProbe.NetworkDeclared || catalogProbe.NetworkPermission != NetworkDenied || catalogProbe.Confidence != ConfidenceUnavailable || catalogProbe.TerminalErrorCode != "ErrNetworkPermissionDenied" || !contains(catalogProbe.GapReasons, "network-permission-denied") {
+		t.Fatalf("catalog probe = %#v, want unavailable network denied", catalogProbe)
+	}
+	foundDeniedCatalog := false
+	for _, snapshot := range report.ModelCatalogSnapshots {
+		if snapshot.AdapterID == "grok" && snapshot.CatalogSourceKind == CatalogSourceProviderMachineReadable && contains(snapshot.GapReasons, "network-permission-denied") {
+			foundDeniedCatalog = true
+			if snapshot.Confidence != ConfidenceUnavailable || snapshot.TerminalErrorCode != "ErrNetworkPermissionDenied" {
+				t.Fatalf("denied catalog snapshot = %#v", snapshot)
+			}
+		}
+	}
+	if !foundDeniedCatalog {
+		t.Fatalf("missing denied provider-machine-readable Grok snapshot in %#v", report.ModelCatalogSnapshots)
+	}
+}
+
 func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, executableName("grok"))
@@ -219,7 +280,8 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 			return ""
 		}
 	}
-	var sawVersion, sawModels bool
+	var sawVersion bool
+	modelsCalls := 0
 	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
 		for _, env := range req.Env {
 			if strings.Contains(env, accessKeyCanary) || strings.Contains(env, unrelatedCanary) || strings.Contains(env, "XAI_API_KEY") || strings.Contains(env, "UNRELATED_SECRET_VALUE") {
@@ -237,7 +299,7 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 			sawVersion = true
 			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
 		case len(req.Argv) == 2 && req.Argv[1] == "models":
-			sawModels = true
+			modelsCalls++
 			return ProbeExecutionResult{
 				Stdout:   `{"models":[{"id":"grok-4.5","name":"Grok 4.5","aliases":["grok-build","default"]},{"id":"openai-main/gpt-5.4","name":"GPT 5.4","alias":"tfy-gpt","provider":"openai","base_url":"https://gateway.example.test/v1","custom":true}]}`,
 				Stderr:   tokenCanary,
@@ -250,14 +312,15 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 	}
 
 	report, err := Discover(context.Background(), Options{
-		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
-		Now:    fixedInventoryNow,
+		Config:        config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:           fixedInventoryNow,
+		NetworkGrants: []NetworkGrant{{ProviderID: "grok", Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}},
 	}, deps)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
-	if !sawVersion || !sawModels {
-		t.Fatalf("probe coverage version=%v models=%v", sawVersion, sawModels)
+	if !sawVersion || modelsCalls != 1 {
+		t.Fatalf("probe coverage version=%v modelsCalls=%d, want one shared grok models call", sawVersion, modelsCalls)
 	}
 	installation := installationForAdapter(t, report, "grok")
 	if installation.InstallationState != InstallationInstalled || installation.Version != "grok 0.1.211" {
@@ -266,6 +329,10 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 	readiness := latestAuthReadinessFor(t, report, "grok")
 	if readiness.ReadinessState != ReadinessReady || readiness.EvidenceKind != EvidenceStatusCommand || !contains(readiness.GapReasons, "authorization-scope-unknown") {
 		t.Fatalf("grok readiness = %#v", readiness)
+	}
+	authProbe := findProbe(t, report, "grok", "auth-readiness")
+	if !authProbe.NetworkDeclared || authProbe.NetworkPermission != NetworkGranted {
+		t.Fatalf("auth probe network = %#v, want granted declared network", authProbe)
 	}
 	xai := capabilityForAdapterModel(t, report, "grok", "grok-4.5")
 	if len(xai.Aliases) != 2 || xai.EntrySources[0].SourceReference != "grok-models:xai" {
@@ -276,7 +343,7 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 		t.Fatalf("custom capability attribution = %#v", custom)
 	}
 	catalogProbe := findProbe(t, report, "grok", "catalog")
-	if catalogProbe.Outcome != OutcomeInstalled || catalogProbe.ParsedFields["model_count"] != "2" || catalogProbe.SecretFindingCount == 0 {
+	if catalogProbe.Outcome != OutcomeInstalled || catalogProbe.NetworkPermission != NetworkGranted || catalogProbe.ParsedFields["model_count"] != "2" || catalogProbe.SecretFindingCount == 0 {
 		t.Fatalf("catalog probe = %#v", catalogProbe)
 	}
 	payload, err := json.Marshal(report)
@@ -287,6 +354,27 @@ func TestDiscoverGrokBuildDynamicCatalogAuthAndSecretBoundaries(t *testing.T) {
 		if strings.Contains(string(payload), forbidden) {
 			t.Fatalf("provider inventory persisted secret canary %q in %s", forbidden, payload)
 		}
+	}
+
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedInventoryNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	if err := Refresh(context.Background(), store, report, fixedInventoryNow()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	loaded, err := Load(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	loadedCustom := capabilityForAdapterModel(t, loaded, "grok", "openai-main/gpt-5.4")
+	if len(loadedCustom.Aliases) != 1 || loadedCustom.Aliases[0].Alias != "tfy-gpt" || len(loadedCustom.EntrySources) == 0 || loadedCustom.EntrySources[0].SourceReference != "grok-models:custom:openai" || !contains(loadedCustom.Constraints, "provider_attribution=custom-non-xai:openai") {
+		t.Fatalf("loaded custom capability = %#v", loadedCustom)
+	}
+	loadedXAI := capabilityForAdapterModel(t, loaded, "grok", "grok-4.5")
+	if len(loadedXAI.Aliases) != 2 || len(loadedXAI.EntrySources) == 0 || loadedXAI.EntrySources[0].SourceReference != "grok-models:xai" {
+		t.Fatalf("loaded xAI capability = %#v", loadedXAI)
 	}
 }
 
@@ -402,8 +490,9 @@ func TestDiscoverGrokBuildFailureBranches(t *testing.T) {
 				}
 			}
 			report, err := Discover(context.Background(), Options{
-				Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
-				Now:    fixedInventoryNow,
+				Config:        config.Config{Adapters: config.Adapters{Worker: "grok"}},
+				Now:           fixedInventoryNow,
+				NetworkGrants: []NetworkGrant{{ProviderID: "grok", Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}},
 			}, deps)
 			if err != nil {
 				t.Fatalf("Discover: %v", err)

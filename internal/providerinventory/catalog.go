@@ -648,6 +648,11 @@ func confidenceForSources(sources []CatalogEntrySource) Confidence {
 			return ConfidenceEstimated
 		}
 	}
+	for _, source := range sources {
+		if source.Confidence == ConfidenceUnavailable {
+			return ConfidenceUnavailable
+		}
+	}
 	return ConfidenceUnknown
 }
 

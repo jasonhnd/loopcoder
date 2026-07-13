@@ -123,6 +123,26 @@ const (
 	NetworkGranted   NetworkPermission = "granted"
 )
 
+type NetworkPurpose string
+
+const (
+	NetworkPurposeAuthReadiness        NetworkPurpose = "auth-readiness"
+	NetworkPurposeModelCatalog         NetworkPurpose = "model-catalog"
+	NetworkPurposeAuthCatalogInventory NetworkPurpose = "auth-catalog-inventory"
+)
+
+type NetworkScope string
+
+const (
+	NetworkScopeMachineInventory NetworkScope = "machine-provider-inventory"
+)
+
+type NetworkGrant struct {
+	ProviderID string
+	Purpose    NetworkPurpose
+	Scope      NetworkScope
+}
+
 type ProfileSource string
 
 const (
@@ -567,6 +587,7 @@ type Options struct {
 	Config          config.Config
 	RuntimeContract runtimecap.Contract
 	Now             func() time.Time
+	NetworkGrants   []NetworkGrant
 }
 
 type Deps struct {
@@ -597,6 +618,16 @@ type ProbeExecutionResult struct {
 	Killed   bool
 }
 
+type discoveryContext struct {
+	networkGrants map[NetworkGrant]bool
+	probeResults  map[string]cachedProbeResult
+}
+
+type cachedProbeResult struct {
+	result ProbeExecutionResult
+	err    error
+}
+
 func DefaultDeps() Deps {
 	return Deps{
 		Getenv:       os.Getenv,
@@ -608,6 +639,63 @@ func DefaultDeps() Deps {
 		RunProbe:     runProbeCommand,
 		RandomID:     randomProbeID,
 	}
+}
+
+func newDiscoveryContext(opts Options) *discoveryContext {
+	grants := make(map[NetworkGrant]bool, len(opts.NetworkGrants))
+	for _, grant := range opts.NetworkGrants {
+		grant.ProviderID = strings.TrimSpace(grant.ProviderID)
+		if grant.ProviderID == "" || grant.Purpose == "" || grant.Scope == "" {
+			continue
+		}
+		grants[grant] = true
+	}
+	return &discoveryContext{
+		networkGrants: grants,
+		probeResults:  map[string]cachedProbeResult{},
+	}
+}
+
+func networkPermissionFor(discovery *discoveryContext, adapter AdapterDeclaration, purpose NetworkPurpose, declared bool) NetworkPermission {
+	if !declared {
+		return NetworkNotNeeded
+	}
+	if discovery == nil {
+		return NetworkDenied
+	}
+	exact := NetworkGrant{ProviderID: adapter.AdapterID, Purpose: purpose, Scope: NetworkScopeMachineInventory}
+	combined := NetworkGrant{ProviderID: adapter.AdapterID, Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}
+	if discovery.networkGrants[exact] || discovery.networkGrants[combined] {
+		return NetworkGranted
+	}
+	return NetworkDenied
+}
+
+func sharedProbeResult(ctx context.Context, discovery *discoveryContext, deps Deps, exec ProbeExecution) (ProbeExecutionResult, error) {
+	if discovery == nil {
+		return deps.RunProbe(ctx, exec)
+	}
+	key := sharedProbeKey(exec)
+	if cached, ok := discovery.probeResults[key]; ok {
+		return cached.result, cached.err
+	}
+	result, err := deps.RunProbe(ctx, exec)
+	discovery.probeResults[key] = cachedProbeResult{result: result, err: err}
+	return result, err
+}
+
+func sharedProbeKey(exec ProbeExecution) string {
+	env := append([]string(nil), exec.Env...)
+	sort.Strings(env)
+	parts := []string{
+		strings.Join(exec.Argv, "\x00"),
+		strings.Join(env, "\x00"),
+		exec.Timeout.String(),
+		strconv.Itoa(exec.StdoutLimitBytes),
+		strconv.Itoa(exec.StderrLimitBytes),
+		strconv.Itoa(exec.CombinedLimitBytes),
+	}
+	return strings.Join(parts, "\x01")
 }
 
 func EmptyRefs() InventoryRefs {
@@ -635,6 +723,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	if violations := contract.InvariantViolations(); len(violations) > 0 {
 		return Report{}, fmt.Errorf("%w: runtime capability contract: %s", ErrInvalidRecord, strings.Join(violations, "; "))
 	}
+	discovery := newDiscoveryContext(opts)
 	adapters, err := adapterDeclarations(opts.Config, contract)
 	if err != nil {
 		return Report{}, err
@@ -660,10 +749,6 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		}
 		modelCatalogSnapshots = append(modelCatalogSnapshots, snapshot)
 		modelCapabilities = append(modelCapabilities, capabilities...)
-		if adapter.CatalogProbeMayNetwork {
-			probes = append(probes, skippedCatalogProbe(adapter, now, deps))
-			gaps = append(gaps, "provider-"+adapter.AdapterID+"-catalog-network-permission-denied")
-		}
 		found := false
 		candidates := discoverCandidates(adapter, deps)
 		for _, candidate := range candidates {
@@ -672,7 +757,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			installations = append(installations, installation)
 			probes = append(probes, probe)
 			if installation.InstallationState == InstallationInstalled {
-				profiles, readiness, authProbe := inspectAuthReadiness(ctx, adapter, candidate, installation.ProviderInstallationID, now, deps)
+				profiles, readiness, authProbe := inspectAuthReadiness(ctx, discovery, adapter, candidate, installation.ProviderInstallationID, now, deps)
 				accountProfiles = append(accountProfiles, profiles...)
 				authReadiness = append(authReadiness, readiness...)
 				if authProbe != nil {
@@ -684,11 +769,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				readiness.GapReasons = append(readiness.GapReasons, "installation-not-usable")
 				authReadiness = append(authReadiness, readiness)
 			}
-			if len(adapter.CatalogProbeCommand) > 0 && !adapter.CatalogProbeMayNetwork {
-				snapshot, capabilities, catalogProbe := inspectCatalogCommand(ctx, adapter, candidate, installation, now, deps)
+			if len(adapter.CatalogProbeCommand) > 0 {
+				snapshot, capabilities, catalogProbe := inspectCatalogCommand(ctx, discovery, adapter, candidate, installation, now, deps)
 				modelCatalogSnapshots = append(modelCatalogSnapshots, snapshot)
 				modelCapabilities = append(modelCapabilities, capabilities...)
 				probes = append(probes, catalogProbe)
+				if catalogProbe.NetworkDeclared && catalogProbe.NetworkPermission == NetworkDenied {
+					gaps = append(gaps, "provider-"+adapter.AdapterID+"-catalog-network-permission-denied")
+				}
 			}
 		}
 		if !found {
@@ -1258,9 +1346,9 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 	return installation, probe
 }
 
-func inspectAuthReadiness(ctx context.Context, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
+func inspectAuthReadiness(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
 	if len(adapter.AuthProbeCommand) > 0 {
-		return inspectAuthCommand(ctx, adapter, candidate, installationID, now, deps)
+		return inspectAuthCommand(ctx, discovery, adapter, candidate, installationID, now, deps)
 	}
 	if len(adapter.AuthArtifactPaths) > 0 {
 		profiles, readiness, probe := inspectAuthArtifacts(adapter, installationID, now, deps)
@@ -1288,7 +1376,7 @@ func stringSliceContains(values []string, want string) bool {
 	return false
 }
 
-func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
+func inspectAuthCommand(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
 	probe := baseProbe(adapter, now, deps)
 	probe.ProviderInstallationID = &installationID
 	probe.ProbeKind = "auth-readiness"
@@ -1298,10 +1386,7 @@ func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candida
 		probe.ProbeMethod = ProbeMethodMachineJSON
 	}
 	probe.NetworkDeclared = adapter.AuthProbeMayNetwork || adapter.MayNetwork
-	probe.NetworkPermission = NetworkNotNeeded
-	if probe.NetworkDeclared {
-		probe.NetworkPermission = NetworkDenied
-	}
+	probe.NetworkPermission = networkPermissionFor(discovery, adapter, NetworkPurposeAuthReadiness, probe.NetworkDeclared)
 	probe.TimeoutMS = int(AuthProbeTimeout / time.Millisecond)
 	probe.StaleAfter = formatTime(now.Add(30 * time.Minute))
 	argv := authProbeArgv(adapter, candidate.path)
@@ -1325,7 +1410,7 @@ func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candida
 		return nil, []AuthReadiness{readiness}, &probe
 	}
 
-	result, err := deps.RunProbe(ctx, ProbeExecution{
+	result, err := sharedProbeResult(ctx, discovery, deps, ProbeExecution{
 		Argv:               argv,
 		Env:                env,
 		Timeout:            AuthProbeTimeout,
@@ -1937,7 +2022,7 @@ func absentProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResu
 	return probe
 }
 
-func inspectCatalogCommand(ctx context.Context, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (ModelCatalogSnapshot, []ModelCapability, ProbeResult) {
+func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (ModelCatalogSnapshot, []ModelCapability, ProbeResult) {
 	installationID := installation.ProviderInstallationID
 	probe := baseProbe(adapter, now, deps)
 	probe.ProviderInstallationID = &installationID
@@ -1947,7 +2032,7 @@ func inspectCatalogCommand(ctx context.Context, adapter AdapterDeclaration, cand
 	probe.TimeoutMS = int(AuthProbeTimeout / time.Millisecond)
 	probe.StaleAfter = formatTime(now.Add(30 * time.Minute))
 	probe.NetworkDeclared = adapter.CatalogProbeMayNetwork
-	probe.NetworkPermission = NetworkNotNeeded
+	probe.NetworkPermission = networkPermissionFor(discovery, adapter, NetworkPurposeModelCatalog, probe.NetworkDeclared)
 	argv := catalogProbeArgv(adapter, candidate.path)
 	env := probeEnvironment(deps.Getenv)
 	probe.Argv = redactArgv(argv)
@@ -1981,7 +2066,17 @@ func inspectCatalogCommand(ctx context.Context, adapter AdapterDeclaration, cand
 		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
 	}
 
-	result, err := deps.RunProbe(ctx, ProbeExecution{
+	if probe.NetworkDeclared && probe.NetworkPermission != NetworkGranted {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnavailable
+		probe.FreshnessState = FreshnessNotApplicable
+		probe.SideEffectClass = "not-run"
+		probe.GapReasons = []string{"network-permission-denied"}
+		probe.TerminalErrorCode = "ErrNetworkPermissionDenied"
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+
+	result, err := sharedProbeResult(ctx, discovery, deps, ProbeExecution{
 		Argv:               argv,
 		Env:                env,
 		Timeout:            AuthProbeTimeout,
@@ -2395,30 +2490,6 @@ func networkFailureText(lower string) bool {
 		strings.Contains(lower, "timeout") ||
 		strings.Contains(lower, "timed out") ||
 		strings.Contains(lower, "proxy")
-}
-
-func skippedCatalogProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
-	probe := baseProbe(adapter, now, deps)
-	argv := append([]string(nil), adapter.CatalogProbeCommand...)
-	if len(argv) == 0 {
-		argv = []string{firstNonEmpty(adapter.ExecutableNames...), "models"}
-	}
-	probe.ProbeKind = "catalog"
-	probe.ProbeCommandID = "model-catalog"
-	probe.ProbeMethod = ProbeMethodMachineJSON
-	probe.Outcome = OutcomeProbeFailed
-	probe.Argv = redactArgv(argv)
-	probe.TimeoutMS = int((15 * time.Second).Milliseconds())
-	probe.NetworkDeclared = true
-	probe.NetworkPermission = NetworkDenied
-	probe.FreshnessState = FreshnessNotApplicable
-	probe.Confidence = ConfidenceUnavailable
-	probe.SideEffectClass = "not-run"
-	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: "model-catalog", ExecutableName: firstNonEmpty(adapter.ExecutableNames...)}
-	probe.Evidence = EvidenceSummary{Kind: string(EvidenceNotRun), CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
-	probe.GapReasons = []string{"network-permission-denied"}
-	probe.TerminalErrorCode = "ErrNetworkPermissionDenied"
-	return probe
 }
 
 func baseProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
