@@ -188,6 +188,9 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 	if input.RoutingDecisionID == "" || input.Trigger == "" || strings.TrimSpace(input.PriorCandidateID) == "" {
 		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision, trigger, and prior candidate are required"}
 	}
+	if !validFallbackTrigger(input.Trigger) {
+		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown fallback trigger"}
+	}
 	if input.Cancelled {
 		if err := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
 			return FallbackDecision{}, err
@@ -204,50 +207,85 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 	if err != nil {
 		return FallbackDecision{}, err
 	}
-	profile, err := resolveFallbackProfile(ctx, store, original)
+	cancelled, err := isDeliveryRunCancelled(ctx, store, original.ProjectID, original.DeliveryRunID)
 	if err != nil {
 		return FallbackDecision{}, err
 	}
-	if err := validateFallbackInputs(original, profile, input.Inputs); err != nil {
-		return FallbackDecision{}, err
-	}
-	if isDeliveryRunCancelled(ctx, store, original.ProjectID, original.DeliveryRunID) {
+	if cancelled {
 		if err := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
 			return FallbackDecision{}, err
 		}
 		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by durable cancellation before route selection"}
 	}
-	evaluated := input.Inputs
-	evaluated.Policy = profile.EligibilityPolicy
-	evaluated.Pins = pinsFromDecision(original, evaluated.Pins)
-	evaluated.Candidates = excludeFallbackCandidates(evaluated.Candidates, append(original.FallbackChain, input.PriorCandidateID))
-	eligibility := FilterHardEligibility(evaluated)
-	scored := scoreCandidates(eligibility.Eligible, evaluated, profile.OptimizationPolicy)
-	selected := Candidate{}
-	if len(scored) > 0 {
-		selected = scored[0].Candidate
-	}
-	fingerprint, err := fallbackRoutingFingerprint(original, profile, input, eligibility, selected)
-	if err != nil {
-		return FallbackDecision{}, err
-	}
-	idempotencyKey := fallbackIdempotencyKey(input, fingerprint)
 	var stored FallbackDecision
+	cancelledInTx := false
 	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		if deliveryRunCancelledTx(ctx, tx, original.ProjectID, original.DeliveryRunID) {
+		original, err := loadRoutingDecisionTx(ctx, tx, input.RoutingDecisionID)
+		if err != nil {
+			return err
+		}
+		profile, err := resolveFallbackProfileTx(ctx, tx, original)
+		if err != nil {
+			return err
+		}
+		storedReq, err := loadTaskRequirementTx(ctx, tx, original.TaskRequirementID)
+		if err != nil {
+			return err
+		}
+		if err := validateFallbackInputs(original, profile, storedReq, input.Inputs); err != nil {
+			return err
+		}
+		cancelled, err := deliveryRunCancelledTx(ctx, tx, original.ProjectID, original.DeliveryRunID)
+		if err != nil {
+			return err
+		}
+		if cancelled {
+			cancelledInTx = true
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by durable cancellation at transaction boundary"}
 		}
+		chain, err := loadFallbackChainTx(ctx, tx, original.RoutingDecisionID)
+		if err != nil {
+			return err
+		}
+		pins, err := pinsFromDecisionTx(ctx, tx, original, input.Inputs.Pins)
+		if err != nil {
+			return err
+		}
+		idempotencyKey, err := fallbackIdempotencyKey(input, original, profile, storedReq, pins)
+		if err != nil {
+			return err
+		}
 		if existing, ok, err := loadFallbackByIdempotency(ctx, tx, original.RoutingDecisionID, idempotencyKey); err != nil || ok {
-			if ok && (existing.Trigger != input.Trigger || existing.PriorCandidateID != strings.TrimSpace(input.PriorCandidateID) || existing.RoutingFingerprint != fingerprint) {
+			if ok && (existing.Trigger != input.Trigger || existing.PriorCandidateID != strings.TrimSpace(input.PriorCandidateID)) {
 				return &delivery.TypedError{Code: delivery.ErrDuplicateReplayCode, Message: "fallback idempotency key replayed with different request"}
 			}
 			stored = existing
 			return err
 		}
-		used, err := countFallbacksTx(ctx, tx, original.RoutingDecisionID)
+		latest := latestFallbackCandidate(original, chain)
+		if strings.TrimSpace(input.PriorCandidateID) != latest {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "fallback prior candidate does not match latest persisted route lineage"}
+		}
+		evaluated := input.Inputs
+		evaluated.Requirement = storedReq
+		evaluated.Policy = profile.EligibilityPolicy
+		evaluated.Pins = pins
+		originalCandidateCount := len(evaluated.Candidates)
+		evaluated.Candidates = excludeFallbackCandidates(evaluated.Candidates, attemptedFallbackCandidates(original, chain, input.PriorCandidateID))
+		eligibility := Result{}
+		if originalCandidateCount == 0 || len(evaluated.Candidates) > 0 {
+			eligibility = FilterHardEligibility(evaluated)
+		}
+		scored := scoreCandidates(eligibility.Eligible, evaluated, profile.OptimizationPolicy)
+		selected := Candidate{}
+		if len(scored) > 0 {
+			selected = scored[0].Candidate
+		}
+		fingerprint, err := fallbackRoutingFingerprint(original, profile, input, storedReq, pins, eligibility, selected)
 		if err != nil {
 			return err
 		}
+		used := len(chain)
 		decision := buildFallbackDecision(original, profile, input, selected, eligibility, fingerprint, idempotencyKey, used+1, store.Now())
 		if used >= profile.FallbackPolicy.MaxFallbacks {
 			decision.FallbackCandidateID = ""
@@ -266,8 +304,10 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, taskrequirements.ErrReplanRequired) {
-			_ = releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host)
+		if cancelledInTx {
+			if releaseErr := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
+				return FallbackDecision{}, releaseErr
+			}
 		}
 		return FallbackDecision{}, err
 	}
@@ -314,15 +354,43 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 	if input.ProjectID == "" || input.DeliveryRunID == "" || input.Trigger == "" || !validFingerprint(input.PriorPlanFingerprint) {
 		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "project, delivery run, trigger, and prior plan fingerprint are required"}
 	}
-	profile, err := resolveReplanProfile(ctx, store, input.RoutingPolicyProfileID)
-	if err != nil {
-		return ReplanDecision{}, err
+	if !validReplanTrigger(input.Trigger) {
+		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown replan trigger"}
 	}
-	idempotencyKey := replanIdempotencyKey(input)
 	var stored ReplanDecision
-	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		if deliveryRunCancelledTx(ctx, tx, input.ProjectID, input.DeliveryRunID) {
+	cancelledInTx := false
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		profile, err := resolveReplanProfileTx(ctx, tx, input.RoutingPolicyProfileID)
+		if err != nil {
+			return err
+		}
+		run, err := loadReplanRunTx(ctx, tx, input.ProjectID, input.DeliveryRunID)
+		if err != nil {
+			return err
+		}
+		if run.PlanFingerprint != input.PriorPlanFingerprint {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan prior plan fingerprint does not match current delivery run"}
+		}
+		if strings.TrimSpace(input.RoutingDecisionID) != "" {
+			route, err := loadRoutingDecisionTx(ctx, tx, input.RoutingDecisionID)
+			if err != nil {
+				return err
+			}
+			if route.ProjectID != input.ProjectID || route.DeliveryRunID != input.DeliveryRunID || route.PlanFingerprint != input.PriorPlanFingerprint || route.RoutingPolicyProfileID != profile.RoutingPolicyProfileID {
+				return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan routing decision does not match current run/profile"}
+			}
+		}
+		cancelled, err := deliveryRunCancelledTx(ctx, tx, input.ProjectID, input.DeliveryRunID)
+		if err != nil {
+			return err
+		}
+		if cancelled {
+			cancelledInTx = true
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "replan stopped by durable cancellation at transaction boundary"}
+		}
+		idempotencyKey, err := replanIdempotencyKey(input, run, profile)
+		if err != nil {
+			return err
 		}
 		if existing, ok, err := loadReplanByIdempotency(ctx, tx, input.DeliveryRunID, idempotencyKey); err != nil || ok {
 			if ok && (existing.Trigger != input.Trigger || existing.PriorPlanFingerprint != input.PriorPlanFingerprint || existing.NewPlanFingerprint != strings.TrimSpace(input.NewPlanFingerprint) || existing.RoutingFingerprint != strings.TrimSpace(input.RoutingFingerprint)) {
@@ -336,6 +404,19 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 			return err
 		}
 		decision := buildReplanDecision(profile, input, idempotencyKey, used+1, store.Now())
+		if decision.ApprovalRequired {
+			approved, err := exactReplanApprovalExistsTx(ctx, tx, run, strings.TrimSpace(input.NewPlanFingerprint), store.Now())
+			if err != nil {
+				return err
+			}
+			if !approved {
+				decision.DecisionStatus = ReplanStatusNeedsHuman
+				decision.TerminalErrorCode = taskrequirements.ErrorCode(delivery.ErrApprovalRequiredCode)
+				decision.NewPlanFingerprint = ""
+			} else {
+				decision.ApprovalRequired = false
+			}
+		}
 		if used >= profile.ReplanPolicy.MaxReplanPasses {
 			decision.DecisionStatus = ReplanStatusBoundExceeded
 			decision.TerminalErrorCode = taskrequirements.ErrReplanBoundExceededCode
@@ -348,8 +429,10 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, taskrequirements.ErrReplanRequired) {
-			_ = releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host)
+		if cancelledInTx {
+			if releaseErr := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
+				return ReplanDecision{}, releaseErr
+			}
 		}
 		return ReplanDecision{}, err
 	}
@@ -683,34 +766,108 @@ func insertReplanDecisionTx(ctx context.Context, tx storage.Tx, decision ReplanD
 	return nil
 }
 
-func resolveFallbackProfile(ctx context.Context, store storage.Store, original RoutingDecision) (RoutingPolicyProfile, error) {
+func loadRoutingDecisionTx(ctx context.Context, tx storage.Tx, routingDecisionID string) (RoutingDecision, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM routing_decisions WHERE routing_decision_id = ?`, strings.TrimSpace(routingDecisionID)).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "routing decision was not persisted"}
+		}
+		return RoutingDecision{}, err
+	}
+	var decision RoutingDecision
+	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+		return RoutingDecision{}, err
+	}
+	if err := validateRoutingDecision(decision); err != nil {
+		return RoutingDecision{}, err
+	}
+	return decision, nil
+}
+
+func loadTaskRequirementTx(ctx context.Context, tx storage.Tx, taskRequirementID string) (taskrequirements.TaskRequirement, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM task_requirements WHERE task_requirement_id = ?`, strings.TrimSpace(taskRequirementID)).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return taskrequirements.TaskRequirement{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "task requirement was not persisted"}
+		}
+		return taskrequirements.TaskRequirement{}, err
+	}
+	var req taskrequirements.TaskRequirement
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		return taskrequirements.TaskRequirement{}, err
+	}
+	if err := taskrequirements.Validate(req); err != nil {
+		return taskrequirements.TaskRequirement{}, err
+	}
+	return req, nil
+}
+
+func loadRoutingPolicyProfileTx(ctx context.Context, tx storage.Tx, id string) (RoutingPolicyProfile, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM routing_policy_profiles WHERE routing_policy_profile_id = ?`, strings.TrimSpace(id)).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "routing policy profile was not persisted"}
+		}
+		return RoutingPolicyProfile{}, err
+	}
+	var profile RoutingPolicyProfile
+	if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+		return RoutingPolicyProfile{}, err
+	}
+	if err := ValidateRoutingPolicyProfile(profile); err != nil {
+		return RoutingPolicyProfile{}, err
+	}
+	return profile, nil
+}
+
+func resolveFallbackProfileTx(ctx context.Context, tx storage.Tx, original RoutingDecision) (RoutingPolicyProfile, error) {
+	profile, err := loadRoutingPolicyProfileTx(ctx, tx, original.RoutingPolicyProfileID)
+	if err != nil {
+		return RoutingPolicyProfile{}, err
+	}
 	if original.RoutingPolicyProfile != nil {
-		profile := normalizeRoutingPolicyProfile(*original.RoutingPolicyProfile)
-		if err := ValidateRoutingPolicyProfile(profile); err != nil {
+		embedded := normalizeRoutingPolicyProfile(*original.RoutingPolicyProfile)
+		if err := requireSameRoutingPolicyProfile(embedded, profile); err != nil {
 			return RoutingPolicyProfile{}, err
 		}
-		return profile, nil
 	}
-	return LoadRoutingPolicyProfile(ctx, store, original.RoutingPolicyProfileID)
+	if profile.PolicyFingerprint != original.PolicyFingerprint {
+		return RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "fallback profile fingerprint does not match original route"}
+	}
+	return profile, nil
 }
 
-func resolveReplanProfile(ctx context.Context, store storage.Store, profileID string) (RoutingPolicyProfile, error) {
+func resolveReplanProfileTx(ctx context.Context, tx storage.Tx, profileID string) (RoutingPolicyProfile, error) {
 	if strings.TrimSpace(profileID) == "" {
-		profileID = defaultStoredRoutingPolicyProfileID(store.Now())
+		profileID = defaultStoredRoutingPolicyProfileID(time.Unix(0, 0).UTC())
 	}
-	return LoadRoutingPolicyProfile(ctx, store, profileID)
+	return loadRoutingPolicyProfileTx(ctx, tx, profileID)
 }
 
-func validateFallbackInputs(original RoutingDecision, profile RoutingPolicyProfile, inputs Inputs) error {
+func validateFallbackInputs(original RoutingDecision, profile RoutingPolicyProfile, storedReq taskrequirements.TaskRequirement, inputs Inputs) error {
 	if original.DecisionStatus != DecisionStatusSelected || original.ChosenCandidateID == "" {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback requires an original selected route"}
 	}
-	if inputs.Requirement.ProjectID != original.ProjectID || inputs.Requirement.DeliveryRunID != original.DeliveryRunID ||
-		inputs.Requirement.TaskID != original.TaskID || inputs.Requirement.TaskRequirementID != original.TaskRequirementID {
+	if storedReq.ProjectID != original.ProjectID || storedReq.DeliveryRunID != original.DeliveryRunID ||
+		storedReq.TaskID != original.TaskID || storedReq.TaskRequirementID != original.TaskRequirementID {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "stored fallback requirement does not match original route"}
+	}
+	if storedReq.PlanFingerprint != original.PlanFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "stored fallback requirement does not match original plan fingerprint"}
+	}
+	caller := inputs.Requirement
+	if caller.ProjectID != storedReq.ProjectID || caller.DeliveryRunID != storedReq.DeliveryRunID ||
+		caller.TaskID != storedReq.TaskID || caller.TaskRequirementID != storedReq.TaskRequirementID {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback requirement does not match original route"}
 	}
-	if inputs.Requirement.PlanFingerprint != original.PlanFingerprint {
+	if caller.PlanFingerprint != storedReq.PlanFingerprint {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback cannot change plan fingerprint"}
+	}
+	if !sameCanonicalRequirementAuthority(caller, storedReq) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrFallbackWouldWeakenPolicyCode, Message: "caller fallback requirement does not match persisted authority"}
 	}
 	if profile.PolicyFingerprint != original.PolicyFingerprint {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "fallback profile fingerprint does not match original route"}
@@ -718,11 +875,14 @@ func validateFallbackInputs(original RoutingDecision, profile RoutingPolicyProfi
 	return nil
 }
 
-func fallbackRoutingFingerprint(original RoutingDecision, profile RoutingPolicyProfile, input FallbackInput, eligibility Result, selected Candidate) (string, error) {
+func fallbackRoutingFingerprint(original RoutingDecision, profile RoutingPolicyProfile, input FallbackInput, req taskrequirements.TaskRequirement, pins []Pin, eligibility Result, selected Candidate) (string, error) {
 	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
 		"routing_decision_id":   original.RoutingDecisionID,
 		"original_fingerprint":  original.RoutingFingerprint,
 		"policy_fingerprint":    profile.PolicyFingerprint,
+		"requirement_id":        req.TaskRequirementID,
+		"requirement_fp":        req.TaskRequirementFingerprint,
+		"user_pins":             pins,
 		"trigger":               input.Trigger,
 		"prior_candidate_id":    input.PriorCandidateID,
 		"selected_candidate_id": selected.RoutingCandidateID,
@@ -733,22 +893,48 @@ func fallbackRoutingFingerprint(original RoutingDecision, profile RoutingPolicyP
 	return digest, err
 }
 
-func fallbackIdempotencyKey(input FallbackInput, fingerprint string) string {
-	if strings.TrimSpace(input.IdempotencyKey) != "" {
-		return strings.TrimSpace(input.IdempotencyKey)
+func fallbackIdempotencyKey(input FallbackInput, original RoutingDecision, profile RoutingPolicyProfile, req taskrequirements.TaskRequirement, pins []Pin) (string, error) {
+	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
+		"schema_version":      "loopcoder.fallback_event.v1",
+		"routing_decision_id": original.RoutingDecisionID,
+		"routing_fingerprint": original.RoutingFingerprint,
+		"policy_fingerprint":  profile.PolicyFingerprint,
+		"requirement_id":      req.TaskRequirementID,
+		"requirement_fp":      req.TaskRequirementFingerprint,
+		"trigger":             input.Trigger,
+		"prior_candidate_id":  strings.TrimSpace(input.PriorCandidateID),
+		"attempt_lineage":     nonNilStrings(input.AttemptLineage),
+		"changed_authority":   nonNilAuthorityInputs(input.ChangedAuthorityInputs),
+		"user_pins":           pins,
+	})
+	if err != nil {
+		return "", err
 	}
-	return "fallback:" + string(input.Trigger) + ":" + strings.TrimSpace(input.PriorCandidateID) + ":" + fingerprint
+	return "fallback-event:" + digest, nil
 }
 
-func replanIdempotencyKey(input ReplanInput) string {
-	if strings.TrimSpace(input.IdempotencyKey) != "" {
-		return strings.TrimSpace(input.IdempotencyKey)
+func replanIdempotencyKey(input ReplanInput, run replanRunAuthority, profile RoutingPolicyProfile) (string, error) {
+	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
+		"schema_version":          "loopcoder.replan_event.v1",
+		"project_id":              run.ProjectID,
+		"delivery_run_id":         run.DeliveryRunID,
+		"authorization_fp":        run.AuthorizationFingerprint,
+		"input_fp":                run.InputFingerprint,
+		"policy_fp":               run.PolicyFingerprint,
+		"prior_plan_fp":           input.PriorPlanFingerprint,
+		"new_plan_fp":             strings.TrimSpace(input.NewPlanFingerprint),
+		"routing_decision_id":     strings.TrimSpace(input.RoutingDecisionID),
+		"routing_fingerprint":     strings.TrimSpace(input.RoutingFingerprint),
+		"routing_policy_profile":  profile.RoutingPolicyProfileID,
+		"routing_policy_fp":       profile.PolicyFingerprint,
+		"trigger":                 input.Trigger,
+		"attempt_lineage":         nonNilStrings(input.AttemptLineage),
+		"changed_authority_input": nonNilAuthorityInputs(input.ChangedAuthorityInputs),
+	})
+	if err != nil {
+		return "", err
 	}
-	fp := input.NewPlanFingerprint
-	if fp == "" {
-		fp = input.RoutingFingerprint
-	}
-	return "replan:" + string(input.Trigger) + ":" + input.PriorPlanFingerprint + ":" + fp
+	return "replan-event:" + digest, nil
 }
 
 func fallbackDecisionID(routingDecisionID string, ordinal int, routingFingerprint string) string {
@@ -757,12 +943,6 @@ func fallbackDecisionID(routingDecisionID string, ordinal int, routingFingerprin
 
 func replanDecisionID(projectID, deliveryRunID, priorPlanFingerprint string, ordinal int) string {
 	return "replan_" + digestBase32(projectID, deliveryRunID, priorPlanFingerprint, fmt.Sprintf("%d", ordinal))
-}
-
-func countFallbacksTx(ctx context.Context, tx storage.Tx, routingDecisionID string) (int, error) {
-	var count int
-	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM fallback_decisions WHERE routing_decision_id = ?`, routingDecisionID).Scan(&count)
-	return count, err
 }
 
 func countReplansTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) (int, error) {
@@ -803,6 +983,49 @@ func loadReplanByIdempotency(ctx context.Context, tx storage.Tx, deliveryRunID, 
 	return decision, true, nil
 }
 
+func loadFallbackChainTx(ctx context.Context, tx storage.Tx, routingDecisionID string) ([]FallbackDecision, error) {
+	rows, err := tx.Query(ctx, `SELECT payload_json FROM fallback_decisions WHERE routing_decision_id = ? ORDER BY fallback_ordinal`, routingDecisionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FallbackDecision
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var decision FallbackDecision
+		if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+			return nil, err
+		}
+		out = append(out, decision)
+	}
+	return out, rows.Err()
+}
+
+func latestFallbackCandidate(original RoutingDecision, chain []FallbackDecision) string {
+	latest := strings.TrimSpace(original.ChosenCandidateID)
+	for _, decision := range chain {
+		if strings.TrimSpace(decision.SelectedCandidateID) != "" {
+			latest = strings.TrimSpace(decision.SelectedCandidateID)
+			continue
+		}
+		if strings.TrimSpace(decision.FallbackCandidateID) != "" {
+			latest = strings.TrimSpace(decision.FallbackCandidateID)
+		}
+	}
+	return latest
+}
+
+func attemptedFallbackCandidates(original RoutingDecision, chain []FallbackDecision, prior string) []string {
+	out := []string{original.ChosenCandidateID, prior}
+	for _, decision := range chain {
+		out = append(out, decision.PriorCandidateID, decision.FallbackCandidateID, decision.SelectedCandidateID)
+	}
+	return dedupeStrings(out)
+}
+
 func excludeFallbackCandidates(candidates []Candidate, excluded []string) []Candidate {
 	blocked := map[string]bool{}
 	for _, id := range excluded {
@@ -819,30 +1042,70 @@ func excludeFallbackCandidates(candidates []Candidate, excluded []string) []Cand
 	return out
 }
 
-func pinsFromDecision(original RoutingDecision, pins []Pin) []Pin {
-	if len(pins) > 0 || len(original.UserPinRefs) == 0 {
-		return pins
+func pinsFromDecisionTx(ctx context.Context, tx storage.Tx, original RoutingDecision, callerPins []Pin) ([]Pin, error) {
+	if len(original.UserPinRefs) == 0 {
+		return callerPins, nil
 	}
-	return pins
+	records := make([]PolicyInputRecord, 0, len(original.UserPinRefs))
+	for _, id := range original.UserPinRefs {
+		record, err := loadPolicyInputTx(ctx, tx, id)
+		if err != nil {
+			return nil, err
+		}
+		if record.InputKind != PolicyInputKindPin || record.Status != PolicyInputStatusActive ||
+			record.ProjectID != original.ProjectID ||
+			(record.DeliveryRunID != "" && record.DeliveryRunID != original.DeliveryRunID) ||
+			record.RoutingPolicyProfileID != original.RoutingPolicyProfileID ||
+			record.PolicyFingerprint != original.PolicyFingerprint ||
+			record.ValidationStatus != ValidationStatusValid {
+			return nil, &taskrequirements.TypedError{Code: taskrequirements.ErrPinnedCandidateIneligibleCode, Message: "stored user pin does not match original routing decision authority"}
+		}
+		records = append(records, record)
+	}
+	pins, _ := constraintsFromPolicyInputRecords(records)
+	if len(pins) != len(original.UserPinRefs) {
+		return nil, &taskrequirements.TypedError{Code: taskrequirements.ErrPinnedCandidateIneligibleCode, Message: "stored user pin refs could not be recovered"}
+	}
+	return pins, nil
 }
 
-func isDeliveryRunCancelled(ctx context.Context, store storage.Store, projectID, deliveryRunID string) bool {
+func loadPolicyInputTx(ctx context.Context, tx storage.Tx, id string) (PolicyInputRecord, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM routing_policy_inputs WHERE routing_policy_input_id = ?`, strings.TrimSpace(id)).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PolicyInputRecord{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "routing policy input ref was not persisted"}
+		}
+		return PolicyInputRecord{}, err
+	}
+	var record PolicyInputRecord
+	if err := json.Unmarshal([]byte(payload), &record); err != nil {
+		return PolicyInputRecord{}, err
+	}
+	return record, nil
+}
+
+func isDeliveryRunCancelled(ctx context.Context, store storage.Store, projectID, deliveryRunID string) (bool, error) {
 	cancelled := false
-	_ = store.WithTx(ctx, func(tx storage.Tx) error {
-		cancelled = deliveryRunCancelledTx(ctx, tx, projectID, deliveryRunID)
-		return nil
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		var err error
+		cancelled, err = deliveryRunCancelledTx(ctx, tx, projectID, deliveryRunID)
+		return err
 	})
-	return cancelled
+	return cancelled, err
 }
 
-func deliveryRunCancelledTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) bool {
+func deliveryRunCancelledTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) (bool, error) {
 	var state string
 	err := tx.QueryRow(ctx, `SELECT state FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`, projectID, deliveryRunID).Scan(&state)
 	if err != nil {
-		return false
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "delivery run was not persisted"}
+		}
+		return false, err
 	}
 	state = strings.ToLower(strings.TrimSpace(state))
-	return state == "cancelled" || state == "canceled" || state == "canceling" || state == "cancelling"
+	return state == "cancelled" || state == "canceled" || state == "canceling" || state == "cancelling", nil
 }
 
 func releaseHeldReservationOnCancellation(ctx context.Context, store storage.Store, reservationID string, generation int64, actor delivery.Actor, host delivery.Host) error {
@@ -861,9 +1124,123 @@ func releaseHeldReservationOnCancellation(ctx context.Context, store storage.Sto
 		Host:           budget.Host{HostID: host.HostID, Provider: host.HostKind, Model: host.LoopcoderVersion},
 	})
 	if errors.Is(err, budget.ErrReservationStateConflict) || errors.Is(err, budget.ErrReservationExpired) {
-		return nil
+		held, inspectErr := reservationStillHeld(ctx, store, reservationID)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if !held {
+			return nil
+		}
 	}
 	return err
+}
+
+func reservationStillHeld(ctx context.Context, store storage.Store, reservationID string) (bool, error) {
+	var payload string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM budget_reservations WHERE budget_reservation_id = ?`, reservationID).Scan(&payload)
+	}); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "held budget reservation was not persisted"}
+		}
+		return false, err
+	}
+	var reservation budget.Reservation
+	if err := json.Unmarshal([]byte(payload), &reservation); err != nil {
+		return false, err
+	}
+	return reservation.State == budget.StateActive || reservation.State == budget.StatePartiallyCommitted, nil
+}
+
+type replanRunAuthority struct {
+	ProjectID                string
+	DeliveryRunID            string
+	State                    string
+	InputFingerprint         string
+	PolicyFingerprint        string
+	PlanFingerprint          string
+	AuthorizationFingerprint string
+	MaxSideEffectClass       string
+}
+
+func loadReplanRunTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) (replanRunAuthority, error) {
+	var run replanRunAuthority
+	err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, state, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint, max_side_effect_class
+		FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`, projectID, deliveryRunID).Scan(
+		&run.ProjectID, &run.DeliveryRunID, &run.State, &run.InputFingerprint, &run.PolicyFingerprint, &run.PlanFingerprint, &run.AuthorizationFingerprint, &run.MaxSideEffectClass)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return replanRunAuthority{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "delivery run was not persisted"}
+		}
+		return replanRunAuthority{}, err
+	}
+	return run, nil
+}
+
+func exactReplanApprovalExistsTx(ctx context.Context, tx storage.Tx, run replanRunAuthority, newPlanFingerprint string, now time.Time) (bool, error) {
+	if !validFingerprint(newPlanFingerprint) {
+		return false, nil
+	}
+	var expires string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(expires_at, '')
+		FROM delivery_approvals
+		WHERE project_id = ? AND delivery_run_id = ? AND input_fingerprint = ? AND policy_fingerprint = ? AND plan_fingerprint = ? AND status = 'active'
+		ORDER BY approved_at DESC LIMIT 1`,
+		run.ProjectID, run.DeliveryRunID, run.InputFingerprint, run.PolicyFingerprint, newPlanFingerprint).Scan(&expires)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if strings.TrimSpace(expires) == "" {
+		return true, nil
+	}
+	expiry, err := time.Parse(time.RFC3339Nano, expires)
+	if err != nil {
+		return false, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "approval expiry is invalid"}
+	}
+	return expiry.After(now), nil
+}
+
+func sameCanonicalRequirementAuthority(caller, stored taskrequirements.TaskRequirement) bool {
+	caller.TaskRequirementFingerprint = stored.TaskRequirementFingerprint
+	caller.CreatedAt = stored.CreatedAt
+	caller.UpdatedAt = stored.UpdatedAt
+	caller.CreatedBy = stored.CreatedBy
+	caller.UpdatedBy = stored.UpdatedBy
+	caller.Host = stored.Host
+	callerPayload, err := delivery.CanonicalJSON(caller)
+	if err != nil {
+		return false
+	}
+	storedPayload, err := delivery.CanonicalJSON(stored)
+	if err != nil {
+		return false
+	}
+	return string(callerPayload) == string(storedPayload)
+}
+
+func validFallbackTrigger(trigger FallbackTrigger) bool {
+	switch trigger {
+	case FallbackTriggerCandidateFailed, FallbackTriggerBreakerOpened, FallbackTriggerQuotaExhausted, FallbackTriggerRateLimited,
+		FallbackTriggerAuthExpired, FallbackTriggerModelRemoved, FallbackTriggerBudgetRefused, FallbackTriggerVerificationFailed,
+		FallbackTriggerWorkerFailed, FallbackTriggerTimeout, FallbackTriggerRequirementsChanged, FallbackTriggerUserRequested:
+		return true
+	default:
+		return false
+	}
+}
+
+func validReplanTrigger(trigger ReplanTrigger) bool {
+	switch trigger {
+	case ReplanTriggerNoEligibleCandidate, ReplanTriggerLegalFallbackExhausted, ReplanTriggerScopeChangeNeeded,
+		ReplanTriggerCapabilityGap, ReplanTriggerGraphBoundHit, ReplanTriggerVerificationFailed,
+		ReplanTriggerAmbiguousSideEffectState, ReplanTriggerUserChangedIntent, ReplanTriggerChangedRequirements:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateSchedulerActor(actor delivery.Actor) error {

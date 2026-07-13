@@ -123,6 +123,97 @@ func TestFallbackRejectsSimultaneousOutageQuotaResetAndAuthModelRemoval(t *testi
 	}
 }
 
+func TestFallbackRecoversPersistedUserPinsAndRefusesForbiddenCandidate(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+
+	input := replayDecisionInput(fixture)
+	input.Inputs.Requirement = persistFallbackTaskRequirement(t, ctx, store, input.Inputs.Requirement, fixture.now)
+	input.TaskRequirementID = input.Inputs.Requirement.TaskRequirementID
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	pin := persistPolicyPin(t, ctx, store, profile, CandidateConstraint{AdapterID: "claude"})
+	input.RoutingPolicyProfile = profile
+	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
+	input.PolicyFingerprint = profile.PolicyFingerprint
+	input.PolicyInputRecords = []PolicyInputRecord{pin}
+	input.Inputs.Policy = profile.EligibilityPolicy
+	input.Inputs.Pins = pinsForRecord(pin)
+	for i := range input.Inputs.Inventory.QuotaSnapshots {
+		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
+			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
+		}
+	}
+	original, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if original.ChosenCandidateID == "" || original.UserPinRefs[0] != pin.RoutingPolicyInputID {
+		t.Fatalf("original route did not persist user pin: %#v", original)
+	}
+	if err := PersistRoutingDecision(ctx, store, original); err != nil {
+		t.Fatalf("PersistRoutingDecision: %v", err)
+	}
+
+	caller := input.Inputs
+	caller.Pins = nil
+	fallback, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerRateLimited,
+		PriorCandidateID:  original.ChosenCandidateID,
+		Inputs:            caller,
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("fallback error = %v, want ErrReplanRequired", err)
+	}
+	if fallback.FallbackCandidateID != "" || !hasIllegalLegalityRow(fallback.LegalityResults, "user_pin") {
+		t.Fatalf("fallback ignored recovered persisted pin: %#v", fallback)
+	}
+}
+
+func TestFallbackRejectsCallerRequirementMutationsBeforeEligibility(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	cases := map[string]func(*taskrequirements.TaskRequirement){
+		"permission": func(req *taskrequirements.TaskRequirement) {
+			req.PermissionRequired = taskrequirements.PermissionReadOnly
+		},
+		"risk": func(req *taskrequirements.TaskRequirement) { req.RiskTier = taskrequirements.RiskLow },
+		"verification": func(req *taskrequirements.TaskRequirement) {
+			req.VerificationRequirements = []taskrequirements.VerificationRequirement{{VerificationKind: taskrequirements.VerificationNone}}
+		},
+		"scope": func(req *taskrequirements.TaskRequirement) { req.ScopeJSON = `{"paths":["README.md"]}` },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			caller := input.Inputs
+			mutate(&caller.Requirement)
+			_, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+				RoutingDecisionID: original.RoutingDecisionID,
+				Trigger:           FallbackTriggerTimeout,
+				PriorCandidateID:  original.ChosenCandidateID,
+				Inputs:            caller,
+				AttemptLineage:    []string{"attempt-" + name},
+				DecidedBy:         schedulerActor(),
+				Host:              routingHost(),
+			})
+			if !errors.Is(err, taskrequirements.ErrFallbackWouldWeakenPolicy) {
+				t.Fatalf("mutated requirement fallback error = %v, want ErrFallbackWouldWeakenPolicy", err)
+			}
+		})
+	}
+	if countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 0 {
+		t.Fatalf("mutated caller requirement persisted fallback decision")
+	}
+}
+
 func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -130,25 +221,38 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 	defer store.Close()
 	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
 
-	for i := 0; i < 3; i++ {
-		_, err := DecideAndPersistFallback(ctx, store, FallbackInput{
-			RoutingDecisionID: original.RoutingDecisionID,
-			Trigger:           FallbackTriggerWorkerFailed,
-			PriorCandidateID:  original.ChosenCandidateID,
-			IdempotencyKey:    "fallback-bound-" + string(rune('a'+i)),
-			Inputs:            input.Inputs,
-			DecidedBy:         schedulerActor(),
-			Host:              routingHost(),
-		})
-		if err != nil {
-			t.Fatalf("fallback %d: %v", i+1, err)
-		}
+	first, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerWorkerFailed,
+		PriorCandidateID:  original.ChosenCandidateID,
+		IdempotencyKey:    "fallback-bound-a",
+		Inputs:            input.Inputs,
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("fallback 1: %v", err)
+	}
+	replayed, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerWorkerFailed,
+		PriorCandidateID:  original.ChosenCandidateID,
+		IdempotencyKey:    "caller-key-must-not-matter",
+		Inputs:            input.Inputs,
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("fallback replay with original prior: %v", err)
+	}
+	if replayed.FallbackDecisionID != first.FallbackDecisionID || countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 1 {
+		t.Fatalf("replay created duplicate fallback: first=%s replay=%s count=%d", first.FallbackDecisionID, replayed.FallbackDecisionID, countFallbackDecisions(t, ctx, store, original.RoutingDecisionID))
 	}
 	blocked, err := DecideAndPersistFallback(ctx, store, FallbackInput{
 		RoutingDecisionID: original.RoutingDecisionID,
 		Trigger:           FallbackTriggerWorkerFailed,
-		PriorCandidateID:  original.ChosenCandidateID,
-		IdempotencyKey:    "fallback-bound-d",
+		PriorCandidateID:  first.FallbackCandidateID,
+		IdempotencyKey:    "fallback-bound-b",
 		Inputs:            input.Inputs,
 		DecidedBy:         schedulerActor(),
 		Host:              routingHost(),
@@ -156,7 +260,7 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
 		t.Fatalf("bound fallback error = %v, want ErrReplanRequired", err)
 	}
-	if blocked.DecisionStatus != FallbackStatusReplanRequired || blocked.BoundsRemaining.FallbacksLeft != 0 {
+	if blocked.DecisionStatus != FallbackStatusReplanRequired {
 		t.Fatalf("bound fallback decision = %#v", blocked)
 	}
 
@@ -169,13 +273,8 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 			PriorPlanFingerprint: original.PlanFingerprint,
 			NewPlanFingerprint:   testFingerprint("new-plan-" + string(rune('a'+i))),
 			IdempotencyKey:       "replan-" + string(rune('a'+i)),
-			ChangedAuthorityInputs: []ChangedAuthorityInput{{
-				InputKind: "plan_fingerprint",
-				Previous:  original.PlanFingerprint,
-				Current:   testFingerprint("new-plan-" + string(rune('a'+i))),
-			}},
-			DecidedBy: schedulerActor(),
-			Host:      routingHost(),
+			DecidedBy:            schedulerActor(),
+			Host:                 routingHost(),
 		})
 		if err != nil {
 			t.Fatalf("replan %d: %v", i+1, err)
@@ -197,6 +296,42 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 	}
 	if exhausted.DecisionStatus != ReplanStatusBoundExceeded || exhausted.BoundsRemaining.ReplanPassesLeft != 0 {
 		t.Fatalf("exhausted replan = %#v", exhausted)
+	}
+}
+
+func TestFallbackRejectsForgedPriorAfterCanonicalLineageMoves(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	first, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerWorkerFailed,
+		PriorCandidateID:  original.ChosenCandidateID,
+		Inputs:            input.Inputs,
+		AttemptLineage:    []string{"att-1"},
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("first fallback: %v", err)
+	}
+	_, err = DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerWorkerFailed,
+		PriorCandidateID:  original.ChosenCandidateID,
+		Inputs:            input.Inputs,
+		AttemptLineage:    []string{"forged-new-event"},
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("forged prior error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+	if first.FallbackCandidateID == "" || countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 1 {
+		t.Fatalf("forged prior changed fallback lineage")
 	}
 }
 
@@ -231,6 +366,87 @@ func TestCancellationStopsReplanAndCancelsHeldReservation(t *testing.T) {
 	}
 }
 
+func TestReplanChangedAuthorityRequiresExactFreshApproval(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	newPlan := testFingerprint("changed-authority-new-plan")
+	needsHuman, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerScopeChangeNeeded,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   newPlan,
+		ChangedAuthorityInputs: []ChangedAuthorityInput{{
+			InputKind: "plan_fingerprint",
+			Previous:  original.PlanFingerprint,
+			Current:   newPlan,
+		}},
+		AttemptLineage: []string{"no-approval"},
+		DecidedBy:      schedulerActor(),
+		Host:           routingHost(),
+	})
+	if !errors.Is(err, delivery.ErrApprovalRequired) {
+		t.Fatalf("changed authority without approval error = %v, want ErrApprovalRequired", err)
+	}
+	if needsHuman.DecisionStatus != ReplanStatusNeedsHuman || needsHuman.NewPlanFingerprint != "" {
+		t.Fatalf("changed authority without approval was launchable: %#v", needsHuman)
+	}
+
+	insertDeliveryApproval(t, ctx, store, original.ProjectID, original.DeliveryRunID, testFingerprint("stale-plan"), "stale")
+	stale, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerScopeChangeNeeded,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   testFingerprint("changed-authority-stale-plan"),
+		ChangedAuthorityInputs: []ChangedAuthorityInput{{
+			InputKind: "plan_fingerprint",
+			Previous:  original.PlanFingerprint,
+			Current:   testFingerprint("changed-authority-stale-plan"),
+		}},
+		AttemptLineage: []string{"stale-approval"},
+		DecidedBy:      schedulerActor(),
+		Host:           routingHost(),
+	})
+	if !errors.Is(err, delivery.ErrApprovalRequired) || stale.DecisionStatus != ReplanStatusNeedsHuman {
+		t.Fatalf("stale approval authorized changed replan: decision=%#v err=%v", stale, err)
+	}
+
+	freshStore := openRoutingStore(t, ctx, fixture.now)
+	defer freshStore.Close()
+	freshOriginal, _ := persistFallbackOriginalRoute(t, ctx, freshStore, fixture)
+	freshPlan := testFingerprint("changed-authority-fresh-plan")
+	insertDeliveryApproval(t, ctx, freshStore, freshOriginal.ProjectID, freshOriginal.DeliveryRunID, freshPlan, "fresh")
+	planned, err := DecideAndPersistReplan(ctx, freshStore, ReplanInput{
+		ProjectID:            freshOriginal.ProjectID,
+		DeliveryRunID:        freshOriginal.DeliveryRunID,
+		RoutingDecisionID:    freshOriginal.RoutingDecisionID,
+		Trigger:              ReplanTriggerScopeChangeNeeded,
+		PriorPlanFingerprint: freshOriginal.PlanFingerprint,
+		NewPlanFingerprint:   freshPlan,
+		ChangedAuthorityInputs: []ChangedAuthorityInput{{
+			InputKind: "plan_fingerprint",
+			Previous:  freshOriginal.PlanFingerprint,
+			Current:   freshPlan,
+		}},
+		AttemptLineage: []string{"fresh-approval"},
+		DecidedBy:      schedulerActor(),
+		Host:           routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("fresh approval replan error: %v", err)
+	}
+	if planned.DecisionStatus != ReplanStatusPlanned || planned.NewPlanFingerprint != freshPlan || planned.ApprovalRequired {
+		t.Fatalf("fresh approval did not authorize exact changed replan: %#v", planned)
+	}
+}
+
 func openRoutingStore(t *testing.T, ctx context.Context, now time.Time) storage.Store {
 	t.Helper()
 	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return now }})
@@ -244,6 +460,8 @@ func openRoutingStore(t *testing.T, ctx context.Context, now time.Time) storage.
 func persistFallbackOriginalRoute(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture) (RoutingDecision, DecisionInput) {
 	t.Helper()
 	input := replayDecisionInput(fixture)
+	input.Inputs.Requirement = persistFallbackTaskRequirement(t, ctx, store, input.Inputs.Requirement, fixture.now)
+	input.TaskRequirementID = input.Inputs.Requirement.TaskRequirementID
 	profile := BalancedRoutingPolicyProfile(fixture.now)
 	input.RoutingPolicyProfile = profile
 	input.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
@@ -273,6 +491,94 @@ func persistFallbackOriginalRoute(t *testing.T, ctx context.Context, store stora
 		t.Fatal("fixture did not choose an original candidate")
 	}
 	return decision, input
+}
+
+func persistFallbackTaskRequirement(t *testing.T, ctx context.Context, store storage.Store, req taskrequirements.TaskRequirement, now time.Time) taskrequirements.TaskRequirement {
+	t.Helper()
+	at := delivery.CanonicalTimestamp(now)
+	_, err := delivery.PersistTask(ctx, store, delivery.Task{
+		SchemaVersion:            delivery.SchemaTask,
+		RecordVersion:            1,
+		TaskID:                   req.TaskID,
+		TaskKey:                  req.TaskKey,
+		DeliveryRunID:            req.DeliveryRunID,
+		ProjectID:                req.ProjectID,
+		State:                    delivery.TaskReady,
+		Title:                    req.TaskKey,
+		RequirementsJSON:         "{}",
+		ScopeJSON:                "{}",
+		Permission:               string(req.PermissionRequired),
+		SideEffectClass:          string(req.SideEffectClass),
+		PolicyVersion:            req.PolicyVersion,
+		PlanFingerprint:          req.PlanFingerprint,
+		AuthorizationFingerprint: testFingerprint("auth"),
+		CreatedAt:                at,
+		UpdatedAt:                at,
+		ReadyAt:                  at,
+		CreatedBy:                routerActor(),
+		UpdatedBy:                routerActor(),
+		Host:                     routingHost(),
+	}, delivery.PersistOptions{IdempotencyKey: "task-" + req.TaskID, Now: now})
+	if err != nil {
+		t.Fatalf("persist fallback delivery task: %v", err)
+	}
+	req.TaskRequirementFingerprint = ""
+	stored, err := taskrequirements.PersistTaskRequirement(ctx, store, req, taskrequirements.PersistOptions{Now: now})
+	if err != nil {
+		t.Fatalf("persist fallback task requirement: %v", err)
+	}
+	return stored
+}
+
+func persistPolicyPin(t *testing.T, ctx context.Context, store storage.Store, profile RoutingPolicyProfile, constraint CandidateConstraint) PolicyInputRecord {
+	t.Helper()
+	record, err := PersistPolicyInput(ctx, store, PolicyInputRecord{
+		SchemaVersion:          PolicyInputSchema,
+		RecordVersion:          1,
+		InputKind:              PolicyInputKindPin,
+		ProjectID:              "proj-routing",
+		DeliveryRunID:          "drun-routing",
+		RoutingPolicyProfileID: profile.RoutingPolicyProfileID,
+		PolicyFingerprint:      profile.PolicyFingerprint,
+		Scope:                  "delivery-run",
+		Reason:                 "test pin",
+		Status:                 PolicyInputStatusActive,
+		Constraint:             constraint,
+		ValidationStatus:       ValidationStatusValid,
+		Actor:                  userActor(),
+		Host:                   routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("PersistPolicyInput pin: %v", err)
+	}
+	return record
+}
+
+func userActor() delivery.Actor {
+	return delivery.Actor{
+		ActorKind:         "user",
+		ActorID:           "user",
+		DecisionAuthority: "user",
+		Source:            "test",
+	}
+}
+
+func insertDeliveryApproval(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID, planFingerprint, suffix string) {
+	t.Helper()
+	at := delivery.CanonicalTimestamp(store.Now())
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO delivery_approvals(
+			approval_id, schema_version, record_version, project_id, delivery_run_id, approval_kind, authorization_fingerprint,
+			input_fingerprint, policy_fingerprint, plan_fingerprint, approved_side_effect_class, approved_scope_json,
+			approved_by_json, status, approved_at, created_at, updated_at, created_by_json, updated_by_json, host_json
+		) VALUES (?, ?, 1, ?, ?, 'plan-approval', ?, ?, ?, ?, 'provider-launch', '{}', '{}', 'active', ?, ?, ?, '{}', '{}', '{}')`,
+			"appr-"+suffix, delivery.SchemaApproval, projectID, deliveryRunID, testFingerprint("auth-"+suffix),
+			testFingerprint("input"), testFingerprint("delivery-policy"), planFingerprint, at, at, at)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("insert delivery approval: %v", err)
+	}
 }
 
 func schedulerActor() delivery.Actor {

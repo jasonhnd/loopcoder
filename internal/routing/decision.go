@@ -1000,6 +1000,12 @@ func routingTerminalError(code taskrequirements.ErrorCode) error {
 		return taskrequirements.ErrNoEligibleCandidate
 	case taskrequirements.ErrPinnedCandidateIneligibleCode:
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrPinnedCandidateIneligibleCode}
+	case taskrequirements.ErrorCode(delivery.ErrApprovalRequiredCode):
+		return delivery.ErrApprovalRequired
+	case taskrequirements.ErrReplanRequiredCode:
+		return taskrequirements.ErrReplanRequired
+	case taskrequirements.ErrReplanBoundExceededCode:
+		return taskrequirements.ErrReplanBoundExceeded
 	default:
 		return &taskrequirements.TypedError{Code: code}
 	}
