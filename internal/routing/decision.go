@@ -36,13 +36,35 @@ type ComponentName string
 const (
 	ComponentQualityFit     ComponentName = "quality_fit"
 	ComponentQuotaHeadroom  ComponentName = "quota_headroom"
+	ComponentAvailability   ComponentName = "availability"
 	ComponentCost           ComponentName = "cost"
 	ComponentLatency        ComponentName = "latency"
-	ComponentHealth         ComponentName = "health"
 	ComponentDiversity      ComponentName = "diversity"
 	ComponentLocality       ComponentName = "locality"
 	ComponentUserPreference ComponentName = "user_preference"
 )
+
+var supportedComponents = map[ComponentName]bool{
+	ComponentAvailability:   true,
+	ComponentQuotaHeadroom:  true,
+	ComponentQualityFit:     true,
+	ComponentLatency:        true,
+	ComponentCost:           true,
+	ComponentDiversity:      true,
+	ComponentLocality:       true,
+	ComponentUserPreference: true,
+}
+
+var scoringComponentOrder = []ComponentName{
+	ComponentAvailability,
+	ComponentQuotaHeadroom,
+	ComponentQualityFit,
+	ComponentLatency,
+	ComponentCost,
+	ComponentDiversity,
+	ComponentLocality,
+	ComponentUserPreference,
+}
 
 type OptimizationPolicy struct {
 	SchemaVersion          string                `json:"schema_version"`
@@ -189,8 +211,13 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if err != nil {
 		return RoutingDecision{}, err
 	}
-	if input.PolicyFingerprint == "" {
+	if strings.TrimSpace(input.PolicyFingerprint) == "" {
 		input.PolicyFingerprint = policy.PolicyFingerprint
+	} else if strings.TrimSpace(input.PolicyFingerprint) != policy.PolicyFingerprint {
+		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "policy fingerprint does not match routing optimization policy"}
+	}
+	if err := validateDecisionInput(input, policy); err != nil {
+		return RoutingDecision{}, err
 	}
 	eligibility := FilterHardEligibility(input.Inputs)
 	refs := inputRefs(input, eligibility)
@@ -218,11 +245,11 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 		RoutingFingerprint:        routingFingerprint,
 		InputRecordRefs:           refs,
 		CandidateGenerationStatus: CandidateGenerationFull,
-		EligibleCandidates:        eligibility.Eligible,
-		RejectedCandidates:        eligibility.Rejected,
-		UserPinRefs:               pinIDs(input.Inputs.Pins),
+		EligibleCandidates:        nonNilCandidates(eligibility.Eligible),
+		RejectedCandidates:        nonNilRejectedCandidates(eligibility.Rejected),
+		UserPinRefs:               nonNilStrings(pinIDs(input.Inputs.Pins)),
 		FallbackChain:             []string{},
-		BreakerGateRefs:           breakerRefs(eligibility),
+		BreakerGateRefs:           nonNilStrings(breakerRefs(eligibility)),
 		OptimizationPolicy:        policy,
 		RejectedSummary:           rejectedSummary(eligibility.Rejected),
 		CreatedAt:                 delivery.CanonicalTimestamp(input.Now),
@@ -257,6 +284,9 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 func PersistRoutingDecision(ctx context.Context, store storage.Store, decision RoutingDecision) error {
 	payload, err := delivery.CanonicalJSON(decision)
 	if err != nil {
+		return err
+	}
+	if err := validateRoutingDecision(decision); err != nil {
 		return err
 	}
 	inputRefs, err := canonicalString(decision.InputRecordRefs)
@@ -296,7 +326,7 @@ func PersistRoutingDecision(ctx context.Context, store storage.Store, decision R
 		return err
 	}
 	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `INSERT INTO routing_decisions(
+		result, err := tx.Exec(ctx, `INSERT INTO routing_decisions(
 			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
 			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
 			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
@@ -309,7 +339,30 @@ func PersistRoutingDecision(ctx context.Context, store storage.Store, decision R
 			decision.RoleDefinitionID, decision.PlanFingerprint, decision.PolicyFingerprint, decision.RoutingFingerprint,
 			decision.CandidateGenerationStatus, decision.DecisionStatus, decision.ChosenCandidateID, string(decision.TerminalErrorCode),
 			inputRefs, eligible, rejected, scored, alternatives, summary, policy, string(payload), decision.CreatedAt, decision.UpdatedAt, actor, host)
-		return err
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil || affected != 0 {
+			return err
+		}
+		var existingPayload string
+		if err := tx.QueryRow(ctx, `SELECT payload_json FROM routing_decisions WHERE routing_decision_id = ?`, decision.RoutingDecisionID).Scan(&existingPayload); err != nil {
+			return err
+		}
+		var existing RoutingDecision
+		if err := json.Unmarshal([]byte(existingPayload), &existing); err != nil {
+			return err
+		}
+		if existing.RoutingFingerprint != decision.RoutingFingerprint ||
+			existing.PolicyFingerprint != decision.PolicyFingerprint ||
+			existing.PlanFingerprint != decision.PlanFingerprint ||
+			existing.TaskRequirementID != decision.TaskRequirementID ||
+			existing.ChosenCandidateID != decision.ChosenCandidateID ||
+			existing.DecisionStatus != decision.DecisionStatus {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "stored routing decision conflicts with replay inputs"}
+		}
+		return nil
 	})
 }
 
@@ -369,18 +422,22 @@ func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (O
 	}
 	if len(policy.Weights) == 0 {
 		policy.Weights = map[ComponentName]int{
-			ComponentQualityFit:     15,
-			ComponentQuotaHeadroom:  15,
-			ComponentCost:           10,
-			ComponentLatency:        10,
-			ComponentHealth:         25,
-			ComponentDiversity:      10,
-			ComponentLocality:       10,
-			ComponentUserPreference: 5,
+			ComponentAvailability:  30,
+			ComponentQuotaHeadroom: 20,
+			ComponentQualityFit:    20,
+			ComponentLatency:       10,
+			ComponentCost:          10,
+			ComponentDiversity:     10,
 		}
 	}
 	total := 0
-	for _, weight := range policy.Weights {
+	for name, weight := range policy.Weights {
+		if !supportedComponents[name] {
+			return OptimizationPolicy{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unsupported routing optimization component %q", name)}
+		}
+		if weight < 0 || weight > 100 {
+			return OptimizationPolicy{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("routing optimization weight %q must be between 0 and 100", name)}
+		}
 		total += weight
 	}
 	if total != 100 {
@@ -442,15 +499,29 @@ func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationP
 	budgetByID := mapBudgets(inputs.Budgets)
 	out := make([]ScoredCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		components := []ComponentScore{
-			scoreQuality(candidate, inputs.Requirement, policy),
-			scoreQuota(candidate, quotaByID, policy),
-			scoreCost(candidate, budgetByID, policy),
-			scoreLatency(candidate, scoreByID, scoreByCandidate, policy),
-			scoreHealth(candidate, scoreByID, scoreByCandidate, policy),
-			scoreDiversity(candidate, policy),
-			scoreLocality(candidate, policy),
-			scoreUserPreference(candidate, policy),
+		components := make([]ComponentScore, 0, len(policy.Weights))
+		for _, name := range scoringComponentOrder {
+			if _, ok := policy.Weights[name]; !ok {
+				continue
+			}
+			switch name {
+			case ComponentAvailability:
+				components = append(components, scoreAvailability(candidate, scoreByID, scoreByCandidate, policy))
+			case ComponentQuotaHeadroom:
+				components = append(components, scoreQuota(candidate, quotaByID, policy))
+			case ComponentQualityFit:
+				components = append(components, scoreQuality(candidate, inputs.Requirement, policy))
+			case ComponentLatency:
+				components = append(components, scoreLatency(candidate, scoreByID, scoreByCandidate, policy))
+			case ComponentCost:
+				components = append(components, scoreCost(candidate, budgetByID, policy))
+			case ComponentDiversity:
+				components = append(components, scoreDiversity(candidate, policy))
+			case ComponentLocality:
+				components = append(components, scoreLocality(candidate, policy))
+			case ComponentUserPreference:
+				components = append(components, scoreUserPreference(candidate, policy))
+			}
 		}
 		totalBasis := 0
 		heuristic := false
@@ -557,7 +628,7 @@ func scoreLatency(candidate Candidate, scoreByID map[string]availability.Score, 
 	return component(ComponentLatency, score, policy, confidence, true, "latency defaults conservatively unless availability observations provide a latency component", evidence, nil)
 }
 
-func scoreHealth(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy OptimizationPolicy) ComponentScore {
+func scoreAvailability(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy OptimizationPolicy) ComponentScore {
 	score := 0
 	confidence := providerinventory.ConfidenceUnknown
 	var evidence []string
@@ -567,7 +638,7 @@ func scoreHealth(candidate Candidate, scoreByID map[string]availability.Score, s
 		evidence = append(evidence, av.AvailabilityScoreID)
 		evidence = append(evidence, av.EvidenceRecordIDs...)
 	}
-	return component(ComponentHealth, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "health score comes from the persisted availability score", evidence, nil)
+	return component(ComponentAvailability, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "availability score comes from the persisted AvailabilityScore record", evidence, nil)
 }
 
 func scoreDiversity(candidate Candidate, policy OptimizationPolicy) ComponentScore {
@@ -883,6 +954,27 @@ func minInt64(a, b int64) int64 {
 	return b
 }
 
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+func nonNilCandidates(values []Candidate) []Candidate {
+	if values == nil {
+		return []Candidate{}
+	}
+	return values
+}
+
+func nonNilRejectedCandidates(values []RejectedCandidate) []RejectedCandidate {
+	if values == nil {
+		return []RejectedCandidate{}
+	}
+	return values
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -890,4 +982,120 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func validateDecisionInput(input DecisionInput, policy OptimizationPolicy) error {
+	if strings.TrimSpace(input.TaskRequirementID) == "" || strings.TrimSpace(input.RoleDefinitionID) == "" || strings.TrimSpace(input.PlanFingerprint) == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "task_requirement_id, role_definition_id, and plan_fingerprint are required"}
+	}
+	if input.Now.IsZero() {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision clock is required"}
+	}
+	if !validFingerprint(input.PlanFingerprint) || !validFingerprint(input.PolicyFingerprint) || !validFingerprint(policy.PolicyFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision fingerprints must be sha256 digests"}
+	}
+	if input.TaskRequirementID != input.Inputs.Requirement.TaskRequirementID {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "task_requirement_id does not match requirement record"}
+	}
+	if input.ProjectID != input.Inputs.Requirement.ProjectID || input.DeliveryRunID != input.Inputs.Requirement.DeliveryRunID {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision project/run does not match task requirement"}
+	}
+	if input.PlanFingerprint != input.Inputs.Requirement.PlanFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision plan fingerprint does not match task requirement"}
+	}
+	if err := taskrequirements.Validate(input.Inputs.Requirement); err != nil {
+		return err
+	}
+	if err := validateActor(input.DecidedBy); err != nil {
+		return err
+	}
+	return validateHost(input.Host)
+}
+
+func validateRoutingDecision(decision RoutingDecision) error {
+	if decision.SchemaVersion != DecisionSchema || decision.RecordVersion != 1 ||
+		decision.RoutingDecisionID == "" || decision.DecisionKey == "" || decision.DecisionKind != DecisionKindRouting ||
+		decision.ProjectID == "" || decision.DeliveryRunID == "" || decision.TaskID == "" ||
+		decision.TaskRequirementID == "" || decision.RoutingPolicyProfileID == "" || decision.RoleDefinitionID == "" ||
+		decision.PlanFingerprint == "" || decision.PolicyFingerprint == "" || decision.RoutingFingerprint == "" ||
+		decision.CandidateGenerationStatus == "" || decision.DecisionStatus == "" || decision.CreatedAt == "" || decision.UpdatedAt == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision has missing required fields"}
+	}
+	if decision.CandidateGenerationStatus != CandidateGenerationFull {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown routing candidate generation status"}
+	}
+	if decision.DecisionStatus != DecisionStatusSelected && decision.DecisionStatus != DecisionStatusNoEligible {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown routing decision status"}
+	}
+	if !validFingerprint(decision.PlanFingerprint) || !validFingerprint(decision.PolicyFingerprint) || !validFingerprint(decision.RoutingFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision fingerprints must be sha256 digests"}
+	}
+	if decision.PolicyFingerprint != decision.OptimizationPolicy.PolicyFingerprint {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision policy fingerprint does not match optimization policy"}
+	}
+	if decision.RoutingDecisionID != routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision id does not match routing fingerprint"}
+	}
+	if len(decision.InputRecordRefs) == 0 || decision.UserPinRefs == nil || decision.FallbackChain == nil || decision.BreakerGateRefs == nil || decision.HeuristicComponents == nil || decision.RejectedSummary == nil || decision.Alternatives == nil {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision required arrays/maps must be present"}
+	}
+	if err := validateActor(decision.DecidedBy); err != nil {
+		return err
+	}
+	if err := validateHost(decision.Host); err != nil {
+		return err
+	}
+	if decision.DecisionStatus == DecisionStatusSelected {
+		if decision.ChosenCandidateID == "" || decision.TerminalErrorCode != "" {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "selected routing decision must have chosen candidate and no terminal error"}
+		}
+		found := false
+		for _, candidate := range decision.ScoredCandidates {
+			if candidate.RoutingCandidateID == decision.ChosenCandidateID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "chosen candidate was not scored"}
+		}
+		return nil
+	}
+	if decision.ChosenCandidateID != "" || len(decision.ScoredCandidates) != 0 || decision.TerminalErrorCode == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "blocked routing decision must not choose or score candidates"}
+	}
+	if decision.TerminalErrorCode != taskrequirements.ErrNoEligibleCandidateCode && decision.TerminalErrorCode != taskrequirements.ErrPinnedCandidateIneligibleCode {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown routing terminal error code"}
+	}
+	return nil
+}
+
+func validateActor(actor delivery.Actor) error {
+	if strings.TrimSpace(actor.ActorKind) == "" || strings.TrimSpace(actor.ActorID) == "" || strings.TrimSpace(actor.DecisionAuthority) == "" || strings.TrimSpace(actor.Source) == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision provenance actor has missing required fields"}
+	}
+	if actor.DecisionAuthority != "router" && actor.DecisionAuthority != "user" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision authority must be router or user"}
+	}
+	return nil
+}
+
+func validateHost(host delivery.Host) error {
+	if strings.TrimSpace(host.HostKind) == "" || strings.TrimSpace(host.HostID) == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision host has missing required fields"}
+	}
+	return nil
+}
+
+func validFingerprint(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	for _, ch := range value[len("sha256:"):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,13 +24,18 @@ func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsAlternatives(t *tes
 			scores[i].Score = 95
 		}
 	}
-	req := workerRequirement("task-route-decision")
+	planFingerprint := testFingerprint("plan-route-decision")
+	req := decisionRequirement(t, fixture, workerRequirement("task-route-decision"), "treq-route-decision", planFingerprint)
 	input := DecisionInput{
 		ProjectID:         "proj-routing",
 		DeliveryRunID:     "drun-routing",
 		DecisionKey:       "route-worker",
-		TaskRequirementID: "treq-routing",
-		PlanFingerprint:   "sha256:plan",
+		TaskRequirementID: req.TaskRequirementID,
+		RoleDefinitionID:  "role-worker",
+		PlanFingerprint:   planFingerprint,
+		DecidedBy:         routerActor(),
+		Host:              routingHost(),
+		Now:               fixture.now,
 		Inputs: Inputs{
 			Requirement: req,
 			Candidates: []Candidate{
@@ -48,7 +54,6 @@ func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsAlternatives(t *tes
 				RequireBudgetEvidence:       true,
 			},
 		},
-		Now: fixture.now,
 	}
 	decision, err := BuildRoutingDecision(input)
 	if err != nil {
@@ -72,6 +77,151 @@ func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsAlternatives(t *tes
 	}
 	if !strings.Contains(string(stable), `"scored_candidates"`) || !strings.Contains(string(stable), `"alternatives"`) {
 		t.Fatalf("stable explain JSON missing scored candidates/alternatives: %s", stable)
+	}
+}
+
+func TestRouteDecisionDefaultBalancedV1WeightsAndAvailabilityComponent(t *testing.T) {
+	fixture := newFixture(t)
+	decision, err := BuildRoutingDecision(replayDecisionInput(fixture))
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	wantWeights := map[ComponentName]int{
+		ComponentAvailability:  30,
+		ComponentQuotaHeadroom: 20,
+		ComponentQualityFit:    20,
+		ComponentLatency:       10,
+		ComponentCost:          10,
+		ComponentDiversity:     10,
+	}
+	if len(decision.OptimizationPolicy.Weights) != len(wantWeights) {
+		t.Fatalf("default weights = %#v, want exactly %#v", decision.OptimizationPolicy.Weights, wantWeights)
+	}
+	for name, want := range wantWeights {
+		if got := decision.OptimizationPolicy.Weights[name]; got != want {
+			t.Fatalf("weight %s = %d, want %d", name, got, want)
+		}
+	}
+	for _, candidate := range decision.ScoredCandidates {
+		if len(candidate.Components) != len(wantWeights) {
+			t.Fatalf("components = %#v, want exactly %d default components", candidate.Components, len(wantWeights))
+		}
+		if !hasComponent(candidate.Components, ComponentAvailability) {
+			t.Fatalf("components missing availability score: %#v", candidate.Components)
+		}
+		if hasComponent(candidate.Components, "health") || hasComponent(candidate.Components, ComponentLocality) || hasComponent(candidate.Components, ComponentUserPreference) {
+			t.Fatalf("balanced-v1 silently included non-default component: %#v", candidate.Components)
+		}
+	}
+}
+
+func TestRouteDecisionRejectsInvalidWeightsBeforeScoring(t *testing.T) {
+	fixture := newFixture(t)
+	for name, weights := range map[string]map[ComponentName]int{
+		"unknown": {
+			ComponentAvailability:  90,
+			ComponentName("bogus"): 10,
+		},
+		"negative": {
+			ComponentAvailability:  30,
+			ComponentQuotaHeadroom: 20,
+			ComponentQualityFit:    20,
+			ComponentLatency:       10,
+			ComponentCost:          -1,
+			ComponentDiversity:     21,
+		},
+		"oversized": {
+			ComponentAvailability: 101,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := replayDecisionInput(fixture)
+			input.OptimizationPolicy.Weights = weights
+			if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+				t.Fatalf("BuildRoutingDecision error = %v, want ErrInvalidRecord", err)
+			}
+		})
+	}
+}
+
+func TestRouteDecisionRejectsPolicyFingerprintMismatch(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.PolicyFingerprint = testFingerprint("wrong-policy")
+	if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("BuildRoutingDecision error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestRouteDecisionRejectsMalformedRequiredInputs(t *testing.T) {
+	fixture := newFixture(t)
+	cases := map[string]func(*DecisionInput){
+		"task requirement": func(input *DecisionInput) { input.TaskRequirementID = "" },
+		"role definition":  func(input *DecisionInput) { input.RoleDefinitionID = "" },
+		"plan fingerprint": func(input *DecisionInput) { input.PlanFingerprint = "sha256:plan" },
+		"actor authority":  func(input *DecisionInput) { input.DecidedBy.DecisionAuthority = "operator" },
+		"host":             func(input *DecisionInput) { input.Host.HostID = "" },
+		"unknown requirement value": func(input *DecisionInput) {
+			input.Inputs.Requirement.RiskTier = taskrequirements.RiskTier("surprise")
+			input.Inputs.Requirement.TaskRequirementFingerprint = ""
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			input := replayDecisionInput(fixture)
+			mutate(&input)
+			if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+				t.Fatalf("BuildRoutingDecision error = %v, want ErrInvalidRecord", err)
+			}
+		})
+	}
+}
+
+func TestPersistRoutingDecisionValidatesDerivedFingerprintFields(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+
+	decision, err := BuildRoutingDecision(replayDecisionInput(fixture))
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	decision.PolicyFingerprint = testFingerprint("tampered-policy")
+	if err := PersistRoutingDecision(ctx, store, decision); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("PersistRoutingDecision error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestRouteDecisionStableExplainGolden(t *testing.T) {
+	fixture := newFixture(t)
+	decision, err := BuildRoutingDecision(replayDecisionInput(fixture))
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	got, err := ExplainJSON(decision)
+	if err != nil {
+		t.Fatalf("ExplainJSON: %v", err)
+	}
+	if os.Getenv("UPDATE_ROUTING_GOLDEN") == "1" {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatalf("mkdir testdata: %v", err)
+		}
+		if err := os.WriteFile("testdata/route_explain_selected.golden.json", got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+		return
+	}
+	want, err := os.ReadFile("testdata/route_explain_selected.golden.json")
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("stable explain JSON mismatch\nwant:\n%s\n\ngot:\n%s", want, got)
 	}
 }
 
@@ -126,13 +276,13 @@ func TestRouteDecisionWeightChangeCreatesNewPolicyVersionWithoutRewritingHistory
 		t.Fatalf("DecideAndPersistRoute first: %v", err)
 	}
 	input.OptimizationPolicy.Weights = map[ComponentName]int{
-		ComponentQualityFit:     30,
+		ComponentAvailability:   10,
+		ComponentQualityFit:     20,
 		ComponentQuotaHeadroom:  10,
 		ComponentCost:           10,
 		ComponentLatency:        10,
-		ComponentHealth:         10,
 		ComponentDiversity:      10,
-		ComponentLocality:       10,
+		ComponentLocality:       20,
 		ComponentUserPreference: 10,
 	}
 	second, err := DecideAndPersistRoute(ctx, store, input)
@@ -182,6 +332,13 @@ func TestRouteDecisionNoEligibleCandidatePersistsTypedBlockedDecision(t *testing
 	if loaded.DecisionStatus != DecisionStatusNoEligible || len(loaded.RejectedCandidates) != 1 || len(loaded.Alternatives) == 0 {
 		t.Fatalf("loaded blocked decision missing rejection evidence: %#v", loaded)
 	}
+	replayed, err := DecideAndPersistRoute(ctx, store, input)
+	if !errors.Is(err, taskrequirements.ErrNoEligibleCandidate) {
+		t.Fatalf("blocked replay error = %v, want ErrNoEligibleCandidate", err)
+	}
+	if replayed.RoutingDecisionID != decision.RoutingDecisionID || replayed.CreatedAt != decision.CreatedAt || replayed.TerminalErrorCode != taskrequirements.ErrNoEligibleCandidateCode {
+		t.Fatalf("blocked replay changed immutable decision:\nfirst=%#v\nreplay=%#v", decision, replayed)
+	}
 }
 
 func replayDecisionInput(fixture hardFixture) DecisionInput {
@@ -190,20 +347,18 @@ func replayDecisionInput(fixture hardFixture) DecisionInput {
 		scores[i].Score = 90
 		scores[i].ScoreConfidence = providerinventory.ConfidenceExact
 	}
-	req := workerRequirement("task-a")
+	planFingerprint := testFingerprint("plan-routing")
+	req := decisionRequirement(nil, fixture, workerRequirement("task-a"), "treq-routing", planFingerprint)
 	return DecisionInput{
 		ProjectID:         "proj-routing",
 		DeliveryRunID:     "drun-routing",
 		DecisionKey:       "route-worker",
-		TaskRequirementID: "treq-routing",
-		PlanFingerprint:   "sha256:plan",
-		DecidedBy: delivery.Actor{
-			ActorKind:         "system",
-			ActorID:           "router",
-			DecisionAuthority: "router",
-			Source:            "test",
-		},
-		Host: delivery.Host{HostKind: "test", HostID: "routing-test"},
+		TaskRequirementID: req.TaskRequirementID,
+		RoleDefinitionID:  "role-worker",
+		PlanFingerprint:   planFingerprint,
+		DecidedBy:         routerActor(),
+		Host:              routingHost(),
+		Now:               fixture.now,
 		Inputs: Inputs{
 			Requirement: req,
 			Candidates: []Candidate{
@@ -246,7 +401,7 @@ func seedRoutingDecisionStore(t *testing.T, ctx context.Context, store storage.S
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', '{}')
 			ON CONFLICT(delivery_run_id) DO NOTHING`,
 			"drun-routing", "run-routing", delivery.SchemaDeliveryRun, 1, "proj-routing", "run-routing", "",
-			"approved", "routing test", "sha256:input", "sha256:policy", "sha256:plan", "sha256:auth",
+			"approved", "routing test", testFingerprint("input"), testFingerprint("delivery-policy"), testFingerprint("plan-routing"), testFingerprint("auth"),
 			"routing-test", "provider-launch", "approved", "none", at, at); err != nil {
 			return err
 		}
@@ -255,6 +410,68 @@ func seedRoutingDecisionStore(t *testing.T, ctx context.Context, store storage.S
 	if err != nil {
 		t.Fatalf("seed storage: %v", err)
 	}
+}
+
+func decisionRequirement(t *testing.T, fixture hardFixture, req taskrequirements.TaskRequirement, reqID, planFingerprint string) taskrequirements.TaskRequirement {
+	if t != nil {
+		t.Helper()
+	}
+	req.SchemaVersion = taskrequirements.SchemaTaskRequirement
+	req.RecordVersion = 1
+	req.TaskRequirementID = reqID
+	req.ProjectID = "proj-routing"
+	req.DeliveryRunID = "drun-routing"
+	req.TaskKey = req.TaskID
+	req.RequiredOutput = taskrequirements.OutputMarkdown
+	req.ScopeJSON = "{}"
+	req.DataClassification = "internal"
+	req.ClassificationRules = []string{"test.routing"}
+	req.ProvenanceSummary = "test routing requirement"
+	req.PolicyVersion = "routing-test"
+	req.PlanFingerprint = planFingerprint
+	req.CreatedAt = delivery.CanonicalTimestamp(fixture.now)
+	req.UpdatedAt = req.CreatedAt
+	req.CreatedBy = routerActor()
+	req.UpdatedBy = routerActor()
+	req.Host = routingHost()
+	req.Classification = "deterministic"
+	req.Confidence = providerinventory.ConfidenceExact
+	req.Source = taskrequirements.SourceDescriptor{SourceKind: "test", SourceReference: "routing"}
+	fp, err := taskrequirements.FingerprintRequirement(req)
+	if err != nil {
+		if t != nil {
+			t.Fatalf("FingerprintRequirement: %v", err)
+		}
+		panic(err)
+	}
+	req.TaskRequirementFingerprint = fp
+	return req
+}
+
+func routerActor() delivery.Actor {
+	return delivery.Actor{
+		ActorKind:         "system",
+		ActorID:           "router",
+		DecisionAuthority: "router",
+		Source:            "test",
+	}
+}
+
+func routingHost() delivery.Host {
+	return delivery.Host{HostKind: "test", HostID: "routing-test"}
+}
+
+func testFingerprint(value string) string {
+	return delivery.SHA256Digest([]byte(value))
+}
+
+func hasComponent(components []ComponentScore, name ComponentName) bool {
+	for _, component := range components {
+		if component.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func assertRoutingDecisionCount(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey string, want int) {
