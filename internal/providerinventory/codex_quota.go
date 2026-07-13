@@ -51,6 +51,11 @@ type CodexAppServerResult struct {
 	Killed   bool
 }
 
+type codexProtocolStdoutEvent struct {
+	line string
+	err  error
+}
+
 type jsonRPCMessage struct {
 	ID     any             `json:"id,omitempty"`
 	Method string          `json:"method,omitempty"`
@@ -326,8 +331,20 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 }
 
 func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io.Reader, retained *boundedBuffer) error {
-	lines := make(chan string, 16)
-	errCh := make(chan error, 1)
+	events := scanCodexAppServerStdout(ctx, stdout, retained)
+	return driveCodexAppServerProtocolEvents(ctx, stdin, events)
+}
+
+func scanCodexAppServerStdout(ctx context.Context, stdout io.Reader, retained *boundedBuffer) <-chan codexProtocolStdoutEvent {
+	events := make(chan codexProtocolStdoutEvent, 16)
+	send := func(event codexProtocolStdoutEvent) bool {
+		select {
+		case events <- event:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 4096), codexQuotaLineBytes)
@@ -336,20 +353,23 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 			if line == "" {
 				continue
 			}
-			_, _ = retained.Write([]byte(line + "\n"))
-			select {
-			case lines <- line:
-			case <-ctx.Done():
-				errCh <- ctx.Err()
+			if retained != nil {
+				_, _ = retained.Write([]byte(line + "\n"))
+			}
+			if !send(codexProtocolStdoutEvent{line: line}) {
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			errCh <- fmt.Errorf("%w: jsonl read: %v", ErrCodexQuotaMalformed, err)
+			_ = send(codexProtocolStdoutEvent{err: fmt.Errorf("%w: jsonl read: %v", ErrCodexQuotaMalformed, err)})
 			return
 		}
-		errCh <- io.EOF
+		_ = send(codexProtocolStdoutEvent{err: io.EOF})
 	}()
+	return events
+}
+
+func driveCodexAppServerProtocolEvents(ctx context.Context, stdin io.Writer, events <-chan codexProtocolStdoutEvent) error {
 	if err := writeJSONL(stdin, jsonRPCMessage{ID: 1, Method: "initialize", Params: map[string]any{
 		"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion},
 		"capabilities": map[string]any{
@@ -364,7 +384,14 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 	limitsSeen := false
 	for {
 		select {
-		case line := <-lines:
+		case event := <-events:
+			if event.err != nil {
+				if errors.Is(event.err, io.EOF) {
+					return fmt.Errorf("%w: eof before required responses", ErrCodexQuotaMalformed)
+				}
+				return event.err
+			}
+			line := event.line
 			msg, err := decodeCodexJSONLMessage(line)
 			if err != nil {
 				return err
@@ -404,11 +431,6 @@ func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io
 			if initialized && accountSeen && limitsSeen {
 				return nil
 			}
-		case err := <-errCh:
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("%w: eof before required responses", ErrCodexQuotaMalformed)
-			}
-			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		}

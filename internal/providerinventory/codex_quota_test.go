@@ -633,6 +633,19 @@ func TestRunCodexAppServerProtocolFailuresUseTypedErrors(t *testing.T) {
 	}
 }
 
+func TestDriveCodexAppServerProtocolPreservesRPCErrorBeforeEOF(t *testing.T) {
+	events := make(chan codexProtocolStdoutEvent, 4)
+	for _, line := range strings.Split(strings.TrimSpace(codexQuotaRPCErrorFrames(t)), "\n") {
+		events <- codexProtocolStdoutEvent{line: line}
+	}
+	events <- codexProtocolStdoutEvent{err: io.EOF}
+
+	err := driveCodexAppServerProtocolEvents(context.Background(), io.Discard, events)
+	if !errors.Is(err, ErrCodexQuotaRPC) {
+		t.Fatalf("driveCodexAppServerProtocolEvents err = %v, want rpc error", err)
+	}
+}
+
 func TestInspectCodexQuotaPreservesRealRunnerProtocolFailures(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
