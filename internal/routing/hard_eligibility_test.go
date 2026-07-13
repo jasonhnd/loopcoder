@@ -3,11 +3,13 @@ package routing
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/availability"
 	"github.com/jasonhnd/loopcoder/internal/budget"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
@@ -188,6 +190,396 @@ func TestFixturesCoverMultipleAccountsModelsHostsAndVerifierConstraints(t *testi
 	})
 	if !rejectedHas(limitedHost, candidates[1].RoutingCandidateID, RejectRoleUnsupported) {
 		t.Fatalf("limited host rejections = %#v, want host compatibility rejection", limitedHost.Rejected)
+	}
+}
+
+func TestBuiltInSoulTeraLunaRolesAreProviderNeutralEnvelopes(t *testing.T) {
+	roles := BuiltInRoleDefinitions()
+	byKey := map[string]RoleDefinition{}
+	for _, role := range roles {
+		byKey[role.RoleKey] = role
+		payload, err := json.Marshal(role)
+		if err != nil {
+			t.Fatalf("marshal role %s: %v", role.RoleKey, err)
+		}
+		for _, forbidden := range []string{"gpt-", "claude-", "gemini-", "codex", "opus"} {
+			if strings.Contains(strings.ToLower(string(payload)), forbidden) {
+				t.Fatalf("built-in role %s contains model/provider identifier %q: %s", role.RoleKey, forbidden, payload)
+			}
+		}
+		for _, want := range []string{"provider_name", "model_id", "account_profile_id"} {
+			if !containsString(role.ForbiddenBindings, want) {
+				t.Fatalf("built-in role %s forbidden_bindings = %#v, want %s", role.RoleKey, role.ForbiddenBindings, want)
+			}
+		}
+	}
+	for _, key := range []string{RoleKeySoul, RoleKeyTera, RoleKeyLuna} {
+		role := byKey[key]
+		if role.RoleDefinitionID == "" || role.SchemaVersion != RoleDefinitionSchema || len(role.MinimumCapabilities) == 0 {
+			t.Fatalf("role %s = %#v, want versioned capability envelope", key, role)
+		}
+	}
+}
+
+func TestCustomRoleDefinitionRoutesWithoutRouterCodeChange(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-custom-role")
+	req.RoleKey = "docs-auditor"
+	req.PermissionRequired = taskrequirements.PermissionReadOnly
+	req.RequiredOutput = taskrequirements.OutputVerificationVerdict
+	custom := RoleDefinition{
+		SchemaVersion:         RoleDefinitionSchema,
+		RecordVersion:         1,
+		RoleKey:               "docs-auditor",
+		RoleVersion:           "1",
+		Description:           "custom read-only JSON verifier envelope",
+		AllowedRiskTiers:      []taskrequirements.RiskTier{taskrequirements.RiskMedium},
+		MinimumCapabilities:   []taskrequirements.CapabilityRequirement{roleCapability(taskrequirements.CapabilityRolesSupported, RoleKeyVerifier), boolCapability(taskrequirements.CapabilityReadOnly), boolCapability(taskrequirements.CapabilityJSONOutput)},
+		PermissionFloor:       taskrequirements.PermissionReadOnly,
+		PermissionCeiling:     taskrequirements.PermissionReadOnly,
+		DefaultOutputContract: taskrequirements.OutputVerificationVerdict,
+		MaxSideEffectClass:    taskrequirements.SideEffectProviderLaunch,
+		QualityFloor:          taskrequirements.QualityStandard,
+		ReasoningDepth:        ReasoningDepthStandard,
+		LatencyTolerance:      LatencyToleranceStandard,
+		CostTolerance:         CostToleranceStandard,
+		PolicyVersion:         RoleDefinitionPolicyVersion,
+	}
+	candidate := fixture.candidate("codex", "acct-b", "codex-verifier")
+	candidate.RoleKey = "docs-auditor"
+	candidate.Permission = taskrequirements.PermissionReadOnly
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		RoleDefinitions: []RoleDefinition{custom},
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 1 {
+		t.Fatalf("eligible custom role = %#v rejected=%#v, want one candidate", result.Eligible, result.Rejected)
+	}
+}
+
+func TestConfigCustomRoleConvertsIntoHardEligibilityPath(t *testing.T) {
+	fixture := newFixture(t)
+	parsed, err := config.Parse([]byte(`
+version: 1
+role_definitions:
+  - schema_version: loopcoder.role_definition.v1
+    record_version: 1
+    role_key: tool-auditor
+    role_version: "1"
+    description: Custom worker role requiring tool and context evidence
+    allowed_risk_tiers: [medium]
+    minimum_capabilities:
+      - dimension: roles_supported
+        required_value: worker
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+    permission_floor: read-only
+    permission_ceiling: write
+    default_output_contract: markdown
+    quality_floor: standard
+    reasoning_depth: standard
+    required_tools: [filesystem-read]
+    minimum_context_window_tokens: 120000
+    max_side_effect_class: provider-launch
+    latency_tolerance: standard
+    cost_tolerance: standard
+    policy_version: role-definition-v1
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	roles, err := RoleDefinitionsFromConfig(parsed.RoleDefinitions)
+	if err != nil {
+		t.Fatalf("RoleDefinitionsFromConfig() error = %v", err)
+	}
+	req := workerRequirement("task-config-role")
+	req.RoleKey = "tool-auditor"
+	req.PermissionRequired = taskrequirements.PermissionReadOnly
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	candidate.RoleKey = "tool-auditor"
+	candidate.Permission = taskrequirements.PermissionReadOnly
+
+	rejected := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		RoleDefinitions: roles,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(rejected.Eligible) != 0 {
+		t.Fatalf("eligible without context/tool evidence = %#v, want rejected", rejected.Eligible)
+	}
+	if !rejectedHas(rejected, candidate.RoutingCandidateID, RejectContextWindowInsufficient) || !rejectedHas(rejected, candidate.RoutingCandidateID, RejectToolSupportUnsupported) {
+		t.Fatalf("rejections = %#v, want context and tool hard failures", rejected.Rejected)
+	}
+
+	fixture.inventory.ModelCapabilities[0].ContextWindowTokens = &providerinventory.CapabilityNumeric{Value: 200000, Confidence: providerinventory.ConfidenceExact}
+	fixture.inventory.ModelCapabilities[0].ToolSupport = []providerinventory.CapabilityFact{{Name: "filesystem-read", Value: "supported", Confidence: providerinventory.ConfidenceExact}}
+	eligible := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		RoleDefinitions: roles,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(eligible.Eligible) != 1 {
+		t.Fatalf("eligible with context/tool evidence = %#v rejected=%#v, want one candidate", eligible.Eligible, eligible.Rejected)
+	}
+}
+
+func TestRoleIndependenceRequirementAppliesWithoutWeakeningTask(t *testing.T) {
+	fixture := newFixture(t)
+	req := verifierRequirement("task-role-independence")
+	req.RoleKey = "strict-verifier"
+	req.PermissionRequired = taskrequirements.PermissionWrite
+	req.VerificationRequirements = nil
+	role := RoleDefinition{
+		SchemaVersion:            RoleDefinitionSchema,
+		RecordVersion:            1,
+		RoleKey:                  "strict-verifier",
+		RoleVersion:              "1",
+		Description:              "Verifier role with provider independence for high risk",
+		AllowedRiskTiers:         []taskrequirements.RiskTier{taskrequirements.RiskHigh},
+		MinimumCapabilities:      []taskrequirements.CapabilityRequirement{roleCapability(taskrequirements.CapabilityRolesSupported, RoleKeyVerifier), boolCapability(taskrequirements.CapabilityReadOnly), boolCapability(taskrequirements.CapabilityJSONOutput)},
+		PermissionFloor:          taskrequirements.PermissionReadOnly,
+		PermissionCeiling:        taskrequirements.PermissionReadOnly,
+		DefaultOutputContract:    taskrequirements.OutputVerificationVerdict,
+		IndependenceRequirements: map[taskrequirements.RiskTier]taskrequirements.IndependenceLevel{taskrequirements.RiskHigh: taskrequirements.IndependenceDifferentProvider},
+		QualityFloor:             taskrequirements.QualityStandard,
+		ReasoningDepth:           ReasoningDepthAdversarial,
+		MaxSideEffectClass:       taskrequirements.SideEffectProviderLaunch,
+		LatencyTolerance:         LatencyToleranceStandard,
+		CostTolerance:            CostToleranceStandard,
+		PolicyVersion:            RoleDefinitionPolicyVersion,
+	}
+	worker := fixture.candidate("codex", "acct-a", "codex-good")
+	candidate := fixture.candidate("codex", "acct-b", "codex-verifier")
+	candidate.RoleKey = "strict-verifier"
+	candidate.Permission = taskrequirements.PermissionReadOnly
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		RoleDefinitions: []RoleDefinition{role},
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+		WorkerRoute:     &worker,
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible same-provider verifier = %#v, want role independence rejection", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectVerifierIndependenceInsufficient) {
+		t.Fatalf("rejections = %#v, want verifier-independence-insufficient", result.Rejected)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectPermissionUnsupported) {
+		t.Fatalf("rejections = %#v, want task read-only hard floor preserved", result.Rejected)
+	}
+}
+
+func TestProgrammaticCustomRoleValidationFailsClosed(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-invalid-role")
+	req.RoleKey = "invalid-role"
+	role := RoleDefinition{
+		SchemaVersion:         RoleDefinitionSchema,
+		RecordVersion:         1,
+		RoleKey:               "invalid-role",
+		RoleVersion:           "1",
+		Description:           "Invalid role",
+		AllowedRiskTiers:      []taskrequirements.RiskTier{taskrequirements.RiskMedium},
+		MinimumCapabilities:   []taskrequirements.CapabilityRequirement{{Dimension: taskrequirements.CapabilityDimension("unknown_dimension"), RequiredValue: true, MinimumConfidence: providerinventory.ConfidenceExact, FreshnessRequired: providerinventory.FreshnessFresh}},
+		PermissionFloor:       taskrequirements.PermissionWrite,
+		PermissionCeiling:     taskrequirements.PermissionReadOnly,
+		DefaultOutputContract: taskrequirements.OutputPatch,
+		QualityFloor:          taskrequirements.QualityStandard,
+		ReasoningDepth:        ReasoningDepthStandard,
+		MaxSideEffectClass:    taskrequirements.SideEffectProviderLaunch,
+		LatencyTolerance:      LatencyToleranceStandard,
+		CostTolerance:         CostToleranceStandard,
+		PolicyVersion:         RoleDefinitionPolicyVersion,
+	}
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	candidate.RoleKey = "invalid-role"
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		RoleDefinitions: []RoleDefinition{role},
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible invalid programmatic role = %#v, want fail closed", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectRoleUnsupported) {
+		t.Fatalf("rejections = %#v, want role-unsupported", result.Rejected)
+	}
+}
+
+func TestUnknownTaskCapabilityDimensionFailsClosed(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-unknown-capability")
+	req.RequiredCapabilities = append(req.RequiredCapabilities, taskrequirements.CapabilityRequirement{
+		Dimension:         taskrequirements.CapabilityDimension("future_capability"),
+		RequiredValue:     true,
+		MinimumConfidence: providerinventory.ConfidenceExact,
+		FreshnessRequired: providerinventory.FreshnessFresh,
+	})
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible unknown task capability = %#v, want fail closed", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectUnknownRecordVersion) {
+		t.Fatalf("rejections = %#v, want unknown-record-version", result.Rejected)
+	}
+}
+
+func TestNestedSubagentPermissionCannotExceedParentDelegation(t *testing.T) {
+	fixture := newFixture(t)
+	nestedModel := model("codex", "codex-nested", "nested-current", []providerinventory.CatalogRole{providerinventory.CatalogRoleNestedSubagents}, fixture.now, caps{nested: providerinventory.CapabilityTrue, cancellation: providerinventory.CapabilityTrue})
+	fixture.inventory.ModelCapabilities = append(fixture.inventory.ModelCapabilities, nestedModel)
+	fixture.inventory.QuotaSnapshots = append(fixture.inventory.QuotaSnapshots, quota("qsnap-codex-a-nested", "codex", "pinst-codex", "acct-a", "codex-nested", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 100, fixture.now))
+	fixture.budgets = append(fixture.budgets, budgetSummary("bpol-codex-nested", "codex", "acct-a", "codex-nested", 100))
+	req := workerRequirement("task-nested")
+	req.RoleKey = RoleKeyNestedSubagent
+	req.PermissionRequired = taskrequirements.PermissionWrite
+	req.RequiredCapabilities = []taskrequirements.CapabilityRequirement{{Dimension: taskrequirements.CapabilityCancellation, RequiredValue: true, MinimumConfidence: providerinventory.ConfidenceExact, FreshnessRequired: providerinventory.FreshnessFresh}}
+	candidate := fixture.candidate("codex", "acct-a", "codex-nested")
+	candidate.RoleKey = RoleKeyNestedSubagent
+	candidate.Permission = taskrequirements.PermissionOrchestrate
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible nested over-permission = %#v, want rejected", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectPermissionUnsupported) {
+		t.Fatalf("rejections = %#v, want permission-unsupported", result.Rejected)
+	}
+}
+
+func TestUnknownRoleCapabilityFailsClosedWithTypedReason(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-unknown-role-cap")
+	req.RoleKey = RoleKeyLuna
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	fixture.inventory.ModelCapabilities[0].RolesSupported = nil
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible unknown role capability = %#v, want fail closed", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectRoleUnsupported) {
+		t.Fatalf("rejections = %#v, want role-unsupported", result.Rejected)
+	}
+}
+
+func TestRoleSelectionCannotLowerTaskHardPermission(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-permission-floor")
+	req.RoleKey = RoleKeyLuna
+	req.PermissionRequired = taskrequirements.PermissionWrite
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	candidate.RoleKey = RoleKeyLuna
+	candidate.Permission = taskrequirements.PermissionReadOnly
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		Candidates:      []Candidate{candidate},
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) != 0 {
+		t.Fatalf("eligible = %#v, want role not to lower write permission task", result.Eligible)
+	}
+	if !rejectedHas(result, candidate.RoutingCandidateID, RejectPermissionUnsupported) {
+		t.Fatalf("rejections = %#v, want permission-unsupported", result.Rejected)
+	}
+}
+
+func TestModelRenameRemovalChangesCandidatesNotRoleIdentity(t *testing.T) {
+	fixture := newFixture(t)
+	req := workerRequirement("task-rename")
+	req.RoleKey = RoleKeyTera
+	oldModel := fixture.inventory.ModelCapabilities[0]
+	newModel := oldModel
+	newModel.ModelCapabilityID = "codex-renamed"
+	newModel.CanonicalModelID = "renamed-current-id"
+	oldModel.LifecycleState = providerinventory.LifecycleRemoved
+	oldModel.AvailabilityState = providerinventory.AvailabilityRemoved
+	fixture.inventory.ModelCapabilities = []providerinventory.ModelCapability{oldModel, newModel}
+	role, ok := ResolveRoleDefinition(RoleKeyTera, nil)
+	if !ok {
+		t.Fatal("tera role definition missing")
+	}
+
+	result := FilterHardEligibility(Inputs{
+		Requirement:     req,
+		Inventory:       fixture.inventory,
+		Budgets:         fixture.budgets,
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{EvidencePolicy: EvidenceAllowEstimated},
+	})
+	if len(result.Eligible) == 0 {
+		t.Fatalf("eligible candidates = %#v rejected=%#v, want renamed current model candidates", result.Eligible, result.Rejected)
+	}
+	for _, candidate := range result.Eligible {
+		if candidate.ModelCapabilityID != "codex-renamed" {
+			t.Fatalf("eligible candidates = %#v rejected=%#v, want no removed model candidates", result.Eligible, result.Rejected)
+		}
+	}
+	again, ok := ResolveRoleDefinition(RoleKeyTera, nil)
+	if !ok || again.RoleDefinitionID != role.RoleDefinitionID {
+		t.Fatalf("role identity changed after model catalog change: before=%#v after=%#v", role, again)
 	}
 }
 
@@ -521,6 +913,15 @@ func quotaIDsFor(adapterID, accountID, modelID string, snapshots []providerinven
 func containsCandidate(candidates []Candidate, id string) bool {
 	for _, candidate := range candidates {
 		if candidate.RoutingCandidateID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
 			return true
 		}
 	}
