@@ -435,6 +435,18 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				results[index] = withNestedDecision(result)
 				return
 			}
+			if errors.Is(err, storage.ErrChildBudgetRequired) || errors.Is(err, storage.ErrDuplicateReplay) {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "provide accepted route authority and live budget capacity before launch"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested scheduler budget gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
 			if nativeAgent {
 				result.Status = NestedStatusNeedsHuman
 				result.Error = err.Error()
@@ -1235,23 +1247,70 @@ func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRu
 	if limit <= 0 {
 		limit = lcdefaults.NestedSchedulerMaxConcurrency
 	}
+	authority := schedulerAuthorityFromChild(child)
+	if strings.TrimSpace(native.AdapterID) != "" {
+		authority.ProjectID = native.ProjectID
+		authority.DeliveryRunID = native.DeliveryRunID
+		authority.TaskID = native.TaskID
+		authority.SubAgentID = storage.ChildAgentIDForRegistration(native)
+		authority.AdapterID = native.AdapterID
+		authority.AccountProfileID = native.AccountProfileID
+		authority.ModelCapabilityID = native.ModelCapabilityID
+		authority.RoutingDecisionID = native.RoutingDecisionID
+		authority.PlanFingerprint = native.PlanFingerprint
+		authority.PolicyFingerprint = native.PolicyFingerprint
+		authority.AuthorizationFingerprint = native.AuthorizationFingerprint
+	}
 	return storage.SchedulerResourceReservationRequest{
-		RootRunID:              opts.RootRunID,
-		ProviderKey:            nestedSchedulerProviderRoute(child, native),
-		RootMaxConcurrency:     limit,
-		ParentMaxConcurrency:   limit,
-		ProviderMaxConcurrency: limit,
+		RootRunID:                opts.RootRunID,
+		ProviderKey:              nestedSchedulerProviderRoute(child, authority),
+		RootMaxConcurrency:       limit,
+		ParentMaxConcurrency:     limit,
+		ProviderMaxConcurrency:   limit,
+		ProjectID:                authority.ProjectID,
+		DeliveryRunID:            authority.DeliveryRunID,
+		TaskID:                   authority.TaskID,
+		SubAgentID:               authority.SubAgentID,
+		AdapterID:                authority.AdapterID,
+		AccountProfileID:         authority.AccountProfileID,
+		ModelCapabilityID:        authority.ModelCapabilityID,
+		RoutingDecisionID:        authority.RoutingDecisionID,
+		RoutingFingerprint:       authority.RoutingFingerprint,
+		PlanFingerprint:          authority.PlanFingerprint,
+		PolicyFingerprint:        authority.PolicyFingerprint,
+		AuthorizationFingerprint: authority.AuthorizationFingerprint,
+		BudgetRequestedValue:     authority.BudgetRequestedValue,
+		BudgetQuantityKind:       authority.BudgetQuantityKind,
+		BudgetUnit:               authority.BudgetUnit,
+		BudgetValueScale:         authority.BudgetValueScale,
+		BudgetWindowKind:         authority.BudgetWindowKind,
+		AttachBudgetBinding:      strings.TrimSpace(native.AdapterID) != "",
 	}
 }
 
-func nestedSchedulerProviderRoute(child ChildRunPlan, native storage.AgentRegistrationRequest) string {
+func schedulerAuthorityFromChild(child ChildRunPlan) schedulerAuthorityMetadata {
+	if len(child.Metadata) == 0 {
+		return schedulerAuthorityMetadata{}
+	}
+	var authority schedulerAuthorityMetadata
+	if err := json.Unmarshal(child.Metadata, &authority); err != nil {
+		return schedulerAuthorityMetadata{}
+	}
+	if strings.TrimSpace(authority.SubAgentID) == "" {
+		authority.SubAgentID = strings.TrimSpace(child.RunID)
+	}
+	return authority
+}
+
+func nestedSchedulerProviderRoute(child ChildRunPlan, authority schedulerAuthorityMetadata) string {
 	parts := []string{
-		strings.TrimSpace(native.AdapterID),
-		strings.TrimSpace(native.AccountProfileID),
-		strings.TrimSpace(native.ModelCapabilityID),
+		strings.TrimSpace(authority.RoutingDecisionID),
+		strings.TrimSpace(authority.AdapterID),
+		strings.TrimSpace(authority.AccountProfileID),
+		strings.TrimSpace(authority.ModelCapabilityID),
 	}
 	if strings.TrimSpace(strings.Join(parts, "")) == "" {
-		parts = []string{"loopcoder", strings.TrimSpace(child.Role), strings.TrimSpace(child.Permission)}
+		return strings.TrimSpace(child.ProviderKey)
 	}
 	for i := range parts {
 		if parts[i] == "" {
@@ -1493,6 +1552,26 @@ type nativeChildAuthorityMetadata struct {
 	Scope                    *storage.AgentScopeGrant     `json:"scope"`
 	BudgetBindings           []storage.AgentBudgetBinding `json:"budget_bindings"`
 	OwnershipLocks           []storage.AgentOwnershipLock `json:"ownership_locks"`
+}
+
+type schedulerAuthorityMetadata struct {
+	ProjectID                string `json:"project_id"`
+	DeliveryRunID            string `json:"delivery_run_id"`
+	TaskID                   string `json:"task_id"`
+	SubAgentID               string `json:"sub_agent_id"`
+	AdapterID                string `json:"adapter_id"`
+	AccountProfileID         string `json:"account_profile_id"`
+	ModelCapabilityID        string `json:"model_capability_id"`
+	RoutingDecisionID        string `json:"routing_decision_id"`
+	RoutingFingerprint       string `json:"routing_fingerprint"`
+	PlanFingerprint          string `json:"plan_fingerprint"`
+	PolicyFingerprint        string `json:"policy_fingerprint"`
+	AuthorizationFingerprint string `json:"authorization_fingerprint"`
+	BudgetRequestedValue     int64  `json:"budget_requested_value"`
+	BudgetQuantityKind       string `json:"budget_quantity_kind"`
+	BudgetUnit               string `json:"budget_unit"`
+	BudgetValueScale         int    `json:"budget_value_scale"`
+	BudgetWindowKind         string `json:"budget_window_kind"`
 }
 
 func nativeRegistrationRequestFromChild(opts NestedScheduleOptions, child ChildRunPlan, at time.Time) (storage.AgentRegistrationRequest, error) {

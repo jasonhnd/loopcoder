@@ -1418,6 +1418,184 @@ func TestScheduleNestedRunsGlobalReservationsPreventConcurrentProviderOversubscr
 	}
 }
 
+func TestScheduleNestedRunsBudgetReservationsPreventConcurrentHardBudgetOversubscription(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+	storeA, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open B: %v", err)
+	}
+	defer storeB.Close()
+	authority := nestedSchedulerBudgetAuthority{
+		ProjectID:                "proj-budget",
+		DeliveryRunID:            "drun-budget",
+		TaskID:                   "task-budget",
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-budget",
+		ModelCapabilityID:        "mcap-budget",
+		RoutingDecisionID:        "route-budget",
+		RoutingFingerprint:       "sha256:route-budget",
+		PlanFingerprint:          "sha256:plan-budget",
+		PolicyFingerprint:        "sha256:policy-budget",
+		AuthorizationFingerprint: "sha256:auth-budget",
+		BudgetRequestedValue:     75,
+	}
+	if err := seedNestedSchedulerBudgetAuthority(ctx, storeA, authority, 100); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	planA := durableReplayTestPlan()
+	planA.PlanID = "plan-budget-a"
+	planA.MaxConcurrency = 2
+	planA.Items[0].ChildKey = "budget-a"
+	planA.Items[0].Title = "budget-a"
+	planA.Items[0].Metadata = mustNestedSchedulerAuthorityJSON(t, authority)
+	planB := durableReplayTestPlan()
+	planB.PlanID = "plan-budget-b"
+	planB.MaxConcurrency = 2
+	planB.ParentRunID = "run-20260709T000001Z-wave"
+	planB.RootRunID = "run-20260709T000001Z-wave"
+	planB.Items[0].ChildKey = "budget-b"
+	planB.Items[0].Title = "budget-b"
+	planB.Items[0].Metadata = mustNestedSchedulerAuthorityJSON(t, authority)
+
+	executeStarted := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount int64
+	doneA := make(chan struct {
+		report NestedScheduleReport
+		err    error
+	}, 1)
+	go func() {
+		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+			RepoPath:         repo,
+			MaxChildren:      1,
+			ConcurrencyLimit: 2,
+			Now:              nestedTestNow(),
+			Clock:            func() time.Time { return nestedTestNow() },
+			Plan:             &planA,
+			Store:            storeA,
+			RecordEvent:      func(string, string, state.Event) error { return nil },
+			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				atomic.AddInt64(&executeCount, 1)
+				close(executeStarted)
+				<-releaseExecute
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			},
+		})
+		doneA <- struct {
+			report NestedScheduleReport
+			err    error
+		}{report: report, err: err}
+	}()
+	waitForNestedSignal(t, executeStarted, "first budgeted child execution")
+
+	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:         repo,
+		MaxChildren:      1,
+		ConcurrencyLimit: 2,
+		Now:              nestedTestNow().Add(time.Minute),
+		Clock:            func() time.Time { return nestedTestNow().Add(time.Minute) },
+		Plan:             &planB,
+		Store:            storeB,
+		RecordEvent:      func(string, string, state.Event) error { return nil },
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			atomic.AddInt64(&executeCount, 1)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("contending ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := reportB.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("contending child status = %q, want needs-human", got)
+	}
+	if !strings.Contains(reportB.Children[0].Error, "ErrChildBudgetReservationRequired") {
+		t.Fatalf("contending child error = %q", reportB.Children[0].Error)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count before release = %d, want 1", got)
+	}
+
+	close(releaseExecute)
+	outcomeA := <-doneA
+	if outcomeA.err != nil {
+		t.Fatalf("owner ScheduleNestedRuns returned error: %v", outcomeA.err)
+	}
+	var active, committed, reserved int64
+	if err := storeA.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE state = 'active'`).Scan(&active); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations WHERE state = 'committed'`).Scan(&committed); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT reserved_value FROM budget_aggregates WHERE budget_policy_id = 'bpol-project-budget'`).Scan(&reserved)
+	}); err != nil {
+		t.Fatalf("query budget reservations: %v", err)
+	}
+	if active != 0 || committed != 1 || reserved != 0 {
+		t.Fatalf("budget states active/committed/reserved = %d/%d/%d, want 0/1/0", active, committed, reserved)
+	}
+}
+
+func TestScheduleNestedRunsMissingAcceptedBudgetRouteFailsBeforeExecute(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-budget-missing-route"
+	plan.Items[0].ChildKey = "budget-missing-route"
+	plan.Items[0].Metadata = mustNestedSchedulerAuthorityJSON(t, nestedSchedulerBudgetAuthority{
+		ProjectID:                "proj-budget",
+		DeliveryRunID:            "drun-budget",
+		TaskID:                   "task-budget",
+		AdapterID:                "codex",
+		RoutingDecisionID:        "route-missing",
+		RoutingFingerprint:       "sha256:route-missing",
+		PlanFingerprint:          "sha256:plan-budget",
+		PolicyFingerprint:        "sha256:policy-budget",
+		AuthorizationFingerprint: "sha256:auth-budget",
+		BudgetRequestedValue:     1,
+	})
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:         repo,
+		MaxChildren:      1,
+		ConcurrencyLimit: 1,
+		Now:              nestedTestNow(),
+		Clock:            func() time.Time { return nestedTestNow() },
+		Plan:             &plan,
+		Store:            store,
+		RecordEvent:      func(string, string, state.Event) error { return nil },
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if executed {
+		t.Fatal("child executed without accepted budget route")
+	}
+	if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("child status = %q, want needs-human", got)
+	}
+	if !strings.Contains(report.Children[0].Error, "accepted routing decision route-missing is missing") {
+		t.Fatalf("child error = %q", report.Children[0].Error)
+	}
+}
+
 func TestScheduleNestedRunsRollsBackClaimWhenReservationPersistenceFails(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -2475,6 +2653,128 @@ func nestedTestAgentID(projectID, deliveryRunID, parentRunID, taskID, attemptID,
 	sum := sha256.Sum256([]byte(strings.Join([]string{projectID, deliveryRunID, parentRunID, taskID, attemptID, childKey, planFingerprint}, "\x00")))
 	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
 	return "agent_" + strings.ToLower(encoded)
+}
+
+type nestedSchedulerBudgetAuthority struct {
+	ProjectID                string `json:"project_id"`
+	DeliveryRunID            string `json:"delivery_run_id"`
+	TaskID                   string `json:"task_id"`
+	SubAgentID               string `json:"sub_agent_id,omitempty"`
+	AdapterID                string `json:"adapter_id"`
+	AccountProfileID         string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID        string `json:"model_capability_id,omitempty"`
+	RoutingDecisionID        string `json:"routing_decision_id"`
+	RoutingFingerprint       string `json:"routing_fingerprint"`
+	PlanFingerprint          string `json:"plan_fingerprint"`
+	PolicyFingerprint        string `json:"policy_fingerprint"`
+	AuthorizationFingerprint string `json:"authorization_fingerprint"`
+	BudgetRequestedValue     int64  `json:"budget_requested_value"`
+	BudgetQuantityKind       string `json:"budget_quantity_kind,omitempty"`
+	BudgetUnit               string `json:"budget_unit,omitempty"`
+	BudgetWindowKind         string `json:"budget_window_kind,omitempty"`
+}
+
+type nestedBudgetTestScope struct {
+	ScopeKind         string `json:"scope_kind"`
+	ProjectID         string `json:"project_id,omitempty"`
+	DeliveryRunID     string `json:"delivery_run_id,omitempty"`
+	TaskID            string `json:"task_id,omitempty"`
+	WorkerID          string `json:"worker_id,omitempty"`
+	SubAgentID        string `json:"sub_agent_id,omitempty"`
+	AdapterID         string `json:"adapter_id,omitempty"`
+	AccountProfileID  string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID string `json:"model_capability_id,omitempty"`
+}
+
+func mustNestedSchedulerAuthorityJSON(t *testing.T, authority nestedSchedulerBudgetAuthority) json.RawMessage {
+	t.Helper()
+	if authority.BudgetQuantityKind == "" {
+		authority.BudgetQuantityKind = "local-policy"
+	}
+	if authority.BudgetUnit == "" {
+		authority.BudgetUnit = "local-policy-unit"
+	}
+	if authority.BudgetWindowKind == "" {
+		authority.BudgetWindowKind = "unbounded"
+	}
+	data, err := json.Marshal(authority)
+	if err != nil {
+		t.Fatalf("marshal scheduler authority: %v", err)
+	}
+	return data
+}
+
+func seedNestedSchedulerBudgetAuthority(ctx context.Context, store storage.Store, authority nestedSchedulerBudgetAuthority, ceiling int64) error {
+	at := state.FormatTimestamp(nestedTestNow())
+	projectScope := mustNestedBudgetScopeKey(nestedBudgetTestScope{ScopeKind: "project", ProjectID: authority.ProjectID})
+	providerScope := mustNestedBudgetScopeKey(nestedBudgetTestScope{
+		ScopeKind:         "provider-scope",
+		ProjectID:         authority.ProjectID,
+		AdapterID:         authority.AdapterID,
+		AccountProfileID:  authority.AccountProfileID,
+		ModelCapabilityID: authority.ModelCapabilityID,
+	})
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			authority.ProjectID, "/tmp/"+authority.ProjectID, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO delivery_runs(
+			delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
+			state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+			policy_version, max_side_effect_class, approval_status, override_status, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, 'loopcoder.delivery_run.v1', 1, ?, 'root-budget', '', 'approved', 'budget scheduler test',
+				'sha256:input-budget', ?, ?, ?, '0805.agent_federation.v1', 'repo-write', 'approved', 'none',
+				?, ?, '{}', '{}', '{}')`,
+			authority.DeliveryRunID, "delivery-budget", authority.ProjectID, authority.PolicyFingerprint,
+			authority.PlanFingerprint, authority.AuthorizationFingerprint, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO routing_decisions(
+			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
+			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
+			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
+			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json,
+			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
+			VALUES (?, 'loopcoder.routing_decision.v1', 1, ?, ?, ?, 'treq-budget', 'route-budget', 'routing',
+				'rprofile-budget', '', ?, ?, ?, 'full', 'selected', 'candidate-budget', '',
+				'[]', '[]', '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
+			authority.RoutingDecisionID, authority.ProjectID, authority.DeliveryRunID, authority.TaskID,
+			authority.PlanFingerprint, authority.PolicyFingerprint, authority.RoutingFingerprint, at, at); err != nil {
+			return err
+		}
+		for _, policy := range []struct {
+			id    string
+			scope string
+		}{
+			{id: "bpol-project-budget", scope: projectScope},
+			{id: "bpol-provider-budget", scope: providerScope},
+		} {
+			if _, err := tx.Exec(ctx, `INSERT INTO budget_policies(
+				budget_policy_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+				model_capability_id, scope_kind, scope_key, quantity_kind, unit, window_kind, policy_mode,
+				ceiling_value, active, policy_version, payload_json)
+				VALUES (?, ?, '', '', '', ?, ?, ?, '', ?, 'local-policy', 'local-policy-unit', 'unbounded', 'hard',
+					?, 1, '0805.agent_federation.v1', '{}')`,
+				policy.id, authority.ProjectID, authority.AdapterID, authority.AccountProfileID, authority.ModelCapabilityID, policy.scope, ceiling); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO budget_aggregates(budget_policy_id, reserved_value, committed_value, updated_at) VALUES (?, 0, 0, ?)`,
+				policy.id, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func mustNestedBudgetScopeKey(scope nestedBudgetTestScope) string {
+	data, err := json.Marshal(scope)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 func validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, childKey, childAgentID, planFingerprint string) map[string]any {
