@@ -2,6 +2,7 @@ package supervisedexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,9 +11,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestRunCompletedExitCodeZero(t *testing.T) {
@@ -224,6 +229,94 @@ func TestRunSilentCPUActiveChildDoesNotStall(t *testing.T) {
 	}
 	if result.Elapsed < 2*time.Second {
 		t.Fatalf("Elapsed = %s, want >= 2s so CPU activity crossed the stall window", result.Elapsed)
+	}
+}
+
+func TestRunSilentCPUActiveProviderContinuesWhenReceiptPersistenceFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	logPath := filepath.Join(root, "worker.log")
+	dbPath := filepath.Join(root, "loopcoder.db")
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at)
+			VALUES ('proj_supervised_progress', ?, ?, 'repo', 'local-path', ?, ?)`,
+			root, root, ts, ts)
+		return err
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	failing := &supervisedFailingWriteStore{Store: store, skip: 1, failures: 100}
+	emitter, err := progress.NewEmitter(progress.EmitterOptions{
+		Store:              failing,
+		ProjectID:          "proj_supervised_progress",
+		DeliveryRunID:      "run-supervised-progress",
+		RunID:              "run-supervised-progress",
+		CorrelationID:      "cpu-active-worker",
+		MaxSilenceInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	if _, err := emitter.Emit(ctx, progress.Observation{
+		TaskID:         "issue-828",
+		AttemptID:      "job-cpu-active",
+		AttemptOrdinal: 1,
+		Phase:          "codex_started",
+		Status:         "running",
+		TaskCounts:     progress.TaskCounts{Total: 1, Running: 1},
+		Provider: progress.ProviderIdentity{
+			ProviderID:         "codex",
+			ProviderConfidence: "exact",
+		},
+		Heartbeat: progress.AgeEvidence{State: "exact", ObservedAt: ts},
+		Progress:  progress.AgeEvidence{State: "exact", ObservedAt: ts},
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "attempt-sidecar",
+			RecordID:       "job-cpu-active",
+			Summary:        "worker process is still supervised",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		QuotaBudget: progress.QuotaBudgetState{State: progress.Unknown, Confidence: progress.Unknown, RemainingQuantity: -1},
+		NextAction:  progress.ActionState{State: "wait-provider"},
+		OccurredAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	defer emitter.Stop(context.Background())
+
+	cmd := helperCommand(t, "silent-cpu-child", logPath, "2500ms", "0")
+	result, err := Run(ctx, cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1200 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v while CPU activity continues despite receipt persistence failures", result.Outcome, OutcomeCompleted)
+	}
+	if got := failing.Attempts(); got < 2 {
+		t.Fatalf("progress write attempts = %d, want initial plus failed periodic attempt", got)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     "proj_supervised_progress",
+		DeliveryRunID: "run-supervised-progress",
+		CorrelationID: "cpu-active-worker",
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipt count = %d, want only initial receipt while periodic persistence fails", len(receipts))
 	}
 }
 
@@ -786,8 +879,49 @@ func helperCommand(t *testing.T, args ...string) *exec.Cmd {
 func helperCommandForProcess(args ...string) *exec.Cmd {
 	cmdArgs := append([]string{"-test.run=TestHelperProcess", "--"}, args...)
 	cmd := exec.Command(os.Args[0], cmdArgs...)
-	cmd.Env = append(os.Environ(), "GO_WANT_SUPERVISEDEXEC_HELPER=1")
+	cmd.Env = helperProcessEnv("GO_WANT_SUPERVISEDEXEC_HELPER=1")
 	return cmd
+}
+
+func helperProcessEnv(extra ...string) []string {
+	env := make([]string, 0, len(os.Environ())+len(extra))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "GIT_") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, extra...)
+}
+
+type supervisedFailingWriteStore struct {
+	storage.Store
+	mu       sync.Mutex
+	attempts int
+	skip     int
+	failures int
+}
+
+func (s *supervisedFailingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	shouldFail := attempt > s.skip && s.failures > 0
+	if shouldFail {
+		s.failures--
+	}
+	s.mu.Unlock()
+	if shouldFail {
+		return errors.New("injected progress write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func (s *supervisedFailingWriteStore) Attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
 }
 
 func shellExitCommand(code int) string {

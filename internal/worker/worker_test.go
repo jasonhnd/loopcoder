@@ -17,6 +17,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -421,6 +422,111 @@ func TestProgressRecorderTaskCountsTruthfulForAttemptStatuses(t *testing.T) {
 				t.Fatalf("TaskCounts sum = %d, total = %d for %#v", sum, obs.TaskCounts.Total, obs.TaskCounts)
 			}
 		})
+	}
+}
+
+func TestProgressRecorderRetryHonorsStaleWorkerOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	clock := newWorkerManualClock(fixedNow())
+	registerWorkerProgressProject(t, ctx, dbPath, repo, clock.Now)
+
+	ownershipStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open ownership store: %v", err)
+	}
+	defer ownershipStore.Close()
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, ownershipStore, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		RunID:         "run-progress",
+		OwnerID:       "worker:run-progress:job-ownership-retry:1",
+		Now:           clock.Now(),
+		LeaseUntil:    clock.Now().Add(time.Hour),
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease: %v", err)
+	}
+
+	var failing *workerFailingWriteStore
+	validateCalls := 0
+	var validateMu sync.Mutex
+	recorder, err := newProgressRecorder(ctx, Options{
+		IssueNumber: 828,
+		RunID:       "run-progress",
+		Attempt:     1,
+		Provider:    "codex",
+	}, Deps{
+		Now: clock.Now,
+		OpenProgressStore: func(ctx context.Context, opts storage.Options) (storage.Store, error) {
+			store, err := storage.Open(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+			failing = &workerFailingWriteStore{Store: store, skip: 1, failures: 100}
+			return failing, nil
+		},
+		ProgressClock:      clock,
+		ProgressMaxSilence: 20 * time.Second,
+	}, runtimepath.Roots{
+		Registered:   true,
+		ProjectID:    "proj_worker_progress",
+		DatabasePath: dbPath,
+	}, "job-ownership-retry", io.Discard, func(ctx context.Context) error {
+		validateMu.Lock()
+		validateCalls++
+		validateMu.Unlock()
+		return storage.ValidateAgentOwnershipFence(ctx, ownershipStore, lease)
+	})
+	if err != nil {
+		t.Fatalf("newProgressRecorder: %v", err)
+	}
+	defer recorder.Stop()
+
+	recorder.RecordAttempt(state.AttemptRecord{
+		JobID:          "job-ownership-retry",
+		Issue:          828,
+		Attempt:        1,
+		Provider:       "codex",
+		Phase:          "codex_started",
+		Status:         state.StatusRunning,
+		StartedAt:      state.FormatTimestamp(clock.Now()),
+		HeartbeatAt:    state.FormatTimestamp(clock.Now()),
+		LastProgressAt: state.FormatTimestamp(clock.Now()),
+	}, false)
+	waitForWorkerWriteAttempts(t, failing, 1)
+
+	clock.Advance(20 * time.Second)
+	waitForWorkerWriteAttempts(t, failing, 2)
+	if err := storage.ReleaseAgentOwnershipLease(ctx, ownershipStore, lease, clock.Now().Add(time.Second)); err != nil {
+		t.Fatalf("ReleaseAgentOwnershipLease: %v", err)
+	}
+	clock.Advance(10 * time.Second)
+	waitForWorkerValidationCalls(t, &validateMu, &validateCalls, 3)
+	if got := failing.Attempts(); got != 2 {
+		t.Fatalf("write attempts after stale retry = %d, want stale ownership to block before persistence", got)
+	}
+
+	verifyStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: clock.Now})
+	if err != nil {
+		t.Fatalf("Open verify store: %v", err)
+	}
+	defer verifyStore.Close()
+	receipts, err := progress.ListReceipts(ctx, verifyStore, progress.ListFilter{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		CorrelationID: "job-ownership-retry",
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipt count after stale retry = %d, want only initial durable receipt", len(receipts))
 	}
 }
 
@@ -2482,12 +2588,85 @@ func (c *workerManualClock) NewTicker(time.Duration) progress.Ticker {
 	return workerManualTicker{ch: c.ch}
 }
 
+func (c *workerManualClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	now := c.now
+	c.mu.Unlock()
+	c.ch <- now
+}
+
 type workerManualTicker struct {
 	ch <-chan time.Time
 }
 
 func (t workerManualTicker) C() <-chan time.Time { return t.ch }
 func (t workerManualTicker) Stop()               {}
+
+type workerFailingWriteStore struct {
+	storage.Store
+	mu       sync.Mutex
+	attempts int
+	skip     int
+	failures int
+}
+
+func (s *workerFailingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	shouldFail := attempt > s.skip && s.failures > 0
+	if shouldFail {
+		s.failures--
+	}
+	s.mu.Unlock()
+	if shouldFail {
+		return errors.New("injected progress write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func (s *workerFailingWriteStore) Attempts() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func waitForWorkerWriteAttempts(t *testing.T, store *workerFailingWriteStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if store != nil && store.Attempts() >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if store == nil {
+		t.Fatalf("write attempts = 0, want at least %d", want)
+	}
+	t.Fatalf("write attempts = %d, want at least %d", store.Attempts(), want)
+}
+
+func waitForWorkerValidationCalls(t *testing.T, mu *sync.Mutex, calls *int, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := *calls
+		mu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	got := *calls
+	mu.Unlock()
+	t.Fatalf("ownership validation calls = %d, want at least %d", got, want)
+}
 
 func assertNoReportFootprint(t *testing.T, surface, text string, record reporter.Report) {
 	t.Helper()

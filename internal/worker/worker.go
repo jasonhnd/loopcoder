@@ -321,7 +321,9 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 		warnings:    dispatch.warnings,
 		attemptPath: dispatch.attemptPath,
 	})
-	recorder, err := newProgressRecorder(ctx, dispatch.opts, dispatch.deps, dispatch.runtimeRoots, dispatch.jobID, dispatch.warnings)
+	recorder, err := newProgressRecorder(ctx, dispatch.opts, dispatch.deps, dispatch.runtimeRoots, dispatch.jobID, dispatch.warnings, func(ctx context.Context) error {
+		return validateWorkerOwnership(ctx, dispatch)
+	})
 	if err != nil {
 		return err
 	}

@@ -24,7 +24,7 @@ type progressRecorder struct {
 	stopOnce sync.Once
 }
 
-func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots runtimepath.Roots, jobID string, warnings io.Writer) (*progressRecorder, error) {
+func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots runtimepath.Roots, jobID string, warnings io.Writer, validateOwnership func(context.Context) error) (*progressRecorder, error) {
 	if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" || strings.TrimSpace(roots.DatabasePath) == "" {
 		return nil, nil
 	}
@@ -36,8 +36,12 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 	if err != nil {
 		return nil, fmt.Errorf("open progress receipt store: %w", err)
 	}
+	progressStore := storage.Store(store)
+	if validateOwnership != nil {
+		progressStore = ownershipValidatedProgressStore{Store: store, validate: validateOwnership}
+	}
 	emitter, err := progress.NewEmitter(progress.EmitterOptions{
-		Store:              store,
+		Store:              progressStore,
 		ProjectID:          roots.ProjectID,
 		DeliveryRunID:      opts.RunID,
 		RunID:              opts.RunID,
@@ -60,6 +64,20 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 		return nil, fmt.Errorf("start progress receipt emitter: %w", err)
 	}
 	return recorder, nil
+}
+
+type ownershipValidatedProgressStore struct {
+	storage.Store
+	validate func(context.Context) error
+}
+
+func (s ownershipValidatedProgressStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	if s.validate != nil {
+		if err := s.validate(ctx); err != nil {
+			return err
+		}
+	}
+	return s.Store.WithWriteTx(ctx, fn)
 }
 
 func (r *progressRecorder) RecordAttempt(attempt state.AttemptRecord, terminal bool) {
