@@ -10,12 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -162,12 +164,22 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 	t.Setenv("LOOPCODER_SECRET_CANARY", "should-not-pass")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-pass")
 	t.Setenv("XAI_API_KEY", "xai-runtime-test-value")
+	hostileHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostileHome, ".grok", "hooks"), 0o755); err != nil {
+		t.Fatalf("mkdir hostile home: %v", err)
+	}
+	t.Setenv("HOME", hostileHome)
+	t.Setenv("USERPROFILE", hostileHome)
 	worktree := t.TempDir()
+	canonicalWorktree, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		t.Fatalf("eval worktree: %v", err)
+	}
+	logDir := t.TempDir()
+	logPath := filepath.Join(logDir, "grok.log")
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
-		if cmd.Dir != worktree {
-			t.Fatalf("cmd.Dir = %q, want %q", cmd.Dir, worktree)
-		}
-		if !containsArgPair(cmd.Args, "--cwd", worktree) || !containsArgPair(cmd.Args, "--sandbox", "strict") || !containsArgPair(cmd.Args, "--permission-mode", "dontAsk") {
+		assertGrokCommandWorkspace(t, cmd, canonicalWorktree)
+		if !containsArgPair(cmd.Args, "--sandbox", "strict") || !containsArgPair(cmd.Args, "--permission-mode", "dontAsk") {
 			t.Fatalf("cmd.Args = %#v, want approved write workspace", cmd.Args)
 		}
 		if containsArg(cmd.Args, "--always-approve") {
@@ -184,8 +196,22 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 				t.Fatalf("bounded env leaked %s in:\n%s", forbidden, env)
 			}
 		}
+		if strings.Contains(env, hostileHome) {
+			t.Fatalf("bounded env inherited hostile home path %q in:\n%s", hostileHome, env)
+		}
 		if !strings.Contains(env, "XAI_API_KEY=xai-runtime-test-value") {
 			t.Fatalf("bounded env missing canonical XAI key:\n%s", env)
+		}
+		runtimeRoot := filepath.Join(logDir, "grok.grok-runtime")
+		for _, want := range []string{
+			"HOME=" + filepath.Join(runtimeRoot, "home"),
+			"USERPROFILE=" + filepath.Join(runtimeRoot, "home"),
+			"XDG_CONFIG_HOME=" + filepath.Join(runtimeRoot, "xdg-config"),
+			"TMPDIR=" + filepath.Join(runtimeRoot, "tmp"),
+		} {
+			if !strings.Contains(env, want) {
+				t.Fatalf("bounded env missing isolated root %q in:\n%s", want, env)
+			}
 		}
 		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"done"}`+"\n")
 		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
@@ -195,7 +221,7 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 	result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
 		WorktreePath: worktree,
 		Prompt:       "write",
-		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+		LogPath:      logPath,
 		RunID:        "run-1",
 		Role:         "worker",
 	})
@@ -205,6 +231,8 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 	if result.Summary != "done" {
 		t.Fatalf("Summary = %q, want done", result.Summary)
 	}
+	assertPrivateDirMode(t, filepath.Join(logDir, "grok.grok-runtime"))
+	assertPrivateDirMode(t, filepath.Join(logDir, "grok.grok-runtime", "home"))
 }
 
 func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
@@ -255,6 +283,180 @@ func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
 			})
 			assertGrokError(t, err, GrokErrUnsupportedCapability, tt.want)
 		})
+	}
+}
+
+func TestGrokRunnerRejectsInheritedProjectConfiguration(t *testing.T) {
+	tests := []string{
+		"CLAUDE.md",
+		filepath.Join(".claude", "settings.json"),
+		filepath.Join(".claude", "hooks"),
+		filepath.Join(".claude", "agents"),
+		filepath.Join(".claude", "plugins.json"),
+		filepath.Join(".claude", "mcp.json"),
+		filepath.Join(".grok", "memory"),
+		".mcp.json",
+	}
+	for _, rel := range tests {
+		t.Run(rel, func(t *testing.T) {
+			worktree := t.TempDir()
+			path := filepath.Join(worktree, rel)
+			if strings.HasSuffix(rel, "hooks") || strings.HasSuffix(rel, "agents") || strings.HasSuffix(rel, "memory") {
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatalf("mkdir hostile config: %v", err)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatalf("mkdir hostile config parent: %v", err)
+				}
+				if err := os.WriteFile(path, []byte("hostile"), 0o644); err != nil {
+					t.Fatalf("write hostile config: %v", err)
+				}
+			}
+
+			_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+				WorktreePath: worktree,
+				Prompt:       "run",
+				LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+				RunID:        "attempt",
+				Role:         "worker",
+			})
+			assertGrokError(t, err, GrokErrUnsupportedCapability, "inherited configuration exists")
+		})
+	}
+}
+
+func TestGrokRunnerCanonicalizesWorkspaceAlias(t *testing.T) {
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical", "repo")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatalf("mkdir physical: %v", err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(filepath.Join(root, "physical"), alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	wantWorkspace, err := filepath.EvalSymlinks(physical)
+	if err != nil {
+		t.Fatalf("eval physical: %v", err)
+	}
+
+	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		assertGrokCommandWorkspace(t, cmd, wantWorkspace)
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"done"}`+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restoreRun()
+
+	_, err = (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: filepath.Join(alias, "repo"),
+		Prompt:       "run",
+		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+		RunID:        "attempt",
+		Role:         "worker",
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestGrokWorkspacePathIdentityAcceptsWindowsCaseOnlyNotWrongDirectory(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only path case contract")
+	}
+	root := t.TempDir()
+	physical := filepath.Join(root, "Physical", "Repo")
+	if err := os.MkdirAll(physical, 0o755); err != nil {
+		t.Fatalf("mkdir physical: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(physical)
+	if err != nil {
+		t.Fatalf("eval physical: %v", err)
+	}
+	caseOnly := strings.ToUpper(want)
+	if caseOnly == want {
+		caseOnly = strings.ToLower(want)
+	}
+	if caseOnly == want {
+		t.Skipf("path has no alphabetic case to vary: %q", want)
+	}
+	ok, err := sameGrokPhysicalWorkspacePath(caseOnly, want)
+	if err != nil {
+		t.Fatalf("sameGrokPhysicalWorkspacePath case-only: %v", err)
+	}
+	if !ok {
+		t.Fatalf("sameGrokPhysicalWorkspacePath(%q, %q) = false, want true for case-only normalization", caseOnly, want)
+	}
+
+	outside := filepath.Join(root, "Outside", "Repo")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	ok, err = sameGrokPhysicalWorkspacePath(outside, want)
+	if err != nil {
+		t.Fatalf("sameGrokPhysicalWorkspacePath outside: %v", err)
+	}
+	if ok {
+		t.Fatalf("sameGrokPhysicalWorkspacePath(%q, %q) = true, want false for wrong directory", outside, want)
+	}
+}
+
+func TestGrokRunnerRejectsWorkspaceSymlinkEscape(t *testing.T) {
+	worktree := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write outside target: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(worktree, "escape")); err != nil {
+		inside, pathErr := grokPathInsideWorkspace(worktree, outside)
+		if pathErr != nil {
+			t.Fatalf("grokPathInsideWorkspace fallback returned error after symlink unavailable (%v): %v", err, pathErr)
+		}
+		if inside {
+			t.Fatalf("grokPathInsideWorkspace(%q, %q) = true after symlink unavailable (%v), want false", worktree, outside, err)
+		}
+		return
+	}
+	_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: worktree,
+		Prompt:       "run",
+		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+		RunID:        "attempt",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrUnsupportedCapability, "symlink escapes")
+}
+
+func TestPrepareGrokRuntimeRootIsPerLogPathAndRejectsSymlink(t *testing.T) {
+	logDir := t.TempDir()
+	firstLog := filepath.Join(logDir, "job-1.log")
+	secondLog := filepath.Join(logDir, "job-2.log")
+
+	firstRoot, err := prepareGrokRuntimeRoot(firstLog)
+	if err != nil {
+		t.Fatalf("prepare first runtime root: %v", err)
+	}
+	secondRoot, err := prepareGrokRuntimeRoot(secondLog)
+	if err != nil {
+		t.Fatalf("prepare second runtime root: %v", err)
+	}
+	if firstRoot == secondRoot {
+		t.Fatalf("runtime roots are shared: %q", firstRoot)
+	}
+	if firstRoot != filepath.Join(logDir, "job-1.grok-runtime") {
+		t.Fatalf("first runtime root = %q, want log-file-specific root", firstRoot)
+	}
+	for _, rel := range []string{".", "home", "tmp", "xdg-config", "xdg-cache", "xdg-data"} {
+		assertPrivateDirMode(t, filepath.Join(firstRoot, rel))
+		assertPrivateDirMode(t, filepath.Join(secondRoot, rel))
+	}
+
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(logDir, "linked.grok-runtime")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := prepareGrokRuntimeRoot(filepath.Join(logDir, "linked.log")); err == nil {
+		t.Fatal("prepareGrokRuntimeRoot accepted pre-created runtime-root symlink")
 	}
 }
 
@@ -562,9 +764,10 @@ func TestGrokRunnerNativeFakeProcessFixture(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, executableNameForTest("grok"))
 	writeFakeGrokExecutable(t, exe)
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	restoreCommand := stubGrokCommand(t, exe)
+	defer restoreCommand()
 
-	result, err := GrokRunner{}.Run(context.Background(), Invocation{
+	result, err := (GrokRunner{probe: supportedGrokProbeForAnyCommand}).Run(context.Background(), Invocation{
 		WorktreePath: t.TempDir(),
 		Prompt:       "fixture",
 		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
@@ -576,6 +779,33 @@ func TestGrokRunnerNativeFakeProcessFixture(t *testing.T) {
 	}
 	if result.Summary != "native fixture" || result.Model != "grok-fixture" {
 		t.Fatalf("result = %#v, want native fixture summary/model", result)
+	}
+}
+
+func TestGrokRunnerCancellationKillsNativeProcessTree(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableNameForTest("grok"))
+	marker := filepath.Join(dir, "leaked-child.txt")
+	started := filepath.Join(dir, "started.txt")
+	writeCancellableGrokExecutable(t, exe, marker, started)
+	restoreCommand := stubGrokCommand(t, exe)
+	defer restoreCommand()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go cancelAfterFileExists(started, cancel, 3*time.Second)
+	_, err := (GrokRunner{probe: supportedGrokProbeForAnyCommand}).Run(ctx, Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fixture",
+		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+		HardCap:      5 * time.Second,
+		RunID:        "native-cancel-fixture",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrCanceled, "")
+	time.Sleep(1500 * time.Millisecond)
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("process-tree child was not killed; marker stat err=%v", statErr)
 	}
 }
 
@@ -591,6 +821,16 @@ func supportedGrokProbe(_ context.Context, argv []string, _ string, _ []string, 
 
 func supportedGrokHelp() string {
 	return "-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny"
+}
+
+func supportedGrokProbeForAnyCommand(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
+	if len(argv) == 2 && argv[1] == "version" {
+		return grokProbeResult{Stdout: "grok 0.1.211\n"}, nil
+	}
+	if len(argv) == 2 && argv[1] == "--help" {
+		return grokProbeResult{Stdout: supportedGrokHelp()}, nil
+	}
+	return grokProbeResult{ExitCode: 2, Stderr: "unexpected argv"}, nil
 }
 
 func assertGrokError(t *testing.T, err error, code GrokErrorCode, contains string) {
@@ -626,6 +866,65 @@ func containsArgPair(args []string, key, value string) bool {
 		}
 	}
 	return false
+}
+
+func argValue(args []string, key string) (string, bool) {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key {
+			return args[index+1], true
+		}
+	}
+	return "", false
+}
+
+func assertGrokCommandWorkspace(t *testing.T, cmd *exec.Cmd, want string) {
+	t.Helper()
+	cwd, ok := argValue(cmd.Args, "--cwd")
+	if !ok {
+		t.Fatalf("cmd.Args = %#v, missing --cwd", cmd.Args)
+	}
+	if cmd.Dir != cwd {
+		t.Fatalf("cmd.Dir = %q, --cwd = %q; want exact same launch workspace", cmd.Dir, cwd)
+	}
+	same, err := sameGrokPhysicalWorkspacePath(cmd.Dir, want)
+	if err != nil {
+		t.Fatalf("compare Grok workspace path %q to %q: %v", cmd.Dir, want, err)
+	}
+	if !same {
+		t.Fatalf("cmd.Dir = %q, want physical workspace %q", cmd.Dir, want)
+	}
+}
+
+func sameGrokPhysicalWorkspacePath(got, want string) (bool, error) {
+	gotResolved, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		return false, err
+	}
+	wantResolved, err := filepath.EvalSymlinks(want)
+	if err != nil {
+		return false, err
+	}
+	if !samePathString(got, gotResolved) {
+		return false, nil
+	}
+	gotID, err := pathid.Identity(got)
+	if err != nil {
+		return false, err
+	}
+	wantID, err := pathid.Identity(wantResolved)
+	if err != nil {
+		return false, err
+	}
+	return gotID == wantID, nil
+}
+
+func samePathString(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func readFileString(t *testing.T, path string) string {
@@ -683,6 +982,15 @@ func executableNameForTest(name string) string {
 	return name
 }
 
+func stubGrokCommand(t *testing.T, path string) func() {
+	t.Helper()
+	previous := grokCommand
+	grokCommand = path
+	return func() {
+		grokCommand = previous
+	}
+}
+
 func writeFakeGrokExecutable(t *testing.T, path string) {
 	t.Helper()
 	if os.PathSeparator == '\\' {
@@ -703,5 +1011,55 @@ func writeFakeGrokExecutable(t *testing.T, path string) {
 		"printf '%s\\n' '{\"type\":\"result\",\"model\":\"grok-fixture\",\"result\":\"native fixture\"}'\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake grok: %v", err)
+	}
+}
+
+func cancelAfterFileExists(path string, cancel context.CancelFunc, timeout time.Duration) {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(path); err == nil {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+			return
+		}
+		select {
+		case <-deadline:
+			cancel()
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func writeCancellableGrokExecutable(t *testing.T, path, marker, started string) {
+	t.Helper()
+	if os.PathSeparator == '\\' {
+		quotedMarker := strings.ReplaceAll(marker, "'", "''")
+		quotedStarted := strings.ReplaceAll(started, "'", "''")
+		script := "@echo off\r\n" +
+			"if \"%1\"==\"version\" echo grok 0.1.211&& exit /b 0\r\n" +
+			"if \"%1\"==\"--help\" echo -p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny&& exit /b 0\r\n" +
+			"powershell -NoProfile -Command \"Set-Content -LiteralPath '" + quotedStarted + "' -Value started\"\r\n" +
+			"start \"\" /b powershell -NoProfile -Command \"Start-Sleep -Milliseconds 1200; Set-Content -LiteralPath '" + quotedMarker + "' -Value leaked\"\r\n" +
+			"ping -n 30 127.0.0.1 >nul\r\n"
+		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatalf("write cancellable grok: %v", err)
+		}
+		return
+	}
+	quotedMarker := strings.ReplaceAll(marker, "'", "'\\''")
+	quotedStarted := strings.ReplaceAll(started, "'", "'\\''")
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  version) echo 'grok 0.1.211'; exit 0 ;;\n" +
+		"  --help) echo '-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny'; exit 0 ;;\n" +
+		"esac\n" +
+		"printf started > '" + quotedStarted + "'\n" +
+		"( sleep 1.2; printf leaked > '" + quotedMarker + "' ) &\n" +
+		"while :; do sleep 10; done\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write cancellable grok: %v", err)
 	}
 }

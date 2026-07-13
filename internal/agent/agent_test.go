@@ -98,3 +98,20 @@ func assertPrivateFileMode(t *testing.T, path string) {
 		t.Fatalf("%s mode = %#o, want %#o", path, got, os.FileMode(0o600))
 	}
 }
+
+func assertPrivateDirMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", path)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("%s mode = %#o, want %#o", path, got, os.FileMode(0o700))
+	}
+}

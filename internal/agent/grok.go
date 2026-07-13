@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -24,6 +26,8 @@ import (
 type GrokRunner struct {
 	probe grokProbeFunc
 }
+
+var grokCommand = "grok"
 
 func init() {
 	registry["grok"] = GrokRunner{}
@@ -85,6 +89,11 @@ type grokProbeResult struct {
 }
 
 type grokProbeFunc func(context.Context, []string, string, []string, time.Duration, int64) (grokProbeResult, error)
+
+type grokExecutionProfile struct {
+	Invocation Invocation
+	Env        []string
+}
 
 func (r GrokRunner) probeFunc() grokProbeFunc {
 	if r.probe != nil {
@@ -149,13 +158,19 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		return Result{ExitCode: -1}, grokError(GrokErrUnsupportedCapability, "schema-enforced JSON output is not advertised by Grok headless", nil)
 	}
 
+	profile, err := prepareGrokExecutionProfile(inv, os.Environ())
+	if err != nil {
+		return Result{ExitCode: -1}, err
+	}
+	inv = profile.Invocation
+
 	logFile, err := createSensitiveFile(inv.LogPath)
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("open grok log: %w", err)
 	}
 	defer logFile.Close()
 
-	capability, err := r.negotiateCapability(ctx, inv)
+	capability, err := r.negotiateCapability(ctx, inv, profile.Env)
 	if err != nil {
 		return Result{ExitCode: -1}, err
 	}
@@ -173,9 +188,9 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		Workspace:      inv.WorktreePath,
 	})
 
-	cmd := exec.CommandContext(runCtx, "grok", BuildGrokArgs(inv)...)
+	cmd := exec.CommandContext(runCtx, grokCommand, BuildGrokArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
-	cmd.Env = grokBoundedEnv(os.Environ(), inv)
+	cmd.Env = profile.Env
 	cmd.Stdin = nil
 	cmd.Stdout = sink.stdoutWriter()
 	cmd.Stderr = sink.stderrWriter()
@@ -216,10 +231,9 @@ type grokCapability struct {
 	Version string
 }
 
-func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation) (grokCapability, error) {
-	env := grokBoundedEnv(os.Environ(), inv)
+func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation, env []string) (grokCapability, error) {
 	probe := r.probeFunc()
-	versionResult, err := probe(ctx, []string{"grok", "version"}, inv.WorktreePath, env, grokProbeTimeout, 32*1024)
+	versionResult, err := probe(ctx, []string{grokCommand, "version"}, inv.WorktreePath, env, grokProbeTimeout, 32*1024)
 	if err != nil {
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "version probe failed", err)
 	}
@@ -234,7 +248,7 @@ func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation) (gr
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "installed version "+version+" does not support bounded headless execution", nil)
 	}
 
-	helpResult, err := probe(ctx, []string{"grok", "--help"}, inv.WorktreePath, env, grokProbeTimeout, 128*1024)
+	helpResult, err := probe(ctx, []string{grokCommand, "--help"}, inv.WorktreePath, env, grokProbeTimeout, 128*1024)
 	if err != nil {
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "help probe failed", err)
 	}
@@ -258,6 +272,180 @@ func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation) (gr
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "installed Grok help is missing required flags: "+strings.Join(missing, ", "), nil)
 	}
 	return grokCapability{Version: version}, nil
+}
+
+func prepareGrokExecutionProfile(inv Invocation, environ []string) (grokExecutionProfile, error) {
+	workspace, err := canonicalGrokWorkspace(inv.WorktreePath)
+	if err != nil {
+		return grokExecutionProfile{}, err
+	}
+	if err := rejectGrokWorkspaceEscapes(workspace.Identity); err != nil {
+		return grokExecutionProfile{}, err
+	}
+	if err := rejectGrokProjectConfig(workspace.Identity); err != nil {
+		return grokExecutionProfile{}, err
+	}
+	runtimeRoot, err := prepareGrokRuntimeRoot(inv.LogPath)
+	if err != nil {
+		return grokExecutionProfile{}, err
+	}
+	bounded := inv
+	bounded.WorktreePath = workspace.Identity
+	return grokExecutionProfile{
+		Invocation: bounded,
+		Env:        grokBoundedEnv(environ, bounded, runtimeRoot),
+	}, nil
+}
+
+func canonicalGrokWorkspace(path string) (pathid.Path, error) {
+	workspace, err := pathid.Canonicalize(path)
+	if err != nil {
+		return pathid.Path{}, grokError(GrokErrUnsupportedCapability, "workspace path cannot be canonicalized", err)
+	}
+	info, err := os.Stat(workspace.Identity)
+	if err != nil {
+		return pathid.Path{}, grokError(GrokErrUnsupportedCapability, "workspace path must exist before Grok launch", err)
+	}
+	if !info.IsDir() {
+		return pathid.Path{}, grokError(GrokErrUnsupportedCapability, "workspace path is not a directory", nil)
+	}
+	return workspace, nil
+}
+
+func rejectGrokWorkspaceEscapes(workspace string) error {
+	return filepath.WalkDir(workspace, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return grokError(GrokErrUnsupportedCapability, "cannot inspect workspace boundary at "+current, walkErr)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return grokError(GrokErrUnsupportedCapability, "cannot inspect workspace entry "+current, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil {
+			return grokError(GrokErrUnsupportedCapability, "workspace symlink cannot be resolved: "+current, err)
+		}
+		inside, err := grokPathInsideWorkspace(workspace, resolved)
+		if err != nil {
+			return err
+		}
+		if !inside {
+			return grokError(GrokErrUnsupportedCapability, "workspace symlink escapes accepted workspace: "+current, nil)
+		}
+		return nil
+	})
+}
+
+func grokPathInsideWorkspace(workspace, candidate string) (bool, error) {
+	workspaceID, err := pathid.Identity(workspace)
+	if err != nil {
+		return false, grokError(GrokErrUnsupportedCapability, "workspace path cannot be canonicalized", err)
+	}
+	candidateID, err := pathid.Identity(candidate)
+	if err != nil {
+		return false, grokError(GrokErrUnsupportedCapability, "candidate path cannot be canonicalized", err)
+	}
+	if candidateID == workspaceID {
+		return true, nil
+	}
+	rel, err := filepath.Rel(workspaceID, candidateID)
+	if err != nil {
+		return false, grokError(GrokErrUnsupportedCapability, "candidate path cannot be related to workspace", err)
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel), nil
+}
+
+func rejectGrokProjectConfig(workspace string) error {
+	var found []string
+	for _, rel := range grokProjectConfigSources() {
+		path := filepath.Join(workspace, rel)
+		if info, err := os.Lstat(path); err == nil {
+			kind := "file"
+			if info.IsDir() {
+				kind = "directory"
+			}
+			found = append(found, rel+" ("+kind+")")
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return grokError(GrokErrUnsupportedCapability, "cannot inspect inherited project configuration "+rel, err)
+		}
+	}
+	if len(found) > 0 {
+		sort.Strings(found)
+		return grokError(GrokErrUnsupportedCapability, "Grok project configuration isolation is unsupported when inherited configuration exists: "+strings.Join(found, ", "), nil)
+	}
+	return nil
+}
+
+func grokProjectConfigSources() []string {
+	return []string{
+		"CLAUDE.md",
+		"CLAUDE.local.md",
+		"GROK.md",
+		".mcp.json",
+		filepath.Join(".claude", "agents"),
+		filepath.Join(".claude", "commands"),
+		filepath.Join(".claude", "hooks"),
+		filepath.Join(".claude", "mcp.json"),
+		filepath.Join(".claude", "memory"),
+		filepath.Join(".claude", "plugins"),
+		filepath.Join(".claude", "plugins.json"),
+		filepath.Join(".claude", "settings.json"),
+		filepath.Join(".claude", "settings.local.json"),
+		filepath.Join(".claude", "skills"),
+		filepath.Join(".grok", "agents"),
+		filepath.Join(".grok", "config.json"),
+		filepath.Join(".grok", "hooks"),
+		filepath.Join(".grok", "memory"),
+		filepath.Join(".grok", "mcp.json"),
+		filepath.Join(".grok", "plugins"),
+		filepath.Join(".grok", "settings.json"),
+	}
+}
+
+func prepareGrokRuntimeRoot(logPath string) (string, error) {
+	root := grokRuntimeRootPath(logPath)
+	for _, rel := range []string{".", "home", "tmp", "xdg-config", "xdg-cache", "xdg-data"} {
+		path := filepath.Join(root, rel)
+		if err := ensureGrokRuntimeDir(path); err != nil {
+			return "", fmt.Errorf("create grok isolated runtime root: %w", err)
+		}
+	}
+	return root, nil
+}
+
+func grokRuntimeRootPath(logPath string) string {
+	base := filepath.Base(filepath.Clean(logPath))
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if stem == "" || stem == "." {
+		stem = "grok"
+	}
+	return filepath.Join(filepath.Dir(logPath), stem+".grok-runtime")
+}
+
+func ensureGrokRuntimeDir(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink", path)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
+		}
+		return os.Chmod(path, 0o700)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return ensureGrokRuntimeDir(path)
+		}
+		return err
+	}
+	return os.Chmod(path, 0o700)
 }
 
 func runGrokProbeCommand(ctx context.Context, argv []string, cwd string, env []string, timeout time.Duration, outputCap int64) (grokProbeResult, error) {
@@ -800,16 +988,13 @@ func firstNonEmptyGrok(values ...string) string {
 	return ""
 }
 
-func grokBoundedEnv(environ []string, inv Invocation) []string {
+func grokBoundedEnv(environ []string, inv Invocation, runtimeRoot string) []string {
 	allowed := map[string]bool{
 		"ALLUSERSPROFILE":   true,
-		"APPDATA":           true,
 		"CI":                true,
 		"ComSpec":           true,
-		"HOME":              true,
 		"LANG":              true,
 		"LC_ALL":            true,
-		"LOCALAPPDATA":      true,
 		"PATH":              true,
 		"PATHEXT":           true,
 		"ProgramData":       true,
@@ -818,10 +1003,6 @@ func grokBoundedEnv(environ []string, inv Invocation) []string {
 		"PUBLIC":            true,
 		"SystemDrive":       true,
 		"SystemRoot":        true,
-		"TEMP":              true,
-		"TMP":               true,
-		"TMPDIR":            true,
-		"USERPROFILE":       true,
 		"XAI_API_KEY":       true,
 		"windir":            true,
 	}
@@ -837,6 +1018,20 @@ func grokBoundedEnv(environ []string, inv Invocation) []string {
 	values["NO_COLOR"] = "1"
 	values["GROK_TELEMETRY_ENABLED"] = "0"
 	values["GROK_TELEMETRY_TRACE_UPLOAD"] = "0"
+	if runtimeRoot != "" {
+		home := filepath.Join(runtimeRoot, "home")
+		tmp := filepath.Join(runtimeRoot, "tmp")
+		values["HOME"] = home
+		values["USERPROFILE"] = home
+		values["APPDATA"] = filepath.Join(runtimeRoot, "xdg-config")
+		values["LOCALAPPDATA"] = filepath.Join(runtimeRoot, "xdg-cache")
+		values["XDG_CONFIG_HOME"] = filepath.Join(runtimeRoot, "xdg-config")
+		values["XDG_CACHE_HOME"] = filepath.Join(runtimeRoot, "xdg-cache")
+		values["XDG_DATA_HOME"] = filepath.Join(runtimeRoot, "xdg-data")
+		values["TMPDIR"] = tmp
+		values["TMP"] = tmp
+		values["TEMP"] = tmp
+	}
 	if strings.TrimSpace(inv.RunID) != "" {
 		values["LOOPCODER_RUN_ID"] = strings.TrimSpace(inv.RunID)
 	}

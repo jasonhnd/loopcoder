@@ -44,11 +44,28 @@ capability, supporting alternatives when known, and the local fix.
 | `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider; local machine-readable status fields only. |
 | `gemini` | `gemini` | yes | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
 | `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
+| `grok` | `grok` | yes | no | yes | no | yes | yes | `grok models` | Requires CLI help to advertise the bounded headless flags; MCP and schema-enforced output fail closed. |
 
 `antigravity` is the clearest partial provider today. If selected for a
 read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,
 loopcoder must fail closed before launching `agy` and point the user to a
 supporting provider such as `codex` or `claude`.
+
+`grok` runs only with an approved execution profile. The adapter probes
+`grok version` and `grok --help` before launch, requires `-p`, `--cwd`,
+`--output-format`, `--no-auto-update`, `--no-alt-screen`, `--sandbox`,
+`--permission-mode`, `--allow`, and `--deny`, and fails closed when the
+installed CLI does not advertise the requested read-only or strict write mode.
+The adapter canonicalizes the worktree path, rejects workspace symlinks that
+resolve outside that physical workspace, replaces user home/config/temp roots
+with private per-attempt directories, passes only an environment allowlist plus
+`XAI_API_KEY`, disables memory, subagents, web search, auto-update, Bash,
+WebFetch, and MCP tools through CLI flags, and rejects known project-local
+Claude/Grok configuration sources before launch. Provider-controlled account,
+server-side conversation, and model state may still exist behind the official
+CLI; loopcoder records only redacted session references and normalized
+receipts. The detailed inherited-source inventory is in
+[`../security/grok-isolation.md`](../security/grok-isolation.md).
 
 ## Compatibility Smoke Matrix
 
@@ -91,8 +108,9 @@ an `expires_at` field.
 Built-in local declarations are part of `internal/runtimecap`: Codex uses
 `codex login status` as sanctioned local status text, Claude uses
 `claude auth status --json` as declared non-secret machine-readable status,
-Gemini reports only auth-reference existence, and Antigravity declares
-`agy models` as network-capable so it is recorded but not run by default.
+Gemini reports only auth-reference existence, Antigravity declares
+`agy models` as network-capable so it is recorded but not run by default, and
+Grok declares `grok models` as the network-capable auth/catalog surface.
 
 ModelCapability records reuse this same capability vocabulary rather than
 creating a parallel model-tier scheme. `read_only`, `json_output`,
@@ -118,6 +136,7 @@ Current role matrix:
 | `claude` | supported | supported | supported |
 | `gemini` | experimental | experimental | unsupported |
 | `antigravity` | experimental | unsupported | unsupported |
+| `grok` | experimental | experimental | unsupported |
 
 Current host matrix:
 

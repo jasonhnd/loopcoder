@@ -18,6 +18,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitremote"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -870,6 +871,7 @@ func gitOutput(ctx context.Context, deps Deps, repoPath string, args ...string) 
 func runGit(ctx context.Context, repoPath string, args ...string) (string, error) {
 	cmdArgs := append([]string{"-C", repoPath}, args...)
 	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

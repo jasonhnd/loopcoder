@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 )
 
 func TestProtectLoopcoderStateAppendsIdempotently(t *testing.T) {
@@ -164,6 +166,7 @@ func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
@@ -174,6 +177,7 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git %s in %s: %v", strings.Join(args, " "), dir, err)

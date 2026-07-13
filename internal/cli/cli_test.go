@@ -23,6 +23,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
@@ -6551,6 +6552,7 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 		cmdArgs = args
 		cmd := exec.Command("git", cmdArgs...)
 		cmd.Dir = repo
+		cmd.Env = gitutil.CleanEnv(os.Environ())
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
@@ -6558,6 +6560,7 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 		return
 	}
 	cmd := exec.Command("git", cmdArgs...)
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(cmdArgs, " "), err, string(output))
