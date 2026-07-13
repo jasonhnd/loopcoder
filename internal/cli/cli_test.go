@@ -4501,6 +4501,70 @@ func TestDispatchNeedsHumanReceiptUsesDispatchReasonAndExitCode(t *testing.T) {
 	}
 }
 
+func TestDispatchHarvestConductorReportWritesWorkerRelayRecord(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	record.Role = reporter.RoleConductor
+	record.ModelSource = reporter.ModelSourceSelfReported
+	record.Permission = reporter.PermissionOrchestrate
+	record.Action = "harvest hung worker issue #101"
+	record.Verified = false
+	result := validDispatchResult(record)
+	result.Status = "needs-human"
+	result.Reason = "harvested hung worker needs human review"
+	result.NextAction = "human should review harvested partial work"
+	result.Summary = "harvested from hung/killed worker - possibly incomplete; needs human review"
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want needs-human 2; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty default text output", stdout.String())
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"loopcoder report: conductor needs human",
+		"- reason: harvested hung worker needs human review",
+		"- human should review harvested partial work",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unsupported relay role") || strings.Contains(got, "write relay ledger") {
+		t.Fatalf("stderr contains relay write failure:\n%s", got)
+	}
+
+	pending := relaygate.Check(repo)
+	if len(pending) != 1 {
+		t.Fatalf("pending relay records = %d, want 1", len(pending))
+	}
+	if pending[0].Role != "worker" || pending[0].PRNumber != 101 || pending[0].Nonce != relaygate.Nonce(result.RunID, 101, "worker") {
+		t.Fatalf("pending relay record = %#v, want normalized worker PR 101 relay", pending[0])
+	}
+	if pending[0].Report == nil || pending[0].Report.Role != reporter.RoleConductor {
+		t.Fatalf("pending relay report = %#v, want original conductor report preserved", pending[0].Report)
+	}
+	if !strings.Contains(pending[0].Block, "loopcoder report: conductor needs human") {
+		t.Fatalf("pending relay block = %q, want conductor pretty block preserved", pending[0].Block)
+	}
+}
+
 func TestNestedRunJSONModeSuppressesSelectionWarnings(t *testing.T) {
 	clearPrettyEnv(t)
 	t.Setenv("LOOPCODER_HOME", t.TempDir())

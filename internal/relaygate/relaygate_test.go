@@ -41,6 +41,49 @@ func TestWriteUsesDeterministicNonceAndCheckReturnsPending(t *testing.T) {
 	}
 }
 
+func TestWriteNormalizesConductorToWorkerRelayRole(t *testing.T) {
+	repo := t.TempDir()
+
+	path, err := Write(WriteOptions{
+		RepoPath: repo,
+		RunID:    "run-test",
+		Role:     "conductor",
+		PRNumber: 101,
+		Block:    "TEST RELAY BLOCK\nrole=conductor\n",
+	})
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	nonce := Nonce("run-test", 101, "worker")
+	if filepath.Base(path) != nonce+".json" {
+		t.Fatalf("path = %s, want normalized nonce filename %s.json", path, nonce)
+	}
+
+	records := Check(repo)
+	if len(records) != 1 {
+		t.Fatalf("Check returned %d records, want 1", len(records))
+	}
+	if records[0].Role != "worker" || records[0].Nonce != nonce {
+		t.Fatalf("record = %#v, want normalized worker relay record", records[0])
+	}
+	if !strings.Contains(records[0].Block, "role=conductor") {
+		t.Fatalf("block = %q, want original conductor block preserved", records[0].Block)
+	}
+}
+
+func TestWriteRejectsUnknownRelayRole(t *testing.T) {
+	_, err := Write(WriteOptions{
+		RepoPath: t.TempDir(),
+		RunID:    "run-test",
+		Role:     "publisher",
+		PRNumber: 101,
+		Block:    testPrettyBlock,
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsupported relay role "publisher"`) {
+		t.Fatalf("Write error = %v, want unsupported role", err)
+	}
+}
+
 func TestCheckFailsOpenOnMissingOrCorruptState(t *testing.T) {
 	repo := t.TempDir()
 	if records := Check(repo); len(records) != 0 {
