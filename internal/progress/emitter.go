@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -32,6 +31,16 @@ const (
 	KnownBlocked                   = "blocked"
 	KnownCancellationInProgress    = "cancellation-in-progress"
 	KnownTerminal                  = "terminal"
+
+	// DefaultMaxSilenceInterval is the v0.8 receipt-generation SLO: an active
+	// LoopCoder-owned run should not go more than five minutes without a durable
+	// generated receipt.
+	DefaultMaxSilenceInterval = 5 * time.Minute
+	// MinMaxSilenceInterval and MaxMaxSilenceInterval are documented guardrails
+	// for tests and future config surfaces. Values outside this range are
+	// rejected so a bad config cannot busy-loop or silently disable receipts.
+	MinMaxSilenceInterval = time.Second
+	MaxMaxSilenceInterval = time.Hour
 )
 
 var (
@@ -39,20 +48,33 @@ var (
 	ErrEmitterClosed = errors.New("progress emitter closed")
 )
 
-type TickSource interface {
+type Clock interface {
+	Now() time.Time
+	NewTicker(time.Duration) Ticker
+}
+
+type Ticker interface {
 	C() <-chan time.Time
 	Stop()
 }
 
+type TickSource = Ticker
 type TickerFactory func(time.Duration) TickSource
 
-type DeliveryAttemptFunc func(context.Context, ProgressReceipt) error
+type realClock struct{}
 
-type EmitterConfig struct {
-	MaxGenerationSilence time.Duration
-	NewTicker            TickerFactory
-	Deliver              DeliveryAttemptFunc
+func (realClock) Now() time.Time { return time.Now().UTC() }
+
+func (realClock) NewTicker(interval time.Duration) Ticker {
+	return realTicker{ticker: time.NewTicker(interval)}
 }
+
+type realTicker struct {
+	ticker *time.Ticker
+}
+
+func (t realTicker) C() <-chan time.Time { return t.ticker.C }
+func (t realTicker) Stop()               { t.ticker.Stop() }
 
 type Observation struct {
 	ProjectID           string
@@ -66,9 +88,10 @@ type Observation struct {
 	Status              string
 	KnownState          string
 	Reason              string
-	Terminal            bool
 	TaskCounts          TaskCounts
 	Provider            ProviderIdentity
+	Heartbeat           AgeEvidence
+	Progress            AgeEvidence
 	HeartbeatObservedAt time.Time
 	HeartbeatState      string
 	ProgressObservedAt  time.Time
@@ -78,6 +101,28 @@ type Observation struct {
 	Blocker             ActionState
 	NextAction          ActionState
 	GapReasons          []string
+	OccurredAt          time.Time
+	Terminal            bool
+}
+
+type DeliveryFunc func(context.Context, ProgressReceipt) error
+type DeliveryAttemptFunc = DeliveryFunc
+
+type EmitterConfig struct {
+	MaxGenerationSilence time.Duration
+	NewTicker            TickerFactory
+	Deliver              DeliveryAttemptFunc
+}
+
+type EmitterOptions struct {
+	Store              storage.Store
+	ProjectID          string
+	DeliveryRunID      string
+	RunID              string
+	CorrelationID      string
+	MaxSilenceInterval time.Duration
+	Clock              Clock
+	Deliver            DeliveryFunc
 }
 
 type EmitResult struct {
@@ -88,75 +133,176 @@ type EmitResult struct {
 }
 
 type Emitter struct {
-	store  storage.Store
-	config EmitterConfig
+	store         storage.Store
+	projectID     string
+	deliveryRunID string
+	runID         string
+	correlationID string
+	interval      time.Duration
+	clock         Clock
+	deliver       DeliveryFunc
 
 	mu                 sync.Mutex
-	closed             bool
 	latest             Observation
-	haveLatest         bool
+	hasLatest          bool
 	lastObservationKey string
 	lastDurableAt      time.Time
-	nextSequence       int64
-	sequenceLoadedFor  string
-	terminalEmitted    bool
+	closed             bool
+	started            bool
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
 type Loop struct {
 	emitter *Emitter
-	ticker  TickSource
-	stop    chan struct{}
-	done    chan error
-	once    sync.Once
 }
 
-type realTickSource struct {
-	ticker *time.Ticker
+func NewEmitter(args ...any) (*Emitter, error) {
+	switch len(args) {
+	case 1:
+		opts, ok := args[0].(EmitterOptions)
+		if !ok {
+			return nil, typed(ErrInvalidRecordCode, "NewEmitter requires EmitterOptions")
+		}
+		return newEmitterFromOptions(opts, true)
+	case 2:
+		store, ok := args[0].(storage.Store)
+		if !ok {
+			return nil, typed(ErrInvalidRecordCode, "NewEmitter requires storage.Store")
+		}
+		config, ok := args[1].(EmitterConfig)
+		if !ok {
+			return nil, typed(ErrInvalidRecordCode, "NewEmitter requires EmitterConfig")
+		}
+		interval := config.MaxGenerationSilence
+		if interval == 0 {
+			interval = DefaultMaxSilenceInterval
+		}
+		opts := EmitterOptions{
+			Store:              store,
+			MaxSilenceInterval: interval,
+			Clock:              storeTickerClock{store: store, factory: config.NewTicker},
+			Deliver:            config.Deliver,
+		}
+		return newEmitterFromOptions(opts, false)
+	default:
+		return nil, typed(ErrInvalidRecordCode, "NewEmitter argument count is invalid")
+	}
 }
 
-func (t realTickSource) C() <-chan time.Time {
-	return t.ticker.C
-}
-
-func (t realTickSource) Stop() {
-	t.ticker.Stop()
-}
-
-func NewEmitter(store storage.Store, config EmitterConfig) (*Emitter, error) {
-	if store == nil {
+func newEmitterFromOptions(opts EmitterOptions, requireIdentity bool) (*Emitter, error) {
+	if opts.Store == nil {
 		return nil, typed(ErrInvalidRecordCode, "store is required")
 	}
-	normalized, err := normalizeEmitterConfig(config)
+	projectID := strings.TrimSpace(opts.ProjectID)
+	deliveryRunID := strings.TrimSpace(opts.DeliveryRunID)
+	if requireIdentity && (projectID == "" || deliveryRunID == "") {
+		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
+	}
+	clock := opts.Clock
+	if clock == nil {
+		clock = realClock{}
+	}
+	interval, err := boundMaxSilence(opts.MaxSilenceInterval)
 	if err != nil {
 		return nil, err
 	}
-	return &Emitter{store: store, config: normalized}, nil
+	return &Emitter{
+		store:         opts.Store,
+		projectID:     projectID,
+		deliveryRunID: deliveryRunID,
+		runID:         firstNonEmpty(opts.RunID, deliveryRunID),
+		correlationID: firstNonEmpty(opts.CorrelationID, deliveryRunID),
+		interval:      interval,
+		clock:         clock,
+		deliver:       opts.Deliver,
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+	}, nil
 }
 
-func normalizeEmitterConfig(config EmitterConfig) (EmitterConfig, error) {
-	if config.MaxGenerationSilence == 0 {
-		config.MaxGenerationSilence = DefaultMaxGenerationSilence
+type storeTickerClock struct {
+	store   storage.Store
+	factory TickerFactory
+}
+
+func (c storeTickerClock) Now() time.Time {
+	if c.store == nil {
+		return time.Now().UTC()
 	}
-	if config.MaxGenerationSilence < MinMaxGenerationSilence || config.MaxGenerationSilence > MaxMaxGenerationSilence {
-		return EmitterConfig{}, fmt.Errorf("%w: max generation silence must be between %s and %s", ErrEmitterConfig, MinMaxGenerationSilence, MaxMaxGenerationSilence)
+	return c.store.Now().UTC()
+}
+
+func (c storeTickerClock) NewTicker(interval time.Duration) Ticker {
+	if c.factory != nil {
+		return c.factory(interval)
 	}
-	if config.NewTicker == nil {
-		config.NewTicker = func(interval time.Duration) TickSource {
-			return realTickSource{ticker: time.NewTicker(interval)}
+	return realClock{}.NewTicker(interval)
+}
+
+func (e *Emitter) Start(ctx context.Context, initial ...Observation) (*Loop, error) {
+	if e == nil {
+		return nil, ErrEmitterClosed
+	}
+	if len(initial) > 0 {
+		if _, err := e.Emit(ctx, initial[0]); err != nil {
+			return nil, err
 		}
 	}
-	return config, nil
+	e.startOnce.Do(func() {
+		e.mu.Lock()
+		e.started = true
+		e.mu.Unlock()
+		go e.run(ctx)
+	})
+	return &Loop{emitter: e}, nil
+}
+
+func (l *Loop) Stop() error {
+	if l == nil || l.emitter == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return l.emitter.Stop(ctx)
 }
 
 func (e *Emitter) Observe(observation Observation) error {
+	if e == nil {
+		return ErrEmitterClosed
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return ErrEmitterClosed
 	}
-	e.latest = normalizeObservationDefaults(observation)
-	e.haveLatest = true
+	e.latest = cloneObservation(observation)
+	e.hasLatest = true
 	return nil
+}
+
+func (e *Emitter) Stop(ctx context.Context) error {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	started := e.started
+	e.mu.Unlock()
+	if !started {
+		return nil
+	}
+	e.stopOnce.Do(func() {
+		close(e.stopCh)
+	})
+	select {
+	case <-e.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (e *Emitter) Emit(ctx context.Context, observation Observation) (EmitResult, error) {
@@ -164,419 +310,247 @@ func (e *Emitter) Emit(ctx context.Context, observation Observation) (EmitResult
 }
 
 func (e *Emitter) EmitTerminal(ctx context.Context, observation Observation) (EmitResult, error) {
-	observation.Terminal = true
 	if strings.TrimSpace(observation.Reason) == "" {
 		observation.Reason = ReasonTerminal
 	}
-	return e.emit(ctx, observation, true)
+	return e.Terminal(ctx, observation)
 }
 
-func (e *Emitter) Start(ctx context.Context, initial Observation) (*Loop, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if strings.TrimSpace(initial.ProjectID) != "" || strings.TrimSpace(initial.DeliveryRunID) != "" {
-		if _, err := e.Emit(ctx, initial); err != nil {
-			return nil, err
-		}
-	}
-	ticker := e.config.NewTicker(e.config.MaxGenerationSilence)
-	loop := &Loop{
-		emitter: e,
-		ticker:  ticker,
-		stop:    make(chan struct{}),
-		done:    make(chan error, 1),
-	}
-	go loop.run(ctx)
-	return loop, nil
-}
-
-func (l *Loop) Stop() error {
-	var err error
-	l.once.Do(func() {
-		close(l.stop)
-		err = <-l.done
-	})
-	return err
-}
-
-func (l *Loop) Terminal(ctx context.Context, observation Observation) (EmitResult, error) {
-	result, err := l.emitter.EmitTerminal(ctx, observation)
-	stopErr := l.Stop()
+func (e *Emitter) Terminal(ctx context.Context, observation Observation) (EmitResult, error) {
+	observation.Terminal = true
+	result, err := e.emit(ctx, observation, false)
 	if err != nil {
 		return result, err
 	}
-	if stopErr != nil {
-		return result, stopErr
+	if err := e.Stop(ctx); err != nil {
+		return result, err
 	}
 	return result, nil
 }
 
-func (l *Loop) run(ctx context.Context) {
-	defer l.ticker.Stop()
-	var lastErr error
+func (e *Emitter) run(ctx context.Context) {
+	defer close(e.doneCh)
+	ticker := e.clock.NewTicker(e.interval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-l.stop:
-			l.done <- lastErr
-			return
 		case <-ctx.Done():
-			l.done <- ctx.Err()
 			return
-		case <-l.ticker.C():
-			if _, err := l.emitter.emitPeriodic(ctx); err != nil {
-				lastErr = err
-			}
+		case <-e.stopCh:
+			return
+		case <-ticker.C():
+			_, _ = e.emitPeriodic(ctx)
 		}
 	}
 }
 
 func (e *Emitter) emitPeriodic(ctx context.Context) (EmitResult, error) {
-	e.mu.Lock()
-	if !e.haveLatest || e.closed || e.terminalEmitted {
-		e.mu.Unlock()
-		return EmitResult{}, nil
-	}
-	observation := e.latest
-	now := e.store.Now().UTC()
-	if !e.lastDurableAt.IsZero() && now.Sub(e.lastDurableAt) < e.config.MaxGenerationSilence {
-		e.mu.Unlock()
-		return EmitResult{}, nil
-	}
-	observation.Reason = ReasonMaxGenerationSilence
-	if !containsString(observation.GapReasons, ReasonMaxGenerationSilence) {
-		observation.GapReasons = append(append([]string{}, observation.GapReasons...), ReasonMaxGenerationSilence)
-	}
-	e.mu.Unlock()
-	return e.emit(ctx, observation, true)
+	return e.emit(ctx, Observation{}, true)
 }
 
-func (e *Emitter) emit(ctx context.Context, observation Observation, force bool) (EmitResult, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	observation = normalizeObservationDefaults(observation)
-	key, err := observationKey(observation)
-	if err != nil {
-		return EmitResult{}, err
-	}
-	now := e.store.Now().UTC()
-
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
+func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bool) (EmitResult, error) {
+	if e == nil {
 		return EmitResult{}, ErrEmitterClosed
 	}
-	if observation.Terminal && e.terminalEmitted {
-		e.mu.Unlock()
-		return EmitResult{}, nil
-	}
-	if !force && key == e.lastObservationKey && !e.lastDurableAt.IsZero() && now.Sub(e.lastDurableAt) < e.config.MaxGenerationSilence {
-		e.latest = observation
-		e.haveLatest = true
-		e.mu.Unlock()
-		return EmitResult{}, nil
-	}
-	correlationID := observationCorrelationID(observation)
-	sequenceKey := observation.ProjectID + "\x00" + observation.DeliveryRunID + "\x00" + correlationID
-	if e.sequenceLoadedFor != sequenceKey {
-		next, err := nextCorrelationSequence(ctx, e.store, observation.ProjectID, observation.DeliveryRunID, correlationID)
-		if err != nil {
-			e.mu.Unlock()
-			return EmitResult{}, err
-		}
-		e.nextSequence = next
-		e.sequenceLoadedFor = sequenceKey
-	}
-	sequence := e.nextSequence
-	e.nextSequence++
-	receipt := receiptFromObservation(observation, correlationID, sequence, now)
-	e.mu.Unlock()
-
-	written, err := PersistReceipt(ctx, e.store, receipt)
-	if err != nil {
-		return EmitResult{}, err
-	}
-
-	result := EmitResult{WriteResult: written, Emitted: written.Inserted}
 	e.mu.Lock()
-	if written.Inserted {
-		e.lastDurableAt = now
-		e.lastObservationKey = key
-	}
-	e.latest = observation
-	e.haveLatest = true
-	if observation.Terminal && written.Inserted {
-		e.terminalEmitted = true
-	}
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 
-	if e.config.Deliver != nil {
-		result.DeliveryAttempted = true
-		result.DeliveryErr = e.config.Deliver(ctx, written.Receipt)
+	if e.closed {
+		return EmitResult{}, ErrEmitterClosed
 	}
-	return result, nil
-}
+	now := e.clock.Now().UTC()
+	if periodic {
+		if !e.hasLatest {
+			return EmitResult{}, nil
+		}
+		observation = e.latest
+		observation.Terminal = false
+		if !e.lastDurableAt.IsZero() && now.Sub(e.lastDurableAt) < e.interval {
+			return EmitResult{}, nil
+		}
+		if observationKey(observation) == e.lastObservationKey {
+			observation.GapReasons = appendUnique(observation.GapReasons, "max-generation-silence")
+		}
+	} else {
+		e.latest = cloneObservation(observation)
+		e.hasLatest = true
+	}
 
-func observationCorrelationID(observation Observation) string {
-	if strings.TrimSpace(observation.CorrelationID) != "" {
-		return strings.TrimSpace(observation.CorrelationID)
-	}
-	if strings.TrimSpace(observation.AttemptID) != "" {
-		return "supervisor-" + strings.TrimSpace(observation.AttemptID)
-	}
-	if strings.TrimSpace(observation.TaskID) != "" {
-		return "supervisor-" + strings.TrimSpace(observation.TaskID)
-	}
-	return "supervisor-" + strings.TrimSpace(observation.DeliveryRunID)
-}
-
-func nextCorrelationSequence(ctx context.Context, store storage.Store, projectID, deliveryRunID, correlationID string) (int64, error) {
-	var max int64
-	err := store.WithTx(ctx, func(tx storage.Tx) error {
-		return tx.QueryRow(ctx, `SELECT COALESCE(MAX(correlation_sequence), 0) FROM progress_receipts WHERE project_id = ? AND delivery_run_id = ? AND correlation_id = ?`,
-			projectID, deliveryRunID, correlationID).Scan(&max)
-	})
+	receipt := e.receiptFor(observation, now, periodic)
+	result, err := PersistReceiptNextSequence(ctx, e.store, receipt)
 	if err != nil {
-		return 0, fmt.Errorf("load progress receipt correlation sequence: %w", err)
+		return EmitResult{WriteResult: result}, err
 	}
-	return max + 1, nil
-}
-
-func receiptFromObservation(observation Observation, correlationID string, sequence int64, now time.Time) ProgressReceipt {
-	observation = normalizeObservationDefaults(observation)
-	heartbeat := AgeEvidence{State: firstNonEmpty(observation.HeartbeatState, Unknown)}
-	if !observation.HeartbeatObservedAt.IsZero() {
-		heartbeat.ObservedAt = delivery.CanonicalTimestamp(observation.HeartbeatObservedAt.UTC())
-		heartbeat.AgeMillis = -1
+	if !periodic {
+		e.lastObservationKey = observationKey(observation)
 	}
-	progressAge := AgeEvidence{State: firstNonEmpty(observation.ProgressState, Unknown)}
-	if !observation.ProgressObservedAt.IsZero() {
-		progressAge.ObservedAt = delivery.CanonicalTimestamp(observation.ProgressObservedAt.UTC())
-		progressAge.AgeMillis = -1
-	}
-	evidence := append([]EvidenceRef{}, observation.Evidence...)
-	evidence = append(evidence, EvidenceRef{
-		RecordKind:     "supervisor-state",
-		RecordID:       firstNonEmpty(observation.KnownState, observation.Reason, Unknown),
-		Summary:        supervisorSummary(observation),
-		Classification: "supervisor-observation",
-		Confidence:     "exact",
-	})
-	return ProgressReceipt{
-		ProjectID:           observation.ProjectID,
-		DeliveryRunID:       observation.DeliveryRunID,
-		RunID:               firstNonEmpty(observation.RunID, observation.DeliveryRunID),
-		TaskID:              firstNonEmpty(observation.TaskID, Unknown),
-		AttemptID:           firstNonEmpty(observation.AttemptID, Unknown),
-		AttemptOrdinal:      observation.AttemptOrdinal,
-		CorrelationID:       correlationID,
-		CorrelationSequence: sequence,
-		Phase:               observation.Phase,
-		Status:              observation.Status,
-		TaskCounts:          observation.TaskCounts,
-		Provider:            observation.Provider,
-		Heartbeat:           heartbeat,
-		Progress:            progressAge,
-		Evidence:            evidence,
-		QuotaBudget:         observation.QuotaBudget,
-		Blocker:             observation.Blocker,
-		NextAction:          observation.NextAction,
-		GapReasons:          observation.GapReasons,
-		OccurredAt:          delivery.CanonicalTimestamp(now),
-	}
-}
-
-func normalizeObservationDefaults(observation Observation) Observation {
-	observation.ProjectID = strings.TrimSpace(observation.ProjectID)
-	observation.DeliveryRunID = strings.TrimSpace(observation.DeliveryRunID)
-	observation.RunID = firstNonEmpty(observation.RunID, observation.DeliveryRunID)
-	observation.CorrelationID = strings.TrimSpace(observation.CorrelationID)
-	observation.Reason = sanitizeEnum(firstNonEmpty(observation.Reason, ReasonStateChange))
-	observation.KnownState = sanitizeEnum(firstNonEmpty(observation.KnownState, KnownAliveNoMeaningfulProgress))
+	e.lastDurableAt = now
+	out := EmitResult{WriteResult: result, Emitted: result.Inserted}
 	if observation.Terminal {
-		observation.KnownState = KnownTerminal
-		if observation.Reason == "" || observation.Reason == ReasonStateChange {
-			observation.Reason = ReasonTerminal
+		e.closed = true
+	}
+	if e.deliver != nil {
+		out.DeliveryAttempted = true
+		out.DeliveryErr = e.deliver(ctx, result.Receipt)
+	}
+	return out, err
+}
+
+func (e *Emitter) receiptFor(observation Observation, now time.Time, periodic bool) ProgressReceipt {
+	observation = normalizeObservation(observation, now)
+	occurredAt := observation.OccurredAt.UTC()
+	if occurredAt.IsZero() {
+		occurredAt = now
+	}
+	evidence := append([]EvidenceRef(nil), observation.Evidence...)
+	if periodic {
+		evidence = append(evidence, EvidenceRef{
+			RecordKind:     "supervisor-clock",
+			RecordID:       e.correlationID,
+			Summary:        "max-silence receipt generated from supervisor state",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		})
+	}
+	return ProgressReceipt{
+		ProjectID:      firstNonEmpty(observation.ProjectID, e.projectID),
+		DeliveryRunID:  firstNonEmpty(observation.DeliveryRunID, e.deliveryRunID),
+		RunID:          firstNonEmpty(observation.RunID, e.runID, observation.DeliveryRunID, e.deliveryRunID),
+		TaskID:         observation.TaskID,
+		AttemptID:      observation.AttemptID,
+		AttemptOrdinal: observation.AttemptOrdinal,
+		CorrelationID:  firstNonEmpty(observation.CorrelationID, e.correlationID, observation.AttemptID),
+		Phase:          firstNonEmpty(observation.Phase, Unknown),
+		Status:         firstNonEmpty(observation.Status, Unknown),
+		TaskCounts:     observation.TaskCounts,
+		Provider:       observation.Provider,
+		Heartbeat:      observation.Heartbeat,
+		Progress:       observation.Progress,
+		Evidence:       evidence,
+		QuotaBudget:    observation.QuotaBudget,
+		Blocker:        observation.Blocker,
+		NextAction:     observation.NextAction,
+		GapReasons:     append([]string(nil), observation.GapReasons...),
+		OccurredAt:     deliveryTimestamp(occurredAt),
+	}
+}
+
+func normalizeObservation(observation Observation, now time.Time) Observation {
+	if observation.Heartbeat.ObservedAt == "" && !observation.HeartbeatObservedAt.IsZero() {
+		observation.Heartbeat = AgeEvidence{
+			State:      firstNonEmpty(observation.HeartbeatState, "exact"),
+			ObservedAt: deliveryTimestamp(observation.HeartbeatObservedAt),
+			AgeMillis:  now.Sub(observation.HeartbeatObservedAt.UTC()).Milliseconds(),
 		}
 	}
-	if strings.TrimSpace(observation.Phase) == "" {
-		observation.Phase = observation.KnownState
+	if observation.Progress.ObservedAt == "" && !observation.ProgressObservedAt.IsZero() {
+		observation.Progress = AgeEvidence{
+			State:      firstNonEmpty(observation.ProgressState, "exact"),
+			ObservedAt: deliveryTimestamp(observation.ProgressObservedAt),
+			AgeMillis:  now.Sub(observation.ProgressObservedAt.UTC()).Milliseconds(),
+		}
 	}
-	if strings.TrimSpace(observation.Status) == "" {
-		observation.Status = statusForKnownState(observation.KnownState)
+	if observation.KnownState != "" {
+		observation.GapReasons = appendUnique(observation.GapReasons, observation.KnownState)
+		if observation.Status == "" {
+			observation.Status = observation.KnownState
+		}
+		if observation.Blocker.State == "" && observation.NextAction.State == "" {
+			observation.Blocker, observation.NextAction = knownStateActions(observation.KnownState)
+		}
 	}
-	if strings.TrimSpace(observation.HeartbeatState) == "" {
-		observation.HeartbeatState = Unknown
+	if observation.Reason != "" {
+		observation.GapReasons = appendUnique(observation.GapReasons, observation.Reason)
 	}
-	if strings.TrimSpace(observation.ProgressState) == "" {
-		observation.ProgressState = progressStateForKnownState(observation.KnownState)
+	if observation.Terminal {
+		observation.GapReasons = appendUnique(observation.GapReasons, ReasonTerminal)
 	}
-	observation.GapReasons = append([]string{}, observation.GapReasons...)
-	switch observation.KnownState {
-	case KnownAliveNoMeaningfulProgress:
-		observation.GapReasons = appendReason(observation.GapReasons, "no-meaningful-progress-observed")
-	case KnownHostOffline:
-		observation.GapReasons = appendReason(observation.GapReasons, KnownHostOffline)
-	case KnownDeliveryPending:
-		observation.GapReasons = appendReason(observation.GapReasons, KnownDeliveryPending)
-	}
-	observation.Blocker = defaultBlocker(observation.KnownState, observation.Blocker)
-	observation.NextAction = defaultNextAction(observation.KnownState, observation.NextAction)
-	observation.QuotaBudget = defaultQuotaBudget(observation.KnownState, observation.QuotaBudget)
+	observation.Heartbeat = refreshObservationAge(observation.Heartbeat, now)
+	observation.Progress = refreshObservationAge(observation.Progress, now)
 	return observation
 }
 
-func statusForKnownState(state string) string {
-	switch state {
-	case KnownWaitingApproval, KnownWaitingCI, KnownDeliveryPending:
-		return "waiting"
-	case KnownQuotaBlocked, KnownBlocked, KnownHostOffline:
-		return "blocked"
-	case KnownCancellationInProgress:
-		return "cancelling"
-	case KnownTerminal:
-		return "terminal"
-	default:
-		return "running"
+func refreshObservationAge(age AgeEvidence, now time.Time) AgeEvidence {
+	if strings.TrimSpace(age.ObservedAt) == "" {
+		return age
 	}
-}
-
-func progressStateForKnownState(state string) string {
-	if state == KnownAliveNoMeaningfulProgress {
-		return "stale"
-	}
-	return Unknown
-}
-
-func defaultBlocker(state string, current ActionState) ActionState {
-	if strings.TrimSpace(current.State) != "" || strings.TrimSpace(current.Summary) != "" {
-		return current
-	}
-	switch state {
-	case KnownWaitingApproval:
-		return ActionState{State: "waiting", Summary: "waiting for approval"}
-	case KnownWaitingCI:
-		return ActionState{State: "waiting", Summary: "waiting for CI"}
-	case KnownQuotaBlocked:
-		return ActionState{State: "quota-blocked", Summary: "quota exhausted or unavailable"}
-	case KnownHostOffline:
-		return ActionState{State: "host-offline", Summary: "host delivery is offline"}
-	case KnownBlocked:
-		return ActionState{State: "blocked", Summary: "supervisor reports blocked state"}
-	default:
-		return ActionState{State: "none"}
-	}
-}
-
-func defaultNextAction(state string, current ActionState) ActionState {
-	if strings.TrimSpace(current.State) != "" || strings.TrimSpace(current.Summary) != "" {
-		return current
-	}
-	switch state {
-	case KnownWaitingApproval:
-		return ActionState{State: "wait", Summary: "wait for approval"}
-	case KnownWaitingCI:
-		return ActionState{State: "wait", Summary: "wait for CI result"}
-	case KnownQuotaBlocked:
-		return ActionState{State: "wait", Summary: "wait for quota recovery or policy change"}
-	case KnownFallbackInProgress:
-		return ActionState{State: "fallback-in-progress", Summary: "continue provider fallback"}
-	case KnownHostOffline, KnownDeliveryPending:
-		return ActionState{State: "delivery-pending", Summary: "persist receipt; delivery remains pending"}
-	case KnownRecoveryInProgress:
-		return ActionState{State: "recover", Summary: "continue supervisor recovery"}
-	case KnownCancellationInProgress:
-		return ActionState{State: "cancel", Summary: "continue cancellation"}
-	case KnownTerminal:
-		return ActionState{State: "none", Summary: "run is terminal"}
-	default:
-		return ActionState{State: "continue", Summary: "continue supervising"}
-	}
-}
-
-func defaultQuotaBudget(state string, current QuotaBudgetState) QuotaBudgetState {
-	if strings.TrimSpace(current.State) != "" || strings.TrimSpace(current.Confidence) != "" || current.RemainingQuantity != 0 {
-		return current
-	}
-	if state == KnownQuotaBlocked {
-		return QuotaBudgetState{State: "exhausted", Confidence: "exact", RemainingQuantity: 0, Unit: Unknown, GapReasons: []string{"quota-blocked"}}
-	}
-	return current
-}
-
-func supervisorSummary(observation Observation) string {
-	switch observation.KnownState {
-	case KnownAliveNoMeaningfulProgress:
-		return "alive; no meaningful progress observed"
-	case KnownWaitingCI:
-		return "waiting for CI"
-	case KnownWaitingApproval:
-		return "waiting for approval"
-	case KnownQuotaBlocked:
-		return "quota blocked"
-	case KnownFallbackInProgress:
-		return "provider fallback in progress"
-	case KnownHostOffline:
-		return "host offline; receipt delivery not implied"
-	case KnownDeliveryPending:
-		return "delivery pending; acknowledgment not implied"
-	case KnownRecoveryInProgress:
-		return "recovery in progress"
-	case KnownCancellationInProgress:
-		return "cancellation in progress"
-	case KnownTerminal:
-		return "terminal state observed"
-	default:
-		return "supervisor state observed"
-	}
-}
-
-func observationKey(observation Observation) (string, error) {
-	canonical := map[string]any{
-		"project_id":            observation.ProjectID,
-		"delivery_run_id":       observation.DeliveryRunID,
-		"run_id":                observation.RunID,
-		"task_id":               observation.TaskID,
-		"attempt_id":            observation.AttemptID,
-		"attempt_ordinal":       observation.AttemptOrdinal,
-		"correlation_id":        observation.CorrelationID,
-		"phase":                 observation.Phase,
-		"status":                observation.Status,
-		"known_state":           observation.KnownState,
-		"reason":                observation.Reason,
-		"terminal":              observation.Terminal,
-		"task_counts":           observation.TaskCounts,
-		"provider":              observation.Provider,
-		"heartbeat_observed_at": observation.HeartbeatObservedAt.UTC().Format(time.RFC3339Nano),
-		"heartbeat_state":       observation.HeartbeatState,
-		"progress_observed_at":  observation.ProgressObservedAt.UTC().Format(time.RFC3339Nano),
-		"progress_state":        observation.ProgressState,
-		"evidence":              observation.Evidence,
-		"quota_budget":          observation.QuotaBudget,
-		"blocker":               observation.Blocker,
-		"next_action":           observation.NextAction,
-		"gap_reasons":           observation.GapReasons,
-	}
-	digest, _, err := delivery.DigestCanonicalJSON(canonical)
+	parsed, err := time.Parse(time.RFC3339Nano, age.ObservedAt)
 	if err != nil {
-		return "", typed(ErrInvalidRecordCode, "semantic progress observation: %v", err)
+		return age
 	}
-	return digest, nil
+	age.AgeMillis = now.UTC().Sub(parsed.UTC()).Milliseconds()
+	if age.AgeMillis < 0 {
+		age.AgeMillis = 0
+	}
+	if age.State == "" || age.State == Unknown {
+		age.State = "exact"
+	}
+	return age
 }
 
-func appendReason(values []string, value string) []string {
-	if containsString(values, value) {
-		return values
+func knownStateActions(known string) (ActionState, ActionState) {
+	switch known {
+	case KnownWaitingCI, KnownWaitingApproval:
+		return ActionState{State: "waiting"}, ActionState{State: "wait"}
+	case KnownQuotaBlocked:
+		return ActionState{State: "quota-blocked"}, ActionState{State: "wait"}
+	case KnownFallbackInProgress:
+		return ActionState{State: "none"}, ActionState{State: "fallback-in-progress"}
+	case KnownCancellationInProgress:
+		return ActionState{State: "none"}, ActionState{State: "cancel"}
+	case KnownRecoveryInProgress:
+		return ActionState{State: "none"}, ActionState{State: "recover"}
+	case KnownHostOffline:
+		return ActionState{State: "host-offline"}, ActionState{State: "delivery-pending"}
+	case KnownDeliveryPending:
+		return ActionState{State: "none"}, ActionState{State: "delivery-pending"}
+	case KnownBlocked:
+		return ActionState{State: "blocked"}, ActionState{State: "wait"}
+	default:
+		return ActionState{State: "none"}, ActionState{State: "continue"}
+	}
+}
+
+func boundMaxSilence(interval time.Duration) (time.Duration, error) {
+	if interval <= 0 {
+		return DefaultMaxSilenceInterval, nil
+	}
+	if interval < MinMaxSilenceInterval {
+		return 0, fmt.Errorf("%w: max silence interval %s is below minimum %s", ErrEmitterConfig, interval, MinMaxSilenceInterval)
+	}
+	if interval > MaxMaxSilenceInterval {
+		return 0, fmt.Errorf("%w: max silence interval %s exceeds maximum %s", ErrEmitterConfig, interval, MaxMaxSilenceInterval)
+	}
+	return interval, nil
+}
+
+func observationKey(observation Observation) string {
+	return strings.Join([]string{
+		observation.Phase,
+		observation.Status,
+		observation.Blocker.State,
+		observation.Blocker.Summary,
+		observation.NextAction.State,
+		observation.NextAction.Summary,
+		strings.Join(observation.GapReasons, ","),
+	}, "\x00")
+}
+
+func cloneObservation(observation Observation) Observation {
+	observation.Evidence = append([]EvidenceRef(nil), observation.Evidence...)
+	observation.GapReasons = append([]string(nil), observation.GapReasons...)
+	return observation
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
 	}
 	return append(values, value)
 }
 
-func containsString(values []string, value string) bool {
-	for _, current := range values {
-		if current == value {
-			return true
-		}
-	}
-	return false
+func deliveryTimestamp(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
 }

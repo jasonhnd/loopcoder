@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -97,19 +98,22 @@ type Lock interface {
 }
 
 type Deps struct {
-	Git         GitClient
-	GitHub      func(repoPath string) GitHubClient
-	AgentLookup func(provider string) (agent.Runner, error)
-	AcquireLock func(repoPath string, timeout time.Duration) (Lock, error)
-	Now         func() time.Time
-	PID         func() int
-	MkdirTemp   func(dir, pattern string) (string, error)
-	MkdirAll    func(path string, perm os.FileMode) error
-	WriteFile   func(path string, data []byte, perm os.FileMode) error
-	Stat        func(path string) (os.FileInfo, error)
-	RemoveAll   func(path string) error
-	RepoSkills  func(repoPath string, domainSkills config.DomainSkills) (string, error)
-	OpenStore   func(context.Context, storage.Options) (storage.Store, error)
+	Git                GitClient
+	GitHub             func(repoPath string) GitHubClient
+	AgentLookup        func(provider string) (agent.Runner, error)
+	AcquireLock        func(repoPath string, timeout time.Duration) (Lock, error)
+	Now                func() time.Time
+	PID                func() int
+	MkdirTemp          func(dir, pattern string) (string, error)
+	MkdirAll           func(path string, perm os.FileMode) error
+	WriteFile          func(path string, data []byte, perm os.FileMode) error
+	Stat               func(path string) (os.FileInfo, error)
+	RemoveAll          func(path string) error
+	RepoSkills         func(repoPath string, domainSkills config.DomainSkills) (string, error)
+	OpenProgressStore  func(context.Context, storage.Options) (storage.Store, error)
+	OpenStore          func(context.Context, storage.Options) (storage.Store, error)
+	ProgressClock      progress.Clock
+	ProgressMaxSilence time.Duration
 }
 
 func DefaultDeps() Deps {
@@ -122,13 +126,14 @@ func DefaultDeps() Deps {
 		AcquireLock: func(repoPath string, timeout time.Duration) (Lock, error) {
 			return lockfile.Acquire(repoPath, timeout)
 		},
-		Now:       time.Now,
-		PID:       os.Getpid,
-		MkdirTemp: os.MkdirTemp,
-		MkdirAll:  os.MkdirAll,
-		WriteFile: os.WriteFile,
-		Stat:      os.Stat,
-		RemoveAll: os.RemoveAll,
+		Now:               time.Now,
+		PID:               os.Getpid,
+		MkdirTemp:         os.MkdirTemp,
+		MkdirAll:          os.MkdirAll,
+		WriteFile:         os.WriteFile,
+		Stat:              os.Stat,
+		RemoveAll:         os.RemoveAll,
+		OpenProgressStore: storage.Open,
 		RepoSkills: func(repoPath string, domainSkills config.DomainSkills) (string, error) {
 			return skills.BuildPromptSection(skills.PromptSectionOptions{
 				RepoPath:            repoPath,
@@ -163,6 +168,7 @@ type dispatchContext struct {
 	tracker        *attemptTracker
 
 	domainPolicy      domainWorkerPolicy
+	progressRecorder  *progressRecorder
 	activePhase       string
 	dispatchSucceeded bool
 	preserveArtifacts bool
@@ -315,6 +321,12 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 		warnings:    dispatch.warnings,
 		attemptPath: dispatch.attemptPath,
 	})
+	recorder, err := newProgressRecorder(ctx, dispatch.opts, dispatch.deps, dispatch.runtimeRoots, dispatch.jobID, dispatch.warnings)
+	if err != nil {
+		return err
+	}
+	dispatch.progressRecorder = recorder
+	dispatch.tracker.progress = recorder
 	dispatch.activePhase = "worktree_created"
 	dispatch.cleanupStatus = "succeeded"
 	dispatch.failureStatus = "failed"
@@ -637,6 +649,9 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		return
 	}
 	defer closeWorkerOwnershipStore(dispatch)
+	if dispatch.progressRecorder != nil {
+		defer dispatch.progressRecorder.Stop()
+	}
 	if dispatch.dispatchSucceeded {
 		if dispatch.opts.KeepWorktree || dispatch.preserveArtifacts {
 			if !dispatch.preserveArtifacts {
@@ -1626,6 +1641,9 @@ func withDefaults(deps Deps) Deps {
 	if deps.OpenStore == nil {
 		deps.OpenStore = defaults.OpenStore
 	}
+	if deps.OpenProgressStore == nil {
+		deps.OpenProgressStore = defaults.OpenProgressStore
+	}
 	return deps
 }
 
@@ -1773,6 +1791,7 @@ type attemptTrackerOptions struct {
 	now         func() time.Time
 	warnings    io.Writer
 	attemptPath string
+	progress    *progressRecorder
 }
 
 type attemptTracker struct {
@@ -1795,10 +1814,11 @@ type attemptTracker struct {
 	errorMessage     *string
 	usage            *reporter.Usage
 	reporter         *reporter.Report
-	artifactDecision *state.ArtifactDecision
 	now              func() time.Time
 	warnings         io.Writer
 	attemptPath      string
+	artifactDecision *state.ArtifactDecision
+	progress         *progressRecorder
 }
 
 func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
@@ -1820,6 +1840,7 @@ func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
 		now:            opts.now,
 		warnings:       opts.warnings,
 		attemptPath:    opts.attemptPath,
+		progress:       opts.progress,
 	}
 }
 
@@ -1877,6 +1898,9 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
 	}
 	t.appendLifecycle(now, "")
+	if t.progress != nil {
+		t.progress.RecordAttempt(t.attemptRecord(), t.progressTerminal())
+	}
 }
 
 func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
@@ -1899,6 +1923,11 @@ func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
 	}
 	t.appendLifecycle(now, eventName)
+	if t.progress != nil && strings.TrimSpace(eventName) != "" {
+		record := t.attemptRecord()
+		record.Status = firstNonEmpty(outcome, record.Status)
+		t.progress.RecordAttempt(record, false)
+	}
 }
 
 func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
@@ -1928,7 +1957,13 @@ func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
 }
 
 func (t *attemptTracker) writeAttempt() {
-	record := state.AttemptRecord{
+	if _, err := state.WriteAttempt(t.repoPath, t.runID, t.attemptRecord()); err != nil {
+		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
+	}
+}
+
+func (t *attemptTracker) attemptRecord() state.AttemptRecord {
+	return state.AttemptRecord{
 		Version:          1,
 		JobID:            t.jobID,
 		Issue:            t.issue,
@@ -1948,9 +1983,13 @@ func (t *attemptTracker) writeAttempt() {
 		Report:           cloneReport(t.reporter),
 		ArtifactDecision: cloneArtifactDecision(t.artifactDecision),
 	}
-	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
-		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
+}
+
+func (t *attemptTracker) progressTerminal() bool {
+	if !state.IsTerminalStatus(t.status) {
+		return false
 	}
+	return t.status != state.StatusSucceeded || t.phase == "cleanup"
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {

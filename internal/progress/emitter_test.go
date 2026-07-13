@@ -4,156 +4,200 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
-func TestEmitterFakeClockTwentyMinuteFixtureHasNoReceiptGap(t *testing.T) {
+func TestEmitterTwentyMinuteFixtureHonorsMaxSilence(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
+	clock := newManualClock(fixedTime)
+	store := newClockStore(t, ctx, clock)
 	defer store.Close()
-	ticks := newManualTicker()
-	emitter := newTestEmitter(t, store, EmitterConfig{
-		MaxGenerationSilence: 5 * time.Minute,
-		NewTicker: func(time.Duration) TickSource {
-			return ticks
-		},
-	})
 
-	loop, err := emitter.Start(ctx, aliveObservation(clock.Now()))
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_fixture",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
 	if err != nil {
-		t.Fatalf("Start: %v", err)
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
 	}
 	for i := 0; i < 4; i++ {
 		clock.Advance(5 * time.Minute)
-		ticks.Tick(clock.Now())
 		waitForReceiptCount(t, ctx, store, i+2)
 	}
-	if err := loop.Stop(); err != nil {
+	if err := emitter.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	receipts := listEmitterReceipts(t, ctx, store)
+	receipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_fixture"})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
 	if len(receipts) != 5 {
 		t.Fatalf("receipt count = %d, want 5", len(receipts))
 	}
 	for i := 1; i < len(receipts); i++ {
-		prev := mustParseTime(t, receipts[i-1].OccurredAt)
-		next := mustParseTime(t, receipts[i].OccurredAt)
+		prev := mustParseReceiptTime(t, receipts[i-1].OccurredAt)
+		next := mustParseReceiptTime(t, receipts[i].OccurredAt)
 		if gap := next.Sub(prev); gap > 5*time.Minute {
-			t.Fatalf("gap %d = %s, want <= 5m", i, gap)
+			t.Fatalf("receipt gap %s between %s and %s exceeds policy", gap, receipts[i-1].OccurredAt, receipts[i].OccurredAt)
 		}
 	}
-	if receipts[len(receipts)-1].Progress.AgeMillis != int64((20*time.Minute + 4*time.Second).Milliseconds()) {
-		t.Fatalf("last progress age = %d, want truthful stale age", receipts[len(receipts)-1].Progress.AgeMillis)
+	if !containsString(receipts[len(receipts)-1].GapReasons, "max-generation-silence") {
+		t.Fatalf("last periodic gap reasons = %#v, want max-generation-silence", receipts[len(receipts)-1].GapReasons)
+	}
+	if receipts[len(receipts)-1].Progress.AgeMillis != int64((20 * time.Minute).Milliseconds()) {
+		t.Fatalf("last progress age = %d, want 20 minutes of no meaningful progress", receipts[len(receipts)-1].Progress.AgeMillis)
 	}
 }
 
-func TestEmitterAliveNoProgressDoesNotResetIndependentStallDeadline(t *testing.T) {
+func TestEmitterPostTerminalNonTerminalIsNoOp(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
+	store := newStore(t, ctx)
 	defer store.Close()
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
-	stallDeadline := clock.Now().Add(7 * time.Minute)
+	emitter := mustEmitter(t, store, nil, "corr_terminal")
 
-	if _, err := emitter.Emit(ctx, aliveObservation(clock.Now())); err != nil {
-		t.Fatalf("Emit: %v", err)
+	if _, err := emitter.Terminal(ctx, terminalObservation(fixedTime)); err != nil {
+		t.Fatalf("Terminal: %v", err)
 	}
+	if _, err := emitter.Emit(ctx, runningObservation(fixedTime.Add(time.Second))); !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("post-terminal Emit error = %v, want ErrEmitterClosed", err)
+	}
+	if got := countReceipts(t, ctx, store); got != 1 {
+		t.Fatalf("receipt count after post-terminal emit = %d, want 1", got)
+	}
+}
+
+func TestEmitterTerminalBlocksConcurrentOrdinaryEmit(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t, ctx)
+	defer base.Close()
+	blocking := newBlockingWriteStoreAfter(base, 0)
+	emitter := mustEmitter(t, blocking, nil, "corr_terminal_barrier")
+
+	terminalDone := make(chan error, 1)
+	go func() {
+		_, err := emitter.Terminal(ctx, terminalObservation(fixedTime))
+		terminalDone <- err
+	}()
+	<-blocking.entered
+
+	ordinaryDone := make(chan error, 1)
+	go func() {
+		_, err := emitter.Emit(ctx, runningObservation(fixedTime.Add(time.Second)))
+		ordinaryDone <- err
+	}()
+
+	select {
+	case err := <-ordinaryDone:
+		t.Fatalf("ordinary emit completed before terminal barrier released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(blocking.release)
+	if err := <-terminalDone; err != nil {
+		t.Fatalf("Terminal: %v", err)
+	}
+	if err := <-ordinaryDone; !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("ordinary emit after terminal error = %v, want ErrEmitterClosed", err)
+	}
+	if got := countReceipts(t, ctx, base); got != 1 {
+		t.Fatalf("receipt count = %d, want terminal only", got)
+	}
+}
+
+func TestEmitterTerminalBlocksConcurrentPeriodicEmit(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(fixedTime)
+	base := newClockStore(t, ctx, clock)
+	defer base.Close()
+	blocking := newBlockingWriteStoreAfter(base, 1)
+	emitter := mustEmitter(t, blocking, clock, "corr_periodic_barrier")
+	emitter.Start(ctx)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+
+	terminalDone := make(chan error, 1)
+	go func() {
+		_, err := emitter.Terminal(ctx, terminalObservation(clock.Now().Add(time.Minute)))
+		terminalDone <- err
+	}()
+	<-blocking.entered
 	clock.Advance(5 * time.Minute)
-	if _, err := emitter.emitPeriodic(ctx); err != nil {
-		t.Fatalf("emitPeriodic: %v", err)
-	}
-	clock.Advance(3 * time.Minute)
-	if clock.Now().Before(stallDeadline) {
-		t.Fatalf("clock = %s before stall deadline %s", clock.Now(), stallDeadline)
-	}
 
-	receipts := listEmitterReceipts(t, ctx, store)
-	last := receipts[len(receipts)-1]
-	if last.Progress.State != "stale" || last.Blocker.State != "none" || last.NextAction.State != "continue" {
-		t.Fatalf("stalled receipt = %#v, want alive/no-progress without blocker invention", last)
+	select {
+	case err := <-terminalDone:
+		t.Fatalf("terminal completed before barrier released: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	if !containsString(last.GapReasons, "no-meaningful-progress-observed") {
-		t.Fatalf("gap reasons = %v, want no-meaningful-progress-observed", last.GapReasons)
+	close(blocking.release)
+	if err := <-terminalDone; err != nil {
+		t.Fatalf("Terminal: %v", err)
+	}
+	waitForReceiptCount(t, ctx, base, 2)
+	if got := countReceipts(t, ctx, base); got != 2 {
+		t.Fatalf("receipt count = %d, want initial + terminal with no post-terminal periodic", got)
 	}
 }
 
-func TestEmitterDeduplicatesUnchangedPeriodicObservationBeforePolicyGap(t *testing.T) {
+func TestEmitterTerminalPersistenceFailureAllowsRetry(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
-	defer store.Close()
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
+	base := newStore(t, ctx)
+	defer base.Close()
+	failing := &failFirstWriteStore{Store: base}
+	emitter := mustEmitter(t, failing, nil, "corr_terminal_retry")
 
-	if _, err := emitter.Emit(ctx, aliveObservation(clock.Now())); err != nil {
-		t.Fatalf("Emit: %v", err)
+	if _, err := emitter.Terminal(ctx, terminalObservation(fixedTime)); err == nil {
+		t.Fatal("first Terminal succeeded, want storage failure")
 	}
-	clock.Advance(4 * time.Minute)
-	result, err := emitter.emitPeriodic(ctx)
+	if got := countReceipts(t, ctx, base); got != 0 {
+		t.Fatalf("receipt count after failed terminal = %d, want 0", got)
+	}
+	if _, err := emitter.Terminal(ctx, terminalObservation(fixedTime.Add(time.Second))); err != nil {
+		t.Fatalf("retry Terminal: %v", err)
+	}
+	if got := countReceipts(t, ctx, base); got != 1 {
+		t.Fatalf("receipt count after retry = %d, want 1", got)
+	}
+}
+
+func TestEmitterDeliveryFailureDoesNotSuppressPersistence(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+	emitter := mustEmitter(t, store, nil, "corr_delivery_failure")
+	emitter.deliver = func(context.Context, ProgressReceipt) error {
+		return errors.New("delivery unavailable")
+	}
+	if _, err := emitter.Emit(ctx, runningObservation(fixedTime)); err != nil {
+		t.Fatalf("Emit with delivery failure: %v", err)
+	}
+	if got := countReceipts(t, ctx, store); got != 1 {
+		t.Fatalf("receipt count = %d, want persisted receipt", got)
+	}
+}
+
+func TestEmitterCompatibilityKnownStatesEmitTruthfulActions(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+	emitter, err := NewEmitter(store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
 	if err != nil {
-		t.Fatalf("emitPeriodic: %v", err)
+		t.Fatalf("NewEmitter compatibility: %v", err)
 	}
-	if result.Emitted || countReceipts(t, ctx, store) != 1 {
-		t.Fatalf("early periodic result/count = %#v/%d, want no new durable receipt", result, countReceipts(t, ctx, store))
-	}
-	clock.Advance(time.Minute)
-	result, err = emitter.emitPeriodic(ctx)
-	if err != nil {
-		t.Fatalf("emitPeriodic at policy: %v", err)
-	}
-	if !result.Emitted || countReceipts(t, ctx, store) != 2 {
-		t.Fatalf("policy periodic result/count = %#v/%d, want durable receipt", result, countReceipts(t, ctx, store))
-	}
-}
-
-func TestEmitterDoesNotRenewRunClaimLeaseOrHeartbeat(t *testing.T) {
-	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
-	defer store.Close()
-	claimedAt := "2026-07-13T11:55:00Z"
-	heartbeatAt := "2026-07-13T11:56:00Z"
-	leaseExpiresAt := "2026-07-13T12:30:00Z"
-	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run_progress', 'proj_progress', 'running', ?) ON CONFLICT(id) DO NOTHING`, claimedAt); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt)
-			VALUES ('run_progress', 'executor-a', 7, ?, ?, ?, 'running', 'provider-key', '')`, claimedAt, leaseExpiresAt, heartbeatAt)
-		return err
-	}); err != nil {
-		t.Fatalf("seed run claim: %v", err)
-	}
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
-	if _, err := emitter.Emit(ctx, aliveObservation(clock.Now())); err != nil {
-		t.Fatalf("Emit: %v", err)
-	}
-
-	var gotGeneration int64
-	var gotHeartbeat, gotLease string
-	if err := store.WithTx(ctx, func(tx storage.Tx) error {
-		return tx.QueryRow(ctx, `SELECT claim_generation, heartbeat_at, lease_expires_at FROM run_claims WHERE run_id = 'run_progress'`).Scan(&gotGeneration, &gotHeartbeat, &gotLease)
-	}); err != nil {
-		t.Fatalf("query run claim: %v", err)
-	}
-	if gotGeneration != 7 || gotHeartbeat != heartbeatAt || gotLease != leaseExpiresAt {
-		t.Fatalf("claim mutated generation=%d heartbeat=%q lease=%q", gotGeneration, gotHeartbeat, gotLease)
-	}
-}
-
-func TestEmitterImmediateTransitionsAndTruthfulKnownStates(t *testing.T) {
-	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
-	defer store.Close()
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
-
 	states := []string{
 		KnownWaitingCI,
 		KnownWaitingApproval,
@@ -164,18 +208,25 @@ func TestEmitterImmediateTransitionsAndTruthfulKnownStates(t *testing.T) {
 		KnownHostOffline,
 		KnownDeliveryPending,
 	}
-	for _, state := range states {
-		clock.Advance(time.Second)
-		obs := aliveObservation(clock.Now())
-		obs.KnownState = state
-		obs.Phase = state
+	for _, known := range states {
+		obs := runningObservation(fixedTime)
+		obs.ProjectID = "proj_progress"
+		obs.DeliveryRunID = "run_progress"
+		obs.RunID = "run_progress"
+		obs.CorrelationID = "corr_known_states"
+		obs.Phase = known
 		obs.Status = ""
+		obs.KnownState = known
+		obs.Blocker = ActionState{}
+		obs.NextAction = ActionState{}
 		if _, err := emitter.Emit(ctx, obs); err != nil {
-			t.Fatalf("Emit %s: %v", state, err)
+			t.Fatalf("Emit %s: %v", known, err)
 		}
 	}
-
-	receipts := listEmitterReceipts(t, ctx, store)
+	receipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_known_states"})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
 	if len(receipts) != len(states) {
 		t.Fatalf("receipt count = %d, want %d", len(receipts), len(states))
 	}
@@ -195,221 +246,147 @@ func TestEmitterImmediateTransitionsAndTruthfulKnownStates(t *testing.T) {
 	assertReceiptState(7, "none", "delivery-pending")
 }
 
-func TestEmitterUsesNoProviderCallsAndDeliveryFailureDoesNotSuppressPersistence(t *testing.T) {
+func TestEmitterDoesNotRenewRunClaimLeaseOrHeartbeat(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
+	store := newStore(t, ctx)
 	defer store.Close()
-	var providerCalls atomic.Int64
-	deliveryErr := errors.New("delivery unavailable")
-	emitter := newTestEmitter(t, store, EmitterConfig{
-		MaxGenerationSilence: 5 * time.Minute,
-		Deliver: func(context.Context, ProgressReceipt) error {
-			return deliveryErr
-		},
-	})
-
-	result, err := emitter.Emit(ctx, aliveObservation(clock.Now()))
-	if err != nil {
+	claimedAt := "2026-07-13T11:55:00Z"
+	heartbeatAt := "2026-07-13T11:56:00Z"
+	leaseExpiresAt := "2026-07-13T12:30:00Z"
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, project_id, status, updated_at) VALUES ('run_progress', 'proj_progress', 'running', ?) ON CONFLICT(id) DO NOTHING`, claimedAt); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO run_claims(run_id, executor_id, claim_generation, claimed_at, lease_expires_at, heartbeat_at, phase, provider_idempotency_key, provider_receipt)
+			VALUES ('run_progress', 'executor-a', 7, ?, ?, ?, 'running', 'provider-key', '')`, claimedAt, leaseExpiresAt, heartbeatAt)
+		return err
+	}); err != nil {
+		t.Fatalf("seed run claim: %v", err)
+	}
+	emitter := mustEmitter(t, store, nil, "corr_claim_independent")
+	if _, err := emitter.Emit(ctx, runningObservation(fixedTime)); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
-	if !result.Emitted || !result.DeliveryAttempted || !errors.Is(result.DeliveryErr, deliveryErr) {
-		t.Fatalf("emit result = %#v, want persisted with delivery error recorded", result)
+
+	var gotGeneration int64
+	var gotHeartbeat, gotLease string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT claim_generation, heartbeat_at, lease_expires_at FROM run_claims WHERE run_id = 'run_progress'`).Scan(&gotGeneration, &gotHeartbeat, &gotLease)
+	}); err != nil {
+		t.Fatalf("query run claim: %v", err)
 	}
-	if providerCalls.Load() != 0 {
-		t.Fatalf("provider calls = %d, want 0", providerCalls.Load())
-	}
-	if countReceipts(t, ctx, store) != 1 {
-		t.Fatalf("receipt persistence suppressed by delivery failure")
+	if gotGeneration != 7 || gotHeartbeat != heartbeatAt || gotLease != leaseExpiresAt {
+		t.Fatalf("claim mutated generation=%d heartbeat=%q lease=%q", gotGeneration, gotHeartbeat, gotLease)
 	}
 }
 
-func TestEmitterTerminalStopsTickerAndEmitsExactlyOnce(t *testing.T) {
+func TestEmitterMaxSilenceBounds(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
+	store := newStore(t, ctx)
 	defer store.Close()
-	ticks := newManualTicker()
-	emitter := newTestEmitter(t, store, EmitterConfig{
-		MaxGenerationSilence: 5 * time.Minute,
-		NewTicker: func(time.Duration) TickSource {
-			return ticks
-		},
-	})
-	loop, err := emitter.Start(ctx, aliveObservation(clock.Now()))
-	if err != nil {
-		t.Fatalf("Start: %v", err)
+	if _, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		CorrelationID:      "corr_bounds_low",
+		MaxSilenceInterval: time.Millisecond,
+	}); !errors.Is(err, ErrEmitterConfig) {
+		t.Fatalf("low interval error = %v, want ErrEmitterConfig", err)
 	}
-
-	terminal := aliveObservation(clock.Now())
-	terminal.Status = "succeeded"
-	if _, err := loop.Terminal(ctx, terminal); err != nil {
-		t.Fatalf("Terminal: %v", err)
-	}
-	clock.Advance(10 * time.Minute)
-	ticks.Tick(clock.Now())
-	time.Sleep(10 * time.Millisecond)
-
-	receipts := listEmitterReceipts(t, ctx, store)
-	if len(receipts) != 2 {
-		t.Fatalf("receipt count after terminal tick = %d, want 2", len(receipts))
-	}
-	if receipts[1].Status != "succeeded" || receipts[1].NextAction.State != "none" {
-		t.Fatalf("terminal receipt = %#v", receipts[1])
-	}
-	if result, err := emitter.EmitTerminal(ctx, terminal); err != nil || result.Emitted {
-		t.Fatalf("second terminal = %#v / %v, want no-op", result, err)
+	if _, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		CorrelationID:      "corr_bounds_high",
+		MaxSilenceInterval: 2 * time.Hour,
+	}); !errors.Is(err, ErrEmitterConfig) {
+		t.Fatalf("high interval error = %v, want ErrEmitterConfig", err)
 	}
 }
 
-func TestEmitterCancellationJoinsTickerWorker(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
-	defer store.Close()
-	ticks := newManualTicker()
-	emitter := newTestEmitter(t, store, EmitterConfig{
-		MaxGenerationSilence: 5 * time.Minute,
-		NewTicker: func(time.Duration) TickSource {
-			return ticks
-		},
-	})
-	loop, err := emitter.Start(ctx, aliveObservation(clock.Now()))
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	cancel()
-	if err := loop.Stop(); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("Stop after cancellation = %v, want nil or context.Canceled", err)
-	}
-	if !ticks.stopped.Load() {
-		t.Fatal("ticker was not stopped after cancellation join")
-	}
-}
-
-func TestEmitterRestartReplayContinuesCorrelationSequence(t *testing.T) {
+func TestEmitterOverlappingInstancesAllocateDistinctSequences(t *testing.T) {
 	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	path := filepath.Join(t.TempDir(), "loopcoder.db")
-	store, err := storage.Open(ctx, storage.Options{Path: path, Now: clock.Now})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	insertProject(t, ctx, store)
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
-	if _, err := emitter.Emit(ctx, aliveObservation(clock.Now())); err != nil {
-		t.Fatalf("first Emit: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	clock.Advance(5 * time.Minute)
-	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: clock.Now})
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer reopened.Close()
-	restarted := newTestEmitter(t, reopened, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
-	obs := aliveObservation(clock.Now())
-	obs.KnownState = KnownWaitingCI
-	if _, err := restarted.Emit(ctx, obs); err != nil {
-		t.Fatalf("restarted Emit: %v", err)
-	}
-
-	receipts := listEmitterReceipts(t, ctx, reopened)
-	if len(receipts) != 2 || receipts[0].CorrelationSequence != 1 || receipts[1].CorrelationSequence != 2 {
-		t.Fatalf("replay sequences = %#v, want 1 then 2", receipts)
-	}
-}
-
-func TestEmitterDetachedNestedRaceSafe(t *testing.T) {
-	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
+	store := newStore(t, ctx)
 	defer store.Close()
-	emitter := newTestEmitter(t, store, EmitterConfig{MaxGenerationSilence: 5 * time.Minute})
+	first := mustEmitter(t, store, nil, "corr_overlap")
+	second := mustEmitter(t, store, nil, "corr_overlap")
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	errs := make(chan error, 2)
+	for _, emitter := range []*Emitter{first, second} {
 		wg.Add(1)
-		go func(index int) {
+		go func(emitter *Emitter) {
 			defer wg.Done()
-			obs := aliveObservation(clock.Now())
-			if index%2 == 0 {
-				obs.RunID = "child_run"
-				obs.TaskID = "child_task"
-				obs.AttemptID = "child_attempt"
-			}
-			_ = emitter.Observe(obs)
-			_, _ = emitter.Emit(ctx, obs)
-		}(i)
+			_, err := emitter.Emit(ctx, runningObservation(fixedTime))
+			errs <- err
+		}(emitter)
 	}
 	wg.Wait()
-	if countReceipts(t, ctx, store) == 0 {
-		t.Fatal("detached/nested concurrent emitter did not persist any receipts")
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Emit overlap: %v", err)
+		}
+	}
+	receipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_overlap"})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	var sequences []int64
+	for _, receipt := range receipts {
+		sequences = append(sequences, receipt.CorrelationSequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	if len(sequences) != 2 || sequences[0] != 1 || sequences[1] != 2 {
+		t.Fatalf("sequences = %v, want [1 2]", sequences)
 	}
 }
 
-func TestEmitterRejectsOutOfBoundsSilenceConfiguration(t *testing.T) {
-	ctx := context.Background()
-	clock := newEmitterClock(fixedTime)
-	store := newStoreWithClock(t, ctx, clock)
-	defer store.Close()
-	if _, err := NewEmitter(store, EmitterConfig{MaxGenerationSilence: time.Millisecond}); !errors.Is(err, ErrEmitterConfig) {
-		t.Fatalf("NewEmitter short interval error = %v, want ErrEmitterConfig", err)
+func mustEmitter(t *testing.T, store storage.Store, clock Clock, correlation string) *Emitter {
+	t.Helper()
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      correlation,
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
 	}
-	if _, err := NewEmitter(store, EmitterConfig{MaxGenerationSilence: 2 * time.Hour}); !errors.Is(err, ErrEmitterConfig) {
-		t.Fatalf("NewEmitter long interval error = %v, want ErrEmitterConfig", err)
+	return emitter
+}
+
+func runningObservation(at time.Time) Observation {
+	return Observation{
+		TaskID:         "task_progress",
+		AttemptID:      "att_progress_1",
+		AttemptOrdinal: 1,
+		Phase:          "codex_started",
+		Status:         "running",
+		TaskCounts:     TaskCounts{Total: 1, Running: 1},
+		Provider:       ProviderIdentity{ProviderID: "codex", ProviderConfidence: "exact"},
+		Heartbeat:      AgeEvidence{State: "exact", ObservedAt: deliveryTimestamp(at), AgeMillis: 0},
+		Progress:       AgeEvidence{State: "exact", ObservedAt: deliveryTimestamp(at), AgeMillis: 0},
+		Blocker:        ActionState{State: "none"},
+		NextAction:     ActionState{State: "wait-provider", Summary: "worker process is alive; no model-authored progress is inferred"},
+		GapReasons:     []string{"alive-but-no-meaningful-progress"},
+		OccurredAt:     at,
 	}
 }
 
-type emitterClock struct {
-	mu  sync.Mutex
-	now time.Time
+func terminalObservation(at time.Time) Observation {
+	obs := runningObservation(at)
+	obs.Phase = "cleanup"
+	obs.Status = "succeeded"
+	obs.NextAction = ActionState{State: "complete", Summary: "worker attempt succeeded"}
+	obs.GapReasons = nil
+	return obs
 }
 
-func newEmitterClock(now time.Time) *emitterClock {
-	return &emitterClock{now: now.UTC()}
-}
-
-func (c *emitterClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *emitterClock) Advance(duration time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(duration)
-}
-
-type manualTicker struct {
-	ch      chan time.Time
-	stopped atomic.Bool
-}
-
-func newManualTicker() *manualTicker {
-	return &manualTicker{ch: make(chan time.Time, 16)}
-}
-
-func (t *manualTicker) C() <-chan time.Time {
-	return t.ch
-}
-
-func (t *manualTicker) Stop() {
-	t.stopped.Store(true)
-}
-
-func (t *manualTicker) Tick(now time.Time) {
-	if t.stopped.Load() {
-		return
-	}
-	t.ch <- now
-}
-
-func newStoreWithClock(t *testing.T, ctx context.Context, clock *emitterClock) storage.Store {
+func newClockStore(t *testing.T, ctx context.Context, clock *manualClock) storage.Store {
 	t.Helper()
 	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: clock.Now})
 	if err != nil {
@@ -417,45 +394,6 @@ func newStoreWithClock(t *testing.T, ctx context.Context, clock *emitterClock) s
 	}
 	insertProject(t, ctx, store)
 	return store
-}
-
-func newTestEmitter(t *testing.T, store storage.Store, config EmitterConfig) *Emitter {
-	t.Helper()
-	emitter, err := NewEmitter(store, config)
-	if err != nil {
-		t.Fatalf("NewEmitter: %v", err)
-	}
-	return emitter
-}
-
-func aliveObservation(now time.Time) Observation {
-	return Observation{
-		ProjectID:           "proj_progress",
-		DeliveryRunID:       "run_progress",
-		RunID:               "run_progress",
-		TaskID:              "task_progress",
-		AttemptID:           "att_progress_1",
-		AttemptOrdinal:      1,
-		CorrelationID:       "corr_supervisor",
-		Phase:               "supervising",
-		Status:              "running",
-		KnownState:          KnownAliveNoMeaningfulProgress,
-		TaskCounts:          TaskCounts{Total: 1, Running: 1},
-		HeartbeatObservedAt: now,
-		HeartbeatState:      "exact",
-		ProgressObservedAt:  now.Add(-4 * time.Second),
-		ProgressState:       "stale",
-		Provider:            ProviderIdentity{ProviderID: "codex", ModelID: "gpt-5.5", ProviderConfidence: "exact"},
-	}
-}
-
-func listEmitterReceipts(t *testing.T, ctx context.Context, store storage.Store) []ProgressReceipt {
-	t.Helper()
-	receipts, err := ListReceipts(ctx, store, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_supervisor"})
-	if err != nil {
-		t.Fatalf("ListReceipts: %v", err)
-	}
-	return receipts
 }
 
 func waitForReceiptCount(t *testing.T, ctx context.Context, store storage.Store, want int) {
@@ -470,11 +408,105 @@ func waitForReceiptCount(t *testing.T, ctx context.Context, store storage.Store,
 	t.Fatalf("receipt count = %d, want at least %d", countReceipts(t, ctx, store), want)
 }
 
-func mustParseTime(t *testing.T, value string) time.Time {
+func mustParseReceiptTime(t *testing.T, value string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		t.Fatalf("parse time %q: %v", value, err)
+		t.Fatalf("parse receipt time %q: %v", value, err)
 	}
 	return parsed
+}
+
+type manualClock struct {
+	mu  sync.Mutex
+	now time.Time
+	ch  chan time.Time
+}
+
+func newManualClock(now time.Time) *manualClock {
+	return &manualClock{now: now.UTC(), ch: make(chan time.Time, 16)}
+}
+
+func (c *manualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *manualClock) NewTicker(time.Duration) Ticker {
+	return manualTicker{ch: c.ch}
+}
+
+func (c *manualClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	now := c.now
+	c.mu.Unlock()
+	c.ch <- now
+}
+
+type manualTicker struct {
+	ch <-chan time.Time
+}
+
+func (t manualTicker) C() <-chan time.Time { return t.ch }
+func (t manualTicker) Stop()               {}
+
+type blockingWriteStore struct {
+	storage.Store
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	skip    int
+	blocked bool
+}
+
+func newBlockingWriteStoreAfter(store storage.Store, skip int) *blockingWriteStore {
+	return &blockingWriteStore{Store: store, entered: make(chan struct{}), release: make(chan struct{}), skip: skip}
+}
+
+func (s *blockingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	block := false
+	s.mu.Lock()
+	if s.skip > 0 {
+		s.skip--
+	} else if !s.blocked {
+		s.blocked = true
+		block = true
+		close(s.entered)
+	}
+	s.mu.Unlock()
+	if block {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+type failFirstWriteStore struct {
+	storage.Store
+	once sync.Once
+}
+
+func (s *failFirstWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	failed := false
+	s.once.Do(func() {
+		failed = true
+	})
+	if failed {
+		return errors.New("injected write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

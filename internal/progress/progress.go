@@ -185,6 +185,18 @@ func WriteReceipt(ctx context.Context, store storage.Store, receipt ProgressRece
 }
 
 func PersistReceipt(ctx context.Context, store storage.Store, receipt ProgressReceipt) (WriteResult, error) {
+	return persistReceipt(ctx, store, receipt, false)
+}
+
+// PersistReceiptNextSequence assigns the next correlation_sequence atomically
+// with receipt insertion. It is for supervisor-owned emitters that may overlap
+// during restart or detached supervision; explicit replay payloads should keep
+// using PersistReceipt with their recorded sequence.
+func PersistReceiptNextSequence(ctx context.Context, store storage.Store, receipt ProgressReceipt) (WriteResult, error) {
+	return persistReceipt(ctx, store, receipt, true)
+}
+
+func persistReceipt(ctx context.Context, store storage.Store, receipt ProgressReceipt, nextSequence bool) (WriteResult, error) {
 	if store == nil {
 		return WriteResult{}, typed(ErrInvalidRecordCode, "store is required")
 	}
@@ -197,6 +209,22 @@ func PersistReceipt(ctx context.Context, store storage.Store, receipt ProgressRe
 	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		if err := ensureProject(ctx, tx, normalized.ProjectID); err != nil {
 			return err
+		}
+		if nextSequence {
+			var sequence int64
+			if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(correlation_sequence), 0) + 1
+				FROM progress_receipts
+				WHERE project_id = ? AND delivery_run_id = ? AND correlation_id = ?`,
+				normalized.ProjectID, normalized.DeliveryRunID, normalized.CorrelationID).Scan(&sequence); err != nil {
+				return fmt.Errorf("allocate progress receipt sequence: %w", err)
+			}
+			normalized.CorrelationSequence = sequence
+			normalized.ProgressReceiptID = ""
+			normalized.SemanticFingerprint = ""
+			normalized, err = NormalizeReceipt(normalized, now)
+			if err != nil {
+				return err
+			}
 		}
 		payload, err := delivery.CanonicalJSON(normalized)
 		if err != nil {
