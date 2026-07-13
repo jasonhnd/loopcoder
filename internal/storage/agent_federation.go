@@ -1034,7 +1034,11 @@ func validateAgentRegistrationOwnershipFence(ctx context.Context, store Store, f
 		if err != nil || !leaseExpiry.After(at.UTC()) {
 			return federationError(ErrOwnershipStaleCode, "ownership lock %s lease expired", fence.LockID)
 		}
-		if strings.TrimSpace(resourceKind) != fence.ResourceKind || !resourceKeyCovers(resourceKind, resourceKey, fence.ResourceKey) {
+		covers, err := resourceKeyCoversForProject(ctx, tx, record.ProjectID, resourceKind, resourceKey, fence.ResourceKey)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(resourceKind) != fence.ResourceKind || !covers {
 			return federationError(ErrOwnershipRequiredCode, "ownership lock %s does not cover %s/%s", fence.LockID, fence.ResourceKind, fence.ResourceKey)
 		}
 		return nil
@@ -1872,7 +1876,14 @@ func validateLiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegist
 		}
 		covered := false
 		for _, lock := range locks {
-			if lock.resourceKind == "repo-path" && resourceKeyCovers(lock.resourceKind, lock.resourceKey, physicalWritePath) {
+			if lock.resourceKind != "repo-path" {
+				continue
+			}
+			covers, err := resourceKeyCoversWithRoot(root, lock.resourceKind, lock.resourceKey, physicalWritePath)
+			if err != nil {
+				return err
+			}
+			if covers {
 				covered = true
 				break
 			}
@@ -2650,6 +2661,7 @@ func reusableAgentOwnershipLeaseTx(ctx context.Context, tx Tx, req AgentOwnershi
 	var generation int64
 	var lockGeneration int64
 	leaseExpiresAt := ""
+	root := ""
 	for rows.Next() {
 		var id, kind, key, expires string
 		var claimGen, lockGen int64
@@ -2658,6 +2670,20 @@ func reusableAgentOwnershipLeaseTx(ctx context.Context, tx Tx, req AgentOwnershi
 		}
 		kind = strings.TrimSpace(kind)
 		key = canonicalResourceKey(kind, key)
+		if kind == "repo-path" && key != "." {
+			if root == "" {
+				var err error
+				root, err = physicalProjectRootTx(ctx, tx, req.ProjectID)
+				if err != nil {
+					return AgentOwnershipLease{}, false, err
+				}
+			}
+			var err error
+			key, err = physicalRepoResourceKey(root, key)
+			if err != nil {
+				return AgentOwnershipLease{}, false, err
+			}
+		}
 		if !requested[kind+"\x00"+key] {
 			return AgentOwnershipLease{}, false, nil
 		}
@@ -2756,7 +2782,11 @@ func checkOwnershipOverlapIgnoringChildTx(ctx context.Context, tx Tx, lock Agent
 		if err := rows.Scan(&id, &existingKey); err != nil {
 			return err
 		}
-		if resourceKeysConflict(lock.ResourceKind, existingKey, lock.ResourceKey) {
+		conflict, err := resourceKeysConflictForProject(ctx, tx, lock.ProjectID, lock.ResourceKind, existingKey, lock.ResourceKey)
+		if err != nil {
+			return err
+		}
+		if conflict {
 			return federationError(ErrOneWriterConflictCode, "lock %s conflicts with %s", lock.AgentOwnershipLockID, id)
 		}
 	}
@@ -3042,22 +3072,17 @@ func physicalOwnershipResourcesTx(ctx context.Context, tx Tx, projectID string, 
 	root := ""
 	for _, resource := range resources {
 		if resource.ResourceKind == "repo-path" {
-			if canonicalResourceKey(resource.ResourceKind, resource.ResourceKey) == "." {
-				resource.ResourceKey = "."
-				out = append(out, resource)
-				continue
-			}
 			if root == "" {
 				var err error
 				root, err = physicalProjectRootTx(ctx, tx, projectID)
 				if err != nil {
-					if errors.Is(err, ErrCrossProjectReference) {
-						resource.ResourceKey = canonicalResourceKey(resource.ResourceKind, resource.ResourceKey)
-						out = append(out, resource)
-						continue
-					}
 					return nil, err
 				}
+			}
+			if canonicalResourceKey(resource.ResourceKind, resource.ResourceKey) == "." {
+				resource.ResourceKey = "."
+				out = append(out, resource)
+				continue
 			}
 			key, err := physicalRepoResourceKey(root, resource.ResourceKey)
 			if err != nil {
@@ -3349,6 +3374,26 @@ func resourceKeysConflict(kind, existing, requested string) bool {
 	return false
 }
 
+func resourceKeysConflictForProject(ctx context.Context, tx Tx, projectID, kind, existing, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeysConflict(kind, existing, requested), nil
+	}
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return false, err
+	}
+	existing, err = physicalRepoResourceKey(root, existing)
+	if err != nil {
+		return false, err
+	}
+	requested, err = physicalRepoResourceKey(root, requested)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeysConflict(kind, existing, requested), nil
+}
+
 func resourceKeyCovers(kind, held, requested string) bool {
 	held = canonicalResourceKey(kind, held)
 	requested = canonicalResourceKey(kind, requested)
@@ -3365,6 +3410,35 @@ func resourceKeyCovers(kind, held, requested string) bool {
 		return strings.HasPrefix(requested, held+"/")
 	}
 	return false
+}
+
+func resourceKeyCoversForProject(ctx context.Context, tx Tx, projectID, kind, held, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeyCovers(kind, held, requested), nil
+	}
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeyCoversWithRoot(root, kind, held, requested)
+}
+
+func resourceKeyCoversWithRoot(root, kind, held, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeyCovers(kind, held, requested), nil
+	}
+	var err error
+	held, err = physicalRepoResourceKey(root, held)
+	if err != nil {
+		return false, err
+	}
+	requested, err = physicalRepoResourceKey(root, requested)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeyCovers(kind, held, requested), nil
 }
 
 func canonicalResourceKey(kind, key string) string {

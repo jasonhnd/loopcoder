@@ -49,8 +49,13 @@ func TestCanonicalizeResolvesWindowsJunctionAliasToSameIdentity(t *testing.T) {
 
 func createWindowsJunction(t *testing.T, link, target string) {
 	t.Helper()
-	output, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:LOOPCODER_JUNCTION_LINK -Target $env:LOOPCODER_JUNCTION_TARGET | Out-Null`)
+	cmd.Env = append(os.Environ(),
+		"LOOPCODER_JUNCTION_LINK="+link,
+		"LOOPCODER_JUNCTION_TARGET="+target,
+	)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Skipf("windows junction creation unavailable: %v: %s", err, strings.TrimSpace(string(output)))
+		t.Fatalf("create Windows junction %q -> %q: %v: %s", link, target, err, strings.TrimSpace(string(output)))
 	}
 }

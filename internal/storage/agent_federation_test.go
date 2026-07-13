@@ -142,6 +142,7 @@ func TestAgentOwnershipLeaseRejectsOverlappingWritersAndStaleOwners(t *testing.T
 		t.Fatalf("Open: %v", err)
 	}
 	defer store.Close()
+	seedOwnershipProject(t, ctx, store, "project-a", t.TempDir())
 
 	rootLease, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
 		ProjectID:     "project-a",
@@ -198,6 +199,140 @@ func TestAgentOwnershipLeaseRejectsOverlappingWritersAndStaleOwners(t *testing.T
 	}
 	if err := ValidateAgentOwnershipFence(ctx, store, rootLease); !errors.Is(err, ErrOwnershipStale) {
 		t.Fatalf("old owner after takeover fence error = %v, want ErrOwnershipStale", err)
+	}
+}
+
+func TestAgentOwnershipLeaseFailsClosedWithoutPhysicalProjectRoot(t *testing.T) {
+	ctx := context.Background()
+	now := fixedNow()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	_, err = AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "missing-project",
+		DeliveryRunID: "delivery-a",
+		RunID:         "run-a",
+		OwnerID:       "worker-a",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if !errors.Is(err, ErrCrossProjectReference) {
+		t.Fatalf("missing project acquire error = %v, want ErrCrossProjectReference", err)
+	}
+
+	repo := t.TempDir()
+	seedOwnershipProject(t, ctx, store, "project-a", repo)
+	lease, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "project-a",
+		DeliveryRunID: "delivery-a",
+		RunID:         "run-a",
+		OwnerID:       "worker-a",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease valid root: %v", err)
+	}
+	if err := ValidateAgentOwnershipFence(ctx, store, lease); err != nil {
+		t.Fatalf("ValidateAgentOwnershipFence valid root: %v", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		outside := filepath.Join(t.TempDir(), "outside")
+		if err := os.MkdirAll(outside, 0o755); err != nil {
+			t.Fatalf("mkdir outside: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "secret.go"), []byte("package outside\n"), 0o644); err != nil {
+			t.Fatalf("write outside: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(repo, "linked-outside")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		_, err = AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+			ProjectID:     "project-a",
+			DeliveryRunID: "delivery-escape",
+			RunID:         "run-escape",
+			OwnerID:       "worker-escape",
+			Now:           now,
+			LeaseUntil:    now.Add(time.Hour),
+			Resources: []AgentOwnershipResource{
+				{ResourceKind: "repo-path", ResourceKey: "linked-outside/secret.go"},
+			},
+		})
+		if !errors.Is(err, ErrScopeWidening) {
+			t.Fatalf("cross-root acquire error = %v, want ErrScopeWidening", err)
+		}
+	}
+}
+
+func TestAgentOwnershipRestartRejectsLegacyAliasedActiveLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows junction coverage lives in agent_federation_windows_test.go")
+	}
+	for _, tc := range []struct {
+		name      string
+		existing  string
+		requested string
+	}{
+		{name: "legacy alias exact blocks physical", existing: "alias-src/a.go", requested: "src/a.go"},
+		{name: "legacy alias prefix blocks physical child", existing: "alias-src", requested: "src/a.go"},
+		{name: "legacy physical exact blocks alias", existing: "src/a.go", requested: "alias-src/a.go"},
+		{name: "legacy physical prefix blocks alias child", existing: "src", requested: "alias-src/a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+			repoRoot := filepath.Join(t.TempDir(), "repo")
+			src := filepath.Join(repoRoot, "src")
+			if err := os.MkdirAll(src, 0o755); err != nil {
+				t.Fatalf("mkdir src: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "a.go"), []byte("package src\n"), 0o644); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			if err := os.Symlink(src, filepath.Join(repoRoot, "alias-src")); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+
+			store, err := Open(ctx, Options{Path: dbPath, Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			seedOwnershipProject(t, ctx, store, "project-a", repoRoot)
+			insertLegacyActiveOwnershipLock(t, ctx, store, "project-a", tc.existing)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			reopened, err := Open(ctx, Options{Path: dbPath, Now: fixedNow})
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer reopened.Close()
+			_, err = AcquireAgentOwnershipLease(ctx, reopened, AgentOwnershipLeaseRequest{
+				ProjectID:     "project-a",
+				DeliveryRunID: "delivery-new",
+				RunID:         "run-new",
+				OwnerID:       "worker-new",
+				Now:           fixedNow(),
+				LeaseUntil:    fixedNow().Add(time.Hour),
+				Resources: []AgentOwnershipResource{
+					{ResourceKind: "repo-path", ResourceKey: tc.requested},
+				},
+			})
+			if !errors.Is(err, ErrOneWriterConflict) {
+				t.Fatalf("AcquireAgentOwnershipLease error = %v, want ErrOneWriterConflict", err)
+			}
+		})
 	}
 }
 
@@ -1055,6 +1190,54 @@ func createFederationClaim(t *testing.T, ctx context.Context, store Store, proje
 		t.Fatalf("ClaimChildRunExecution: %v", err)
 	}
 	return federationClaim{ParentRunID: rootRunID, RunID: childRunID, RootRunID: rootRunID, ChildKey: childKey, ExecutorID: claim.ExecutorID, ClaimGeneration: claim.ClaimGeneration, ProviderKey: claim.ProviderKey}
+}
+
+func seedOwnershipProject(t *testing.T, ctx context.Context, store Store, projectID, repoPath string) {
+	t.Helper()
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("mkdir project repo: %v", err)
+	}
+	at := "2026-01-01T00:00:00Z"
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, git_root, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET local_path = excluded.local_path, local_path_canonical = excluded.local_path_canonical, git_root = excluded.git_root, updated_at = excluded.updated_at`,
+			projectID, repoPath, repoPath, repoPath, at, at)
+		return err
+	}); err != nil {
+		t.Fatalf("seed ownership project: %v", err)
+	}
+}
+
+func insertLegacyActiveOwnershipLock(t *testing.T, ctx context.Context, store Store, projectID, resourceKey string) {
+	t.Helper()
+	now := "2026-01-01T00:00:00Z"
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO agent_ownership_locks(
+				id, project_id, delivery_run_id, child_agent_id, run_id, claim_generation,
+				lock_generation, resource_kind, resource_key, lock_mode, state, lease_expires_at,
+				heartbeat_at, conflicts_with_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			stableID("legacy_alock_", projectID, resourceKey),
+			projectID,
+			"delivery-legacy",
+			"worker-legacy",
+			"run-legacy",
+			1,
+			1,
+			"repo-path",
+			canonicalResourceKey("repo-path", resourceKey),
+			"write",
+			OwnershipStateHeld,
+			"2026-01-01T01:00:00Z",
+			now,
+			"[]",
+			now,
+			now)
+		return err
+	}); err != nil {
+		t.Fatalf("insert legacy active ownership lock: %v", err)
+	}
 }
 
 func federationAuthorityScope(projectID string) AgentScopeGrant {

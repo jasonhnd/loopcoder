@@ -2143,6 +2143,15 @@ func attachReleasedWorkerOwnership(t *testing.T, ctx context.Context, dispatch *
 	if err != nil {
 		t.Fatalf("Open ownership store: %v", err)
 	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, git_root, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			"project-worker", dispatch.repoPath, dispatch.repoPath, dispatch.repoPath, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+		return err
+	}); err != nil {
+		store.Close()
+		t.Fatalf("seed worker ownership project: %v", err)
+	}
 	lease, err := storage.AcquireAgentOwnershipLease(ctx, store, storage.AgentOwnershipLeaseRequest{
 		ProjectID:     "project-worker",
 		DeliveryRunID: dispatch.opts.RunID,
