@@ -115,6 +115,7 @@ type ComponentScore struct {
 	Score             int                              `json:"score"`
 	Weight            int                              `json:"weight"`
 	WeightedScore     string                           `json:"weighted_score"`
+	EvidenceValue     *int64                           `json:"evidence_value,omitempty"`
 	Confidence        providerinventory.Confidence     `json:"confidence"`
 	Heuristic         bool                             `json:"heuristic"`
 	HeuristicReason   string                           `json:"heuristic_reason,omitempty"`
@@ -134,14 +135,6 @@ type ScoredCandidate struct {
 	Confidence         providerinventory.Confidence `json:"confidence"`
 	Heuristic          bool                         `json:"heuristic"`
 	WhyNotSelected     string                       `json:"why_not_selected,omitempty"`
-}
-
-type Alternative struct {
-	RoutingCandidateID string            `json:"routing_candidate_id"`
-	Decision           string            `json:"decision"`
-	Reasons            []RejectionReason `json:"reasons,omitempty"`
-	Score              string            `json:"score,omitempty"`
-	Explanation        string            `json:"explanation"`
 }
 
 type RoutingDecision struct {
@@ -173,7 +166,6 @@ type RoutingDecision struct {
 	HeuristicComponents       []ComponentScore           `json:"heuristic_components"`
 	DecisionStatus            string                     `json:"decision_status"`
 	RejectedSummary           map[RejectionCode]int      `json:"rejected_summary"`
-	Alternatives              []Alternative              `json:"alternatives"`
 	CreatedAt                 string                     `json:"created_at"`
 	UpdatedAt                 string                     `json:"updated_at"`
 	DecidedBy                 delivery.Actor             `json:"decided_by"`
@@ -263,7 +255,6 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if len(decision.ScoredCandidates) == 0 {
 		decision.DecisionStatus = DecisionStatusNoEligible
 		decision.TerminalErrorCode = blockedErrorCode(eligibility.Rejected)
-		decision.Alternatives = alternativesForRejected(eligibility.Rejected)
 		decision.ChosenReason = "no hard-eligible candidates remain after deterministic eligibility"
 		return decision, nil
 	}
@@ -271,7 +262,6 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	decision.DecisionStatus = DecisionStatusSelected
 	decision.ChosenCandidateID = chosen.RoutingCandidateID
 	decision.ChosenReason = fmt.Sprintf("selected %s with total score %s under policy %s", chosen.RoutingCandidateID, chosen.TotalScore, policy.PolicyVersion)
-	decision.Alternatives = alternativesForDecision(decision.ScoredCandidates, eligibility.Rejected, chosen.RoutingCandidateID)
 	for i := range decision.ScoredCandidates {
 		if decision.ScoredCandidates[i].RoutingCandidateID == chosen.RoutingCandidateID {
 			continue
@@ -305,10 +295,6 @@ func PersistRoutingDecision(ctx context.Context, store storage.Store, decision R
 	if err != nil {
 		return err
 	}
-	alternatives, err := canonicalString(decision.Alternatives)
-	if err != nil {
-		return err
-	}
 	summary, err := canonicalString(decision.RejectedSummary)
 	if err != nil {
 		return err
@@ -330,15 +316,15 @@ func PersistRoutingDecision(ctx context.Context, store storage.Store, decision R
 			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
 			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
 			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
-			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json, alternatives_json,
+			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json,
 			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(routing_decision_id) DO NOTHING`,
 			decision.RoutingDecisionID, decision.SchemaVersion, decision.RecordVersion, decision.ProjectID, decision.DeliveryRunID,
 			decision.TaskID, decision.TaskRequirementID, decision.DecisionKey, decision.DecisionKind, decision.RoutingPolicyProfileID,
 			decision.RoleDefinitionID, decision.PlanFingerprint, decision.PolicyFingerprint, decision.RoutingFingerprint,
 			decision.CandidateGenerationStatus, decision.DecisionStatus, decision.ChosenCandidateID, string(decision.TerminalErrorCode),
-			inputRefs, eligible, rejected, scored, alternatives, summary, policy, string(payload), decision.CreatedAt, decision.UpdatedAt, actor, host)
+			inputRefs, eligible, rejected, scored, summary, policy, string(payload), decision.CreatedAt, decision.UpdatedAt, actor, host)
 		if err != nil {
 			return err
 		}
@@ -392,11 +378,18 @@ func ExplainHuman(decision RoutingDecision) string {
 	} else {
 		fmt.Fprintf(&b, "blocked %s: %s\n", decision.DecisionStatus, decision.TerminalErrorCode)
 	}
-	for _, alternative := range decision.Alternatives {
-		if alternative.RoutingCandidateID == decision.ChosenCandidateID {
+	for _, candidate := range decision.ScoredCandidates {
+		if candidate.RoutingCandidateID == decision.ChosenCandidateID {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s: %s\n", alternative.RoutingCandidateID, alternative.Explanation)
+		reason := candidate.WhyNotSelected
+		if reason == "" {
+			reason = fmt.Sprintf("eligible but ranked below %s by total score or deterministic tie-break", decision.ChosenCandidateID)
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", candidate.RoutingCandidateID, reason)
+	}
+	for _, rejected := range decision.RejectedCandidates {
+		fmt.Fprintf(&b, "- %s: %s\n", rejected.Candidate.RoutingCandidateID, candidateLabel(rejected.Candidate)+" "+rejectionExplanation(rejected.Reasons))
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -566,47 +559,57 @@ func scoreQuality(candidate Candidate, requirement taskrequirements.TaskRequirem
 	if qualityRank(candidate.QualityFloor) > qualityRank(requirement.QualityFloor) {
 		score = 100
 	}
-	return component(ComponentQualityFit, score, policy, providerinventory.ConfidenceEstimated, true, "quality fit uses policy quality floor until conformance records are persisted", nil, nil)
+	return component(ComponentQualityFit, score, policy, providerinventory.ConfidenceEstimated, true, "quality fit uses policy quality floor until conformance records are persisted", nil, nil, nil)
 }
 
 func scoreQuota(candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy) ComponentScore {
 	score := 0
 	confidence := providerinventory.ConfidenceUnknown
-	var snapshots []string
+	var selected *providerinventory.QuotaSnapshot
 	for _, id := range candidate.QuotaSnapshotIDs {
 		snapshot, ok := quotaByID[id]
-		if !ok {
+		if !ok || snapshot.RemainingValue == nil {
 			continue
 		}
-		snapshots = append(snapshots, snapshot.QuotaSnapshotID)
-		if confidenceRank(snapshot.Confidence) > confidenceRank(confidence) {
-			confidence = snapshot.Confidence
-		}
-		if snapshot.RemainingValue != nil && *snapshot.RemainingValue > int64(score) {
-			score = int(minInt64(*snapshot.RemainingValue, 100))
+		if selected == nil || quotaSnapshotBetterForScore(snapshot, *selected) {
+			selectedSnapshot := snapshot
+			selected = &selectedSnapshot
 		}
 	}
-	return component(ComponentQuotaHeadroom, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "quota headroom is capped at 100 from remaining capacity evidence", nil, snapshots)
+	var value *int64
+	var snapshots []string
+	if selected != nil {
+		value = selected.RemainingValue
+		score = int(minInt64(*selected.RemainingValue, 100))
+		confidence = selected.Confidence
+		snapshots = []string{selected.QuotaSnapshotID}
+	}
+	return component(ComponentQuotaHeadroom, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "quota headroom is capped at 100 from selected remaining capacity evidence", nil, snapshots, value)
 }
 
 func scoreCost(candidate Candidate, budgetByID map[string]budget.Summary, policy OptimizationPolicy) ComponentScore {
 	score := 0
 	confidence := providerinventory.ConfidenceUnknown
-	var evidence []string
+	var selected *budget.Summary
 	for _, id := range candidate.BudgetPolicyIDs {
 		summary, ok := budgetByID[id]
 		if !ok {
 			continue
 		}
-		evidence = append(evidence, summary.BudgetPolicyID)
-		if confidenceRank(summary.Confidence) > confidenceRank(confidence) {
-			confidence = summary.Confidence
-		}
-		if summary.AvailableValue > int64(score) {
-			score = int(minInt64(summary.AvailableValue, 100))
+		if selected == nil || budgetSummaryBetterForScore(summary, *selected) {
+			selectedSummary := summary
+			selected = &selectedSummary
 		}
 	}
-	return component(ComponentCost, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "cost score uses hard budget headroom until exact unit-cost tables are available", evidence, nil)
+	var value *int64
+	var evidence []string
+	if selected != nil {
+		value = &selected.AvailableValue
+		score = int(minInt64(selected.AvailableValue, 100))
+		confidence = selected.Confidence
+		evidence = []string{selected.BudgetPolicyID}
+	}
+	return component(ComponentCost, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "cost score uses selected hard budget headroom until exact unit-cost tables are available", evidence, nil, value)
 }
 
 func scoreLatency(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy OptimizationPolicy) ComponentScore {
@@ -625,7 +628,7 @@ func scoreLatency(candidate Candidate, scoreByID map[string]availability.Score, 
 			}
 		}
 	}
-	return component(ComponentLatency, score, policy, confidence, true, "latency defaults conservatively unless availability observations provide a latency component", evidence, nil)
+	return component(ComponentLatency, score, policy, confidence, true, "latency defaults conservatively unless availability observations provide a latency component", evidence, nil, nil)
 }
 
 func scoreAvailability(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy OptimizationPolicy) ComponentScore {
@@ -638,7 +641,7 @@ func scoreAvailability(candidate Candidate, scoreByID map[string]availability.Sc
 		evidence = append(evidence, av.AvailabilityScoreID)
 		evidence = append(evidence, av.EvidenceRecordIDs...)
 	}
-	return component(ComponentAvailability, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "availability score comes from the persisted AvailabilityScore record", evidence, nil)
+	return component(ComponentAvailability, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "availability score comes from the persisted AvailabilityScore record", evidence, nil, nil)
 }
 
 func scoreDiversity(candidate Candidate, policy OptimizationPolicy) ComponentScore {
@@ -654,7 +657,7 @@ func scoreDiversity(candidate Candidate, policy OptimizationPolicy) ComponentSco
 			score -= 20
 		}
 	}
-	return component(ComponentDiversity, clampScore(score), policy, providerinventory.ConfidenceExact, false, "", nil, nil)
+	return component(ComponentDiversity, clampScore(score), policy, providerinventory.ConfidenceExact, false, "", nil, nil, nil)
 }
 
 func scoreLocality(candidate Candidate, policy OptimizationPolicy) ComponentScore {
@@ -668,7 +671,7 @@ func scoreLocality(candidate Candidate, policy OptimizationPolicy) ComponentScor
 	if len(policy.LocalAdapterIDs) == 0 && candidate.NetworkPermission == providerinventory.NetworkNotNeeded {
 		score = 80
 	}
-	return component(ComponentLocality, score, policy, providerinventory.ConfidenceEstimated, true, "locality uses profile local adapter preference and network declaration", nil, nil)
+	return component(ComponentLocality, score, policy, providerinventory.ConfidenceEstimated, true, "locality uses profile local adapter preference and network declaration", nil, nil, nil)
 }
 
 func scoreUserPreference(candidate Candidate, policy OptimizationPolicy) ComponentScore {
@@ -679,22 +682,51 @@ func scoreUserPreference(candidate Candidate, policy OptimizationPolicy) Compone
 			break
 		}
 	}
-	return component(ComponentUserPreference, score, policy, providerinventory.ConfidenceExact, false, "", policy.PreferredCandidateIDs, nil)
+	return component(ComponentUserPreference, score, policy, providerinventory.ConfidenceExact, false, "", policy.PreferredCandidateIDs, nil, nil)
 }
 
-func component(name ComponentName, score int, policy OptimizationPolicy, confidence providerinventory.Confidence, heuristic bool, reason string, evidence, snapshots []string) ComponentScore {
+func component(name ComponentName, score int, policy OptimizationPolicy, confidence providerinventory.Confidence, heuristic bool, reason string, evidence, snapshots []string, value *int64) ComponentScore {
 	weight := policy.Weights[name]
 	return ComponentScore{
 		Name:              name,
 		Score:             clampScore(score),
 		Weight:            weight,
 		WeightedScore:     formatBasisPoints(clampScore(score) * weight * 100),
+		EvidenceValue:     value,
 		Confidence:        confidence,
 		Heuristic:         heuristic,
 		HeuristicReason:   reason,
 		EvidenceRecordIDs: dedupeStrings(evidence),
 		SnapshotIDs:       dedupeStrings(snapshots),
 	}
+}
+
+func quotaSnapshotBetterForScore(candidate, current providerinventory.QuotaSnapshot) bool {
+	candidateValue := int64(0)
+	currentValue := int64(0)
+	if candidate.RemainingValue != nil {
+		candidateValue = *candidate.RemainingValue
+	}
+	if current.RemainingValue != nil {
+		currentValue = *current.RemainingValue
+	}
+	if candidateValue != currentValue {
+		return candidateValue > currentValue
+	}
+	if confidenceRank(candidate.Confidence) != confidenceRank(current.Confidence) {
+		return confidenceRank(candidate.Confidence) > confidenceRank(current.Confidence)
+	}
+	return candidate.QuotaSnapshotID < current.QuotaSnapshotID
+}
+
+func budgetSummaryBetterForScore(candidate, current budget.Summary) bool {
+	if candidate.AvailableValue != current.AvailableValue {
+		return candidate.AvailableValue > current.AvailableValue
+	}
+	if confidenceRank(candidate.Confidence) != confidenceRank(current.Confidence) {
+		return confidenceRank(candidate.Confidence) > confidenceRank(current.Confidence)
+	}
+	return candidate.BudgetPolicyID < current.BudgetPolicyID
 }
 
 func availabilityForCandidate(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score) (availability.Score, bool) {
@@ -719,47 +751,6 @@ func heuristicComponents(scored []ScoredCandidate) []ComponentScore {
 		out = append(out, component)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-func alternativesForDecision(scored []ScoredCandidate, rejected []RejectedCandidate, chosenID string) []Alternative {
-	out := alternativesForRejected(rejected)
-	for _, candidate := range scored {
-		if candidate.RoutingCandidateID == chosenID {
-			out = append(out, Alternative{
-				RoutingCandidateID: candidate.RoutingCandidateID,
-				Decision:           "selected",
-				Score:              candidate.TotalScore,
-				Explanation:        "selected highest-ranked eligible candidate",
-			})
-			continue
-		}
-		out = append(out, Alternative{
-			RoutingCandidateID: candidate.RoutingCandidateID,
-			Decision:           "not-selected",
-			Score:              candidate.TotalScore,
-			Explanation:        fmt.Sprintf("eligible but ranked below %s by total score or deterministic tie-break", chosenID),
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Decision != out[j].Decision {
-			return out[i].Decision < out[j].Decision
-		}
-		return out[i].RoutingCandidateID < out[j].RoutingCandidateID
-	})
-	return out
-}
-
-func alternativesForRejected(rejected []RejectedCandidate) []Alternative {
-	out := make([]Alternative, 0, len(rejected))
-	for _, candidate := range rejected {
-		out = append(out, Alternative{
-			RoutingCandidateID: candidate.Candidate.RoutingCandidateID,
-			Decision:           "rejected",
-			Reasons:            candidate.Reasons,
-			Explanation:        candidateLabel(candidate.Candidate) + " " + rejectionExplanation(candidate.Reasons),
-		})
-	}
 	return out
 }
 
@@ -1036,7 +1027,7 @@ func validateRoutingDecision(decision RoutingDecision) error {
 	if decision.RoutingDecisionID != routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing decision id does not match routing fingerprint"}
 	}
-	if len(decision.InputRecordRefs) == 0 || decision.UserPinRefs == nil || decision.FallbackChain == nil || decision.BreakerGateRefs == nil || decision.HeuristicComponents == nil || decision.RejectedSummary == nil || decision.Alternatives == nil {
+	if len(decision.InputRecordRefs) == 0 || decision.UserPinRefs == nil || decision.FallbackChain == nil || decision.BreakerGateRefs == nil || decision.HeuristicComponents == nil || decision.RejectedSummary == nil {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision required arrays/maps must be present"}
 	}
 	if err := validateActor(decision.DecidedBy); err != nil {

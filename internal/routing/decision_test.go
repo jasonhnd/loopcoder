@@ -8,13 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
 
-func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsAlternatives(t *testing.T) {
+func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsCandidates(t *testing.T) {
 	fixture := newFixture(t)
 	scores := fixture.availabilityScores()
 	for i := range scores {
@@ -75,8 +76,66 @@ func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsAlternatives(t *tes
 	if err != nil {
 		t.Fatalf("ExplainJSON: %v", err)
 	}
-	if !strings.Contains(string(stable), `"scored_candidates"`) || !strings.Contains(string(stable), `"alternatives"`) {
-		t.Fatalf("stable explain JSON missing scored candidates/alternatives: %s", stable)
+	if !strings.Contains(string(stable), `"scored_candidates"`) || !strings.Contains(string(stable), `"rejected_candidates"`) {
+		t.Fatalf("stable explain JSON missing scored/rejected candidates: %s", stable)
+	}
+	if strings.Contains(string(stable), `"alternatives"`) {
+		t.Fatalf("stable explain JSON includes non-v1 alternatives field: %s", stable)
+	}
+}
+
+func TestRouteDecisionQuotaAndCostEvidenceStayWithScoreProducingRecord(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	lowQuota := quota("qsnap-low-exact", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 10, fixture.now)
+	highQuota := quota("qsnap-high-estimated", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceEstimated, providerinventory.FreshnessFresh, 80, fixture.now)
+	candidate.QuotaSnapshotIDs = []string{lowQuota.QuotaSnapshotID, highQuota.QuotaSnapshotID}
+	lowBudget := budgetSummary("bpol-low-exact", "codex", "acct-a", "codex-good", 10)
+	highBudget := budgetSummary("bpol-high-estimated", "codex", "acct-a", "codex-good", 90)
+	highBudget.Confidence = providerinventory.ConfidenceEstimated
+	candidate.BudgetPolicyIDs = []string{lowBudget.BudgetPolicyID, highBudget.BudgetPolicyID}
+	candidate.RoutingCandidateID = candidateID(candidate)
+	candidate.CandidateFingerprint = candidateFingerprint(candidate)
+	input.Inputs.Candidates = []Candidate{candidate}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, lowQuota, highQuota)
+	input.Inputs.Budgets = append(input.Inputs.Budgets, lowBudget, highBudget)
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if len(decision.ScoredCandidates) != 1 {
+		t.Fatalf("scored candidates = %#v, want one", decision.ScoredCandidates)
+	}
+	quotaScore := componentByName(t, decision.ScoredCandidates[0].Components, ComponentQuotaHeadroom)
+	if quotaScore.Confidence != providerinventory.ConfidenceEstimated || !quotaScore.Heuristic || quotaScore.EvidenceValue == nil || *quotaScore.EvidenceValue != 80 || len(quotaScore.SnapshotIDs) != 1 || quotaScore.SnapshotIDs[0] != highQuota.QuotaSnapshotID {
+		t.Fatalf("quota component mixed evidence: %#v", quotaScore)
+	}
+	costScore := componentByName(t, decision.ScoredCandidates[0].Components, ComponentCost)
+	if costScore.Confidence != providerinventory.ConfidenceEstimated || !costScore.Heuristic || costScore.EvidenceValue == nil || *costScore.EvidenceValue != 90 || len(costScore.EvidenceRecordIDs) != 1 || costScore.EvidenceRecordIDs[0] != highBudget.BudgetPolicyID {
+		t.Fatalf("cost component mixed evidence: %#v", costScore)
+	}
+}
+
+func TestRouteDecisionScoreEvidenceTieBreaksDeterministically(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	exactQuota := quota("qsnap-b-exact", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 50, fixture.now)
+	estimatedQuota := quota("qsnap-a-estimated", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceEstimated, providerinventory.FreshnessFresh, 50, fixture.now)
+	candidate.QuotaSnapshotIDs = []string{estimatedQuota.QuotaSnapshotID, exactQuota.QuotaSnapshotID}
+	quotaScore := scoreQuota(candidate, mapQuotaSnapshots([]providerinventory.QuotaSnapshot{estimatedQuota, exactQuota}), OptimizationPolicy{Weights: map[ComponentName]int{ComponentQuotaHeadroom: 20}})
+	if quotaScore.Confidence != providerinventory.ConfidenceExact || len(quotaScore.SnapshotIDs) != 1 || quotaScore.SnapshotIDs[0] != exactQuota.QuotaSnapshotID {
+		t.Fatalf("quota equal-value confidence tie-break = %#v", quotaScore)
+	}
+
+	exactBudget := budgetSummary("bpol-b-exact", "codex", "acct-a", "codex-good", 40)
+	estimatedBudget := budgetSummary("bpol-a-estimated", "codex", "acct-a", "codex-good", 40)
+	estimatedBudget.Confidence = providerinventory.ConfidenceEstimated
+	candidate.BudgetPolicyIDs = []string{estimatedBudget.BudgetPolicyID, exactBudget.BudgetPolicyID}
+	costScore := scoreCost(candidate, mapBudgets([]budget.Summary{estimatedBudget, exactBudget}), OptimizationPolicy{Weights: map[ComponentName]int{ComponentCost: 10}})
+	if costScore.Confidence != providerinventory.ConfidenceExact || len(costScore.EvidenceRecordIDs) != 1 || costScore.EvidenceRecordIDs[0] != exactBudget.BudgetPolicyID {
+		t.Fatalf("cost equal-value confidence tie-break = %#v", costScore)
 	}
 }
 
@@ -329,7 +388,7 @@ func TestRouteDecisionNoEligibleCandidatePersistsTypedBlockedDecision(t *testing
 	if err != nil {
 		t.Fatalf("LoadRoutingDecision: %v", err)
 	}
-	if loaded.DecisionStatus != DecisionStatusNoEligible || len(loaded.RejectedCandidates) != 1 || len(loaded.Alternatives) == 0 {
+	if loaded.DecisionStatus != DecisionStatusNoEligible || len(loaded.RejectedCandidates) != 1 || len(loaded.RejectedSummary) == 0 {
 		t.Fatalf("loaded blocked decision missing rejection evidence: %#v", loaded)
 	}
 	replayed, err := DecideAndPersistRoute(ctx, store, input)
@@ -472,6 +531,17 @@ func hasComponent(components []ComponentScore, name ComponentName) bool {
 		}
 	}
 	return false
+}
+
+func componentByName(t *testing.T, components []ComponentScore, name ComponentName) ComponentScore {
+	t.Helper()
+	for _, component := range components {
+		if component.Name == name {
+			return component
+		}
+	}
+	t.Fatalf("missing component %s in %#v", name, components)
+	return ComponentScore{}
 }
 
 func assertRoutingDecisionCount(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey string, want int) {
