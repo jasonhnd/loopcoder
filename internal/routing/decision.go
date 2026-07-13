@@ -472,6 +472,8 @@ func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result R
 		"project_id":          input.ProjectID,
 		"delivery_run_id":     input.DeliveryRunID,
 		"task_requirement_id": input.TaskRequirementID,
+		"role_definition_id":  input.RoleDefinitionID,
+		"role_definitions":    input.Inputs.RoleDefinitions,
 		"plan_fingerprint":    input.PlanFingerprint,
 		"policy_fingerprint":  firstNonEmpty(input.PolicyFingerprint, policy.PolicyFingerprint),
 		"hard_policy":         input.Inputs.Policy,
@@ -816,6 +818,10 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		refs = append(refs, InputRecordRef{RecordKind: kind, RecordID: id, Fingerprint: fingerprint})
 	}
 	addRef("task_requirement", input.TaskRequirementID, input.Inputs.Requirement.TaskRequirementFingerprint)
+	if role, ok := ResolveRoleDefinition(input.Inputs.Requirement.RoleKey, input.Inputs.RoleDefinitions); ok {
+		fp := "sha256:" + hashCanonical(role)
+		addRef("role_definition", firstNonEmpty(input.RoleDefinitionID, role.RoleDefinitionID), fp)
+	}
 	for _, candidate := range append([]Candidate{}, result.Eligible...) {
 		addRef("routing_candidate", candidate.RoutingCandidateID, candidate.CandidateFingerprint)
 		for _, id := range candidate.QuotaSnapshotIDs {

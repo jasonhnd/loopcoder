@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -119,6 +120,71 @@ func TestParseReadsProviderInventoryProfileSelection(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "profile_selection.codex") || !strings.Contains(err.Error(), "acct_") {
 		t.Fatalf("error = %v, want profile selection acct_ hint", err)
+	}
+}
+
+func TestCustomRoleDefinitionsRoundTripThroughConfigAndJSON(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+role_definitions:
+  - schema_version: loopcoder.role_definition.v1
+    record_version: 1
+    role_key: docs-auditor
+    role_version: "1"
+    description: Custom read-only docs auditor
+    allowed_risk_tiers: [low, medium]
+    minimum_capabilities:
+      - dimension: roles_supported
+        required_value: verifier
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+      - dimension: json_output
+        required_value: true
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+    permission_floor: read-only
+    permission_ceiling: read-only
+    default_output_contract: verification-verdict
+    independence_requirements:
+      high: different-provider
+    forbidden_bindings: [provider_name, model_id, account_profile_id]
+    quality_floor: strong
+    reasoning_depth: deep
+    required_tools: [filesystem-read]
+    minimum_context_window_tokens: 120000
+    max_side_effect_class: provider-launch
+    verification_requirements:
+      - verification_kind: loopreview
+        required_for_risk_tiers: [high]
+        independence_level: different-provider
+        permission_required: read-only
+        output_contract: verification-verdict
+        source: fixture
+    latency_tolerance: relaxed
+    cost_tolerance: high
+    policy_version: fixture-policy-v1
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if len(cfg.RoleDefinitions) != 1 {
+		t.Fatalf("RoleDefinitions = %#v, want one custom role", cfg.RoleDefinitions)
+	}
+	data, err := json.Marshal(cfg.RoleDefinitions)
+	if err != nil {
+		t.Fatalf("json.Marshal role definitions: %v", err)
+	}
+	var roundTrip []RoleDefinition
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("json.Unmarshal role definitions: %v", err)
+	}
+	if !reflect.DeepEqual(roundTrip, cfg.RoleDefinitions) {
+		t.Fatalf("role definitions JSON round trip = %#v, want %#v", roundTrip, cfg.RoleDefinitions)
+	}
+	if strings.Contains(string(data), "provider:") || strings.Contains(string(data), "model_id\":\"gpt") {
+		t.Fatalf("role definition JSON contains provider/model binding: %s", data)
 	}
 }
 

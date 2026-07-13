@@ -125,6 +125,7 @@ type Policy struct {
 
 type Inputs struct {
 	Requirement     taskrequirements.TaskRequirement
+	RoleDefinitions []RoleDefinition
 	Candidates      []Candidate
 	Inventory       providerinventory.Report
 	Availability    []availability.Score
@@ -160,7 +161,12 @@ type Result struct {
 func FilterHardEligibility(inputs Inputs) Result {
 	policy := normalizePolicy(inputs.Policy)
 	requirement := inputs.Requirement
-	candidates := normalizeCandidates(inputs.Candidates, requirement, inputs.Inventory)
+	roleDef, hasRoleDef := ResolveRoleDefinition(requirement.RoleKey, inputs.RoleDefinitions)
+	var roleErr error
+	if hasRoleDef {
+		requirement, roleErr = ComposeRoleRequirement(requirement, roleDef)
+	}
+	candidates := normalizeCandidates(inputs.Candidates, requirement, inputs.Inventory, roleDef, hasRoleDef)
 	contract := inputs.RuntimeContract
 	if len(contract.Providers) == 0 && len(contract.Hosts) == 0 {
 		contract = runtimecap.DefaultContract()
@@ -202,6 +208,11 @@ func FilterHardEligibility(inputs Inputs) Result {
 
 		reasons = append(reasons, evaluatePins(candidate, inputs.Pins)...)
 		reasons = append(reasons, evaluateExclusions(candidate, inputs.Exclusions)...)
+		if !hasRoleDef {
+			reasons = append(reasons, reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, "role definition is missing", nil, nil))
+		} else if roleErr != nil {
+			reasons = append(reasons, reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, roleErr.Error(), []string{roleDef.RoleDefinitionID}, nil))
+		}
 		if !candidate.ScopeBounded && policy.RequireBoundedScope {
 			reasons = append(reasons, reason(RejectScopeUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "candidate does not prove bounded task scope", nil, nil))
 		}
@@ -228,12 +239,12 @@ func FilterHardEligibility(inputs Inputs) Result {
 			reasons = append(reasons, reason(RejectAuthNotReady, taskrequirements.ErrRequirementConfidenceInsufficientCode, "auth readiness evidence is missing", []string{candidate.AuthReadinessID}, nil))
 		}
 		if hasModel {
-			reasons = append(reasons, evaluateModel(requirement, candidate, model, policy)...)
+			reasons = append(reasons, evaluateModel(requirement, candidate, model, policy, roleDef, hasRoleDef)...)
 		} else {
 			reasons = append(reasons, reason(RejectModelUnavailable, taskrequirements.ErrCapabilityUnsupportedCode, "model capability evidence is missing", []string{candidate.ModelCapabilityID}, nil))
 		}
-		reasons = append(reasons, evaluatePermissionAndSideEffects(requirement, candidate)...)
-		reasons = append(reasons, evaluateRuntimeCompatibility(contract, hostName, requirement, candidate)...)
+		reasons = append(reasons, evaluatePermissionAndSideEffects(requirement, candidate, roleDef, hasRoleDef)...)
+		reasons = append(reasons, evaluateRuntimeCompatibility(contract, hostName, requirement, candidate, roleDef, hasRoleDef)...)
 		reasons = append(reasons, evaluateQuota(candidate, quotaByID, policy)...)
 		reasons = append(reasons, evaluateBudgets(candidate, budgetByID, policy)...)
 		reasons = append(reasons, evaluateAvailability(candidate, scoreByID, scoreByCandidate, policy)...)
@@ -269,9 +280,9 @@ func normalizePolicy(policy Policy) Policy {
 	return policy
 }
 
-func normalizeCandidates(candidates []Candidate, requirement taskrequirements.TaskRequirement, inventory providerinventory.Report) []Candidate {
+func normalizeCandidates(candidates []Candidate, requirement taskrequirements.TaskRequirement, inventory providerinventory.Report, role RoleDefinition, hasRole bool) []Candidate {
 	if len(candidates) == 0 {
-		candidates = candidatesFromInventory(requirement, inventory)
+		candidates = candidatesFromInventory(requirement, inventory, role, hasRole)
 	}
 	out := make([]Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -286,16 +297,19 @@ func normalizeCandidates(candidates []Candidate, requirement taskrequirements.Ta
 			candidate.InvocationProfileKey = "default"
 		}
 		if candidate.Permission == "" {
-			candidate.Permission = taskrequirements.PermissionWrite
-			if candidate.RoleKey == "verifier" {
-				candidate.Permission = taskrequirements.PermissionReadOnly
-			}
+			candidate.Permission = defaultPermissionForRoleDefinition(candidate.RoleKey, role, hasRole)
 		}
 		if candidate.LaunchSideEffectClass == "" {
 			candidate.LaunchSideEffectClass = taskrequirements.SideEffectProviderLaunch
 		}
 		if candidate.NetworkPermission == "" {
 			candidate.NetworkPermission = providerinventory.NetworkNotNeeded
+		}
+		if hasRole {
+			if role.MinimumContextWindowTokens > candidate.RequiredContextTokens {
+				candidate.RequiredContextTokens = role.MinimumContextWindowTokens
+			}
+			candidate.RequiredTools = dedupeStrings(append(candidate.RequiredTools, role.RequiredTools...))
 		}
 		candidate.QuotaSnapshotIDs = dedupeStrings(candidate.QuotaSnapshotIDs)
 		candidate.BudgetPolicyIDs = dedupeStrings(candidate.BudgetPolicyIDs)
@@ -310,7 +324,7 @@ func normalizeCandidates(candidates []Candidate, requirement taskrequirements.Ta
 	return out
 }
 
-func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inventory providerinventory.Report) []Candidate {
+func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inventory providerinventory.Report, role RoleDefinition, hasRole bool) []Candidate {
 	installations := inventory.Installations
 	sort.Slice(installations, func(i, j int) bool {
 		return installations[i].ProviderInstallationID < installations[j].ProviderInstallationID
@@ -354,13 +368,18 @@ func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inven
 					ModelCapabilityID:      model.ModelCapabilityID,
 					CanonicalModelID:       model.CanonicalModelID,
 					InvocationProfileKey:   "default",
-					Permission:             defaultPermissionForRole(requirement.RoleKey),
+					Permission:             defaultPermissionForRoleDefinition(requirement.RoleKey, role, hasRole),
 					LaunchSideEffectClass:  taskrequirements.SideEffectProviderLaunch,
 					NetworkPermission:      providerinventory.NetworkNotNeeded,
 					ScopeBounded:           true,
 					QualityFloor:           taskrequirements.QualityStandard,
 					RequiredContextTokens:  0,
 					CapabilitySummary:      capabilitySummary(model),
+				}
+				if hasRole {
+					candidate.RequiredContextTokens = role.MinimumContextWindowTokens
+					candidate.RequiredTools = append([]string(nil), role.RequiredTools...)
+					candidate.QualityFloor = role.QualityFloor
 				}
 				candidate.QuotaSnapshotIDs = quotaIDsForCandidate(candidate, inventory.QuotaSnapshots)
 				out = append(out, candidate)
@@ -370,14 +389,14 @@ func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inven
 	return out
 }
 
-func evaluateModel(requirement taskrequirements.TaskRequirement, candidate Candidate, model providerinventory.ModelCapability, policy Policy) []RejectionReason {
+func evaluateModel(requirement taskrequirements.TaskRequirement, candidate Candidate, model providerinventory.ModelCapability, policy Policy, role RoleDefinition, hasRole bool) []RejectionReason {
 	var reasons []RejectionReason
 	reasons = append(reasons, staleReason(model.ModelCapabilityID, model.FreshnessState, model.Confidence, policy)...)
 	if model.LifecycleState == providerinventory.LifecycleRemoved || model.AvailabilityState != providerinventory.AvailabilityAvailable {
 		reasons = append(reasons, reason(RejectModelUnavailable, taskrequirements.ErrCapabilityUnsupportedCode, "model is not available", []string{model.ModelCapabilityID}, nil))
 	}
-	if !roleSupported(requirement.RoleKey, model.RolesSupported) {
-		reasons = append(reasons, reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, "model does not support required role", []string{model.ModelCapabilityID}, nil))
+	if hasRole && len(role.MinimumCapabilities) == 0 {
+		reasons = append(reasons, reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, "role definition has no minimum capability evidence floor", []string{role.RoleDefinitionID}, nil))
 	}
 	for _, req := range requirement.RequiredCapabilities {
 		reasons = append(reasons, evaluateCapability(req, candidate, model, policy)...)
@@ -404,6 +423,27 @@ func evaluateCapability(req taskrequirements.CapabilityRequirement, candidate Ca
 	}
 	if req.MinimumConfidence != "" && !meetsMinimumConfidence(model.Confidence, req.MinimumConfidence, policy) {
 		return []RejectionReason{reason(RejectUnknownTelemetry, taskrequirements.ErrRequirementConfidenceInsufficientCode, "capability confidence is insufficient", evidence, nil)}
+	}
+	switch req.Dimension {
+	case taskrequirements.CapabilityRolesSupported:
+		for _, want := range requiredRoles(req.RequiredValue) {
+			if !roleSupported(want, model.RolesSupported) {
+				return []RejectionReason{reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, "model does not support role capability "+want, evidence, nil)}
+			}
+		}
+		return nil
+	case taskrequirements.CapabilityContextWindowTokens:
+		required := numericRequirement(req.RequiredValue)
+		if required > 0 && (model.ContextWindowTokens == nil || model.ContextWindowTokens.Value < required || !confidenceAllowed(model.ContextWindowTokens.Confidence, policy)) {
+			return []RejectionReason{reason(RejectContextWindowInsufficient, taskrequirements.ErrCapabilityUnsupportedCode, "context window capability is insufficient", evidence, nil)}
+		}
+		return nil
+	case taskrequirements.CapabilityToolSupport:
+		tools := requiredRoles(req.RequiredValue)
+		if len(tools) > 0 && !toolsSupported(tools, model.ToolSupport, policy) {
+			return []RejectionReason{reason(RejectToolSupportUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "tool support is unsupported", evidence, nil)}
+		}
+		return nil
 	}
 	requiredBool, boolRequired := req.RequiredValue.(bool)
 	if !boolRequired || !requiredBool {
@@ -442,41 +482,30 @@ func evaluateCapability(req taskrequirements.CapabilityRequirement, candidate Ca
 		if model.ImageOutput != providerinventory.CapabilityTrue {
 			return []RejectionReason{reason(RejectImageOutputUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "image output is unsupported", evidence, nil)}
 		}
-	case taskrequirements.CapabilityContextWindowTokens:
-		if candidate.RequiredContextTokens > 0 && model.ContextWindowTokens == nil {
-			return []RejectionReason{reason(RejectContextWindowInsufficient, taskrequirements.ErrCapabilityUnsupportedCode, "context window evidence is missing", evidence, nil)}
-		}
-	case taskrequirements.CapabilityToolSupport:
-		if len(candidate.RequiredTools) > 0 && !toolsSupported(candidate.RequiredTools, model.ToolSupport, policy) {
-			return []RejectionReason{reason(RejectToolSupportUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "tool support is unsupported", evidence, nil)}
-		}
 	}
 	return nil
 }
 
-func evaluatePermissionAndSideEffects(requirement taskrequirements.TaskRequirement, candidate Candidate) []RejectionReason {
+func evaluatePermissionAndSideEffects(requirement taskrequirements.TaskRequirement, candidate Candidate, role RoleDefinition, hasRole bool) []RejectionReason {
 	var reasons []RejectionReason
 	if permissionRank(candidate.Permission) < permissionRank(requirement.PermissionRequired) {
 		reasons = append(reasons, reason(RejectPermissionUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "candidate cannot enforce required permission", nil, nil))
 	}
-	if requirement.RoleKey == "verifier" && candidate.Permission != taskrequirements.PermissionReadOnly {
-		reasons = append(reasons, reason(RejectPermissionUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "verifier route must remain read-only", nil, nil))
+	if hasRole && permissionRank(candidate.Permission) > permissionRank(role.PermissionCeiling) {
+		reasons = append(reasons, reason(RejectPermissionUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "candidate permission exceeds role envelope ceiling", []string{role.RoleDefinitionID}, nil))
 	}
 	if sideEffectRank(candidate.LaunchSideEffectClass) > sideEffectRank(requirement.SideEffectClass) && requirement.SideEffectClass != "" {
 		reasons = append(reasons, reason(RejectSideEffectClassExceeded, taskrequirements.ErrCapabilityUnsupportedCode, "candidate side-effect class exceeds task authorization", nil, nil))
 	}
+	if hasRole && role.MaxSideEffectClass != "" && sideEffectRank(candidate.LaunchSideEffectClass) > sideEffectRank(role.MaxSideEffectClass) {
+		reasons = append(reasons, reason(RejectSideEffectClassExceeded, taskrequirements.ErrCapabilityUnsupportedCode, "candidate side-effect class exceeds role envelope", []string{role.RoleDefinitionID}, nil))
+	}
 	return reasons
 }
 
-func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string, requirement taskrequirements.TaskRequirement, candidate Candidate) []RejectionReason {
-	role := runtimecap.RoleWorker
-	switch requirement.RoleKey {
-	case "verifier":
-		role = runtimecap.RoleVerifier
-	case "nested-subagent":
-		role = runtimecap.RoleNestedSubagents
-	}
-	entry := contract.EvaluateCompatibility(candidate.AdapterID, hostName, role)
+func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string, requirement taskrequirements.TaskRequirement, candidate Candidate, role RoleDefinition, hasRole bool) []RejectionReason {
+	runtimeRole := runtimeRoleForRequirement(requirement, role, hasRole)
+	entry := contract.EvaluateCompatibility(candidate.AdapterID, hostName, runtimeRole)
 	if entry.Support == runtimecap.SupportUnsupported {
 		code := RejectRoleUnsupported
 		if entry.Code == "unsupported_json_output" {
@@ -691,15 +720,76 @@ func confidenceRank(value providerinventory.Confidence) int {
 
 func roleSupported(role string, roles []providerinventory.CatalogRole) bool {
 	want := providerinventory.CatalogRole(role)
-	if role == "nested-subagent" {
+	if role == RoleKeyNestedSubagent {
 		want = providerinventory.CatalogRoleNestedSubagents
 	}
 	for _, have := range roles {
-		if have == want || (role == "verifier" && have == providerinventory.CatalogRoleAuditReview) {
+		if have == want || (role == RoleKeyVerifier && have == providerinventory.CatalogRoleAuditReview) {
 			return true
 		}
 	}
 	return false
+}
+
+func runtimeRoleForRequirement(requirement taskrequirements.TaskRequirement, role RoleDefinition, hasRole bool) runtimecap.CompatibilityRole {
+	if hasRole {
+		for _, capability := range role.MinimumCapabilities {
+			if capability.Dimension != taskrequirements.CapabilityRolesSupported {
+				continue
+			}
+			for _, required := range requiredRoles(capability.RequiredValue) {
+				switch required {
+				case string(providerinventory.CatalogRoleNestedSubagents), RoleKeyNestedSubagent:
+					return runtimecap.RoleNestedSubagents
+				case string(providerinventory.CatalogRoleVerifier), string(providerinventory.CatalogRoleAuditReview), RoleKeySoul:
+					return runtimecap.RoleVerifier
+				}
+			}
+		}
+	}
+	switch normalizeRoleKey(requirement.RoleKey) {
+	case RoleKeyVerifier, RoleKeySoul:
+		return runtimecap.RoleVerifier
+	case RoleKeyNestedSubagent:
+		return runtimecap.RoleNestedSubagents
+	default:
+		return runtimecap.RoleWorker
+	}
+}
+
+func requiredRoles(value any) []string {
+	switch v := value.(type) {
+	case string:
+		return dedupeStrings([]string{v})
+	case []string:
+		return dedupeStrings(v)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return dedupeStrings(out)
+	default:
+		return nil
+	}
+}
+
+func numericRequirement(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		if v > int64(^uint(0)>>1) {
+			return int(^uint(0) >> 1)
+		}
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
 }
 
 func toolsSupported(required []string, facts []providerinventory.CapabilityFact, policy Policy) bool {
@@ -999,8 +1089,11 @@ func hashCanonical(value any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func defaultPermissionForRole(role string) taskrequirements.Permission {
-	if role == "verifier" {
+func defaultPermissionForRoleDefinition(roleKey string, role RoleDefinition, hasRole bool) taskrequirements.Permission {
+	if hasRole && role.PermissionFloor != "" {
+		return role.PermissionFloor
+	}
+	if normalizeRoleKey(roleKey) == RoleKeyVerifier || normalizeRoleKey(roleKey) == RoleKeySoul {
 		return taskrequirements.PermissionReadOnly
 	}
 	return taskrequirements.PermissionWrite

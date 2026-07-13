@@ -34,6 +34,7 @@ type Config struct {
 	Domain            Domain            `yaml:"domain,omitempty"`
 	MCP               MCP               `yaml:"mcp,omitempty"`
 	ProviderInventory ProviderInventory `yaml:"provider_inventory,omitempty"`
+	RoleDefinitions   []RoleDefinition  `yaml:"role_definitions,omitempty" json:"role_definitions,omitempty"`
 	Audit             Audit             `yaml:"audit,omitempty"`
 	Report            Report            `yaml:"report"`
 }
@@ -254,6 +255,48 @@ type ProviderInventory struct {
 	ProfileSelection map[string]string   `yaml:"profile_selection,omitempty"`
 }
 
+type RoleDefinition struct {
+	SchemaVersion              string             `yaml:"schema_version,omitempty" json:"schema_version,omitempty"`
+	RecordVersion              int                `yaml:"record_version,omitempty" json:"record_version,omitempty"`
+	RoleDefinitionID           string             `yaml:"role_definition_id,omitempty" json:"role_definition_id,omitempty"`
+	RoleKey                    string             `yaml:"role_key" json:"role_key"`
+	RoleVersion                string             `yaml:"role_version,omitempty" json:"role_version,omitempty"`
+	Description                string             `yaml:"description,omitempty" json:"description,omitempty"`
+	AllowedRiskTiers           []string           `yaml:"allowed_risk_tiers,omitempty" json:"allowed_risk_tiers,omitempty"`
+	MinimumCapabilities        []RoleCapability   `yaml:"minimum_capabilities,omitempty" json:"minimum_capabilities,omitempty"`
+	PermissionFloor            string             `yaml:"permission_floor,omitempty" json:"permission_floor,omitempty"`
+	PermissionCeiling          string             `yaml:"permission_ceiling,omitempty" json:"permission_ceiling,omitempty"`
+	DefaultOutputContract      string             `yaml:"default_output_contract,omitempty" json:"default_output_contract,omitempty"`
+	IndependenceRequirements   map[string]string  `yaml:"independence_requirements,omitempty" json:"independence_requirements,omitempty"`
+	ForbiddenBindings          []string           `yaml:"forbidden_bindings,omitempty" json:"forbidden_bindings,omitempty"`
+	QualityFloor               string             `yaml:"quality_floor,omitempty" json:"quality_floor,omitempty"`
+	ReasoningDepth             string             `yaml:"reasoning_depth,omitempty" json:"reasoning_depth,omitempty"`
+	RequiredTools              []string           `yaml:"required_tools,omitempty" json:"required_tools,omitempty"`
+	MinimumContextWindowTokens int                `yaml:"minimum_context_window_tokens,omitempty" json:"minimum_context_window_tokens,omitempty"`
+	MaxSideEffectClass         string             `yaml:"max_side_effect_class,omitempty" json:"max_side_effect_class,omitempty"`
+	VerificationRequirements   []RoleVerification `yaml:"verification_requirements,omitempty" json:"verification_requirements,omitempty"`
+	LatencyTolerance           string             `yaml:"latency_tolerance,omitempty" json:"latency_tolerance,omitempty"`
+	CostTolerance              string             `yaml:"cost_tolerance,omitempty" json:"cost_tolerance,omitempty"`
+	PolicyVersion              string             `yaml:"policy_version,omitempty" json:"policy_version,omitempty"`
+}
+
+type RoleCapability struct {
+	Dimension         string `yaml:"dimension" json:"dimension"`
+	RequiredValue     any    `yaml:"required_value" json:"required_value"`
+	MinimumConfidence string `yaml:"minimum_confidence,omitempty" json:"minimum_confidence,omitempty"`
+	FreshnessRequired string `yaml:"freshness_required,omitempty" json:"freshness_required,omitempty"`
+	Source            string `yaml:"source,omitempty" json:"source,omitempty"`
+}
+
+type RoleVerification struct {
+	VerificationKind     string   `yaml:"verification_kind" json:"verification_kind"`
+	RequiredForRiskTiers []string `yaml:"required_for_risk_tiers,omitempty" json:"required_for_risk_tiers,omitempty"`
+	IndependenceLevel    string   `yaml:"independence_level,omitempty" json:"independence_level,omitempty"`
+	PermissionRequired   string   `yaml:"permission_required,omitempty" json:"permission_required,omitempty"`
+	OutputContract       string   `yaml:"output_contract,omitempty" json:"output_contract,omitempty"`
+	Source               string   `yaml:"source,omitempty" json:"source,omitempty"`
+}
+
 // Audit is the optional 0.5.3 audit command configuration surface. It is
 // additive: absent fields preserve built-in audit defaults.
 type Audit struct {
@@ -434,6 +477,9 @@ func validateParsedConfig(cfg Config) error {
 	if err := validateProviderInventory(cfg.ProviderInventory); err != nil {
 		return err
 	}
+	if err := validateRoleDefinitions(cfg.RoleDefinitions); err != nil {
+		return err
+	}
 	if err := validateDomainCommands(cfg.Domain); err != nil {
 		return err
 	}
@@ -562,6 +608,32 @@ func validateProviderInventory(inventory ProviderInventory) error {
 		accountProfileID = strings.TrimSpace(accountProfileID)
 		if !strings.HasPrefix(accountProfileID, "acct_") || len(accountProfileID) < len("acct_")+8 {
 			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection.%s must be an opaque acct_ account profile id", provider)
+		}
+	}
+	return nil
+}
+
+func validateRoleDefinitions(roles []RoleDefinition) error {
+	seen := map[string]bool{}
+	for index, role := range roles {
+		key := strings.ToLower(strings.TrimSpace(role.RoleKey))
+		if key == "" {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key must not be empty", index)
+		}
+		if !validMCPServerName(key) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key %q is not a safe role key", index, role.RoleKey)
+		}
+		if seen[key] {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key %q is duplicated", index, role.RoleKey)
+		}
+		seen[key] = true
+		for capIndex, capability := range role.MinimumCapabilities {
+			if strings.TrimSpace(capability.Dimension) == "" {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].minimum_capabilities[%d].dimension must not be empty", index, capIndex)
+			}
+			if capability.RequiredValue == nil {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].minimum_capabilities[%d].required_value must be set", index, capIndex)
+			}
 		}
 	}
 	return nil
