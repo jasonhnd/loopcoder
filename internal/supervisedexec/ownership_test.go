@@ -49,8 +49,11 @@ type fakeGroup struct {
 
 func (f *fakeGroup) prepare(cmd *exec.Cmd)     {}
 func (f *fakeGroup) adopt(cmd *exec.Cmd) error { return nil }
-func (f *fakeGroup) kill() error               { f.killed = true; return nil }
-func (f *fakeGroup) close()                    { f.closed = true }
+func (f *fakeGroup) activity() processActivityObservation {
+	return processActivityObservation{}
+}
+func (f *fakeGroup) kill() error { f.killed = true; return nil }
+func (f *fakeGroup) close()      { f.closed = true }
 
 func TestManagedListsRegisteredAndShutdownReaps(t *testing.T) {
 	clearRegistry()

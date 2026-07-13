@@ -1752,7 +1752,7 @@ func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
+	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--timeout duration", "worker hard-cap override", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1773,7 +1773,7 @@ func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--format", "--verbose", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
+	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--timeout duration", "--format", "--verbose", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -4321,6 +4321,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 		"--issue-body", "Body",
 		"--model", "gpt-5",
 		"--effort", "high",
+		"--timeout", "2m",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			if opts.RepoPath != repo {
@@ -4329,7 +4330,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 			if opts.IssueNumber != 101 || opts.IssueTitle != "Implement dispatch" || opts.IssueBody != "Body" {
 				t.Fatalf("dispatch opts issue fields = %#v", opts)
 			}
-			if opts.BaseBranch != "main" || opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
+			if opts.BaseBranch != "main" || opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" || opts.Timeout != 2*time.Minute {
 				t.Fatalf("dispatch opts defaults/pass-through = %#v", opts)
 			}
 			if opts.Stderr == nil {
@@ -5532,6 +5533,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 		"--run-id", "run-test-wave",
 		"--model", "gpt-5.5",
 		"--effort", "high",
+		"--timeout", "3m",
 	}, &stdout, &stderr, Deps{
 		Stdin: strings.NewReader(`{"ready":[{"issue":201,"title":"Wave","reason":"ready"}]}`),
 		NewGitHubReader: func(string) orchestration.GitHubReader {
@@ -5574,7 +5576,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	if dispatchOpts.IssueNumber != 201 || dispatchOpts.IssueTitle != "Wave" || dispatchOpts.IssueBody != "Body" {
 		t.Fatalf("dispatch opts issue fields = %#v", dispatchOpts)
 	}
-	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5.5" || dispatchOpts.Effort != "high" {
+	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5.5" || dispatchOpts.Effort != "high" || dispatchOpts.Timeout != 3*time.Minute {
 		t.Fatalf("dispatch opts run/model/effort = %#v", dispatchOpts)
 	}
 	text := stdout.String()

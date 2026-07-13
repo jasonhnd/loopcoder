@@ -35,6 +35,13 @@ func (g *unixKillGroup) adopt(cmd *exec.Cmd) error {
 	return nil
 }
 
+func (g *unixKillGroup) activity() processActivityObservation {
+	if g.pgid <= 0 {
+		return processActivityObservation{}
+	}
+	return observeUnixProcessGroupActivity(g.pgid)
+}
+
 func (g *unixKillGroup) kill() error {
 	if g.pgid <= 0 {
 		return nil

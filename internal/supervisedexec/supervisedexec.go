@@ -3,6 +3,7 @@
 package supervisedexec
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -58,7 +59,7 @@ type Outcome int
 
 const (
 	OutcomeCompleted Outcome = iota // process exited on its own (any exit code)
-	OutcomeStalled                  // killed: no log growth or worktree activity for StallTimeout
+	OutcomeStalled                  // killed: no meaningful log, worktree, or process-tree activity for StallTimeout
 	OutcomeDeadline                 // killed: exceeded HardCap
 )
 
@@ -167,11 +168,18 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	var lastLog logObservation
 	var lastWorktree worktreeObservation
 	var lastWorktreeWalk time.Time
+	var lastProcess processActivityObservation
+	var lastProcessPoll time.Time
 	var worktreeSignalDisabled bool
 	var worktreeWarningEmitted bool
+	processActivityEnabled := opts.LivenessMode == LivenessModeWorktreeMTime
 	lastProgress := start
 	if opts.StallTimeout > 0 {
 		lastLog = observeLog(opts.LogPath)
+		if processActivityEnabled {
+			lastProcess = group.activity()
+			lastProcessPoll = start
+		}
 		if opts.LivenessMode == LivenessModeWorktreeMTime {
 			lastWorktree = observeWorktree(opts.WorktreePath)
 			lastWorktreeWalk = start
@@ -186,6 +194,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		stallC = stallTicks.C
 	}
 	worktreePoll := worktreePollInterval(opts.StallTimeout, stallPollInterval(opts.StallTimeout))
+	processPoll := processPollInterval(opts.StallTimeout, stallPollInterval(opts.StallTimeout))
 
 	for {
 		select {
@@ -204,7 +213,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			}
 			currentLog := observeLog(opts.LogPath)
 			currentWorktree := lastWorktree
-			logProgress := currentLog.changedFrom(lastLog)
+			logProgress := meaningfulLogProgress(opts.LogPath, lastLog, currentLog)
 			worktreeProgress := false
 			if opts.LivenessMode == LivenessModeWorktreeMTime && !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
 				currentWorktree = observeWorktreeAfter(opts.WorktreePath, lastWorktree.latestModTime)
@@ -216,6 +225,15 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 				} else {
 					worktreeProgress = currentWorktree.advancedFrom(lastWorktree)
 					lastWorktree = currentWorktree
+				}
+			}
+			processProgress := false
+			if processActivityEnabled && shouldObserveProcessActivity(now, lastProcessPoll, processPoll) {
+				currentProcess := group.activity()
+				lastProcessPoll = now
+				processProgress = currentProcess.changedFrom(lastProcess)
+				if currentProcess.available {
+					lastProcess = currentProcess
 				}
 			}
 			customProgress := false
@@ -231,7 +249,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 				}
 			}
 			lastLog = currentLog
-			if logProgress || worktreeProgress || customProgress {
+			if logProgress || worktreeProgress || processProgress || customProgress {
 				lastProgress = now
 				continue
 			}
@@ -377,8 +395,40 @@ func observeLog(path string) logObservation {
 	}
 }
 
-func (o logObservation) changedFrom(prev logObservation) bool {
-	return o.exists != prev.exists || o.size != prev.size || !o.modTime.Equal(prev.modTime)
+func meaningfulLogProgress(path string, prev, current logObservation) bool {
+	if !current.exists {
+		return false
+	}
+	if !prev.exists || current.size < prev.size {
+		return logContainsProviderProgress(path, 0)
+	}
+	if current.size > prev.size {
+		return logContainsProviderProgress(path, prev.size)
+	}
+	return !current.modTime.Equal(prev.modTime)
+}
+
+func logContainsProviderProgress(path string, offset int64) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return false
+		}
+	}
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString('\n')
+		if strings.TrimSpace(line) != "" && !strings.HasPrefix(strings.TrimSpace(line), "[loopcoder]") {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
 }
 
 func observeWorktree(path string) worktreeObservation {
@@ -464,6 +514,10 @@ func shouldWalkWorktree(current, last time.Time, interval time.Duration) bool {
 		return true
 	}
 	return current.Sub(last) >= interval
+}
+
+func shouldObserveProcessActivity(current, last time.Time, interval time.Duration) bool {
+	return shouldWalkWorktree(current, last, interval)
 }
 
 func runCustomLivenessProbe(ctx context.Context, opts Options, remainingHardCap time.Duration) bool {

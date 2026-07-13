@@ -3,6 +3,7 @@ package supervisedexec
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,6 +181,66 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 	}
 }
 
+func TestRunSilentProcessTreeActivityDoesNotStall(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1500 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v (quiet child-process activity must not stall)", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	if result.Elapsed < 2*time.Second {
+		t.Fatalf("Elapsed = %s, want >= 2s so process-tree activity crossed the stall window", result.Elapsed)
+	}
+}
+
+func TestRunLoopCoderReceiptLogGrowthDoesNotResetStallClock(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				appendLog(logPath, "[loopcoder] receipt: still supervising")
+			}
+		}
+	}()
+
+	result, err := Run(ctx, cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 300 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+	if result.Elapsed > 2*time.Second {
+		t.Fatalf("Elapsed = %s, receipt-only log writes reset the stall clock", result.Elapsed)
+	}
+}
+
 func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "worker.log")
@@ -201,6 +262,27 @@ func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
 	}
 	if result.Outcome != OutcomeStalled {
 		t.Fatalf("Outcome = %v, want %v when log-only ignores worktree writes", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+}
+
+func TestRunLogOnlyIgnoresProcessTreeActivity(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 400 * time.Millisecond,
+		LogPath:      logPath,
+		LivenessMode: LivenessModeLogOnly,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v when log-only ignores process-tree churn", result.Outcome, OutcomeStalled)
 	}
 	if !result.Killed {
 		t.Fatal("Killed = false, want true")
@@ -593,6 +675,32 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "silent-child-churn":
+		logPath := args[0]
+		interval := parseDuration(args[1])
+		count := parseInt(args[2])
+		childDuration := parseDuration(args[3])
+		code := parseInt(args[4])
+		appendLog(logPath, "first")
+		children := make([]*exec.Cmd, 0, count)
+		for i := 0; i < count; i++ {
+			child := helperCommandForProcess("sleep-exit", childDuration.String(), "0")
+			child.Stdout = io.Discard
+			child.Stderr = io.Discard
+			if err := child.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "start silent child: %v\n", err)
+				os.Exit(2)
+			}
+			children = append(children, child)
+			time.Sleep(interval)
+		}
+		for _, child := range children {
+			if err := child.Wait(); err != nil {
+				fmt.Fprintf(os.Stderr, "wait silent child: %v\n", err)
+				os.Exit(2)
+			}
+		}
+		os.Exit(code)
 	case "assert-arg":
 		if len(args) != 1 {
 			fmt.Fprintf(os.Stderr, "assert-arg got %d args\n", len(args))
@@ -608,6 +716,10 @@ func TestHelperProcess(t *testing.T) {
 
 func helperCommand(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
+	return helperCommandForProcess(args...)
+}
+
+func helperCommandForProcess(args ...string) *exec.Cmd {
 	cmdArgs := append([]string{"-test.run=TestHelperProcess", "--"}, args...)
 	cmd := exec.Command(os.Args[0], cmdArgs...)
 	cmd.Env = append(os.Environ(), "GO_WANT_SUPERVISEDEXEC_HELPER=1")

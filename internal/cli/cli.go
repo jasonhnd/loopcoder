@@ -450,6 +450,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --timeout duration          optional worker hard-cap override for this dispatch")
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
@@ -665,6 +666,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
+		fmt.Fprintln(w, "  --timeout duration         optional worker hard-cap override for this wave")
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
@@ -3586,6 +3588,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var timeoutAlias time.Duration
 	var configFromBaseAlias bool
 	var keepWorktreeAlias bool
 	var strict bool
@@ -3623,6 +3626,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.DurationVar(&opts.Timeout, "timeout", 0, "worker hard-cap override")
+	fs.DurationVar(&timeoutAlias, "Timeout", 0, "worker hard-cap override")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
@@ -3677,6 +3682,9 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		opts.Effort = effortAlias
 	}
+	if timeoutAlias != 0 {
+		opts.Timeout = timeoutAlias
+	}
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
 	strict = strict || strictAlias
@@ -3705,6 +3713,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if strings.TrimSpace(opts.IssueTitle) == "" {
 		fmt.Fprintln(stderr, "dispatch: --issue-title is required")
+		return 2
+	}
+	if opts.Timeout < 0 {
+		fmt.Fprintln(stderr, "dispatch: --timeout must not be negative")
 		return 2
 	}
 
@@ -4345,6 +4357,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effort string
 	var effortAlias string
+	var timeout time.Duration
+	var timeoutAlias time.Duration
 	var configFromBase bool
 	var configFromBaseAlias bool
 	var strict bool
@@ -4378,6 +4392,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.DurationVar(&timeout, "timeout", 0, "worker hard-cap override")
+	fs.DurationVar(&timeoutAlias, "Timeout", 0, "worker hard-cap override")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
@@ -4421,6 +4437,9 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		effort = effortAlias
 	}
+	if timeoutAlias != 0 {
+		timeout = timeoutAlias
+	}
 	configFromBase = configFromBase || configFromBaseAlias
 	strict = strict || strictAlias
 	if throttleLimitAlias != 0 {
@@ -4443,6 +4462,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if throttleLimit <= 0 {
 		fmt.Fprintln(stderr, "dispatch-wave: --throttle-limit must be greater than zero")
+		return 2
+	}
+	if timeout < 0 {
+		fmt.Fprintln(stderr, "dispatch-wave: --timeout must not be negative")
 		return 2
 	}
 
@@ -4595,6 +4618,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Provider:        provider,
 		Model:           model,
 		Effort:          effort,
+		Timeout:         timeout,
 		ConfigFromBase:  configFromBase,
 		ThrottleLimit:   throttleLimit,
 		Thresholds:      cfg.Resilience.Worker,
