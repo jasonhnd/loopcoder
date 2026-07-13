@@ -318,8 +318,8 @@ func TestAcceptGraphProposalConcurrentSameGraphIsIdempotentAndChangedGraphLoses(
 
 func TestAcceptGraphProposalTransactionFailureRollsBackResidualState(t *testing.T) {
 	ctx := context.Background()
-	store := openGraphStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
-	defer store.Close()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store := openGraphStore(t, ctx, path)
 	seedGraphProject(t, ctx, store, "proj_graph")
 	input := graphInput()
 	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
@@ -341,6 +341,249 @@ func TestAcceptGraphProposalTransactionFailureRollsBackResidualState(t *testing.
 		t.Fatalf("AcceptGraphProposal() error = %v, want injected failure", err)
 	}
 	assertGraphAcceptanceEmpty(t, ctx, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened := openGraphStore(t, ctx, path)
+	defer reopened.Close()
+	assertGraphAcceptanceEmpty(t, ctx, reopened)
+}
+
+func TestAcceptGraphProposalCrashBeforeCommitRollsBackAfterReopenAndRetries(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store := openGraphStore(t, ctx, path)
+	seedGraphProject(t, ctx, store, "proj_graph")
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+
+	cause := &injectedGraphCommitCause{phase: "before-commit"}
+	failing := openGraphStoreWithOptions(t, ctx, storage.Options{
+		Path: path,
+		Now:  func() time.Time { return fixedGraphTime() },
+		WriteTxCommitHookForTest: func(context.Context, storage.Tx, func(context.Context) error) error {
+			return cause
+		},
+	})
+	_, err = AcceptGraphProposal(ctx, failing, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-crash-before-commit",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if !errors.Is(err, cause) {
+		t.Fatalf("AcceptGraphProposal() error = %v, want original commit cause", err)
+	}
+	if err := failing.Close(); err != nil {
+		t.Fatalf("close failed store: %v", err)
+	}
+
+	reopened := openGraphStore(t, ctx, path)
+	assertGraphAcceptanceEmpty(t, ctx, reopened)
+	accepted, err := AcceptGraphProposal(ctx, reopened, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-crash-before-commit",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() retry after reopen error = %v", err)
+	}
+	replayed, err := AcceptGraphProposal(ctx, reopened, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-crash-before-commit",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() replay after retry error = %v", err)
+	}
+	if replayed.GraphVersionID != accepted.GraphVersionID || replayed.CanonicalProposalHash != accepted.CanonicalProposalHash {
+		t.Fatalf("replayed accepted version = %#v, want %#v", replayed, accepted)
+	}
+	assertAcceptedGraphAuthorityCounts(t, ctx, reopened, 1, 1, 1, 1, 1, 1)
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened store: %v", err)
+	}
+}
+
+func TestAcceptGraphProposalAmbiguousCommitReopensAndReplaysIdempotently(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store := openGraphStore(t, ctx, path)
+	seedGraphProject(t, ctx, store, "proj_graph")
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+
+	cause := &injectedGraphCommitCause{phase: "after-commit"}
+	failing := openGraphStoreWithOptions(t, ctx, storage.Options{
+		Path: path,
+		Now:  func() time.Time { return fixedGraphTime() },
+		WriteTxCommitHookForTest: func(commitCtx context.Context, _ storage.Tx, commit func(context.Context) error) error {
+			if err := commit(commitCtx); err != nil {
+				return err
+			}
+			return cause
+		},
+	})
+	_, err = AcceptGraphProposal(ctx, failing, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-ambiguous-commit",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if !errors.Is(err, cause) {
+		t.Fatalf("AcceptGraphProposal() error = %v, want original ambiguous commit cause", err)
+	}
+	if err := failing.Close(); err != nil {
+		t.Fatalf("close failed store: %v", err)
+	}
+
+	reopened := openGraphStore(t, ctx, path)
+	defer reopened.Close()
+	loaded, err := LoadAcceptedGraphVersion(ctx, reopened, proposal.ProjectID, proposal.DeliveryRunID)
+	if err != nil {
+		t.Fatalf("LoadAcceptedGraphVersion() after ambiguous commit error = %v", err)
+	}
+	replayed, err := AcceptGraphProposal(ctx, reopened, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-ambiguous-commit",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() replay after ambiguous commit error = %v", err)
+	}
+	if replayed.GraphVersionID != loaded.GraphVersionID || replayed.CanonicalProposalHash != loaded.CanonicalProposalHash {
+		t.Fatalf("replayed accepted version = %#v, want loaded %#v", replayed, loaded)
+	}
+	assertAcceptedGraphAuthorityCounts(t, ctx, reopened, 1, 1, 1, 1, 1, 1)
+}
+
+func TestAcceptGraphProposalCrashBeforeCommitUnderSQLiteContention(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store := openGraphStore(t, ctx, path)
+	seedGraphProject(t, ctx, store, "proj_graph")
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+
+	locker := openGraphStore(t, ctx, path)
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- locker.WithWriteTx(ctx, func(storage.Tx) error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+
+	cause := &injectedGraphCommitCause{phase: "contention-before-commit"}
+	contender := openGraphStoreWithOptions(t, ctx, storage.Options{
+		Path: path,
+		Now:  func() time.Time { return fixedGraphTime() },
+		WriteTxCommitHookForTest: func(context.Context, storage.Tx, func(context.Context) error) error {
+			return cause
+		},
+	})
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := AcceptGraphProposal(ctx, contender, proposal, AcceptOptions{
+			ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+			IdempotencyKey:                   "accept-graph-contention-crash",
+			Actor:                            graphActor(),
+			Host:                             graphHost(),
+			Now:                              input.Now,
+		})
+		acceptDone <- err
+	}()
+	select {
+	case err := <-acceptDone:
+		t.Fatalf("AcceptGraphProposal() completed while competing write transaction was still open: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-lockDone; err != nil {
+		t.Fatalf("release write lock: %v", err)
+	}
+	if err := locker.Close(); err != nil {
+		t.Fatalf("close locker: %v", err)
+	}
+	err = <-acceptDone
+	if !errors.Is(err, cause) {
+		t.Fatalf("AcceptGraphProposal() under contention error = %v, want original cause", err)
+	}
+	if err := contender.Close(); err != nil {
+		t.Fatalf("close contender: %v", err)
+	}
+
+	reopened := openGraphStore(t, ctx, path)
+	defer reopened.Close()
+	assertGraphAcceptanceEmpty(t, ctx, reopened)
+	accepted, err := AcceptGraphProposal(ctx, reopened, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-contention-crash",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() retry after contention crash error = %v", err)
+	}
+	replayed, err := AcceptGraphProposal(ctx, reopened, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph-contention-crash",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() replay after contention retry error = %v", err)
+	}
+	if replayed.GraphVersionID != accepted.GraphVersionID || replayed.CanonicalProposalHash != accepted.CanonicalProposalHash {
+		t.Fatalf("replayed accepted version = %#v, want %#v", replayed, accepted)
+	}
+	assertAcceptedGraphAuthorityCounts(t, ctx, reopened, 1, 1, 1, 1, 1, 1)
+}
+
+type injectedGraphCommitCause struct {
+	phase string
+}
+
+func (e *injectedGraphCommitCause) Error() string {
+	return "injected delivery transaction " + e.phase
 }
 
 func graphInput() ProposalInput {
@@ -384,7 +627,12 @@ func graphHost() delivery.Host {
 
 func openGraphStore(t *testing.T, ctx context.Context, path string) storage.Store {
 	t.Helper()
-	store, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixedGraphTime() }})
+	return openGraphStoreWithOptions(t, ctx, storage.Options{Path: path, Now: func() time.Time { return fixedGraphTime() }})
+}
+
+func openGraphStoreWithOptions(t *testing.T, ctx context.Context, opts storage.Options) storage.Store {
+	t.Helper()
+	store, err := storage.Open(ctx, opts)
 	if err != nil {
 		t.Fatalf("open storage: %v", err)
 	}
@@ -408,13 +656,32 @@ func assertGraphAcceptanceEmpty(t *testing.T, ctx context.Context, store storage
 		"delivery_plan_fingerprints",
 		"delivery_tasks",
 		"delivery_dependency_edges",
+		"delivery_decisions",
 		"delivery_approvals",
+		"delivery_idempotency",
+		"fallback_decisions",
+		"replan_decisions",
+		"verification_decisions",
 		"task_requirements",
 		"task_graph_validations",
 		"accepted_task_graph_versions",
 	} {
 		assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM `+table, 0)
 	}
+}
+
+func assertAcceptedGraphAuthorityCounts(t *testing.T, ctx context.Context, store storage.Store, runs, approvals, tasks, requirements, versions, idempotency int) {
+	t.Helper()
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_runs`, runs)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_approvals`, approvals)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks`, tasks)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM task_requirements`, requirements)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM accepted_task_graph_versions`, versions)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_idempotency`, idempotency)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_decisions`, 0)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM fallback_decisions`, 0)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM replan_decisions`, 0)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM verification_decisions`, 0)
 }
 
 func assertGraphCount(t *testing.T, ctx context.Context, store storage.Store, query string, want int) {
