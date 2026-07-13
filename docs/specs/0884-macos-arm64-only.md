@@ -33,10 +33,9 @@ opened.
   v0.8.0.
 - Define one fail-fast runtime, installer, and upgrade error contract for
   unsupported hosts, including machine-readable diagnostics.
-- Define the safe migration from the existing required CI contexts
-  `native (ubuntu-latest)`, `native (macos-latest)`, and
-  `native (windows-latest)` without temporarily making every pull request
-  unmergeable.
+- Define the safe migration from the existing eight required CI contexts to
+  the four durable contexts `verify`, `test`, `race`, and `security` without
+  temporarily making every pull request unmergeable.
 - Define the v0.8.0 release artifact set, install behavior, upgrade behavior,
   release smoke behavior, current-documentation obligations, and v0.7 historical
   compatibility policy.
@@ -168,52 +167,57 @@ without requiring Windows or Linux runners.
 
 ## CI And Branch Protection
 
-Every required GitHub Actions job for v0.8.0 must run on a pinned
-GitHub-hosted Apple Silicon macOS image. A runner label alone is insufficient
-evidence: each required job must assert the actual Go runtime tuple with
-`go env GOOS GOARCH` and fail unless it is exactly `darwin` and `arm64`.
+Every required GitHub Actions job for v0.8.0 must run on the fixed
+GitHub-hosted Apple Silicon macOS image label `macos-15`, never the floating
+`macos-latest` label. The authoritative runner references for this requirement
+are the GitHub-hosted runner reference
+<https://docs.github.com/en/actions/reference/runners/github-hosted-runners>
+and the runner-images repository <https://github.com/actions/runner-images>.
+A runner label alone is insufficient evidence: each required job must assert
+the actual Go runtime tuple with `go env GOOS GOARCH` and fail unless it
+resolves to `darwin arm64` before substantive work begins.
 
 Ubuntu and Windows jobs must be removed from v0.8.0 CI and release workflows.
 They must not remain as optional, advisory, or non-blocking compatibility jobs.
 Unsupported-platform behavior is covered by injected tuple tests on the
 supported Apple Silicon macOS runner, not by native unsupported-host CI.
 
-The target required check layout is:
+The target durable required check layout is exactly four contexts:
 
 | Required context | Runner requirement | Tuple proof |
 | --- | --- | --- |
-| `verify` | Pinned GitHub-hosted Apple Silicon macOS image | Assert `GOOS=darwin` and `GOARCH=arm64` before checks. |
-| `go` | Pinned GitHub-hosted Apple Silicon macOS image | Assert `GOOS=darwin` and `GOARCH=arm64` before build/test. |
-| `staticcheck` | Pinned GitHub-hosted Apple Silicon macOS image | Assert `GOOS=darwin` and `GOARCH=arm64` before staticcheck. |
-| `govulncheck` | Pinned GitHub-hosted Apple Silicon macOS image | Assert `GOOS=darwin` and `GOARCH=arm64` before govulncheck. |
-| `audit` | Pinned GitHub-hosted Apple Silicon macOS image | Assert `GOOS=darwin` and `GOARCH=arm64` before audit. |
+| `verify` | `runs-on: macos-15` | Assert `go env GOOS GOARCH` resolves to `darwin arm64` before YAML, config, release-policy, or repository-policy checks. |
+| `test` | `runs-on: macos-15` | Assert `go env GOOS GOARCH` resolves to `darwin arm64` before build, vet, Markdown/link validation, or ordinary Go tests. |
+| `race` | `runs-on: macos-15` | Assert `go env GOOS GOARCH` resolves to `darwin arm64` before race-enabled Go tests. This job runs in parallel with `test`. |
+| `security` | `runs-on: macos-15` | Assert `go env GOOS GOARCH` resolves to `darwin arm64` before staticcheck, govulncheck, gosec, loopcoder audit, or other security checks. |
 
 The current branch-protection state on `main` requires eight contexts:
 `verify`, `go`, `staticcheck`, `govulncheck`, `audit`,
 `native (ubuntu-latest)`, `native (macos-latest)`, and
-`native (windows-latest)`. The current `.delivery.yml` check list mechanically
-requires only the five hosted check IDs: `verify`, `go`, `staticcheck`,
-`govulncheck`, and `audit`.
+`native (windows-latest)`. After the migration is complete, the implemented
+`.delivery.yml` allow-list must become exactly `[verify, test, race, security]`.
+This consolidation reduces context count, not coverage: tests, race detection,
+static analysis, vulnerability scanning, gosec, audit, policy, and release
+checks remain required, while compatible work is grouped and race detection is
+parallelized.
 
-The safe rollout order is:
+The safe no-missing-context rollout order for protected `main` is:
 
-1. Add or update the five target jobs so they still emit `verify`, `go`,
-   `staticcheck`, `govulncheck`, and `audit`, now on pinned Apple Silicon macOS
-   with explicit tuple assertions.
-2. Keep the old `native (...)` matrix contexts available until repository
-   administration updates `main` branch protection, or update branch protection
-   before removing the matrix in the same coordinated administrative window.
-3. Change `main` branch protection to require only the five emitted target
-   contexts. Verify the effective protection with the GitHub API.
-4. Remove `native (ubuntu-latest)`, `native (macos-latest)`, and
-   `native (windows-latest)` from workflows after protection no longer requires
-   them.
-5. Confirm a fresh pull request reports only the target contexts as required
-   and no pull request is left waiting for a context the workflow cannot emit.
+1. Add and dual-emit the four new contexts `verify`, `test`, `race`, and
+   `security` while the old eight contexts still exist.
+2. Validate the new four contexts on a fresh pull request.
+3. Update the `main` branch-protection required-context list through the GitHub
+   API to require only `verify`, `test`, `race`, and `security`.
+4. Read back and verify the effective branch-protection configuration through
+   the GitHub API.
+5. Only then remove the old eight job contexts, native OS matrix, and duplicate
+   standalone jobs from workflows.
+6. Validate another fresh pull request and prove that no required context is
+   permanently pending or absent.
 
 Implementation must include a deterministic repository-policy test that rejects
 future required workflow jobs on Ubuntu, Windows, Linux, Intel macOS, or generic
-unpinned macOS runners.
+unpinned macOS runners, including `macos-latest`.
 
 ## Release And Installation
 
@@ -331,7 +335,7 @@ independently testable issues. The parent #885 is not dispatchable.
 | A | Runtime platform contract and shared `ErrUnsupportedPlatform` diagnostic. | This accepted spec. | Injected tuple tests for `darwin/arm64`, `darwin/amd64`, Linux, and Windows; side-effect-before-gate tests; JSON diagnostic fixture. |
 | B | Installer surface. | Slice A contract available or duplicated as a shell-level equivalent. | Shell installer rejects unsupported hosts before download; Darwin arm64 path selects the single archive; Windows installer removed from current advertised surface. |
 | C | `upgrade` asset selection and migration/self-bootstrap gate. | Slice A. | Unsupported tuple rejects before release lookup or state open; Darwin arm64 selects only the Darwin arm64 archive; v0.7-to-v0.8 proof remains Apple Silicon-only. |
-| D | CI and repository policy. | Slice A for injected tests. | Required jobs run on pinned Apple Silicon macOS and assert `GOOS/GOARCH`; Ubuntu/Windows jobs removed; repository-policy test rejects unsupported runners; branch-protection migration evidence recorded. |
+| D | CI and repository policy. | Slice A for injected tests. | Exactly `verify`, `test`, `race`, and `security` run on `macos-15` and assert `go env GOOS GOARCH` resolves to `darwin arm64`; Ubuntu/Windows jobs removed; repository-policy test rejects unsupported runners; branch-protection migration evidence recorded. |
 | E | Release build, staging, smoke, and publication gates. | Slices B, C, and D. | Exactly one archive plus integrity/provenance files; staged smoke tests the exact artifact; no unsupported-platform artifact or smoke job remains. |
 | F | Living docs and v0.8 issue acceptance. | This accepted spec; can run partly in parallel with A-C if it does not claim implemented behavior before it exists. | README, support/stability, architecture, usage, releasing, changelog, release notes, go/no-go template/evidence, and platform-sensitive issue criteria align with this spec. |
 | G | Bounded legacy-source cleanup, optional. | Inventory evidence from this spec and completed A-F slice needs. | One cohesive unsupported subsystem per issue; Darwin arm64 build/test proof; no cleanup justified only by reducing grep matches. |
