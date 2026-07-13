@@ -2,9 +2,12 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -143,31 +146,62 @@ func TestPrepareDeliveryV10BackupProbeErrorsFailClosed(t *testing.T) {
 	}
 }
 
-func TestDeliveryV10CopyFilePreservesExistingOverwriteSemantics(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "source.db")
-	dst := filepath.Join(dir, "backups", "source.db")
-	want := []byte("current source bytes")
-	if err := os.WriteFile(src, want, 0o600); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		t.Fatalf("mkdir backup dir: %v", err)
-	}
-	if err := os.WriteFile(dst, []byte("stale backup bytes"), 0o600); err != nil {
-		t.Fatalf("write stale backup: %v", err)
-	}
+func TestDeliveryV10BackupHashReaderUsesBoundedBuffer(t *testing.T) {
+	const size = 32 << 20
+	const bufferSize = 4 << 10
+	reader := &trackingZeroReader{remaining: size}
 
-	if err := copyFile(src, dst); err != nil {
-		t.Fatalf("copyFile returned error: %v", err)
-	}
-	got, err := os.ReadFile(dst)
+	got, err := readerSHA256(context.Background(), reader, make([]byte, bufferSize))
 	if err != nil {
-		t.Fatalf("read backup: %v", err)
+		t.Fatalf("readerSHA256 returned error: %v", err)
 	}
-	if string(got) != string(want) {
-		t.Fatalf("backup bytes = %q, want overwritten source bytes %q", got, want)
+	want := zeroSHA256(size)
+	if got != want {
+		t.Fatalf("hash = %s, want %s", got, want)
 	}
+	if reader.maxReadLen > bufferSize {
+		t.Fatalf("max read len = %d, want <= %d", reader.maxReadLen, bufferSize)
+	}
+	if reader.reads <= 1 {
+		t.Fatalf("reads = %d, want streaming reads", reader.reads)
+	}
+}
+
+type trackingZeroReader struct {
+	remaining  int64
+	maxReadLen int
+	reads      int
+}
+
+func (r *trackingZeroReader) Read(p []byte) (int, error) {
+	if len(p) > r.maxReadLen {
+		r.maxReadLen = len(p)
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if int64(n) > r.remaining {
+		n = int(r.remaining)
+	}
+	clear(p[:n])
+	r.remaining -= int64(n)
+	r.reads++
+	return n, nil
+}
+
+func zeroSHA256(size int64) string {
+	hash := sha256.New()
+	buffer := make([]byte, 8<<10)
+	for size > 0 {
+		n := len(buffer)
+		if int64(n) > size {
+			n = int(size)
+		}
+		hash.Write(buffer[:n])
+		size -= int64(n)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func TestOpenRerunsRoutingPolicyProfileMigrationIdempotently(t *testing.T) {
@@ -368,33 +402,52 @@ func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
 	raw := createRawDB(t, path)
 	createV9NestedClaimLifecycleSchema(t, raw)
 	closeRawDB(t, raw)
-	sourceHash, err := fileSHA256(path)
-	if err != nil {
-		t.Fatalf("hash source before migration: %v", err)
-	}
-	sourceBytes, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read source before migration: %v", err)
-	}
 
 	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
 	first := readOnlyDeliveryMigrationBackup(t, ctx, store)
-	wantBackupPath := filepath.Join(filepath.Dir(path), "backups", "schema-v9-"+sourceHash[:16]+".db")
 	if first.BackupID == "" || !strings.HasPrefix(first.BackupID, "backup_") {
 		t.Fatalf("backup_id = %q, want real backup prefix", first.BackupID)
 	}
-	if first.SourceDBPath != filepath.Clean(path) || first.SourceSchemaVersion != 9 || first.SourceDBHash != sourceHash || first.BackupPath != wantBackupPath {
-		t.Fatalf("backup metadata = %#v, want real v9 source metadata with backup path %q and hash %q", first, wantBackupPath, sourceHash)
+	if first.SourceDBHash == "" {
+		t.Fatal("source_db_hash is empty")
 	}
-	backupBytes, err := os.ReadFile(wantBackupPath)
+	wantBackupPath := filepath.Join(filepath.Dir(path), "backups", "schema-v9-"+first.SourceDBHash[:16]+".db")
+	if first.SourceDBPath != filepath.Clean(path) || first.SourceSchemaVersion != 9 || first.BackupPath != wantBackupPath {
+		t.Fatalf("backup metadata = %#v, want real v9 backup path %q", first, wantBackupPath)
+	}
+	backupHash, err := fileSHA256(ctx, wantBackupPath, nil)
 	if err != nil {
-		t.Fatalf("read backup image: %v", err)
+		t.Fatalf("hash backup image: %v", err)
 	}
-	if string(backupBytes) != string(sourceBytes) {
-		t.Fatal("backup image bytes differ from pre-migration source database")
+	if backupHash != first.SourceDBHash {
+		t.Fatalf("backup hash = %s, want recorded source_db_hash %s", backupHash, first.SourceDBHash)
+	}
+	backupRaw, err := sql.Open(driverName, wantBackupPath)
+	if err != nil {
+		t.Fatalf("open backup image: %v", err)
+	}
+	backupVersion, err := schemaVersion(ctx, backupRaw)
+	if closeErr := backupRaw.Close(); closeErr != nil {
+		t.Fatalf("close backup image: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("query backup schema version: %v", err)
+	}
+	if backupVersion != 9 {
+		t.Fatalf("backup schema version = %d, want 9", backupVersion)
+	}
+	if err := appendFile(wantBackupPath, []byte("corrupt")); err != nil {
+		t.Fatalf("corrupt backup image: %v", err)
+	}
+	corruptHash, err := fileSHA256(ctx, wantBackupPath, nil)
+	if err != nil {
+		t.Fatalf("hash corrupt backup image: %v", err)
+	}
+	if corruptHash == first.SourceDBHash {
+		t.Fatal("corrupt backup hash still matches recorded checksum")
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close first store: %v", err)
@@ -410,6 +463,160 @@ func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
 		t.Fatalf("backup metadata changed after reopen:\nfirst:  %#v\nsecond: %#v", first, second)
 	}
 	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
+}
+
+func TestOpenMigratesLargeV9DatabaseWithBoundedBackupHashBuffer(t *testing.T) {
+	ctx := context.Background()
+	const largePayloadSize = 8 << 20
+	const hashBufferSize = 4 << 10
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV9NestedClaimLifecycleSchema(t, raw)
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE backup_large_payloads(id TEXT PRIMARY KEY, payload BLOB NOT NULL)`); err != nil {
+		t.Fatalf("create large payload table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO backup_large_payloads(id, payload) VALUES ('large', zeroblob(?))`, largePayloadSize); err != nil {
+		t.Fatalf("insert large payload: %v", err)
+	}
+	closeRawDB(t, raw)
+
+	bufferCalls := 0
+	maxBufferLen := 0
+	store, err := Open(ctx, Options{
+		Path: path,
+		Now:  fixedNow,
+		deliveryV10BackupBufferFactoryForTest: func() []byte {
+			bufferCalls++
+			buffer := make([]byte, hashBufferSize)
+			if len(buffer) > maxBufferLen {
+				maxBufferLen = len(buffer)
+			}
+			return buffer
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	backup := readOnlyDeliveryMigrationBackup(t, ctx, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	if bufferCalls == 0 {
+		t.Fatal("backup hash buffer factory was not used")
+	}
+	if maxBufferLen > hashBufferSize {
+		t.Fatalf("max backup hash buffer = %d, want <= %d", maxBufferLen, hashBufferSize)
+	}
+	info, err := os.Stat(backup.BackupPath)
+	if err != nil {
+		t.Fatalf("stat backup image: %v", err)
+	}
+	if info.Size() <= int64(largePayloadSize) {
+		t.Fatalf("backup size = %d, want larger than large fixture payload %d", info.Size(), largePayloadSize)
+	}
+	backupHash, err := fileSHA256(ctx, backup.BackupPath, nil)
+	if err != nil {
+		t.Fatalf("hash backup image: %v", err)
+	}
+	if backupHash != backup.SourceDBHash {
+		t.Fatalf("backup hash = %s, want recorded source_db_hash %s", backupHash, backup.SourceDBHash)
+	}
+	backupRaw, err := sql.Open(driverName, backup.BackupPath)
+	if err != nil {
+		t.Fatalf("open backup image: %v", err)
+	}
+	var payloadLen int
+	if err := backupRaw.QueryRowContext(ctx, `SELECT length(payload) FROM backup_large_payloads WHERE id = 'large'`).Scan(&payloadLen); err != nil {
+		t.Fatalf("query backup large payload: %v", err)
+	}
+	if err := backupRaw.Close(); err != nil {
+		t.Fatalf("close backup image: %v", err)
+	}
+	if payloadLen != largePayloadSize {
+		t.Fatalf("backup payload length = %d, want %d", payloadLen, largePayloadSize)
+	}
+}
+
+func TestOpenMigratesV9WALDatabaseBackupIncludesCommittedContent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw := createRawDB(t, path)
+	if _, err := raw.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
+		t.Fatalf("enable WAL mode: %v", err)
+	}
+	createV9NestedClaimLifecycleSchema(t, raw)
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE wal_backup_markers(id TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create WAL marker table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO wal_backup_markers(id, value) VALUES ('marker', 'committed-through-wal')`); err != nil {
+		t.Fatalf("insert WAL marker: %v", err)
+	}
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	backup := readOnlyDeliveryMigrationBackup(t, ctx, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	closeRawDB(t, raw)
+
+	backupRaw, err := sql.Open(driverName, backup.BackupPath)
+	if err != nil {
+		t.Fatalf("open backup image: %v", err)
+	}
+	var value string
+	if err := backupRaw.QueryRowContext(ctx, `SELECT value FROM wal_backup_markers WHERE id = 'marker'`).Scan(&value); err != nil {
+		t.Fatalf("query WAL marker from backup: %v", err)
+	}
+	if err := backupRaw.Close(); err != nil {
+		t.Fatalf("close backup image: %v", err)
+	}
+	if value != "committed-through-wal" {
+		t.Fatalf("backup WAL marker = %q, want committed-through-wal", value)
+	}
+}
+
+func TestOpenV9MigrationCancellationCleansPartialBackup(t *testing.T) {
+	ctx := context.Background()
+	for _, phase := range []deliveryV10BackupPhase{
+		deliveryV10BackupPhaseBeforeVacuum,
+		deliveryV10BackupPhaseAfterVacuum,
+		deliveryV10BackupPhaseAfterHash,
+		deliveryV10BackupPhaseBeforeRename,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "loopcoder.db")
+			raw := createRawDB(t, path)
+			createV9NestedClaimLifecycleSchema(t, raw)
+			closeRawDB(t, raw)
+
+			_, err := Open(ctx, Options{
+				Path: path,
+				Now:  fixedNow,
+				deliveryV10BackupHookForTest: func(_ context.Context, got deliveryV10BackupPhase, _ string) error {
+					if got == phase {
+						return context.Canceled
+					}
+					return nil
+				},
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Open error = %v, want context.Canceled", err)
+			}
+			assertBackupDirEmpty(t, path)
+			raw = createRawDB(t, path)
+			version, err := schemaVersion(ctx, raw)
+			closeRawDB(t, raw)
+			if err != nil {
+				t.Fatalf("query source schema after cancelled migration: %v", err)
+			}
+			if version != 9 {
+				t.Fatalf("source schema after cancelled migration = %d, want 9", version)
+			}
+		})
+	}
 }
 
 func TestOpenMigratesProjectIdentityColumns(t *testing.T) {
@@ -1313,6 +1520,37 @@ func assertCountInStore(t *testing.T, ctx context.Context, store Store, query st
 	}
 	if got != want {
 		t.Fatalf("%s = %d, want %d", query, got, want)
+	}
+}
+
+func appendFile(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func assertBackupDirEmpty(t *testing.T, dbPath string) {
+	t.Helper()
+	backupDir := filepath.Join(filepath.Dir(dbPath), "backups")
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		t.Fatalf("read backup dir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("backup dir contains partial files: %v", names)
 	}
 }
 

@@ -53,11 +53,27 @@ type Options struct {
 	Now  func() time.Time
 
 	WriteTxCommitHookForTest WriteTxCommitHookForTest
+
+	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
+	deliveryV10BackupBufferFactoryForTest func() []byte
 }
 
 // WriteTxCommitHookForTest lets tests inject deterministic failures at the
 // final write transaction boundary without sharing mutable package state.
 type WriteTxCommitHookForTest func(context.Context, Tx, func(context.Context) error) error
+
+type deliveryV10BackupPhase string
+
+const (
+	deliveryV10BackupPhaseBeforeVacuum deliveryV10BackupPhase = "before-vacuum"
+	deliveryV10BackupPhaseAfterVacuum  deliveryV10BackupPhase = "after-vacuum"
+	deliveryV10BackupPhaseAfterHash    deliveryV10BackupPhase = "after-hash"
+	deliveryV10BackupPhaseBeforeRename deliveryV10BackupPhase = "before-rename"
+)
+
+// deliveryV10BackupHookForTest lets tests inject cancellation or faults at
+// deterministic backup boundaries without package-global mutable state.
+type deliveryV10BackupHookForTest func(context.Context, deliveryV10BackupPhase, string) error
 
 // Health reports the local database state without exposing table internals.
 type Health struct {
@@ -69,11 +85,13 @@ type Health struct {
 }
 
 type sqliteStore struct {
-	path                     string
-	db                       *sql.DB
-	now                      func() time.Time
-	writeTxCommitHookForTest WriteTxCommitHookForTest
-	sourceExistedBeforeOpen  bool
+	path                                  string
+	db                                    *sql.DB
+	now                                   func() time.Time
+	writeTxCommitHookForTest              WriteTxCommitHookForTest
+	sourceExistedBeforeOpen               bool
+	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
+	deliveryV10BackupBufferFactoryForTest func() []byte
 }
 
 type sqlTx struct {
@@ -480,11 +498,13 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		}
 		db.SetMaxOpenConns(1)
 		opened := &sqliteStore{
-			path:                     path,
-			db:                       db,
-			now:                      normalizeNow(opts.Now),
-			writeTxCommitHookForTest: opts.WriteTxCommitHookForTest,
-			sourceExistedBeforeOpen:  sourceExistedBeforeOpen,
+			path:                                  path,
+			db:                                    db,
+			now:                                   normalizeNow(opts.Now),
+			writeTxCommitHookForTest:              opts.WriteTxCommitHookForTest,
+			sourceExistedBeforeOpen:               sourceExistedBeforeOpen,
+			deliveryV10BackupHookForTest:          opts.deliveryV10BackupHookForTest,
+			deliveryV10BackupBufferFactoryForTest: opts.deliveryV10BackupBufferFactoryForTest,
 		}
 		if err := opened.configure(ctx); err != nil {
 			_ = db.Close()
@@ -765,7 +785,10 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 	if CurrentSchemaVersion >= 10 {
 		switch {
 		case version == 9:
-			deliveryV10Backup, err = prepareDeliveryV10Backup(s.path, formatTimestamp(s.now()))
+			deliveryV10Backup, err = prepareDeliveryV10Backup(ctx, s.db, s.path, formatTimestamp(s.now()), deliveryV10BackupOptions{
+				hook:          s.deliveryV10BackupHookForTest,
+				bufferFactory: s.deliveryV10BackupBufferFactoryForTest,
+			})
 		case version < 10 && !s.sourceExistedBeforeOpen:
 			deliveryV10Backup = prepareDeliveryV10NoSourceMetadata(s.path, formatTimestamp(s.now()))
 		}
