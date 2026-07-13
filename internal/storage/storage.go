@@ -51,7 +51,13 @@ type Tx interface {
 type Options struct {
 	Path string
 	Now  func() time.Time
+
+	WriteTxCommitHookForTest WriteTxCommitHookForTest
 }
+
+// WriteTxCommitHookForTest lets tests inject deterministic failures at the
+// final write transaction boundary without sharing mutable package state.
+type WriteTxCommitHookForTest func(context.Context, Tx, func(context.Context) error) error
 
 // Health reports the local database state without exposing table internals.
 type Health struct {
@@ -63,9 +69,10 @@ type Health struct {
 }
 
 type sqliteStore struct {
-	path string
-	db   *sql.DB
-	now  func() time.Time
+	path                     string
+	db                       *sql.DB
+	now                      func() time.Time
+	writeTxCommitHookForTest WriteTxCommitHookForTest
 }
 
 type sqlTx struct {
@@ -457,7 +464,7 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 			return fmt.Errorf("open storage %s: %w", path, err)
 		}
 		db.SetMaxOpenConns(1)
-		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
+		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now), writeTxCommitHookForTest: opts.WriteTxCommitHookForTest}
 		if err := opened.configure(ctx); err != nil {
 			_ = db.Close()
 			return err
@@ -605,11 +612,21 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 		}
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+	commit := func(commitCtx context.Context) error {
+		_, err := conn.ExecContext(commitCtx, `COMMIT`)
+		return err
+	}
+	var commitErr error
+	if s.writeTxCommitHookForTest != nil {
+		commitErr = s.writeTxCommitHookForTest(ctx, wrapped, commit)
+	} else {
+		commitErr = commit(ctx)
+	}
+	if commitErr != nil {
 		if rollbackErr := rollbackConnTx(conn); rollbackErr != nil {
 			_ = discardConn(conn)
 		}
-		return fmt.Errorf("storage write transaction: commit: %w", err)
+		return fmt.Errorf("storage write transaction: commit: %w", commitErr)
 	}
 	return nil
 }
