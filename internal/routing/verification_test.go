@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -19,7 +20,7 @@ func TestVerificationDecisionAcceptsIndependentVerifierAndReplaysStably(t *testi
 	store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
 	defer store.Close()
 
-	input := verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "diff clean", "ev-diff"))
+	input := verificationInput(worker, verifier, passVerdict(verifier, "diff clean", "ev-diff"))
 	first, err := DecideAndPersistVerification(ctx, store, input)
 	if err != nil {
 		t.Fatalf("DecideAndPersistVerification: %v", err)
@@ -61,7 +62,7 @@ func TestVerificationDecisionRequiresHumanWhenIndependenceCannotBeEstablished(t 
 	store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("codex", "acct-b", "codex-verifier"), nil)
 	defer store.Close()
 
-	decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "same provider", "ev-same-provider")))
+	decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier, "same provider", "ev-same-provider")))
 	if !errors.Is(err, taskrequirements.ErrVerifierIndependenceRequired) {
 		t.Fatalf("verification error = %v, want ErrVerifierIndependenceRequired", err)
 	}
@@ -127,7 +128,7 @@ func TestVerificationDecisionHumanRequiredNoEligibleAndOutputContractFailClosed(
 			}}
 		})
 		defer store.Close()
-		decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "assist only", "ev-human")))
+		decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier, "assist only", "ev-human")))
 		if !errors.Is(err, taskrequirements.ErrVerifierIndependenceRequired) || decision.FinalAuthority != FinalAuthorityHuman {
 			t.Fatalf("human-required decision/error = %#v / %v", decision, err)
 		}
@@ -150,11 +151,111 @@ func TestVerificationDecisionHumanRequiredNoEligibleAndOutputContractFailClosed(
 			req.VerificationRequirements[0].OutputContract = taskrequirements.OutputFreeform
 		})
 		defer store.Close()
-		decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "freeform", "ev-output")))
+		decision, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier, "freeform", "ev-output")))
 		if !errors.Is(err, taskrequirements.ErrCapabilityUnsupported) || decision.DecisionStatus != VerificationStatusNeedsHuman {
 			t.Fatalf("output contract decision/error = %#v / %v", decision, err)
 		}
 	})
+}
+
+func TestVerificationDecisionBindsVerdictsToSelectedVerifierAuthority(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	cases := []struct {
+		name         string
+		mutateInput  func(RoutingDecision, RoutingDecision, *VerificationDecisionInput)
+		mutateRoutes func(*taskrequirements.TaskRequirement, *Candidate)
+		wantErr      error
+	}{
+		{
+			name: "worker candidate id",
+			mutateInput: func(worker, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].RoutingCandidateID = worker.ChosenCandidateID
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "unrelated candidate id",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].RoutingCandidateID = "rcand_unrelated"
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "wrong authority fingerprint",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].AuthorityFingerprint = testFingerprint("wrong-verifier-authority")
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "missing authority fingerprint",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].AuthorityFingerprint = ""
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "forbidden authority",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].Authority = FinalAuthorityHuman
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "pass plus terminal error",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].TerminalErrorCode = taskrequirements.ErrCapabilityUnsupportedCode
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "unknown verdict",
+			mutateInput: func(_, _ RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts[0].Verdict = "approved"
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "duplicate council member",
+			mutateInput: func(_, verifier RoutingDecision, input *VerificationDecisionInput) {
+				input.VerifierVerdicts = append(input.VerifierVerdicts, passVerdict(verifier, "second", "ev-second"))
+				input.VerifierVerdicts[1].MemberID = input.VerifierVerdicts[0].MemberID
+				input.CouncilLimits = validCouncilLimits(fixture.now)
+				input.CouncilRoundsUsed = 1
+				input.CouncilBudgetTokensUsed = 10
+			},
+			wantErr: taskrequirements.ErrVerificationDecisionConflict,
+		},
+		{
+			name: "selected read-only non-verifier route",
+			mutateRoutes: func(req *taskrequirements.TaskRequirement, candidate *Candidate) {
+				req.RoleKey = RoleKeyVerifier
+				candidate.RoleKey = RoleKeyLuna
+			},
+			wantErr: taskrequirements.ErrCapabilityUnsupported,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			store, worker, verifier := persistVerificationRoutesWithMutators(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil, tt.mutateRoutes)
+			defer store.Close()
+			input := verificationInput(worker, verifier, passVerdict(verifier, "bound", "ev-bound"))
+			if tt.mutateInput != nil {
+				tt.mutateInput(worker, verifier, &input)
+			}
+			decision, err := DecideAndPersistVerification(ctx, store, input)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v; decision=%#v", err, tt.wantErr, decision)
+			}
+			if decision.DecisionStatus == VerificationStatusAccepted || decision.FinalAuthority != FinalAuthorityHuman || decision.TerminalErrorCode == "" {
+				t.Fatalf("invalid verdict was accepted or not fail-closed: %#v", decision)
+			}
+			if countVerificationDecisions(t, ctx, store, worker.RoutingDecisionID) != 1 {
+				t.Fatalf("fail-closed decision was not persisted exactly once")
+			}
+		})
+	}
 }
 
 func TestVerificationCouncilBoundsTimeoutAndDisagreementAreDurable(t *testing.T) {
@@ -170,9 +271,10 @@ func TestVerificationCouncilBoundsTimeoutAndDisagreementAreDurable(t *testing.T)
 		MaxDurationMS:   1000,
 		MaxBudgetTokens: 50,
 		StartedAt:       fixture.now.Add(-2 * time.Second).Format(time.RFC3339Nano),
+		DeadlineAt:      fixture.now.Add(-1 * time.Second).Format(time.RFC3339Nano),
 	}
 	input := verificationInput(worker, verifier,
-		passVerdict(verifier.ChosenCandidateID, "one pass", "ev-pass"),
+		passVerdict(verifier, "one pass", "ev-pass"),
 		VerifierVerdict{MemberID: "member-b", RoutingCandidateID: verifier.ChosenCandidateID, Verdict: VerificationVerdictFail, Message: "found regression", Authority: "verifier", AuthorityFingerprint: verifier.RoutingFingerprint},
 	)
 	input.CouncilLimits = limits
@@ -196,12 +298,81 @@ func TestVerificationCouncilBoundsTimeoutAndDisagreementAreDurable(t *testing.T)
 	}
 }
 
+func TestVerificationCouncilBoundsAreMandatory(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
+	defer store.Close()
+
+	clean := verificationInput(worker, verifier, passVerdict(verifier, "clean", "ev-clean"))
+	clean.CouncilLimits = validCouncilLimits(fixture.now)
+	clean.CouncilRoundsUsed = 1
+	clean.CouncilBudgetTokensUsed = 10
+	accepted, err := DecideAndPersistVerification(ctx, store, clean)
+	if err != nil || accepted.DecisionStatus != VerificationStatusAccepted || accepted.Council.MemberCount != 1 {
+		t.Fatalf("bounded council acceptance = %#v / %v", accepted, err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*VerificationDecisionInput)
+	}{
+		{"missing start", func(input *VerificationDecisionInput) { input.CouncilLimits.StartedAt = "" }},
+		{"invalid start", func(input *VerificationDecisionInput) { input.CouncilLimits.StartedAt = "not-time" }},
+		{"future start", func(input *VerificationDecisionInput) {
+			input.CouncilLimits.StartedAt = fixture.now.Add(time.Second).Format(time.RFC3339Nano)
+		}},
+		{"missing deadline", func(input *VerificationDecisionInput) { input.CouncilLimits.DeadlineAt = "" }},
+		{"deadline beyond cap", func(input *VerificationDecisionInput) {
+			input.CouncilLimits.DeadlineAt = fixture.now.Add(2 * time.Second).Format(time.RFC3339Nano)
+		}},
+		{"expired boundary", func(input *VerificationDecisionInput) {
+			input.CouncilLimits.DeadlineAt = fixture.now.Format(time.RFC3339Nano)
+		}},
+		{"negative budget", func(input *VerificationDecisionInput) { input.CouncilBudgetTokensUsed = -1 }},
+		{"zero members", func(input *VerificationDecisionInput) { input.VerifierVerdicts = nil }},
+		{"duplicate member", func(input *VerificationDecisionInput) {
+			input.VerifierVerdicts = append(input.VerifierVerdicts, input.VerifierVerdicts[0])
+		}},
+		{"zero rounds", func(input *VerificationDecisionInput) { input.CouncilRoundsUsed = 0 }},
+		{"too many rounds", func(input *VerificationDecisionInput) { input.CouncilRoundsUsed = 2 }},
+		{"too many members", func(input *VerificationDecisionInput) {
+			input.CouncilLimits.MaxMembers = 1
+			input.VerifierVerdicts = append(input.VerifierVerdicts, passVerdict(verifier, "second", "ev-second"))
+			input.VerifierVerdicts[1].MemberID = "member-b"
+		}},
+		{"over budget", func(input *VerificationDecisionInput) { input.CouncilBudgetTokensUsed = 51 }},
+		{"zero duration", func(input *VerificationDecisionInput) { input.CouncilLimits.MaxDurationMS = 0 }},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
+			defer store.Close()
+			input := verificationInput(worker, verifier, passVerdict(verifier, "bounded", "ev-"+strings.ReplaceAll(tt.name, " ", "-")))
+			input.CouncilLimits = validCouncilLimits(fixture.now)
+			input.CouncilRoundsUsed = 1
+			input.CouncilBudgetTokensUsed = 10
+			tt.mutate(&input)
+			decision, err := DecideAndPersistVerification(ctx, store, input)
+			if !errors.Is(err, taskrequirements.ErrVerifierCouncilBoundExceeded) && tt.name != "duplicate member" {
+				t.Fatalf("error = %v, want ErrVerifierCouncilBoundExceeded; decision=%#v", err, decision)
+			}
+			if tt.name == "duplicate member" && !errors.Is(err, taskrequirements.ErrVerificationDecisionConflict) {
+				t.Fatalf("duplicate member error = %v, want ErrVerificationDecisionConflict; decision=%#v", err, decision)
+			}
+			if decision.DecisionStatus != VerificationStatusNeedsHuman || decision.TerminalErrorCode == "" {
+				t.Fatalf("council bound was not fail-closed: %#v", decision)
+			}
+		})
+	}
+}
+
 func TestVerificationDecisionConcurrentDuplicateAndAuthorityChanges(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
 	defer store.Close()
-	input := verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "concurrent", "ev-concurrent"))
+	input := verificationInput(worker, verifier, passVerdict(verifier, "concurrent", "ev-concurrent"))
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
@@ -256,7 +427,7 @@ func TestVerificationDecisionRefusesOverwriteOfAcceptedAuthority(t *testing.T) {
 	store, worker, verifier := persistVerificationRoutes(t, ctx, fixture, fixture.candidate("claude", "acct-c", "claude-good"), nil)
 	defer store.Close()
 
-	first, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier.ChosenCandidateID, "accepted", "ev-accepted")))
+	first, err := DecideAndPersistVerification(ctx, store, verificationInput(worker, verifier, passVerdict(verifier, "accepted", "ev-accepted")))
 	if err != nil {
 		t.Fatalf("first verification: %v", err)
 	}
@@ -266,7 +437,7 @@ func TestVerificationDecisionRefusesOverwriteOfAcceptedAuthority(t *testing.T) {
 		Verdict:              VerificationVerdictFail,
 		Message:              "later contradictory verdict",
 		Authority:            "verifier",
-		AuthorityFingerprint: testFingerprint("verdict-overwrite"),
+		AuthorityFingerprint: verifier.RoutingFingerprint,
 		EvidenceRefs:         []EvidenceRef{{RecordKind: "check", RecordID: "ev-overwrite", Summary: "later contradictory verdict"}},
 	})
 	overwrite.IdempotencyKey = "overwrite-attempt"
@@ -285,25 +456,46 @@ func TestVerificationDecisionRefusesOverwriteOfAcceptedAuthority(t *testing.T) {
 
 func TestVerificationExplanationRedactsBeforeTruncation(t *testing.T) {
 	secret := "AKIA" + strings.Repeat("A", 16)
+	windowsPath := `C:\Users\example\private\secret\file.txt`
+	unixPath := "/Users/example/private/path/with/token"
+	multibyte := strings.Repeat("検証", 120)
 	decision := VerificationDecision{
-		SchemaVersion:             VerificationDecisionSchema,
-		RecordVersion:             1,
-		VerificationDecisionID:    "vdec_test",
-		ProjectID:                 "proj",
-		DeliveryRunID:             "run",
-		TaskID:                    "task",
-		TaskRequirementID:         "treq",
-		WorkerRoutingDecisionID:   "rdec_worker",
-		DecisionKey:               "verify",
-		IdempotencyKey:            "verify",
-		DecisionStatus:            VerificationStatusNeedsHuman,
-		Verdict:                   VerificationVerdictNeedsHuman,
-		RequiredIndependence:      taskrequirements.IndependenceDifferentProvider,
-		ActualIndependence:        taskrequirements.IndependenceNone,
-		WorkerCandidateID:         "worker",
-		VerifierVerdicts:          []VerifierVerdict{{MemberID: "member", Verdict: VerificationVerdictNeedsHuman, Message: strings.Repeat("x", 300) + secret, EvidenceRefs: []EvidenceRef{{RecordKind: "log", RecordID: "ev", Summary: "/Users/example/private/path/with/token secret=" + secret}}}},
-		Disagreements:             []string{strings.Repeat("y", 300) + " token=" + secret},
-		EvidenceRefs:              []EvidenceRef{{RecordKind: "log", RecordID: "ev", Summary: strings.Repeat("z", 300) + secret}},
+		SchemaVersion:           VerificationDecisionSchema,
+		RecordVersion:           1,
+		VerificationDecisionID:  "vdec_test",
+		ProjectID:               "proj",
+		DeliveryRunID:           "run",
+		TaskID:                  "task",
+		TaskRequirementID:       "treq",
+		WorkerRoutingDecisionID: "rdec_worker",
+		DecisionKey:             "verify",
+		IdempotencyKey:          "verify",
+		DecisionStatus:          VerificationStatusNeedsHuman,
+		Verdict:                 VerificationVerdictNeedsHuman,
+		RequiredIndependence:    taskrequirements.IndependenceDifferentProvider,
+		ActualIndependence:      taskrequirements.IndependenceNone,
+		WorkerCandidateID:       "worker-" + secret,
+		VerifierCandidateID:     "verifier-" + windowsPath,
+		VerifierVerdicts: []VerifierVerdict{{
+			MemberID:             "member-" + secret,
+			RoutingCandidateID:   "candidate-" + unixPath,
+			Verdict:              VerificationVerdictNeedsHuman,
+			Message:              multibyte + secret,
+			Authority:            "verifier token=" + secret,
+			AuthorityFingerprint: "sha256:" + secret,
+			EvidenceRefs: []EvidenceRef{
+				{RecordKind: "log-" + secret, RecordID: windowsPath, Summary: unixPath + " secret=" + secret},
+				{RecordKind: "log-" + secret, RecordID: windowsPath, Summary: unixPath + " secret=" + secret},
+			},
+		}},
+		Disagreements: []string{strings.Repeat("y", 300) + " token=" + secret},
+		EligibilityExclusions: []RejectionReason{{
+			Code:              RejectEvidenceStale,
+			Message:           windowsPath + " bearer " + strings.Repeat("a", 16),
+			EvidenceRecordIDs: []string{"evidence-" + unixPath, "evidence-" + unixPath},
+			SnapshotIDs:       []string{"snapshot-" + secret},
+		}},
+		EvidenceRefs:              []EvidenceRef{{RecordKind: unixPath, RecordID: "ev-" + secret, Summary: strings.Repeat("z", 300) + secret}},
 		FinalAuthority:            FinalAuthorityHuman,
 		FinalAuthorityFingerprint: testFingerprint("auth"),
 		VerificationFingerprint:   testFingerprint("verification"),
@@ -319,15 +511,33 @@ func TestVerificationExplanationRedactsBeforeTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExplainVerificationJSON: %v", err)
 	}
+	human := ExplainVerificationHuman(decision)
+	for _, surface := range []string{string(out), human} {
+		if !utf8.ValidString(surface) {
+			t.Fatalf("explanation emitted invalid utf-8: %q", surface)
+		}
+		for _, raw := range []string{secret, "/Users/example", `C:\Users\example`, "token=" + secret} {
+			if strings.Contains(surface, raw) {
+				t.Fatalf("explanation leaked raw material %q: %s", raw, surface)
+			}
+		}
+	}
+	if strings.Count(string(out), `"record_kind"`) > 2 {
+		t.Fatalf("explanation did not dedupe evidence refs: %s", out)
+	}
 	if strings.Contains(string(out), secret) || strings.Contains(string(out), "/Users/example") {
 		t.Fatalf("explanation leaked secret/local path after truncation: %s", out)
 	}
-	if !strings.Contains(string(out), "[REDACTED]") {
-		t.Fatalf("explanation did not include redaction marker: %s", out)
+	if !strings.Contains(string(out), "[REDACTED]") || !strings.Contains(human, "[REDACTED]") {
+		t.Fatalf("explanation did not include redaction marker: json=%s human=%s", out, human)
 	}
 }
 
 func persistVerificationRoutes(t *testing.T, ctx context.Context, fixture hardFixture, verifierCandidate Candidate, mutateWorkerReq func(*taskrequirements.TaskRequirement)) (storage.Store, RoutingDecision, RoutingDecision) {
+	return persistVerificationRoutesWithMutators(t, ctx, fixture, verifierCandidate, mutateWorkerReq, nil)
+}
+
+func persistVerificationRoutesWithMutators(t *testing.T, ctx context.Context, fixture hardFixture, verifierCandidate Candidate, mutateWorkerReq func(*taskrequirements.TaskRequirement), mutateVerifierRoute func(*taskrequirements.TaskRequirement, *Candidate)) (storage.Store, RoutingDecision, RoutingDecision) {
 	t.Helper()
 	store := openRoutingStore(t, ctx, fixture.now)
 	workerInput := replayDecisionInput(fixture)
@@ -370,13 +580,17 @@ func persistVerificationRoutes(t *testing.T, ctx context.Context, fixture hardFi
 	}
 
 	verifierReq := decisionRequirement(t, fixture, verifierRequirement("task-verifier-route"), "treq-verifier-route", worker.PlanFingerprint)
+	verifierReq.RequiredOutput = taskrequirements.OutputVerificationVerdict
 	verifierReq.TaskID = "task-verifier-route"
 	verifierReq.TaskKey = verifierReq.TaskID
-	verifierReq = persistFallbackTaskRequirement(t, ctx, store, verifierReq, fixture.now)
 	verifierCandidate.TaskID = verifierReq.TaskID
-	verifierCandidate.RoleKey = RoleKeyVerifier
-	verifierCandidate.Permission = taskrequirements.PermissionReadOnly
+	verifierCandidate.RoleKey = verifierReq.RoleKey
+	verifierCandidate.Permission = verifierReq.PermissionRequired
 	verifierCandidate.LaunchSideEffectClass = taskrequirements.SideEffectProviderLaunch
+	if mutateVerifierRoute != nil {
+		mutateVerifierRoute(&verifierReq, &verifierCandidate)
+	}
+	verifierReq = persistFallbackTaskRequirement(t, ctx, store, verifierReq, fixture.now)
 	verifierCandidate.RoutingCandidateID = candidateID(verifierCandidate)
 	verifierCandidate.CandidateFingerprint = candidateFingerprint(verifierCandidate)
 	verifierInput := workerInput
@@ -397,27 +611,43 @@ func persistVerificationRoutes(t *testing.T, ctx context.Context, fixture hardFi
 }
 
 func verificationInput(worker, verifier RoutingDecision, verdicts ...VerifierVerdict) VerificationDecisionInput {
+	authorityFingerprint := verifier.RoutingFingerprint
+	if authorityFingerprint == "" {
+		authorityFingerprint = worker.RoutingFingerprint
+	}
 	return VerificationDecisionInput{
 		WorkerRoutingDecisionID:   worker.RoutingDecisionID,
 		VerifierRoutingDecisionID: verifier.RoutingDecisionID,
 		DecisionKey:               "verify-worker",
 		IdempotencyKey:            "verify-worker-key",
 		VerifierVerdicts:          verdicts,
-		AuthorityFingerprint:      worker.RoutingFingerprint,
+		AuthorityFingerprint:      authorityFingerprint,
 		DecidedBy:                 schedulerActor(),
 		Host:                      routingHost(),
 	}
 }
 
-func passVerdict(candidateID, message, evidenceID string) VerifierVerdict {
+func passVerdict(verifier RoutingDecision, message, evidenceID string) VerifierVerdict {
 	return VerifierVerdict{
 		MemberID:             "member-a",
-		RoutingCandidateID:   candidateID,
+		RoutingCandidateID:   verifier.ChosenCandidateID,
 		Verdict:              VerificationVerdictPass,
 		Message:              message,
 		Authority:            "verifier",
-		AuthorityFingerprint: testFingerprint("verdict-" + evidenceID),
+		AuthorityFingerprint: verifier.RoutingFingerprint,
 		EvidenceRefs:         []EvidenceRef{{RecordKind: "check", RecordID: evidenceID, Summary: message}},
+	}
+}
+
+func validCouncilLimits(now time.Time) CouncilLimits {
+	return CouncilLimits{
+		Enabled:         true,
+		MaxMembers:      2,
+		MaxRounds:       1,
+		MaxDurationMS:   1000,
+		MaxBudgetTokens: 50,
+		StartedAt:       now.Add(-500 * time.Millisecond).Format(time.RFC3339Nano),
+		DeadlineAt:      now.Add(500 * time.Millisecond).Format(time.RFC3339Nano),
 	}
 }
 

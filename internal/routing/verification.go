@@ -32,6 +32,8 @@ const (
 	FinalAuthorityHuman             = "human"
 )
 
+const maxCouncilDurationMS = int64(1<<63-1) / int64(time.Millisecond)
+
 type EvidenceRef struct {
 	RecordKind string `json:"record_kind"`
 	RecordID   string `json:"record_id"`
@@ -154,7 +156,7 @@ func DecideAndPersistVerification(ctx context.Context, store storage.Store, inpu
 		if err != nil {
 			return err
 		}
-		verifierRoute, verifierCandidate, exclusions, err := resolveVerifierRouteTx(ctx, tx, input.VerifierRoutingDecisionID)
+		verifierRoute, verifierCandidate, verifierReq, exclusions, err := resolveVerifierRouteTx(ctx, tx, input.VerifierRoutingDecisionID)
 		if err != nil {
 			return err
 		}
@@ -176,7 +178,7 @@ func DecideAndPersistVerification(ctx context.Context, store storage.Store, inpu
 			stored = existing
 			return nil
 		}
-		decision, err := buildVerificationDecision(workerRoute, verifierRoute, req, profile, workerCandidate, verifierCandidate, exclusions, input, store.Now())
+		decision, err := buildVerificationDecision(workerRoute, verifierRoute, req, verifierReq, profile, workerCandidate, verifierCandidate, exclusions, input, store.Now())
 		if err != nil {
 			return err
 		}
@@ -224,13 +226,15 @@ func RequiredVerifierIndependence(req taskrequirements.TaskRequirement, profile 
 	return required
 }
 
-func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {
+func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req, verifierReq taskrequirements.TaskRequirement, profile RoutingPolicyProfile, worker, verifier Candidate, exclusions []RejectionReason, input VerificationDecisionInput, now time.Time) (VerificationDecision, error) {
 	required := RequiredVerifierIndependence(req, profile)
 	actual := actualIndependence(worker, verifier)
-	council := aggregateCouncil(input.CouncilLimits, input.CouncilRoundsUsed, input.CouncilBudgetTokensUsed, input.Timeout, input.VerifierVerdicts, now)
 	verdicts := sanitizeVerifierVerdicts(input.VerifierVerdicts)
+	verdictValidation := validateBoundVerifierVerdicts(input.VerifierVerdicts, verifierRoute, verifier, input.CouncilLimits.Enabled)
+	council := aggregateCouncil(input.CouncilLimits, input.CouncilRoundsUsed, input.CouncilBudgetTokensUsed, input.Timeout, verdictValidation.memberCount, verdicts, now)
 	evidence := evidenceRefs(verdicts)
 	disagreements := councilDisagreements(verdicts, council)
+	disagreements = append(disagreements, verdictValidation.disagreements...)
 	status := VerificationStatusAccepted
 	verdict := VerificationVerdictPass
 	authority := FinalAuthorityAutomatedVerifier
@@ -247,12 +251,17 @@ func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req t
 	} else if verifier.Permission != taskrequirements.PermissionReadOnly {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrCapabilityUnsupportedCode
 		disagreements = append(disagreements, "verifier route is not read-only")
-	} else if !verificationOutputAllowed(req, profile) {
+	} else if !verifierRouteAllowed(verifierReq, verifier) {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrCapabilityUnsupportedCode
-		disagreements = append(disagreements, "verifier output contract is not verification-verdict or json-schema")
+		disagreements = append(disagreements, "selected route is not a read-only verifier route with verification output")
+	} else if !workerVerificationOutputAllowed(req, profile) {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrCapabilityUnsupportedCode
+		disagreements = append(disagreements, "worker verification output contract is not verification-verdict or json-schema")
 	} else if !independentEnough(worker, verifier, required) {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, taskrequirements.ErrVerifierIndependenceRequiredCode
 		disagreements = append(disagreements, "verifier route is not independent enough from worker route")
+	} else if verdictValidation.terminal != "" {
+		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, verdictValidation.terminal
 	} else if council.TerminalErrorCode != "" {
 		status, verdict, authority, terminal = VerificationStatusNeedsHuman, VerificationVerdictNeedsHuman, FinalAuthorityHuman, council.TerminalErrorCode
 	} else if len(verdicts) == 0 {
@@ -316,14 +325,109 @@ func buildVerificationDecision(workerRoute, verifierRoute RoutingDecision, req t
 	return decision, nil
 }
 
-func aggregateCouncil(limits CouncilLimits, roundsUsed int, budgetUsed int64, timedOut bool, verdicts []VerifierVerdict, now time.Time) CouncilState {
+type verdictValidationResult struct {
+	memberCount   int
+	terminal      taskrequirements.ErrorCode
+	disagreements []string
+}
+
+func validateBoundVerifierVerdicts(verdicts []VerifierVerdict, verifierRoute RoutingDecision, verifier Candidate, councilEnabled bool) verdictValidationResult {
+	result := verdictValidationResult{}
+	if councilEnabled {
+		result.memberCount = uniqueMemberCount(verdicts)
+	} else {
+		result.memberCount = len(verdicts)
+	}
+	if verifierRoute.DecisionStatus != DecisionStatusSelected || verifier.RoutingCandidateID == "" {
+		return result
+	}
+	if !councilEnabled && len(verdicts) != 1 {
+		result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		result.disagreements = append(result.disagreements, "non-council verification requires exactly one verifier verdict")
+		return result
+	}
+	seenMembers := map[string]struct{}{}
+	for _, verdict := range verdicts {
+		memberID := strings.TrimSpace(verdict.MemberID)
+		switch {
+		case !validVerifierIdentity(memberID):
+			result.disagreements = append(result.disagreements, "verifier member identity is missing or invalid")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		case councilEnabled:
+			if _, ok := seenMembers[memberID]; ok {
+				result.disagreements = append(result.disagreements, "duplicate verifier member identity")
+				result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+			}
+			seenMembers[memberID] = struct{}{}
+		}
+		if strings.TrimSpace(verdict.RoutingCandidateID) != verifierRoute.ChosenCandidateID || strings.TrimSpace(verdict.RoutingCandidateID) != verifier.RoutingCandidateID {
+			result.disagreements = append(result.disagreements, "verifier verdict is not bound to selected verifier candidate")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		if strings.TrimSpace(verdict.AuthorityFingerprint) != verifierRoute.RoutingFingerprint || !validFingerprint(strings.TrimSpace(verdict.AuthorityFingerprint)) {
+			result.disagreements = append(result.disagreements, "verifier verdict authority fingerprint does not match selected verifier route")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		if !allowedVerifierVerdictAuthority(verdict.Authority) {
+			result.disagreements = append(result.disagreements, "verifier verdict claimed forbidden authority")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		switch verdict.Verdict {
+		case VerificationVerdictPass, VerificationVerdictFail, VerificationVerdictNeedsHuman:
+		default:
+			result.disagreements = append(result.disagreements, "verifier verdict enum is unknown")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+		if verdict.TerminalErrorCode != "" {
+			result.disagreements = append(result.disagreements, "verifier verdict carried terminal error")
+			result.terminal = taskrequirements.ErrVerificationDecisionConflictCode
+		}
+	}
+	return result
+}
+
+func uniqueMemberCount(verdicts []VerifierVerdict) int {
+	seen := map[string]struct{}{}
+	for _, verdict := range verdicts {
+		memberID := strings.TrimSpace(verdict.MemberID)
+		if memberID == "" {
+			continue
+		}
+		seen[memberID] = struct{}{}
+	}
+	return len(seen)
+}
+
+func validVerifierIdentity(value string) bool {
+	if value == "" || len(value) > 120 {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func allowedVerifierVerdictAuthority(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "verifier", "council-member":
+		return true
+	default:
+		return false
+	}
+}
+
+func aggregateCouncil(limits CouncilLimits, roundsUsed int, budgetUsed int64, timedOut bool, memberCount int, verdicts []VerifierVerdict, now time.Time) CouncilState {
 	state := CouncilState{
 		Enabled:          limits.Enabled,
 		MaxMembers:       limits.MaxMembers,
 		MaxRounds:        limits.MaxRounds,
 		MaxDurationMS:    limits.MaxDurationMS,
 		MaxBudgetTokens:  limits.MaxBudgetTokens,
-		MemberCount:      len(verdicts),
+		MemberCount:      memberCount,
 		RoundsUsed:       roundsUsed,
 		BudgetTokensUsed: budgetUsed,
 		Outcome:          VerificationVerdictPass,
@@ -336,16 +440,16 @@ func aggregateCouncil(limits CouncilLimits, roundsUsed int, budgetUsed int64, ti
 		return aggregateVerdicts(state, verdicts)
 	}
 	switch {
-	case limits.MaxMembers <= 0 || len(verdicts) > limits.MaxMembers:
+	case limits.MaxMembers <= 0 || memberCount <= 0 || memberCount > limits.MaxMembers:
 		state.BoundExceeded, state.TerminalErrorCode = "members", taskrequirements.ErrVerifierCouncilBoundExceededCode
 	case limits.MaxRounds <= 0 || roundsUsed <= 0 || roundsUsed > limits.MaxRounds:
 		state.BoundExceeded, state.TerminalErrorCode = "rounds", taskrequirements.ErrVerifierCouncilBoundExceededCode
-	case limits.MaxBudgetTokens <= 0 || budgetUsed > limits.MaxBudgetTokens:
+	case limits.MaxBudgetTokens <= 0 || budgetUsed < 0 || budgetUsed > limits.MaxBudgetTokens:
 		state.BoundExceeded, state.TerminalErrorCode = "budget", taskrequirements.ErrVerifierCouncilBoundExceededCode
-	case limits.MaxDurationMS <= 0:
+	case limits.MaxDurationMS <= 0 || limits.MaxDurationMS > maxCouncilDurationMS:
 		state.BoundExceeded, state.TerminalErrorCode = "time", taskrequirements.ErrVerifierCouncilBoundExceededCode
 	}
-	if deadline, ok := parseCouncilDeadline(limits); timedOut || (ok && now.After(deadline)) {
+	if deadline, ok := parseCouncilDeadline(limits, now); timedOut || !ok || !now.Before(deadline) {
 		state.TimedOut = true
 		state.BoundExceeded = "time"
 		state.TerminalErrorCode = taskrequirements.ErrVerifierCouncilBoundExceededCode
@@ -475,20 +579,24 @@ func ExplainVerificationHuman(decision VerificationDecision) string {
 	return strings.TrimSpace(b.String())
 }
 
-func resolveVerifierRouteTx(ctx context.Context, tx storage.Tx, verifierRoutingDecisionID string) (RoutingDecision, Candidate, []RejectionReason, error) {
+func resolveVerifierRouteTx(ctx context.Context, tx storage.Tx, verifierRoutingDecisionID string) (RoutingDecision, Candidate, taskrequirements.TaskRequirement, []RejectionReason, error) {
 	if strings.TrimSpace(verifierRoutingDecisionID) == "" {
-		return RoutingDecision{}, Candidate{}, nil, nil
+		return RoutingDecision{}, Candidate{}, taskrequirements.TaskRequirement{}, nil, nil
 	}
 	route, err := loadRoutingDecisionTx(ctx, tx, verifierRoutingDecisionID)
 	if err != nil {
-		return RoutingDecision{}, Candidate{}, nil, err
+		return RoutingDecision{}, Candidate{}, taskrequirements.TaskRequirement{}, nil, err
+	}
+	req, err := loadTaskRequirementTx(ctx, tx, route.TaskRequirementID)
+	if err != nil {
+		return RoutingDecision{}, Candidate{}, taskrequirements.TaskRequirement{}, nil, err
 	}
 	candidate, _ := chosenCandidate(route)
 	var exclusions []RejectionReason
 	for _, rejected := range route.RejectedCandidates {
 		exclusions = append(exclusions, rejected.Reasons...)
 	}
-	return route, candidate, exclusions, nil
+	return route, candidate, req, exclusions, nil
 }
 
 func chosenCandidate(decision RoutingDecision) (Candidate, bool) {
@@ -528,7 +636,7 @@ func strongerIndependence(a, b taskrequirements.IndependenceLevel) taskrequireme
 	return a
 }
 
-func verificationOutputAllowed(req taskrequirements.TaskRequirement, profile RoutingPolicyProfile) bool {
+func workerVerificationOutputAllowed(req taskrequirements.TaskRequirement, profile RoutingPolicyProfile) bool {
 	requiredOutput := taskrequirements.OutputVerificationVerdict
 	if risk, ok := profile.RiskPolicy[req.RiskTier]; ok && risk.VerificationOutput != "" {
 		requiredOutput = risk.VerificationOutput
@@ -542,14 +650,36 @@ func verificationOutputAllowed(req taskrequirements.TaskRequirement, profile Rou
 	return requiredOutput == taskrequirements.OutputVerificationVerdict || requiredOutput == taskrequirements.OutputJSONSchema
 }
 
+func verifierRouteAllowed(req taskrequirements.TaskRequirement, verifier Candidate) bool {
+	if !verifierRoleCompatible(req.RoleKey) || !verifierRoleCompatible(verifier.RoleKey) {
+		return false
+	}
+	if req.PermissionRequired != taskrequirements.PermissionReadOnly || verifier.Permission != taskrequirements.PermissionReadOnly {
+		return false
+	}
+	return req.RequiredOutput == taskrequirements.OutputVerificationVerdict || req.RequiredOutput == taskrequirements.OutputJSONSchema
+}
+
+func verifierRoleCompatible(roleKey string) bool {
+	switch normalizeRoleKey(roleKey) {
+	case RoleKeyVerifier, RoleKeySoul:
+		return true
+	default:
+		return false
+	}
+}
+
 func evidenceRefs(verdicts []VerifierVerdict) []EvidenceRef {
 	var refs []EvidenceRef
 	for _, verdict := range verdicts {
 		refs = append(refs, verdict.EvidenceRefs...)
 	}
 	for i := range refs {
+		refs[i].RecordKind = sanitizeIdentifier(refs[i].RecordKind)
+		refs[i].RecordID = sanitizeIdentifier(refs[i].RecordID)
 		refs[i].Summary = sanitizeText(refs[i].Summary, 160)
 	}
+	refs = dedupeEvidenceRefs(refs)
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].RecordKind != refs[j].RecordKind {
 			return refs[i].RecordKind < refs[j].RecordKind
@@ -590,9 +720,12 @@ func sanitizeVerifierVerdicts(verdicts []VerifierVerdict) []VerifierVerdict {
 	out := make([]VerifierVerdict, 0, len(verdicts))
 	for _, verdict := range verdicts {
 		verdict.MemberID = sanitizeIdentifier(verdict.MemberID)
-		verdict.RoutingCandidateID = strings.TrimSpace(verdict.RoutingCandidateID)
+		verdict.RoutingCandidateID = sanitizeIdentifier(verdict.RoutingCandidateID)
 		verdict.Message = sanitizeText(verdict.Message, 256)
 		verdict.Authority = sanitizeIdentifier(verdict.Authority)
+		verdict.AuthorityFingerprint = sanitizeIdentifier(verdict.AuthorityFingerprint)
+		verdict.VerificationStartedAt = sanitizeIdentifier(verdict.VerificationStartedAt)
+		verdict.VerificationEndedAt = sanitizeIdentifier(verdict.VerificationEndedAt)
 		verdict.EvidenceRefs = evidenceRefs([]VerifierVerdict{verdict})
 		out = append(out, verdict)
 	}
@@ -609,6 +742,10 @@ func redactedVerificationDecision(decision VerificationDecision) VerificationDec
 	decision.DecidedBy.ActorID = sanitizeIdentifier(decision.DecidedBy.ActorID)
 	decision.DecidedBy.Display = sanitizeText(decision.DecidedBy.Display, 80)
 	decision.Host.HostID = sanitizeIdentifier(decision.Host.HostID)
+	decision.WorkerCandidateID = sanitizeIdentifier(decision.WorkerCandidateID)
+	decision.VerifierCandidateID = sanitizeIdentifier(decision.VerifierCandidateID)
+	decision.WorkerRoutingDecisionID = sanitizeIdentifier(decision.WorkerRoutingDecisionID)
+	decision.VerifierRoutingDecisionID = sanitizeIdentifier(decision.VerifierRoutingDecisionID)
 	decision.VerifierVerdicts = sanitizeVerifierVerdicts(decision.VerifierVerdicts)
 	for i := range decision.Disagreements {
 		decision.Disagreements[i] = sanitizeText(decision.Disagreements[i], 160)
@@ -626,16 +763,21 @@ var secretLikePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 	regexp.MustCompile(`(?i)(token|secret|password|api[_-]?key)=\S+`),
 	regexp.MustCompile(`(?i)bearer\s+[a-z0-9._~+/=-]{12,}`),
+	regexp.MustCompile(`[A-Za-z]:\\[^\s"']{8,}`),
 	regexp.MustCompile(`/[A-Za-z0-9._@%+=:,/-]{12,}`),
 }
 
 func sanitizeText(value string, max int) string {
+	value = strings.ToValidUTF8(value, "")
 	value = strings.TrimSpace(value)
 	for _, pattern := range secretLikePatterns {
 		value = pattern.ReplaceAllString(value, "[REDACTED]")
 	}
-	if max > 0 && len(value) > max {
-		return value[:max]
+	if max > 0 {
+		runes := []rune(value)
+		if len(runes) > max {
+			return string(runes[:max])
+		}
 	}
 	return value
 }
@@ -653,6 +795,20 @@ func boundedSanitizedIDs(values []string, max int) []string {
 		values[i] = sanitizeIdentifier(values[i])
 	}
 	return values
+}
+
+func dedupeEvidenceRefs(values []EvidenceRef) []EvidenceRef {
+	out := make([]EvidenceRef, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		key := value.RecordKind + "\x00" + value.RecordID + "\x00" + value.Summary
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func verificationRequestFingerprint(input VerificationDecisionInput, workerRoute, verifierRoute RoutingDecision) string {
@@ -776,19 +932,23 @@ func verificationTerminalError(code taskrequirements.ErrorCode) error {
 	}
 }
 
-func parseCouncilDeadline(limits CouncilLimits) (time.Time, bool) {
-	if strings.TrimSpace(limits.DeadlineAt) != "" {
-		t, err := time.Parse(time.RFC3339Nano, limits.DeadlineAt)
-		return t, err == nil
-	}
-	if strings.TrimSpace(limits.StartedAt) == "" || limits.MaxDurationMS <= 0 {
+func parseCouncilDeadline(limits CouncilLimits, now time.Time) (time.Time, bool) {
+	if strings.TrimSpace(limits.StartedAt) == "" || strings.TrimSpace(limits.DeadlineAt) == "" || limits.MaxDurationMS <= 0 || limits.MaxDurationMS > maxCouncilDurationMS {
 		return time.Time{}, false
 	}
 	started, err := time.Parse(time.RFC3339Nano, limits.StartedAt)
-	if err != nil {
+	if err != nil || limits.StartedAt != started.Format(time.RFC3339Nano) || started.After(now) {
 		return time.Time{}, false
 	}
-	return started.Add(time.Duration(limits.MaxDurationMS) * time.Millisecond), true
+	deadline, err := time.Parse(time.RFC3339Nano, limits.DeadlineAt)
+	if err != nil || limits.DeadlineAt != deadline.Format(time.RFC3339Nano) {
+		return time.Time{}, false
+	}
+	capDeadline := started.Add(time.Duration(limits.MaxDurationMS) * time.Millisecond)
+	if deadline.After(capDeadline) {
+		return time.Time{}, false
+	}
+	return deadline, true
 }
 
 func nonNilRejectionReasons(values []RejectionReason) []RejectionReason {
