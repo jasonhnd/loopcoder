@@ -632,6 +632,135 @@ func TestEmitterTerminalPersistsAndStopsWhileDeliveryBacklogged(t *testing.T) {
 	}
 }
 
+func TestEmitterStopFencesPostPersistDeliveryAdmissionRace(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+	persistedBeforeDelivery := make(chan struct{})
+	releaseDeliveryAdmission := make(chan struct{})
+	callbackStarted := make(chan struct{}, 1)
+	deliver := func(context.Context, ProgressReceipt) error {
+		callbackStarted <- struct{}{}
+		return nil
+	}
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_stop_delivery_fence",
+		MaxSilenceInterval: 5 * time.Minute,
+		Deliver:            deliver,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	var persistedOnce sync.Once
+	emitter.testHookAfterPersistBeforeDelivery = func() {
+		persistedOnce.Do(func() { close(persistedBeforeDelivery) })
+		<-releaseDeliveryAdmission
+	}
+
+	type emitOutcome struct {
+		result EmitResult
+		err    error
+	}
+	emitDone := make(chan emitOutcome, 1)
+	go func() {
+		result, err := emitter.Emit(ctx, runningObservation(fixedTime))
+		emitDone <- emitOutcome{result: result, err: err}
+	}()
+	select {
+	case <-persistedBeforeDelivery:
+	case <-time.After(time.Second):
+		t.Fatal("emit did not reach post-persist delivery barrier")
+	}
+	if got := countReceipts(t, ctx, store); got != 1 {
+		t.Fatalf("receipt count before delivery admission = %d, want durable receipt", got)
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := emitter.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop before delivery admission: %v", err)
+	}
+	close(releaseDeliveryAdmission)
+	outcome := <-emitDone
+	if outcome.err != nil {
+		t.Fatalf("Emit: %v", outcome.err)
+	}
+	if !outcome.result.Emitted {
+		t.Fatal("Emit result did not report durable persistence")
+	}
+	if outcome.result.DeliveryAttempted || !errors.Is(outcome.result.DeliveryErr, errDeliveryCanceled) {
+		t.Fatalf("delivery result attempted=%v err=%v, want fenced cancellation before callback start", outcome.result.DeliveryAttempted, outcome.result.DeliveryErr)
+	}
+	select {
+	case <-callbackStarted:
+		t.Fatal("delivery callback started after Stop fenced delivery")
+	default:
+	}
+}
+
+func TestEmitterStopCancelsAndJoinsDeliveryWhenAdmissionWins(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+	callbackStarted := make(chan struct{})
+	callbackReturned := make(chan struct{})
+	deliver := func(ctx context.Context, _ ProgressReceipt) error {
+		close(callbackStarted)
+		<-ctx.Done()
+		close(callbackReturned)
+		return ctx.Err()
+	}
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_start_delivery_wins",
+		MaxSilenceInterval: 5 * time.Minute,
+		Deliver:            deliver,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+
+	type emitOutcome struct {
+		result EmitResult
+		err    error
+	}
+	emitDone := make(chan emitOutcome, 1)
+	go func() {
+		result, err := emitter.Emit(ctx, runningObservation(fixedTime))
+		emitDone <- emitOutcome{result: result, err: err}
+	}()
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delivery callback did not start")
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := emitter.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop after delivery admission: %v", err)
+	}
+	select {
+	case <-callbackReturned:
+	default:
+		t.Fatal("Stop returned before the in-flight delivery callback joined")
+	}
+	outcome := <-emitDone
+	if outcome.err != nil {
+		t.Fatalf("Emit: %v", outcome.err)
+	}
+	if !outcome.result.DeliveryAttempted || outcome.result.DeliveryErr == nil {
+		t.Fatalf("delivery result attempted=%v err=%v, want canceled in-flight delivery", outcome.result.DeliveryAttempted, outcome.result.DeliveryErr)
+	}
+}
+
 func TestEmitterCompatibilityKnownStatesEmitTruthfulActions(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, ctx)

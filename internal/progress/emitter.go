@@ -52,6 +52,7 @@ var (
 	ErrEmitterConfig    = errors.New("progress emitter config")
 	ErrEmitterClosed    = errors.New("progress emitter closed")
 	ErrDeliveryBacklog  = errors.New("progress delivery backlog")
+	ErrDeliveryPending  = errors.New("progress delivery pending")
 	errDeliveryCanceled = errors.New("progress delivery canceled")
 )
 
@@ -170,6 +171,8 @@ type Emitter struct {
 	deliverySem     chan struct{}
 	deliveryCtx     context.Context
 	deliveryCancel  context.CancelFunc
+
+	testHookAfterPersistBeforeDelivery func()
 }
 
 type Loop struct {
@@ -443,6 +446,9 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 	e.mu.Unlock()
 
 	if e.deliver != nil {
+		if e.testHookAfterPersistBeforeDelivery != nil {
+			e.testHookAfterPersistBeforeDelivery()
+		}
 		waitForDelivery := !periodic && !terminal
 		out.DeliveryAttempted, out.DeliveryErr = e.deliverReceipt(ctx, result.Receipt, waitForDelivery)
 	}
@@ -475,7 +481,7 @@ func (e *Emitter) deliverReceipt(ctx context.Context, receipt ProgressReceipt, w
 		resultCh <- e.deliver(deliveryCtx, receipt)
 	}()
 	if !wait {
-		return true, nil
+		return true, ErrDeliveryPending
 	}
 	select {
 	case err := <-resultCh:
@@ -498,16 +504,19 @@ func (e *Emitter) markDeliveryStarted() error {
 }
 
 func (e *Emitter) stopDelivery(ctx context.Context) error {
-	e.deliveryMu.Lock()
-	if !e.deliveryStarted {
-		e.deliveryMu.Unlock()
-		return nil
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	e.deliveryMu.Lock()
 	if !e.deliveryStopped {
 		e.deliveryStopped = true
 		e.deliveryCancel()
 	}
+	started := e.deliveryStarted
 	e.deliveryMu.Unlock()
+	if !started {
+		return nil
+	}
 
 	select {
 	case e.deliverySem <- struct{}{}:
