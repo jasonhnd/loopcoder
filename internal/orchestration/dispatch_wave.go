@@ -51,6 +51,7 @@ type DispatchWaveOptions struct {
 	Provider       string
 	Model          string
 	Effort         string
+	Timeout        time.Duration
 	ConfigFromBase bool
 	ThrottleLimit  int
 	Thresholds     config.ResilienceWorker
@@ -406,6 +407,7 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		Provider:       opts.Provider,
 		Model:          opts.Model,
 		Effort:         opts.Effort,
+		Timeout:        opts.Timeout,
 		ConfigFromBase: opts.ConfigFromBase,
 		Stderr:         opts.Stderr,
 	})

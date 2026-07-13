@@ -1713,6 +1713,57 @@ func TestDispatchHelperSeamsSuccessPath(t *testing.T) {
 	}
 }
 
+func TestBuildInvocationUsesPerRunTimeoutOverride(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatalf("write delivery config: %v", err)
+	}
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:       repo,
+		IssueNumber:    601,
+		IssueTitle:     "Timeout override",
+		RunID:          "run-timeout-override",
+		Provider:       "codex",
+		Timeout:        2 * time.Minute,
+		ConfigFromBase: false,
+	}, Deps{
+		Git: &workerFakeGit{},
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return &workerFakeAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now:       fixedNow,
+		PID:       func() int { return 2468 },
+		MkdirTemp: os.MkdirTemp,
+		RemoveAll: os.RemoveAll,
+		RepoSkills: func(string, config.DomainSkills) (string, error) {
+			return "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	invocation, err := buildInvocation(ctx, dispatch)
+	if err != nil {
+		t.Fatalf("buildInvocation returned error: %v", err)
+	}
+	if invocation.HardCap != 2*time.Minute {
+		t.Fatalf("HardCap = %s, want timeout override 2m0s", invocation.HardCap)
+	}
+	if invocation.StallTimeout != WorkerStallTimeout {
+		t.Fatalf("StallTimeout = %s, want configured default %s", invocation.StallTimeout, WorkerStallTimeout)
+	}
+}
+
 func TestHandleHungReportOnlyAndWriteRecoveryHelpers(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()

@@ -87,6 +87,6 @@ func appendStallLine(logPath, provider string) func(time.Duration) {
 			return
 		}
 		defer file.Close()
-		fmt.Fprintf(file, "\n[loopcoder] %s provider silent for %s\n", provider, silentFor.Round(time.Second))
+		fmt.Fprintf(file, "\n[loopcoder] %s provider stalled for %s without meaningful provider log, worktree, or process-tree activity\n", provider, silentFor.Round(time.Second))
 	}
 }

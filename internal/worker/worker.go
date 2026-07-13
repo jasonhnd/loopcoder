@@ -45,6 +45,7 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
+	Timeout         time.Duration
 	ConfigFromBase  bool
 	KeepWorktree    bool
 	Stderr          io.Writer
@@ -342,6 +343,10 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		return agent.Invocation{}, err
 	}
 	resilience := cfg.Resilience
+	hardCap := config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap)
+	if dispatch.opts.Timeout > 0 {
+		hardCap = dispatch.opts.Timeout
+	}
 	domainPolicy, err := resolveDomainWorkerPolicy(cfg)
 	if err != nil {
 		return agent.Invocation{}, err
@@ -354,7 +359,7 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		Stderr:          dispatch.warnings,
 		Model:           dispatch.opts.Model,
 		Effort:          dispatch.opts.Effort,
-		HardCap:         config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		HardCap:         hardCap,
 		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
 		LivenessMode:    domainPolicy.AgentLivenessMode(),
 		LivenessCommand: domainPolicy.LivenessCommand,
