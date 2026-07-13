@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,6 +128,221 @@ func TestBuildGraphProposalIsSideEffectFree(t *testing.T) {
 	}
 }
 
+func TestAcceptGraphProposalPersistsImmutableVersionAndReplays(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	store := openGraphStore(t, ctx, path)
+	seedGraphProject(t, ctx, store, "proj_graph")
+	input := graphInput()
+	input.Tasks = []TaskInput{
+		{TaskKey: "implement", Title: "Implement change", Scope: taskrequirements.Scope{Paths: []string{"internal/foo/foo.go"}, AllowsRepoWrite: true}},
+		{TaskKey: "verify", Title: "Verify change", Scope: taskrequirements.Scope{Paths: []string{"internal/foo/foo_test.go"}, Tests: true, AllowsRepoWrite: true}},
+	}
+	input.Edges = []EdgeInput{{FromTaskKey: "implement", ToTaskKey: "verify", EdgeKind: "requires"}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+	accepted, err := AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() error = %v", err)
+	}
+	replayed, err := AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		IdempotencyKey:                   "accept-graph",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcceptGraphProposal() replay error = %v", err)
+	}
+	if replayed.GraphVersionID != accepted.GraphVersionID || replayed.CanonicalProposalHash != accepted.CanonicalProposalHash {
+		t.Fatalf("replayed accepted version = %#v, want %#v", replayed, accepted)
+	}
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM accepted_task_graph_versions`, 1)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM task_graph_validations`, 1)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_tasks`, 2)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM task_requirements`, 2)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened := openGraphStore(t, ctx, path)
+	defer reopened.Close()
+	loaded, err := LoadAcceptedGraphVersion(ctx, reopened, proposal.ProjectID, proposal.DeliveryRunID)
+	if err != nil {
+		t.Fatalf("LoadAcceptedGraphVersion() error = %v", err)
+	}
+	if loaded.CanonicalProposalHash != accepted.CanonicalProposalHash || loaded.Proposal.PlanFingerprint != proposal.PlanFingerprint || len(loaded.Proposal.Tasks) != 2 {
+		t.Fatalf("loaded accepted graph = %#v, want exact accepted proposal", loaded)
+	}
+}
+
+func TestAcceptGraphProposalRejectsAdversarialMutationAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := openGraphStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
+	defer store.Close()
+	seedGraphProject(t, ctx, store, "proj_graph")
+	input := graphInput()
+	input.Tasks = []TaskInput{
+		{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{}},
+		{TaskKey: "b", Title: "B", Scope: taskrequirements.Scope{}},
+	}
+	input.Edges = []EdgeInput{{FromTaskKey: "a", ToTaskKey: "b", EdgeKind: "requires"}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+	proposal.Edges[0].ToTaskID = proposal.Edges[0].FromTaskID
+	_, err = AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if !errors.Is(err, taskrequirements.ErrGraphCycleDetected) {
+		t.Fatalf("AcceptGraphProposal() error = %v, want ErrGraphCycleDetected", err)
+	}
+	assertGraphAcceptanceEmpty(t, ctx, store)
+}
+
+func TestAcceptGraphProposalRejectsChangedMaterialInputAndStaleExpectedFingerprint(t *testing.T) {
+	ctx := context.Background()
+	store := openGraphStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
+	defer store.Close()
+	seedGraphProject(t, ctx, store, "proj_graph")
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+	_, err = AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if !errors.Is(err, delivery.ErrStaleApproval) {
+		t.Fatalf("stale expected fingerprint error = %v, want ErrStaleApproval", err)
+	}
+	assertGraphAcceptanceEmpty(t, ctx, store)
+
+	changed := proposal
+	changed.Tasks = append([]TaskProposal(nil), proposal.Tasks...)
+	changed.Tasks[0].Requirement.ProvenanceSummary = "tampered after approval"
+	_, err = AcceptGraphProposal(ctx, store, changed, AcceptOptions{
+		ExpectedAuthorizationFingerprint: changed.AuthorizationFingerprint,
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+	})
+	if !errors.Is(err, delivery.ErrStaleApproval) {
+		t.Fatalf("changed requirement error = %v, want ErrStaleApproval", err)
+	}
+	assertGraphAcceptanceEmpty(t, ctx, store)
+}
+
+func TestAcceptGraphProposalConcurrentSameGraphIsIdempotentAndChangedGraphLoses(t *testing.T) {
+	ctx := context.Background()
+	store := openGraphStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
+	defer store.Close()
+	seedGraphProject(t, ctx, store, "proj_graph")
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+	var wg sync.WaitGroup
+	results := make(chan AcceptedGraphVersion, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+				ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+				Actor:                            graphActor(),
+				Host:                             graphHost(),
+				Now:                              input.Now,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- got
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent AcceptGraphProposal() error = %v", err)
+	}
+	var first string
+	for result := range results {
+		if first == "" {
+			first = result.GraphVersionID
+		}
+		if result.GraphVersionID != first {
+			t.Fatalf("concurrent graph version = %q, want %q", result.GraphVersionID, first)
+		}
+	}
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM accepted_task_graph_versions`, 1)
+
+	changedInput := input
+	changedInput.Tasks = []TaskInput{{TaskKey: "a", Title: "Changed A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	changed, err := BuildGraphProposal(changedInput)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() changed error = %v", err)
+	}
+	_, err = AcceptGraphProposal(ctx, store, changed, AcceptOptions{
+		ExpectedAuthorizationFingerprint: changed.AuthorizationFingerprint,
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now.Add(time.Minute),
+	})
+	if !errors.Is(err, delivery.ErrStaleApproval) {
+		t.Fatalf("changed graph after accepted error = %v, want ErrStaleApproval", err)
+	}
+	assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM accepted_task_graph_versions`, 1)
+}
+
+func TestAcceptGraphProposalTransactionFailureRollsBackResidualState(t *testing.T) {
+	ctx := context.Background()
+	store := openGraphStore(t, ctx, filepath.Join(t.TempDir(), "loopcoder.db"))
+	defer store.Close()
+	seedGraphProject(t, ctx, store, "proj_graph")
+	input := graphInput()
+	input.Tasks = []TaskInput{{TaskKey: "a", Title: "A", Scope: taskrequirements.Scope{AllowsRepoWrite: true}}}
+	proposal, err := BuildGraphProposal(input)
+	if err != nil {
+		t.Fatalf("BuildGraphProposal() error = %v", err)
+	}
+	injected := errors.New("injected transaction failure")
+	_, err = AcceptGraphProposal(ctx, store, proposal, AcceptOptions{
+		ExpectedAuthorizationFingerprint: proposal.AuthorizationFingerprint,
+		Actor:                            graphActor(),
+		Host:                             graphHost(),
+		Now:                              input.Now,
+		afterRunPersistedForTest: func() error {
+			return injected
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("AcceptGraphProposal() error = %v, want injected failure", err)
+	}
+	assertGraphAcceptanceEmpty(t, ctx, store)
+}
+
 func graphInput() ProposalInput {
 	now := fixedGraphTime()
 	return ProposalInput{
@@ -166,6 +382,54 @@ func graphHost() delivery.Host {
 	}
 }
 
+func openGraphStore(t *testing.T, ctx context.Context, path string) storage.Store {
+	t.Helper()
+	store, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixedGraphTime() }})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	return store
+}
+
+func seedGraphProject(t *testing.T, ctx context.Context, store storage.Store, projectID string) {
+	t.Helper()
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT OR IGNORE INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?)`, projectID, "/repo/"+projectID, delivery.CanonicalTimestamp(fixedGraphTime()), delivery.CanonicalTimestamp(fixedGraphTime()))
+		return err
+	}); err != nil {
+		t.Fatalf("seed graph project: %v", err)
+	}
+}
+
+func assertGraphAcceptanceEmpty(t *testing.T, ctx context.Context, store storage.Store) {
+	t.Helper()
+	for _, table := range []string{
+		"delivery_runs",
+		"delivery_plan_fingerprints",
+		"delivery_tasks",
+		"delivery_dependency_edges",
+		"delivery_approvals",
+		"task_requirements",
+		"task_graph_validations",
+		"accepted_task_graph_versions",
+	} {
+		assertGraphCount(t, ctx, store, `SELECT COUNT(*) FROM `+table, 0)
+	}
+}
+
+func assertGraphCount(t *testing.T, ctx context.Context, store storage.Store, query string, want int) {
+	t.Helper()
+	var got int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, query).Scan(&got)
+	}); err != nil {
+		t.Fatalf("count query %q: %v", query, err)
+	}
+	if got != want {
+		t.Fatalf("count query %q = %d, want %d", query, got, want)
+	}
+}
+
 func countDeliveryRows(t *testing.T, ctx context.Context, store storage.Store) int {
 	t.Helper()
 	tables := []string{
@@ -180,6 +444,8 @@ func countDeliveryRows(t *testing.T, ctx context.Context, store storage.Store) i
 		"delivery_idempotency",
 		"task_requirements",
 		"task_requirement_overrides",
+		"task_graph_validations",
+		"accepted_task_graph_versions",
 	}
 	total := 0
 	if err := store.WithTx(ctx, func(tx storage.Tx) error {

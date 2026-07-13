@@ -24,7 +24,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 19
+	CurrentSchemaVersion = 20
 
 	driverName = "sqlite"
 
@@ -336,6 +336,11 @@ var migrations = []migration{
 		name:    "bounded circuit breaker recovery",
 		apply:   migrateCircuitBreakerRecovery,
 	},
+	{
+		version:    20,
+		name:       "accepted task graph versions",
+		statements: acceptedTaskGraphSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -378,6 +383,8 @@ var requiredTables = []string{
 	"inventory_events",
 	"task_requirements",
 	"task_requirement_overrides",
+	"task_graph_validations",
+	"accepted_task_graph_versions",
 	"agent_scope_grants",
 	"agent_registrations",
 	"agent_ownership_locks",
