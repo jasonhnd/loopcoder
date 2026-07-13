@@ -29,8 +29,10 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -1810,6 +1812,140 @@ func TestStatusMissingRunReturnsClearError(t *testing.T) {
 	}
 }
 
+func TestStatusProgressReceiptsJSONLIsCleanStdout(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stdout lines = %d, want 1:\n%s", len(lines), stdout.String())
+	}
+	var view progress.ReceiptView
+	if err := json.Unmarshal([]byte(lines[0]), &view); err != nil {
+		t.Fatalf("stdout jsonl did not parse: %v\n%s", err, stdout.String())
+	}
+	if view.Receipt.DeliveryRunID != runID || view.DeliveryState.State != "unsupported-pending-unacknowledged" || view.RenderAuthority != "attached-consumer-write-only" {
+		t.Fatalf("receipt view = %#v", view)
+	}
+}
+
+func TestStatusProgressReceiptsDiagnosticsStayOnStderr(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	insertStatusUnknownProgressRecord(t, store, runID)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "progress-receipt-skipped") {
+		t.Fatalf("stderr missing receipt warning:\n%s", stderr.String())
+	}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("stdout line %d was corrupted by diagnostics: %v\n%s", lineNumber+1, err, stdout.String())
+		}
+	}
+}
+
+func TestStatusProgressReceiptsRedactCorruptRecordDiagnostics(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	canary := "sk-" + strings.Repeat("Z9q_", 8)
+	insertStatusCorruptTimestampProgressRecord(t, store, runID, "api_"+"key="+canary)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	for _, stream := range []struct {
+		name string
+		text string
+	}{
+		{name: "stdout", text: stdout.String()},
+		{name: "stderr", text: stderr.String()},
+	} {
+		assertNoStatusCanaryFragments(t, stream.name, stream.text, canary)
+	}
+	if !strings.Contains(stderr.String(), "progress-receipt-skipped") || !strings.Contains(stderr.String(), "[REDACTED]") || !strings.Contains(stderr.String(), "ErrInvalidRecord") {
+		t.Fatalf("stderr missing bounded redacted warning:\n%s", stderr.String())
+	}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("stdout line %d was corrupted by diagnostics: %v\n%s", lineNumber+1, err, stdout.String())
+		}
+	}
+}
+
+func TestStatusProgressFollowReconnectsFromCursor(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	ctx := context.Background()
+	first, err := progress.ReadReceipts(ctx, store, progress.ReadFilter{ProjectID: statusProgressProjectID(t, store), DeliveryRunID: runID}, time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("ReadReceipts first: %v", err)
+	}
+	if len(first.Views) != 1 || first.NextCursor == "" {
+		t.Fatalf("first receipt batch = %#v", first)
+	}
+	if _, err := progress.PersistReceipt(ctx, store, statusProgressReceipt(statusProgressProjectID(t, store), runID, func(r *progress.ProgressReceipt) {
+		r.CorrelationSequence = 2
+		r.Status = "running"
+		r.NextAction = progress.ActionState{State: "continue", Summary: "still waiting"}
+		r.OccurredAt = "2026-07-13T12:00:10Z"
+	})); err != nil {
+		t.Fatalf("persist second receipt: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--follow", "--cursor", string(first.NextCursor), "--format", "jsonl", "--follow-for", "80ms"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status follow exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	var views []progress.ReceiptView
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("follow stdout did not parse: %v\n%s", err, stdout.String())
+		}
+		views = append(views, view)
+	}
+	if len(views) != 1 || views[0].Receipt.CorrelationSequence != 2 {
+		t.Fatalf("follow views = %#v, want only second receipt", views)
+	}
+}
+
 func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
@@ -1828,6 +1964,155 @@ func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 	}
 	if strings.Contains(help, "Codex model") || strings.Contains(help, "Codex reasoning") {
 		t.Fatalf("dispatch help still describes model/effort as Codex-specific:\n%s", help)
+	}
+}
+
+func setupStatusProgressFixture(t *testing.T) (string, string, storage.Store) {
+	t.Helper()
+	clearGitSelectionEnvForFixture(t)
+	home := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", home)
+	repo := t.TempDir()
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("register progress fixture project: %v", err)
+	}
+	dbPath := filepath.Join(home, "data", "loopcoder.db")
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return time.Date(2026, 7, 13, 12, 0, 5, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open progress fixture store: %v", err)
+	}
+	runID := "run-progress-status"
+	if _, err := progress.PersistReceipt(ctx, store, statusProgressReceipt(registered.Project.ProjectID, runID, func(r *progress.ProgressReceipt) {})); err != nil {
+		t.Fatalf("persist progress fixture receipt: %v", err)
+	}
+	return repo, runID, store
+}
+
+func clearGitSelectionEnvForFixture(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"GIT_DIR",
+		"GIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_COMMON_DIR",
+		"GIT_NAMESPACE",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func statusProgressProjectID(t *testing.T, store storage.Store) string {
+	t.Helper()
+	var projectID string
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT id FROM projects ORDER BY created_at LIMIT 1`).Scan(&projectID)
+	}); err != nil {
+		t.Fatalf("load fixture project id: %v", err)
+	}
+	return projectID
+}
+
+func statusProgressReceipt(projectID, runID string, mutate func(*progress.ProgressReceipt)) progress.ProgressReceipt {
+	receipt := progress.ProgressReceipt{
+		ProjectID:           projectID,
+		DeliveryRunID:       runID,
+		RunID:               runID,
+		TaskID:              "task-progress-status",
+		AttemptID:           "attempt-progress-status",
+		AttemptOrdinal:      1,
+		CorrelationID:       "corr-progress-status",
+		CorrelationSequence: 1,
+		Phase:               "dispatching",
+		Status:              "pending",
+		TaskCounts:          progress.TaskCounts{Total: 1, Ready: 0, Running: 1, Succeeded: 0, Failed: 0, Blocked: 0, Unknown: 0},
+		Provider: progress.ProviderIdentity{
+			ProviderID:           "codex",
+			ModelID:              "gpt-5.5",
+			AccountProfileID:     progress.Unknown,
+			ModelCapabilityID:    progress.Unknown,
+			ProviderConfidence:   "exact",
+			ProviderInstallation: progress.Unknown,
+		},
+		Heartbeat:   progress.AgeEvidence{State: "exact", ObservedAt: "2026-07-13T12:00:03Z", AgeMillis: 2000},
+		Progress:    progress.AgeEvidence{State: "exact", ObservedAt: "2026-07-13T12:00:02Z", AgeMillis: 3000},
+		Evidence:    []progress.EvidenceRef{{RecordKind: "terminal-receipt", RecordID: "attached-consumer", Summary: "receipt rendered to attached consumer", Classification: "local-diagnostic", Confidence: "exact"}},
+		QuotaBudget: progress.QuotaBudgetState{State: "unknown", Confidence: "unknown", BudgetPolicyID: progress.Unknown, BudgetReservationID: progress.Unknown, RemainingQuantity: -1, Unit: progress.Unknown, GapReasons: []string{"not-collected"}},
+		Blocker:     progress.ActionState{State: "none"},
+		NextAction:  progress.ActionState{State: "continue", Summary: "wait for provider completion"},
+		OccurredAt:  "2026-07-13T12:00:05Z",
+	}
+	mutate(&receipt)
+	return receipt
+}
+
+func insertStatusUnknownProgressRecord(t *testing.T, store storage.Store, runID string) {
+	t.Helper()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	payload := `{"schema_version":"loopcoder.progress_receipt.future","record_version":1}`
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO progress_receipts(
+			progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
+			attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
+			provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
+			task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
+			blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
+		) VALUES ('prec_future_status', 'loopcoder.progress_receipt.v1', 1, ?, ?, ?, 'task-progress-status',
+			'attempt-progress-status', 1, 'corr-progress-status', 2, 'sha256:future-status', 'future-host', 'pending',
+			'future-host', 'future-model', -1, -1, '2026-07-13T12:00:06Z', '2026-07-13T12:00:06Z',
+			'{}', '{}', '{}', '{}', '[]', '{}', '{}', '{}', '{}', '[]', ?)`,
+			projectID, runID, runID, payload)
+		return err
+	}); err != nil {
+		t.Fatalf("insert unknown progress fixture record: %v", err)
+	}
+}
+
+func insertStatusCorruptTimestampProgressRecord(t *testing.T, store storage.Store, runID, invalidTimestamp string) {
+	t.Helper()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	receipt, err := progress.NormalizeReceipt(statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.CorrelationSequence = 3
+		r.CorrelationID = "corr-progress-corrupt"
+		r.OccurredAt = "2026-07-13T12:00:07Z"
+	}), time.Date(2026, 7, 13, 12, 0, 5, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("normalize corrupt status fixture: %v", err)
+	}
+	receipt.OccurredAt = invalidTimestamp
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal corrupt status fixture: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO progress_receipts(
+			progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
+			attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
+			provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
+			task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
+			blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
+		) VALUES ('prec_corrupt_status', 'loopcoder.progress_receipt.v1', 1, ?, ?, ?, 'task-progress-status',
+			'attempt-progress-status', 1, 'corr-progress-corrupt', 3, 'sha256:corrupt-status', 'dispatching', 'pending',
+			'codex', 'gpt-5.5', -1, -1, '2026-07-13T12:00:07Z', '2026-07-13T12:00:07Z',
+			'{}', '{}', '{}', '{}', '[]', '{}', '{}', '{}', '{}', '[]', ?)`,
+			projectID, runID, runID, string(payload))
+		return err
+	}); err != nil {
+		t.Fatalf("insert corrupt status progress fixture record: %v", err)
+	}
+}
+
+func assertNoStatusCanaryFragments(t *testing.T, name, text, canary string) {
+	t.Helper()
+	for _, forbidden := range []string{canary, canary[:8], canary[len(canary)-8:]} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("%s leaked canary fragment %q:\n%s", name, forbidden, text)
+		}
 	}
 }
 

@@ -707,6 +707,10 @@ func sanitizeText(value string, maxRunes int, redaction *RedactionState) string 
 	return value
 }
 
+func DiagnosticMessage(value string) string {
+	return sanitizeText(value, maxTextRunes, nil)
+}
+
 func looksOpaque(value string) bool {
 	value = strings.Trim(value, `"'`)
 	if len(value) < 12 {
