@@ -413,6 +413,126 @@ func TestDeliveryProgressFailureReportsDiagnosticWithoutRollback(t *testing.T) {
 	}
 }
 
+func TestDeliveryWriteTxBusyRetryDoesNotDuplicateIdempotentRecords(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	seedStore, err := storage.Open(ctx, storage.Options{Path: path, Now: fixedTime})
+	if err != nil {
+		t.Fatalf("Open seed store: %v", err)
+	}
+	seedProject(t, ctx, seedStore, "proj_retry")
+	if err := seedStore.Close(); err != nil {
+		t.Fatalf("Close seed store: %v", err)
+	}
+
+	busyErr := deliverySQLiteBusyError(t)
+	clock := newDeliveryRetryClock(fixedTime())
+	commitCalls := 0
+	store, err := storage.Open(ctx, storage.Options{
+		Path: path,
+		Now:  fixedTime,
+		WriteTxCommitHookForTest: func(commitCtx context.Context, tx storage.Tx, commit func(context.Context) error) error {
+			commitCalls++
+			if commitCalls == 1 {
+				return busyErr
+			}
+			return commit(commitCtx)
+		},
+		WriteTxRetry: storage.WriteTxRetryOptions{
+			MaxAttempts: 3,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open retry store: %v", err)
+	}
+	defer store.Close()
+
+	run := deliveryRunFixture("proj_retry", "run_retry")
+	created, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "retry-run", Now: fixedTime()})
+	if err != nil {
+		t.Fatalf("PersistDeliveryRun: %v", err)
+	}
+	if commitCalls != 2 {
+		t.Fatalf("commit calls = %d, want retry after first busy commit", commitCalls)
+	}
+	if clock.sleeps != 1 {
+		t.Fatalf("retry sleeps = %d, want 1", clock.sleeps)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_runs WHERE delivery_run_id = 'run_retry'`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_idempotency WHERE idempotency_key = 'retry-run'`, 1)
+
+	replayed, err := PersistDeliveryRun(ctx, store, created, PersistOptions{IdempotencyKey: "retry-run", Now: fixedTime().Add(time.Minute)})
+	if err != nil {
+		t.Fatalf("PersistDeliveryRun replay: %v", err)
+	}
+	if replayed.CreatedAt != created.CreatedAt {
+		t.Fatalf("replay CreatedAt = %q, want %q", replayed.CreatedAt, created.CreatedAt)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_runs WHERE delivery_run_id = 'run_retry'`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_idempotency WHERE idempotency_key = 'retry-run'`, 1)
+}
+
+func TestDeliveryWriteTxBusyRetryAfterMigrationPreservesBackupMetadata(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	createV9Fixture(t, ctx, raw)
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	busyErr := deliverySQLiteBusyError(t)
+	clock := newDeliveryRetryClock(fixedTime())
+	commitCalls := 0
+	store, err := storage.Open(ctx, storage.Options{
+		Path: path,
+		Now:  fixedTime,
+		WriteTxCommitHookForTest: func(commitCtx context.Context, tx storage.Tx, commit func(context.Context) error) error {
+			commitCalls++
+			if commitCalls == 1 {
+				return busyErr
+			}
+			return commit(commitCtx)
+		},
+		WriteTxRetry: storage.WriteTxRetryOptions{
+			MaxAttempts: 3,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open migrated retry store: %v", err)
+	}
+	defer store.Close()
+
+	before := readDeliveryMigrationBackupSnapshot(t, ctx, store)
+	run := deliveryRunFixture("proj_v9", "run_retry_after_migration")
+	if _, err := PersistDeliveryRun(ctx, store, run, PersistOptions{IdempotencyKey: "retry-after-migration", Now: fixedTime().Add(time.Minute)}); err != nil {
+		t.Fatalf("PersistDeliveryRun after migration: %v", err)
+	}
+	after := readDeliveryMigrationBackupSnapshot(t, ctx, store)
+
+	if before != after {
+		t.Fatalf("backup metadata changed after busy-retried write:\nbefore: %#v\nafter:  %#v", before, after)
+	}
+	if commitCalls != 2 {
+		t.Fatalf("commit calls = %d, want first busy commit plus retry success", commitCalls)
+	}
+	if clock.sleeps != 1 {
+		t.Fatalf("retry sleeps = %d, want 1", clock.sleeps)
+	}
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_runs WHERE delivery_run_id = 'run_retry_after_migration'`, 1)
+	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_idempotency WHERE idempotency_key = 'retry-after-migration'`, 1)
+}
+
 func TestDependencyEdgeCycleQueryFailureIsAtomic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1119,6 +1239,37 @@ func migrateV9FixtureAndReadIDs(t *testing.T, ctx context.Context) (string, stri
 	return backupID, importID
 }
 
+type deliveryMigrationBackupSnapshot struct {
+	backupID                 string
+	sourceDBPath             string
+	sourceSchemaVersion      int
+	sourceDBHash             string
+	backupPath               string
+	createdAt                string
+	loopcoderVersion         string
+	migrationPlanFingerprint string
+}
+
+func readDeliveryMigrationBackupSnapshot(t *testing.T, ctx context.Context, store storage.Store) deliveryMigrationBackupSnapshot {
+	t.Helper()
+	var row deliveryMigrationBackupSnapshot
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT backup_id, source_db_path, source_schema_version, source_db_hash, backup_path, created_at, loopcoder_version, migration_plan_fingerprint FROM delivery_migration_backups`).Scan(
+			&row.backupID,
+			&row.sourceDBPath,
+			&row.sourceSchemaVersion,
+			&row.sourceDBHash,
+			&row.backupPath,
+			&row.createdAt,
+			&row.loopcoderVersion,
+			&row.migrationPlanFingerprint,
+		)
+	}); err != nil {
+		t.Fatalf("query delivery migration backup metadata: %v", err)
+	}
+	return row
+}
+
 func openDeliveryStore(t *testing.T) storage.Store {
 	t.Helper()
 	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedTime})
@@ -1599,6 +1750,64 @@ func (tx dependencyEdgeInsertFailureTx) Exec(ctx context.Context, query string, 
 
 func isDependencyEdgeInsert(query string) bool {
 	return strings.Contains(query, "INSERT INTO delivery_dependency_edges")
+}
+
+type deliveryRetryClock struct {
+	now    time.Time
+	sleeps int
+}
+
+func newDeliveryRetryClock(now time.Time) *deliveryRetryClock {
+	return &deliveryRetryClock{now: now}
+}
+
+func (c *deliveryRetryClock) Now() time.Time {
+	return c.now
+}
+
+func (c *deliveryRetryClock) Sleep(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.sleeps++
+	c.now = c.now.Add(delay)
+	return ctx.Err()
+}
+
+func deliverySQLiteBusyError(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "busy.db")
+	db1, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open busy db1: %v", err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open busy db2: %v", err)
+	}
+	defer db2.Close()
+	for _, db := range []*sql.DB{db1, db2} {
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+			t.Fatalf("set busy timeout: %v", err)
+		}
+	}
+	conn1, err := db1.Conn(ctx)
+	if err != nil {
+		t.Fatalf("busy conn1: %v", err)
+	}
+	defer conn1.Close()
+	if _, err := conn1.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin busy lock: %v", err)
+	}
+	defer conn1.ExecContext(ctx, `ROLLBACK`)
+	_, err = db2.ExecContext(ctx, `BEGIN IMMEDIATE`)
+	if err == nil || !storage.IsBusy(err) {
+		t.Fatalf("generated busy error = %T %[1]v, want typed SQLITE_BUSY", err)
+	}
+	return err
 }
 
 func createV9Fixture(t *testing.T, ctx context.Context, db *sql.DB) {
