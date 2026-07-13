@@ -23,6 +23,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
@@ -873,6 +874,8 @@ func runProjects(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runProjectsList(args[1:], stdout, stderr, deps)
 	case "show":
 		return runProjectsShow(args[1:], stdout, stderr, deps)
+	case "inspect":
+		return runProjectsInspect(args[1:], stdout, stderr, deps)
 	case "remove":
 		return runProjectsRemove(args[1:], stdout, stderr, deps)
 	default:
@@ -887,12 +890,28 @@ func printProjectsHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder projects register --repo <path> [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects list [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects inspect [--project-id <id>] [--run-id <id>] [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Register, inspect, list active projects, and detach projects from the machine-local registry.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
+	fmt.Fprintln(w, "  --db string       storage database path for inspect (default $LOOPCODER_HOME/data/loopcoder.db)")
+	fmt.Fprintln(w, "  --project-id string")
+	fmt.Fprintln(w, "                    project id filter for inspect")
+	fmt.Fprintln(w, "  --run-id string   delivery run id filter for inspect")
+	fmt.Fprintln(w, "  --limit int       delivery runs per project for inspect (default 20, max 200)")
+	fmt.Fprintln(w, "  --offset int      delivery run offset for inspect")
+	fmt.Fprintln(w, "  --project-limit int")
+	fmt.Fprintln(w, "                    projects to list for inspect (default 50, max 200)")
+	fmt.Fprintln(w, "  --project-offset int")
+	fmt.Fprintln(w, "                    project offset for inspect")
+	fmt.Fprintln(w, "  --task-limit int  tasks per run for inspect (default 50, max 200)")
+	fmt.Fprintln(w, "  --attempt-limit int")
+	fmt.Fprintln(w, "                    attempts per task for inspect (default 20, max 200)")
+	fmt.Fprintln(w, "  --include-detached")
+	fmt.Fprintln(w, "                    include detached registry rows in inspect")
 	fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help            show command help")
 }
@@ -986,6 +1005,130 @@ func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 	}
 	return 0
+}
+
+func runProjectsInspect(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("projects inspect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts inspect.Options
+	format := "text"
+	var formatAlias string
+	fs.StringVar(&opts.DatabasePath, "db", "", "storage database path")
+	fs.StringVar(&opts.ProjectID, "project-id", "", "project id")
+	fs.StringVar(&opts.RunID, "run-id", "", "delivery run id")
+	fs.StringVar(&opts.RunID, "run", "", "delivery run id")
+	fs.BoolVar(&opts.IncludeDetached, "include-detached", false, "include detached projects")
+	fs.IntVar(&opts.ProjectLimit, "project-limit", inspect.DefaultProjectLimit, "project limit")
+	fs.IntVar(&opts.ProjectOffset, "project-offset", 0, "project offset")
+	fs.IntVar(&opts.RunLimit, "limit", inspect.DefaultRunLimit, "delivery run limit")
+	fs.IntVar(&opts.RunOffset, "offset", 0, "delivery run offset")
+	fs.IntVar(&opts.TaskLimit, "task-limit", inspect.DefaultTaskLimit, "task limit")
+	fs.IntVar(&opts.AttemptLimit, "attempt-limit", inspect.DefaultAttemptLimit, "attempt limit")
+	fs.DurationVar(&opts.StaleAfter, "stale-after", 0, "stale progress threshold")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "projects inspect: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "projects inspect: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	opts.Now = deps.Now
+	report, err := inspect.Load(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "projects inspect: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects inspect", report)
+	}
+	if err := renderProjectsInspectText(stdout, report); err != nil {
+		fmt.Fprintf(stderr, "projects inspect: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderProjectsInspectText(w io.Writer, report inspect.Report) error {
+	fmt.Fprintf(w, "PROJECT INSPECTION\nstatus: %s\nread_only: true\ndatabase: %s\n", report.Status, report.DatabasePath)
+	if len(report.Projects) == 0 {
+		fmt.Fprintln(w, "projects: 0")
+		renderInspectDiagnostics(w, "diagnostics", report.Diagnostics, "  ")
+		return nil
+	}
+	fmt.Fprintf(w, "projects: %d", len(report.Projects))
+	if report.Pagination.ProjectHasMore {
+		fmt.Fprint(w, " (more available)")
+	}
+	fmt.Fprintln(w)
+	for _, project := range report.Projects {
+		fmt.Fprintf(w, "- %s %s identity=%s checkout=%s path=%s\n", project.ProjectID, project.DisplayName, project.IdentitySource, project.CheckoutStatus, project.LocalPath)
+		if project.RunCount == 0 {
+			fmt.Fprintln(w, "  runs: 0")
+		} else {
+			fmt.Fprintf(w, "  runs: %d", project.RunCount)
+			if project.RunHasMore {
+				fmt.Fprint(w, " (more available)")
+			}
+			fmt.Fprintln(w)
+		}
+		renderInspectDiagnostics(w, "diagnostics", project.Diagnostics, "  ")
+		for _, run := range project.Runs {
+			fmt.Fprintf(w, "  - run %s state=%s tasks=%d attempts=%d blocker=%s next=%s progress=%s\n",
+				run.DeliveryRunID,
+				displayText(run.State),
+				run.TaskCount,
+				run.AttemptCount,
+				displayText(run.Blocker),
+				displayText(run.NextAction),
+				displayText(run.LastDurableProgress.At),
+			)
+			renderInspectDiagnostics(w, "diagnostics", run.Diagnostics, "    ")
+			for _, task := range run.Tasks {
+				fmt.Fprintf(w, "    - task %s state=%s attempts=%d blocker=%s next=%s progress=%s\n",
+					task.TaskKey,
+					displayText(task.State),
+					task.AttemptCount,
+					displayText(task.Blocker),
+					displayText(task.NextAction),
+					displayText(task.LastDurableProgress.At),
+				)
+				renderInspectDiagnostics(w, "diagnostics", task.Diagnostics, "      ")
+				for _, attempt := range task.Attempts {
+					fmt.Fprintf(w, "      - attempt %d %s state=%s progress=%s\n", attempt.AttemptOrdinal, attempt.AttemptID, displayText(attempt.State), displayText(attempt.LastDurableProgress.At))
+					renderInspectDiagnostics(w, "diagnostics", attempt.Diagnostics, "        ")
+				}
+			}
+		}
+	}
+	renderInspectDiagnostics(w, "diagnostics", report.Diagnostics, "")
+	return nil
+}
+
+func renderInspectDiagnostics(w io.Writer, label string, diagnostics []inspect.Diagnostic, indent string) {
+	if len(diagnostics) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%s%s:\n", indent, label)
+	for _, diagnostic := range diagnostics {
+		fmt.Fprintf(w, "%s  - %s %s: %s\n", indent, diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+	}
 }
 
 func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {

@@ -30,6 +30,17 @@ const (
 	TaskSkipped          = "skipped"
 	TaskCancelled        = "cancelled"
 	TaskNeedsHuman       = "needs-human"
+
+	AttemptPlanned    = "planned"
+	AttemptClaimed    = "claimed"
+	AttemptLaunching  = "launching"
+	AttemptRunning    = "running"
+	AttemptSucceeded  = "succeeded"
+	AttemptFailed     = "failed"
+	AttemptCancelled  = "cancelled"
+	AttemptNeedsHuman = "needs-human"
+	AttemptStale      = "stale"
+	AttemptSuperseded = "superseded"
 )
 
 var runTransitions = map[string]map[string]string{

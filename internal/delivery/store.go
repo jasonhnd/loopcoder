@@ -582,7 +582,7 @@ func ClaimTask(ctx context.Context, store storage.Store, projectID, deliveryRunI
 			DeliveryRunID:          deliveryRunID,
 			ProjectID:              projectID,
 			AttemptOrdinal:         ordinal,
-			State:                  "claimed",
+			State:                  AttemptClaimed,
 			ClaimGeneration:        int64(ordinal),
 			ExecutorID:             strings.TrimSpace(executorID),
 			ProviderIdempotencyKey: "task-attempt:" + taskID + ":" + fmt.Sprint(ordinal),
@@ -597,8 +597,8 @@ func ClaimTask(ctx context.Context, store storage.Store, projectID, deliveryRunI
 				attempt_id, schema_version, record_version, project_id, delivery_run_id, task_id, attempt_ordinal, state,
 				claim_generation, executor_id, provider_idempotency_key, side_effect_class, created_at, updated_at,
 				created_by_json, updated_by_json, host_json
-			) VALUES (?, ?, 1, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			out.AttemptID, out.SchemaVersion, projectID, deliveryRunID, taskID, ordinal, out.ClaimGeneration, out.ExecutorID,
+			) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			out.AttemptID, out.SchemaVersion, projectID, deliveryRunID, taskID, ordinal, out.State, out.ClaimGeneration, out.ExecutorID,
 			out.ProviderIdempotencyKey, out.SideEffectClass, now, now, createdBy, createdBy, hostJSON); err != nil {
 			return fmt.Errorf("claim task attempt: %w", err)
 		}

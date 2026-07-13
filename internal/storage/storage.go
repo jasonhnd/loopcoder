@@ -17,7 +17,6 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitremote"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 
-	_ "modernc.org/sqlite"
 	moderncsqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
