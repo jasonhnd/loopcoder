@@ -742,21 +742,30 @@ func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
 		assertNoGrokSecretFragments(t, readFileString(t, logPath), canaries...)
 	})
 
-	t.Run("malformed cost", func(t *testing.T) {
+	t.Run("malformed cost does not hide result", func(t *testing.T) {
 		restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 			_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"done","cost_usd":"NaN"}`+"\n")
 			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
 		})
 		defer restoreRun()
 
-		_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		logPath := filepath.Join(t.TempDir(), "grok.log")
+		result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
 			WorktreePath: t.TempDir(),
 			Prompt:       "run",
-			LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+			LogPath:      logPath,
 			RunID:        "attempt",
 			Role:         "worker",
 		})
-		assertGrokError(t, err, GrokErrMalformedFrame, "invalid cost_usd")
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if result.Summary != "done" {
+			t.Fatalf("Summary = %q, want done", result.Summary)
+		}
+		if logText := readFileString(t, logPath); !strings.Contains(logText, `"gap_reasons":["malformed-cost-usd"]`) {
+			t.Fatalf("log missing malformed cost gap:\n%s", logText)
+		}
 	})
 }
 
