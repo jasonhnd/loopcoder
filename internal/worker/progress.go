@@ -111,7 +111,7 @@ func (r *progressRecorder) observation(attempt state.AttemptRecord) progress.Obs
 		AttemptOrdinal: attempt.Attempt,
 		Phase:          phase,
 		Status:         status,
-		TaskCounts:     progress.TaskCounts{Total: 1, Running: 1},
+		TaskCounts:     attemptTaskCounts(status),
 		Provider: progress.ProviderIdentity{
 			ProviderID:         attempt.Provider,
 			ProviderConfidence: "exact",
@@ -136,6 +136,25 @@ func (r *progressRecorder) observation(attempt state.AttemptRecord) progress.Obs
 		GapReasons: gaps,
 		OccurredAt: now,
 	}
+}
+
+func attemptTaskCounts(status string) progress.TaskCounts {
+	counts := progress.TaskCounts{Total: 1}
+	switch state.NormalizeStatus(status) {
+	case state.StatusPlanned, state.StatusQueued, state.StatusLaunching:
+		counts.Ready = 1
+	case state.StatusRunning, state.StatusFinishing:
+		counts.Running = 1
+	case state.StatusSucceeded, state.StatusSucceededWithOptionalFailures:
+		counts.Succeeded = 1
+	case state.StatusFailed, state.StatusCancelled, state.StatusTimedOut, state.StatusAbandoned, state.StatusSkipped:
+		counts.Failed = 1
+	case state.StatusHung, state.StatusNeedsHuman, state.StatusWaiting:
+		counts.Blocked = 1
+	default:
+		counts.Unknown = 1
+	}
+	return counts
 }
 
 func ageEvidence(value string, now time.Time) progress.AgeEvidence {

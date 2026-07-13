@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -226,47 +225,47 @@ func persistReceipt(ctx context.Context, store storage.Store, receipt ProgressRe
 				return err
 			}
 		}
-		payload, err := delivery.CanonicalJSON(normalized)
+		payload, err := canonicalJSON(normalized)
 		if err != nil {
 			return typed(ErrInvalidRecordCode, "canonical progress receipt: %v", err)
 		}
-		taskCounts, err := delivery.CanonicalJSON(normalized.TaskCounts)
+		taskCounts, err := canonicalJSON(normalized.TaskCounts)
 		if err != nil {
 			return err
 		}
-		provider, err := delivery.CanonicalJSON(normalized.Provider)
+		provider, err := canonicalJSON(normalized.Provider)
 		if err != nil {
 			return err
 		}
-		heartbeat, err := delivery.CanonicalJSON(normalized.Heartbeat)
+		heartbeat, err := canonicalJSON(normalized.Heartbeat)
 		if err != nil {
 			return err
 		}
-		progressAge, err := delivery.CanonicalJSON(normalized.Progress)
+		progressAge, err := canonicalJSON(normalized.Progress)
 		if err != nil {
 			return err
 		}
-		evidence, err := delivery.CanonicalJSON(normalized.Evidence)
+		evidence, err := canonicalJSON(normalized.Evidence)
 		if err != nil {
 			return err
 		}
-		quotaBudget, err := delivery.CanonicalJSON(normalized.QuotaBudget)
+		quotaBudget, err := canonicalJSON(normalized.QuotaBudget)
 		if err != nil {
 			return err
 		}
-		blocker, err := delivery.CanonicalJSON(normalized.Blocker)
+		blocker, err := canonicalJSON(normalized.Blocker)
 		if err != nil {
 			return err
 		}
-		nextAction, err := delivery.CanonicalJSON(normalized.NextAction)
+		nextAction, err := canonicalJSON(normalized.NextAction)
 		if err != nil {
 			return err
 		}
-		redaction, err := delivery.CanonicalJSON(normalized.Redaction)
+		redaction, err := canonicalJSON(normalized.Redaction)
 		if err != nil {
 			return err
 		}
-		gaps, err := delivery.CanonicalJSON(normalized.GapReasons)
+		gaps, err := canonicalJSON(normalized.GapReasons)
 		if err != nil {
 			return err
 		}
@@ -386,7 +385,7 @@ func Replay(ctx context.Context, store storage.Store, filter ReplayFilter) ([]Pr
 }
 
 func NormalizeReceipt(receipt ProgressReceipt, now time.Time) (ProgressReceipt, error) {
-	nowText := delivery.CanonicalTimestamp(now)
+	nowText := canonicalTimestamp(now)
 	receipt.SchemaVersion = firstNonEmpty(receipt.SchemaVersion, SchemaProgressReceipt)
 	if receipt.SchemaVersion != SchemaProgressReceipt {
 		return ProgressReceipt{}, typed(ErrUnknownRecordVersionCode, "unsupported progress receipt schema %q", receipt.SchemaVersion)
@@ -424,7 +423,7 @@ func NormalizeReceipt(receipt ProgressReceipt, now time.Time) (ProgressReceipt, 
 	} else {
 		receipt.ProgressReceiptID = sanitizeID(receipt.ProgressReceiptID)
 	}
-	payload, err := delivery.CanonicalJSON(receipt)
+	payload, err := canonicalJSON(receipt)
 	if err != nil {
 		return ProgressReceipt{}, typed(ErrInvalidRecordCode, "canonical progress receipt: %v", err)
 	}
@@ -470,7 +469,7 @@ func semanticFingerprint(receipt ProgressReceipt) (string, error) {
 		"truncated":            receipt.Redaction.Truncated,
 		"secret_finding_count": receipt.Redaction.SecretFindingCount,
 	}
-	digest, _, err := delivery.DigestCanonicalJSON(canonical)
+	digest, _, err := digestCanonicalJSON(canonical)
 	if err != nil {
 		return "", typed(ErrInvalidRecordCode, "semantic progress receipt: %v", err)
 	}
@@ -735,11 +734,11 @@ func normalizeTimestampOr(value, fallback string) string {
 	if value == "" {
 		return fallback
 	}
-	normalized, err := delivery.NormalizeTimestamp(value)
+	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
 		return value
 	}
-	return normalized
+	return canonicalTimestamp(parsed)
 }
 
 func firstNonEmpty(values ...string) string {

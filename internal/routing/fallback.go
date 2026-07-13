@@ -12,6 +12,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
@@ -158,6 +159,7 @@ type FallbackInput struct {
 	HeldReservationGeneration int64
 	DecidedBy                 delivery.Actor
 	Host                      delivery.Host
+	Progress                  *progress.Emitter
 }
 
 type ReplanInput struct {
@@ -314,6 +316,7 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 		}
 		return FallbackDecision{}, err
 	}
+	emitFallbackProgress(ctx, input.Progress, stored, store.Now())
 	if stored.TerminalErrorCode != "" {
 		return stored, routingTerminalError(stored.TerminalErrorCode)
 	}

@@ -376,6 +376,54 @@ func TestDispatchRegisteredRunEmitsProgressReceiptsFromTracker(t *testing.T) {
 	}
 }
 
+func TestProgressRecorderTaskCountsTruthfulForAttemptStatuses(t *testing.T) {
+	now := fixedNow()
+	recorder := &progressRecorder{now: func() time.Time { return now }}
+	tests := []struct {
+		status string
+		want   progress.TaskCounts
+	}{
+		{state.StatusPlanned, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusQueued, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusLaunching, progress.TaskCounts{Total: 1, Ready: 1}},
+		{state.StatusRunning, progress.TaskCounts{Total: 1, Running: 1}},
+		{state.StatusFinishing, progress.TaskCounts{Total: 1, Running: 1}},
+		{state.StatusWaiting, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{state.StatusSucceeded, progress.TaskCounts{Total: 1, Succeeded: 1}},
+		{state.StatusSucceededWithOptionalFailures, progress.TaskCounts{Total: 1, Succeeded: 1}},
+		{state.StatusFailed, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusCancelled, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusTimedOut, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusAbandoned, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusSkipped, progress.TaskCounts{Total: 1, Failed: 1}},
+		{state.StatusHung, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{state.StatusNeedsHuman, progress.TaskCounts{Total: 1, Blocked: 1}},
+		{"unrecognized", progress.TaskCounts{Total: 1, Unknown: 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			obs := recorder.observation(state.AttemptRecord{
+				JobID:          "job-counts",
+				Issue:          828,
+				Attempt:        1,
+				Provider:       "codex",
+				Phase:          "test_phase",
+				Status:         tt.status,
+				StartedAt:      state.FormatTimestamp(now.Add(-time.Minute)),
+				HeartbeatAt:    state.FormatTimestamp(now.Add(-30 * time.Second)),
+				LastProgressAt: state.FormatTimestamp(now.Add(-45 * time.Second)),
+			})
+			if obs.TaskCounts != tt.want {
+				t.Fatalf("TaskCounts for %q = %#v, want %#v", tt.status, obs.TaskCounts, tt.want)
+			}
+			sum := obs.TaskCounts.Ready + obs.TaskCounts.Running + obs.TaskCounts.Succeeded + obs.TaskCounts.Failed + obs.TaskCounts.Blocked + obs.TaskCounts.Unknown
+			if sum != obs.TaskCounts.Total {
+				t.Fatalf("TaskCounts sum = %d, total = %d for %#v", sum, obs.TaskCounts.Total, obs.TaskCounts)
+			}
+		})
+	}
+}
+
 func TestDispatchRecordsCancelledFailureState(t *testing.T) {
 	repo := t.TempDir()
 	scratchRoot := t.TempDir()

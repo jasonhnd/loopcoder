@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -15,6 +16,7 @@ type cycleDetector func(context.Context, storage.Tx, string, string, string) (bo
 type PersistOptions struct {
 	IdempotencyKey string
 	Now            time.Time
+	Progress       *progress.Emitter
 
 	cycleDetector cycleDetector
 }
@@ -88,6 +90,9 @@ func PersistDeliveryRun(ctx context.Context, store storage.Store, run DeliveryRu
 		out = run
 		return remember(ctx, tx, opts.IdempotencyKey, run.ProjectID, run.DeliveryRunID, "persist_delivery_run", request, out, now)
 	})
+	if err == nil {
+		emitDeliveryRunProgress(ctx, opts.Progress, out, "persist_delivery_run", optionNow(opts))
+	}
 	return out, err
 }
 
@@ -211,6 +216,9 @@ func PersistTask(ctx context.Context, store storage.Store, task Task, opts Persi
 		out = task
 		return remember(ctx, tx, opts.IdempotencyKey, task.ProjectID, task.DeliveryRunID, "persist_task", request, out, now)
 	})
+	if err == nil {
+		emitTaskProgress(ctx, opts.Progress, out, "persist_task", optionNow(opts))
+	}
 	return out, err
 }
 
@@ -320,6 +328,14 @@ func TransitionDeliveryRun(ctx context.Context, store storage.Store, projectID, 
 		next = transitioned
 		return remember(ctx, tx, opts.IdempotencyKey, projectID, deliveryRunID, "transition_delivery_run", request, next, optionNow(opts))
 	})
+	if err == nil {
+		emitDeliveryRunProgress(ctx, opts.Progress, DeliveryRun{
+			ProjectID:     projectID,
+			DeliveryRunID: deliveryRunID,
+			RunID:         deliveryRunID,
+			State:         next,
+		}, event, optionNow(opts))
+	}
 	return next, err
 }
 
@@ -365,6 +381,14 @@ func TransitionTask(ctx context.Context, store storage.Store, projectID, deliver
 		next = transitioned
 		return remember(ctx, tx, opts.IdempotencyKey, projectID, deliveryRunID, "transition_task", request, next, optionNow(opts))
 	})
+	if err == nil {
+		emitTaskProgress(ctx, opts.Progress, Task{
+			ProjectID:     projectID,
+			DeliveryRunID: deliveryRunID,
+			TaskID:        taskID,
+			State:         next,
+		}, event, optionNow(opts))
+	}
 	return next, err
 }
 
@@ -468,6 +492,9 @@ func RecordApproval(ctx context.Context, store storage.Store, approval Approval,
 		out = approval
 		return remember(ctx, tx, opts.IdempotencyKey, approval.ProjectID, approval.DeliveryRunID, "record_approval", request, out, now)
 	})
+	if err == nil {
+		emitApprovalProgress(ctx, opts.Progress, out, "record_approval", optionNow(opts))
+	}
 	return out, err
 }
 
@@ -611,5 +638,8 @@ func ClaimTask(ctx context.Context, store storage.Store, projectID, deliveryRunI
 		}
 		return remember(ctx, tx, opts.IdempotencyKey, projectID, deliveryRunID, "claim_task", request, out, optionNow(opts))
 	})
+	if err == nil {
+		emitAttemptProgress(ctx, opts.Progress, out, "claim_task", optionNow(opts))
+	}
 	return out, err
 }

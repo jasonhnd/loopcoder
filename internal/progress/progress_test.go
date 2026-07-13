@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
@@ -390,7 +389,7 @@ func tableExists(t *testing.T, ctx context.Context, store storage.Store, table s
 
 func mustJSON(t *testing.T, value any) string {
 	t.Helper()
-	data, err := delivery.CanonicalJSON(value)
+	data, err := canonicalJSON(value)
 	if err != nil {
 		t.Fatalf("CanonicalJSON: %v", err)
 	}
