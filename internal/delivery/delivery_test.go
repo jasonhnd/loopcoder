@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,10 +458,111 @@ func TestDependencyEdgeCycleDetectedIsAtomic(t *testing.T) {
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
 }
 
-func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
+func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	const workers = 8
+	type detectorRun struct {
+		index    int
+		store    storage.Store
+		edge     DependencyEdge
+		injected error
+		calls    atomic.Int32
+	}
+	runs := make([]*detectorRun, 0, workers)
+	for i := 0; i < workers; i++ {
+		store := openDeliveryStore(t)
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+		})
+		runID := fmt.Sprintf("run_cycle_detector_parallel_%02d", i)
+		run, taskA, taskB := seedTwoTaskDependencyRun(t, ctx, store, "proj_a", runID)
+
+		edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+		if _, err := AddDependencyEdge(ctx, store, edgeAB, PersistOptions{IdempotencyKey: runID + "-edge-ab", Now: fixedTime()}); err != nil {
+			t.Fatalf("AddDependencyEdge seed %d: %v", i, err)
+		}
+		runs = append(runs, &detectorRun{
+			index:    i,
+			store:    store,
+			edge:     DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, EdgeKind: "orders-after", PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()},
+			injected: fmt.Errorf("cte scan failed %02d", i),
+		})
+	}
+
+	ready := make(chan int, workers)
+	start := make(chan struct{})
+	var startOnce sync.Once
+	closeStart := func() {
+		startOnce.Do(func() {
+			close(start)
+		})
+	}
+	defer closeStart()
+
+	type result struct {
+		index int
+		err   error
+	}
+	results := make(chan result, workers)
+	for _, run := range runs {
+		run := run
+		go func() {
+			opts := PersistOptions{
+				IdempotencyKey: fmt.Sprintf("edge-cycle-query-failure-%02d", run.index),
+				Now:            fixedTime(),
+				cycleDetector: func(context.Context, storage.Tx, string, string, string) (bool, error) {
+					if got := run.calls.Add(1); got != 1 {
+						return false, fmt.Errorf("detector %d called %d times", run.index, got)
+					}
+					ready <- run.index
+					select {
+					case <-start:
+						return false, run.injected
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+				},
+			}
+			_, err := AddDependencyEdge(ctx, run.store, run.edge, opts)
+			results <- result{index: run.index, err: err}
+		}()
+	}
+
+	for range runs {
+		select {
+		case <-ready:
+		case res := <-results:
+			t.Fatalf("AddDependencyEdge %d returned before detector barrier: %v", res.index, res.err)
+		case <-ctx.Done():
+			t.Fatalf("waiting for detector barrier: %v", ctx.Err())
+		}
+	}
+	closeStart()
+
+	for range runs {
+		select {
+		case res := <-results:
+			run := runs[res.index]
+			if res.err == nil || errors.Is(res.err, ErrCycleDetected) || !errors.Is(res.err, run.injected) {
+				t.Fatalf("cycle query failure %d error = %v, want wrapped injected error", res.index, res.err)
+			}
+			if got := run.calls.Load(); got != 1 {
+				t.Fatalf("detector %d calls = %d, want 1", res.index, got)
+			}
+			assertCount(t, ctx, run.store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+		case <-ctx.Done():
+			t.Fatalf("waiting for detector result: %v", ctx.Err())
+		}
+	}
+}
+
+func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
+	t.Parallel()
 
 	for _, tt := range []struct {
 		name      string
@@ -479,7 +582,12 @@ func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
 			wantErr:   ErrDuplicateRecord,
 		},
 	} {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
 			dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
 			seedStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedTime})
 			if err != nil {
