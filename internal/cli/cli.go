@@ -31,6 +31,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/registry"
@@ -40,9 +41,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -488,10 +491,19 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --fix                  apply explicit storage permission repair, migrations, and stale local state cleanup")
 	}
 	if command.Name == "status" {
-		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
-		fmt.Fprintln(w, "  --run string      run id; omit to inspect the latest local run")
-		fmt.Fprintln(w, "  --run-id string   alias for --run")
-		fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id; omit to inspect the latest local run")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --receipts             render durable progress receipts for the run")
+		fmt.Fprintln(w, "  --replay               alias for --receipts")
+		fmt.Fprintln(w, "  --follow               follow durable progress receipts from --cursor")
+		fmt.Fprintln(w, "  --cursor string        opaque receipt cursor to resume after")
+		fmt.Fprintln(w, "  --correlation string   filter progress receipts by correlation id")
+		fmt.Fprintln(w, "  --task string          filter progress receipts by task id")
+		fmt.Fprintln(w, "  --limit int            maximum progress receipts per read (default 500)")
+		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -593,8 +605,11 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "status" {
-		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
-		fmt.Fprintln(w, "  --run string    local run id to inspect (default latest modified local run)")
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           local run id to inspect (default latest modified local run)")
+		fmt.Fprintln(w, "  --receipts             render durable progress receipts for the run")
+		fmt.Fprintln(w, "  --follow               follow durable progress receipts")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -5560,7 +5575,7 @@ func readReadySetJSON(r io.Reader) (*report.ReadySetReport, error) {
 	return &readySet, nil
 }
 
-func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
+func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -5570,6 +5585,15 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	var runIDAlias string
 	format := "text"
 	var formatAlias string
+	var receipts bool
+	var replay bool
+	var follow bool
+	var cursor string
+	var correlationID string
+	var taskID string
+	var limit int
+	var pollInterval time.Duration
+	var followFor time.Duration
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -5579,6 +5603,15 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&receipts, "receipts", false, "render durable progress receipts")
+	fs.BoolVar(&replay, "replay", false, "render durable progress receipt replay")
+	fs.BoolVar(&follow, "follow", false, "follow durable progress receipts")
+	fs.StringVar(&cursor, "cursor", "", "opaque progress receipt cursor")
+	fs.StringVar(&correlationID, "correlation", "", "progress receipt correlation id")
+	fs.StringVar(&taskID, "task", "", "progress receipt task id")
+	fs.IntVar(&limit, "limit", 500, "maximum progress receipts per read")
+	fs.DurationVar(&pollInterval, "poll", progress.DefaultFollowPollInterval, "follow poll interval")
+	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -5592,10 +5625,20 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	receiptMode := receipts || replay || follow || cursor != "" || correlationID != "" || taskID != ""
 	switch format {
 	case "text", "json":
+	case "jsonl":
+		if !receiptMode {
+			fmt.Fprintf(stderr, "status: --format jsonl requires --receipts or --follow\n")
+			return 2
+		}
 	default:
-		fmt.Fprintf(stderr, "status: invalid --format %q; want text or json\n", format)
+		fmt.Fprintf(stderr, "status: invalid --format %q; want text, json, or jsonl\n", format)
+		return 2
+	}
+	if follow && format == "json" {
+		fmt.Fprintf(stderr, "status: --follow with machine output requires --format jsonl\n")
 		return 2
 	}
 
@@ -5603,6 +5646,20 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 2
+	}
+	if receiptMode {
+		return runStatusProgressReceipts(statusProgressOptions{
+			RepoPath:      resolvedRepo,
+			RunID:         runID,
+			Format:        format,
+			Follow:        follow,
+			Cursor:        progress.Cursor(cursor),
+			CorrelationID: correlationID,
+			TaskID:        taskID,
+			Limit:         limit,
+			PollInterval:  pollInterval,
+			FollowFor:     followFor,
+		}, stdout, stderr, deps)
 	}
 
 	report, err := runstatus.Load(runstatus.Options{
@@ -5626,6 +5683,97 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 		return 0
 	}
 	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+type statusProgressOptions struct {
+	RepoPath      string
+	RunID         string
+	Format        string
+	Follow        bool
+	Cursor        progress.Cursor
+	CorrelationID string
+	TaskID        string
+	Limit         int
+	PollInterval  time.Duration
+	FollowFor     time.Duration
+}
+
+func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Writer, deps Deps) int {
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	ctx := context.Background()
+	roots, err := runtimepath.Resolve(ctx, opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "status: resolve progress receipt roots: %v\n", err)
+		return 1
+	}
+	if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
+		fmt.Fprintf(stderr, "status: progress receipts require a registered project\n")
+		return 1
+	}
+	runID := strings.TrimSpace(opts.RunID)
+	if runID == "" {
+		latest, err := state.LatestRunID(opts.RepoPath)
+		if err != nil || strings.TrimSpace(latest) == "" {
+			fmt.Fprintf(stderr, "status: progress receipts require --run when no latest local run exists\n")
+			return 1
+		}
+		runID = latest
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: now})
+	if err != nil {
+		fmt.Fprintf(stderr, "status: open progress receipt store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	filter := progress.ReadFilter{
+		ProjectID:     roots.ProjectID,
+		DeliveryRunID: runID,
+		CorrelationID: opts.CorrelationID,
+		TaskID:        opts.TaskID,
+		Limit:         opts.Limit,
+		After:         opts.Cursor,
+	}
+	render := func(batch progress.ReceiptBatch) error {
+		for _, diagnostic := range batch.Diagnostics {
+			fmt.Fprintf(stderr, "status: warning: %s storage_order=%d: %s\n", diagnostic.Code, diagnostic.StorageOrder, diagnostic.Message)
+		}
+		switch opts.Format {
+		case "json":
+			return progress.RenderJSON(stdout, batch)
+		case "jsonl":
+			return progress.RenderJSONL(stdout, batch.Views)
+		default:
+			return progress.RenderHuman(stdout, batch.Views)
+		}
+	}
+	if opts.Follow {
+		followCtx := ctx
+		if opts.FollowFor > 0 {
+			var cancel context.CancelFunc
+			followCtx, cancel = context.WithTimeout(ctx, opts.FollowFor)
+			defer cancel()
+		}
+		err = progress.FollowReceipts(followCtx, store, progress.FollowOptions{ReadFilter: filter, PollInterval: opts.PollInterval}, now, render)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintf(stderr, "status: follow progress receipts: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	batch, err := progress.ReadReceipts(ctx, store, filter, now().UTC())
+	if err != nil {
+		fmt.Fprintf(stderr, "status: read progress receipts: %v\n", err)
+		return 1
+	}
+	if err := render(batch); err != nil {
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
 	}
