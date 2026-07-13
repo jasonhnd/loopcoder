@@ -458,6 +458,9 @@ func TestRunCodexAppServerProtocolFailuresUseTypedErrors(t *testing.T) {
 		{mode: "eof", wantErr: ErrCodexQuotaMalformed},
 		{mode: "rpc-error", wantErr: ErrCodexQuotaRPC},
 		{mode: "malformed-line", wantErr: ErrCodexQuotaMalformed},
+		{mode: "contradictory-envelope", wantErr: ErrCodexQuotaMalformed},
+		{mode: "trailing-json", wantErr: ErrCodexQuotaMalformed},
+		{mode: "malformed-rpc-error", wantErr: ErrCodexQuotaMalformed},
 		{mode: "oversized-line", wantErr: ErrCodexQuotaMalformed},
 		{mode: "unsupported-init", wantErr: ErrCodexQuotaUnsupported},
 	}
@@ -489,8 +492,12 @@ func TestInspectCodexQuotaPreservesRealRunnerProtocolFailures(t *testing.T) {
 		wantCode string
 		wantGap  string
 	}{
+		{mode: "eof", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{mode: "rpc-error", wantCode: "ErrCodexQuotaRPCError", wantGap: "rpc-error"},
 		{mode: "malformed-line", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "contradictory-envelope", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "trailing-json", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
+		{mode: "malformed-rpc-error", wantCode: "ErrCodexQuotaMalformedFrame", wantGap: "malformed-frame"},
 		{mode: "unsupported-init", wantCode: "ErrUnsupportedVersion", wantGap: "unsupported-cli-version"},
 	}
 	for _, tt := range cases {
@@ -527,34 +534,46 @@ func TestInspectCodexQuotaPreservesRealRunnerProtocolFailures(t *testing.T) {
 }
 
 func TestCodexAppServerOfficialEnvelopeGoldens(t *testing.T) {
-	requests := []jsonRPCMessage{
-		{ID: 1, Method: "initialize", Params: map[string]any{"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion}}},
-		{Method: "initialized"},
-		{ID: 2, Method: "account/read", Params: map[string]any{"refreshToken": false}},
-		{ID: 3, Method: "account/rateLimits/read", Params: map[string]any{}},
+	valid := []struct {
+		name string
+		line string
+	}{
+		{name: "request", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 1, Method: "initialize", Params: map[string]any{"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion}}})},
+		{name: "notification", line: codexQuotaJSONL(t, jsonRPCMessage{Method: "initialized"})},
+		{name: "success-response", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 2, Result: mustRawJSON(t, map[string]any{"requiresOpenaiAuth": false})})},
+		{name: "error-response", line: codexQuotaJSONL(t, jsonRPCMessage{ID: 3, Error: &jsonRPCError{Code: -32000, Message: "rate limited"}})},
 	}
-	for _, request := range requests {
-		line := codexQuotaJSONL(t, request)
-		assertNoJSONRPCMember(t, line)
-		if _, err := decodeCodexJSONLMessage(line); err != nil {
-			t.Fatalf("decode request %s: %v", line, err)
-		}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			assertNoJSONRPCMember(t, tt.line)
+			if _, err := decodeCodexJSONLMessage(tt.line); err != nil {
+				t.Fatalf("decode %s %s: %v", tt.name, tt.line, err)
+			}
+		})
 	}
-	responses := codexQuotaFrames(t,
-		map[string]any{"requiresOpenaiAuth": false, "account": map[string]any{"id": "acct_fixture"}},
-		map[string]any{"rateLimits": map[string]any{"primary": map[string]any{"usedPercent": 1, "windowDurationMins": 300, "resetsAt": fixedInventoryNow().Unix()}}},
-	)
-	for _, line := range strings.Split(strings.TrimSpace(responses), "\n") {
-		assertNoJSONRPCMember(t, line)
-		if _, err := decodeCodexJSONLMessage(line); err != nil {
-			t.Fatalf("decode response %s: %v", line, err)
-		}
+
+	malformed := []struct {
+		name string
+		line string
+	}{
+		{name: "missing-response-id", line: `{"result":{}}`},
+		{name: "missing-response-payload", line: `{"id":1}`},
+		{name: "request-carries-result", line: `{"id":1,"method":"initialize","result":{}}`},
+		{name: "request-carries-error", line: `{"id":1,"method":"initialize","error":{"code":-32000,"message":"bad"}}`},
+		{name: "notification-carries-result", line: `{"method":"initialized","result":{}}`},
+		{name: "notification-carries-error", line: `{"method":"initialized","error":{"code":-32000,"message":"bad"}}`},
+		{name: "success-carries-method", line: `{"id":2,"method":"account/read","result":{}}`},
+		{name: "response-carries-result-and-error", line: `{"id":3,"result":{},"error":{"code":-32000,"message":"bad"}}`},
+		{name: "error-missing-message", line: `{"id":3,"error":{"code":-32000}}`},
+		{name: "error-empty-message", line: `{"id":3,"error":{"code":-32000,"message":"  "}}`},
+		{name: "trailing-json", line: `{"method":"initialized"} {"method":"second"}`},
 	}
-	if _, err := decodeCodexJSONLMessage(`{"result":{}}`); !errors.Is(err, ErrCodexQuotaMalformed) {
-		t.Fatalf("decode missing required id err = %v, want malformed", err)
-	}
-	if _, err := decodeCodexJSONLMessage(`{"id":1}`); !errors.Is(err, ErrCodexQuotaMalformed) {
-		t.Fatalf("decode missing result/error/method err = %v, want malformed", err)
+	for _, tt := range malformed {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeCodexJSONLMessage(tt.line); !errors.Is(err, ErrCodexQuotaMalformed) {
+				t.Fatalf("decode %s err = %v, want malformed", tt.line, err)
+			}
+		})
 	}
 }
 
@@ -762,6 +781,18 @@ func runFakeCodexAppServer() {
 	}
 	if mode == "malformed-line" {
 		fmt.Println("{not-json")
+		return
+	}
+	if mode == "contradictory-envelope" {
+		fmt.Println(`{"id":1,"method":"initialize","result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex-test"}}`)
+		return
+	}
+	if mode == "trailing-json" {
+		fmt.Println(`{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex-test"}} {"method":"codex/notice"}`)
+		return
+	}
+	if mode == "malformed-rpc-error" {
+		fmt.Println(`{"id":1,"error":{"code":-32000}}`)
 		return
 	}
 	if mode == "oversized-line" {

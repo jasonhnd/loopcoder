@@ -440,6 +440,10 @@ func decodeCodexJSONLMessage(line string) (jsonRPCMessage, error) {
 	if err := dec.Decode(&msg); err != nil {
 		return msg, fmt.Errorf("%w: jsonl message", ErrCodexQuotaMalformed)
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return msg, fmt.Errorf("%w: jsonl trailing token", ErrCodexQuotaMalformed)
+	}
 	if err := validateCodexAppServerEnvelope(msg); err != nil {
 		return msg, err
 	}
@@ -452,15 +456,16 @@ func validateCodexAppServerEnvelope(msg jsonRPCMessage) error {
 	hasResult := msg.Result != nil
 	hasError := msg.Error != nil
 	switch {
-	case hasMethod && hasID:
+	case hasMethod && hasID && !hasResult && !hasError:
 		return nil
-	case hasMethod:
+	case hasMethod && !hasID && !hasResult && !hasError:
 		return nil
-	case hasID && (hasResult || hasError):
-		if hasError && strings.TrimSpace(msg.Error.Message) == "" {
-			return fmt.Errorf("%w: json-rpc error envelope", ErrCodexQuotaMalformed)
-		}
+	case hasID && !hasMethod && hasResult && !hasError:
 		return nil
+	case hasID && !hasMethod && !hasResult && hasError && strings.TrimSpace(msg.Error.Message) != "":
+		return nil
+	case hasError && strings.TrimSpace(msg.Error.Message) == "":
+		return fmt.Errorf("%w: json-rpc error envelope", ErrCodexQuotaMalformed)
 	default:
 		return fmt.Errorf("%w: app-server envelope", ErrCodexQuotaMalformed)
 	}
