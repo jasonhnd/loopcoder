@@ -1,12 +1,13 @@
 package providerinventory
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,9 +20,10 @@ import (
 )
 
 const (
-	codexQuotaSourceSchema = "codex.app_server.rate_limits.v1"
+	codexQuotaSourceSchema = "codex.app_server.protocol.v2.rate_limits.v1"
 	codexQuotaTimeout      = 10 * time.Second
 	codexQuotaOutputBytes  = 128 * 1024
+	codexQuotaLineBytes    = 64 * 1024
 )
 
 var (
@@ -53,6 +55,7 @@ type jsonRPCMessage struct {
 	JSONRPC string          `json:"jsonrpc,omitempty"`
 	ID      any             `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
+	Params  any             `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *jsonRPCError   `json:"error,omitempty"`
 }
@@ -83,7 +86,7 @@ func inspectCodexQuota(ctx context.Context, discovery *discoveryContext, adapter
 	probe.Argv = redactArgv(argv)
 	probe.EnvironmentKeys = environmentKeys(env)
 	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: probe.ProbeCommandID, DiscoverySource: string(candidate.source), ExecutableName: filepath.Base(candidate.path)}
-	probe.Evidence = EvidenceSummary{Kind: "bounded-codex-app-server-json-rpc", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
+	probe.Evidence = EvidenceSummary{Kind: "bounded-codex-app-server-jsonl-rpc", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
 
 	unavailable := func(reason, terminal string) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
 		snapshot := codexQuotaUnavailableSnapshot(source, &installationID, now, reason, terminal)
@@ -95,9 +98,6 @@ func inspectCodexQuota(ctx context.Context, discovery *discoveryContext, adapter
 		return source, []QuotaSnapshot{snapshot}, probe
 	}
 
-	if !codexQuotaVersionSupported(installation.Version) {
-		return unavailable("unsupported-cli-version", "ErrUnsupportedVersion")
-	}
 	if probe.NetworkPermission != NetworkGranted {
 		probe.SideEffectClass = "not-run"
 		return unavailable("quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
@@ -111,9 +111,9 @@ func inspectCodexQuota(ctx context.Context, discovery *discoveryContext, adapter
 		StderrLimitBytes:   StdoutLimitBytes,
 		CombinedLimitBytes: codexQuotaOutputBytes + StdoutLimitBytes,
 	})
-	stdout, stdoutFindings := redactProviderOutputBeforeTruncate(result.Stdout, 4096)
+	_, stdoutFindings := redactProviderOutputNoTruncate(result.Stdout)
 	stderr, stderrFindings := redactProviderOutputBeforeTruncate(result.Stderr, 4096)
-	probe.StdoutSummary = stdout
+	probe.StdoutSummary = codexProtocolSummary(result.Stdout)
 	probe.StderrSummary = stderr
 	probe.SecretFindingCount = stdoutFindings + stderrFindings
 	probe.TimedOut = result.TimedOut
@@ -156,10 +156,10 @@ func codexQuotaSource(now time.Time) QuotaTelemetrySource {
 		SourceKind:             QuotaSourceOfficialCLICommand,
 		SourceKey:              "codex-app-server-rate-limits-v1",
 		SourceSchemaVersion:    codexQuotaSourceSchema,
-		SupportedQuantities:    []QuantityKind{QuantityRequests, QuantityProviderDefined},
+		SupportedQuantities:    []QuantityKind{QuantityProviderDefined},
 		SupportedWindows:       []WindowKind{WindowRolling, WindowFixedWeek, WindowProviderDefined, WindowUnbounded, WindowUnknown},
 		ScopeDimensions:        []string{"provider", "account", "scope"},
-		ConfidenceContract:     map[string]Confidence{"limit_value": ConfidenceExact, "used_value": ConfidenceExact, "remaining_value": ConfidenceExact, "reset_at": ConfidenceExact},
+		ConfidenceContract:     map[string]Confidence{"limit_value": ConfidenceUnknown, "used_value": ConfidenceExact, "remaining_value": ConfidenceEstimated, "reset_at": ConfidenceExact},
 		NetworkDeclared:        true,
 		NetworkPermissionScope: "provider:codex/action:quota-read/side-effect:read/freshness:interactive",
 		Argv:                   []string{"codex", "-s", "read-only", "-a", "untrusted", "app-server"},
@@ -206,18 +206,42 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
 		return CodexAppServerResult{ExitCode: -1}, errors.New("codex app-server argv is empty")
 	}
-	input := encodeJSONRPCFrame(jsonRPCMessage{JSONRPC: "2.0", ID: 1, Method: "account/read"}) +
-		encodeJSONRPCFrame(jsonRPCMessage{JSONRPC: "2.0", ID: 2, Method: "account/rateLimits/read"})
 	budget := newOutputBudget(req.CombinedLimitBytes)
 	stdout := newBoundedBuffer(req.StdoutLimitBytes, budget)
 	stderr := newBoundedBuffer(req.StderrLimitBytes, budget)
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = os.TempDir()
 	cmd.Env = append([]string{}, req.Env...)
-	cmd.Stdin = strings.NewReader(input)
-	cmd.Stdout = stdout
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return CodexAppServerResult{ExitCode: -1}, err
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return CodexAppServerResult{ExitCode: -1}, err
+	}
 	cmd.Stderr = stderr
-	result, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "codex-quota-app-server"})
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	runCh := make(chan struct {
+		result supervisedexec.Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "codex-quota-app-server"})
+		runCh <- struct {
+			result supervisedexec.Result
+			err    error
+		}{result: result, err: err}
+	}()
+	protocolErr := driveCodexAppServerProtocol(runCtx, stdin, stdoutPipe, stdout)
+	_ = stdin.Close()
+	if protocolErr != nil {
+		cancel()
+	}
+	run := <-runCh
+	result := run.result
+	err = run.err
 	exitCode := result.ExitCode
 	if (err != nil || result.Outcome == supervisedexec.OutcomeDeadline || result.Killed) && exitCode == 0 {
 		exitCode = -1
@@ -235,26 +259,120 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 		}
 		out.Stderr += "[loopcoder] codex app-server output truncated"
 	}
+	if protocolErr != nil && err == nil {
+		err = protocolErr
+	}
 	return out, err
 }
 
-func encodeJSONRPCFrame(message jsonRPCMessage) string {
+func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io.Reader, retained *boundedBuffer) error {
+	lines := make(chan string, 16)
+	errCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 4096), codexQuotaLineBytes)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			_, _ = retained.Write([]byte(line + "\n"))
+			select {
+			case lines <- line:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			errCh <- fmt.Errorf("%w: jsonl read: %v", ErrCodexQuotaMalformed, err)
+			return
+		}
+		errCh <- io.EOF
+	}()
+	if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: map[string]any{
+		"clientInfo": map[string]any{"name": "loopcoder", "version": PolicyVersion},
+		"capabilities": map[string]any{
+			"experimentalApi":           false,
+			"optOutNotificationMethods": []string{"thread/started", "thread/status_changed", "account/rate_limits/updated"},
+		},
+	}}); err != nil {
+		return err
+	}
+	initialized := false
+	accountSeen := false
+	limitsSeen := false
+	for {
+		select {
+		case line := <-lines:
+			msg, err := decodeCodexJSONLMessage(line)
+			if err != nil {
+				return err
+			}
+			if msg.Error != nil {
+				return fmt.Errorf("%w: %s", ErrCodexQuotaRPC, msg.Error.Message)
+			}
+			switch jsonRPCID(msg.ID) {
+			case "1":
+				if initialized {
+					continue
+				}
+				if err := validateCodexInitializeResponse(msg.Result); err != nil {
+					return err
+				}
+				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", Method: "initialized"}); err != nil {
+					return err
+				}
+				initialized = true
+				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 2, Method: "account/read", Params: map[string]any{"refreshToken": false}}); err != nil {
+					return err
+				}
+				if err := writeJSONL(stdin, jsonRPCMessage{JSONRPC: "2.0", ID: 3, Method: "account/rateLimits/read", Params: map[string]any{}}); err != nil {
+					return err
+				}
+			case "2":
+				if !initialized {
+					return fmt.Errorf("%w: account/read before initialize", ErrCodexQuotaUnsupported)
+				}
+				accountSeen = true
+			case "3":
+				if !initialized {
+					return fmt.Errorf("%w: account/rateLimits/read before initialize", ErrCodexQuotaUnsupported)
+				}
+				limitsSeen = true
+			}
+			if initialized && accountSeen && limitsSeen {
+				return nil
+			}
+		case err := <-errCh:
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("%w: eof before required responses", ErrCodexQuotaMalformed)
+			}
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func writeJSONL(w io.Writer, message jsonRPCMessage) error {
 	payload, _ := json.Marshal(message)
-	return fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(payload), payload)
+	_, err := fmt.Fprintf(w, "%s\n", payload)
+	return err
 }
 
 func decodeCodexQuotaRPC(output string) (map[string]any, map[string]any, []json.RawMessage, error) {
 	if len(output) > codexQuotaOutputBytes {
 		return nil, nil, nil, fmt.Errorf("%w: decoded output exceeded limit", ErrCodexQuotaMalformed)
 	}
-	messages, raws, err := decodeJSONRPCMessages([]byte(output))
+	messages, raws, err := decodeJSONLMessages([]byte(output))
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	var account map[string]any
 	var limits map[string]any
 	for _, msg := range messages {
-		if msg.Method != "" && msg.ID == nil {
+		if msg.Method != "" && jsonRPCID(msg.ID) == "" {
 			continue
 		}
 		if msg.Error != nil {
@@ -262,10 +380,14 @@ func decodeCodexQuotaRPC(output string) (map[string]any, map[string]any, []json.
 		}
 		switch jsonRPCID(msg.ID) {
 		case "1":
+			if err := validateCodexInitializeResponse(msg.Result); err != nil {
+				return nil, nil, nil, err
+			}
+		case "2":
 			if err := json.Unmarshal(msg.Result, &account); err != nil {
 				return nil, nil, nil, fmt.Errorf("%w: account/read result", ErrCodexQuotaMalformed)
 			}
-		case "2":
+		case "3":
 			if err := json.Unmarshal(msg.Result, &limits); err != nil {
 				return nil, nil, nil, fmt.Errorf("%w: account/rateLimits/read result", ErrCodexQuotaMalformed)
 			}
@@ -277,13 +399,13 @@ func decodeCodexQuotaRPC(output string) (map[string]any, map[string]any, []json.
 	return account, limits, raws, nil
 }
 
-func decodeJSONRPCMessages(data []byte) ([]jsonRPCMessage, []json.RawMessage, error) {
+func decodeJSONLMessages(data []byte) ([]jsonRPCMessage, []json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
 		return nil, nil, fmt.Errorf("%w: empty output", ErrCodexQuotaMalformed)
 	}
 	if bytes.HasPrefix(trimmed, []byte("Content-Length:")) {
-		return decodeContentLengthFrames(trimmed)
+		return nil, nil, fmt.Errorf("%w: content-length frames are unsupported", ErrCodexQuotaMalformed)
 	}
 	lines := bytes.Split(trimmed, []byte("\n"))
 	messages := make([]jsonRPCMessage, 0, len(lines))
@@ -293,8 +415,11 @@ func decodeJSONRPCMessages(data []byte) ([]jsonRPCMessage, []json.RawMessage, er
 		if len(line) == 0 {
 			continue
 		}
-		var msg jsonRPCMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
+		if len(line) > codexQuotaLineBytes {
+			return nil, nil, fmt.Errorf("%w: oversized jsonl line", ErrCodexQuotaMalformed)
+		}
+		msg, err := decodeCodexJSONLMessage(string(line))
+		if err != nil {
 			return nil, nil, fmt.Errorf("%w: newline-delimited json", ErrCodexQuotaMalformed)
 		}
 		messages = append(messages, msg)
@@ -303,68 +428,53 @@ func decodeJSONRPCMessages(data []byte) ([]jsonRPCMessage, []json.RawMessage, er
 	return messages, raws, nil
 }
 
-func decodeContentLengthFrames(data []byte) ([]jsonRPCMessage, []json.RawMessage, error) {
-	var messages []jsonRPCMessage
-	var raws []json.RawMessage
-	for len(bytes.TrimSpace(data)) > 0 {
-		headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
-		sepLen := 4
-		if headerEnd < 0 {
-			headerEnd = bytes.Index(data, []byte("\n\n"))
-			sepLen = 2
-		}
-		if headerEnd < 0 {
-			return nil, nil, fmt.Errorf("%w: missing frame header terminator", ErrCodexQuotaMalformed)
-		}
-		headers := string(data[:headerEnd])
-		length := -1
-		for _, line := range strings.Split(strings.ReplaceAll(headers, "\r\n", "\n"), "\n") {
-			name, value, ok := strings.Cut(line, ":")
-			if ok && strings.EqualFold(strings.TrimSpace(name), "Content-Length") {
-				n, err := strconv.Atoi(strings.TrimSpace(value))
-				if err != nil || n < 0 || n > codexQuotaOutputBytes {
-					return nil, nil, fmt.Errorf("%w: invalid content length", ErrCodexQuotaMalformed)
-				}
-				length = n
-			}
-		}
-		if length < 0 {
-			return nil, nil, fmt.Errorf("%w: missing content length", ErrCodexQuotaMalformed)
-		}
-		start := headerEnd + sepLen
-		if len(data) < start+length {
-			return nil, nil, fmt.Errorf("%w: truncated frame", ErrCodexQuotaMalformed)
-		}
-		payload := data[start : start+length]
-		var msg jsonRPCMessage
-		if err := json.Unmarshal(payload, &msg); err != nil {
-			return nil, nil, fmt.Errorf("%w: frame payload", ErrCodexQuotaMalformed)
-		}
-		messages = append(messages, msg)
-		raws = append(raws, append(json.RawMessage(nil), payload...))
-		data = bytes.TrimLeft(data[start+length:], "\r\n\t ")
+func decodeCodexJSONLMessage(line string) (jsonRPCMessage, error) {
+	var msg jsonRPCMessage
+	dec := json.NewDecoder(strings.NewReader(line))
+	dec.UseNumber()
+	if err := dec.Decode(&msg); err != nil {
+		return msg, fmt.Errorf("%w: jsonl message", ErrCodexQuotaMalformed)
 	}
-	return messages, raws, nil
+	if msg.JSONRPC != "2.0" {
+		return msg, fmt.Errorf("%w: unsupported jsonrpc version", ErrCodexQuotaMalformed)
+	}
+	return msg, nil
+}
+
+func validateCodexInitializeResponse(result json.RawMessage) error {
+	var payload struct {
+		CodexHome      string `json:"codexHome"`
+		PlatformFamily string `json:"platformFamily"`
+		PlatformOS     string `json:"platformOs"`
+		UserAgent      string `json:"userAgent"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return fmt.Errorf("%w: initialize result", ErrCodexQuotaUnsupported)
+	}
+	if strings.TrimSpace(payload.CodexHome) == "" || strings.TrimSpace(payload.PlatformFamily) == "" || strings.TrimSpace(payload.PlatformOS) == "" || strings.TrimSpace(payload.UserAgent) == "" {
+		return fmt.Errorf("%w: initialize schema", ErrCodexQuotaUnsupported)
+	}
+	return nil
 }
 
 func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *string, cliVersion string, account, limits map[string]any, frames []json.RawMessage, now time.Time) ([]QuotaSnapshot, error) {
 	accountScope := codexAccountScope(account)
-	items := codexLimitItems(limits)
-	if len(items) == 0 {
-		return nil, fmt.Errorf("%w: no recognized rate limit windows", ErrCodexQuotaMalformed)
-	}
 	raw := bytes.Join(rawJSONFrames(frames), []byte("\n"))
 	if credentialMaterialLike(string(raw)) {
 		return nil, ErrQuotaCredentialMaterial
 	}
 	rawHash := rawSourceHash(raw)
+	parsed, err := parseCodexRateLimitsResponse(limits)
+	if err != nil {
+		return nil, err
+	}
 	var snapshots []QuotaSnapshot
-	for _, item := range items {
-		snapshot := codexSnapshotFromItem(source, installationID, cliVersion, accountScope, item, rawHash, now)
-		if snapshot.ScopeKey == "" {
-			continue
-		}
-		snapshots = append(snapshots, snapshot)
+	snapshots = append(snapshots, snapshotsFromCodexRateLimitSnapshot(source, installationID, cliVersion, accountScope, "default", parsed.RateLimits, rawHash, now)...)
+	for _, key := range sortedRateLimitIDs(parsed.RateLimitsByLimitID) {
+		snapshots = append(snapshots, snapshotsFromCodexRateLimitSnapshot(source, installationID, cliVersion, accountScope, key, parsed.RateLimitsByLimitID[key], rawHash, now)...)
+	}
+	if parsed.RateLimitResetCredits != nil {
+		snapshots = append(snapshots, codexResetCreditsSnapshot(source, installationID, cliVersion, accountScope, parsed.RateLimitResetCredits, rawHash, now))
 	}
 	if len(snapshots) == 0 {
 		return nil, fmt.Errorf("%w: no supported quota fields", ErrCodexQuotaMalformed)
@@ -375,133 +485,157 @@ func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *s
 	return snapshots, nil
 }
 
-type codexLimitItem struct {
-	Name   string
-	Scope  string
-	Fields map[string]any
+type codexRateLimitsResponse struct {
+	RateLimitResetCredits *codexRateLimitResetCreditsSummary `json:"rateLimitResetCredits"`
+	RateLimits            codexRateLimitSnapshot             `json:"rateLimits"`
+	RateLimitsByLimitID   map[string]codexRateLimitSnapshot  `json:"rateLimitsByLimitId"`
 }
 
-func codexLimitItems(value any) []codexLimitItem {
-	var out []codexLimitItem
-	collectCodexLimitItems("", value, &out)
-	return out
+type codexRateLimitSnapshot struct {
+	Credits              *codexCreditsSnapshot           `json:"credits"`
+	IndividualLimit      *codexSpendControlLimitSnapshot `json:"individualLimit"`
+	LimitID              *string                         `json:"limitId"`
+	LimitName            *string                         `json:"limitName"`
+	PlanType             *string                         `json:"planType"`
+	Primary              *codexRateLimitWindow           `json:"primary"`
+	RateLimitReachedType *string                         `json:"rateLimitReachedType"`
+	Secondary            *codexRateLimitWindow           `json:"secondary"`
 }
 
-func collectCodexLimitItems(name string, value any, out *[]codexLimitItem) {
-	switch typed := value.(type) {
-	case map[string]any:
-		if codexMapHasQuotaFields(typed) {
-			*out = append(*out, codexLimitItem{Name: firstNonEmpty(codexStringField(typed, "name", "window", "window_kind", "period", "type"), name), Scope: codexStringField(typed, "scope", "scope_key"), Fields: typed})
-			return
-		}
-		for _, key := range sortedMapKeys(typed) {
-			collectCodexLimitItems(key, typed[key], out)
-		}
-	case []any:
-		for _, item := range typed {
-			collectCodexLimitItems(name, item, out)
-		}
-	}
+type codexRateLimitWindow struct {
+	ResetsAt           *int64 `json:"resetsAt"`
+	UsedPercent        *int64 `json:"usedPercent"`
+	WindowDurationMins *int64 `json:"windowDurationMins"`
 }
 
-func codexMapHasQuotaFields(fields map[string]any) bool {
-	for _, key := range []string{"limit", "limit_value", "used", "used_value", "remaining", "remaining_value", "reset_at", "resetAt", "window_start", "windowStart", "credits", "balance"} {
-		if _, ok := fields[key]; ok {
-			return true
-		}
-	}
-	return false
+type codexCreditsSnapshot struct {
+	Balance    *string `json:"balance"`
+	HasCredits bool    `json:"hasCredits"`
+	Unlimited  bool    `json:"unlimited"`
 }
 
-func codexSnapshotFromItem(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope string, item codexLimitItem, rawHash string, now time.Time) QuotaSnapshot {
-	name := normalizeQuotaName(item.Name)
-	quantity := QuantityRequests
-	providerName := name
-	if strings.Contains(name, "credit") || strings.Contains(name, "balance") {
-		quantity = QuantityProviderDefined
-		providerName = "credits"
+type codexSpendControlLimitSnapshot struct {
+	Limit            string `json:"limit"`
+	RemainingPercent *int64 `json:"remainingPercent"`
+	ResetsAt         *int64 `json:"resetsAt"`
+	Used             string `json:"used"`
+}
+
+type codexRateLimitResetCreditsSummary struct {
+	AvailableCount int64                       `json:"availableCount"`
+	Credits        []codexRateLimitResetCredit `json:"credits"`
+}
+
+type codexRateLimitResetCredit struct {
+	ExpiresAt *int64 `json:"expiresAt"`
+	GrantedAt int64  `json:"grantedAt"`
+	ID        string `json:"id"`
+	ResetType string `json:"resetType"`
+	Status    string `json:"status"`
+}
+
+func parseCodexRateLimitsResponse(limits map[string]any) (codexRateLimitsResponse, error) {
+	var parsed codexRateLimitsResponse
+	data, err := json.Marshal(limits)
+	if err != nil {
+		return parsed, fmt.Errorf("%w: rate limits remarshal", ErrCodexQuotaMalformed)
 	}
-	windowKind, rolling := codexWindowKind(name, item.Fields)
-	windowStart := codexTimeField(item.Fields, "window_start", "windowStart", "start", "starts_at", "startsAt")
-	windowEnd := codexTimeField(item.Fields, "window_end", "windowEnd", "end", "ends_at", "endsAt", "expires_at", "expiresAt")
-	resetAt := codexTimeField(item.Fields, "reset_at", "resetAt", "resets_at", "resetsAt")
-	if resetAt == "" {
-		resetAt = windowEnd
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
+		return parsed, fmt.Errorf("%w: rate limits schema", ErrCodexQuotaMalformed)
 	}
-	resetSemantics := ResetUnknown
-	if resetAt != "" {
-		resetSemantics = ResetProviderDefined
-		if windowEnd != "" && resetAt == windowEnd {
-			resetSemantics = ResetWindowBoundary
+	if parsed.RateLimitsByLimitID == nil {
+		parsed.RateLimitsByLimitID = map[string]codexRateLimitSnapshot{}
+	}
+	return parsed, nil
+}
+
+func sortedRateLimitIDs(values map[string]codexRateLimitSnapshot) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if safeScopeToken(key) {
+			keys = append(keys, key)
 		}
 	}
-	if windowKind == WindowFixedWeek && (windowStart == "" || windowEnd == "") {
-		windowKind = WindowRolling
-		rolling = int64((7 * 24 * time.Hour).Milliseconds())
+	sort.Strings(keys)
+	return keys
+}
+
+func snapshotsFromCodexRateLimitSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope, scopeLabel string, limit codexRateLimitSnapshot, rawHash string, now time.Time) []QuotaSnapshot {
+	if scoped := codexStringPtr(limit.LimitID); scoped != "" && safeScopeToken(scoped) {
+		scopeLabel = scoped
 	}
-	if windowKind == WindowRolling && rolling == 0 {
-		rolling = int64((5 * time.Hour).Milliseconds())
+	var snapshots []QuotaSnapshot
+	if limit.Primary != nil {
+		snapshots = append(snapshots, codexWindowSnapshot(source, installationID, cliVersion, accountScope, scopeLabel, "primary", limit.Primary, rawHash, now))
 	}
-	limit, limitOK := codexIntField(item.Fields, "limit", "limit_value", "limitValue", "max", "total")
-	used, usedOK := codexIntField(item.Fields, "used", "used_value", "usedValue", "current")
-	remaining, remainingOK := codexIntField(item.Fields, "remaining", "remaining_value", "remainingValue", "available", "balance")
+	if limit.Secondary != nil {
+		snapshots = append(snapshots, codexWindowSnapshot(source, installationID, cliVersion, accountScope, scopeLabel, "secondary", limit.Secondary, rawHash, now))
+	}
+	if limit.Credits != nil {
+		snapshots = append(snapshots, codexCreditsBalanceSnapshot(source, installationID, cliVersion, accountScope, scopeLabel, limit.Credits, rawHash, now))
+	}
+	if limit.IndividualLimit != nil {
+		snapshots = append(snapshots, codexIndividualLimitSnapshot(source, installationID, cliVersion, accountScope, scopeLabel, limit.IndividualLimit, rawHash, now))
+	}
+	return snapshots
+}
+
+func codexWindowSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope, scopeLabel, windowName string, window *codexRateLimitWindow, rawHash string, now time.Time) QuotaSnapshot {
+	windowKind, rolling := codexWindowKindFromDuration(window.WindowDurationMins)
+	resetAt := codexUnixSecondsTime(window.ResetsAt)
+	used, usedOK := boundedPercent(window.UsedPercent)
+	var remaining *int64
+	remainingConfidence := ConfidenceUnknown
+	gaps := []string{}
+	if usedOK {
+		value := int64(100) - *used
+		remaining = &value
+		remainingConfidence = ConfidenceEstimated
+		gaps = append(gaps, "remaining-derived-from-used-percent")
+	} else {
+		gaps = append(gaps, "missing-used-percent")
+	}
+	if window.WindowDurationMins == nil {
+		gaps = append(gaps, "missing-window-duration")
+	}
 	fieldConf := map[string]Confidence{
 		"limit_value":     ConfidenceUnknown,
 		"used_value":      ConfidenceUnknown,
-		"remaining_value": ConfidenceUnknown,
+		"remaining_value": remainingConfidence,
 		"reset_at":        ConfidenceUnknown,
-	}
-	var gaps []string
-	if limitOK {
-		fieldConf["limit_value"] = ConfidenceExact
-	} else {
-		gaps = append(gaps, "missing-limit")
 	}
 	if usedOK {
 		fieldConf["used_value"] = ConfidenceExact
-	} else {
-		gaps = append(gaps, "missing-used")
-	}
-	if remainingOK {
-		fieldConf["remaining_value"] = ConfidenceExact
-	} else {
-		gaps = append(gaps, "missing-remaining")
 	}
 	if resetAt != "" {
 		fieldConf["reset_at"] = ConfidenceExact
-	}
-	scope := "provider:codex"
-	if accountScope != "" {
-		scope += "/account:" + accountScope
-	}
-	if item.Scope != "" && safeScopeToken(item.Scope) {
-		scope += "/scope:" + item.Scope
-	}
-	if scope == "provider:codex" && item.Scope != "" {
-		gaps = append(gaps, "scope-redacted")
+	} else {
+		gaps = append(gaps, "missing-reset-at")
 	}
 	confidence := ConfidenceExact
-	if !limitOK && !usedOK && !remainingOK && resetAt == "" {
+	if !usedOK && resetAt == "" && window.WindowDurationMins == nil {
 		confidence = ConfidenceUnknown
 		gaps = append(gaps, "absent-fields")
 	}
-	diag := fmt.Sprintf("codex app-server parser %s cli version %s protocol jsonrpc-2.0 window %s", codexQuotaSourceSchema, safeSummary(cliVersion), name)
-	snapshot := normalizeQuotaSnapshot(QuotaSnapshot{
-		QuotaSnapshotID:        quotaSnapshotID("codex", source.QuotaSourceID, scope, string(quantity), string(windowKind), name, formatTime(now)),
+	scope := codexScope(accountScope, scopeLabel, windowName)
+	providerName := windowName + "_used_percent"
+	diag := fmt.Sprintf("codex app-server parser %s cli version %s protocol jsonl schema v2 window %s percent remaining derived when present", codexQuotaSourceSchema, safeSummary(cliVersion), windowName)
+	return normalizeQuotaSnapshot(QuotaSnapshot{
+		QuotaSnapshotID:        quotaSnapshotID("codex", source.QuotaSourceID, scope, providerName, string(windowKind), formatTime(now)),
 		QuotaSourceID:          source.QuotaSourceID,
 		SourceKind:             source.SourceKind,
 		AdapterID:              "codex",
 		ProviderInstallationID: installationID,
 		ScopeKey:               scope,
-		QuantityKind:           quantity,
+		QuantityKind:           QuantityProviderDefined,
 		ProviderQuantityName:   providerName,
+		Unit:                   "percent",
 		WindowKind:             windowKind,
-		WindowStart:            windowStart,
-		WindowEnd:              windowEnd,
 		RollingDurationMS:      rolling,
 		ResetAt:                resetAt,
-		ResetSemantics:         resetSemantics,
-		LimitValue:             limit,
+		ResetSemantics:         codexResetSemantics(resetAt, windowKind),
 		UsedValue:              used,
 		RemainingValue:         remaining,
 		ValueScale:             0,
@@ -509,8 +643,8 @@ func codexSnapshotFromItem(source QuotaTelemetrySource, installationID *string, 
 		FieldConfidences:       fieldConf,
 		FreshnessState:         FreshnessFresh,
 		CapturedAt:             formatTime(now),
-		ValidUntil:             firstNonEmpty(resetAt, windowEnd),
-		StaleAfter:             firstNonEmpty(resetAt, windowEnd, formatTime(now.Add(30*time.Minute))),
+		ValidUntil:             resetAt,
+		StaleAfter:             firstNonEmpty(resetAt, formatTime(now.Add(30*time.Minute))),
 		RawSourceHash:          rawHash,
 		RedactedDiagnostics:    diag,
 		ConflictSet:            []string{},
@@ -519,37 +653,273 @@ func codexSnapshotFromItem(source QuotaTelemetrySource, installationID *string, 
 		UpdatedAt:              formatTime(now),
 		PolicyVersion:          PolicyVersion,
 	})
-	return snapshot
 }
 
-func codexQuotaVersionSupported(version string) bool {
-	parts := firstVersionParts(version)
-	if len(parts) == 0 {
-		return false
+func codexCreditsBalanceSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope, scopeLabel string, credits *codexCreditsSnapshot, rawHash string, now time.Time) QuotaSnapshot {
+	var remaining *int64
+	scale := 0
+	conf := ConfidenceUnknown
+	gaps := []string{}
+	if credits.Balance != nil {
+		if parsed, parsedScale, ok := parseScaledDecimal(*credits.Balance); ok {
+			remaining = &parsed
+			scale = parsedScale
+			conf = ConfidenceExact
+		} else {
+			gaps = append(gaps, "malformed-credit-balance")
+		}
+	} else if !credits.HasCredits && !credits.Unlimited {
+		zero := int64(0)
+		remaining = &zero
+		conf = ConfidenceExact
+	} else {
+		gaps = append(gaps, "missing-credit-balance")
 	}
-	if parts[0] > 0 {
-		return true
+	if credits.Unlimited {
+		gaps = append(gaps, "credits-unlimited")
 	}
-	if len(parts) > 1 && parts[1] >= 8 {
-		return true
-	}
-	return false
+	scope := codexScope(accountScope, scopeLabel, "credits")
+	return normalizeQuotaSnapshot(QuotaSnapshot{
+		QuotaSnapshotID:        quotaSnapshotID("codex", source.QuotaSourceID, scope, "credits_balance", formatTime(now)),
+		QuotaSourceID:          source.QuotaSourceID,
+		SourceKind:             source.SourceKind,
+		AdapterID:              "codex",
+		ProviderInstallationID: installationID,
+		ScopeKey:               scope,
+		QuantityKind:           QuantityProviderDefined,
+		ProviderQuantityName:   "credits_balance",
+		Unit:                   "credits",
+		WindowKind:             WindowUnbounded,
+		ResetSemantics:         ResetNone,
+		RemainingValue:         remaining,
+		ValueScale:             scale,
+		Confidence:             conf,
+		FieldConfidences:       map[string]Confidence{"limit_value": ConfidenceUnknown, "used_value": ConfidenceUnknown, "remaining_value": conf, "reset_at": ConfidenceUnknown},
+		FreshnessState:         FreshnessFresh,
+		CapturedAt:             formatTime(now),
+		StaleAfter:             formatTime(now.Add(30 * time.Minute)),
+		RawSourceHash:          rawHash,
+		RedactedDiagnostics:    fmt.Sprintf("codex app-server parser %s cli version %s protocol jsonl schema v2 credits balance", codexQuotaSourceSchema, safeSummary(cliVersion)),
+		ConflictSet:            []string{},
+		GapReasons:             gaps,
+		CreatedAt:              formatTime(now),
+		UpdatedAt:              formatTime(now),
+		PolicyVersion:          PolicyVersion,
+	})
 }
 
-func codexWindowKind(name string, fields map[string]any) (WindowKind, int64) {
-	period := normalizeQuotaName(firstNonEmpty(name, codexStringField(fields, "period", "window", "window_kind", "windowKind")))
-	switch {
-	case strings.Contains(period, "five") || strings.Contains(period, "5h") || strings.Contains(period, "5_hour"):
-		return WindowRolling, int64((5 * time.Hour).Milliseconds())
-	case strings.Contains(period, "week"):
-		return WindowFixedWeek, 0
-	case strings.Contains(period, "credit") || strings.Contains(period, "balance"):
-		return WindowUnbounded, 0
-	case period != "":
-		return WindowProviderDefined, 0
-	default:
+func codexResetCreditsSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope string, credits *codexRateLimitResetCreditsSummary, rawHash string, now time.Time) QuotaSnapshot {
+	count := credits.AvailableCount
+	validUntil := earliestCreditExpiry(credits.Credits)
+	return normalizeQuotaSnapshot(QuotaSnapshot{
+		QuotaSnapshotID:        quotaSnapshotID("codex", source.QuotaSourceID, codexScope(accountScope, "default", "reset_credits"), "rate_limit_reset_credits", formatTime(now)),
+		QuotaSourceID:          source.QuotaSourceID,
+		SourceKind:             source.SourceKind,
+		AdapterID:              "codex",
+		ProviderInstallationID: installationID,
+		ScopeKey:               codexScope(accountScope, "default", "reset_credits"),
+		QuantityKind:           QuantityProviderDefined,
+		ProviderQuantityName:   "rate_limit_reset_credits",
+		Unit:                   "credit",
+		WindowKind:             WindowUnbounded,
+		ResetSemantics:         ResetNone,
+		RemainingValue:         &count,
+		ValueScale:             0,
+		Confidence:             ConfidenceExact,
+		FieldConfidences:       map[string]Confidence{"limit_value": ConfidenceUnknown, "used_value": ConfidenceUnknown, "remaining_value": ConfidenceExact, "reset_at": ConfidenceUnknown},
+		FreshnessState:         FreshnessFresh,
+		CapturedAt:             formatTime(now),
+		ValidUntil:             validUntil,
+		StaleAfter:             firstNonEmpty(validUntil, formatTime(now.Add(30*time.Minute))),
+		RawSourceHash:          rawHash,
+		RedactedDiagnostics:    fmt.Sprintf("codex app-server parser %s cli version %s protocol jsonl schema v2 reset credits", codexQuotaSourceSchema, safeSummary(cliVersion)),
+		ConflictSet:            []string{},
+		GapReasons:             []string{},
+		CreatedAt:              formatTime(now),
+		UpdatedAt:              formatTime(now),
+		PolicyVersion:          PolicyVersion,
+	})
+}
+
+func codexIndividualLimitSnapshot(source QuotaTelemetrySource, installationID *string, cliVersion, accountScope, scopeLabel string, limit *codexSpendControlLimitSnapshot, rawHash string, now time.Time) QuotaSnapshot {
+	remaining, ok := boundedPercent(limit.RemainingPercent)
+	conf := ConfidenceUnknown
+	gaps := []string{}
+	if ok {
+		conf = ConfidenceExact
+	} else {
+		gaps = append(gaps, "missing-remaining-percent")
+	}
+	resetAt := codexUnixSecondsTime(limit.ResetsAt)
+	if resetAt == "" {
+		gaps = append(gaps, "missing-reset-at")
+	}
+	scope := codexScope(accountScope, scopeLabel, "individual_limit")
+	return normalizeQuotaSnapshot(QuotaSnapshot{
+		QuotaSnapshotID:        quotaSnapshotID("codex", source.QuotaSourceID, scope, "spend_control_remaining_percent", formatTime(now)),
+		QuotaSourceID:          source.QuotaSourceID,
+		SourceKind:             source.SourceKind,
+		AdapterID:              "codex",
+		ProviderInstallationID: installationID,
+		ScopeKey:               scope,
+		QuantityKind:           QuantityProviderDefined,
+		ProviderQuantityName:   "spend_control_remaining_percent",
+		Unit:                   "percent",
+		WindowKind:             WindowProviderDefined,
+		ResetAt:                resetAt,
+		ResetSemantics:         codexResetSemantics(resetAt, WindowProviderDefined),
+		RemainingValue:         remaining,
+		ValueScale:             0,
+		Confidence:             conf,
+		FieldConfidences:       map[string]Confidence{"limit_value": ConfidenceUnknown, "used_value": ConfidenceUnknown, "remaining_value": conf, "reset_at": confidenceForPresent(resetAt != "")},
+		FreshnessState:         FreshnessFresh,
+		CapturedAt:             formatTime(now),
+		ValidUntil:             resetAt,
+		StaleAfter:             firstNonEmpty(resetAt, formatTime(now.Add(30*time.Minute))),
+		RawSourceHash:          rawHash,
+		RedactedDiagnostics:    fmt.Sprintf("codex app-server parser %s cli version %s protocol jsonl schema v2 individual limit", codexQuotaSourceSchema, safeSummary(cliVersion)),
+		ConflictSet:            []string{},
+		GapReasons:             gaps,
+		CreatedAt:              formatTime(now),
+		UpdatedAt:              formatTime(now),
+		PolicyVersion:          PolicyVersion,
+	})
+}
+
+func codexWindowKindFromDuration(minutes *int64) (WindowKind, int64) {
+	if minutes == nil || *minutes <= 0 {
 		return WindowUnknown, 0
 	}
+	duration := time.Duration(*minutes) * time.Minute
+	switch *minutes {
+	case 300:
+		return WindowRolling, int64(duration.Milliseconds())
+	case 10080:
+		return WindowFixedWeek, int64(duration.Milliseconds())
+	default:
+		return WindowProviderDefined, int64(duration.Milliseconds())
+	}
+}
+
+func codexUnixSecondsTime(value *int64) string {
+	if value == nil || *value <= 0 {
+		return ""
+	}
+	return formatTime(time.Unix(*value, 0))
+}
+
+func boundedPercent(value *int64) (*int64, bool) {
+	if value == nil || *value < 0 || *value > 100 {
+		return nil, false
+	}
+	v := *value
+	return &v, true
+}
+
+func parseScaledDecimal(value string) (int64, int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, 0, false
+	}
+	sign := int64(1)
+	if strings.HasPrefix(value, "-") {
+		sign = -1
+		value = strings.TrimPrefix(value, "-")
+	}
+	whole, frac, hasFrac := strings.Cut(value, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if !allDigits(whole) || (hasFrac && !allDigits(frac)) {
+		return 0, 0, false
+	}
+	scale := 0
+	if hasFrac {
+		frac = strings.TrimRight(frac, "0")
+		scale = len(frac)
+	}
+	digits := whole + frac
+	if digits == "" {
+		digits = "0"
+	}
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return sign * n, scale, true
+}
+
+func allDigits(value string) bool {
+	if value == "" {
+		return true
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func earliestCreditExpiry(credits []codexRateLimitResetCredit) string {
+	var earliest *int64
+	for _, credit := range credits {
+		if credit.ExpiresAt == nil || *credit.ExpiresAt <= 0 {
+			continue
+		}
+		if earliest == nil || *credit.ExpiresAt < *earliest {
+			v := *credit.ExpiresAt
+			earliest = &v
+		}
+	}
+	return codexUnixSecondsTime(earliest)
+}
+
+func codexScope(accountScope, scopeLabel, detail string) string {
+	scope := "provider:codex"
+	if accountScope != "" && safeScopeToken(accountScope) {
+		scope += "/account:" + accountScope
+	}
+	if scopeLabel != "" && safeScopeToken(scopeLabel) {
+		scope += "/scope:" + scopeLabel
+	}
+	if detail != "" && safeScopeToken(detail) {
+		scope += "/detail:" + detail
+	}
+	return scope
+}
+
+func codexResetSemantics(resetAt string, windowKind WindowKind) ResetSemantics {
+	if resetAt == "" {
+		return ResetUnknown
+	}
+	if windowKind == WindowRolling {
+		return ResetRolling
+	}
+	return ResetProviderDefined
+}
+
+func confidenceForPresent(present bool) Confidence {
+	if present {
+		return ConfidenceExact
+	}
+	return ConfidenceUnknown
+}
+
+func codexStringPtr(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+func codexProtocolSummary(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+	lines := strings.Count(output, "\n") + 1
+	return fmt.Sprintf("codex app-server JSONL protocol messages retained as hash only; lines=%d bytes=%d", lines, len(output))
 }
 
 func codexAccountScope(account map[string]any) string {
@@ -563,43 +933,6 @@ func codexAccountScope(account map[string]any) string {
 		}
 	}
 	return "unknown"
-}
-
-func codexIntField(fields map[string]any, keys ...string) (*int64, bool) {
-	for _, key := range keys {
-		value, ok := fields[key]
-		if !ok {
-			continue
-		}
-		switch typed := value.(type) {
-		case float64:
-			if math.Trunc(typed) == typed {
-				n := int64(typed)
-				return &n, true
-			}
-		case string:
-			if n, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil {
-				return &n, true
-			}
-		case json.Number:
-			if n, err := typed.Int64(); err == nil {
-				return &n, true
-			}
-		}
-	}
-	return nil, false
-}
-
-func codexTimeField(fields map[string]any, keys ...string) string {
-	value := codexStringField(fields, keys...)
-	if value == "" {
-		return ""
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return ""
-	}
-	return formatTime(parsed)
 }
 
 func codexStringField(fields map[string]any, keys ...string) string {
@@ -649,28 +982,12 @@ func rawJSONFrames(frames []json.RawMessage) [][]byte {
 	return out
 }
 
-func normalizeQuotaName(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "_")
-	value = strings.ReplaceAll(value, "-", "_")
-	return value
-}
-
 func safeScopeToken(value string) bool {
 	value = strings.TrimSpace(value)
 	if value == "" || secretLike(value) || strings.ContainsAny(value, "/ \t\r\n:=") {
 		return false
 	}
 	return len(value) <= 80
-}
-
-func sortedMapKeys(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func codexQuotaReason(err error) string {

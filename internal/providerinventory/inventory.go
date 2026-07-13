@@ -744,6 +744,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	for _, adapter := range adapters {
 		quotaSource, quotaSnapshot := unsupportedQuotaTelemetryForAdapter(adapter, now)
 		adapterQuotaCollected := false
+		adapterQuotaAttempted := false
 		snapshot, capabilities, err := staticCatalogForAdapter(adapter, now)
 		if err != nil {
 			return Report{}, err
@@ -764,11 +765,12 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				if authProbe != nil {
 					probes = append(probes, *authProbe)
 				}
-				if adapter.AdapterID == "codex" && !adapterQuotaCollected {
+				if adapter.AdapterID == "codex" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectCodexQuota(ctx, discovery, adapter, candidate, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
 					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
 			} else {
@@ -792,7 +794,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			probes = append(probes, probe)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
 		}
-		if adapter.AdapterID != "codex" || !adapterQuotaCollected {
+		if adapter.AdapterID != "codex" || (!adapterQuotaCollected && !adapterQuotaAttempted) {
 			if adapter.AdapterID == "codex" {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
