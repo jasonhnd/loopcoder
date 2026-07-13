@@ -265,6 +265,20 @@ func quotaTelemetryFallbackForAdapter(adapter AdapterDeclaration, now time.Time,
 		environmentKeys = allowedProbeEnvKeys()
 		classificationRules = []string{"json-rpc-field-allowlist", "redact-before-truncate", "no-credential-material", "no-login-update-or-provider-work"}
 	}
+	if adapter.AdapterID == "claude" {
+		sourceKind = QuotaSourceOfficialCLIError
+		sourceKey = "claude-usage-rendered-status-v1"
+		sourceSchema = claudeQuotaSourceSchema
+		unsupportedReason = ""
+		sourceGaps = []string{"not-collected"}
+		supportedQuantities = []QuantityKind{QuantityProviderDefined}
+		supportedWindows = []WindowKind{WindowFixedWeek, WindowProviderDefined, WindowUnknown}
+		scopeDimensions = []string{"provider", "account", "scope"}
+		timeoutMS = int(claudeQuotaTimeout / time.Millisecond)
+		outputLimits = OutputLimits{StdoutBytes: claudeQuotaOutputBytes, StderrBytes: StderrLimitBytes, CombinedBytes: claudeQuotaOutputBytes + StderrLimitBytes, DecodedBytes: claudeQuotaOutputBytes}
+		environmentKeys = claudeQuotaEnvKeys()
+		classificationRules = []string{"rendered-status-allowlist", "ansi-normalized", "redact-before-truncate", "no-credential-material", "no-login-update-or-provider-work"}
+	}
 	if strings.TrimSpace(reason) == "" {
 		reason = "not-collected"
 	}
@@ -280,16 +294,22 @@ func quotaTelemetryFallbackForAdapter(adapter AdapterDeclaration, now time.Time,
 		SupportedWindows:    supportedWindows,
 		ScopeDimensions:     scopeDimensions,
 		ConfidenceContract:  map[string]Confidence{"limit_value": ConfidenceUnavailable, "used_value": ConfidenceUnavailable, "remaining_value": ConfidenceUnavailable, "reset_at": ConfidenceUnavailable},
-		NetworkDeclared:     adapter.AdapterID == "codex",
+		NetworkDeclared:     adapter.AdapterID == "codex" || adapter.AdapterID == "claude",
 		NetworkPermissionScope: func() string {
 			if adapter.AdapterID == "codex" {
 				return "provider:codex/action:quota-read/side-effect:read/freshness:interactive"
+			}
+			if adapter.AdapterID == "claude" {
+				return "provider:claude/action:quota-read/side-effect:read/freshness:interactive"
 			}
 			return ""
 		}(),
 		Argv: func() []string {
 			if adapter.AdapterID == "codex" {
 				return []string{"codex", "-s", "read-only", "-a", "untrusted", "app-server"}
+			}
+			if adapter.AdapterID == "claude" {
+				return claudeQuotaSourceArgv()
 			}
 			return nil
 		}(),
