@@ -8,7 +8,7 @@ type processActivityObservation struct {
 }
 
 func (o processActivityObservation) changedFrom(prev processActivityObservation) bool {
-	return o.available && prev.available && o.signature != prev.signature
+	return o.available && (!prev.available || o.signature != prev.signature)
 }
 
 func processPollInterval(timeout, logInterval time.Duration) time.Duration {

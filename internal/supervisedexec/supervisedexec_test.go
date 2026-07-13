@@ -204,6 +204,29 @@ func TestRunSilentProcessTreeActivityDoesNotStall(t *testing.T) {
 	}
 }
 
+func TestRunSilentCPUActiveChildDoesNotStall(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-cpu-child", logPath, "2500ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1200 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v (quiet CPU-active child must not stall)", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	if result.Elapsed < 2*time.Second {
+		t.Fatalf("Elapsed = %s, want >= 2s so CPU activity crossed the stall window", result.Elapsed)
+	}
+}
+
 func TestRunLoopCoderReceiptLogGrowthDoesNotResetStallClock(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
 	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
@@ -425,6 +448,16 @@ func TestWorktreePollIntervalDecouplesFromLogPollAtScale(t *testing.T) {
 	}
 	if walks >= logPolls/10 {
 		t.Fatalf("worktree walks = %d over %d log polls, want far less than log cadence", walks, logPolls)
+	}
+}
+
+func TestProcessActivityFirstAvailableCountsAsProgress(t *testing.T) {
+	current := processActivityObservation{available: true, signature: "123:S:0"}
+	if !current.changedFrom(processActivityObservation{}) {
+		t.Fatal("changedFrom = false, want first available process observation to count as progress")
+	}
+	if current.changedFrom(current) {
+		t.Fatal("changedFrom = true, want unchanged available process observation to be idle")
 	}
 }
 
@@ -699,6 +732,37 @@ func TestHelperProcess(t *testing.T) {
 				fmt.Fprintf(os.Stderr, "wait silent child: %v\n", err)
 				os.Exit(2)
 			}
+		}
+		os.Exit(code)
+	case "silent-cpu-child":
+		logPath := args[0]
+		childDuration := parseDuration(args[1])
+		code := parseInt(args[2])
+		appendLog(logPath, "first")
+		child := helperCommandForProcess("burn-cpu", childDuration.String(), "0")
+		child.Stdout = io.Discard
+		child.Stderr = io.Discard
+		if err := child.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "start cpu child: %v\n", err)
+			os.Exit(2)
+		}
+		if err := child.Wait(); err != nil {
+			fmt.Fprintf(os.Stderr, "wait cpu child: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(code)
+	case "burn-cpu":
+		duration := parseDuration(args[0])
+		code := parseInt(args[1])
+		deadline := time.Now().Add(duration)
+		var sum uint64
+		for time.Now().Before(deadline) {
+			sum += uint64(time.Now().UnixNano()) | 1
+			sum ^= sum << 7
+			sum ^= sum >> 3
+		}
+		if sum == 0 {
+			fmt.Fprintln(os.Stderr, "unreachable cpu sink")
 		}
 		os.Exit(code)
 	case "assert-arg":

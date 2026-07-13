@@ -22,6 +22,17 @@ type windowsKillGroup struct {
 	closed bool
 }
 
+type jobObjectBasicAccountingInformation struct {
+	TotalUserTime             windows.Filetime
+	TotalKernelTime           windows.Filetime
+	ThisPeriodTotalUserTime   windows.Filetime
+	ThisPeriodTotalKernelTime windows.Filetime
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
 func newKillGroup(runID string) killGroup {
 	g := &windowsKillGroup{}
 	var name *uint16
@@ -106,11 +117,23 @@ func (g *windowsKillGroup) activity() processActivityObservation {
 	if len(pids) == 0 {
 		return processActivityObservation{}
 	}
+	accounting := jobObjectBasicAccountingInformation{}
+	_ = windows.QueryInformationJobObject(
+		job,
+		windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&accounting)), // #nosec G103 -- documented Windows syscall interop for a local struct.
+		uint32(unsafe.Sizeof(accounting)),
+		&returned,
+	)
 	sort.Ints(pids)
 	parts := make([]string, 0, len(pids))
 	for _, pid := range pids {
 		parts = append(parts, fmt.Sprintf("%d", pid))
 	}
+	parts = append(parts,
+		fmt.Sprintf("user=%d:%d", accounting.TotalUserTime.HighDateTime, accounting.TotalUserTime.LowDateTime),
+		fmt.Sprintf("kernel=%d:%d", accounting.TotalKernelTime.HighDateTime, accounting.TotalKernelTime.LowDateTime),
+	)
 	return processActivityObservation{available: true, signature: strings.Join(parts, ",")}
 }
 
