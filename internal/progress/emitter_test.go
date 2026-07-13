@@ -505,6 +505,133 @@ func TestEmitterDeliveryFailureDoesNotSuppressPersistence(t *testing.T) {
 	}
 }
 
+func TestEmitterBlockingDeliveryDoesNotStallMaxSilencePersistenceOrStop(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(fixedTime)
+	store := newClockStore(t, ctx, clock)
+	defer store.Close()
+	entered := make(chan struct{}, 1)
+	deliver := func(ctx context.Context, _ ProgressReceipt) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_blocking_delivery_periodic",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+		Deliver:            deliver,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+
+	type emitOutcome struct {
+		result EmitResult
+		err    error
+	}
+	emitDone := make(chan emitOutcome, 1)
+	go func() {
+		result, err := emitter.Emit(ctx, runningObservation(clock.Now()))
+		emitDone <- emitOutcome{result: result, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("delivery callback did not start")
+	}
+
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 2)
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := emitter.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop while delivery blocked: %v", err)
+	}
+	outcome := <-emitDone
+	if outcome.err != nil {
+		t.Fatalf("Emit: %v", outcome.err)
+	}
+	if !outcome.result.DeliveryAttempted || outcome.result.DeliveryErr == nil {
+		t.Fatalf("Emit delivery result attempted=%v err=%v, want observable canceled delivery", outcome.result.DeliveryAttempted, outcome.result.DeliveryErr)
+	}
+	clock.Advance(30 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, ctx, store); got != 2 {
+		t.Fatalf("receipt count after stopped blocked-delivery emitter = %d, want 2", got)
+	}
+}
+
+func TestEmitterTerminalPersistsAndStopsWhileDeliveryBacklogged(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(fixedTime)
+	store := newClockStore(t, ctx, clock)
+	defer store.Close()
+	entered := make(chan struct{}, 1)
+	deliver := func(ctx context.Context, _ ProgressReceipt) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_blocking_delivery_terminal",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+		Deliver:            deliver,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	emitDone := make(chan error, 1)
+	go func() {
+		_, err := emitter.Emit(ctx, runningObservation(clock.Now()))
+		emitDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("delivery callback did not start")
+	}
+
+	terminalCtx, cancelTerminal := context.WithTimeout(context.Background(), time.Second)
+	defer cancelTerminal()
+	result, err := emitter.Terminal(terminalCtx, terminalObservation(clock.Now().Add(time.Minute)))
+	if err != nil {
+		t.Fatalf("Terminal while delivery backlogged: %v", err)
+	}
+	if result.DeliveryAttempted || !errors.Is(result.DeliveryErr, ErrDeliveryBacklog) {
+		t.Fatalf("terminal delivery result attempted=%v err=%v, want bounded backlog error", result.DeliveryAttempted, result.DeliveryErr)
+	}
+	if err := <-emitDone; err != nil {
+		t.Fatalf("initial Emit: %v", err)
+	}
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now().Add(2*time.Minute))); !errors.Is(err, ErrEmitterClosed) {
+		t.Fatalf("post-terminal Emit error = %v, want ErrEmitterClosed", err)
+	}
+	clock.Advance(30 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, ctx, store); got != 2 {
+		t.Fatalf("receipt count after terminal with delivery backlog = %d, want initial + terminal", got)
+	}
+}
+
 func TestEmitterCompatibilityKnownStatesEmitTruthfulActions(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, ctx)

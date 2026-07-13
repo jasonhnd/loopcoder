@@ -49,8 +49,10 @@ const (
 )
 
 var (
-	ErrEmitterConfig = errors.New("progress emitter config")
-	ErrEmitterClosed = errors.New("progress emitter closed")
+	ErrEmitterConfig    = errors.New("progress emitter config")
+	ErrEmitterClosed    = errors.New("progress emitter closed")
+	ErrDeliveryBacklog  = errors.New("progress delivery backlog")
+	errDeliveryCanceled = errors.New("progress delivery canceled")
 )
 
 type Clock interface {
@@ -161,6 +163,13 @@ type Emitter struct {
 	stopCh    chan struct{}
 	wakeupCh  chan struct{}
 	doneCh    chan struct{}
+
+	deliveryMu      sync.Mutex
+	deliveryStarted bool
+	deliveryStopped bool
+	deliverySem     chan struct{}
+	deliveryCtx     context.Context
+	deliveryCancel  context.CancelFunc
 }
 
 type Loop struct {
@@ -217,19 +226,24 @@ func newEmitterFromOptions(opts EmitterOptions, requireIdentity bool) (*Emitter,
 	if err != nil {
 		return nil, err
 	}
-	return &Emitter{
-		store:         opts.Store,
-		projectID:     projectID,
-		deliveryRunID: deliveryRunID,
-		runID:         firstNonEmpty(opts.RunID, deliveryRunID),
-		correlationID: firstNonEmpty(opts.CorrelationID, deliveryRunID),
-		interval:      interval,
-		clock:         clock,
-		deliver:       opts.Deliver,
-		stopCh:        make(chan struct{}),
-		wakeupCh:      make(chan struct{}, 1),
-		doneCh:        make(chan struct{}),
-	}, nil
+	deliveryCtx, deliveryCancel := context.WithCancel(context.Background())
+	emitter := &Emitter{
+		store:          opts.Store,
+		projectID:      projectID,
+		deliveryRunID:  deliveryRunID,
+		runID:          firstNonEmpty(opts.RunID, deliveryRunID),
+		correlationID:  firstNonEmpty(opts.CorrelationID, deliveryRunID),
+		interval:       interval,
+		clock:          clock,
+		deliver:        opts.Deliver,
+		stopCh:         make(chan struct{}),
+		wakeupCh:       make(chan struct{}, 1),
+		doneCh:         make(chan struct{}),
+		deliverySem:    make(chan struct{}, 1),
+		deliveryCtx:    deliveryCtx,
+		deliveryCancel: deliveryCancel,
+	}
+	return emitter, nil
 }
 
 type storeTickerClock struct {
@@ -299,18 +313,21 @@ func (e *Emitter) Stop(ctx context.Context) error {
 	e.mu.Lock()
 	started := e.started
 	e.mu.Unlock()
-	if !started {
-		return nil
+	var firstErr error
+	if started {
+		e.stopOnce.Do(func() {
+			close(e.stopCh)
+		})
+		select {
+		case <-e.doneCh:
+		case <-ctx.Done():
+			firstErr = ctx.Err()
+		}
 	}
-	e.stopOnce.Do(func() {
-		close(e.stopCh)
-	})
-	select {
-	case <-e.doneCh:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := e.stopDelivery(ctx); err != nil && firstErr == nil {
+		firstErr = err
 	}
+	return firstErr
 }
 
 func (e *Emitter) Emit(ctx context.Context, observation Observation) (EmitResult, error) {
@@ -376,19 +393,21 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 		return EmitResult{}, ErrEmitterClosed
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if e.closed {
+		e.mu.Unlock()
 		return EmitResult{}, ErrEmitterClosed
 	}
 	now := e.clock.Now().UTC()
 	if periodic {
 		if !e.hasLatest {
+			e.mu.Unlock()
 			return EmitResult{}, nil
 		}
 		observation = e.latest
 		observation.Terminal = false
 		if !e.lastDurableAt.IsZero() && now.Sub(e.lastDurableAt) < e.interval {
+			e.mu.Unlock()
 			return EmitResult{}, nil
 		}
 		if observationKey(observation) == e.lastObservationKey {
@@ -405,6 +424,7 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 		if periodic {
 			e.nextRetryAt = now.Add(e.periodicRetryDelay())
 		}
+		e.mu.Unlock()
 		return EmitResult{WriteResult: result}, err
 	}
 	if !periodic {
@@ -419,11 +439,101 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 	if observation.Terminal {
 		e.closed = true
 	}
+	terminal := observation.Terminal
+	e.mu.Unlock()
+
 	if e.deliver != nil {
-		out.DeliveryAttempted = true
-		out.DeliveryErr = e.deliver(ctx, result.Receipt)
+		waitForDelivery := !periodic && !terminal
+		out.DeliveryAttempted, out.DeliveryErr = e.deliverReceipt(ctx, result.Receipt, waitForDelivery)
 	}
 	return out, err
+}
+
+func (e *Emitter) deliverReceipt(ctx context.Context, receipt ProgressReceipt, wait bool) (bool, error) {
+	if e == nil || e.deliver == nil {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := e.markDeliveryStarted(); err != nil {
+		return false, err
+	}
+	select {
+	case <-e.deliveryCtx.Done():
+		return false, errDeliveryCanceled
+	case e.deliverySem <- struct{}{}:
+	default:
+		return false, ErrDeliveryBacklog
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		defer func() { <-e.deliverySem }()
+		deliveryCtx, cancel := mergedDeliveryContext(e.deliveryCtx, ctx)
+		defer cancel()
+		resultCh <- e.deliver(deliveryCtx, receipt)
+	}()
+	if !wait {
+		return true, nil
+	}
+	select {
+	case err := <-resultCh:
+		return true, err
+	case <-ctx.Done():
+		return true, ctx.Err()
+	case <-e.deliveryCtx.Done():
+		return true, errDeliveryCanceled
+	}
+}
+
+func (e *Emitter) markDeliveryStarted() error {
+	e.deliveryMu.Lock()
+	defer e.deliveryMu.Unlock()
+	if e.deliveryStopped {
+		return errDeliveryCanceled
+	}
+	e.deliveryStarted = true
+	return nil
+}
+
+func (e *Emitter) stopDelivery(ctx context.Context) error {
+	e.deliveryMu.Lock()
+	if !e.deliveryStarted {
+		e.deliveryMu.Unlock()
+		return nil
+	}
+	if !e.deliveryStopped {
+		e.deliveryStopped = true
+		e.deliveryCancel()
+	}
+	e.deliveryMu.Unlock()
+
+	select {
+	case e.deliverySem <- struct{}{}:
+		<-e.deliverySem
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func mergedDeliveryContext(root, request context.Context) (context.Context, context.CancelFunc) {
+	if root == nil {
+		root = context.Background()
+	}
+	ctx, cancel := context.WithCancel(root)
+	if request == nil {
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-request.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func (e *Emitter) nextSilenceDelay() time.Duration {
