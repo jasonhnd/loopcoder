@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	RoutingPolicyProfileSchema = "loopcoder.routing_policy_profile.v1"
-	PolicyInputSchema          = "loopcoder.routing_policy_input.v1"
-	LegacyModelMappingSchema   = "loopcoder.routing_legacy_model_mapping.v1"
-	RoutingPolicyVersion       = "0804.routing-policy.v1"
+	RoutingPolicyProfileSchema  = "loopcoder.routing_policy_profile.v1"
+	PolicyInputSchema           = "loopcoder.routing_policy_input.v1"
+	LegacyModelMappingSchema    = "loopcoder.routing_legacy_model_mapping.v1"
+	RoutingPolicyVersion        = "0804.routing-policy.v1"
+	builtInProfileEffectiveFrom = "1970-01-01T00:00:00Z"
 
 	ProfileKeyFast     = "fast-v1"
 	ProfileKeyBalanced = "balanced-v1"
@@ -189,20 +190,18 @@ type LegacyModelMapping struct {
 	UpdatedAt               string                     `json:"updated_at"`
 }
 
-func BuiltInRoutingPolicyProfiles(now time.Time) []RoutingPolicyProfile {
-	if now.IsZero() {
-		now = time.Unix(0, 0).UTC()
-	}
+func BuiltInRoutingPolicyProfiles(_ time.Time) []RoutingPolicyProfile {
+	effectiveAt := time.Unix(0, 0).UTC()
 	return []RoutingPolicyProfile{
-		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyFast, now, map[ComponentName]int{
+		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyFast, effectiveAt, map[ComponentName]int{
 			ComponentAvailability: 35, ComponentQuotaHeadroom: 20, ComponentQualityFit: 15, ComponentLatency: 20, ComponentCost: 10,
 		}, planner.GraphBounds{
 			MaxTasks: 16, MaxDepth: 3, MaxFanOut: 6, MaxDependenciesPerTask: 6, MaxParallelReady: 4, MaxReplanPasses: 1, MaxGraphValidationMS: 3000, MaxRequirementBytes: 32768, MaxScopePathsPerTask: 64,
 		}, taskrequirements.IndependenceDifferentAccount, taskrequirements.QualityStandard)),
-		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyBalanced, now, map[ComponentName]int{
+		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyBalanced, effectiveAt, map[ComponentName]int{
 			ComponentAvailability: 30, ComponentQuotaHeadroom: 20, ComponentQualityFit: 20, ComponentLatency: 10, ComponentCost: 10, ComponentDiversity: 10,
 		}, planner.DefaultGraphBounds(), taskrequirements.IndependenceDifferentProvider, taskrequirements.QualityStrong)),
-		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyDeep, now, map[ComponentName]int{
+		normalizeRoutingPolicyProfile(profileTemplate(ProfileKeyDeep, effectiveAt, map[ComponentName]int{
 			ComponentAvailability: 15, ComponentQuotaHeadroom: 15, ComponentQualityFit: 35, ComponentLatency: 5, ComponentCost: 10, ComponentDiversity: 20,
 		}, planner.HardGraphBounds(), taskrequirements.IndependenceDifferentProvider, taskrequirements.QualityAdversarial)),
 	}
@@ -240,6 +239,9 @@ func PersistRoutingPolicyProfile(ctx context.Context, store storage.Store, profi
 		return RoutingPolicyProfile{}, err
 	}
 	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if err := verifyProfileRoleReferences(ctx, tx, profile); err != nil {
+			return err
+		}
 		result, err := tx.Exec(ctx, `INSERT INTO routing_policy_profiles(
 			routing_policy_profile_id, schema_version, record_version, profile_key, profile_version, policy_version,
 			policy_fingerprint, payload_json, provenance_json, effective_from, supersedes_profile_id, created_at
@@ -285,10 +287,108 @@ func LoadRoutingPolicyProfile(ctx context.Context, store storage.Store, id strin
 }
 
 func EnsureBuiltInRoutingPolicyProfiles(ctx context.Context, store storage.Store, now time.Time) ([]RoutingPolicyProfile, error) {
+	if _, err := EnsureBuiltInRoleDefinitions(ctx, store, now); err != nil {
+		return nil, err
+	}
 	profiles := BuiltInRoutingPolicyProfiles(now)
 	out := make([]RoutingPolicyProfile, 0, len(profiles))
 	for _, profile := range profiles {
 		stored, err := PersistRoutingPolicyProfile(ctx, store, profile)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, stored)
+	}
+	return out, nil
+}
+
+func PersistRoleDefinition(ctx context.Context, store storage.Store, role RoleDefinition, now time.Time) (RoleDefinition, error) {
+	if store == nil {
+		return RoleDefinition{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
+	}
+	role = normalizeRoleDefinition(role)
+	if err := ValidateRoleDefinition(role); err != nil {
+		return RoleDefinition{}, err
+	}
+	if now.IsZero() {
+		now = time.Unix(0, 0).UTC()
+	}
+	payload, err := delivery.CanonicalJSON(role)
+	if err != nil {
+		return RoleDefinition{}, err
+	}
+	fingerprint := delivery.SHA256Digest(payload)
+	provenance, err := delivery.CanonicalJSON(map[string]string{
+		"source_kind":      "built-in",
+		"source_reference": "docs/specs/0804-decomposition-routing.md",
+		"source_hash":      fingerprint,
+	})
+	if err != nil {
+		return RoleDefinition{}, err
+	}
+	createdAt := delivery.CanonicalTimestamp(now.UTC())
+	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		result, err := tx.Exec(ctx, `INSERT INTO role_definitions(
+			role_definition_id, schema_version, record_version, role_key, role_version, policy_version,
+			payload_json, payload_fingerprint, provenance_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(role_definition_id) DO NOTHING`,
+			role.RoleDefinitionID, role.SchemaVersion, role.RecordVersion, role.RoleKey, role.RoleVersion, role.PolicyVersion,
+			string(payload), fingerprint, string(provenance), createdAt)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil || affected != 0 {
+			return err
+		}
+		var existing string
+		if err := tx.QueryRow(ctx, `SELECT payload_json FROM role_definitions WHERE role_definition_id = ?`, role.RoleDefinitionID).Scan(&existing); err != nil {
+			return err
+		}
+		if existing != string(payload) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrDuplicateRecordCode, Message: "role definition id already exists with different payload"}
+		}
+		return nil
+	})
+	if err != nil {
+		return RoleDefinition{}, err
+	}
+	return LoadRoleDefinition(ctx, store, role.RoleDefinitionID)
+}
+
+func LoadRoleDefinition(ctx context.Context, store storage.Store, id string) (RoleDefinition, error) {
+	if store == nil {
+		return RoleDefinition{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
+	}
+	var payload string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM role_definitions WHERE role_definition_id = ?`, strings.TrimSpace(id)).Scan(&payload)
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RoleDefinition{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "role definition was not persisted"}
+		}
+		return RoleDefinition{}, err
+	}
+	var role RoleDefinition
+	if err := json.Unmarshal([]byte(payload), &role); err != nil {
+		return RoleDefinition{}, err
+	}
+	if err := ValidateRoleDefinition(role); err != nil {
+		return RoleDefinition{}, err
+	}
+	return role, nil
+}
+
+func EnsureBuiltInRoleDefinitions(ctx context.Context, store storage.Store, now time.Time) ([]RoleDefinition, error) {
+	if now.IsZero() {
+		now = time.Unix(0, 0).UTC()
+	}
+	roles := BuiltInRoleDefinitions()
+	out := make([]RoleDefinition, 0, len(roles))
+	for _, role := range roles {
+		stored, err := PersistRoleDefinition(ctx, store, role, now)
 		if err != nil {
 			return nil, err
 		}
@@ -372,6 +472,44 @@ func LoadPolicyInput(ctx context.Context, store storage.Store, id string) (Polic
 	return record, nil
 }
 
+func LoadActivePolicyInputs(ctx context.Context, store storage.Store, projectID, deliveryRunID, routingPolicyProfileID string) ([]PolicyInputRecord, error) {
+	if store == nil {
+		return nil, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
+	}
+	var payloads []string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT payload_json FROM routing_policy_inputs
+			WHERE project_id = ? AND routing_policy_profile_id = ? AND status = ?
+				AND (delivery_run_id = ? OR delivery_run_id IS NULL)
+			ORDER BY routing_policy_input_id`,
+			strings.TrimSpace(projectID), strings.TrimSpace(routingPolicyProfileID), PolicyInputStatusActive, strings.TrimSpace(deliveryRunID))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				return err
+			}
+			payloads = append(payloads, payload)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PolicyInputRecord, 0, len(payloads))
+	for _, payload := range payloads {
+		var record PolicyInputRecord
+		if err := json.Unmarshal([]byte(payload), &record); err != nil {
+			return nil, err
+		}
+		out = append(out, record)
+	}
+	return out, nil
+}
+
 func ValidatePolicyInputs(inventory providerinventory.Report, pins []Pin, exclusions []Exclusion, policyFingerprint string, now time.Time) []PolicyDiagnostic {
 	var diagnostics []PolicyDiagnostic
 	for _, pin := range pins {
@@ -384,8 +522,16 @@ func ValidatePolicyInputs(inventory providerinventory.Report, pins []Pin, exclus
 	return diagnostics
 }
 
-func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time) []PolicyDiagnostic {
+func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time, activeBindings ...string) []PolicyDiagnostic {
 	var diagnostics []PolicyDiagnostic
+	activePolicyFingerprint := ""
+	activeAuthorizationFingerprint := ""
+	if len(activeBindings) > 0 {
+		activePolicyFingerprint = strings.TrimSpace(activeBindings[0])
+	}
+	if len(activeBindings) > 1 {
+		activeAuthorizationFingerprint = strings.TrimSpace(activeBindings[1])
+	}
 	for _, override := range overrides {
 		id := strings.TrimSpace(override.OverrideID)
 		if strings.TrimSpace(override.Reason) == "" {
@@ -396,6 +542,13 @@ func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time) [
 		}
 		if strings.TrimSpace(override.PolicyFingerprint) == "" || !strings.HasPrefix(override.PolicyFingerprint, "sha256:") {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrStaleApprovalCode), "stale", "policy_fingerprint", id, "override must bind to the active policy fingerprint", nil, "re-approve against the current policy fingerprint"))
+		} else if activePolicyFingerprint != "" && override.PolicyFingerprint != activePolicyFingerprint {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrRoutingFingerprintMismatchCode, "stale", "policy_fingerprint", id, "override policy fingerprint does not match the active routing policy fingerprint", nil, "re-approve against the current policy fingerprint"))
+		}
+		if strings.TrimSpace(override.AuthorizationFingerprint) == "" || !strings.HasPrefix(override.AuthorizationFingerprint, "sha256:") {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrStaleApprovalCode), "stale", "authorization_fingerprint", id, "override must bind to the current authorization fingerprint", nil, "re-approve against the current authorization binding"))
+		} else if activeAuthorizationFingerprint == "" || override.AuthorizationFingerprint != activeAuthorizationFingerprint {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrRoutingFingerprintMismatchCode, "stale", "authorization_fingerprint", id, "override authorization fingerprint does not match the current authorization binding", nil, "re-approve against the current authorization binding"))
 		}
 		if override.Actor.ActorID == "" || override.Actor.ActorKind != "user" {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "actor", id, "override requires a user actor", nil, "record the user actor that granted the override"))
@@ -409,6 +562,9 @@ func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time) [
 		}
 		if isHardGateOverride(override.OverrideKind, override.Scope) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrPolicyDeniedCode), "invalid", "override_kind", id, "override cannot weaken hard eligibility, permission, side-effect, scope, approval, independence, budget, or release gates", nil, "change the plan or choose an eligible route instead"))
+		}
+		if !supportedBoundedOverride(override.OverrideKind, override.Scope) {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "override_kind", id, "unsupported routing override kind or scope", nil, "use a bounded routing, fallback, replan, or budget preference override"))
 		}
 	}
 	sortDiagnostics(diagnostics)
@@ -468,11 +624,29 @@ func ValidateRoutingPolicyProfile(profile RoutingPolicyProfile) error {
 	if profile.SchemaVersion != RoutingPolicyProfileSchema || profile.RecordVersion != 1 || profile.RoutingPolicyProfileID == "" || profile.ProfileKey == "" || profile.ProfileVersion == "" || profile.PolicyVersion == "" || profile.PolicyFingerprint == "" {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile has missing required fields"}
 	}
+	if want := routingProfileID(profile.ProfileKey, profile.ProfileVersion, profile.PolicyVersion); profile.RoutingPolicyProfileID != want {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile id does not match profile key, version, and policy version"}
+	}
 	if _, err := time.Parse(time.RFC3339Nano, profile.EffectiveFrom); err != nil {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile effective_from must be RFC3339"}
 	}
+	if len(profile.RoleDefinitionIDs) == 0 || len(profile.RiskPolicy) == 0 || len(profile.VerifierSeparation) == 0 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile requires role, risk, and verifier policies"}
+	}
+	if profile.GraphBounds.MaxTasks <= 0 || profile.GraphBounds.MaxDepth <= 0 || profile.GraphBounds.MaxReplanPasses < 0 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile graph bounds are invalid"}
+	}
 	if _, err := normalizeOptimizationPolicy(profile.OptimizationPolicy, profile.RoutingPolicyProfileID); err != nil {
 		return err
+	}
+	if profile.EligibilityPolicy.EvidencePolicy == "" || profile.FallbackPolicy.PolicyVersion == "" || profile.ReplanPolicy.PolicyVersion == "" || profile.UserPinPolicy.PolicyVersion == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile has missing hard policy fields"}
+	}
+	if profile.Provenance.SourceKind == "" || profile.Provenance.SourceReference == "" || profile.Provenance.CreatedBy == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile provenance is required"}
+	}
+	if want := profileFingerprint(profile); profile.PolicyFingerprint != want {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing policy profile fingerprint does not match canonical payload"}
 	}
 	return nil
 }
@@ -597,7 +771,7 @@ func profileTemplate(key string, now time.Time, weights map[ComponentName]int, b
 			taskrequirements.RiskCritical: taskrequirements.IndependenceHuman,
 		},
 		Provenance:    ProfileProvenance{SourceKind: "built-in", SourceReference: "docs/specs/0804-decomposition-routing.md", CreatedBy: "loopcoder"},
-		EffectiveFrom: delivery.CanonicalTimestamp(now.UTC()),
+		EffectiveFrom: builtInProfileEffectiveFrom,
 	}
 }
 
@@ -688,7 +862,7 @@ func validatePolicyInput(record PolicyInputRecord) error {
 	if record.SchemaVersion != PolicyInputSchema || record.RecordVersion != 1 || record.RoutingPolicyInputID == "" || record.InputKind == "" || record.ProjectID == "" || record.RoutingPolicyProfileID == "" || record.PolicyFingerprint == "" || record.Scope == "" || record.Reason == "" {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy input has missing required fields"}
 	}
-	if record.Actor.ActorID == "" || record.Actor.ActorKind == "" || record.Host.HostID == "" {
+	if record.Actor.ActorID == "" || record.Actor.ActorKind != "user" || record.Host.HostID == "" {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy input requires actor and host provenance"}
 	}
 	if record.InputKind != PolicyInputKindPin && record.InputKind != PolicyInputKindExclusion {
@@ -772,6 +946,9 @@ func validateConstraint(kind, id string, c CandidateConstraint, inventory provid
 			}
 		}
 	}
+	if c.InvocationProfileKey != "" && strings.TrimSpace(c.InvocationProfileKey) == "" {
+		diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "invocation_profile_key", id, "invocation profile key must not be blank", nil, "record a concrete invocation profile key"))
+	}
 	return diagnostics
 }
 
@@ -822,6 +999,175 @@ func isHardGateOverride(kind, scope string) bool {
 		}
 	}
 	return false
+}
+
+func supportedBoundedOverride(kind, scope string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if kind == "" || scope == "" {
+		return false
+	}
+	for _, allowedKind := range []string{"routing", "routing-preference", "fallback", "fallback-preference", "replan", "budget", "budget-preference"} {
+		if kind == allowedKind {
+			for _, allowedScope := range []string{"routing-preference", "fallback-preference", "replan", "budget-preference", "task:", "run:"} {
+				if strings.Contains(scope, allowedScope) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func verifyProfileRoleReferences(ctx context.Context, tx storage.Tx, profile RoutingPolicyProfile) error {
+	for _, roleID := range profile.RoleDefinitionIDs {
+		roleID = strings.TrimSpace(roleID)
+		if roleID == "" {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy profile references an empty role definition id"}
+		}
+		var existing string
+		if err := tx.QueryRow(ctx, `SELECT role_definition_id FROM role_definitions WHERE role_definition_id = ?`, roleID).Scan(&existing); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "routing policy profile references missing role definition " + roleID}
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStoredPolicyInputsForDecision(records []PolicyInputRecord, input DecisionInput, profileID, policyFingerprint string) error {
+	now := input.Now
+	for _, record := range records {
+		if err := validatePolicyInput(record); err != nil {
+			return err
+		}
+		if record.Status != PolicyInputStatusActive || record.ValidationStatus != ValidationStatusValid {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing policy input is not active and valid"}
+		}
+		if record.ProjectID != input.ProjectID || (record.DeliveryRunID != "" && record.DeliveryRunID != input.DeliveryRunID) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrCrossProjectReferenceCode, Message: "routing policy input project/run does not match decision"}
+		}
+		if record.RoutingPolicyProfileID != profileID {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing policy input profile does not match active profile"}
+		}
+		if record.PolicyFingerprint != policyFingerprint {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "routing policy input fingerprint does not match active policy fingerprint"}
+		}
+		if record.ExpiresAt != "" {
+			expiresAt, err := time.Parse(time.RFC3339Nano, record.ExpiresAt)
+			if err != nil || (!now.IsZero() && !expiresAt.After(now.UTC())) {
+				return &taskrequirements.TypedError{Code: taskrequirements.ErrorCode(delivery.ErrExpiredApprovalCode), Message: "routing policy input is expired"}
+			}
+		}
+		diagnostics := ValidatePolicyInputs(input.Inputs.Inventory, pinsForRecord(record), exclusionsForRecord(record), policyFingerprint, now)
+		diagnostics = append(diagnostics, validateInvocationProfileConstraint(record, input.Inputs.Candidates)...)
+		sortDiagnostics(diagnostics)
+		if len(diagnostics) > 0 {
+			return &taskrequirements.TypedError{Code: diagnostics[0].Code, Message: diagnostics[0].Message}
+		}
+	}
+	return nil
+}
+
+func validateInvocationProfileConstraint(record PolicyInputRecord, candidates []Candidate) []PolicyDiagnostic {
+	key := strings.TrimSpace(record.Constraint.InvocationProfileKey)
+	if key == "" {
+		return nil
+	}
+	if len(candidates) == 0 {
+		if key == "default" {
+			return nil
+		}
+		return []PolicyDiagnostic{policyDiag(taskrequirements.ErrMissingReferenceCode, "invalid", "invocation_profile_key", key, "invocation profile is not present in current routing candidates", nil, "refresh routing inventory or remove the stale invocation profile constraint")}
+	}
+	for _, candidate := range candidates {
+		if matchesSelector(candidate, record.Constraint.AdapterID, record.Constraint.ProviderInstallationID, record.Constraint.AccountProfileID, record.Constraint.ModelCapabilityID, record.Constraint.InvocationProfileKey) && strings.TrimSpace(candidate.InvocationProfileKey) == key {
+			return nil
+		}
+	}
+	return []PolicyDiagnostic{policyDiag(taskrequirements.ErrMissingReferenceCode, "invalid", "invocation_profile_key", key, "invocation profile is not present in current routing candidates", nil, "refresh routing inventory or remove the stale invocation profile constraint")}
+}
+
+func requireCallerInputsPersisted(pins []Pin, exclusions []Exclusion, records []PolicyInputRecord) error {
+	for _, pin := range pins {
+		if !storedConstraintExists(PolicyInputKindPin, constraintFromPin(pin), records) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "caller-supplied pin is not backed by an active persisted policy input"}
+		}
+	}
+	for _, exclusion := range exclusions {
+		if !storedConstraintExists(PolicyInputKindExclusion, constraintFromExclusion(exclusion), records) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "caller-supplied exclusion is not backed by an active persisted policy input"}
+		}
+	}
+	return nil
+}
+
+func storedConstraintExists(kind string, constraint CandidateConstraint, records []PolicyInputRecord) bool {
+	for _, record := range records {
+		if record.InputKind == kind && sameConstraint(record.Constraint, constraint) {
+			return true
+		}
+	}
+	return false
+}
+
+func constraintsFromPolicyInputRecords(records []PolicyInputRecord) ([]Pin, []Exclusion) {
+	pins := []Pin{}
+	exclusions := []Exclusion{}
+	for _, record := range records {
+		switch record.InputKind {
+		case PolicyInputKindPin:
+			pins = append(pins, pinForRecord(record))
+		case PolicyInputKindExclusion:
+			exclusions = append(exclusions, exclusionForRecord(record))
+		}
+	}
+	return pins, exclusions
+}
+
+func pinsForRecord(record PolicyInputRecord) []Pin {
+	if record.InputKind != PolicyInputKindPin {
+		return nil
+	}
+	return []Pin{pinForRecord(record)}
+}
+
+func exclusionsForRecord(record PolicyInputRecord) []Exclusion {
+	if record.InputKind != PolicyInputKindExclusion {
+		return nil
+	}
+	return []Exclusion{exclusionForRecord(record)}
+}
+
+func pinForRecord(record PolicyInputRecord) Pin {
+	return Pin{
+		PinID:                  record.RoutingPolicyInputID,
+		AdapterID:              record.Constraint.AdapterID,
+		ProviderInstallationID: record.Constraint.ProviderInstallationID,
+		AccountProfileID:       record.Constraint.AccountProfileID,
+		ModelCapabilityID:      record.Constraint.ModelCapabilityID,
+		InvocationProfileKey:   record.Constraint.InvocationProfileKey,
+	}
+}
+
+func exclusionForRecord(record PolicyInputRecord) Exclusion {
+	return Exclusion{
+		ExclusionID:            record.RoutingPolicyInputID,
+		AdapterID:              record.Constraint.AdapterID,
+		ProviderInstallationID: record.Constraint.ProviderInstallationID,
+		AccountProfileID:       record.Constraint.AccountProfileID,
+		ModelCapabilityID:      record.Constraint.ModelCapabilityID,
+		InvocationProfileKey:   record.Constraint.InvocationProfileKey,
+	}
+}
+
+func sameConstraint(a, b CandidateConstraint) bool {
+	return strings.TrimSpace(a.AdapterID) == strings.TrimSpace(b.AdapterID) &&
+		strings.TrimSpace(a.ProviderInstallationID) == strings.TrimSpace(b.ProviderInstallationID) &&
+		strings.TrimSpace(a.AccountProfileID) == strings.TrimSpace(b.AccountProfileID) &&
+		strings.TrimSpace(a.ModelCapabilityID) == strings.TrimSpace(b.ModelCapabilityID) &&
+		strings.TrimSpace(a.InvocationProfileKey) == strings.TrimSpace(b.InvocationProfileKey)
 }
 
 func legacyModelMapping(projectID, roleKey, provider, modelName, effort string, inventory providerinventory.Report, policyFingerprint string, now time.Time) LegacyModelMapping {

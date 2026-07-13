@@ -53,6 +53,9 @@ func TestRoutingPolicyProfilePersistenceIsReplaySafeAndVersioned(t *testing.T) {
 	}
 	defer store.Close()
 	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	if _, err := EnsureBuiltInRoleDefinitions(ctx, store, fixture.now); err != nil {
+		t.Fatalf("EnsureBuiltInRoleDefinitions: %v", err)
+	}
 
 	balanced := BalancedRoutingPolicyProfile(fixture.now)
 	first, err := PersistRoutingPolicyProfile(ctx, store, balanced)
@@ -87,6 +90,57 @@ func TestRoutingPolicyProfilePersistenceIsReplaySafeAndVersioned(t *testing.T) {
 	}
 	if loadedFirst.PolicyFingerprint != first.PolicyFingerprint {
 		t.Fatalf("first profile history was rewritten: got %s want %s", loadedFirst.PolicyFingerprint, first.PolicyFingerprint)
+	}
+}
+
+func TestRoutingPolicyProfileRejectsMutatedPayloadWithTrustedFingerprint(t *testing.T) {
+	fixture := newFixture(t)
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	mutated := profile
+	mutated.GraphBounds.MaxTasks++
+	if err := ValidateRoutingPolicyProfile(mutated); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("ValidateRoutingPolicyProfile error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfile = mutated
+	if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("BuildRoutingDecision error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestEnsureBuiltInRoutingPolicyProfilesIsRestartIdempotentAcrossClocks(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	path := tempDB(t)
+	store, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	first, err := EnsureBuiltInRoutingPolicyProfiles(ctx, store, fixture.now)
+	if err != nil {
+		t.Fatalf("EnsureBuiltInRoutingPolicyProfiles first: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close first store: %v", err)
+	}
+	later := fixture.now.Add(48 * time.Hour)
+	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return later }})
+	if err != nil {
+		t.Fatalf("reopen storage: %v", err)
+	}
+	defer reopened.Close()
+	second, err := EnsureBuiltInRoutingPolicyProfiles(ctx, reopened, later)
+	if err != nil {
+		t.Fatalf("EnsureBuiltInRoutingPolicyProfiles second: %v", err)
+	}
+	if len(first) != len(second) {
+		t.Fatalf("profile count changed: first=%d second=%d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].RoutingPolicyProfileID != second[i].RoutingPolicyProfileID || first[i].PolicyFingerprint != second[i].PolicyFingerprint || first[i].EffectiveFrom != second[i].EffectiveFrom {
+			t.Fatalf("built-in profile changed across restart:\nfirst=%#v\nsecond=%#v", first[i], second[i])
+		}
 	}
 }
 
@@ -162,6 +216,41 @@ func TestOverrideProvenanceCannotBypassHardGates(t *testing.T) {
 	}
 }
 
+func TestOverrideProvenanceRequiresExactActiveBindingsThroughRouting(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfile = profile
+	input.AuthorizationFingerprint = testFingerprint("auth")
+	input.OverrideProvenance = []OverrideProvenance{{
+		OverrideID:               "ovr-routing",
+		OverrideKind:             "routing",
+		Reason:                   "prefer a bounded route",
+		Scope:                    "routing-preference task-a",
+		ExpiresAt:                "2026-07-14T00:00:00Z",
+		PolicyFingerprint:        testFingerprint("wrong-policy-but-well-formed"),
+		AuthorizationFingerprint: testFingerprint("auth"),
+		Actor:                    delivery.Actor{ActorKind: "user", ActorID: "user-1", DecisionAuthority: "user", Source: "test"},
+		Host:                     routingHost(),
+	}}
+	if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("BuildRoutingDecision wrong policy error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+	input.OverrideProvenance[0].PolicyFingerprint = profile.PolicyFingerprint
+	input.OverrideProvenance[0].AuthorizationFingerprint = testFingerprint("wrong-auth-but-well-formed")
+	if _, err := DecideAndPersistRoute(ctx, store, input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("DecideAndPersistRoute wrong auth error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
 func TestLegacyModelMigrationMapsOnlyDeterministicSettings(t *testing.T) {
 	fixture := newFixture(t)
 	mappings := LegacyModelMappingsFromConfig("proj-routing", config.Config{
@@ -193,6 +282,7 @@ func TestProfileAwareExplainNamesProfileAndSafeOverrideProvenance(t *testing.T) 
 	input := replayDecisionInput(fixture)
 	profile := BalancedRoutingPolicyProfile(fixture.now)
 	input.RoutingPolicyProfile = profile
+	input.AuthorizationFingerprint = testFingerprint("auth")
 	input.OverrideProvenance = []OverrideProvenance{{
 		OverrideID:               "ovr-routing",
 		OverrideKind:             "routing",
@@ -227,6 +317,113 @@ func TestProfileAwareExplainNamesProfileAndSafeOverrideProvenance(t *testing.T) 
 	}
 	if !strings.Contains(string(stable), `"routing_policy_profile"`) || !strings.Contains(string(stable), `"override_provenance"`) {
 		t.Fatalf("stable explain JSON missing profile/override provenance: %s", stable)
+	}
+}
+
+func TestDecideAndPersistRouteRequiresPersistedCurrentPolicyInputs(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	if _, err := EnsureBuiltInRoleDefinitions(ctx, store, fixture.now); err != nil {
+		t.Fatalf("EnsureBuiltInRoleDefinitions: %v", err)
+	}
+	if _, err := PersistRoutingPolicyProfile(ctx, store, profile); err != nil {
+		t.Fatalf("PersistRoutingPolicyProfile: %v", err)
+	}
+
+	input := replayDecisionInput(fixture)
+	input.RoutingPolicyProfile = profile
+	input.Inputs.Pins = []Pin{{PinID: "caller-only", ModelCapabilityID: "codex-good"}}
+	if _, err := DecideAndPersistRoute(ctx, store, input); !errors.Is(err, taskrequirements.ErrMissingReference) {
+		t.Fatalf("caller-only pin error = %v, want ErrMissingReference", err)
+	}
+
+	stored, err := PersistPolicyInput(ctx, store, PolicyInputRecord{
+		InputKind:              PolicyInputKindPin,
+		ProjectID:              input.ProjectID,
+		DeliveryRunID:          input.DeliveryRunID,
+		RoutingPolicyProfileID: profile.RoutingPolicyProfileID,
+		PolicyFingerprint:      profile.PolicyFingerprint,
+		Scope:                  "task:task-a",
+		Reason:                 "operator pins this task to the codex-good model",
+		Constraint:             CandidateConstraint{ModelCapabilityID: "codex-good"},
+		Actor:                  delivery.Actor{ActorKind: "user", ActorID: "user-1", DecisionAuthority: "user", Source: "test"},
+		Host:                   routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("PersistPolicyInput current pin: %v", err)
+	}
+	input.DecisionKey = "route-stored-pin"
+	input.Inputs.Pins = nil
+	decision, err := DecideAndPersistRoute(ctx, store, input)
+	if err != nil {
+		t.Fatalf("DecideAndPersistRoute with stored pin: %v", err)
+	}
+	if len(decision.PolicyInputRecords) != 1 || decision.PolicyInputRecords[0].RoutingPolicyInputID != stored.RoutingPolicyInputID || decision.ChosenCandidateID == "" {
+		t.Fatalf("decision did not load stored policy input: %#v", decision)
+	}
+
+	staleInput := replayDecisionInput(fixture)
+	staleInput.DecisionKey = "route-stale-pin"
+	staleInput.RoutingPolicyProfile = profile
+	_, err = PersistPolicyInput(ctx, store, PolicyInputRecord{
+		InputKind:              PolicyInputKindExclusion,
+		ProjectID:              staleInput.ProjectID,
+		DeliveryRunID:          staleInput.DeliveryRunID,
+		RoutingPolicyProfileID: profile.RoutingPolicyProfileID,
+		PolicyFingerprint:      testFingerprint("stale-policy"),
+		Scope:                  "task:task-a",
+		Reason:                 "stale exclusion should fail before scoring",
+		Constraint:             CandidateConstraint{ModelCapabilityID: "claude-good"},
+		Actor:                  delivery.Actor{ActorKind: "user", ActorID: "user-2", DecisionAuthority: "user", Source: "test"},
+		Host:                   routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("PersistPolicyInput stale exclusion setup: %v", err)
+	}
+	if _, err := DecideAndPersistRoute(ctx, store, staleInput); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("stale stored input error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestRoleDefinitionPersistenceReplayConflictAndProfileReferences(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	role := BuiltInRoleDefinitions()[0]
+	first, err := PersistRoleDefinition(ctx, store, role, fixture.now)
+	if err != nil {
+		t.Fatalf("PersistRoleDefinition first: %v", err)
+	}
+	replayed, err := PersistRoleDefinition(ctx, store, role, fixture.now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("PersistRoleDefinition replay: %v", err)
+	}
+	if first.RoleDefinitionID != replayed.RoleDefinitionID {
+		t.Fatalf("role replay changed identity: first=%#v replay=%#v", first, replayed)
+	}
+	conflict := role
+	conflict.Description = "conflicting payload"
+	if _, err := PersistRoleDefinition(ctx, store, conflict, fixture.now); !errors.Is(err, taskrequirements.ErrDuplicateRecord) {
+		t.Fatalf("conflicting role error = %v, want ErrDuplicateRecord", err)
+	}
+	profile := BalancedRoutingPolicyProfile(fixture.now)
+	profile.RoleDefinitionIDs = append(profile.RoleDefinitionIDs, "roledef_missing")
+	profile.PolicyFingerprint = ""
+	profile = normalizeRoutingPolicyProfile(profile)
+	if _, err := PersistRoutingPolicyProfile(ctx, store, profile); !errors.Is(err, taskrequirements.ErrMissingReference) {
+		t.Fatalf("missing role profile error = %v, want ErrMissingReference", err)
 	}
 }
 
