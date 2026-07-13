@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -777,6 +778,58 @@ func TestResumeApprovedHandoffStartedOutcomeWithoutReceiptMarksExecuting(t *test
 	}
 }
 
+func TestResumeApprovedHandoffStartedOutcomeErrorPersistsExecutingAndPropagates(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	launchErr := errors.New("provider accepted launch but stream failed")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionStarted}, launchErr
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, launchErr) || !strings.Contains(err.Error(), "launch started") {
+		t.Fatalf("started with executor error = %v, want launchErr with started signal", err)
+	}
+	if executions.Load() != 1 || result.Successor.ProviderReceipt != "" || result.Successor.LaunchPhase != storage.ClaimPhaseExecuting || result.Fallback.FallbackDecisionID != "" {
+		t.Fatalf("started with executor error result=%#v executions=%d, want executing without fallback", result, executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("started with executor error reservation state = %q, want active", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseExecuting || state.claimReceipt != "" || state.registrationState != storage.AgentStateRunning || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("started with executor error durable state = %#v, want executing/running launch", state)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if replayErr != nil {
+		t.Fatalf("started with executor error replay error = %v", replayErr)
+	}
+	if executions.Load() != 1 || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+		t.Fatalf("started with executor error replay result=%#v executions=%d attempts=%d, want observe-only replay", replayed, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
 func TestResumeApprovedHandoffReceiptOverridesAmbiguousOutcome(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -825,6 +878,151 @@ func TestResumeApprovedHandoffReceiptOverridesAmbiguousOutcome(t *testing.T) {
 	}
 	if executions.Load() != 1 || replayed.Successor.LaunchExposed {
 		t.Fatalf("receipt precedence replay result=%#v executions=%d, want observe-only replay", replayed, executions.Load())
+	}
+}
+
+func TestResumeApprovedHandoffReceiptErrorOverridesAmbiguousAndZeroOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome HandoffSuccessorExecutionOutcome
+	}{
+		{name: "ambiguous", outcome: HandoffSuccessorExecutionAmbiguous},
+		{name: "zero"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newFixture(t)
+			store, handoff, input := handoffResumeFixture(t, ctx, fixture)
+			defer store.Close()
+			makeClaudeEligibleOnly(input)
+			var executions atomic.Int64
+			receipt := "receipt-" + tc.name
+			launchErr := errors.New("provider returned receipt and warning")
+			result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+				HandoffID:        handoff.HandoffID,
+				DecisionInput:    input,
+				ReservationValue: 1,
+				ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+					executions.Add(1)
+					return HandoffSuccessorExecutionResult{ProviderReceipt: receipt, Outcome: tc.outcome}, launchErr
+				},
+				DecidedBy: routerActor(),
+				Host:      routingHost(),
+			})
+			if !errors.Is(err, launchErr) || !strings.Contains(err.Error(), "launch started") {
+				t.Fatalf("receipt+%s executor error = %v, want launchErr with started signal", tc.name, err)
+			}
+			if executions.Load() != 1 || result.Successor.ProviderReceipt != receipt || result.Successor.LaunchPhase != storage.ClaimPhaseExecuting || result.Fallback.FallbackDecisionID != "" {
+				t.Fatalf("receipt+%s result=%#v executions=%d, want executing with receipt and no fallback", tc.name, result, executions.Load())
+			}
+			if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+				t.Fatalf("receipt+%s reservation state = %q, want active", tc.name, state)
+			}
+			state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+			if state.claimPhase != storage.ClaimPhaseExecuting || state.claimReceipt != receipt || state.registrationState != storage.AgentStateRunning || state.attemptState != "claimed" || state.taskState != "claimed" {
+				t.Fatalf("receipt+%s durable state = %#v, want executing/running launch with receipt", tc.name, state)
+			}
+
+			replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+				HandoffID:        handoff.HandoffID,
+				DecisionInput:    input,
+				ReservationValue: 1,
+				ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+					executions.Add(1)
+					return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+				},
+				DecidedBy: routerActor(),
+				Host:      routingHost(),
+			})
+			if replayErr != nil {
+				t.Fatalf("receipt+%s replay error = %v", tc.name, replayErr)
+			}
+			if executions.Load() != 1 || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+				t.Fatalf("receipt+%s replay result=%#v executions=%d attempts=%d, want observe-only replay", tc.name, replayed, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+			}
+		})
+	}
+}
+
+func TestResumeApprovedHandoffStartedOutcomePersistenceFailureJoinsExecutorError(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	path := tempDB(t)
+	seedStore, handoff, input := handoffResumeFixtureAtPath(t, ctx, fixture, path)
+	makeClaudeEligibleOnly(input)
+	if err := seedStore.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+	persistErr := errors.New("persist executing state failed")
+	var failExecutingPersist atomic.Bool
+	store, err := storage.Open(ctx, storage.Options{
+		Path: path,
+		Now:  func() time.Time { return fixture.now },
+		WriteTxCommitHookForTest: func(commitCtx context.Context, _ storage.Tx, commit func(context.Context) error) error {
+			if failExecutingPersist.Load() {
+				return persistErr
+			}
+			return commit(commitCtx)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open storage with commit hook: %v", err)
+	}
+	var executions atomic.Int64
+	launchErr := errors.New("provider launch returned after start")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			failExecutingPersist.Store(true)
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionStarted}, launchErr
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, launchErr) || !errors.Is(err, persistErr) {
+		t.Fatalf("started persistence failure error = %v, want launchErr joined with persistErr", err)
+	}
+	if result.Fallback.FallbackDecisionID != "" {
+		t.Fatalf("started persistence failure fallback = %#v, want none", result.Fallback)
+	}
+	if result.Reservation.BudgetReservationID == "" {
+		t.Fatalf("started persistence failure did not reserve destination budget")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close failing store: %v", err)
+	}
+	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("reopen storage: %v", err)
+	}
+	defer reopened.Close()
+	if state := reservationState(t, ctx, reopened, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("started persistence failure reservation state = %q, want active", state)
+	}
+	state := handoffLaunchDurableState(t, ctx, reopened, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseLaunching || state.claimReceipt != "" || state.registrationState != storage.AgentStateLaunching || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("started persistence failure durable state = %#v, want prior launching state", state)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, reopened, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if replayErr != nil {
+		t.Fatalf("started persistence failure replay error = %v", replayErr)
+	}
+	if executions.Load() != 1 || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, reopened, handoff.TaskID) != 1 {
+		t.Fatalf("started persistence failure replay result=%#v executions=%d attempts=%d, want fail-closed observe-only replay", replayed, executions.Load(), countSuccessorAttempts(t, ctx, reopened, handoff.TaskID))
 	}
 }
 
@@ -1138,6 +1336,7 @@ func handoffRegistrationState(t *testing.T, ctx context.Context, store storage.S
 
 func handoffLaunchDurableState(t *testing.T, ctx context.Context, store storage.Store, childRunID, attemptID string) struct {
 	claimPhase        string
+	claimReceipt      string
 	registrationState string
 	attemptState      string
 	taskState         string
@@ -1145,12 +1344,13 @@ func handoffLaunchDurableState(t *testing.T, ctx context.Context, store storage.
 	t.Helper()
 	var out struct {
 		claimPhase        string
+		claimReceipt      string
 		registrationState string
 		attemptState      string
 		taskState         string
 	}
 	if err := store.WithTx(ctx, func(tx storage.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT phase FROM run_claims WHERE run_id = ?`, childRunID).Scan(&out.claimPhase); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT phase, provider_receipt FROM run_claims WHERE run_id = ?`, childRunID).Scan(&out.claimPhase, &out.claimReceipt); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE child_run_id = ?`, childRunID).Scan(&out.registrationState); err != nil {

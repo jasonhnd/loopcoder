@@ -211,11 +211,12 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	result.Successor.ProviderReceipt = strings.TrimSpace(executed.ProviderReceipt)
 	switch handoffExecutionOutcome(executed) {
 	case HandoffSuccessorExecutionStarted:
+		startedErr := handoffStartedExecutionError(execErr)
 		if err := markHandoffSuccessorExecuting(store, handoff, launch, result.Successor.ProviderReceipt); err != nil {
-			return result, err
+			return result, errors.Join(err, startedErr)
 		}
 		result.Successor.LaunchPhase = storage.ClaimPhaseExecuting
-		return result, nil
+		return result, startedErr
 	case HandoffSuccessorExecutionNotStarted:
 		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-not-started", input.DecidedBy, input.Host)
 		fallback, fallbackErr := HandoffDestinationFailureFallback(ctx, store, result, routeInput.Inputs, FallbackTriggerWorkerFailed, firstActor(input.DecidedBy, routeInput.DecidedBy), firstHost(input.Host, routeInput.Host))
@@ -225,6 +226,13 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-ambiguous", input.DecidedBy, input.Host)
 		return result, errors.Join(execErr, cleanupErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch outcome is ambiguous; human reconciliation required"})
 	}
+}
+
+func handoffStartedExecutionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("handoff successor launch started; executor reported post-launch error: %w", err)
 }
 
 func handoffExecutionOutcome(result HandoffSuccessorExecutionResult) HandoffSuccessorExecutionOutcome {
