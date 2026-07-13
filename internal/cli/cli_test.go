@@ -5010,6 +5010,83 @@ func TestEnforceNestedPlanScopeUsesPhysicalPathIdentity(t *testing.T) {
 	}
 }
 
+func TestEnforceNestedPlanScopeWindowsJunctionDistinctions(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows junction coverage")
+	}
+	repo := t.TempDir()
+	inRepoDir := filepath.Join(repo, "src")
+	if err := os.MkdirAll(inRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir in-repo dir: %v", err)
+	}
+	inRepoAlias := filepath.Join(repo, "alias-src")
+	createWindowsJunctionForCLITest(t, inRepoAlias, inRepoDir)
+
+	validAliasPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "alias",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("alias-src", "future", "new.txt")}},
+	}}}
+	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &validAliasPlan); err != nil {
+		t.Fatalf("in-repo junction alias rejected: %v", err)
+	}
+
+	validMissingLeafPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "missing-leaf",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("src", "future", "new.txt")}},
+	}}}
+	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &validMissingLeafPlan); err != nil {
+		t.Fatalf("in-repo missing leaf rejected: %v", err)
+	}
+
+	outside := t.TempDir()
+	escapeAlias := filepath.Join(repo, "escape")
+	createWindowsJunctionForCLITest(t, escapeAlias, outside)
+	escapePlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "escape",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("escape", "owned.txt")}},
+	}}}
+	err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &escapePlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes approved repo scope") {
+		t.Fatalf("junction escape error = %v, want escape diagnostic", err)
+	}
+
+	foreignVolumePlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "foreign-volume",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{`Z:\loopcoder-outside`}},
+	}}}
+	err = enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &foreignVolumePlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes approved repo scope") {
+		t.Fatalf("foreign volume error = %v, want escape diagnostic", err)
+	}
+
+	foreignRepoPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "foreign-repo",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: `Z:\loopcoder-outside`, Paths: []string{"owned.txt"}},
+	}}}
+	err = enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &foreignRepoPlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes parent repo") {
+		t.Fatalf("foreign repo error = %v, want escape diagnostic", err)
+	}
+}
+
+func createWindowsJunctionForCLITest(t *testing.T, link, target string) {
+	t.Helper()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:LOOPCODER_JUNCTION_LINK -Target $env:LOOPCODER_JUNCTION_TARGET | Out-Null`)
+	cmd.Env = append(os.Environ(),
+		"LOOPCODER_JUNCTION_LINK="+link,
+		"LOOPCODER_JUNCTION_TARGET="+target,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("create Windows junction %q -> %q: %v: %s", link, target, err, strings.TrimSpace(string(output)))
+	}
+}
+
 func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
