@@ -191,28 +191,31 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 	if !validFallbackTrigger(input.Trigger) {
 		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown fallback trigger"}
 	}
-	if input.Cancelled {
-		if err := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
-			return FallbackDecision{}, err
-		}
-		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by cancellation before route selection"}
-	}
 	if err := validateSchedulerActor(input.DecidedBy); err != nil {
 		return FallbackDecision{}, err
 	}
 	if err := validateHost(input.Host); err != nil {
 		return FallbackDecision{}, err
 	}
+	if input.ApprovalRequired || len(input.ChangedAuthorityInputs) > 0 {
+		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback cannot continue with changed authority or pending approval"}
+	}
 	original, err := LoadRoutingDecision(ctx, store, input.RoutingDecisionID)
 	if err != nil {
 		return FallbackDecision{}, err
+	}
+	if input.Cancelled {
+		if err := releaseHeldReservationsOnCancellation(ctx, store, original.ProjectID, original.DeliveryRunID, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
+			return FallbackDecision{}, err
+		}
+		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by cancellation before route selection"}
 	}
 	cancelled, err := isDeliveryRunCancelled(ctx, store, original.ProjectID, original.DeliveryRunID)
 	if err != nil {
 		return FallbackDecision{}, err
 	}
 	if cancelled {
-		if err := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
+		if err := releaseHeldReservationsOnCancellation(ctx, store, original.ProjectID, original.DeliveryRunID, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
 			return FallbackDecision{}, err
 		}
 		return FallbackDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "fallback stopped by durable cancellation before route selection"}
@@ -305,7 +308,7 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 	})
 	if err != nil {
 		if cancelledInTx {
-			if releaseErr := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
+			if releaseErr := releaseHeldReservationsOnCancellation(ctx, store, original.ProjectID, original.DeliveryRunID, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
 				return FallbackDecision{}, releaseErr
 			}
 		}
@@ -336,12 +339,6 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 	if store == nil {
 		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "store is required"}
 	}
-	if input.Cancelled {
-		if err := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
-			return ReplanDecision{}, err
-		}
-		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "replan stopped by cancellation before planning"}
-	}
 	if err := validateSchedulerActor(input.DecidedBy); err != nil {
 		return ReplanDecision{}, err
 	}
@@ -357,13 +354,15 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 	if !validReplanTrigger(input.Trigger) {
 		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown replan trigger"}
 	}
+	if input.Cancelled {
+		if err := releaseHeldReservationsOnCancellation(ctx, store, input.ProjectID, input.DeliveryRunID, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); err != nil {
+			return ReplanDecision{}, err
+		}
+		return ReplanDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "replan stopped by cancellation before planning"}
+	}
 	var stored ReplanDecision
 	cancelledInTx := false
 	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		profile, err := resolveReplanProfileTx(ctx, tx, input.RoutingPolicyProfileID)
-		if err != nil {
-			return err
-		}
 		run, err := loadReplanRunTx(ctx, tx, input.ProjectID, input.DeliveryRunID)
 		if err != nil {
 			return err
@@ -371,14 +370,15 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 		if run.PlanFingerprint != input.PriorPlanFingerprint {
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan prior plan fingerprint does not match current delivery run"}
 		}
-		if strings.TrimSpace(input.RoutingDecisionID) != "" {
-			route, err := loadRoutingDecisionTx(ctx, tx, input.RoutingDecisionID)
-			if err != nil {
-				return err
-			}
-			if route.ProjectID != input.ProjectID || route.DeliveryRunID != input.DeliveryRunID || route.PlanFingerprint != input.PriorPlanFingerprint || route.RoutingPolicyProfileID != profile.RoutingPolicyProfileID {
-				return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan routing decision does not match current run/profile"}
-			}
+		profile, route, err := resolveReplanRouteProfileTx(ctx, tx, input, run)
+		if err != nil {
+			return err
+		}
+		resolvedInput := input
+		resolvedInput.RoutingDecisionID = route.RoutingDecisionID
+		resolvedInput.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
+		if strings.TrimSpace(resolvedInput.RoutingFingerprint) == "" {
+			resolvedInput.RoutingFingerprint = route.RoutingFingerprint
 		}
 		cancelled, err := deliveryRunCancelledTx(ctx, tx, input.ProjectID, input.DeliveryRunID)
 		if err != nil {
@@ -388,12 +388,12 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 			cancelledInTx = true
 			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "replan stopped by durable cancellation at transaction boundary"}
 		}
-		idempotencyKey, err := replanIdempotencyKey(input, run, profile)
+		idempotencyKey, err := replanIdempotencyKey(resolvedInput, run, profile)
 		if err != nil {
 			return err
 		}
 		if existing, ok, err := loadReplanByIdempotency(ctx, tx, input.DeliveryRunID, idempotencyKey); err != nil || ok {
-			if ok && (existing.Trigger != input.Trigger || existing.PriorPlanFingerprint != input.PriorPlanFingerprint || existing.NewPlanFingerprint != strings.TrimSpace(input.NewPlanFingerprint) || existing.RoutingFingerprint != strings.TrimSpace(input.RoutingFingerprint)) {
+			if ok && (existing.Trigger != input.Trigger || existing.PriorPlanFingerprint != input.PriorPlanFingerprint || existing.NewPlanFingerprint != strings.TrimSpace(input.NewPlanFingerprint) || existing.RoutingFingerprint != strings.TrimSpace(resolvedInput.RoutingFingerprint)) {
 				return &delivery.TypedError{Code: delivery.ErrDuplicateReplayCode, Message: "replan idempotency key replayed with different request"}
 			}
 			stored = existing
@@ -403,19 +403,13 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 		if err != nil {
 			return err
 		}
-		decision := buildReplanDecision(profile, input, idempotencyKey, used+1, store.Now())
+		decision := buildReplanDecision(profile, resolvedInput, idempotencyKey, used+1, store.Now())
+		if newPlan := strings.TrimSpace(resolvedInput.NewPlanFingerprint); newPlan != "" && newPlan != run.PlanFingerprint {
+			decision.ApprovalRequired = true
+		}
 		if decision.ApprovalRequired {
-			approved, err := exactReplanApprovalExistsTx(ctx, tx, run, strings.TrimSpace(input.NewPlanFingerprint), store.Now())
-			if err != nil {
-				return err
-			}
-			if !approved {
-				decision.DecisionStatus = ReplanStatusNeedsHuman
-				decision.TerminalErrorCode = taskrequirements.ErrorCode(delivery.ErrApprovalRequiredCode)
-				decision.NewPlanFingerprint = ""
-			} else {
-				decision.ApprovalRequired = false
-			}
+			decision.DecisionStatus = ReplanStatusNeedsHuman
+			decision.TerminalErrorCode = taskrequirements.ErrorCode(delivery.ErrApprovalRequiredCode)
 		}
 		if used >= profile.ReplanPolicy.MaxReplanPasses {
 			decision.DecisionStatus = ReplanStatusBoundExceeded
@@ -430,7 +424,7 @@ func DecideAndPersistReplan(ctx context.Context, store storage.Store, input Repl
 	})
 	if err != nil {
 		if cancelledInTx {
-			if releaseErr := releaseHeldReservationOnCancellation(ctx, store, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
+			if releaseErr := releaseHeldReservationsOnCancellation(ctx, store, input.ProjectID, input.DeliveryRunID, input.HeldBudgetReservationID, input.HeldReservationGeneration, input.DecidedBy, input.Host); releaseErr != nil {
 				return ReplanDecision{}, releaseErr
 			}
 		}
@@ -840,11 +834,69 @@ func resolveFallbackProfileTx(ctx context.Context, tx storage.Tx, original Routi
 	return profile, nil
 }
 
-func resolveReplanProfileTx(ctx context.Context, tx storage.Tx, profileID string) (RoutingPolicyProfile, error) {
-	if strings.TrimSpace(profileID) == "" {
-		profileID = defaultStoredRoutingPolicyProfileID(time.Unix(0, 0).UTC())
+func resolveReplanRouteProfileTx(ctx context.Context, tx storage.Tx, input ReplanInput, run replanRunAuthority) (RoutingPolicyProfile, RoutingDecision, error) {
+	var route RoutingDecision
+	var err error
+	if strings.TrimSpace(input.RoutingDecisionID) != "" {
+		route, err = loadRoutingDecisionTx(ctx, tx, input.RoutingDecisionID)
+	} else {
+		route, err = loadLatestRoutingDecisionForRunTx(ctx, tx, run.ProjectID, run.DeliveryRunID)
 	}
-	return loadRoutingPolicyProfileTx(ctx, tx, profileID)
+	if err != nil {
+		return RoutingPolicyProfile{}, RoutingDecision{}, err
+	}
+	if route.ProjectID != run.ProjectID || route.DeliveryRunID != run.DeliveryRunID || route.PlanFingerprint != run.PlanFingerprint {
+		return RoutingPolicyProfile{}, RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan route does not match current delivery run"}
+	}
+	if strings.TrimSpace(input.RoutingPolicyProfileID) != "" && strings.TrimSpace(input.RoutingPolicyProfileID) != route.RoutingPolicyProfileID {
+		return RoutingPolicyProfile{}, RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan routing policy profile does not match current route"}
+	}
+	if strings.TrimSpace(input.RoutingFingerprint) != "" && strings.TrimSpace(input.RoutingFingerprint) != route.RoutingFingerprint {
+		return RoutingPolicyProfile{}, RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan routing fingerprint does not match current route"}
+	}
+	profile, err := loadRoutingPolicyProfileTx(ctx, tx, route.RoutingPolicyProfileID)
+	if err != nil {
+		return RoutingPolicyProfile{}, RoutingDecision{}, err
+	}
+	if profile.PolicyFingerprint != route.PolicyFingerprint {
+		return RoutingPolicyProfile{}, RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan profile fingerprint does not match current route"}
+	}
+	return profile, route, nil
+}
+
+func loadLatestRoutingDecisionForRunTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID string) (RoutingDecision, error) {
+	rows, err := tx.Query(ctx, `SELECT payload_json FROM routing_decisions
+		WHERE project_id = ? AND delivery_run_id = ?
+		ORDER BY created_at DESC, routing_decision_id DESC LIMIT 2`, strings.TrimSpace(projectID), strings.TrimSpace(deliveryRunID))
+	if err != nil {
+		return RoutingDecision{}, err
+	}
+	defer rows.Close()
+	var payloads []string
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return RoutingDecision{}, err
+		}
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		return RoutingDecision{}, err
+	}
+	if len(payloads) == 0 {
+		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "replan current route was not persisted"}
+	}
+	if len(payloads) > 1 {
+		return RoutingDecision{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "replan current route is ambiguous without an exact routing decision"}
+	}
+	var decision RoutingDecision
+	if err := json.Unmarshal([]byte(payloads[0]), &decision); err != nil {
+		return RoutingDecision{}, err
+	}
+	if err := validateRoutingDecision(decision); err != nil {
+		return RoutingDecision{}, err
+	}
+	return decision, nil
 }
 
 func validateFallbackInputs(original RoutingDecision, profile RoutingPolicyProfile, storedReq taskrequirements.TaskRequirement, inputs Inputs) error {
@@ -888,7 +940,6 @@ func fallbackRoutingFingerprint(original RoutingDecision, profile RoutingPolicyP
 		"selected_candidate_id": selected.RoutingCandidateID,
 		"eligible_candidates":   eligibility.Eligible,
 		"rejected_candidates":   eligibility.Rejected,
-		"changed_authority":     input.ChangedAuthorityInputs,
 	})
 	return digest, err
 }
@@ -903,8 +954,6 @@ func fallbackIdempotencyKey(input FallbackInput, original RoutingDecision, profi
 		"requirement_fp":      req.TaskRequirementFingerprint,
 		"trigger":             input.Trigger,
 		"prior_candidate_id":  strings.TrimSpace(input.PriorCandidateID),
-		"attempt_lineage":     nonNilStrings(input.AttemptLineage),
-		"changed_authority":   nonNilAuthorityInputs(input.ChangedAuthorityInputs),
 		"user_pins":           pins,
 	})
 	if err != nil {
@@ -915,21 +964,19 @@ func fallbackIdempotencyKey(input FallbackInput, original RoutingDecision, profi
 
 func replanIdempotencyKey(input ReplanInput, run replanRunAuthority, profile RoutingPolicyProfile) (string, error) {
 	digest, _, err := delivery.DigestCanonicalJSON(map[string]any{
-		"schema_version":          "loopcoder.replan_event.v1",
-		"project_id":              run.ProjectID,
-		"delivery_run_id":         run.DeliveryRunID,
-		"authorization_fp":        run.AuthorizationFingerprint,
-		"input_fp":                run.InputFingerprint,
-		"policy_fp":               run.PolicyFingerprint,
-		"prior_plan_fp":           input.PriorPlanFingerprint,
-		"new_plan_fp":             strings.TrimSpace(input.NewPlanFingerprint),
-		"routing_decision_id":     strings.TrimSpace(input.RoutingDecisionID),
-		"routing_fingerprint":     strings.TrimSpace(input.RoutingFingerprint),
-		"routing_policy_profile":  profile.RoutingPolicyProfileID,
-		"routing_policy_fp":       profile.PolicyFingerprint,
-		"trigger":                 input.Trigger,
-		"attempt_lineage":         nonNilStrings(input.AttemptLineage),
-		"changed_authority_input": nonNilAuthorityInputs(input.ChangedAuthorityInputs),
+		"schema_version":         "loopcoder.replan_event.v1",
+		"project_id":             run.ProjectID,
+		"delivery_run_id":        run.DeliveryRunID,
+		"authorization_fp":       run.AuthorizationFingerprint,
+		"input_fp":               run.InputFingerprint,
+		"policy_fp":              run.PolicyFingerprint,
+		"prior_plan_fp":          input.PriorPlanFingerprint,
+		"new_plan_fp":            strings.TrimSpace(input.NewPlanFingerprint),
+		"routing_decision_id":    strings.TrimSpace(input.RoutingDecisionID),
+		"routing_fingerprint":    strings.TrimSpace(input.RoutingFingerprint),
+		"routing_policy_profile": profile.RoutingPolicyProfileID,
+		"routing_policy_fp":      profile.PolicyFingerprint,
+		"trigger":                input.Trigger,
 	})
 	if err != nil {
 		return "", err
@@ -1108,31 +1155,130 @@ func deliveryRunCancelledTx(ctx context.Context, tx storage.Tx, projectID, deliv
 	return state == "cancelled" || state == "canceled" || state == "canceling" || state == "cancelling", nil
 }
 
-func releaseHeldReservationOnCancellation(ctx context.Context, store storage.Store, reservationID string, generation int64, actor delivery.Actor, host delivery.Host) error {
+func releaseHeldReservationsOnCancellation(ctx context.Context, store storage.Store, projectID, deliveryRunID, reservationID string, generation int64, actor delivery.Actor, host delivery.Host) error {
+	projectID = strings.TrimSpace(projectID)
+	deliveryRunID = strings.TrimSpace(deliveryRunID)
 	reservationID = strings.TrimSpace(reservationID)
-	if reservationID == "" {
-		return nil
+	if projectID == "" || deliveryRunID == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "project and delivery run are required for cancellation reservation release"}
 	}
-	if generation <= 0 {
-		return fmt.Errorf("%w: held reservation generation is required for cancellation", budget.ErrReservationStateConflict)
-	}
-	_, err := budget.Cancel(ctx, store, budget.MutationRequest{
-		ReservationID:  reservationID,
-		IdempotencyKey: "fallback-cancel:" + reservationID,
-		Generation:     generation,
-		Actor:          budget.Actor{ActorID: actor.ActorID, Role: actor.DecisionAuthority},
-		Host:           budget.Host{HostID: host.HostID, Provider: host.HostKind, Model: host.LoopcoderVersion},
+	var reservations []budget.Reservation
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		run, err := loadReplanRunTx(ctx, tx, projectID, deliveryRunID)
+		if err != nil {
+			return err
+		}
+		if reservationID != "" {
+			supplied, found, err := loadBudgetReservationTx(ctx, tx, reservationID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return &taskrequirements.TypedError{Code: taskrequirements.ErrMissingReferenceCode, Message: "held budget reservation was not persisted"}
+			}
+			if supplied.Scope.ProjectID != projectID || supplied.Scope.DeliveryRunID != deliveryRunID {
+				return fmt.Errorf("%w: supplied reservation does not belong to delivery run", budget.ErrReservationStateConflict)
+			}
+			if strings.TrimSpace(supplied.AuthorizationFingerprint) != "" && strings.TrimSpace(run.AuthorizationFingerprint) != "" && supplied.AuthorizationFingerprint != run.AuthorizationFingerprint {
+				return fmt.Errorf("%w: supplied reservation authorization does not match delivery run", budget.ErrReservationStateConflict)
+			}
+			if reservationHeld(supplied) && generation != supplied.Generation {
+				return fmt.Errorf("%w: supplied reservation generation %d does not match active generation %d", budget.ErrReservationExpired, generation, supplied.Generation)
+			}
+		}
+		rows, err := tx.Query(ctx, `SELECT payload_json FROM budget_reservations
+			WHERE project_id = ? AND delivery_run_id = ? AND state IN (?, ?)
+			ORDER BY budget_reservation_id`, projectID, deliveryRunID, string(budget.StateActive), string(budget.StatePartiallyCommitted))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				return err
+			}
+			var reservation budget.Reservation
+			if err := json.Unmarshal([]byte(payload), &reservation); err != nil {
+				return err
+			}
+			reservations = append(reservations, reservation)
+		}
+		return rows.Err()
 	})
-	if errors.Is(err, budget.ErrReservationStateConflict) || errors.Is(err, budget.ErrReservationExpired) {
-		held, inspectErr := reservationStillHeld(ctx, store, reservationID)
-		if inspectErr != nil {
-			return inspectErr
-		}
-		if !held {
-			return nil
+	if err != nil {
+		return err
+	}
+	for _, reservation := range reservations {
+		_, err := budget.Cancel(ctx, store, budget.MutationRequest{
+			ReservationID:  reservation.BudgetReservationID,
+			IdempotencyKey: "fallback-cancel:" + reservation.BudgetReservationID,
+			Generation:     reservation.Generation,
+			Actor:          budget.Actor{ActorID: actor.ActorID, Role: actor.DecisionAuthority},
+			Host:           budget.Host{HostID: host.HostID, Provider: host.HostKind},
+		})
+		if err != nil {
+			if errors.Is(err, budget.ErrReservationStateConflict) || errors.Is(err, budget.ErrReservationExpired) {
+				held, inspectErr := reservationStillHeld(ctx, store, reservation.BudgetReservationID)
+				if inspectErr != nil {
+					return inspectErr
+				}
+				if !held {
+					continue
+				}
+			}
+			return err
 		}
 	}
-	return err
+	held, err := activeRunReservations(ctx, store, projectID, deliveryRunID)
+	if err != nil {
+		return err
+	}
+	if len(held) > 0 {
+		return fmt.Errorf("%w: cancellation left held reservations: %s", budget.ErrReservationStateConflict, strings.Join(held, ","))
+	}
+	return nil
+}
+
+func loadBudgetReservationTx(ctx context.Context, tx storage.Tx, reservationID string) (budget.Reservation, bool, error) {
+	var payload string
+	err := tx.QueryRow(ctx, `SELECT payload_json FROM budget_reservations WHERE budget_reservation_id = ?`, strings.TrimSpace(reservationID)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return budget.Reservation{}, false, nil
+	}
+	if err != nil {
+		return budget.Reservation{}, false, err
+	}
+	var reservation budget.Reservation
+	if err := json.Unmarshal([]byte(payload), &reservation); err != nil {
+		return budget.Reservation{}, false, err
+	}
+	return reservation, true, nil
+}
+
+func activeRunReservations(ctx context.Context, store storage.Store, projectID, deliveryRunID string) ([]string, error) {
+	var ids []string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT budget_reservation_id FROM budget_reservations
+			WHERE project_id = ? AND delivery_run_id = ? AND state IN (?, ?)
+			ORDER BY budget_reservation_id`, projectID, deliveryRunID, string(budget.StateActive), string(budget.StatePartiallyCommitted))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	if ids == nil {
+		ids = []string{}
+	}
+	return ids, err
 }
 
 func reservationStillHeld(ctx context.Context, store storage.Store, reservationID string) (bool, error) {
@@ -1149,7 +1295,11 @@ func reservationStillHeld(ctx context.Context, store storage.Store, reservationI
 	if err := json.Unmarshal([]byte(payload), &reservation); err != nil {
 		return false, err
 	}
-	return reservation.State == budget.StateActive || reservation.State == budget.StatePartiallyCommitted, nil
+	return reservationHeld(reservation), nil
+}
+
+func reservationHeld(reservation budget.Reservation) bool {
+	return reservation.State == budget.StateActive || reservation.State == budget.StatePartiallyCommitted
 }
 
 type replanRunAuthority struct {
@@ -1175,32 +1325,6 @@ func loadReplanRunTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunI
 		return replanRunAuthority{}, err
 	}
 	return run, nil
-}
-
-func exactReplanApprovalExistsTx(ctx context.Context, tx storage.Tx, run replanRunAuthority, newPlanFingerprint string, now time.Time) (bool, error) {
-	if !validFingerprint(newPlanFingerprint) {
-		return false, nil
-	}
-	var expires string
-	err := tx.QueryRow(ctx, `SELECT COALESCE(expires_at, '')
-		FROM delivery_approvals
-		WHERE project_id = ? AND delivery_run_id = ? AND input_fingerprint = ? AND policy_fingerprint = ? AND plan_fingerprint = ? AND status = 'active'
-		ORDER BY approved_at DESC LIMIT 1`,
-		run.ProjectID, run.DeliveryRunID, run.InputFingerprint, run.PolicyFingerprint, newPlanFingerprint).Scan(&expires)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	if strings.TrimSpace(expires) == "" {
-		return true, nil
-	}
-	expiry, err := time.Parse(time.RFC3339Nano, expires)
-	if err != nil {
-		return false, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "approval expiry is invalid"}
-	}
-	return expiry.After(now), nil
 }
 
 func sameCanonicalRequirementAuthority(caller, stored taskrequirements.TaskRequirement) bool {

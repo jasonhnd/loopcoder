@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -265,13 +266,14 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
+		trigger := []ReplanTrigger{ReplanTriggerLegalFallbackExhausted, ReplanTriggerNoEligibleCandidate}[i]
 		_, err := DecideAndPersistReplan(ctx, store, ReplanInput{
 			ProjectID:            original.ProjectID,
 			DeliveryRunID:        original.DeliveryRunID,
 			RoutingDecisionID:    original.RoutingDecisionID,
-			Trigger:              ReplanTriggerLegalFallbackExhausted,
+			Trigger:              trigger,
 			PriorPlanFingerprint: original.PlanFingerprint,
-			NewPlanFingerprint:   testFingerprint("new-plan-" + string(rune('a'+i))),
+			NewPlanFingerprint:   original.PlanFingerprint,
 			IdempotencyKey:       "replan-" + string(rune('a'+i)),
 			DecidedBy:            schedulerActor(),
 			Host:                 routingHost(),
@@ -284,9 +286,9 @@ func TestFallbackReplanBoundsTerminateWithoutRetryLoop(t *testing.T) {
 		ProjectID:            original.ProjectID,
 		DeliveryRunID:        original.DeliveryRunID,
 		RoutingDecisionID:    original.RoutingDecisionID,
-		Trigger:              ReplanTriggerLegalFallbackExhausted,
+		Trigger:              ReplanTriggerGraphBoundHit,
 		PriorPlanFingerprint: original.PlanFingerprint,
-		NewPlanFingerprint:   testFingerprint("new-plan-c"),
+		NewPlanFingerprint:   original.PlanFingerprint,
 		IdempotencyKey:       "replan-c",
 		DecidedBy:            schedulerActor(),
 		Host:                 routingHost(),
@@ -320,7 +322,7 @@ func TestFallbackRejectsForgedPriorAfterCanonicalLineageMoves(t *testing.T) {
 	}
 	_, err = DecideAndPersistFallback(ctx, store, FallbackInput{
 		RoutingDecisionID: original.RoutingDecisionID,
-		Trigger:           FallbackTriggerWorkerFailed,
+		Trigger:           FallbackTriggerTimeout,
 		PriorCandidateID:  original.ChosenCandidateID,
 		Inputs:            input.Inputs,
 		AttemptLineage:    []string{"forged-new-event"},
@@ -366,6 +368,156 @@ func TestCancellationStopsReplanAndCancelsHeldReservation(t *testing.T) {
 	}
 }
 
+func TestCancellationDiscoveredAtWriteBoundaryReleasesRunReservations(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	base := openRoutingStore(t, ctx, fixture.now)
+	defer base.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, base, fixture)
+	reservation := reserveCancellationBudget(t, ctx, base, fixture.now)
+	hooked := &writeHookStore{Store: base, beforeWrite: func() {
+		updateDeliveryRunState(t, ctx, base, original.ProjectID, original.DeliveryRunID, delivery.RunCancelled)
+	}}
+
+	_, err := DecideAndPersistReplan(ctx, hooked, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerUserChangedIntent,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   original.PlanFingerprint,
+		DecidedBy:            schedulerActor(),
+		Host:                 routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("write-boundary cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if countReplanDecisions(t, ctx, base, original.ProjectID, original.DeliveryRunID) != 0 {
+		t.Fatalf("write-boundary cancellation persisted a replan decision")
+	}
+	if got := budgetReservationState(t, ctx, base, reservation.BudgetReservationID); got != budget.StateCancelled {
+		t.Fatalf("reservation state = %s, want cancelled", got)
+	}
+}
+
+func TestCancellationStorageReadErrorPropagatesWithoutDecision(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	base := openRoutingStore(t, ctx, fixture.now)
+	defer base.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, base, fixture)
+	sentinel := errors.New("cancellation reservation query failed")
+	failing := txErrorStore{Store: base, err: sentinel}
+
+	_, err := DecideAndPersistReplan(ctx, failing, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		Trigger:              ReplanTriggerUserChangedIntent,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   original.PlanFingerprint,
+		Cancelled:            true,
+		DecidedBy:            schedulerActor(),
+		Host:                 routingHost(),
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("cancellation storage error = %v, want sentinel", err)
+	}
+	if countReplanDecisions(t, ctx, base, original.ProjectID, original.DeliveryRunID) != 0 {
+		t.Fatalf("storage-error cancellation persisted a replan decision")
+	}
+}
+
+func TestCancellationWrongSuppliedGenerationFailsWhileHeld(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	reservation := reserveCancellationBudget(t, ctx, store, fixture.now)
+
+	_, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:                 original.ProjectID,
+		DeliveryRunID:             original.DeliveryRunID,
+		Trigger:                   ReplanTriggerUserChangedIntent,
+		PriorPlanFingerprint:      original.PlanFingerprint,
+		NewPlanFingerprint:        original.PlanFingerprint,
+		Cancelled:                 true,
+		HeldBudgetReservationID:   reservation.BudgetReservationID,
+		HeldReservationGeneration: reservation.Generation + 1,
+		DecidedBy:                 schedulerActor(),
+		Host:                      routingHost(),
+	})
+	if !errors.Is(err, budget.ErrReservationExpired) {
+		t.Fatalf("wrong generation error = %v, want ErrReservationExpired", err)
+	}
+	if got := budgetReservationState(t, ctx, store, reservation.BudgetReservationID); got != budget.StateActive {
+		t.Fatalf("reservation state = %s, want active", got)
+	}
+	if countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 0 {
+		t.Fatalf("wrong-generation cancellation persisted a replan decision")
+	}
+}
+
+func TestCancellationOmittedReservationIDDiscoversActiveRunReservation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	reservation := reserveCancellationBudget(t, ctx, store, fixture.now)
+
+	_, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		Trigger:              ReplanTriggerUserChangedIntent,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   original.PlanFingerprint,
+		Cancelled:            true,
+		DecidedBy:            schedulerActor(),
+		Host:                 routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("omitted reservation cancellation error = %v, want ErrReplanRequired", err)
+	}
+	if got := budgetReservationState(t, ctx, store, reservation.BudgetReservationID); got != budget.StateCancelled {
+		t.Fatalf("reservation state = %s, want cancelled", got)
+	}
+	if active := activeReservationIDsForRun(t, ctx, store, original.ProjectID, original.DeliveryRunID); len(active) != 0 {
+		t.Fatalf("active reservations after cancellation = %#v, want none", active)
+	}
+}
+
+func TestCancellationRejectsForeignReservationAndDoesNotMutateIt(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	foreign := reserveCancellationBudgetForRun(t, ctx, store, fixture.now, "proj-routing", "foreign-run", testFingerprint("auth"))
+
+	_, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:                 original.ProjectID,
+		DeliveryRunID:             original.DeliveryRunID,
+		Trigger:                   ReplanTriggerUserChangedIntent,
+		PriorPlanFingerprint:      original.PlanFingerprint,
+		NewPlanFingerprint:        original.PlanFingerprint,
+		Cancelled:                 true,
+		HeldBudgetReservationID:   foreign.BudgetReservationID,
+		HeldReservationGeneration: foreign.Generation,
+		DecidedBy:                 schedulerActor(),
+		Host:                      routingHost(),
+	})
+	if !errors.Is(err, budget.ErrReservationStateConflict) {
+		t.Fatalf("foreign reservation error = %v, want ErrReservationStateConflict", err)
+	}
+	if got := budgetReservationState(t, ctx, store, foreign.BudgetReservationID); got != budget.StateActive {
+		t.Fatalf("foreign reservation state = %s, want active", got)
+	}
+	if countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 0 {
+		t.Fatalf("foreign-reservation cancellation persisted a replan decision")
+	}
+}
+
 func TestReplanChangedAuthorityRequiresExactFreshApproval(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -393,11 +545,11 @@ func TestReplanChangedAuthorityRequiresExactFreshApproval(t *testing.T) {
 	if !errors.Is(err, delivery.ErrApprovalRequired) {
 		t.Fatalf("changed authority without approval error = %v, want ErrApprovalRequired", err)
 	}
-	if needsHuman.DecisionStatus != ReplanStatusNeedsHuman || needsHuman.NewPlanFingerprint != "" {
+	if needsHuman.DecisionStatus != ReplanStatusNeedsHuman || needsHuman.NewPlanFingerprint != newPlan || !needsHuman.ApprovalRequired {
 		t.Fatalf("changed authority without approval was launchable: %#v", needsHuman)
 	}
 
-	insertDeliveryApproval(t, ctx, store, original.ProjectID, original.DeliveryRunID, testFingerprint("stale-plan"), "stale")
+	recordCurrentDeliveryApproval(t, ctx, store, "stale")
 	stale, err := DecideAndPersistReplan(ctx, store, ReplanInput{
 		ProjectID:            original.ProjectID,
 		DeliveryRunID:        original.DeliveryRunID,
@@ -422,7 +574,7 @@ func TestReplanChangedAuthorityRequiresExactFreshApproval(t *testing.T) {
 	defer freshStore.Close()
 	freshOriginal, _ := persistFallbackOriginalRoute(t, ctx, freshStore, fixture)
 	freshPlan := testFingerprint("changed-authority-fresh-plan")
-	insertDeliveryApproval(t, ctx, freshStore, freshOriginal.ProjectID, freshOriginal.DeliveryRunID, freshPlan, "fresh")
+	recordCurrentDeliveryApproval(t, ctx, freshStore, "fresh")
 	planned, err := DecideAndPersistReplan(ctx, freshStore, ReplanInput{
 		ProjectID:            freshOriginal.ProjectID,
 		DeliveryRunID:        freshOriginal.DeliveryRunID,
@@ -439,11 +591,229 @@ func TestReplanChangedAuthorityRequiresExactFreshApproval(t *testing.T) {
 		DecidedBy:      schedulerActor(),
 		Host:           routingHost(),
 	})
-	if err != nil {
-		t.Fatalf("fresh approval replan error: %v", err)
+	if !errors.Is(err, delivery.ErrApprovalRequired) {
+		t.Fatalf("fresh approval replan error = %v, want ErrApprovalRequired", err)
 	}
-	if planned.DecisionStatus != ReplanStatusPlanned || planned.NewPlanFingerprint != freshPlan || planned.ApprovalRequired {
-		t.Fatalf("fresh approval did not authorize exact changed replan: %#v", planned)
+	if planned.DecisionStatus != ReplanStatusNeedsHuman || planned.NewPlanFingerprint != freshPlan || !planned.ApprovalRequired {
+		t.Fatalf("fresh approval unexpectedly authorized changed replan: %#v", planned)
+	}
+}
+
+func TestReplanInfersPlanFingerprintChangeRequiresApprovalWhenCallerOmitsAuthority(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	newPlan := testFingerprint("omitted-authority-new-plan")
+
+	decision, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerScopeChangeNeeded,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   newPlan,
+		DecidedBy:            schedulerActor(),
+		Host:                 routingHost(),
+	})
+	if !errors.Is(err, delivery.ErrApprovalRequired) {
+		t.Fatalf("omitted authority plan change error = %v, want ErrApprovalRequired", err)
+	}
+	if decision.DecisionStatus != ReplanStatusNeedsHuman || !decision.ApprovalRequired || decision.NewPlanFingerprint != newPlan {
+		t.Fatalf("omitted authority plan change decision = %#v, want retained non-launchable new plan", decision)
+	}
+	if countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 1 {
+		t.Fatalf("omitted authority plan change decision count = %d, want 1", countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID))
+	}
+}
+
+func TestReplanRejectsWeakerCallerProfileSubstitution(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	fast, ok := BuiltInRoutingPolicyProfile(ProfileKeyFast, fixture.now)
+	if !ok {
+		t.Fatal("missing fast routing profile")
+	}
+
+	_, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:              original.ProjectID,
+		DeliveryRunID:          original.DeliveryRunID,
+		RoutingPolicyProfileID: fast.RoutingPolicyProfileID,
+		Trigger:                ReplanTriggerLegalFallbackExhausted,
+		PriorPlanFingerprint:   original.PlanFingerprint,
+		NewPlanFingerprint:     original.PlanFingerprint,
+		DecidedBy:              schedulerActor(),
+		Host:                   routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("weaker profile substitution error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+	if countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 0 {
+		t.Fatalf("weaker profile substitution persisted a replan decision")
+	}
+}
+
+func TestFallbackRejectsChangedAuthorityMetadataWithoutSelectedRoute(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	_, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID:      original.RoutingDecisionID,
+		Trigger:                FallbackTriggerRequirementsChanged,
+		PriorCandidateID:       original.ChosenCandidateID,
+		Inputs:                 input.Inputs,
+		ChangedAuthorityInputs: []ChangedAuthorityInput{{InputKind: "scope", Previous: "a", Current: "b"}},
+		ApprovalRequired:       true,
+		DecidedBy:              schedulerActor(),
+		Host:                   routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("fallback changed authority error = %v, want ErrReplanRequired", err)
+	}
+	if countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 0 {
+		t.Fatalf("fallback changed authority persisted a decision")
+	}
+}
+
+func TestFallbackNoRouteReplayIgnoresCallerLineageAndAuthorityArrays(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, input := persistFallbackOriginalRoute(t, ctx, store, fixture)
+	input.Inputs.Candidates = []Candidate{candidateByID(t, input.Inputs.Candidates, original.ChosenCandidateID)}
+
+	first, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerQuotaExhausted,
+		PriorCandidateID:  original.ChosenCandidateID,
+		Inputs:            input.Inputs,
+		AttemptLineage:    []string{"attempt-a"},
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("first no-route fallback error = %v, want ErrReplanRequired", err)
+	}
+	replayed, err := DecideAndPersistFallback(ctx, store, FallbackInput{
+		RoutingDecisionID: original.RoutingDecisionID,
+		Trigger:           FallbackTriggerQuotaExhausted,
+		PriorCandidateID:  original.ChosenCandidateID,
+		Inputs:            input.Inputs,
+		AttemptLineage:    []string{"attempt-b", "attempt-c"},
+		DecidedBy:         schedulerActor(),
+		Host:              routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("replayed no-route fallback error = %v, want ErrReplanRequired", err)
+	}
+	if replayed.FallbackDecisionID != first.FallbackDecisionID || countFallbackDecisions(t, ctx, store, original.RoutingDecisionID) != 1 {
+		t.Fatalf("no-route replay created duplicate: first=%s replay=%s count=%d", first.FallbackDecisionID, replayed.FallbackDecisionID, countFallbackDecisions(t, ctx, store, original.RoutingDecisionID))
+	}
+}
+
+func TestReplanReplayIgnoresCallerLineageAndAuthorityArrays(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	first, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerNoEligibleCandidate,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   original.PlanFingerprint,
+		AttemptLineage:       []string{"attempt-a"},
+		DecidedBy:            schedulerActor(),
+		Host:                 routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("first replan: %v", err)
+	}
+	replayed, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+		ProjectID:            original.ProjectID,
+		DeliveryRunID:        original.DeliveryRunID,
+		RoutingDecisionID:    original.RoutingDecisionID,
+		Trigger:              ReplanTriggerNoEligibleCandidate,
+		PriorPlanFingerprint: original.PlanFingerprint,
+		NewPlanFingerprint:   original.PlanFingerprint,
+		AttemptLineage:       []string{"attempt-b"},
+		ChangedAuthorityInputs: []ChangedAuthorityInput{{
+			InputKind: "caller-noise",
+			Previous:  "old",
+			Current:   "new",
+		}},
+		DecidedBy: schedulerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("replayed replan: %v", err)
+	}
+	if replayed.ReplanDecisionID != first.ReplanDecisionID || countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 1 {
+		t.Fatalf("replan replay created duplicate: first=%s replay=%s count=%d", first.ReplanDecisionID, replayed.ReplanDecisionID, countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID))
+	}
+}
+
+func TestReplanConcurrentReplayPersistsOneDecision(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store := openRoutingStore(t, ctx, fixture.now)
+	defer store.Close()
+	original, _ := persistFallbackOriginalRoute(t, ctx, store, fixture)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make(chan ReplanDecision, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			decision, err := DecideAndPersistReplan(ctx, store, ReplanInput{
+				ProjectID:            original.ProjectID,
+				DeliveryRunID:        original.DeliveryRunID,
+				RoutingDecisionID:    original.RoutingDecisionID,
+				Trigger:              ReplanTriggerNoEligibleCandidate,
+				PriorPlanFingerprint: original.PlanFingerprint,
+				NewPlanFingerprint:   original.PlanFingerprint,
+				AttemptLineage:       []string{"caller-noise"},
+				DecidedBy:            schedulerActor(),
+				Host:                 routingHost(),
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- decision
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent replay error: %v", err)
+	}
+	var first string
+	for decision := range results {
+		if first == "" {
+			first = decision.ReplanDecisionID
+		}
+		if decision.ReplanDecisionID != first {
+			t.Fatalf("concurrent replay returned different decision: %s vs %s", decision.ReplanDecisionID, first)
+		}
+	}
+	if countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID) != 1 {
+		t.Fatalf("concurrent replay decision count = %d, want 1", countReplanDecisions(t, ctx, store, original.ProjectID, original.DeliveryRunID))
 	}
 }
 
@@ -563,22 +933,44 @@ func userActor() delivery.Actor {
 	}
 }
 
-func insertDeliveryApproval(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID, planFingerprint, suffix string) {
+func recordCurrentDeliveryApproval(t *testing.T, ctx context.Context, store storage.Store, suffix string) {
 	t.Helper()
-	at := delivery.CanonicalTimestamp(store.Now())
-	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		_, err := tx.Exec(ctx, `INSERT INTO delivery_approvals(
-			approval_id, schema_version, record_version, project_id, delivery_run_id, approval_kind, authorization_fingerprint,
-			input_fingerprint, policy_fingerprint, plan_fingerprint, approved_side_effect_class, approved_scope_json,
-			approved_by_json, status, approved_at, created_at, updated_at, created_by_json, updated_by_json, host_json
-		) VALUES (?, ?, 1, ?, ?, 'plan-approval', ?, ?, ?, ?, 'provider-launch', '{}', '{}', 'active', ?, ?, ?, '{}', '{}', '{}')`,
-			"appr-"+suffix, delivery.SchemaApproval, projectID, deliveryRunID, testFingerprint("auth-"+suffix),
-			testFingerprint("input"), testFingerprint("delivery-policy"), planFingerprint, at, at, at)
-		return err
+	run := loadRunForApproval(t, ctx, store)
+	_, err := delivery.RecordApproval(ctx, store, delivery.Approval{
+		SchemaVersion:            delivery.SchemaApproval,
+		RecordVersion:            1,
+		ProjectID:                run.ProjectID,
+		DeliveryRunID:            run.DeliveryRunID,
+		ApprovalKind:             "plan-approval",
+		AuthorizationFingerprint: run.AuthorizationFingerprint,
+		InputFingerprint:         run.InputFingerprint,
+		PolicyFingerprint:        run.PolicyFingerprint,
+		PlanFingerprint:          run.PlanFingerprint,
+		ApprovedSideEffectClass:  run.MaxSideEffectClass,
+		ApprovedScopeJSON:        "{}",
+		ApprovedBy:               userActor(),
+		Status:                   "active",
+		CreatedBy:                userActor(),
+		UpdatedBy:                userActor(),
+		Host:                     routingHost(),
+	}, delivery.PersistOptions{IdempotencyKey: "record-current-approval-" + suffix, Now: store.Now()})
+	if err != nil {
+		t.Fatalf("RecordApproval: %v", err)
+	}
+}
+
+func loadRunForApproval(t *testing.T, ctx context.Context, store storage.Store) replanRunAuthority {
+	t.Helper()
+	var run replanRunAuthority
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, state, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint, max_side_effect_class
+			FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`, "proj-routing", "drun-routing").Scan(
+			&run.ProjectID, &run.DeliveryRunID, &run.State, &run.InputFingerprint, &run.PolicyFingerprint, &run.PlanFingerprint, &run.AuthorizationFingerprint, &run.MaxSideEffectClass)
 	})
 	if err != nil {
-		t.Fatalf("insert delivery approval: %v", err)
+		t.Fatalf("load run for approval: %v", err)
 	}
+	return run
 }
 
 func schedulerActor() delivery.Actor {
@@ -650,6 +1042,11 @@ func reserveCancellationBudget(t *testing.T, ctx context.Context, store storage.
 
 func budgetReservationState(t *testing.T, ctx context.Context, store storage.Store, reservationID string) budget.ReservationState {
 	t.Helper()
+	return budgetReservation(t, ctx, store, reservationID).State
+}
+
+func budgetReservation(t *testing.T, ctx context.Context, store storage.Store, reservationID string) budget.Reservation {
+	t.Helper()
 	var payload string
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		return tx.QueryRow(ctx, `SELECT payload_json FROM budget_reservations WHERE budget_reservation_id = ?`, reservationID).Scan(&payload)
@@ -661,5 +1058,84 @@ func budgetReservationState(t *testing.T, ctx context.Context, store storage.Sto
 	if err := json.Unmarshal([]byte(payload), &reservation); err != nil {
 		t.Fatalf("decode reservation: %v", err)
 	}
-	return reservation.State
+	return reservation
+}
+
+func reserveCancellationBudgetForRun(t *testing.T, ctx context.Context, store storage.Store, now time.Time, projectID, deliveryRunID, auth string) budget.Reservation {
+	t.Helper()
+	result, err := budget.Reserve(ctx, store, budget.ReserveRequest{
+		ScopeChain: []budget.Scope{{
+			ScopeKind:     budget.ScopeDeliveryRun,
+			ProjectID:     projectID,
+			DeliveryRunID: deliveryRunID,
+		}},
+		QuantityKind:             providerinventory.QuantityRequests,
+		Unit:                     "request",
+		RequestedValue:           1,
+		LeaseExpiresAt:           now.Add(time.Hour),
+		IdempotencyKey:           "cancel-reservation-" + deliveryRunID,
+		RequesterID:              "scheduler",
+		AuthorizationFingerprint: auth,
+		RequirementConfidence:    providerinventory.ConfidenceExact,
+		Actor:                    budget.Actor{ActorID: "scheduler", Role: "scheduler"},
+		Host:                     budget.Host{HostID: "routing-test"},
+	})
+	if err != nil {
+		t.Fatalf("Reserve cancellation budget for run: %v", err)
+	}
+	return result.Reservation
+}
+
+func updateDeliveryRunState(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID, state string) {
+	t.Helper()
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE delivery_runs SET state = ? WHERE project_id = ? AND delivery_run_id = ?`, state, projectID, deliveryRunID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("update delivery run state: %v", err)
+	}
+}
+
+func activeReservationIDsForRun(t *testing.T, ctx context.Context, store storage.Store, projectID, deliveryRunID string) []string {
+	t.Helper()
+	ids, err := activeRunReservations(ctx, store, projectID, deliveryRunID)
+	if err != nil {
+		t.Fatalf("active reservations for run: %v", err)
+	}
+	return ids
+}
+
+func candidateByID(t *testing.T, candidates []Candidate, id string) Candidate {
+	t.Helper()
+	for _, candidate := range candidates {
+		if candidate.RoutingCandidateID == id {
+			return candidate
+		}
+	}
+	t.Fatalf("candidate %s not found", id)
+	return Candidate{}
+}
+
+type writeHookStore struct {
+	storage.Store
+	beforeWrite func()
+}
+
+func (s *writeHookStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	if s.beforeWrite != nil {
+		hook := s.beforeWrite
+		s.beforeWrite = nil
+		hook()
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+type txErrorStore struct {
+	storage.Store
+	err error
+}
+
+func (s txErrorStore) WithTx(context.Context, func(storage.Tx) error) error {
+	return s.err
 }
