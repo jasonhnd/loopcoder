@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,7 +51,14 @@ func TestBuildGrokArgs(t *testing.T) {
 				"--disable-web-search",
 				"--no-subagents",
 				"--no-memory",
-				"--always-approve",
+				"--permission-mode", "dontAsk",
+				"--sandbox", "strict",
+				"--allow", "Read",
+				"--allow", "Grep",
+				"--allow", "Edit(**)",
+				"--deny", "Bash(*)",
+				"--deny", "WebFetch(*)",
+				"--deny", "MCPTool(*)",
 			},
 		},
 		{
@@ -71,10 +79,14 @@ func TestBuildGrokArgs(t *testing.T) {
 				"--disable-web-search",
 				"--no-subagents",
 				"--no-memory",
+				"--permission-mode", "dontAsk",
 				"--sandbox", "read-only",
-				"--deny", "write:*",
-				"--deny", "shell:*",
-				"--disallowed-tools", "write,edit,shell,terminal",
+				"--allow", "Read",
+				"--allow", "Grep",
+				"--deny", "Edit(*)",
+				"--deny", "Bash(*)",
+				"--deny", "WebFetch(*)",
+				"--deny", "MCPTool(*)",
 				"-m", "grok-4.5",
 				"--effort", "high",
 			},
@@ -91,8 +103,6 @@ func TestBuildGrokArgs(t *testing.T) {
 }
 
 func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
-	restoreProbe := stubGrokProbe(t, supportedGrokProbe)
-	defer restoreProbe()
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {
 		if opts.HardCap != 123*time.Millisecond {
 			t.Fatalf("HardCap = %s, want 123ms", opts.HardCap)
@@ -106,6 +116,9 @@ func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
 		if containsArg(cmd.Args, "--always-approve") {
 			t.Fatalf("cmd.Args = %#v, must not auto-approve in read-only mode", cmd.Args)
 		}
+		if !containsArgPair(cmd.Args, "--permission-mode", "dontAsk") {
+			t.Fatalf("cmd.Args = %#v, want dontAsk permission mode", cmd.Args)
+		}
 		_, _ = io.WriteString(cmd.Stdout, `{"type":"system","session_id":"session-123","model":"grok-4.5"}`+"\n")
 		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","structured_output":{"verdict":"pass","evidence":"fixture"},"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10},"cost_usd":0.001}`+"\n")
 		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
@@ -113,7 +126,7 @@ func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
 	defer restoreRun()
 
 	logPath := filepath.Join(t.TempDir(), "grok.log")
-	result, err := GrokRunner{}.Run(context.Background(), Invocation{
+	result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
 		WorktreePath: t.TempDir(),
 		Prompt:       "inspect",
 		ReadOnly:     true,
@@ -144,8 +157,6 @@ func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
 }
 
 func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T) {
-	restoreProbe := stubGrokProbe(t, supportedGrokProbe)
-	defer restoreProbe()
 	t.Setenv("LOOPCODER_SECRET_CANARY", "should-not-pass")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-pass")
 	t.Setenv("XAI_API_KEY", "xai-runtime-test-value")
@@ -154,11 +165,16 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 		if cmd.Dir != worktree {
 			t.Fatalf("cmd.Dir = %q, want %q", cmd.Dir, worktree)
 		}
-		if !containsArgPair(cmd.Args, "--cwd", worktree) || !containsArg(cmd.Args, "--always-approve") {
+		if !containsArgPair(cmd.Args, "--cwd", worktree) || !containsArgPair(cmd.Args, "--sandbox", "strict") || !containsArgPair(cmd.Args, "--permission-mode", "dontAsk") {
 			t.Fatalf("cmd.Args = %#v, want approved write workspace", cmd.Args)
 		}
-		if containsArg(cmd.Args, "--sandbox") {
-			t.Fatalf("cmd.Args = %#v, must not include read-only sandbox in write mode", cmd.Args)
+		if containsArg(cmd.Args, "--always-approve") {
+			t.Fatalf("cmd.Args = %#v, must not include always-approve in write mode", cmd.Args)
+		}
+		for _, want := range []string{"Edit(**)", "Bash(*)", "WebFetch(*)", "MCPTool(*)"} {
+			if !containsArg(cmd.Args, want) {
+				t.Fatalf("cmd.Args = %#v, missing enforcement rule %q", cmd.Args, want)
+			}
 		}
 		env := strings.Join(cmd.Env, "\n")
 		for _, forbidden := range []string{"LOOPCODER_SECRET_CANARY", "AWS_SECRET_ACCESS_KEY"} {
@@ -174,7 +190,7 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 	})
 	defer restoreRun()
 
-	result, err := GrokRunner{}.Run(context.Background(), Invocation{
+	result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
 		WorktreePath: worktree,
 		Prompt:       "write",
 		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
@@ -215,15 +231,24 @@ func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
 			},
 			want: "missing required flags",
 		},
+		{
+			name: "missing write enforcement",
+			probe: func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
+				if reflect.DeepEqual(argv, []string{"grok", "version"}) {
+					return grokProbeResult{Stdout: "grok 0.1.211\n"}, nil
+				}
+				return grokProbeResult{Stdout: "-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox --allow --deny --permission-mode dontAsk workspace"}, nil
+			},
+			want: "missing required flags",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			restoreProbe := stubGrokProbe(t, tt.probe)
-			defer restoreProbe()
-			_, err := GrokRunner{}.Run(context.Background(), Invocation{
+			readOnly := tt.name != "missing write enforcement"
+			_, err := (GrokRunner{probe: tt.probe}).Run(context.Background(), Invocation{
 				WorktreePath: t.TempDir(),
 				Prompt:       "inspect",
-				ReadOnly:     true,
+				ReadOnly:     readOnly,
 				LogPath:      filepath.Join(t.TempDir(), "grok.log"),
 			})
 			assertGrokError(t, err, GrokErrUnsupportedCapability, tt.want)
@@ -300,8 +325,6 @@ func TestGrokRunnerTypedFailures(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			restoreProbe := stubGrokProbe(t, supportedGrokProbe)
-			defer restoreProbe()
 			restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 				return tt.run(cmd)
 			})
@@ -310,7 +333,7 @@ func TestGrokRunnerTypedFailures(t *testing.T) {
 			if tt.ctx != nil {
 				ctx = tt.ctx()
 			}
-			_, err := GrokRunner{}.Run(ctx, Invocation{
+			_, err := (GrokRunner{probe: supportedGrokProbe}).Run(ctx, Invocation{
 				WorktreePath: t.TempDir(),
 				Prompt:       "run",
 				LogPath:      filepath.Join(t.TempDir(), "grok.log"),
@@ -326,8 +349,6 @@ func TestGrokRunnerTypedFailures(t *testing.T) {
 }
 
 func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
-	restoreProbe := stubGrokProbe(t, supportedGrokProbe)
-	defer restoreProbe()
 	canary := "xai-" + strings.Repeat("A", 24)
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"api_key=`+canary+` Bearer `+canary+`"}`+"\n")
@@ -336,7 +357,7 @@ func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
 	})
 	defer restoreRun()
 	logPath := filepath.Join(t.TempDir(), "grok.log")
-	result, err := GrokRunner{}.Run(context.Background(), Invocation{
+	result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
 		WorktreePath: t.TempDir(),
 		Prompt:       "run",
 		LogPath:      logPath,
@@ -356,6 +377,107 @@ func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
 	if !strings.Contains(logText, "[REDACTED]") {
 		t.Fatalf("log missing redaction marker:\n%s", logText)
 	}
+}
+
+func TestGrokRunnerRedactsBeforeEveryCapBoundary(t *testing.T) {
+	canary := "xai-" + strings.Repeat("B", 24)
+
+	var probe cappedProbeBuffer
+	probe.cap = 40
+	_, _ = probe.Write([]byte(strings.Repeat("p", 32) + " api_key=" + canary + " tail"))
+	assertNoGrokCanary(t, probe.String(), canary)
+
+	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		_, _ = io.WriteString(cmd.Stdout, strings.Repeat("o", grokMaxFrameBytes-8)+"api_key="+canary+"\n")
+		_, _ = io.WriteString(cmd.Stderr, strings.Repeat("e", grokMaxFrameBytes-8)+"Bearer "+canary+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restoreRun()
+
+	logPath := filepath.Join(t.TempDir(), "grok.log")
+	_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "run",
+		LogPath:      logPath,
+		RunID:        "attempt",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrOutputFlood, "")
+	assertNoGrokCanary(t, readFileString(t, logPath), canary)
+}
+
+func TestGrokRunnerCancelsProviderOnTerminalStreamError(t *testing.T) {
+	var sawCancel atomic.Bool
+	restoreRun := stubRunSupervised(t, func(ctx context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		_, _ = io.WriteString(cmd.Stdout, "not-json\n")
+		select {
+		case <-ctx.Done():
+			sawCancel.Store(true)
+			return supervisedexec.Result{Outcome: supervisedexec.OutcomeDeadline, Killed: true}, ctx.Err()
+		case <-time.After(time.Second):
+			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+		}
+	})
+	defer restoreRun()
+
+	_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "run",
+		LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+		RunID:        "attempt",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrMalformedFrame, "")
+	if !sawCancel.Load() {
+		t.Fatal("provider context was not canceled after malformed frame")
+	}
+}
+
+func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
+	t.Run("structured summary cap", func(t *testing.T) {
+		canary := "xai-" + strings.Repeat("C", 24)
+		restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+			huge := strings.Repeat("s", grokMaxSummaryBytes-6) + canary + strings.Repeat("z", 128)
+			payload := `{"type":"result","model":"grok-4.5","structured_output":{"value":"` + huge + `"}}`
+			_, _ = io.WriteString(cmd.Stdout, payload+"\n")
+			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+		})
+		defer restoreRun()
+
+		logPath := filepath.Join(t.TempDir(), "grok.log")
+		result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+			WorktreePath: t.TempDir(),
+			Prompt:       "run",
+			LogPath:      logPath,
+			RunID:        "attempt",
+			Role:         "worker",
+		})
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if len(result.Summary) > grokMaxSummaryBytes {
+			t.Fatalf("summary length = %d, want <= %d", len(result.Summary), grokMaxSummaryBytes)
+		}
+		assertNoGrokCanary(t, result.Summary, canary)
+		assertNoGrokCanary(t, readFileString(t, logPath), canary)
+	})
+
+	t.Run("malformed cost", func(t *testing.T) {
+		restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+			_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"done","cost_usd":"NaN"}`+"\n")
+			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+		})
+		defer restoreRun()
+
+		_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+			WorktreePath: t.TempDir(),
+			Prompt:       "run",
+			LogPath:      filepath.Join(t.TempDir(), "grok.log"),
+			RunID:        "attempt",
+			Role:         "worker",
+		})
+		assertGrokError(t, err, GrokErrMalformedFrame, "invalid cost_usd")
+	})
 }
 
 func TestGrokRunnerNativeFakeProcessFixture(t *testing.T) {
@@ -390,16 +512,7 @@ func supportedGrokProbe(_ context.Context, argv []string, _ string, _ []string, 
 }
 
 func supportedGrokHelp() string {
-	return "-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox --deny --disallowed-tools --always-approve"
-}
-
-func stubGrokProbe(t *testing.T, fn func(context.Context, []string, string, []string, time.Duration, int64) (grokProbeResult, error)) func() {
-	t.Helper()
-	original := runGrokProbe
-	runGrokProbe = fn
-	return func() {
-		runGrokProbe = original
-	}
+	return "-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny"
 }
 
 func assertGrokError(t *testing.T, err error, code GrokErrorCode, contains string) {
@@ -446,6 +559,15 @@ func readFileString(t *testing.T, path string) string {
 	return string(data)
 }
 
+func assertNoGrokCanary(t *testing.T, value, canary string) {
+	t.Helper()
+	for _, forbidden := range []string{canary, "xai-", strings.Repeat("B", 12), strings.Repeat("C", 12)} {
+		if strings.Contains(value, forbidden) {
+			t.Fatalf("value retained secret fragment %q:\n%s", forbidden, value)
+		}
+	}
+}
+
 func executableNameForTest(name string) string {
 	if strings.EqualFold(filepath.Ext(name), ".exe") {
 		return name
@@ -461,7 +583,7 @@ func writeFakeGrokExecutable(t *testing.T, path string) {
 	if os.PathSeparator == '\\' {
 		script := "@echo off\r\n" +
 			"if \"%1\"==\"version\" echo grok 0.1.211&& exit /b 0\r\n" +
-			"if \"%1\"==\"--help\" echo -p --cwd --output-format --no-auto-update --no-alt-screen --sandbox --deny --disallowed-tools --always-approve&& exit /b 0\r\n" +
+			"if \"%1\"==\"--help\" echo -p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny&& exit /b 0\r\n" +
 			"echo {\"type\":\"result\",\"model\":\"grok-fixture\",\"result\":\"native fixture\"}\r\n"
 		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 			t.Fatalf("write fake grok: %v", err)
@@ -471,7 +593,7 @@ func writeFakeGrokExecutable(t *testing.T, path string) {
 	script := "#!/bin/sh\n" +
 		"case \"$1\" in\n" +
 		"  version) echo 'grok 0.1.211'; exit 0 ;;\n" +
-		"  --help) echo '-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox --deny --disallowed-tools --always-approve'; exit 0 ;;\n" +
+		"  --help) echo '-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox strict read-only --permission-mode dontAsk --allow --deny'; exit 0 ;;\n" +
 		"esac\n" +
 		"printf '%s\\n' '{\"type\":\"result\",\"model\":\"grok-fixture\",\"result\":\"native fixture\"}'\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {

@@ -843,11 +843,21 @@ func renderModelProviders(w io.Writer, providers []models.Provider) error {
 		if _, err := fmt.Fprintf(w, "cli: %s\n", provider.CLI); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "default: %s / %s\n", provider.DefaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
+		defaultModel := provider.DefaultModel
+		if defaultModel == "" {
+			defaultModel = "(provider default)"
+		}
+		if _, err := fmt.Fprintf(w, "default: %s / %s\n", defaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintln(w, "models:"); err != nil {
 			return err
+		}
+		if len(provider.Models) == 0 {
+			if _, err := fmt.Fprintln(w, "  (dynamic inventory required)"); err != nil {
+				return err
+			}
+			continue
 		}
 		for _, model := range provider.Models {
 			if _, err := fmt.Fprintf(w, "  - %s\n", model.Name); err != nil {

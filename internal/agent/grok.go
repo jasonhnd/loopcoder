@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -20,7 +21,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-type GrokRunner struct{}
+type GrokRunner struct {
+	probe grokProbeFunc
+}
 
 func init() {
 	registry["grok"] = GrokRunner{}
@@ -33,6 +36,7 @@ const (
 	grokMaxLogBytes     = 1024 * 1024
 	grokMaxSummaryBytes = 8192
 	grokProbeTimeout    = 5 * time.Second
+	grokRedactOverlap   = 4096
 )
 
 type GrokErrorCode string
@@ -80,7 +84,14 @@ type grokProbeResult struct {
 	ExitCode int
 }
 
-var runGrokProbe = runGrokProbeCommand
+type grokProbeFunc func(context.Context, []string, string, []string, time.Duration, int64) (grokProbeResult, error)
+
+func (r GrokRunner) probeFunc() grokProbeFunc {
+	if r.probe != nil {
+		return r.probe
+	}
+	return runGrokProbeCommand
+}
 
 func BuildGrokArgs(inv Invocation) []string {
 	args := []string{
@@ -92,16 +103,28 @@ func BuildGrokArgs(inv Invocation) []string {
 		"--disable-web-search",
 		"--no-subagents",
 		"--no-memory",
+		"--permission-mode", "dontAsk",
 	}
 	if inv.ReadOnly {
 		args = append(args,
 			"--sandbox", "read-only",
-			"--deny", "write:*",
-			"--deny", "shell:*",
-			"--disallowed-tools", "write,edit,shell,terminal",
+			"--allow", "Read",
+			"--allow", "Grep",
+			"--deny", "Edit(*)",
+			"--deny", "Bash(*)",
+			"--deny", "WebFetch(*)",
+			"--deny", "MCPTool(*)",
 		)
 	} else {
-		args = append(args, "--always-approve")
+		args = append(args,
+			"--sandbox", "strict",
+			"--allow", "Read",
+			"--allow", "Grep",
+			"--allow", "Edit(**)",
+			"--deny", "Bash(*)",
+			"--deny", "WebFetch(*)",
+			"--deny", "MCPTool(*)",
+		)
 	}
 	if strings.TrimSpace(inv.Model) != "" {
 		args = append(args, "-m", inv.Model)
@@ -112,7 +135,7 @@ func BuildGrokArgs(inv Invocation) []string {
 	return args
 }
 
-func (GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
+func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("grok log path is required")
 	}
@@ -132,12 +155,15 @@ func (GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	defer logFile.Close()
 
-	capability, err := negotiateGrokCapability(ctx, inv)
+	capability, err := r.negotiateCapability(ctx, inv)
 	if err != nil {
 		return Result{ExitCode: -1}, err
 	}
 
-	sink := newGrokStreamSink(logFile, grokMaxLogBytes, grokMaxFrameBytes)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	sink := newGrokStreamSink(logFile, grokMaxLogBytes, grokMaxFrameBytes, cancelRun)
 	sink.writeRecord(grokNormalizedRecord{
 		Kind:           "start",
 		Provider:       "grok",
@@ -147,7 +173,7 @@ func (GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		Workspace:      inv.WorktreePath,
 	})
 
-	cmd := exec.CommandContext(ctx, "grok", BuildGrokArgs(inv)...)
+	cmd := exec.CommandContext(runCtx, "grok", BuildGrokArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
 	cmd.Env = grokBoundedEnv(os.Environ(), inv)
 	cmd.Stdin = nil
@@ -155,7 +181,7 @@ func (GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	cmd.Stderr = sink.stderrWriter()
 
 	startedAt := time.Now()
-	supervision, runErr := runProviderCommand(ctx, cmd, inv, "grok")
+	supervision, runErr := runProviderCommand(runCtx, cmd, inv, "grok")
 	endedAt := time.Now()
 	sink.close()
 	_ = logFile.Sync()
@@ -166,10 +192,12 @@ func (GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	result.AdapterVersion = capability.Version
 	result.ExternalSessionRef = metadata.ExternalSessionRef
 
-	if err := grokSupervisionError(supervision, runErr, ctx); err != nil {
+	if err := sink.err(); err != nil {
+		result.Hung = false
+		result.HungReason = ""
 		return result, err
 	}
-	if err := sink.err(); err != nil {
+	if err := grokSupervisionError(supervision, runErr, ctx); err != nil {
 		return result, err
 	}
 	if result.ExitCode != 0 {
@@ -188,9 +216,10 @@ type grokCapability struct {
 	Version string
 }
 
-func negotiateGrokCapability(ctx context.Context, inv Invocation) (grokCapability, error) {
+func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation) (grokCapability, error) {
 	env := grokBoundedEnv(os.Environ(), inv)
-	versionResult, err := runGrokProbe(ctx, []string{"grok", "version"}, inv.WorktreePath, env, grokProbeTimeout, 32*1024)
+	probe := r.probeFunc()
+	versionResult, err := probe(ctx, []string{"grok", "version"}, inv.WorktreePath, env, grokProbeTimeout, 32*1024)
 	if err != nil {
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "version probe failed", err)
 	}
@@ -205,7 +234,7 @@ func negotiateGrokCapability(ctx context.Context, inv Invocation) (grokCapabilit
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "installed version "+version+" does not support bounded headless execution", nil)
 	}
 
-	helpResult, err := runGrokProbe(ctx, []string{"grok", "--help"}, inv.WorktreePath, env, grokProbeTimeout, 128*1024)
+	helpResult, err := probe(ctx, []string{"grok", "--help"}, inv.WorktreePath, env, grokProbeTimeout, 128*1024)
 	if err != nil {
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "help probe failed", err)
 	}
@@ -213,11 +242,11 @@ func negotiateGrokCapability(ctx context.Context, inv Invocation) (grokCapabilit
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, fmt.Sprintf("help probe exited with code %d", helpResult.ExitCode), nil)
 	}
 	help := helpResult.Stdout + "\n" + helpResult.Stderr
-	required := []string{"-p", "--cwd", "--output-format", "--no-auto-update", "--no-alt-screen"}
+	required := []string{"-p", "--cwd", "--output-format", "--no-auto-update", "--no-alt-screen", "--sandbox", "--permission-mode", "--allow", "--deny"}
 	if inv.ReadOnly {
-		required = append(required, "--sandbox", "--deny", "--disallowed-tools")
+		required = append(required, "read-only", "dontAsk")
 	} else {
-		required = append(required, "--always-approve")
+		required = append(required, "strict", "dontAsk")
 	}
 	var missing []string
 	for _, flag := range required {
@@ -281,22 +310,29 @@ func (b *cappedProbeBuffer) Write(p []byte) (int, error) {
 	if b.cap <= 0 {
 		return originalLen, nil
 	}
-	remaining := b.cap - int64(b.buf.Len())
-	if remaining <= 0 {
+	storeLimit := b.cap + grokRedactOverlap
+	if int64(b.buf.Len()) >= storeLimit {
 		b.overflow = true
 		return originalLen, nil
 	}
+	remaining := storeLimit - int64(b.buf.Len())
 	if int64(len(p)) > remaining {
 		b.overflow = true
 		p = p[:remaining]
 	}
-	redacted, _ := redactGrokOutput(string(p))
-	_, _ = b.buf.WriteString(redacted)
+	if int64(b.buf.Len()+len(p)) > b.cap {
+		b.overflow = true
+	}
+	_, _ = b.buf.Write(p)
 	return originalLen, nil
 }
 
 func (b *cappedProbeBuffer) String() string {
-	return b.buf.String()
+	if b.cap <= 0 {
+		return ""
+	}
+	redacted, _ := redactGrokOutputBounded(b.buf.String(), int(b.cap))
+	return redacted
 }
 
 type grokStreamSink struct {
@@ -308,6 +344,7 @@ type grokStreamSink struct {
 	stdoutLine  []byte
 	stderrLine  []byte
 	firstErr    error
+	cancel      context.CancelFunc
 	terminal    bool
 	summaryText boundedString
 	meta        grokMetadata
@@ -325,7 +362,6 @@ type boundedString struct {
 }
 
 func (b *boundedString) append(value string) {
-	value, _ = redactGrokOutput(value)
 	if b.limit <= 0 {
 		b.limit = grokMaxSummaryBytes
 	}
@@ -333,17 +369,21 @@ func (b *boundedString) append(value string) {
 		return
 	}
 	remaining := b.limit - len(b.value)
-	if len(value) > remaining {
-		value = value[:remaining]
-	}
+	value, _ = redactGrokOutputBounded(value, remaining)
 	b.value += value
 }
 
-func newGrokStreamSink(log io.Writer, maxLogBytes, maxFrameBytes int) *grokStreamSink {
+func (b *boundedString) set(value string) {
+	b.value = ""
+	b.append(value)
+}
+
+func newGrokStreamSink(log io.Writer, maxLogBytes, maxFrameBytes int, cancel context.CancelFunc) *grokStreamSink {
 	return &grokStreamSink{
 		log:         log,
 		maxLogBytes: maxLogBytes,
 		maxFrame:    maxFrameBytes,
+		cancel:      cancel,
 		summaryText: boundedString{limit: grokMaxSummaryBytes},
 	}
 }
@@ -401,6 +441,9 @@ type grokStreamWriter struct {
 
 func (w grokStreamWriter) Write(p []byte) (int, error) {
 	w.sink.write(w.stream, p)
+	if err := w.sink.err(); err != nil {
+		return len(p), err
+	}
 	return len(p), nil
 }
 
@@ -425,9 +468,11 @@ func (s *grokStreamSink) appendPartialLocked(stream string, p []byte) {
 		target = &s.stderrLine
 	}
 	*target = append(*target, p...)
+	if len(*target) > s.maxFrame+s.redactionOverlap() {
+		*target = (*target)[:s.maxFrame+s.redactionOverlap()]
+	}
 	if len(*target) > s.maxFrame {
 		s.setErrLocked(grokError(GrokErrOutputFlood, fmt.Sprintf("%s frame exceeded %d bytes", stream, s.maxFrame), nil))
-		*target = (*target)[:s.maxFrame]
 	}
 }
 
@@ -442,7 +487,7 @@ func (s *grokStreamSink) flushLineLocked(stream string, final bool) {
 		return
 	}
 	if stream == "stderr" {
-		redacted, truncated := redactGrokOutput(string(line))
+		redacted, truncated := redactGrokOutputBounded(string(line), s.maxFrame)
 		if truncated {
 			s.setErrLocked(grokError(GrokErrOutputFlood, "stderr diagnostic exceeded frame cap after redaction", nil))
 		}
@@ -451,7 +496,8 @@ func (s *grokStreamSink) flushLineLocked(stream string, final bool) {
 	}
 	if len(line) > s.maxFrame {
 		s.setErrLocked(grokError(GrokErrOutputFlood, fmt.Sprintf("stdout frame exceeded %d bytes", s.maxFrame), nil))
-		line = line[:s.maxFrame]
+		redacted, _ := redactGrokOutputBounded(string(line), s.maxFrame)
+		line = []byte(redacted)
 	}
 	if err := s.handleJSONLineLocked(line); err != nil {
 		if final {
@@ -467,11 +513,14 @@ func (s *grokStreamSink) handleJSONLineLocked(line []byte) error {
 	decoder.UseNumber()
 	var payload map[string]any
 	if err := decoder.Decode(&payload); err != nil {
-		redacted, _ := redactGrokOutput(string(line))
+		redacted, _ := redactGrokOutputBounded(string(line), s.maxFrame)
 		s.writeRecordLocked(grokNormalizedRecord{Kind: "malformed", Stream: "stdout", Message: redacted})
 		return grokError(GrokErrMalformedFrame, "invalid streaming-json frame", err)
 	}
-	record := normalizeGrokFrame(payload)
+	record, err := normalizeGrokFrame(payload)
+	if err != nil {
+		return err
+	}
 	if record.SessionRef != "" {
 		s.meta.ExternalSessionRef = record.SessionRef
 	}
@@ -490,7 +539,7 @@ func (s *grokStreamSink) handleJSONLineLocked(line []byte) error {
 		s.summaryText.append(record.Text)
 	}
 	if record.StructuredOutput != nil {
-		s.summaryText.value = string(record.StructuredOutput)
+		s.summaryText.set(string(record.StructuredOutput))
 	}
 	if record.Kind == "terminal" {
 		s.terminal = true
@@ -511,7 +560,7 @@ func (s *grokStreamSink) writeRecord(record grokNormalizedRecord) {
 func (s *grokStreamSink) writeRecordLocked(record grokNormalizedRecord) {
 	data, err := json.Marshal(record)
 	if err != nil {
-		s.setErrLocked(err)
+		s.setErrLocked(grokError(GrokErrMalformedFrame, "marshal normalized grok record", err))
 		return
 	}
 	data = append(data, '\n')
@@ -529,7 +578,17 @@ func (s *grokStreamSink) writeRecordLocked(record grokNormalizedRecord) {
 func (s *grokStreamSink) setErrLocked(err error) {
 	if err != nil && s.firstErr == nil {
 		s.firstErr = err
+		if s.cancel != nil {
+			s.cancel()
+		}
 	}
+}
+
+func (s *grokStreamSink) redactionOverlap() int {
+	if grokRedactOverlap > s.maxFrame {
+		return s.maxFrame
+	}
+	return grokRedactOverlap
 }
 
 type grokNormalizedRecord struct {
@@ -553,7 +612,7 @@ type grokNormalizedRecord struct {
 	Cost             string          `json:"cost,omitempty"`
 }
 
-func normalizeGrokFrame(payload map[string]any) grokNormalizedRecord {
+func normalizeGrokFrame(payload map[string]any) (grokNormalizedRecord, error) {
 	kind := strings.ToLower(firstStringValue(payload, "type", "event", "kind"))
 	record := grokNormalizedRecord{
 		Kind:       normalizeGrokKind(kind),
@@ -571,11 +630,19 @@ func normalizeGrokFrame(payload map[string]any) grokNormalizedRecord {
 		record.Text = nestedText(payload["delta"])
 	}
 	if rawStructured, ok := payload["structured_output"]; ok {
-		record.StructuredOutput = compactJSONValue(rawStructured)
+		structured, err := compactJSONValue(rawStructured)
+		if err != nil {
+			return grokNormalizedRecord{}, grokError(GrokErrMalformedFrame, "invalid structured_output field", err)
+		}
+		record.StructuredOutput = structured
 	}
 	if record.StructuredOutput == nil {
 		if rawStructured, ok := payload["structuredOutput"]; ok {
-			record.StructuredOutput = compactJSONValue(rawStructured)
+			structured, err := compactJSONValue(rawStructured)
+			if err != nil {
+				return grokNormalizedRecord{}, grokError(GrokErrMalformedFrame, "invalid structuredOutput field", err)
+			}
+			record.StructuredOutput = structured
 		}
 	}
 	if errorValue, ok := payload["error"]; ok {
@@ -587,9 +654,13 @@ func normalizeGrokFrame(payload map[string]any) grokNormalizedRecord {
 	if record.ErrorCode == "" {
 		record.ErrorCode = firstStringValue(payload, "error_code", "errorCode")
 	}
-	record.CostUSD = firstFloat64Value(payload, "cost_usd", "costUsd", "costUSD")
+	costUSD, err := firstFloat64Value(payload, "cost_usd", "costUsd", "costUSD")
+	if err != nil {
+		return grokNormalizedRecord{}, grokError(GrokErrMalformedFrame, "invalid cost_usd field", err)
+	}
+	record.CostUSD = costUSD
 	record.Cost = firstStringValue(payload, "cost")
-	return sanitizeGrokRecord(record)
+	return sanitizeGrokRecord(record), nil
 }
 
 func normalizeGrokKind(kind string) string {
@@ -611,14 +682,11 @@ func normalizeGrokKind(kind string) string {
 }
 
 func sanitizeGrokRecord(record grokNormalizedRecord) grokNormalizedRecord {
-	record.Message, _ = redactGrokOutput(record.Message)
-	record.Text, _ = redactGrokOutput(record.Text)
-	record.ErrorMessage, _ = redactGrokOutput(record.ErrorMessage)
-	if len(record.Text) > grokMaxSummaryBytes {
-		record.Text = record.Text[:grokMaxSummaryBytes]
-	}
-	if len(record.Message) > grokMaxFrameBytes {
-		record.Message = record.Message[:grokMaxFrameBytes]
+	record.Message, _ = redactGrokOutputBounded(record.Message, grokMaxFrameBytes)
+	record.Text, _ = redactGrokOutputBounded(record.Text, grokMaxSummaryBytes)
+	record.ErrorMessage, _ = redactGrokOutputBounded(record.ErrorMessage, grokMaxFrameBytes)
+	if record.StructuredOutput != nil {
+		record.StructuredOutput = boundedJSONRawMessage(string(record.StructuredOutput), grokMaxSummaryBytes)
 	}
 	return record
 }
@@ -654,17 +722,25 @@ func nestedText(value any) string {
 	return ""
 }
 
-func compactJSONValue(value any) json.RawMessage {
+func compactJSONValue(value any) (json.RawMessage, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var compacted bytes.Buffer
 	if err := json.Compact(&compacted, data); err != nil {
-		return nil
+		return nil, err
 	}
-	redacted, _ := redactGrokOutput(compacted.String())
-	return json.RawMessage(redacted)
+	return boundedJSONRawMessage(compacted.String(), grokMaxSummaryBytes), nil
+}
+
+func boundedJSONRawMessage(value string, limit int) json.RawMessage {
+	redacted, truncated := redactGrokOutputBounded(value, limit)
+	if !truncated && json.Valid([]byte(redacted)) {
+		return json.RawMessage(redacted)
+	}
+	encoded, _ := json.Marshal(redacted)
+	return json.RawMessage(encoded)
 }
 
 func grokErrorFields(value any) (string, string) {
@@ -678,7 +754,7 @@ func grokErrorFields(value any) (string, string) {
 	}
 }
 
-func firstFloat64Value(values map[string]any, keys ...string) *float64 {
+func firstFloat64Value(values map[string]any, keys ...string) (*float64, error) {
 	for _, key := range keys {
 		value, ok := values[key]
 		if !ok {
@@ -686,18 +762,33 @@ func firstFloat64Value(values map[string]any, keys ...string) *float64 {
 		}
 		switch typed := value.(type) {
 		case float64:
-			return &typed
+			if math.IsInf(typed, 0) || math.IsNaN(typed) {
+				return nil, fmt.Errorf("%s is not finite", key)
+			}
+			return &typed, nil
 		case json.Number:
 			if parsed, err := typed.Float64(); err == nil {
-				return &parsed
+				if math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+					return nil, fmt.Errorf("%s is not finite", key)
+				}
+				return &parsed, nil
+			} else {
+				return nil, fmt.Errorf("%s: %w", key, err)
 			}
 		case string:
 			if parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64); err == nil {
-				return &parsed
+				if math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+					return nil, fmt.Errorf("%s is not finite", key)
+				}
+				return &parsed, nil
+			} else {
+				return nil, fmt.Errorf("%s: %w", key, err)
 			}
+		default:
+			return nil, fmt.Errorf("%s has unsupported type %T", key, value)
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func firstNonEmptyGrok(values ...string) string {
@@ -863,8 +954,16 @@ func redactGrokOutput(value string) (string, bool) {
 			return "[REDACTED]"
 		})
 	}
-	if len(redacted) > grokMaxFrameBytes {
-		return redacted[:grokMaxFrameBytes], true
+	return redacted, false
+}
+
+func redactGrokOutputBounded(value string, limit int) (string, bool) {
+	redacted, _ := redactGrokOutput(value)
+	if limit <= 0 {
+		return redacted, false
+	}
+	if len(redacted) > limit {
+		return redacted[:limit], true
 	}
 	return redacted, false
 }

@@ -1104,10 +1104,9 @@ func expectedModelsOutput() string {
 		"provider: grok\n" +
 		"vendor: xAI\n" +
 		"cli: grok\n" +
-		"default: grok-4.5 / (none)\n" +
+		"default: (provider default) / (none)\n" +
 		"models:\n" +
-		"  - grok-4.5\n" +
-		"    depths: (none)\n"
+		"  (dynamic inventory required)\n"
 }
 
 func expectedAntigravityModelsOutput() string {
