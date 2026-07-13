@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +122,26 @@ const (
 	NetworkDenied    NetworkPermission = "denied"
 	NetworkGranted   NetworkPermission = "granted"
 )
+
+type NetworkPurpose string
+
+const (
+	NetworkPurposeAuthReadiness        NetworkPurpose = "auth-readiness"
+	NetworkPurposeModelCatalog         NetworkPurpose = "model-catalog"
+	NetworkPurposeAuthCatalogInventory NetworkPurpose = "auth-catalog-inventory"
+)
+
+type NetworkScope string
+
+const (
+	NetworkScopeMachineInventory NetworkScope = "machine-provider-inventory"
+)
+
+type NetworkGrant struct {
+	ProviderID string
+	Purpose    NetworkPurpose
+	Scope      NetworkScope
+}
 
 type ProfileSource string
 
@@ -565,6 +587,7 @@ type Options struct {
 	Config          config.Config
 	RuntimeContract runtimecap.Contract
 	Now             func() time.Time
+	NetworkGrants   []NetworkGrant
 }
 
 type Deps struct {
@@ -595,6 +618,16 @@ type ProbeExecutionResult struct {
 	Killed   bool
 }
 
+type discoveryContext struct {
+	networkGrants map[NetworkGrant]bool
+	probeResults  map[string]cachedProbeResult
+}
+
+type cachedProbeResult struct {
+	result ProbeExecutionResult
+	err    error
+}
+
 func DefaultDeps() Deps {
 	return Deps{
 		Getenv:       os.Getenv,
@@ -606,6 +639,63 @@ func DefaultDeps() Deps {
 		RunProbe:     runProbeCommand,
 		RandomID:     randomProbeID,
 	}
+}
+
+func newDiscoveryContext(opts Options) *discoveryContext {
+	grants := make(map[NetworkGrant]bool, len(opts.NetworkGrants))
+	for _, grant := range opts.NetworkGrants {
+		grant.ProviderID = strings.TrimSpace(grant.ProviderID)
+		if grant.ProviderID == "" || grant.Purpose == "" || grant.Scope == "" {
+			continue
+		}
+		grants[grant] = true
+	}
+	return &discoveryContext{
+		networkGrants: grants,
+		probeResults:  map[string]cachedProbeResult{},
+	}
+}
+
+func networkPermissionFor(discovery *discoveryContext, adapter AdapterDeclaration, purpose NetworkPurpose, declared bool) NetworkPermission {
+	if !declared {
+		return NetworkNotNeeded
+	}
+	if discovery == nil {
+		return NetworkDenied
+	}
+	exact := NetworkGrant{ProviderID: adapter.AdapterID, Purpose: purpose, Scope: NetworkScopeMachineInventory}
+	combined := NetworkGrant{ProviderID: adapter.AdapterID, Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}
+	if discovery.networkGrants[exact] || discovery.networkGrants[combined] {
+		return NetworkGranted
+	}
+	return NetworkDenied
+}
+
+func sharedProbeResult(ctx context.Context, discovery *discoveryContext, deps Deps, exec ProbeExecution) (ProbeExecutionResult, error) {
+	if discovery == nil {
+		return deps.RunProbe(ctx, exec)
+	}
+	key := sharedProbeKey(exec)
+	if cached, ok := discovery.probeResults[key]; ok {
+		return cached.result, cached.err
+	}
+	result, err := deps.RunProbe(ctx, exec)
+	discovery.probeResults[key] = cachedProbeResult{result: result, err: err}
+	return result, err
+}
+
+func sharedProbeKey(exec ProbeExecution) string {
+	env := append([]string(nil), exec.Env...)
+	sort.Strings(env)
+	parts := []string{
+		strings.Join(exec.Argv, "\x00"),
+		strings.Join(env, "\x00"),
+		exec.Timeout.String(),
+		strconv.Itoa(exec.StdoutLimitBytes),
+		strconv.Itoa(exec.StderrLimitBytes),
+		strconv.Itoa(exec.CombinedLimitBytes),
+	}
+	return strings.Join(parts, "\x01")
 }
 
 func EmptyRefs() InventoryRefs {
@@ -633,6 +723,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	if violations := contract.InvariantViolations(); len(violations) > 0 {
 		return Report{}, fmt.Errorf("%w: runtime capability contract: %s", ErrInvalidRecord, strings.Join(violations, "; "))
 	}
+	discovery := newDiscoveryContext(opts)
 	adapters, err := adapterDeclarations(opts.Config, contract)
 	if err != nil {
 		return Report{}, err
@@ -658,10 +749,6 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		}
 		modelCatalogSnapshots = append(modelCatalogSnapshots, snapshot)
 		modelCapabilities = append(modelCapabilities, capabilities...)
-		if adapter.CatalogProbeMayNetwork {
-			probes = append(probes, skippedCatalogProbe(adapter, now, deps))
-			gaps = append(gaps, "provider-"+adapter.AdapterID+"-catalog-network-permission-denied")
-		}
 		found := false
 		candidates := discoverCandidates(adapter, deps)
 		for _, candidate := range candidates {
@@ -669,11 +756,27 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			installation, probe := inspectCandidate(ctx, adapter, candidate, now, deps)
 			installations = append(installations, installation)
 			probes = append(probes, probe)
-			profiles, readiness, authProbe := inspectAuthReadiness(ctx, adapter, candidate, installation.ProviderInstallationID, now, deps)
-			accountProfiles = append(accountProfiles, profiles...)
-			authReadiness = append(authReadiness, readiness...)
-			if authProbe != nil {
-				probes = append(probes, *authProbe)
+			if installation.InstallationState == InstallationInstalled {
+				profiles, readiness, authProbe := inspectAuthReadiness(ctx, discovery, adapter, candidate, installation.ProviderInstallationID, now, deps)
+				accountProfiles = append(accountProfiles, profiles...)
+				authReadiness = append(authReadiness, readiness...)
+				if authProbe != nil {
+					probes = append(probes, *authProbe)
+				}
+			} else {
+				readiness := unsupportedAuthReadiness(adapter, &installation.ProviderInstallationID, now, firstNonEmpty(installation.TerminalErrorCode, "installation-not-usable"))
+				readiness.EvidenceKind = EvidenceNotRun
+				readiness.GapReasons = append(readiness.GapReasons, "installation-not-usable")
+				authReadiness = append(authReadiness, readiness)
+			}
+			if len(adapter.CatalogProbeCommand) > 0 {
+				snapshot, capabilities, catalogProbe := inspectCatalogCommand(ctx, discovery, adapter, candidate, installation, now, deps)
+				modelCatalogSnapshots = append(modelCatalogSnapshots, snapshot)
+				modelCapabilities = append(modelCapabilities, capabilities...)
+				probes = append(probes, catalogProbe)
+				if catalogProbe.NetworkDeclared && catalogProbe.NetworkPermission == NetworkDenied {
+					gaps = append(gaps, "provider-"+adapter.AdapterID+"-catalog-network-permission-denied")
+				}
 			}
 		}
 		if !found {
@@ -1167,6 +1270,14 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 	if terminal == "" {
 		version = parseVersion(result.Stdout, result.Stderr)
 	}
+	if terminal == "" && malformedAdapterVersion(adapter, version) {
+		version = ""
+		versionConfidence = ConfidenceUnknown
+		state = InstallationInstalledUnusable
+		confidence = ConfidenceUnknown
+		outcome = OutcomeInstalledUnusable
+		terminal = "ErrProbeUnparseableVersion"
+	}
 	if version == "" {
 		versionConfidence = ConfidenceUnknown
 		gaps = append(gaps, "version-unknown")
@@ -1176,6 +1287,13 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 			outcome = OutcomeInstalledUnusable
 			terminal = "ErrProbeUnparseableVersion"
 		}
+	}
+	if terminal == "" && unsupportedAdapterVersion(adapter, version) {
+		state = InstallationInstalledUnusable
+		confidence = ConfidenceUnknown
+		outcome = OutcomeInstalledUnusable
+		terminal = "ErrUnsupportedVersion"
+		gaps = append(gaps, "unsupported-version")
 	}
 	probe.Outcome = outcome
 	probe.Confidence = confidence
@@ -1228,9 +1346,9 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 	return installation, probe
 }
 
-func inspectAuthReadiness(ctx context.Context, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
+func inspectAuthReadiness(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
 	if len(adapter.AuthProbeCommand) > 0 {
-		return inspectAuthCommand(ctx, adapter, candidate, installationID, now, deps)
+		return inspectAuthCommand(ctx, discovery, adapter, candidate, installationID, now, deps)
 	}
 	if len(adapter.AuthArtifactPaths) > 0 {
 		profiles, readiness, probe := inspectAuthArtifacts(adapter, installationID, now, deps)
@@ -1258,7 +1376,7 @@ func stringSliceContains(values []string, want string) bool {
 	return false
 }
 
-func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
+func inspectAuthCommand(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installationID string, now time.Time, deps Deps) ([]AccountProfile, []AuthReadiness, *ProbeResult) {
 	probe := baseProbe(adapter, now, deps)
 	probe.ProviderInstallationID = &installationID
 	probe.ProbeKind = "auth-readiness"
@@ -1268,10 +1386,7 @@ func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candida
 		probe.ProbeMethod = ProbeMethodMachineJSON
 	}
 	probe.NetworkDeclared = adapter.AuthProbeMayNetwork || adapter.MayNetwork
-	probe.NetworkPermission = NetworkNotNeeded
-	if probe.NetworkDeclared {
-		probe.NetworkPermission = NetworkDenied
-	}
+	probe.NetworkPermission = networkPermissionFor(discovery, adapter, NetworkPurposeAuthReadiness, probe.NetworkDeclared)
 	probe.TimeoutMS = int(AuthProbeTimeout / time.Millisecond)
 	probe.StaleAfter = formatTime(now.Add(30 * time.Minute))
 	argv := authProbeArgv(adapter, candidate.path)
@@ -1295,7 +1410,7 @@ func inspectAuthCommand(ctx context.Context, adapter AdapterDeclaration, candida
 		return nil, []AuthReadiness{readiness}, &probe
 	}
 
-	result, err := deps.RunProbe(ctx, ProbeExecution{
+	result, err := sharedProbeResult(ctx, discovery, deps, ProbeExecution{
 		Argv:               argv,
 		Env:                env,
 		Timeout:            AuthProbeTimeout,
@@ -1498,9 +1613,44 @@ func parseAuthStatus(adapter AdapterDeclaration, output string, exitCode int) []
 	switch adapter.AuthProbeParser {
 	case "claude-auth-status-json":
 		return parseClaudeAuthStatus(output, exitCode)
+	case "grok-models":
+		return parseGrokModelsAuthStatus(output, exitCode)
 	default:
 		return parseTextAuthStatus(adapter.AdapterID, output)
 	}
+}
+
+func parseGrokModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
+	lower := strings.ToLower(output)
+	state, scope, summary, refresh, gaps, recognized := classifyAuthLine(output)
+	if networkFailureText(lower) {
+		state = ReadinessUnknown
+		scope = AuthorizationUnknown
+		summary = "model inventory network unavailable"
+		refresh = false
+		gaps = []string{"catalog-network-unavailable"}
+		recognized = true
+	}
+	if !recognized && exitCode == 0 && len(parseGrokModelEntries(output)) > 0 {
+		state = ReadinessReady
+		scope = AuthorizationUnknown
+		summary = "model authorization unknown"
+		gaps = []string{"authorization-scope-unknown"}
+		recognized = true
+	}
+	if !recognized {
+		return parseTextAuthStatus("grok", output)
+	}
+	return []parsedAuthStatus{{
+		ReferenceHash: "sha256:" + hashHex("grok", "models-status", string(state), strings.Join(gaps, ",")),
+		Display:       "grok-profile",
+		EvidenceKind:  EvidenceStatusCommand,
+		State:         state,
+		ScopeState:    scope,
+		ScopeSummary:  summary,
+		Refresh:       refresh,
+		Gaps:          gaps,
+	}}
 }
 
 func parseTextAuthStatus(adapterID, output string) []parsedAuthStatus {
@@ -1872,28 +2022,474 @@ func absentProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResu
 	return probe
 }
 
-func skippedCatalogProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
+func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (ModelCatalogSnapshot, []ModelCapability, ProbeResult) {
+	installationID := installation.ProviderInstallationID
 	probe := baseProbe(adapter, now, deps)
-	argv := append([]string(nil), adapter.CatalogProbeCommand...)
-	if len(argv) == 0 {
-		argv = []string{firstNonEmpty(adapter.ExecutableNames...), "models"}
-	}
+	probe.ProviderInstallationID = &installationID
 	probe.ProbeKind = "catalog"
-	probe.ProbeCommandID = "model-catalog"
+	probe.ProbeCommandID = catalogProbeCommandID(adapter)
 	probe.ProbeMethod = ProbeMethodMachineJSON
-	probe.Outcome = OutcomeProbeFailed
+	probe.TimeoutMS = int(AuthProbeTimeout / time.Millisecond)
+	probe.StaleAfter = formatTime(now.Add(30 * time.Minute))
+	probe.NetworkDeclared = adapter.CatalogProbeMayNetwork
+	probe.NetworkPermission = networkPermissionFor(discovery, adapter, NetworkPurposeModelCatalog, probe.NetworkDeclared)
+	argv := catalogProbeArgv(adapter, candidate.path)
+	env := probeEnvironment(deps.Getenv)
 	probe.Argv = redactArgv(argv)
-	probe.TimeoutMS = int((15 * time.Second).Milliseconds())
-	probe.NetworkDeclared = true
-	probe.NetworkPermission = NetworkDenied
-	probe.FreshnessState = FreshnessNotApplicable
-	probe.Confidence = ConfidenceUnavailable
-	probe.SideEffectClass = "not-run"
-	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: "model-catalog", ExecutableName: firstNonEmpty(adapter.ExecutableNames...)}
-	probe.Evidence = EvidenceSummary{Kind: string(EvidenceNotRun), CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
-	probe.GapReasons = []string{"network-permission-denied"}
-	probe.TerminalErrorCode = "ErrNetworkPermissionDenied"
-	return probe
+	probe.EnvironmentKeys = environmentKeys(env)
+	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: probe.ProbeCommandID, DiscoverySource: string(candidate.source), ExecutableName: filepath.Base(candidate.path)}
+	probe.Evidence = EvidenceSummary{Kind: "bounded-model-catalog-command", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
+
+	unavailable := func(gaps []string, terminal string) (ModelCatalogSnapshot, []ModelCapability, ProbeResult) {
+		source := CatalogSourceInput{
+			Kind:                CatalogSourceProviderMachineReadable,
+			Reference:           string(CatalogSourceProviderMachineReadable) + ":" + adapter.AdapterID + ":unavailable",
+			SourceSchemaVersion: firstNonEmpty(adapter.CatalogProbeParser, "provider-text"),
+			ProviderCLIVersion:  installation.Version,
+			Precedence:          200,
+			Confidence:          ConfidenceUnavailable,
+			FreshnessState:      FreshnessNotApplicable,
+			Gaps:                append([]string(nil), gaps...),
+		}
+		snapshot, capabilities, _ := buildCatalogSnapshot(adapter, &installationID, []CatalogSourceInput{source}, now)
+		snapshot.TerminalErrorCode = terminal
+		return snapshot, capabilities, probe
+	}
+
+	if installation.InstallationState != InstallationInstalled {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnavailable
+		probe.FreshnessState = FreshnessNotApplicable
+		probe.SideEffectClass = "not-run"
+		probe.GapReasons = []string{"installation-not-usable"}
+		probe.TerminalErrorCode = firstNonEmpty(installation.TerminalErrorCode, "ErrInstallationNotUsable")
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+
+	if probe.NetworkDeclared && probe.NetworkPermission != NetworkGranted {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnavailable
+		probe.FreshnessState = FreshnessNotApplicable
+		probe.SideEffectClass = "not-run"
+		probe.GapReasons = []string{"network-permission-denied"}
+		probe.TerminalErrorCode = "ErrNetworkPermissionDenied"
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+
+	result, err := sharedProbeResult(ctx, discovery, deps, ProbeExecution{
+		Argv:               argv,
+		Env:                env,
+		Timeout:            AuthProbeTimeout,
+		StdoutLimitBytes:   StdoutLimitBytes,
+		StderrLimitBytes:   StderrLimitBytes,
+		CombinedLimitBytes: CombinedLimitBytes,
+	})
+	stdout, stdoutFindings := redactProviderOutput(result.Stdout)
+	stderr, stderrFindings := redactProviderOutput(result.Stderr)
+	probe.StdoutSummary = stdout
+	probe.StderrSummary = stderr
+	probe.SecretFindingCount = stdoutFindings + stderrFindings
+	probe.TimedOut = result.TimedOut
+	probe.Killed = result.Killed
+	probe.ExitCode = &result.ExitCode
+	if err != nil || result.TimedOut || result.Killed {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnknown
+		probe.GapReasons = []string{"catalog-probe-failed"}
+		probe.TerminalErrorCode = "ErrCatalogProbeExecutionFailed"
+		if result.TimedOut {
+			probe.GapReasons = []string{"catalog-probe-timeout"}
+			probe.TerminalErrorCode = "ErrCatalogProbeTimeout"
+		}
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+
+	output := result.Stdout + "\n" + result.Stderr
+	if result.ExitCode != 0 {
+		probe.Outcome = OutcomeInstalledUnusable
+		probe.Confidence = ConfidenceUnknown
+		probe.GapReasons = []string{"catalog-probe-nonzero-exit"}
+		probe.TerminalErrorCode = "ErrCatalogProbeNonZeroExit"
+		if networkFailureText(strings.ToLower(output)) {
+			probe.GapReasons = []string{"catalog-network-unavailable"}
+			probe.TerminalErrorCode = "ErrCatalogNetworkUnavailable"
+		}
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+
+	sources, modelGaps := catalogSourcesFromGrokModels(adapter, installation.Version, output)
+	if len(sources) == 0 {
+		probe.Outcome = OutcomeInstalledUnusable
+		probe.Confidence = ConfidenceUnknown
+		probe.GapReasons = append([]string{"catalog-output-malformed"}, modelGaps...)
+		probe.TerminalErrorCode = "ErrCatalogMalformedOutput"
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+	probe.Outcome = OutcomeInstalled
+	probe.Confidence = ConfidenceExact
+	probe.setParsedFields(map[string]string{
+		"model_count":  fmt.Sprintf("%d", countCatalogEntries(sources)),
+		"source_count": fmt.Sprintf("%d", len(sources)),
+		"parser":       firstNonEmpty(adapter.CatalogProbeParser, "provider-text"),
+	})
+	if len(modelGaps) > 0 {
+		probe.GapReasons = append(probe.GapReasons, modelGaps...)
+	}
+	snapshot, capabilities, err := buildCatalogSnapshot(adapter, &installationID, sources, now)
+	if err != nil {
+		probe.Outcome = OutcomeProbeFailed
+		probe.Confidence = ConfidenceUnknown
+		probe.GapReasons = append(probe.GapReasons, "catalog-build-failed")
+		probe.TerminalErrorCode = "ErrCatalogBuildFailed"
+		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
+	}
+	return snapshot, capabilities, probe
+}
+
+func catalogProbeArgv(adapter AdapterDeclaration, executablePath string) []string {
+	command := append([]string(nil), adapter.CatalogProbeCommand...)
+	if len(command) == 0 {
+		return nil
+	}
+	command[0] = executablePath
+	return command
+}
+
+func catalogProbeCommandID(adapter AdapterDeclaration) string {
+	parser := strings.TrimSpace(adapter.CatalogProbeParser)
+	if parser != "" {
+		return parser
+	}
+	return "model-catalog"
+}
+
+func catalogSourcesFromGrokModels(adapter AdapterDeclaration, cliVersion, output string) ([]CatalogSourceInput, []string) {
+	entries := parseGrokModelEntries(output)
+	if len(entries) == 0 {
+		return nil, []string{"catalog-empty-or-unrecognized"}
+	}
+	byReference := map[string][]CatalogInputEntry{}
+	var refs []string
+	for _, entry := range entries {
+		if entry.ModelID == "" {
+			continue
+		}
+		ref, constraint := grokModelSourceReference(entry)
+		if len(byReference[ref]) == 0 {
+			refs = append(refs, ref)
+		}
+		input := CatalogInputEntry{
+			CanonicalModelID:    entry.ModelID,
+			DisplayName:         firstNonEmpty(entry.DisplayName, entry.ModelID),
+			Aliases:             append([]string(nil), entry.Aliases...),
+			LifecycleState:      LifecycleAvailable,
+			AvailabilityState:   AvailabilityAvailable,
+			ReadOnly:            CapabilityUnknown,
+			JSONOutput:          CapabilityUnknown,
+			NestedSubagents:     CapabilityFalse,
+			MCPConfig:           CapabilityUnknown,
+			Cancellation:        CapabilityTrue,
+			TokenUsageReporting: CapabilityUnknown,
+			ImageInput:          CapabilityUnknown,
+			ImageOutput:         CapabilityUnknown,
+			Constraints:         []string{"reported-by-grok-models"},
+		}
+		if constraint != "" {
+			input.Constraints = append(input.Constraints, constraint)
+		}
+		byReference[ref] = append(byReference[ref], input)
+	}
+	sort.Strings(refs)
+	sources := make([]CatalogSourceInput, 0, len(refs))
+	for _, ref := range refs {
+		sources = append(sources, CatalogSourceInput{
+			Kind:                CatalogSourceProviderMachineReadable,
+			Reference:           ref,
+			SourceSchemaVersion: firstNonEmpty(adapter.CatalogProbeParser, "provider-text"),
+			ProviderCLIVersion:  cliVersion,
+			Precedence:          200,
+			Confidence:          ConfidenceExact,
+			FreshnessState:      FreshnessFresh,
+			Entries:             byReference[ref],
+		})
+	}
+	return sources, nil
+}
+
+type grokModelEntry struct {
+	ModelID     string
+	DisplayName string
+	Aliases     []string
+	Provider    string
+	BaseURL     string
+	Custom      bool
+}
+
+func parseGrokModelEntries(output string) []grokModelEntry {
+	var decoded any
+	decoder := json.NewDecoder(strings.NewReader(output))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err == nil {
+		return dedupeGrokModelEntries(collectGrokJSONModels(decoded, ""))
+	}
+	return dedupeGrokModelEntries(parseGrokTextModels(output))
+}
+
+func collectGrokJSONModels(value any, keyHint string) []grokModelEntry {
+	switch typed := value.(type) {
+	case []any:
+		var out []grokModelEntry
+		for _, item := range typed {
+			out = append(out, collectGrokJSONModels(item, keyHint)...)
+		}
+		return out
+	case map[string]any:
+		if rawModels, ok := typed["models"]; ok {
+			return collectGrokJSONModels(rawModels, "models")
+		}
+		if rawData, ok := typed["data"]; ok {
+			return collectGrokJSONModels(rawData, "data")
+		}
+		entry := grokModelEntry{
+			ModelID:     firstJSONText(typed, "model", "id", "model_id", "canonical_model_id"),
+			DisplayName: firstJSONText(typed, "name", "display_name", "displayName"),
+			Provider:    firstJSONText(typed, "provider", "vendor", "api_provider"),
+			BaseURL:     firstJSONText(typed, "base_url", "baseUrl", "url"),
+			Custom:      boolJSON(typed, "custom"),
+		}
+		if alias := firstJSONText(typed, "alias", "key"); alias != "" {
+			entry.Aliases = append(entry.Aliases, alias)
+		}
+		if aliases, ok := typed["aliases"]; ok {
+			entry.Aliases = append(entry.Aliases, stringListJSON(aliases)...)
+		}
+		if entry.ModelID != "" {
+			return []grokModelEntry{entry}
+		}
+		var out []grokModelEntry
+		for key, child := range typed {
+			if key == "models" || key == "data" {
+				continue
+			}
+			out = append(out, collectGrokJSONModels(child, key)...)
+		}
+		return out
+	case string:
+		if keyHint == "models" || looksLikeModelID(typed) {
+			return []grokModelEntry{{ModelID: typed}}
+		}
+	}
+	return nil
+}
+
+func parseGrokTextModels(output string) []grokModelEntry {
+	var entries []grokModelEntry
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(line, "-*• "))
+		if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "---") {
+			continue
+		}
+		if strings.ContainsAny(line, "{}") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "available models") || strings.HasPrefix(lower, "model ") || strings.HasPrefix(lower, "alias ") || strings.Contains(lower, "not authenticated") || networkFailureText(lower) {
+			continue
+		}
+		entry := grokModelEntry{}
+		if left, right, ok := strings.Cut(line, "->"); ok {
+			entry.Aliases = append(entry.Aliases, strings.Fields(left)...)
+			line = strings.TrimSpace(right)
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		entry.ModelID = strings.Trim(fields[0], "`'\",")
+		for _, field := range fields[1:] {
+			clean := strings.Trim(field, "`'\",()[]")
+			lowerField := strings.ToLower(clean)
+			switch {
+			case strings.HasPrefix(lowerField, "alias="), strings.HasPrefix(lowerField, "aliases="):
+				_, aliases, _ := strings.Cut(clean, "=")
+				entry.Aliases = append(entry.Aliases, splitAliases(aliases)...)
+			case strings.HasPrefix(lowerField, "provider="), strings.HasPrefix(lowerField, "vendor="):
+				_, entry.Provider, _ = strings.Cut(clean, "=")
+			case strings.HasPrefix(lowerField, "base_url="), strings.HasPrefix(lowerField, "url="):
+				_, entry.BaseURL, _ = strings.Cut(clean, "=")
+			case lowerField == "custom" || lowerField == "custom=true":
+				entry.Custom = true
+			}
+		}
+		if looksLikeModelID(entry.ModelID) {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+func dedupeGrokModelEntries(entries []grokModelEntry) []grokModelEntry {
+	seen := map[string]grokModelEntry{}
+	var ids []string
+	for _, entry := range entries {
+		entry.ModelID = strings.TrimSpace(entry.ModelID)
+		if entry.ModelID == "" || secretLike(entry.ModelID) {
+			continue
+		}
+		entry.DisplayName = safeSummary(entry.DisplayName)
+		entry.Provider = safeSummary(entry.Provider)
+		entry.BaseURL = safeSummary(entry.BaseURL)
+		entry.Aliases = dedupeStrings(entry.Aliases)
+		if _, ok := seen[entry.ModelID]; !ok {
+			ids = append(ids, entry.ModelID)
+			seen[entry.ModelID] = entry
+			continue
+		}
+		existing := seen[entry.ModelID]
+		existing.Aliases = dedupeStrings(append(existing.Aliases, entry.Aliases...))
+		existing.DisplayName = firstNonEmpty(existing.DisplayName, entry.DisplayName)
+		existing.Provider = firstNonEmpty(existing.Provider, entry.Provider)
+		existing.BaseURL = firstNonEmpty(existing.BaseURL, entry.BaseURL)
+		existing.Custom = existing.Custom || entry.Custom
+		seen[entry.ModelID] = existing
+	}
+	sort.Strings(ids)
+	out := make([]grokModelEntry, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, seen[id])
+	}
+	return out
+}
+
+func grokModelSourceReference(entry grokModelEntry) (string, string) {
+	provider := strings.ToLower(strings.TrimSpace(entry.Provider))
+	host := hostFromURL(entry.BaseURL)
+	isXAI := provider == "" || provider == "xai" || provider == "grok" || strings.Contains(host, "x.ai") || strings.Contains(host, "grok.com") || strings.HasPrefix(entry.ModelID, "grok-")
+	if !entry.Custom && isXAI {
+		return "grok-models:xai", "provider_attribution=xai"
+	}
+	attribution := firstNonEmpty(provider, host, providerPrefix(entry.ModelID), "custom")
+	if attribution == "" || secretLike(attribution) {
+		attribution = "custom-" + hashBase32(entry.ModelID)[:8]
+	}
+	attribution = boundedToken(safeSummary(attribution), 64)
+	return "grok-models:custom:" + attribution, "provider_attribution=custom-non-xai:" + attribution
+}
+
+func hostFromURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+func providerPrefix(modelID string) string {
+	prefix, _, ok := strings.Cut(modelID, "/")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(prefix))
+}
+
+func countCatalogEntries(sources []CatalogSourceInput) int {
+	count := 0
+	for _, source := range sources {
+		count += len(source.Entries)
+	}
+	return count
+}
+
+func firstJSONText(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		if text, ok := value.(string); ok {
+			text = strings.TrimSpace(text)
+			if text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func boolJSON(values map[string]any, key string) bool {
+	value, ok := values[key]
+	if !ok {
+		return false
+	}
+	if typed, ok := value.(bool); ok {
+		return typed
+	}
+	if text, ok := value.(string); ok {
+		return strings.EqualFold(strings.TrimSpace(text), "true") || strings.EqualFold(strings.TrimSpace(text), "yes")
+	}
+	return false
+}
+
+func stringListJSON(value any) []string {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	case string:
+		return splitAliases(typed)
+	default:
+		return nil
+	}
+}
+
+func splitAliases(value string) []string {
+	var aliases []string
+	for _, alias := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' || r == '|' }) {
+		alias = strings.TrimSpace(alias)
+		if alias != "" {
+			aliases = append(aliases, alias)
+		}
+	}
+	return aliases
+}
+
+func looksLikeModelID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || secretLike(value) {
+		return false
+	}
+	lower := strings.ToLower(value)
+	if strings.ContainsAny(value, " \t\n\r") || strings.HasPrefix(lower, "http") || strings.Contains(lower, "=") {
+		return false
+	}
+	switch lower {
+	case "default", "name", "description", "provider", "custom", "models":
+		return false
+	default:
+		return true
+	}
+}
+
+func networkFailureText(lower string) bool {
+	return strings.Contains(lower, "network") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "dns") ||
+		strings.Contains(lower, "tls") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "proxy")
 }
 
 func baseProbe(adapter AdapterDeclaration, now time.Time, deps Deps) ProbeResult {
@@ -2672,6 +3268,54 @@ func parseVersion(stdout, stderr string) string {
 	}
 	return ""
 }
+
+func unsupportedAdapterVersion(adapter AdapterDeclaration, version string) bool {
+	if adapter.AdapterID != "grok" {
+		return false
+	}
+	return semanticVersionLess(version, []int{0, 1, 0})
+}
+
+func malformedAdapterVersion(adapter AdapterDeclaration, version string) bool {
+	return adapter.AdapterID == "grok" && strings.TrimSpace(version) != "" && len(firstVersionParts(version)) == 0
+}
+
+func semanticVersionLess(value string, minimum []int) bool {
+	parts := firstVersionParts(value)
+	if len(parts) == 0 {
+		return false
+	}
+	for len(parts) < len(minimum) {
+		parts = append(parts, 0)
+	}
+	for index, min := range minimum {
+		if parts[index] < min {
+			return true
+		}
+		if parts[index] > min {
+			return false
+		}
+	}
+	return false
+}
+
+func firstVersionParts(value string) []int {
+	match := versionPattern.FindString(value)
+	if match == "" {
+		return nil
+	}
+	var parts []int
+	for _, piece := range strings.Split(match, ".") {
+		n, err := strconv.Atoi(piece)
+		if err != nil {
+			return nil
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+var versionPattern = regexp.MustCompile(`\d+(?:\.\d+){0,3}`)
 
 func redactPath(path string) string {
 	base := filepath.Base(path)

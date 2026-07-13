@@ -176,7 +176,7 @@ func TestAdapterConformanceCoversPartialMalformedTimeoutCancellationAndRedaction
 	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
 		return ProbeExecutionResult{Stdout: "{malformed", ExitCode: 0}, nil
 	}
-	_, readiness, probe := inspectAuthReadiness(context.Background(), adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
+	_, readiness, probe := inspectAuthReadiness(context.Background(), nil, adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
 	if probe == nil || !contains(probe.GapReasons, "auth-status-unrecognized") || len(readiness) != 1 || readiness[0].ReadinessState != ReadinessUnknown || readiness[0].TerminalErrorCode != "ErrAuthStatusUnrecognized" {
 		t.Fatalf("malformed auth output probe=%#v readiness=%#v, want schema mismatch unknown", probe, readiness)
 	}
@@ -184,7 +184,7 @@ func TestAdapterConformanceCoversPartialMalformedTimeoutCancellationAndRedaction
 	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
 		return ProbeExecutionResult{ExitCode: -1, TimedOut: true, Killed: true}, nil
 	}
-	_, readiness, probe = inspectAuthReadiness(context.Background(), adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
+	_, readiness, probe = inspectAuthReadiness(context.Background(), nil, adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
 	if probe == nil || !probe.TimedOut || !probe.Killed || probe.TerminalErrorCode != "ErrAuthProbeTimeout" || readiness[0].TerminalErrorCode != "ErrAuthProbeTimeout" {
 		t.Fatalf("timeout/cancellation probe=%#v readiness=%#v", probe, readiness)
 	}
