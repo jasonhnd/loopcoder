@@ -41,6 +41,11 @@ const (
 	DefaultMaxGenerationSilence = DefaultMaxSilenceInterval
 	MinMaxGenerationSilence     = MinMaxSilenceInterval
 	MaxMaxGenerationSilence     = MaxMaxSilenceInterval
+
+	// Failed max-silence persistence retries are paced by the same injected
+	// clock as ordinary supervisor ticks. This keeps transient store failures
+	// prompt without turning an overdue durable receipt into a hot loop.
+	persistenceRetryInterval = 10 * time.Second
 )
 
 var (
@@ -147,6 +152,7 @@ type Emitter struct {
 	hasLatest          bool
 	lastObservationKey string
 	lastDurableAt      time.Time
+	nextRetryAt        time.Time
 	closed             bool
 	started            bool
 
@@ -332,8 +338,20 @@ func (e *Emitter) Terminal(ctx context.Context, observation Observation) (EmitRe
 
 func (e *Emitter) run(ctx context.Context) {
 	defer close(e.doneCh)
-	ticker := e.clock.NewTicker(e.nextSilenceDelay())
-	defer ticker.Stop()
+	var ticker Ticker
+	stopTicker := func() {
+		if ticker != nil {
+			ticker.Stop()
+			ticker = nil
+		}
+	}
+	resetTicker := func() {
+		stopTicker()
+		e.drainWakeups()
+		ticker = e.clock.NewTicker(e.nextSilenceDelay())
+	}
+	defer stopTicker()
+	resetTicker()
 	for {
 		select {
 		case <-ctx.Done():
@@ -341,12 +359,10 @@ func (e *Emitter) run(ctx context.Context) {
 		case <-e.stopCh:
 			return
 		case <-e.wakeupCh:
-			ticker.Stop()
-			ticker = e.clock.NewTicker(e.nextSilenceDelay())
+			resetTicker()
 		case <-ticker.C():
 			_, _ = e.emitPeriodic(ctx)
-			ticker.Stop()
-			ticker = e.clock.NewTicker(e.nextSilenceDelay())
+			resetTicker()
 		}
 	}
 }
@@ -386,13 +402,19 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 	receipt := e.receiptFor(observation, now, periodic)
 	result, err := PersistReceiptNextSequence(ctx, e.store, receipt)
 	if err != nil {
+		if periodic {
+			e.nextRetryAt = now.Add(e.periodicRetryDelay())
+		}
 		return EmitResult{WriteResult: result}, err
 	}
 	if !periodic {
 		e.lastObservationKey = observationKey(observation)
 	}
 	e.lastDurableAt = now
-	e.wakeSchedulerLocked()
+	e.nextRetryAt = time.Time{}
+	if !periodic {
+		e.wakeSchedulerLocked()
+	}
 	out := EmitResult{WriteResult: result, Emitted: result.Inserted}
 	if observation.Terminal {
 		e.closed = true
@@ -413,11 +435,26 @@ func (e *Emitter) nextSilenceDelay() time.Duration {
 	if e.lastDurableAt.IsZero() {
 		return e.interval
 	}
-	delay := e.lastDurableAt.Add(e.interval).Sub(e.clock.Now().UTC())
+	now := e.clock.Now().UTC()
+	dueAt := e.lastDurableAt.Add(e.interval)
+	if !e.nextRetryAt.IsZero() && e.nextRetryAt.After(dueAt) {
+		dueAt = e.nextRetryAt
+	}
+	delay := dueAt.Sub(now)
 	if delay <= 0 {
 		return time.Nanosecond
 	}
 	return delay
+}
+
+func (e *Emitter) periodicRetryDelay() time.Duration {
+	if e == nil || e.interval <= 0 {
+		return persistenceRetryInterval
+	}
+	if e.interval < persistenceRetryInterval {
+		return e.interval
+	}
+	return persistenceRetryInterval
 }
 
 func (e *Emitter) wakeSchedulerLocked() {
@@ -427,6 +464,16 @@ func (e *Emitter) wakeSchedulerLocked() {
 	select {
 	case e.wakeupCh <- struct{}{}:
 	default:
+	}
+}
+
+func (e *Emitter) drainWakeups() {
+	for {
+		select {
+		case <-e.wakeupCh:
+		default:
+			return
+		}
 	}
 }
 

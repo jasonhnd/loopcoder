@@ -89,10 +89,12 @@ func TestEmitterMaxSilenceRearmsAfterMisalignedStateChange(t *testing.T) {
 		t.Fatalf("NewEmitter: %v", err)
 	}
 	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
 	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
 		t.Fatalf("Emit initial: %v", err)
 	}
 	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
 	clock.Advance(5 * time.Minute)
 	waitForReceiptCount(t, ctx, store, 2)
 
@@ -130,6 +132,215 @@ func TestEmitterMaxSilenceRearmsAfterMisalignedStateChange(t *testing.T) {
 	}
 	if !containsString(receipts[3].GapReasons, ReasonMaxGenerationSilence) || !containsString(receipts[3].GapReasons, KnownWaitingCI) {
 		t.Fatalf("rearmed periodic gap reasons = %#v, want max-silence waiting-for-ci", receipts[3].GapReasons)
+	}
+}
+
+func TestEmitterStopCleansCurrentRearmedTicker(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	store := newPreciseClockStore(t, ctx, clock)
+	defer store.Close()
+
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_stop_rearmed",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 2)
+
+	stateChange := runningObservation(clock.Now().Add(2 * time.Minute))
+	stateChange.Phase = "approval"
+	stateChange.Status = KnownWaitingApproval
+	stateChange.KnownState = KnownWaitingApproval
+	stateChange.Reason = ReasonStateChange
+	stateChange.NextAction = ActionState{State: "wait", Summary: "waiting for approval"}
+	clock.Advance(2 * time.Minute)
+	creationsBeforeStateChange := preciseTickerCreations(clock)
+	if _, err := emitter.Emit(ctx, stateChange); err != nil {
+		t.Fatalf("Emit state change: %v", err)
+	}
+	waitForPreciseTickerCreations(t, clock, creationsBeforeStateChange+1)
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 4)
+	if got := activePreciseTickerCount(clock); got != 1 {
+		t.Fatalf("active tickers before stop = %d, want 1", got)
+	}
+	if err := emitter.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	waitForActivePreciseTickerCount(t, clock, 0)
+	clock.Advance(30 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, ctx, store); got != 4 {
+		t.Fatalf("receipt count after stopped ticker advance = %d, want 4", got)
+	}
+}
+
+func TestEmitterTerminalCleansCurrentRearmedTicker(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	store := newPreciseClockStore(t, ctx, clock)
+	defer store.Close()
+
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_terminal_rearmed",
+		MaxSilenceInterval: 5 * time.Minute,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 2)
+	if _, err := emitter.Terminal(ctx, terminalObservation(clock.Now().Add(time.Minute))); err != nil {
+		t.Fatalf("Terminal: %v", err)
+	}
+	waitForActivePreciseTickerCount(t, clock, 0)
+	clock.Advance(30 * time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if got := countReceipts(t, ctx, store); got != 3 {
+		t.Fatalf("receipt count after terminal ticker advance = %d, want 3", got)
+	}
+}
+
+func TestEmitterPeriodicPersistenceFailureRetriesWithoutHotLoop(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	base := newPreciseClockStore(t, ctx, clock)
+	defer base.Close()
+	failing := newFailingWriteStore(base, 1, 1)
+	emitter := mustEmitter(t, failing, clock, "corr_periodic_retry")
+	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForWriteAttempts(t, failing, 1)
+	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
+
+	clock.Advance(5 * time.Minute)
+	waitForWriteAttempts(t, failing, 2)
+	if got := countReceipts(t, ctx, base); got != 1 {
+		t.Fatalf("receipt count after failed periodic = %d, want only initial durable receipt", got)
+	}
+	clock.Advance(persistenceRetryInterval/2 - time.Nanosecond)
+	time.Sleep(10 * time.Millisecond)
+	if got := failing.Attempts(); got != 2 {
+		t.Fatalf("write attempts before retry deadline = %d, want 2", got)
+	}
+	clock.Advance(persistenceRetryInterval/2 + time.Nanosecond)
+	waitForReceiptCount(t, ctx, base, 2)
+	waitForWriteAttempts(t, failing, 3)
+	if err := emitter.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	receipts, err := ListReceipts(ctx, base, ListFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", CorrelationID: "corr_periodic_retry"})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("receipt count = %d, want 2", len(receipts))
+	}
+	wantPersisted := deliveryTimestamp(fixedTime.Add(5*time.Minute + persistenceRetryInterval))
+	if receipts[1].PersistedAt != wantPersisted {
+		t.Fatalf("retry persisted_at = %s, want actual durable retry timestamp %s", receipts[1].PersistedAt, wantPersisted)
+	}
+}
+
+func TestEmitterPersistentPeriodicPersistenceFailureStaysBounded(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	base := newPreciseClockStore(t, ctx, clock)
+	defer base.Close()
+	failing := newFailingWriteStore(base, 1, 100)
+	emitter := mustEmitter(t, failing, clock, "corr_periodic_persistent_failure")
+	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForWriteAttempts(t, failing, 1)
+	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
+	clock.Advance(5 * time.Minute)
+	waitForWriteAttempts(t, failing, 2)
+
+	for i := 0; i < 3; i++ {
+		clock.Advance(persistenceRetryInterval - time.Nanosecond)
+		time.Sleep(10 * time.Millisecond)
+		wantAttempts := 2 + i
+		if got := failing.Attempts(); got != wantAttempts {
+			t.Fatalf("write attempts before retry %d = %d, want %d", i+1, got, wantAttempts)
+		}
+		clock.Advance(time.Nanosecond)
+		waitForWriteAttempts(t, failing, wantAttempts+1)
+		if got := countReceipts(t, ctx, base); got != 1 {
+			t.Fatalf("durable receipts during persistent failure = %d, want only initial receipt", got)
+		}
+	}
+	if got := activePreciseTickerCount(clock); got != 1 {
+		t.Fatalf("active tickers during persistent failure = %d, want 1", got)
+	}
+	if err := emitter.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestEmitterPeriodicSuccessDoesNotQueueSelfWakeupRearm(t *testing.T) {
+	ctx := context.Background()
+	clock := newPreciseManualClock(fixedTime)
+	store := newPreciseClockStore(t, ctx, clock)
+	defer store.Close()
+	emitter := mustEmitter(t, store, clock, "corr_periodic_no_self_wake")
+	emitter.Start(ctx)
+	waitForPreciseTickerCreations(t, clock, 1)
+	if _, err := emitter.Emit(ctx, runningObservation(clock.Now())); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	waitForPreciseTickerCount(t, clock, 1)
+	waitForPreciseTickerCreations(t, clock, 2)
+	before := preciseTickerCreations(clock)
+
+	clock.Advance(5 * time.Minute)
+	waitForReceiptCount(t, ctx, store, 2)
+	waitForPreciseTickerCreations(t, clock, before+1)
+	time.Sleep(20 * time.Millisecond)
+	if got := preciseTickerCreations(clock); got != before+1 {
+		t.Fatalf("ticker creations after one periodic emit = %d, want %d without queued self-wakeup rearm", got, before+1)
+	}
+	if got := activePreciseTickerCount(clock); got != 1 {
+		t.Fatalf("active tickers after one periodic emit = %d, want 1", got)
+	}
+	if err := emitter.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 
@@ -709,6 +920,7 @@ type preciseManualClock struct {
 	mu      sync.Mutex
 	now     time.Time
 	tickers map[*preciseManualTicker]struct{}
+	created int
 }
 
 func newPreciseManualClock(now time.Time) *preciseManualClock {
@@ -737,6 +949,7 @@ func (c *preciseManualClock) NewTicker(interval time.Duration) Ticker {
 		ch:       make(chan time.Time, 16),
 	}
 	c.tickers[ticker] = struct{}{}
+	c.created++
 	return ticker
 }
 
@@ -766,18 +979,50 @@ func waitForPreciseTickerCount(t *testing.T, clock *preciseManualClock, want int
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		clock.mu.Lock()
-		got := len(clock.tickers)
-		clock.mu.Unlock()
+		got := activePreciseTickerCount(clock)
 		if got >= want {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	clock.mu.Lock()
-	got := len(clock.tickers)
-	clock.mu.Unlock()
+	got := activePreciseTickerCount(clock)
 	t.Fatalf("precise ticker count = %d, want at least %d", got, want)
+}
+
+func waitForActivePreciseTickerCount(t *testing.T, clock *preciseManualClock, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := activePreciseTickerCount(clock); got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("active precise ticker count = %d, want %d", activePreciseTickerCount(clock), want)
+}
+
+func activePreciseTickerCount(clock *preciseManualClock) int {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return len(clock.tickers)
+}
+
+func waitForPreciseTickerCreations(t *testing.T, clock *preciseManualClock, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := preciseTickerCreations(clock); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("precise ticker creations = %d, want at least %d", preciseTickerCreations(clock), want)
+}
+
+func preciseTickerCreations(clock *preciseManualClock) int {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.created
 }
 
 type preciseManualTicker struct {
@@ -845,6 +1090,53 @@ func (s *failFirstWriteStore) WithWriteTx(ctx context.Context, fn func(storage.T
 		return errors.New("injected write failure")
 	}
 	return s.Store.WithWriteTx(ctx, fn)
+}
+
+type failingWriteStore struct {
+	storage.Store
+	mu       sync.Mutex
+	skip     int
+	failures int
+	attempts int
+}
+
+func newFailingWriteStore(store storage.Store, skip, failures int) *failingWriteStore {
+	return &failingWriteStore{Store: store, skip: skip, failures: failures}
+}
+
+func (s *failingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	s.mu.Lock()
+	s.attempts++
+	fail := false
+	if s.skip > 0 {
+		s.skip--
+	} else if s.failures > 0 {
+		s.failures--
+		fail = true
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("injected write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func (s *failingWriteStore) Attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func waitForWriteAttempts(t *testing.T, store *failingWriteStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := store.Attempts(); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("write attempts = %d, want at least %d", store.Attempts(), want)
 }
 
 func containsString(values []string, want string) bool {
