@@ -373,11 +373,11 @@ func TestDiscoverEmitsHonestUnsupportedQuotaSnapshotsForCurrentProviders(t *test
 			t.Fatalf("missing quota snapshot for %s in %#v", adapterID, report.QuotaSnapshots)
 		}
 		wantGap := "unsupported-source"
-		if adapterID == "codex" {
+		if adapterID == "codex" || adapterID == "claude" {
 			wantGap = "quota-collection-not-granted"
 		}
 		if got.Confidence != ConfidenceUnavailable || got.FreshnessState != FreshnessNotApplicable || !containsString(got.GapReasons, wantGap) {
-			t.Fatalf("%s quota snapshot = %#v, want honest unavailable unsupported-source", adapterID, got)
+			t.Fatalf("%s quota snapshot = %#v, want honest unavailable %s", adapterID, got, wantGap)
 		}
 	}
 }

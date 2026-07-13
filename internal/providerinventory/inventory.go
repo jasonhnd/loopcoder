@@ -600,6 +600,10 @@ type Deps struct {
 	EvalSymlinks func(string) (string, error)
 	RunProbe     func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
 	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
+	RunClaudePTY func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
+	MkdirTemp    func(string, string) (string, error)
+	RemoveAll    func(string) error
+	WriteFile    func(string, []byte, os.FileMode) error
 	RandomID     func() string
 }
 
@@ -640,6 +644,10 @@ func DefaultDeps() Deps {
 		EvalSymlinks: filepath.EvalSymlinks,
 		RunProbe:     runProbeCommand,
 		RunCodexRPC:  runCodexAppServer,
+		RunClaudePTY: runClaudeUsagePTY,
+		MkdirTemp:    os.MkdirTemp,
+		RemoveAll:    os.RemoveAll,
+		WriteFile:    os.WriteFile,
 		RandomID:     randomProbeID,
 	}
 }
@@ -773,6 +781,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
+				if adapter.AdapterID == "claude" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, now, deps)
+					quotaTelemetrySources = append(quotaTelemetrySources, source)
+					quotaSnapshots = append(quotaSnapshots, snapshots...)
+					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
+					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
+				}
 			} else {
 				readiness := unsupportedAuthReadiness(adapter, &installation.ProviderInstallationID, now, firstNonEmpty(installation.TerminalErrorCode, "installation-not-usable"))
 				readiness.EvidenceKind = EvidenceNotRun
@@ -794,8 +810,11 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			probes = append(probes, probe)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
 		}
-		if adapter.AdapterID != "codex" || (!adapterQuotaCollected && !adapterQuotaAttempted) {
+		if (adapter.AdapterID != "codex" && adapter.AdapterID != "claude") || (!adapterQuotaCollected && !adapterQuotaAttempted) {
 			if adapter.AdapterID == "codex" {
+				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
+			}
+			if adapter.AdapterID == "claude" {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
 			quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
@@ -3695,6 +3714,18 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunCodexRPC == nil {
 		deps.RunCodexRPC = defaults.RunCodexRPC
+	}
+	if deps.RunClaudePTY == nil {
+		deps.RunClaudePTY = defaults.RunClaudePTY
+	}
+	if deps.MkdirTemp == nil {
+		deps.MkdirTemp = defaults.MkdirTemp
+	}
+	if deps.RemoveAll == nil {
+		deps.RemoveAll = defaults.RemoveAll
+	}
+	if deps.WriteFile == nil {
+		deps.WriteFile = defaults.WriteFile
 	}
 	if deps.RandomID == nil {
 		deps.RandomID = defaults.RandomID
