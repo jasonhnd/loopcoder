@@ -2305,6 +2305,10 @@ func validNativeSchedulerMetadata(projectID, deliveryRunID, taskID, attemptID, c
 			"resource_kind": "repo-path",
 			"resource_key":  "src/native.go",
 			"state":         storage.OwnershipStateHeld,
+		}, {
+			"resource_kind": "provider-receipt",
+			"resource_key":  "run-20260709T000000Z-child-0-native-child",
+			"state":         storage.OwnershipStateHeld,
 		}},
 	}
 }

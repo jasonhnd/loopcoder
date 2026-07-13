@@ -533,6 +533,9 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
 		}
+		if absolutePathOnDifferentVolume(parentRepo.Display, childRepo) {
+			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+		}
 		childRepoID, err := pathid.Canonicalize(childRepo)
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
@@ -544,6 +547,9 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 			resolvedPath, err := resolveNestedScopedPath(childRepoID.Display, scopedPath)
 			if err != nil {
 				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			if absolutePathOnDifferentVolume(childRepoID.Display, resolvedPath) || absolutePathOnDifferentVolume(parentRepo.Display, resolvedPath) {
+				return fmt.Errorf("child %q scope.paths %q escapes approved repo scope", child.ChildKey, scopedPath)
 			}
 			scopedID, err := pathid.Canonicalize(resolvedPath)
 			if err != nil {
@@ -866,6 +872,15 @@ func pathWithin(parent, child string) bool {
 		return true
 	}
 	return strings.HasPrefix(child, parent+string(filepath.Separator))
+}
+
+func absolutePathOnDifferentVolume(base, candidate string) bool {
+	if runtime.GOOS != "windows" || !filepath.IsAbs(candidate) {
+		return false
+	}
+	baseVolume := filepath.VolumeName(filepath.Clean(base))
+	candidateVolume := filepath.VolumeName(filepath.Clean(candidate))
+	return baseVolume != "" && candidateVolume != "" && !strings.EqualFold(baseVolume, candidateVolume)
 }
 
 func shellCommand(ctx context.Context, command string) *exec.Cmd {

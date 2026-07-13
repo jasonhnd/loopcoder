@@ -16,6 +16,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -1839,6 +1840,108 @@ func TestCleanupRefusesUnownedScratchDeletion(t *testing.T) {
 	}
 }
 
+func TestCommitAndOpenPRRejectsStaleWorkerOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGitHub := &workerFakeGitHub{prURL: "https://github.com/owner/repo/pull/511"}
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 511,
+		IssueTitle:  "Fence stale worker",
+		RunID:       "run-stale-worker",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return &workerFakeAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	store, lease := attachReleasedWorkerOwnership(t, ctx, dispatch)
+	defer store.Close()
+
+	_, err = commitAndOpenPR(ctx, dispatch, validWorkerAgentResult("stale output", 0))
+	if !errors.Is(err, storage.ErrOwnershipStale) {
+		t.Fatalf("commitAndOpenPR error = %v, want ErrOwnershipStale", err)
+	}
+	if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("stale owner reached mutation calls add=%d commit=%d push=%d pr=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGitHub.createPRCalls)
+	}
+	if err := storage.ValidateAgentOwnershipFence(ctx, store, lease); !errors.Is(err, storage.ErrOwnershipStale) {
+		t.Fatalf("stale lease validation = %v, want ErrOwnershipStale", err)
+	}
+}
+
+func TestCleanupRefusesStaleWorkerOwnershipDeletion(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	dispatch, err := prepareDispatch(ctx, Options{
+		RepoPath:    repo,
+		IssueNumber: 512,
+		IssueTitle:  "Fence cleanup",
+		RunID:       "run-stale-cleanup",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return &workerFakeAgent{}, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareDispatch returned error: %v", err)
+	}
+	if err := prepareWorktree(ctx, dispatch); err != nil {
+		t.Fatalf("prepareWorktree returned error: %v", err)
+	}
+	_, _ = attachReleasedWorkerOwnership(t, ctx, dispatch)
+	dispatch.dispatchSucceeded = true
+	cleanup(ctx, dispatch, nil)
+	if fakeGit.removeCalls != 0 || fakeGit.branchDeleteCalls != 0 {
+		t.Fatalf("stale cleanup removed worktree/branch remove=%d branchDelete=%d", fakeGit.removeCalls, fakeGit.branchDeleteCalls)
+	}
+	assertPathExists(t, dispatch.scratch)
+	if !strings.Contains(warnings.String(), "refused cleanup without active ownership fence") {
+		t.Fatalf("warnings missing stale cleanup refusal:\n%s", warnings.String())
+	}
+}
+
 func TestBuildInvocationUsesPerRunTimeoutOverride(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -2032,6 +2135,45 @@ func assertPathExists(t *testing.T, path string) {
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("%s does not exist: %v", path, err)
 	}
+}
+
+func attachReleasedWorkerOwnership(t *testing.T, ctx context.Context, dispatch *dispatchContext) (storage.Store, storage.AgentOwnershipLease) {
+	t.Helper()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open ownership store: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, git_root, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			"project-worker", dispatch.repoPath, dispatch.repoPath, dispatch.repoPath, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+		return err
+	}); err != nil {
+		store.Close()
+		t.Fatalf("seed worker ownership project: %v", err)
+	}
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, store, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     "project-worker",
+		DeliveryRunID: dispatch.opts.RunID,
+		RunID:         dispatch.opts.RunID,
+		OwnerID:       workerOwnershipOwnerID(dispatch),
+		Now:           fixedNow(),
+		LeaseUntil:    fixedNow().Add(time.Hour),
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		store.Close()
+		t.Fatalf("AcquireAgentOwnershipLease: %v", err)
+	}
+	dispatch.ownershipStore = store
+	dispatch.ownershipLease = &lease
+	if err := storage.ReleaseAgentOwnershipLease(ctx, store, lease, fixedNow().Add(time.Minute)); err != nil {
+		store.Close()
+		t.Fatalf("ReleaseAgentOwnershipLease: %v", err)
+	}
+	return store, lease
 }
 
 type workerFakeGit struct {

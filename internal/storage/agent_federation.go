@@ -90,6 +90,7 @@ const (
 	ErrCredentialScopeDeniedCode     FederationErrorCode = "ErrCredentialScopeDenied"
 	ErrOneWriterConflictCode         FederationErrorCode = "ErrOneWriterConflict"
 	ErrOwnershipRequiredCode         FederationErrorCode = "ErrOwnershipRequired"
+	ErrOwnershipStaleCode            FederationErrorCode = "ErrOwnershipStale"
 	ErrChildBudgetRequiredCode       FederationErrorCode = "ErrChildBudgetReservationRequired"
 	ErrAgentFingerprintMismatchCode  FederationErrorCode = "ErrAgentFingerprintMismatch"
 	ErrInvalidTransitionCode         FederationErrorCode = "ErrInvalidTransition"
@@ -109,6 +110,7 @@ var (
 	ErrCredentialScopeDenied     = &FederationError{Code: ErrCredentialScopeDeniedCode}
 	ErrOneWriterConflict         = &FederationError{Code: ErrOneWriterConflictCode}
 	ErrOwnershipRequired         = &FederationError{Code: ErrOwnershipRequiredCode}
+	ErrOwnershipStale            = &FederationError{Code: ErrOwnershipStaleCode}
 	ErrChildBudgetRequired       = &FederationError{Code: ErrChildBudgetRequiredCode}
 	ErrAgentFingerprintMismatch  = &FederationError{Code: ErrAgentFingerprintMismatchCode}
 	ErrInvalidTransition         = &FederationError{Code: ErrInvalidTransitionCode}
@@ -420,6 +422,18 @@ type AgentRegistrationRequest struct {
 	CreatedAt                string
 }
 
+type AgentOwnershipFence struct {
+	ChildAgentID    string
+	RunID           string
+	ExecutorID      string
+	ClaimGeneration int64
+	LockID          string
+	LockGeneration  int64
+	ResourceKind    string
+	ResourceKey     string
+	At              string
+}
+
 type ProviderCapabilityEvidence struct {
 	AdapterID            string   `json:"adapter_id"`
 	NestedSubagents      bool     `json:"nested_subagents"`
@@ -465,6 +479,32 @@ type AgentTreeRegistration struct {
 	GapReasons            []string `json:"gap_reasons"`
 	FederationFingerprint string   `json:"agent_federation_fingerprint"`
 	TerminalErrorCode     string   `json:"terminal_error_code,omitempty"`
+}
+
+type AgentOwnershipResource struct {
+	ResourceKind string `json:"resource_kind"`
+	ResourceKey  string `json:"resource_key"`
+}
+
+type AgentOwnershipLeaseRequest struct {
+	ProjectID     string
+	DeliveryRunID string
+	RunID         string
+	OwnerID       string
+	Resources     []AgentOwnershipResource
+	Now           time.Time
+	LeaseUntil    time.Time
+}
+
+type AgentOwnershipLease struct {
+	ProjectID       string   `json:"project_id"`
+	DeliveryRunID   string   `json:"delivery_run_id"`
+	RunID           string   `json:"run_id"`
+	OwnerID         string   `json:"owner_id"`
+	ClaimGeneration int64    `json:"claim_generation"`
+	LockGeneration  int64    `json:"lock_generation"`
+	LockIDs         []string `json:"lock_ids"`
+	LeaseExpiresAt  string   `json:"lease_expires_at"`
 }
 
 type federationFingerprintInput struct {
@@ -633,6 +673,20 @@ func registerAgentTx(ctx context.Context, tx Tx, req AgentRegistrationRequest) (
 			return AgentRegistration{}, err
 		}
 	}
+	root, err := physicalProjectRootTx(ctx, tx, req.ProjectID)
+	if err != nil {
+		return AgentRegistration{}, err
+	}
+	for i := range req.OwnershipLocks {
+		if strings.TrimSpace(req.OwnershipLocks[i].ResourceKind) != "repo-path" {
+			continue
+		}
+		key, err := physicalRepoResourceKey(root, req.OwnershipLocks[i].ResourceKey)
+		if err != nil {
+			return AgentRegistration{}, err
+		}
+		req.OwnershipLocks[i].ResourceKey = key
+	}
 	scopeBytes, err := json.Marshal(scopePayload(scope))
 	if err != nil {
 		return AgentRegistration{}, federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
@@ -742,6 +796,13 @@ func registerAgentTx(ctx context.Context, tx Tx, req AgentRegistrationRequest) (
 	if ok {
 		if existing.RegistrationPayloadHash == record.RegistrationPayloadHash {
 			return existing, nil
+		}
+		recovered, recoveredOK, recoverErr := recoverPreLaunchRegistrationTx(ctx, tx, existing, record, scope, req)
+		if recoverErr != nil {
+			return AgentRegistration{}, recoverErr
+		}
+		if recoveredOK {
+			return recovered, nil
 		}
 		return AgentRegistration{}, federationError(ErrAgentRegistrationConflictCode, "child_agent_id %s replays with different canonical bytes", record.ChildAgentID)
 	}
@@ -881,13 +942,13 @@ func ValidateNativeChildLaunch(ctx context.Context, store Store, childRunID, exe
 		if err := validateLiveBudgetReservationTx(ctx, tx, record, now); err != nil {
 			return err
 		}
+		if err := validateRegistrationClaimTx(ctx, tx, record, executorID, claimGeneration); err != nil {
+			return err
+		}
 		if record.Permission != PermissionReadOnly {
 			if err := validateLiveOwnershipLocksTx(ctx, tx, record, claimGeneration, now); err != nil {
 				return err
 			}
-		}
-		if err := validateRegistrationClaimTx(ctx, tx, record, executorID, claimGeneration); err != nil {
-			return err
 		}
 		return nil
 	})
@@ -895,6 +956,177 @@ func ValidateNativeChildLaunch(ctx context.Context, store Store, childRunID, exe
 		persistAgentAuthorityRefusal(ctx, store, registrationRequestFromRecord(record, childRunID, executorID, claimGeneration, formatTimestamp(now)), err)
 	}
 	return record, err
+}
+
+func ValidateAgentOwnershipFence(ctx context.Context, store Store, fence any) error {
+	if store == nil {
+		return federationError(ErrOwnershipRequiredCode, "store is required")
+	}
+	switch typed := fence.(type) {
+	case AgentOwnershipFence:
+		return validateAgentRegistrationOwnershipFence(ctx, store, typed)
+	case *AgentOwnershipFence:
+		if typed == nil {
+			return federationError(ErrOwnershipRequiredCode, "complete ownership fence is required")
+		}
+		return validateAgentRegistrationOwnershipFence(ctx, store, *typed)
+	case AgentOwnershipLease:
+		return validateAgentOwnershipLeaseFence(ctx, store, typed)
+	case *AgentOwnershipLease:
+		if typed == nil {
+			return federationError(ErrOwnershipRequiredCode, "complete ownership lease is required")
+		}
+		return validateAgentOwnershipLeaseFence(ctx, store, *typed)
+	default:
+		return federationError(ErrOwnershipRequiredCode, "unsupported ownership fence %T", fence)
+	}
+}
+
+func validateAgentRegistrationOwnershipFence(ctx context.Context, store Store, fence AgentOwnershipFence) error {
+	fence.ChildAgentID = strings.TrimSpace(fence.ChildAgentID)
+	fence.RunID = strings.TrimSpace(fence.RunID)
+	fence.ExecutorID = strings.TrimSpace(fence.ExecutorID)
+	fence.LockID = strings.TrimSpace(fence.LockID)
+	fence.ResourceKind = strings.TrimSpace(fence.ResourceKind)
+	fence.ResourceKey = canonicalResourceKey(fence.ResourceKind, fence.ResourceKey)
+	if fence.ChildAgentID == "" || fence.RunID == "" || fence.ExecutorID == "" || fence.ClaimGeneration <= 0 || fence.LockID == "" || fence.LockGeneration <= 0 || fence.ResourceKind == "" || fence.ResourceKey == "" {
+		return federationError(ErrOwnershipRequiredCode, "complete ownership fence is required")
+	}
+	if err := requireNonZeroTimestamp(fence.At, "at"); err != nil {
+		return err
+	}
+	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(fence.At))
+	if err != nil {
+		return federationError(ErrInvalidRecordCode, "at is invalid")
+	}
+	return store.WithTx(ctx, func(tx Tx) error {
+		record, ok, err := loadAgentRegistrationTx(ctx, tx, fence.ChildAgentID)
+		if err != nil {
+			return err
+		}
+		if !ok || record.RunID != fence.RunID {
+			return federationError(ErrOwnershipRequiredCode, "registration ownership is missing")
+		}
+		if fence.ResourceKind == "repo-path" {
+			physicalKey, err := physicalRepoResourceKeyTx(ctx, tx, record.ProjectID, fence.ResourceKey)
+			if err != nil {
+				return err
+			}
+			fence.ResourceKey = physicalKey
+		}
+		if err := validateRegistrationClaimTx(ctx, tx, record, fence.ExecutorID, fence.ClaimGeneration); err != nil {
+			return federationError(ErrOwnershipStaleCode, "registration claim is stale")
+		}
+		var runID, resourceKind, resourceKey, state, leaseExpiresAt string
+		var lockClaimGeneration, lockGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT run_id, claim_generation, lock_generation, resource_kind, resource_key, state, lease_expires_at
+			FROM agent_ownership_locks WHERE id = ? AND child_agent_id = ?`,
+			fence.LockID, fence.ChildAgentID).Scan(&runID, &lockClaimGeneration, &lockGeneration, &resourceKind, &resourceKey, &state, &leaseExpiresAt); err != nil {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s is missing", fence.LockID)
+		}
+		if runID != fence.RunID || lockClaimGeneration != fence.ClaimGeneration || lockGeneration != fence.LockGeneration {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s generation is stale", fence.LockID)
+		}
+		if strings.TrimSpace(state) != OwnershipStateHeld {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s is %s", fence.LockID, state)
+		}
+		leaseExpiry, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseExpiresAt))
+		if err != nil || !leaseExpiry.After(at.UTC()) {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s lease expired", fence.LockID)
+		}
+		covers, err := resourceKeyCoversForProject(ctx, tx, record.ProjectID, resourceKind, resourceKey, fence.ResourceKey)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(resourceKind) != fence.ResourceKind || !covers {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s does not cover %s/%s", fence.LockID, fence.ResourceKind, fence.ResourceKey)
+		}
+		return nil
+	})
+}
+
+func AcquireAgentOwnershipLease(ctx context.Context, store Store, req AgentOwnershipLeaseRequest) (AgentOwnershipLease, error) {
+	if store == nil {
+		return AgentOwnershipLease{}, federationError(ErrOwnershipRequiredCode, "store is required")
+	}
+	req.ProjectID = strings.TrimSpace(req.ProjectID)
+	req.DeliveryRunID = strings.TrimSpace(req.DeliveryRunID)
+	req.RunID = strings.TrimSpace(req.RunID)
+	req.OwnerID = strings.TrimSpace(req.OwnerID)
+	req.Now = req.Now.UTC()
+	req.LeaseUntil = req.LeaseUntil.UTC()
+	if req.ProjectID == "" || req.DeliveryRunID == "" || req.RunID == "" || req.OwnerID == "" {
+		return AgentOwnershipLease{}, federationError(ErrInvalidRecordCode, "project_id, delivery_run_id, run_id, and owner_id are required")
+	}
+	if req.Now.IsZero() || req.LeaseUntil.IsZero() || !req.LeaseUntil.After(req.Now) {
+		return AgentOwnershipLease{}, federationError(ErrInvalidRecordCode, "valid now and future lease_until are required")
+	}
+	resources, err := normalizeOwnershipResources(req.Resources)
+	if err != nil {
+		return AgentOwnershipLease{}, err
+	}
+	if len(resources) == 0 {
+		return AgentOwnershipLease{}, federationError(ErrOwnershipRequiredCode, "at least one ownership resource is required")
+	}
+	var lease AgentOwnershipLease
+	err = withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			var err error
+			lease, err = acquireAgentOwnershipLeaseTx(ctx, tx, req, resources)
+			return err
+		})
+	})
+	return lease, err
+}
+
+func validateAgentOwnershipLeaseFence(ctx context.Context, store Store, lease AgentOwnershipLease) error {
+	lease.ProjectID = strings.TrimSpace(lease.ProjectID)
+	lease.DeliveryRunID = strings.TrimSpace(lease.DeliveryRunID)
+	lease.RunID = strings.TrimSpace(lease.RunID)
+	lease.OwnerID = strings.TrimSpace(lease.OwnerID)
+	if lease.ProjectID == "" || lease.DeliveryRunID == "" || lease.RunID == "" || lease.OwnerID == "" || lease.ClaimGeneration <= 0 || lease.LockGeneration <= 0 || len(lease.LockIDs) == 0 {
+		return federationError(ErrOwnershipRequiredCode, "complete ownership lease is required")
+	}
+	now := store.Now().UTC()
+	return store.WithTx(ctx, func(tx Tx) error {
+		return validateAgentOwnershipFenceTx(ctx, tx, lease, now)
+	})
+}
+
+func ReleaseAgentOwnershipLease(ctx context.Context, store Store, lease AgentOwnershipLease, at time.Time) error {
+	if store == nil || len(lease.LockIDs) == 0 {
+		return nil
+	}
+	at = at.UTC()
+	if at.IsZero() {
+		at = store.Now().UTC()
+	}
+	lease.LockIDs = sortedCopyAgent(lease.LockIDs)
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			if err := validateAgentOwnershipFenceTx(ctx, tx, lease, at); err != nil {
+				return err
+			}
+			args := append([]any{
+				OwnershipStateReleased, formatTimestamp(at), lease.ProjectID, lease.DeliveryRunID, lease.OwnerID, lease.RunID,
+				lease.ClaimGeneration, lease.LockGeneration, OwnershipStateHeld,
+			}, stringsToAny(lease.LockIDs)...)
+			result, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+				SET state = ?, updated_at = ?
+				WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
+					AND claim_generation = ? AND lock_generation = ? AND state = ?
+					AND id IN (`+placeholders(len(lease.LockIDs))+`)`,
+				args...)
+			if err != nil {
+				return fmt.Errorf("release ownership lease: %w", err)
+			}
+			affected, err := result.RowsAffected()
+			if err == nil && affected != int64(len(lease.LockIDs)) {
+				return federationError(ErrOwnershipStaleCode, "released %d ownership locks, want %d", affected, len(lease.LockIDs))
+			}
+			return nil
+		})
+	})
 }
 
 func LoadAgentTree(ctx context.Context, store Store, projectID, rootRunID string) (AgentTree, error) {
@@ -1400,6 +1632,10 @@ func validatePhysicalRepoScopeTx(ctx context.Context, tx Tx, record AgentRegistr
 	if err != nil {
 		return err
 	}
+	return validatePhysicalRepoScopeRoot(root, scope)
+}
+
+func validatePhysicalRepoScopeRoot(root string, scope AgentScopeGrant) error {
 	for _, item := range []struct {
 		name  string
 		paths []string
@@ -1438,23 +1674,39 @@ func physicalProjectRootTx(ctx context.Context, tx Tx, projectID string) (string
 }
 
 func validateRepoRelativePhysicalPath(root, dimension, rel string) error {
-	normalized, err := normalizeRepoResource(rel)
-	if err != nil {
+	if _, err := physicalRepoResourceKey(root, rel); err != nil {
 		return err
 	}
-	if normalized == "" {
-		return nil
+	return nil
+}
+
+func physicalRepoResourceKey(root, rel string) (string, error) {
+	normalized, err := normalizeRepoResource(rel)
+	if err != nil {
+		return "", err
 	}
+	if normalized == "" {
+		return ".", nil
+	}
+	root = filepath.Clean(root)
 	target := filepath.Join(root, filepath.FromSlash(normalized))
 	identity, err := pathid.Identity(target)
 	if err != nil {
-		return federationError(ErrScopeUnknownCode, "%s %q physical path is ambiguous: %v", dimension, rel, err)
+		return "", federationError(ErrScopeUnknownCode, "repo path %q physical path is ambiguous: %v", rel, err)
 	}
 	identity = filepath.Clean(identity)
-	if sameOrDescendantPath(root, identity) {
-		return nil
+	if !sameOrDescendantPath(root, identity) {
+		return "", federationError(ErrScopeWideningCode, "repo path %q resolves outside project root", rel)
 	}
-	return federationError(ErrScopeWideningCode, "%s %q resolves outside project root", dimension, rel)
+	relative, err := filepath.Rel(root, identity)
+	if err != nil {
+		return "", federationError(ErrScopeUnknownCode, "repo path %q physical path is ambiguous: %v", rel, err)
+	}
+	relative = filepath.ToSlash(filepath.Clean(relative))
+	if relative == "." {
+		return ".", nil
+	}
+	return relative, nil
 }
 
 func sameOrDescendantPath(root, child string) bool {
@@ -1613,10 +1865,25 @@ func validateLiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegist
 	if err != nil {
 		return err
 	}
+	root, err := physicalProjectRootTx(ctx, tx, record.ProjectID)
+	if err != nil {
+		return err
+	}
 	for _, writePath := range writeScope {
+		physicalWritePath, err := physicalRepoResourceKey(root, writePath)
+		if err != nil {
+			return err
+		}
 		covered := false
 		for _, lock := range locks {
-			if lock.resourceKind == "repo-path" && resourceKeyCovers(lock.resourceKind, lock.resourceKey, writePath) {
+			if lock.resourceKind != "repo-path" {
+				continue
+			}
+			covers, err := resourceKeyCoversWithRoot(root, lock.resourceKind, lock.resourceKey, physicalWritePath)
+			if err != nil {
+				return err
+			}
+			if covers {
 				covered = true
 				break
 			}
@@ -1717,6 +1984,142 @@ func validateStoredAgentFingerprint(record AgentRegistration, scope AgentScopeGr
 	return nil
 }
 
+func recoverPreLaunchRegistrationTx(ctx context.Context, tx Tx, existing, record AgentRegistration, scope AgentScopeGrant, req AgentRegistrationRequest) (AgentRegistration, bool, error) {
+	if !samePreLaunchRecoveryIdentity(existing, record) {
+		return AgentRegistration{}, false, nil
+	}
+	if normalizeAgentRegistrationState(existing.RegistrationState) != AgentStateRegistered || strings.TrimSpace(existing.ProviderReceipt) != "" {
+		return AgentRegistration{}, false, nil
+	}
+	if record.ClaimGeneration <= existing.ClaimGeneration {
+		return AgentRegistration{}, false, nil
+	}
+	var claimExecutor, claimPhase, providerReceipt string
+	var claimGeneration int64
+	if err := tx.QueryRow(ctx, `SELECT executor_id, claim_generation, phase, COALESCE(provider_receipt, '') FROM run_claims WHERE run_id = ?`,
+		record.RunID).Scan(&claimExecutor, &claimGeneration, &claimPhase, &providerReceipt); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if claimExecutor != record.ExecutorID || claimGeneration != record.ClaimGeneration || normalizeClaimPhase(claimPhase) != ClaimPhaseClaimed || strings.TrimSpace(providerReceipt) != "" {
+		return AgentRegistration{}, false, nil
+	}
+	if !sameStringSetAgent(existing.BudgetBindingIDs, record.BudgetBindingIDs) || !sameStringSetAgent(existing.OwnershipLockIDs, record.OwnershipLockIDs) {
+		return AgentRegistration{}, false, nil
+	}
+	if err := validateRegistrationReferences(ctx, tx, record); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if err := validateAcceptedAuthorityTx(ctx, tx, record, scope); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	if err := validatePhysicalRepoScopeTx(ctx, tx, record, scope); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	for _, lock := range req.OwnershipLocks {
+		if lock.State == OwnershipStateHeld || lock.State == OwnershipStateRequested || lock.State == OwnershipStateReleasing {
+			if err := checkOwnershipOverlapIgnoringChildTx(ctx, tx, lock, existing.ChildAgentID); err != nil {
+				return AgentRegistration{}, false, err
+			}
+		}
+		result, err := tx.Exec(ctx, `UPDATE agent_ownership_locks
+			SET run_id = ?, claim_generation = ?, lock_generation = lock_generation + 1,
+				resource_kind = ?, resource_key = ?, lock_mode = ?, state = ?,
+				lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+			WHERE id = ? AND child_agent_id = ? AND run_id = ? AND claim_generation = ? AND state = ?`,
+			record.RunID, record.ClaimGeneration, lock.ResourceKind, lock.ResourceKey, lock.LockMode, lock.State,
+			lock.LeaseExpiresAt, lock.HeartbeatAt, lock.UpdatedAt,
+			lock.AgentOwnershipLockID, existing.ChildAgentID, existing.RunID, existing.ClaimGeneration, OwnershipStateHeld)
+		if err != nil {
+			return AgentRegistration{}, false, fmt.Errorf("recover ownership lock %s: %w", lock.AgentOwnershipLockID, err)
+		}
+		affected, err := result.RowsAffected()
+		if err == nil && affected != 1 {
+			return AgentRegistration{}, false, federationError(ErrOwnershipStaleCode, "recovered %d ownership lock rows for %s, want 1", affected, lock.AgentOwnershipLockID)
+		}
+	}
+	if len(record.OwnershipLockIDs) > 0 {
+		createdAt, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+		if err != nil {
+			return AgentRegistration{}, false, federationError(ErrInvalidRecordCode, "created_at is invalid")
+		}
+		if err := validateLiveOwnershipLocksTx(ctx, tx, record, record.ClaimGeneration, createdAt.UTC()); err != nil {
+			return AgentRegistration{}, false, err
+		}
+	}
+	if err := validateLiveBudgetReservationTx(ctx, tx, record, mustParseAgentTime(record.CreatedAt)); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	result, err := tx.Exec(ctx, `UPDATE agent_scope_grants
+		SET agent_federation_fingerprint = ?, updated_at = ?
+		WHERE id = ? AND child_agent_id = ?`,
+		record.AgentFederationFingerprint, record.UpdatedAt, record.ScopeGrantID, record.ChildAgentID)
+	if err != nil {
+		return AgentRegistration{}, false, fmt.Errorf("recover scope grant: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return AgentRegistration{}, false, federationError(ErrAgentRegistrationRequiredCode, "updated %d scope grants, want 1", affected)
+	}
+	record.RecordVersion = existing.RecordVersion + 1
+	result, err = tx.Exec(ctx, `UPDATE agent_registrations
+		SET record_version = ?, claim_generation = ?, executor_id = ?, provider_idempotency_key = ?,
+			agent_federation_fingerprint = ?, registration_payload_hash = ?, updated_at = ?
+		WHERE id = ? AND child_run_id = ? AND claim_generation = ? AND registration_state = ?`,
+		record.RecordVersion, record.ClaimGeneration, record.ExecutorID, record.ProviderIDempotencyKey,
+		record.AgentFederationFingerprint, record.RegistrationPayloadHash, record.UpdatedAt,
+		record.ChildAgentID, record.RunID, existing.ClaimGeneration, AgentStateRegistered)
+	if err != nil {
+		return AgentRegistration{}, false, fmt.Errorf("recover registration generation: %w", err)
+	}
+	affected, err = result.RowsAffected()
+	if err == nil && affected != 1 {
+		return AgentRegistration{}, false, federationError(ErrStaleClaimCode, "updated %d registrations, want 1", affected)
+	}
+	if err := appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration.recover_takeover", record.UpdatedAt, record); err != nil {
+		return AgentRegistration{}, false, err
+	}
+	return record, true, nil
+}
+
+func samePreLaunchRecoveryIdentity(existing, record AgentRegistration) bool {
+	return existing.ChildAgentID == record.ChildAgentID &&
+		existing.ProjectID == record.ProjectID &&
+		existing.DeliveryRunID == record.DeliveryRunID &&
+		existing.RootRunID == record.RootRunID &&
+		existing.ParentRunID == record.ParentRunID &&
+		existing.RunID == record.RunID &&
+		existing.ParentAgentID == record.ParentAgentID &&
+		existing.TaskID == record.TaskID &&
+		existing.AttemptID == record.AttemptID &&
+		existing.PlanID == record.PlanID &&
+		existing.ChildKey == record.ChildKey &&
+		existing.AdapterID == record.AdapterID &&
+		existing.ProviderInstallationID == record.ProviderInstallationID &&
+		existing.AccountProfileID == record.AccountProfileID &&
+		existing.ModelCapabilityID == record.ModelCapabilityID &&
+		existing.RoutingDecisionID == record.RoutingDecisionID &&
+		existing.ProviderSessionRef == record.ProviderSessionRef &&
+		existing.ScopeGrantID == record.ScopeGrantID &&
+		existing.Permission == record.Permission &&
+		existing.SideEffectClass == record.SideEffectClass &&
+		existing.CancellationChannel == record.CancellationChannel &&
+		existing.ExpectedOutputsJSON == record.ExpectedOutputsJSON &&
+		existing.PolicyVersion == record.PolicyVersion &&
+		existing.PlanFingerprint == record.PlanFingerprint &&
+		existing.PolicyFingerprint == record.PolicyFingerprint &&
+		existing.AuthorizationFingerprint == record.AuthorizationFingerprint &&
+		existing.Classification == record.Classification &&
+		sameStringSetAgent(existing.GapReasons, record.GapReasons)
+}
+
+func mustParseAgentTime(value string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed.UTC()
+}
+
 func acceptedScopeGrantFromJSON(raw, permission, sideEffectClass, policyFingerprint, planFingerprint, authorizationFingerprint string) (AgentScopeGrant, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1813,6 +2216,34 @@ func releaseHeldOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistr
 	return nil
 }
 
+func markAgentRegistrationNeedsHumanForRunTx(ctx context.Context, tx Tx, childRunID, at, reason string) error {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, childRunID)
+	if err != nil {
+		return err
+	}
+	if !ok || isTerminalAgentState(record.RegistrationState) {
+		return nil
+	}
+	record.RegistrationState = AgentStateNeedsHuman
+	record.TerminalErrorCode = string(ErrOwnershipStaleCode)
+	record.GapReasons = sortedCopyAgent(append(record.GapReasons, firstNonEmptyAgent(reason, "ambiguous child ownership recovery")))
+	record.UpdatedAt = at
+	record.RecordVersion++
+	result, err := tx.Exec(ctx, `UPDATE agent_registrations
+		SET registration_state = ?, terminal_error_code = ?, gap_reasons_json = ?, updated_at = ?, record_version = ?
+		WHERE id = ? AND child_run_id = ? AND record_version = ?`,
+		record.RegistrationState, record.TerminalErrorCode, mustJSONList(record.GapReasons), record.UpdatedAt, record.RecordVersion,
+		record.ChildAgentID, record.RunID, record.RecordVersion-1)
+	if err != nil {
+		return fmt.Errorf("mark agent registration needs-human: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return federationError(ErrOwnershipStaleCode, "updated %d registrations, want 1", affected)
+	}
+	return appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration."+AgentActionInvalidate, at, record)
+}
+
 func renewClaimFencedOwnershipLocksTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, heartbeatAt, leaseUntil string) error {
 	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, childRunID)
 	if err != nil {
@@ -1876,6 +2307,9 @@ func completeNativeRegistrationForRunTx(ctx context.Context, tx Tx, childRunID, 
 	if err != nil {
 		return federationError(ErrInvalidRecordCode, "terminal timestamp is invalid")
 	}
+	if err := validateTerminalOwnershipLocksTx(ctx, tx, record, claimGeneration, terminalAt.UTC(), strings.TrimSpace(providerReceipt) != ""); err != nil {
+		return err
+	}
 	if err := validateLiveBudgetReservationTx(ctx, tx, record, terminalAt.UTC()); err != nil {
 		return err
 	}
@@ -1902,6 +2336,62 @@ func completeNativeRegistrationForRunTx(ctx context.Context, tx Tx, childRunID, 
 		return err
 	}
 	return appendAgentEventTx(ctx, tx, record.ProjectID, record.DeliveryRunID, record.ChildAgentID, "registration."+action, at, record)
+}
+
+func validateTerminalOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegistration, claimGeneration int64, at time.Time, requireProviderReceipt bool) error {
+	if record.Permission == PermissionReadOnly && !requireProviderReceipt {
+		return nil
+	}
+	if len(record.OwnershipLockIDs) == 0 {
+		return federationError(ErrOwnershipRequiredCode, "registration %s has no ownership locks", record.ChildAgentID)
+	}
+	expected := stringSetAgent(record.OwnershipLockIDs)
+	seen := map[string]bool{}
+	providerReceiptCovered := !requireProviderReceipt
+	rows, err := tx.Query(ctx, `SELECT id, run_id, claim_generation, resource_kind, resource_key, state, lease_expires_at
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ?`,
+		record.ProjectID, record.DeliveryRunID, record.ChildAgentID)
+	if err != nil {
+		return fmt.Errorf("validate terminal ownership locks: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, runID, resourceKind, resourceKey, state, leaseExpiresAt string
+		var lockClaimGeneration int64
+		if err := rows.Scan(&id, &runID, &lockClaimGeneration, &resourceKind, &resourceKey, &state, &leaseExpiresAt); err != nil {
+			return fmt.Errorf("validate terminal ownership lock row: %w", err)
+		}
+		if !expected[id] {
+			continue
+		}
+		seen[id] = true
+		if strings.TrimSpace(runID) != record.RunID || lockClaimGeneration != claimGeneration || lockClaimGeneration != record.ClaimGeneration {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s is not fenced to terminal claim", id)
+		}
+		if strings.TrimSpace(state) != OwnershipStateHeld {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s is %s, want held", id, state)
+		}
+		leaseExpiry, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseExpiresAt))
+		if err != nil || !leaseExpiry.After(at.UTC()) {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s lease expired at %s", id, leaseExpiresAt)
+		}
+		if strings.TrimSpace(resourceKind) == "provider-receipt" && resourceKeyCovers(resourceKind, resourceKey, record.RunID) {
+			providerReceiptCovered = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("validate terminal ownership lock rows: %w", err)
+	}
+	for id := range expected {
+		if !seen[id] {
+			return federationError(ErrOwnershipRequiredCode, "ownership lock %s is missing", id)
+		}
+	}
+	if !providerReceiptCovered {
+		return federationError(ErrOwnershipRequiredCode, "provider receipt write requires provider-receipt ownership")
+	}
+	return nil
 }
 
 func reconcileAgentBudgetReservationsTx(ctx context.Context, tx Tx, record AgentRegistration, status, at string) error {
@@ -2091,10 +2581,198 @@ func insertOwnershipLockTx(ctx context.Context, tx Tx, lock AgentOwnershipLock) 
 	return nil
 }
 
+func acquireAgentOwnershipLeaseTx(ctx context.Context, tx Tx, req AgentOwnershipLeaseRequest, resources []AgentOwnershipResource) (AgentOwnershipLease, error) {
+	var err error
+	resources, err = physicalOwnershipResourcesTx(ctx, tx, req.ProjectID, resources)
+	if err != nil {
+		return AgentOwnershipLease{}, err
+	}
+	if existing, ok, err := reusableAgentOwnershipLeaseTx(ctx, tx, req, resources); err != nil {
+		return AgentOwnershipLease{}, err
+	} else if ok {
+		return existing, nil
+	}
+	var generation int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(claim_generation), 0) + 1
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND run_id = ?`,
+		req.ProjectID, req.DeliveryRunID, req.RunID).Scan(&generation); err != nil {
+		return AgentOwnershipLease{}, fmt.Errorf("allocate ownership generation: %w", err)
+	}
+	if generation <= 0 {
+		generation = 1
+	}
+	lockIDs := make([]string, 0, len(resources))
+	now := formatTimestamp(req.Now)
+	leaseUntil := formatTimestamp(req.LeaseUntil)
+	for _, resource := range resources {
+		lock := AgentOwnershipLock{
+			SchemaVersion:        AgentOwnershipLockSchema,
+			AgentOwnershipLockID: stableID("alock_", req.ProjectID, resource.ResourceKind, resource.ResourceKey, req.OwnerID, req.RunID, fmt.Sprint(generation)),
+			ProjectID:            req.ProjectID,
+			DeliveryRunID:        req.DeliveryRunID,
+			ChildAgentID:         req.OwnerID,
+			RunID:                req.RunID,
+			ClaimGeneration:      generation,
+			LockGeneration:       1,
+			ResourceKind:         resource.ResourceKind,
+			ResourceKey:          resource.ResourceKey,
+			LockMode:             "write",
+			State:                OwnershipStateHeld,
+			LeaseExpiresAt:       leaseUntil,
+			HeartbeatAt:          now,
+			CreatedAt:            now,
+			UpdatedAt:            now,
+		}
+		if err := insertOwnershipLockTx(ctx, tx, lock); err != nil {
+			return AgentOwnershipLease{}, err
+		}
+		lockIDs = append(lockIDs, lock.AgentOwnershipLockID)
+	}
+	sort.Strings(lockIDs)
+	return AgentOwnershipLease{
+		ProjectID:       req.ProjectID,
+		DeliveryRunID:   req.DeliveryRunID,
+		RunID:           req.RunID,
+		OwnerID:         req.OwnerID,
+		ClaimGeneration: generation,
+		LockGeneration:  1,
+		LockIDs:         lockIDs,
+		LeaseExpiresAt:  leaseUntil,
+	}, nil
+}
+
+func reusableAgentOwnershipLeaseTx(ctx context.Context, tx Tx, req AgentOwnershipLeaseRequest, resources []AgentOwnershipResource) (AgentOwnershipLease, bool, error) {
+	requested := map[string]bool{}
+	for _, resource := range resources {
+		requested[resource.ResourceKind+"\x00"+resource.ResourceKey] = true
+	}
+	rows, err := tx.Query(ctx, `SELECT id, claim_generation, lock_generation, resource_kind, resource_key, lease_expires_at
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ? AND state = ?
+		ORDER BY id`,
+		req.ProjectID, req.DeliveryRunID, req.OwnerID, req.RunID, OwnershipStateHeld)
+	if err != nil {
+		return AgentOwnershipLease{}, false, fmt.Errorf("inspect existing ownership lease: %w", err)
+	}
+	defer rows.Close()
+	lockIDs := []string{}
+	seen := map[string]bool{}
+	var generation int64
+	var lockGeneration int64
+	leaseExpiresAt := ""
+	root := ""
+	for rows.Next() {
+		var id, kind, key, expires string
+		var claimGen, lockGen int64
+		if err := rows.Scan(&id, &claimGen, &lockGen, &kind, &key, &expires); err != nil {
+			return AgentOwnershipLease{}, false, fmt.Errorf("scan existing ownership lease: %w", err)
+		}
+		kind = strings.TrimSpace(kind)
+		key = canonicalResourceKey(kind, key)
+		if kind == "repo-path" && key != "." {
+			if root == "" {
+				var err error
+				root, err = physicalProjectRootTx(ctx, tx, req.ProjectID)
+				if err != nil {
+					return AgentOwnershipLease{}, false, err
+				}
+			}
+			var err error
+			key, err = physicalRepoResourceKey(root, key)
+			if err != nil {
+				return AgentOwnershipLease{}, false, err
+			}
+		}
+		if !requested[kind+"\x00"+key] {
+			return AgentOwnershipLease{}, false, nil
+		}
+		if !claimLeaseActive(expires, formatTimestamp(req.Now)) {
+			return AgentOwnershipLease{}, false, nil
+		}
+		if generation == 0 {
+			generation = claimGen
+			lockGeneration = lockGen
+			leaseExpiresAt = expires
+		}
+		if generation != claimGen || lockGeneration != lockGen {
+			return AgentOwnershipLease{}, false, nil
+		}
+		seen[kind+"\x00"+key] = true
+		lockIDs = append(lockIDs, id)
+		if expires < leaseExpiresAt {
+			leaseExpiresAt = expires
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return AgentOwnershipLease{}, false, err
+	}
+	if len(seen) != len(requested) || len(lockIDs) != len(resources) {
+		return AgentOwnershipLease{}, false, nil
+	}
+	sort.Strings(lockIDs)
+	return AgentOwnershipLease{
+		ProjectID:       req.ProjectID,
+		DeliveryRunID:   req.DeliveryRunID,
+		RunID:           req.RunID,
+		OwnerID:         req.OwnerID,
+		ClaimGeneration: generation,
+		LockGeneration:  lockGeneration,
+		LockIDs:         lockIDs,
+		LeaseExpiresAt:  leaseExpiresAt,
+	}, true, nil
+}
+
+func validateAgentOwnershipFenceTx(ctx context.Context, tx Tx, lease AgentOwnershipLease, now time.Time) error {
+	expected := stringSetAgent(lease.LockIDs)
+	rows, err := tx.Query(ctx, `SELECT id, child_agent_id, run_id, claim_generation, lock_generation, state, lease_expires_at
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND id IN (`+placeholders(len(lease.LockIDs))+`)`,
+		append([]any{lease.ProjectID, lease.DeliveryRunID}, stringsToAny(lease.LockIDs)...)...)
+	if err != nil {
+		return fmt.Errorf("validate ownership fence: %w", err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var id, ownerID, runID, state, leaseExpiresAt string
+		var claimGeneration, lockGeneration int64
+		if err := rows.Scan(&id, &ownerID, &runID, &claimGeneration, &lockGeneration, &state, &leaseExpiresAt); err != nil {
+			return fmt.Errorf("scan ownership fence: %w", err)
+		}
+		if !expected[id] {
+			continue
+		}
+		seen[id] = true
+		if ownerID != lease.OwnerID || runID != lease.RunID || claimGeneration != lease.ClaimGeneration || lockGeneration != lease.LockGeneration {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s no longer matches owner/generation", id)
+		}
+		if state != OwnershipStateHeld {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s is %s", id, state)
+		}
+		if !claimLeaseActive(leaseExpiresAt, formatTimestamp(now)) {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s lease expired at %s", id, leaseExpiresAt)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("validate ownership fence rows: %w", err)
+	}
+	for id := range expected {
+		if !seen[id] {
+			return federationError(ErrOwnershipStaleCode, "ownership lock %s is missing", id)
+		}
+	}
+	return nil
+}
+
 func checkOwnershipOverlapTx(ctx context.Context, tx Tx, lock AgentOwnershipLock) error {
+	return checkOwnershipOverlapIgnoringChildTx(ctx, tx, lock, "")
+}
+
+func checkOwnershipOverlapIgnoringChildTx(ctx context.Context, tx Tx, lock AgentOwnershipLock, ignoredChildAgentID string) error {
 	rows, err := tx.Query(ctx, `SELECT id, resource_key FROM agent_ownership_locks
-		WHERE project_id = ? AND resource_kind = ? AND state NOT IN (?, ?, ?, ?)`,
-		lock.ProjectID, lock.ResourceKind, OwnershipStateReleased, OwnershipStateExpired, OwnershipStateConflict, OwnershipStateNeedsHuman)
+		WHERE project_id = ? AND resource_kind = ? AND (? = '' OR child_agent_id <> ?) AND state NOT IN (?, ?, ?, ?)`,
+		lock.ProjectID, lock.ResourceKind, ignoredChildAgentID, ignoredChildAgentID, OwnershipStateReleased, OwnershipStateExpired, OwnershipStateConflict, OwnershipStateNeedsHuman)
 	if err != nil {
 		return err
 	}
@@ -2104,7 +2782,11 @@ func checkOwnershipOverlapTx(ctx context.Context, tx Tx, lock AgentOwnershipLock
 		if err := rows.Scan(&id, &existingKey); err != nil {
 			return err
 		}
-		if resourceKeysConflict(lock.ResourceKind, existingKey, lock.ResourceKey) {
+		conflict, err := resourceKeysConflictForProject(ctx, tx, lock.ProjectID, lock.ResourceKind, existingKey, lock.ResourceKey)
+		if err != nil {
+			return err
+		}
+		if conflict {
 			return federationError(ErrOneWriterConflictCode, "lock %s conflicts with %s", lock.AgentOwnershipLockID, id)
 		}
 	}
@@ -2385,6 +3067,42 @@ func pathBoundaryByte(b byte) bool {
 	}
 }
 
+func physicalOwnershipResourcesTx(ctx context.Context, tx Tx, projectID string, resources []AgentOwnershipResource) ([]AgentOwnershipResource, error) {
+	out := make([]AgentOwnershipResource, 0, len(resources))
+	root := ""
+	for _, resource := range resources {
+		if resource.ResourceKind == "repo-path" {
+			if root == "" {
+				var err error
+				root, err = physicalProjectRootTx(ctx, tx, projectID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if canonicalResourceKey(resource.ResourceKind, resource.ResourceKey) == "." {
+				resource.ResourceKey = "."
+				out = append(out, resource)
+				continue
+			}
+			key, err := physicalRepoResourceKey(root, resource.ResourceKey)
+			if err != nil {
+				return nil, err
+			}
+			resource.ResourceKey = key
+		}
+		out = append(out, resource)
+	}
+	return out, nil
+}
+
+func physicalRepoResourceKeyTx(ctx context.Context, tx Tx, projectID, rel string) (string, error) {
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return "", err
+	}
+	return physicalRepoResourceKey(root, rel)
+}
+
 func pathTerminatorRune(r rune) bool {
 	switch r {
 	case ' ', '\t', '\n', '\r', '"', '\'', ')', ']', '}', '>', ',':
@@ -2416,7 +3134,7 @@ func federationBoundaryForCode(code FederationErrorCode) string {
 		return "scope-unknown"
 	case ErrCredentialScopeDeniedCode:
 		return "credential"
-	case ErrOneWriterConflictCode, ErrOwnershipRequiredCode:
+	case ErrOneWriterConflictCode, ErrOwnershipRequiredCode, ErrOwnershipStaleCode:
 		return "ownership"
 	case ErrChildBudgetRequiredCode:
 		return "budget"
@@ -2476,6 +3194,36 @@ func normalizeOwnershipLock(lock AgentOwnershipLock, req AgentRegistrationReques
 	lock.UpdatedAt = firstNonEmptyAgent(lock.UpdatedAt, req.CreatedAt)
 	lock.AgentOwnershipLockID = stableID("alock_", lock.ProjectID, lock.ResourceKind, lock.ResourceKey, childAgentID)
 	return lock
+}
+
+func normalizeOwnershipResources(resources []AgentOwnershipResource) ([]AgentOwnershipResource, error) {
+	out := make([]AgentOwnershipResource, 0, len(resources))
+	for _, resource := range resources {
+		kind := strings.TrimSpace(resource.ResourceKind)
+		key := canonicalResourceKey(kind, resource.ResourceKey)
+		if kind == "" || key == "" {
+			return nil, federationError(ErrInvalidRecordCode, "ownership resource kind and key are required")
+		}
+		if kind == "repo-path" {
+			if _, err := normalizeRepoResource(key); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, AgentOwnershipResource{ResourceKind: kind, ResourceKey: key})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ResourceKind != out[j].ResourceKind {
+			return out[i].ResourceKind < out[j].ResourceKind
+		}
+		return out[i].ResourceKey < out[j].ResourceKey
+	})
+	deduped := out[:0]
+	for _, resource := range out {
+		if len(deduped) == 0 || deduped[len(deduped)-1] != resource {
+			deduped = append(deduped, resource)
+		}
+	}
+	return deduped, nil
 }
 
 func canonicalizeScope(scope *AgentScopeGrant) error {
@@ -2574,6 +3322,22 @@ func normalizeScopeList(values []string, repoPath bool) []string {
 	return dedupeAgent(out)
 }
 
+func placeholders(count int) string {
+	if count <= 0 {
+		return "NULL"
+	}
+	out := strings.Repeat("?,", count)
+	return strings.TrimSuffix(out, ",")
+}
+
+func stringsToAny(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
+}
+
 func normalizeRepoResource(value string) (string, error) {
 	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
 	if value == "" {
@@ -2602,9 +3366,32 @@ func resourceKeysConflict(kind, existing, requested string) bool {
 		return true
 	}
 	if kind == "repo-path" {
+		if existing == "." || requested == "." {
+			return true
+		}
 		return strings.HasPrefix(existing, requested+"/") || strings.HasPrefix(requested, existing+"/")
 	}
 	return false
+}
+
+func resourceKeysConflictForProject(ctx context.Context, tx Tx, projectID, kind, existing, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeysConflict(kind, existing, requested), nil
+	}
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return false, err
+	}
+	existing, err = physicalRepoResourceKey(root, existing)
+	if err != nil {
+		return false, err
+	}
+	requested, err = physicalRepoResourceKey(root, requested)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeysConflict(kind, existing, requested), nil
 }
 
 func resourceKeyCovers(kind, held, requested string) bool {
@@ -2617,15 +3404,50 @@ func resourceKeyCovers(kind, held, requested string) bool {
 		return true
 	}
 	if kind == "repo-path" {
+		if held == "." {
+			return true
+		}
 		return strings.HasPrefix(requested, held+"/")
 	}
 	return false
+}
+
+func resourceKeyCoversForProject(ctx context.Context, tx Tx, projectID, kind, held, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeyCovers(kind, held, requested), nil
+	}
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeyCoversWithRoot(root, kind, held, requested)
+}
+
+func resourceKeyCoversWithRoot(root, kind, held, requested string) (bool, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "repo-path" {
+		return resourceKeyCovers(kind, held, requested), nil
+	}
+	var err error
+	held, err = physicalRepoResourceKey(root, held)
+	if err != nil {
+		return false, err
+	}
+	requested, err = physicalRepoResourceKey(root, requested)
+	if err != nil {
+		return false, err
+	}
+	return resourceKeyCovers(kind, held, requested), nil
 }
 
 func canonicalResourceKey(kind, key string) string {
 	key = strings.TrimSpace(strings.ReplaceAll(key, "\\", "/"))
 	if kind == "repo-path" {
 		if normalized, err := normalizeRepoResource(key); err == nil {
+			if normalized == "" {
+				return "."
+			}
 			return normalized
 		}
 	}
@@ -2839,6 +3661,20 @@ func containsStringAgent(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func sameStringSetAgent(left, right []string) bool {
+	leftSet := stringSetAgent(left)
+	rightSet := stringSetAgent(right)
+	if len(leftSet) != len(rightSet) {
+		return false
+	}
+	for value := range leftSet {
+		if !rightSet[value] {
+			return false
+		}
+	}
+	return true
 }
 
 func dedupeAgent(values []string) []string {

@@ -134,6 +134,208 @@ func TestAgentRegistrationRequiresCallerTimestamps(t *testing.T) {
 	}
 }
 
+func TestAgentOwnershipLeaseRejectsOverlappingWritersAndStaleOwners(t *testing.T) {
+	ctx := context.Background()
+	now := fixedNow()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	seedOwnershipProject(t, ctx, store, "project-a", t.TempDir())
+
+	rootLease, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "project-a",
+		DeliveryRunID: "delivery-a",
+		RunID:         "run-a",
+		OwnerID:       "worker-a",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease root: %v", err)
+	}
+	if err := ValidateAgentOwnershipFence(ctx, store, rootLease); err != nil {
+		t.Fatalf("ValidateAgentOwnershipFence root: %v", err)
+	}
+	if _, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "project-a",
+		DeliveryRunID: "delivery-b",
+		RunID:         "run-b",
+		OwnerID:       "worker-b",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "src/nested/file.go"},
+		},
+	}); !errors.Is(err, ErrOneWriterConflict) {
+		t.Fatalf("overlap acquire error = %v, want ErrOneWriterConflict", err)
+	}
+	if err := ReleaseAgentOwnershipLease(ctx, store, rootLease, now.Add(time.Minute)); err != nil {
+		t.Fatalf("ReleaseAgentOwnershipLease root: %v", err)
+	}
+	if err := ValidateAgentOwnershipFence(ctx, store, rootLease); !errors.Is(err, ErrOwnershipStale) {
+		t.Fatalf("released owner fence error = %v, want ErrOwnershipStale", err)
+	}
+	nextLease, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "project-a",
+		DeliveryRunID: "delivery-b",
+		RunID:         "run-b",
+		OwnerID:       "worker-b",
+		Now:           now.Add(2 * time.Minute),
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "src/nested/file.go"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease after release: %v", err)
+	}
+	if nextLease.ClaimGeneration != 1 {
+		t.Fatalf("independent run generation = %d, want 1", nextLease.ClaimGeneration)
+	}
+	if err := ValidateAgentOwnershipFence(ctx, store, rootLease); !errors.Is(err, ErrOwnershipStale) {
+		t.Fatalf("old owner after takeover fence error = %v, want ErrOwnershipStale", err)
+	}
+}
+
+func TestAgentOwnershipLeaseFailsClosedWithoutPhysicalProjectRoot(t *testing.T) {
+	ctx := context.Background()
+	now := fixedNow()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	_, err = AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "missing-project",
+		DeliveryRunID: "delivery-a",
+		RunID:         "run-a",
+		OwnerID:       "worker-a",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if !errors.Is(err, ErrCrossProjectReference) {
+		t.Fatalf("missing project acquire error = %v, want ErrCrossProjectReference", err)
+	}
+
+	repo := t.TempDir()
+	seedOwnershipProject(t, ctx, store, "project-a", repo)
+	lease, err := AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+		ProjectID:     "project-a",
+		DeliveryRunID: "delivery-a",
+		RunID:         "run-a",
+		OwnerID:       "worker-a",
+		Now:           now,
+		LeaseUntil:    now.Add(time.Hour),
+		Resources: []AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease valid root: %v", err)
+	}
+	if err := ValidateAgentOwnershipFence(ctx, store, lease); err != nil {
+		t.Fatalf("ValidateAgentOwnershipFence valid root: %v", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		outside := filepath.Join(t.TempDir(), "outside")
+		if err := os.MkdirAll(outside, 0o755); err != nil {
+			t.Fatalf("mkdir outside: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "secret.go"), []byte("package outside\n"), 0o644); err != nil {
+			t.Fatalf("write outside: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(repo, "linked-outside")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		_, err = AcquireAgentOwnershipLease(ctx, store, AgentOwnershipLeaseRequest{
+			ProjectID:     "project-a",
+			DeliveryRunID: "delivery-escape",
+			RunID:         "run-escape",
+			OwnerID:       "worker-escape",
+			Now:           now,
+			LeaseUntil:    now.Add(time.Hour),
+			Resources: []AgentOwnershipResource{
+				{ResourceKind: "repo-path", ResourceKey: "linked-outside/secret.go"},
+			},
+		})
+		if !errors.Is(err, ErrScopeWidening) {
+			t.Fatalf("cross-root acquire error = %v, want ErrScopeWidening", err)
+		}
+	}
+}
+
+func TestAgentOwnershipRestartRejectsLegacyAliasedActiveLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows junction coverage lives in agent_federation_windows_test.go")
+	}
+	for _, tc := range []struct {
+		name      string
+		existing  string
+		requested string
+	}{
+		{name: "legacy alias exact blocks physical", existing: "alias-src/a.go", requested: "src/a.go"},
+		{name: "legacy alias prefix blocks physical child", existing: "alias-src", requested: "src/a.go"},
+		{name: "legacy physical exact blocks alias", existing: "src/a.go", requested: "alias-src/a.go"},
+		{name: "legacy physical prefix blocks alias child", existing: "src", requested: "alias-src/a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+			repoRoot := filepath.Join(t.TempDir(), "repo")
+			src := filepath.Join(repoRoot, "src")
+			if err := os.MkdirAll(src, 0o755); err != nil {
+				t.Fatalf("mkdir src: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "a.go"), []byte("package src\n"), 0o644); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			if err := os.Symlink(src, filepath.Join(repoRoot, "alias-src")); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+
+			store, err := Open(ctx, Options{Path: dbPath, Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			seedOwnershipProject(t, ctx, store, "project-a", repoRoot)
+			insertLegacyActiveOwnershipLock(t, ctx, store, "project-a", tc.existing)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			reopened, err := Open(ctx, Options{Path: dbPath, Now: fixedNow})
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer reopened.Close()
+			_, err = AcquireAgentOwnershipLease(ctx, reopened, AgentOwnershipLeaseRequest{
+				ProjectID:     "project-a",
+				DeliveryRunID: "delivery-new",
+				RunID:         "run-new",
+				OwnerID:       "worker-new",
+				Now:           fixedNow(),
+				LeaseUntil:    fixedNow().Add(time.Hour),
+				Resources: []AgentOwnershipResource{
+					{ResourceKind: "repo-path", ResourceKey: tc.requested},
+				},
+			})
+			if !errors.Is(err, ErrOneWriterConflict) {
+				t.Fatalf("AcquireAgentOwnershipLease error = %v, want ErrOneWriterConflict", err)
+			}
+		})
+	}
+}
+
 func TestAgentRegistrationLifecycleTable(t *testing.T) {
 	for _, state := range []string{
 		AgentStatePlanned,
@@ -229,6 +431,46 @@ func TestOneWriterActivePartialIndexAndPathOverlap(t *testing.T) {
 	req2.OwnershipLocks[0].ResourceKey = "src"
 	if _, err := RegisterAgent(ctx, store, req2); !errors.Is(err, ErrOneWriterConflict) {
 		t.Fatalf("ancestor lock error = %v, want ErrOneWriterConflict", err)
+	}
+}
+
+func TestOverlappingReadOnlyRegistrationsDoNotRequireWriterLocks(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	readScope := federationReadOnlyScope("project-a")
+	if err := updateFederationAuthority(ctx, store, "project-a", readScope, PermissionReadOnly, SideEffectLocalRead); err != nil {
+		t.Fatalf("update read-only authority: %v", err)
+	}
+	req := federationRequest(claim)
+	req.Scope = readScope
+	req.ParentScope = &readScope
+	req.Permission = PermissionReadOnly
+	req.SideEffectClass = SideEffectLocalRead
+	req.OwnershipLocks = nil
+	if _, err := RegisterAgent(ctx, store, req); err != nil {
+		t.Fatalf("RegisterAgent first read-only: %v", err)
+	}
+
+	claim2 := createFederationClaim(t, ctx, store, "project-a", "run-root-2", "run-child-2", "child-b")
+	if err := updateFederationAuthority(ctx, store, "project-a", readScope, PermissionReadOnly, SideEffectLocalRead); err != nil {
+		t.Fatalf("update second read-only authority: %v", err)
+	}
+	req2 := federationRequest(claim2)
+	req2.ChildKey = "child-b"
+	req2.RunID = "run-child-2"
+	req2.Scope = readScope
+	req2.ParentScope = &readScope
+	req2.Permission = PermissionReadOnly
+	req2.SideEffectClass = SideEffectLocalRead
+	req2.OwnershipLocks = nil
+	if _, err := RegisterAgent(ctx, store, req2); err != nil {
+		t.Fatalf("RegisterAgent overlapping read-only: %v", err)
 	}
 }
 
@@ -601,6 +843,218 @@ func TestTransitionAgentRegistrationReleasesHeldLocksAndAllowsNewWriter(t *testi
 	}
 }
 
+func TestTerminalCompletionRequiresLiveOwnershipFence(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	record, err := RegisterAgent(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, record.ChildAgentID, AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:02Z"); err != nil {
+		t.Fatalf("launch transition: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, record.ChildAgentID, AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:03Z"); err != nil {
+		t.Fatalf("heartbeat transition: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET lease_expires_at = ? WHERE child_agent_id = ?`,
+			"2026-01-01T00:00:03Z", record.ChildAgentID)
+		return err
+	}); err != nil {
+		t.Fatalf("expire ownership lock: %v", err)
+	}
+
+	err = CompleteClaimedChildRun(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, "succeeded", "2026-01-01T00:00:04Z", "terminal", "")
+	if !errors.Is(err, ErrOwnershipStale) {
+		t.Fatalf("CompleteClaimedChildRun error = %v, want ErrOwnershipStale", err)
+	}
+	var state string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, record.ChildAgentID).Scan(&state)
+	}); err != nil {
+		t.Fatalf("load registration state: %v", err)
+	}
+	if state != AgentStateRunning {
+		t.Fatalf("registration state = %q, want rollback to running", state)
+	}
+}
+
+func TestProviderReceiptCompletionRequiresProviderReceiptOwnership(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	record, err := RegisterAgent(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, record.ChildAgentID, AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:02Z"); err != nil {
+		t.Fatalf("launch transition: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, record.ChildAgentID, AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:03Z"); err != nil {
+		t.Fatalf("heartbeat transition: %v", err)
+	}
+
+	err = CompleteClaimedChildRun(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, "succeeded", "2026-01-01T00:00:04Z", "terminal", "provider-receipt-1")
+	if !errors.Is(err, ErrOwnershipRequired) {
+		t.Fatalf("CompleteClaimedChildRun error = %v, want ErrOwnershipRequired", err)
+	}
+}
+
+func TestOwnershipFenceRejectsStaleGenerationAndNonOwner(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	record, err := RegisterAgent(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	lockID := record.OwnershipLockIDs[0]
+	if err := ValidateAgentOwnershipFence(ctx, store, AgentOwnershipFence{
+		ChildAgentID:    record.ChildAgentID,
+		RunID:           record.RunID,
+		ExecutorID:      claim.ExecutorID,
+		ClaimGeneration: claim.ClaimGeneration,
+		LockID:          lockID,
+		LockGeneration:  1,
+		ResourceKind:    "repo-path",
+		ResourceKey:     "src/a.go",
+		At:              "2026-01-01T00:00:02Z",
+	}); err != nil {
+		t.Fatalf("ValidateAgentOwnershipFence current: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET lock_generation = lock_generation + 1 WHERE id = ?`, lockID)
+		return err
+	}); err != nil {
+		t.Fatalf("bump lock generation: %v", err)
+	}
+	err = ValidateAgentOwnershipFence(ctx, store, AgentOwnershipFence{
+		ChildAgentID:    record.ChildAgentID,
+		RunID:           record.RunID,
+		ExecutorID:      claim.ExecutorID,
+		ClaimGeneration: claim.ClaimGeneration,
+		LockID:          lockID,
+		LockGeneration:  1,
+		ResourceKind:    "repo-path",
+		ResourceKey:     "src/a.go",
+		At:              "2026-01-01T00:00:03Z",
+	})
+	if !errors.Is(err, ErrOwnershipStale) {
+		t.Fatalf("stale lock generation error = %v, want ErrOwnershipStale", err)
+	}
+	err = ValidateAgentOwnershipFence(ctx, store, AgentOwnershipFence{
+		ChildAgentID:    record.ChildAgentID,
+		RunID:           record.RunID,
+		ExecutorID:      "other-executor",
+		ClaimGeneration: claim.ClaimGeneration,
+		LockID:          lockID,
+		LockGeneration:  2,
+		ResourceKind:    "repo-path",
+		ResourceKey:     "src/a.go",
+		At:              "2026-01-01T00:00:04Z",
+	})
+	if !errors.Is(err, ErrOwnershipStale) {
+		t.Fatalf("non-owner error = %v, want ErrOwnershipStale", err)
+	}
+}
+
+func TestPreLaunchRecoveryTakeoverAdvancesRegistrationGeneration(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = "2026-01-01T00:30:01Z"
+	record, err := RegisterAgent(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
+	now := time.Date(2026, 1, 1, 0, 31, 0, 0, time.UTC)
+	replayReq := federationRequest(claim)
+	replayReq.CreatedAt = ""
+	replayReq.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	takeover, replay, err := ClaimAndRegisterNativeChild(ctx, store, claim.ParentRunID, claim.RunID, "executor-recovery", now, fixedNow().Add(time.Hour), replayReq)
+	if err != nil {
+		t.Fatalf("ClaimAndRegisterNativeChild takeover: %v", err)
+	}
+	if takeover.Outcome != ClaimOutcomeStaleClaim || replay.ChildAgentID != record.ChildAgentID || replay.ClaimGeneration != 2 || replay.ExecutorID != "executor-recovery" {
+		t.Fatalf("takeover=%#v replay=%#v, want stale takeover on same agent generation 2", takeover, replay)
+	}
+	if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, "executor-recovery", 2); err != nil {
+		t.Fatalf("ValidateNativeChildLaunch recovered owner: %v", err)
+	}
+	if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, claim.ExecutorID, 1); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("ValidateNativeChildLaunch stale owner error = %v, want ErrStaleClaim", err)
+	}
+}
+
+func TestAmbiguousExpiredExecutingRecoveryMarksRegistrationNeedsHuman(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	claim := createFederationClaim(t, ctx, store, "project-a", "run-root", "run-child", "child-a")
+	req := federationRequest(claim)
+	req.OwnershipLocks[0].LeaseExpiresAt = formatTimestamp(fixedNow().Add(time.Hour))
+	record, err := RegisterAgent(ctx, store, req)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if _, err := TransitionAgentRegistration(ctx, store, record.ChildAgentID, AgentActionLaunch, claim.ExecutorID, claim.ClaimGeneration, "2026-01-01T00:00:02Z"); err != nil {
+		t.Fatalf("launch transition: %v", err)
+	}
+	if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, "2026-01-01T00:00:03Z", ""); err != nil {
+		t.Fatalf("UpdateChildRunClaimPhase executing: %v", err)
+	}
+
+	blocked, err := ClaimChildRunExecution(ctx, store, claim.ParentRunID, claim.RunID, "executor-recovery", fixedNow().Add(2*time.Hour), fixedNow().Add(3*time.Hour))
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecution ambiguous: %v", err)
+	}
+	if blocked.Outcome != ClaimOutcomeBlocked {
+		t.Fatalf("blocked claim = %#v, want blocked", blocked)
+	}
+	var state string
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, record.ChildAgentID).Scan(&state)
+	}); err != nil {
+		t.Fatalf("load registration state: %v", err)
+	}
+	if state != AgentStateNeedsHuman {
+		t.Fatalf("registration state = %q, want needs-human", state)
+	}
+}
+
 func TestScopeInheritanceAndCrossProjectFailClosed(t *testing.T) {
 	parent := AgentScopeGrant{Permission: PermissionWrite, SideEffectClass: SideEffectRepoWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
 	child := AgentScopeGrant{Permission: PermissionOrchestrate, SideEffectClass: SideEffectRepoWrite, ReadScope: []string{"src"}, WriteScope: []string{"src/a.go"}, PathScope: []string{"src/a.go"}, CredentialScope: []string{"none"}}
@@ -738,6 +1192,54 @@ func createFederationClaim(t *testing.T, ctx context.Context, store Store, proje
 	return federationClaim{ParentRunID: rootRunID, RunID: childRunID, RootRunID: rootRunID, ChildKey: childKey, ExecutorID: claim.ExecutorID, ClaimGeneration: claim.ClaimGeneration, ProviderKey: claim.ProviderKey}
 }
 
+func seedOwnershipProject(t *testing.T, ctx context.Context, store Store, projectID, repoPath string) {
+	t.Helper()
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("mkdir project repo: %v", err)
+	}
+	at := "2026-01-01T00:00:00Z"
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, git_root, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET local_path = excluded.local_path, local_path_canonical = excluded.local_path_canonical, git_root = excluded.git_root, updated_at = excluded.updated_at`,
+			projectID, repoPath, repoPath, repoPath, at, at)
+		return err
+	}); err != nil {
+		t.Fatalf("seed ownership project: %v", err)
+	}
+}
+
+func insertLegacyActiveOwnershipLock(t *testing.T, ctx context.Context, store Store, projectID, resourceKey string) {
+	t.Helper()
+	now := "2026-01-01T00:00:00Z"
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO agent_ownership_locks(
+				id, project_id, delivery_run_id, child_agent_id, run_id, claim_generation,
+				lock_generation, resource_kind, resource_key, lock_mode, state, lease_expires_at,
+				heartbeat_at, conflicts_with_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			stableID("legacy_alock_", projectID, resourceKey),
+			projectID,
+			"delivery-legacy",
+			"worker-legacy",
+			"run-legacy",
+			1,
+			1,
+			"repo-path",
+			canonicalResourceKey("repo-path", resourceKey),
+			"write",
+			OwnershipStateHeld,
+			"2026-01-01T01:00:00Z",
+			now,
+			"[]",
+			now,
+			now)
+		return err
+	}); err != nil {
+		t.Fatalf("insert legacy active ownership lock: %v", err)
+	}
+}
+
 func federationAuthorityScope(projectID string) AgentScopeGrant {
 	return AgentScopeGrant{
 		Permission:      PermissionWrite,
@@ -751,6 +1253,22 @@ func federationAuthorityScope(projectID string) AgentScopeGrant {
 		NetworkScope:    []string{"none"},
 		CredentialScope: []string{"none"},
 		SideEffectScope: []string{SideEffectRepoWrite},
+		ApprovalScope:   []string{"auth-a"},
+	}
+}
+
+func federationReadOnlyScope(projectID string) AgentScopeGrant {
+	return AgentScopeGrant{
+		Permission:      PermissionReadOnly,
+		SideEffectClass: SideEffectLocalRead,
+		ReadScope:       []string{"src/a.go"},
+		PathScope:       []string{"src/a.go"},
+		RepositoryScope: []string{projectID},
+		WorktreeScope:   []string{"worktree-a"},
+		CommandScope:    []string{"go-test"},
+		NetworkScope:    []string{"none"},
+		CredentialScope: []string{"none"},
+		SideEffectScope: []string{SideEffectLocalRead},
 		ApprovalScope:   []string{"auth-a"},
 	}
 }
@@ -868,6 +1386,26 @@ func updateFederationProjectAndAuthorityScope(ctx context.Context, store Store, 
 		}
 		_, err := tx.Exec(ctx, `UPDATE task_requirements SET scope_json = ? WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
 			string(scopeJSON), projectID, "drun-a", "task-a")
+		return err
+	})
+}
+
+func updateFederationAuthority(ctx context.Context, store Store, projectID string, scope AgentScopeGrant, permission, sideEffectClass string) error {
+	scopeJSON, err := json.Marshal(scope)
+	if err != nil {
+		return err
+	}
+	return store.WithWriteTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE delivery_tasks SET scope_json = ?, permission = ?, side_effect_class = ? WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+			string(scopeJSON), permission, sideEffectClass, projectID, "drun-a", "task-a"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_requirements SET scope_json = ?, permission_required = ?, side_effect_class = ? WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+			string(scopeJSON), permission, sideEffectClass, projectID, "drun-a", "task-a"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE run_edges SET permission = ?, scope_json = ? WHERE root_run_id IN ('run-root', 'run-root-2')`,
+			permission, string(scopeJSON))
 		return err
 	})
 }
