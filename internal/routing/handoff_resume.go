@@ -3,7 +3,9 @@ package routing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/budget"
@@ -20,9 +22,22 @@ type HandoffResumeInput struct {
 	LeaseExpiresAt      time.Time
 	ReusableEvidenceIDs []string
 	Cancelled           bool
+	IsCancelled         func(context.Context) bool
 	BeforeLaunch        func() error
+	ExecuteSuccessor    HandoffSuccessorExecutor
 	DecidedBy           delivery.Actor
 	Host                delivery.Host
+}
+
+type HandoffSuccessorExecutor func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error)
+
+type HandoffSuccessorExecution struct {
+	Launch    storage.HandoffSuccessorLaunch
+	Candidate Candidate
+}
+
+type HandoffSuccessorExecutionResult struct {
+	ProviderReceipt string
 }
 
 type HandoffResumeResult struct {
@@ -82,23 +97,30 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		return result, err
 	}
 	result.Reservation = reserved.Reservation
-	if input.Cancelled {
-		_ = releaseHandoffReservation(ctx, store, result.Reservation, "cancelled-before-launch", input.DecidedBy, input.Host)
-		return result, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before launch"}
+	obsoleteReservations, err := handoffObsoleteReservations(ctx, store, handoff.ChildRunID, result.Reservation.BudgetReservationID)
+	if err != nil {
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "inspect-obsolete-reservation-failed", input.DecidedBy, input.Host)
+		return result, errors.Join(err, releaseErr)
+	}
+	if handoffResumeCancelled(ctx, input) {
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "cancelled-before-launch", input.DecidedBy, input.Host)
+		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before launch"}, releaseErr)
 	}
 	if input.BeforeLaunch != nil {
 		if err := input.BeforeLaunch(); err != nil {
-			_ = releaseHandoffReservation(ctx, store, result.Reservation, "stopped-before-launch", input.DecidedBy, input.Host)
-			return result, err
+			releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "stopped-before-launch", input.DecidedBy, input.Host)
+			return result, errors.Join(err, releaseErr)
 		}
 	}
 	actorJSON, err := delivery.CanonicalJSON(firstActor(input.DecidedBy, routeInput.DecidedBy))
 	if err != nil {
-		return result, err
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-canonicalization-failed", input.DecidedBy, input.Host)
+		return result, errors.Join(err, releaseErr)
 	}
 	hostJSON, err := delivery.CanonicalJSON(firstHost(input.Host, routeInput.Host))
 	if err != nil {
-		return result, err
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-canonicalization-failed", input.DecidedBy, input.Host)
+		return result, errors.Join(err, releaseErr)
 	}
 	launch, err := storage.PrepareHandoffSuccessorLaunch(ctx, store, storage.HandoffSuccessorRequest{
 		HandoffID:           handoff.HandoffID,
@@ -122,11 +144,44 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		HostJSON:  string(hostJSON),
 	})
 	if err != nil {
-		_ = releaseHandoffReservation(ctx, store, result.Reservation, "launch-refused", input.DecidedBy, input.Host)
-		return result, err
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-refused", input.DecidedBy, input.Host)
+		return result, errors.Join(err, releaseErr)
 	}
 	result.Successor = launch
 	result.Replay = reserved.Replay || launch.Replay
+	if err := releaseHandoffReservationsCleanup(store, obsoleteReservations, "source-reservation-superseded:"+handoff.HandoffID, input.DecidedBy, input.Host); err != nil {
+		return result, err
+	}
+	if !launch.LaunchExposed {
+		if handoffLaunchNeedsHuman(launch, store.Now()) {
+			result.Blocked = true
+			return result, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor launch ownership is ambiguous; human recovery required before replay"}
+		}
+		return result, nil
+	}
+	if handoffResumeCancelled(ctx, input) {
+		releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "cancelled-at-launch-boundary", input.DecidedBy, input.Host)
+		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled at launch boundary"}, releaseErr)
+	}
+	if input.ExecuteSuccessor != nil {
+		if err := transitionHandoffSuccessorLaunching(ctx, store, handoff, launch); err != nil {
+			releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "launch-transition-refused", input.DecidedBy, input.Host)
+			return result, errors.Join(err, releaseErr)
+		}
+		if handoffResumeCancelled(ctx, input) {
+			releaseErr := releaseHandoffReservationCleanup(store, result.Reservation, "cancelled-before-provider-invocation", input.DecidedBy, input.Host)
+			return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before provider invocation"}, releaseErr)
+		}
+		executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected})
+		if execErr != nil {
+			return result, execErr
+		}
+		if err := markHandoffSuccessorExecuting(store, handoff, launch, executed.ProviderReceipt); err != nil {
+			return result, err
+		}
+		result.Successor.ProviderReceipt = strings.TrimSpace(executed.ProviderReceipt)
+		result.Successor.LaunchPhase = storage.ClaimPhaseExecuting
+	}
 	return result, nil
 }
 
@@ -168,6 +223,56 @@ func HandoffDestinationFailureFallback(ctx context.Context, store storage.Store,
 		DecidedBy:                 actor,
 		Host:                      host,
 	})
+}
+
+func handoffResumeCancelled(ctx context.Context, input HandoffResumeInput) bool {
+	if input.Cancelled {
+		return true
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if input.IsCancelled != nil && input.IsCancelled(ctx) {
+		return true
+	}
+	return false
+}
+
+func handoffLaunchNeedsHuman(launch storage.HandoffSuccessorLaunch, now time.Time) bool {
+	if strings.TrimSpace(launch.ProviderReceipt) != "" || launch.LaunchPhase == storage.ClaimPhaseExecuting || launch.LaunchPhase == storage.ClaimPhaseCompleted {
+		return false
+	}
+	if launch.LaunchPhase != storage.ClaimPhaseLaunching {
+		return false
+	}
+	lease, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(launch.LeaseExpiresAt))
+	if err != nil {
+		return true
+	}
+	return !lease.After(now.UTC())
+}
+
+func transitionHandoffSuccessorLaunching(ctx context.Context, store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch) error {
+	registration, err := storage.ValidateNativeChildLaunch(ctx, store, handoff.ChildRunID, launch.ExecutorID, launch.ClaimGeneration)
+	if err != nil {
+		return err
+	}
+	_, err = storage.TransitionAgentRegistration(ctx, store, registration.ChildAgentID, storage.AgentActionLaunch, launch.ExecutorID, launch.ClaimGeneration, delivery.CanonicalTimestamp(store.Now()))
+	return err
+}
+
+func markHandoffSuccessorExecuting(store storage.Store, handoff storage.HandoffTransaction, launch storage.HandoffSuccessorLaunch, providerReceipt string) error {
+	cleanupCtx, cancel := handoffCleanupContext()
+	defer cancel()
+	if err := storage.UpdateChildRunClaimPhase(cleanupCtx, store, handoff.ParentRunID, handoff.ChildRunID, launch.ExecutorID, launch.ClaimGeneration, storage.ClaimPhaseExecuting, delivery.CanonicalTimestamp(store.Now()), providerReceipt); err != nil {
+		return err
+	}
+	childAgentID, err := handoffChildAgentID(cleanupCtx, store, handoff.ChildRunID)
+	if err != nil {
+		return err
+	}
+	_, err = storage.TransitionAgentRegistration(cleanupCtx, store, childAgentID, storage.AgentActionHeartbeat, launch.ExecutorID, launch.ClaimGeneration, delivery.CanonicalTimestamp(store.Now()))
+	return err
 }
 
 func candidatesFromRoutingDecision(decision RoutingDecision) []Candidate {
@@ -237,6 +342,71 @@ func releaseHandoffReservation(ctx context.Context, store storage.Store, reserva
 		Host:           budget.Host{HostID: host.HostID, Provider: host.HostKind},
 	})
 	return err
+}
+
+func handoffCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+func releaseHandoffReservationCleanup(store storage.Store, reservation budget.Reservation, key string, actor delivery.Actor, host delivery.Host) error {
+	cleanupCtx, cancel := handoffCleanupContext()
+	defer cancel()
+	return releaseHandoffReservation(cleanupCtx, store, reservation, key, actor, host)
+}
+
+func releaseHandoffReservationsCleanup(store storage.Store, reservations []budget.Reservation, keyPrefix string, actor delivery.Actor, host delivery.Host) error {
+	var out error
+	for _, reservation := range reservations {
+		key := keyPrefix
+		if reservation.BudgetReservationID != "" {
+			key += ":" + reservation.BudgetReservationID
+		}
+		if err := releaseHandoffReservationCleanup(store, reservation, key, actor, host); err != nil {
+			if live, liveErr := handoffReservationLive(context.Background(), store, reservation.BudgetReservationID); liveErr == nil && !live {
+				continue
+			}
+			out = errors.Join(out, fmt.Errorf("release obsolete handoff reservation %s: %w", reservation.BudgetReservationID, err))
+		}
+	}
+	return out
+}
+
+func handoffReservationLive(ctx context.Context, store storage.Store, reservationID string) (bool, error) {
+	var state string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT state FROM budget_reservations WHERE budget_reservation_id = ?`, reservationID).Scan(&state)
+	}); err != nil {
+		return false, err
+	}
+	return liveReservationState(budget.ReservationState(state)), nil
+}
+
+func handoffObsoleteReservations(ctx context.Context, store storage.Store, childRunID, destinationReservationID string) ([]budget.Reservation, error) {
+	var reservations []budget.Reservation
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT br.budget_reservation_id, br.generation, br.state
+			FROM agent_registrations ar
+			JOIN agent_budget_bindings abb ON abb.child_agent_id = ar.id
+			JOIN budget_reservations br ON br.budget_reservation_id = abb.budget_reservation_id
+			WHERE ar.child_run_id = ?`, childRunID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var reservation budget.Reservation
+			var state string
+			if err := rows.Scan(&reservation.BudgetReservationID, &reservation.Generation, &state); err != nil {
+				return err
+			}
+			reservation.State = budget.ReservationState(state)
+			if reservation.BudgetReservationID != "" && reservation.BudgetReservationID != destinationReservationID && liveReservationState(reservation.State) {
+				reservations = append(reservations, reservation)
+			}
+		}
+		return rows.Err()
+	})
+	return reservations, err
 }
 
 func selectedCandidate(decision RoutingDecision) Candidate {

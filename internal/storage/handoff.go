@@ -139,6 +139,9 @@ type HandoffSuccessorLaunch struct {
 	BudgetReservationID    string   `json:"budget_reservation_id"`
 	ReusableEvidenceIDs    []string `json:"reusable_evidence_ids"`
 	LaunchExposed          bool     `json:"launch_exposed"`
+	LaunchPhase            string   `json:"launch_phase,omitempty"`
+	ProviderReceipt        string   `json:"provider_receipt,omitempty"`
+	LeaseExpiresAt         string   `json:"lease_expires_at,omitempty"`
 	Replay                 bool     `json:"replay"`
 }
 
@@ -1081,6 +1084,9 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 	if err := insertHandoffSuccessorDecisionTx(ctx, tx, handoff, req, attemptID, providerKey); err != nil {
 		return HandoffSuccessorLaunch{}, err
 	}
+	if err := claimHandoffSuccessorLaunchTx(ctx, tx, handoff, req.CreatedAt); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE delivery_tasks
 		SET state = 'claimed', active_attempt_id = ?, attempt_count = CASE WHEN attempt_count < ? THEN ? ELSE attempt_count END,
 			updated_at = ?, terminal_error_code = '', error_message = ''
@@ -1104,7 +1110,34 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		BudgetReservationID:    req.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(req.ReusableEvidenceIDs),
 		LaunchExposed:          true,
+		LaunchPhase:            ClaimPhaseLaunching,
 	}, nil
+}
+
+func claimHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, handoff HandoffTransaction, at string) error {
+	result, err := tx.Exec(ctx, `UPDATE run_claims
+		SET phase = ?, heartbeat_at = ?, provider_receipt = ''
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND phase = ?`,
+		ClaimPhaseLaunching, at, handoff.ChildRunID, handoff.DestinationExecutorID, handoff.HandoffGeneration, ClaimPhaseClaimed)
+	if err != nil {
+		return fmt.Errorf("handoff successor: claim launch ownership: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected != 1 {
+		return federationError(ErrStaleClaimCode, "handoff successor launch ownership is no longer claimable")
+	}
+	if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+		RunID:       handoff.ChildRunID,
+		ParentRunID: handoff.ParentRunID,
+		ChildRunID:  handoff.ChildRunID,
+		Status:      "launching",
+		UpdatedAt:   at,
+		Reason:      "handoff successor launch claimed",
+		Source:      "handoff",
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateHandoffLaunchFenceTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest) error {
@@ -1292,6 +1325,7 @@ func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff Handof
 		"provider_idempotency_key": providerKey,
 		"provider_session_ref":     "",
 		"launch_exposed":           true,
+		"launch_phase":             ClaimPhaseLaunching,
 	})
 	if err != nil {
 		return err
@@ -1334,15 +1368,18 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID  string   `json:"routing_candidate_id"`
 		BudgetReservationID string   `json:"budget_reservation_id"`
 		ReusableEvidenceIDs []string `json:"reusable_evidence_ids"`
+		LaunchPhase         string   `json:"launch_phase"`
 	}
 	if outputJSON != "" {
 		_ = json.Unmarshal([]byte(outputJSON), &payload)
 	}
+	var claimPhase, providerReceipt, leaseExpiresAt string
+	_ = tx.QueryRow(ctx, `SELECT phase, provider_receipt, lease_expires_at FROM run_claims WHERE run_id = ?`, handoff.ChildRunID).Scan(&claimPhase, &providerReceipt, &leaseExpiresAt)
 	return HandoffSuccessorLaunch{
-		HandoffID:              payload.HandoffID,
+		HandoffID:              firstNonEmptyAgent(payload.HandoffID, handoff.HandoffID),
 		HandoffGeneration:      firstPositiveAgent(payload.HandoffGeneration, generation),
 		AttemptID:              attemptID,
-		SourceAttemptID:        payload.SourceAttemptID,
+		SourceAttemptID:        firstNonEmptyAgent(payload.SourceAttemptID, handoff.SourceAttemptID),
 		TaskID:                 taskID,
 		DeliveryRunID:          deliveryRunID,
 		ProjectID:              projectID,
@@ -1353,7 +1390,10 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID:     payload.RoutingCandidateID,
 		BudgetReservationID:    payload.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(payload.ReusableEvidenceIDs),
-		LaunchExposed:          true,
+		LaunchExposed:          false,
+		LaunchPhase:            firstNonEmptyAgent(claimPhase, payload.LaunchPhase),
+		ProviderReceipt:        providerReceipt,
+		LeaseExpiresAt:         leaseExpiresAt,
 	}, true, nil
 }
 
