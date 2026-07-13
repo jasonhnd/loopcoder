@@ -24,6 +24,18 @@ const (
 )
 
 var ErrStaleChildRunClaim = errors.New("stale claim")
+var ErrNestedSchedulerResourceExhausted = errors.New("nested scheduler resource exhausted")
+
+const schedulerReservationStateActive = "active"
+const schedulerReservationStateReleased = "released"
+
+type SchedulerResourceReservationRequest struct {
+	RootRunID              string
+	ProviderKey            string
+	RootMaxConcurrency     int
+	ParentMaxConcurrency   int
+	ProviderMaxConcurrency int
+}
 
 // RunNode describes the durable run graph metadata required for nested runs.
 type RunNode struct {
@@ -135,6 +147,10 @@ type ClaimResult struct {
 
 func IsStaleChildRunClaim(err error) bool {
 	return errors.Is(err, ErrStaleChildRunClaim)
+}
+
+func IsNestedSchedulerResourceExhausted(err error) bool {
+	return errors.Is(err, ErrNestedSchedulerResourceExhausted)
 }
 
 func staleChildRunClaimError(runID string, claimGeneration int64) error {
@@ -396,6 +412,47 @@ func ClaimChildRunExecution(ctx context.Context, store Store, parentRunID, child
 	return result, err
 }
 
+func ClaimChildRunExecutionWithReservations(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, reservation SchedulerResourceReservationRequest) (ClaimResult, error) {
+	if store == nil {
+		return ClaimChildRunExecution(ctx, store, parentRunID, childRunID, executorID, now, leaseUntil)
+	}
+	parentRunID = strings.TrimSpace(parentRunID)
+	childRunID = strings.TrimSpace(childRunID)
+	executorID = strings.TrimSpace(executorID)
+	if parentRunID == "" || childRunID == "" || executorID == "" {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: parent_run_id, child_run_id, and executor_id are required")
+	}
+	now = now.UTC()
+	leaseUntil = leaseUntil.UTC()
+	if now.IsZero() || leaseUntil.IsZero() || !leaseUntil.After(now) {
+		return ClaimResult{}, fmt.Errorf("claim child run execution: valid now and future lease_until are required")
+	}
+	var result ClaimResult
+	err := withRetry(ctx, func() error {
+		var txResult ClaimResult
+		err := store.WithWriteTx(ctx, func(tx Tx) error {
+			claim, err := claimChildRunExecutionTx(ctx, tx, parentRunID, childRunID, executorID, formatTimestamp(now), formatTimestamp(leaseUntil))
+			if err != nil {
+				return err
+			}
+			switch claim.Outcome {
+			case ClaimOutcomeClaimed, ClaimOutcomeStaleClaim:
+				if err := reserveNestedSchedulerResourcesTx(ctx, tx, claim, parentRunID, reservation, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+					return err
+				}
+			}
+			txResult = claim
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		result = txResult
+		return nil
+	})
+	return result, err
+}
+
 func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID string, claimGeneration int64, now, leaseUntil time.Time) error {
 	if store == nil {
 		return nil
@@ -424,6 +481,9 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 				return staleChildRunClaimError(childRunID, claimGeneration)
 			}
 			if err := renewClaimFencedOwnershipLocksTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+				return err
+			}
+			if err := renewNestedSchedulerReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
 				return err
 			}
 			return nil
@@ -523,6 +583,9 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 				Reason:      reason,
 				Source:      "nested-scheduler",
 			}); err != nil {
+				return err
+			}
+			if err := releaseNestedSchedulerReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, updatedAt); err != nil {
 				return err
 			}
 			return completeNativeRegistrationForRunTx(ctx, tx, childRunID, executorID, claimGeneration, status, updatedAt, providerReceipt)
@@ -1030,6 +1093,112 @@ func claimPhaseAutoTakeoverAllowed(phase string) bool {
 
 func providerIdempotencyKey(runID string) string {
 	return "child-run:" + strings.TrimSpace(runID)
+}
+
+type nestedSchedulerResource struct {
+	kind  string
+	key   string
+	limit int
+}
+
+func reserveNestedSchedulerResourcesTx(ctx context.Context, tx Tx, claim ClaimResult, parentRunID string, req SchedulerResourceReservationRequest, now, leaseUntil string) error {
+	resources := nestedSchedulerResources(claim.RunID, parentRunID, req)
+	for _, resource := range resources {
+		if resource.limit <= 0 {
+			continue
+		}
+		var active int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations
+			WHERE resource_kind = ? AND resource_key = ? AND state = ? AND lease_expires_at > ?
+				AND NOT (run_id = ? AND claim_generation = ?)`,
+			resource.kind, resource.key, schedulerReservationStateActive, now, claim.RunID, claim.ClaimGeneration).Scan(&active); err != nil {
+			return fmt.Errorf("reserve nested scheduler resource: count %s/%s: %w", resource.kind, resource.key, err)
+		}
+		if active >= resource.limit {
+			return fmt.Errorf("%w: %s %s active=%d limit=%d", ErrNestedSchedulerResourceExhausted, resource.kind, resource.key, active, resource.limit)
+		}
+		reservationID := stableID("nsres_", claim.RunID, resource.kind, resource.key)
+		if _, err := tx.Exec(ctx, `INSERT INTO nested_scheduler_resource_reservations(
+				reservation_id, run_id, parent_run_id, root_run_id, resource_kind, resource_key,
+				executor_id, claim_generation, join_identity, state, lease_expires_at, heartbeat_at,
+				created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(reservation_id) DO UPDATE SET
+				parent_run_id = excluded.parent_run_id,
+				root_run_id = excluded.root_run_id,
+				executor_id = excluded.executor_id,
+				claim_generation = excluded.claim_generation,
+				join_identity = excluded.join_identity,
+				state = excluded.state,
+				lease_expires_at = excluded.lease_expires_at,
+				heartbeat_at = excluded.heartbeat_at,
+				updated_at = excluded.updated_at`,
+			reservationID, claim.RunID, parentRunID, firstNonEmptyNestedGraph(req.RootRunID, parentRunID),
+			resource.kind, resource.key, claim.ExecutorID, claim.ClaimGeneration, claim.ProviderKey,
+			schedulerReservationStateActive, leaseUntil, now, now, now); err != nil {
+			return fmt.Errorf("reserve nested scheduler resource %s/%s: %w", resource.kind, resource.key, err)
+		}
+	}
+	return nil
+}
+
+func nestedSchedulerResources(childRunID, parentRunID string, req SchedulerResourceReservationRequest) []nestedSchedulerResource {
+	rootRunID := firstNonEmptyNestedGraph(req.RootRunID, parentRunID)
+	providerKey := strings.TrimSpace(req.ProviderKey)
+	if providerKey == "" {
+		providerKey = "provider:default"
+	}
+	parentLimit := req.ParentMaxConcurrency
+	rootLimit := req.RootMaxConcurrency
+	if rootLimit <= 0 {
+		rootLimit = parentLimit
+	}
+	providerLimit := req.ProviderMaxConcurrency
+	if providerLimit <= 0 {
+		providerLimit = parentLimit
+	}
+	resources := []nestedSchedulerResource{
+		{kind: "root", key: rootRunID, limit: rootLimit},
+		{kind: "parent", key: parentRunID, limit: parentLimit},
+		{kind: "provider", key: providerKey, limit: providerLimit},
+	}
+	if parentRunID == "" || childRunID == "" {
+		return nil
+	}
+	out := resources[:0]
+	for _, resource := range resources {
+		if strings.TrimSpace(resource.key) != "" && resource.limit > 0 {
+			out = append(out, resource)
+		}
+	}
+	return out
+}
+
+func renewNestedSchedulerReservationsTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, now, leaseUntil string) error {
+	result, err := tx.Exec(ctx, `UPDATE nested_scheduler_resource_reservations
+		SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ?`,
+		now, leaseUntil, now, childRunID, executorID, claimGeneration, schedulerReservationStateActive)
+	if err != nil {
+		return fmt.Errorf("renew nested scheduler reservations: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		return nil
+	}
+	return nil
+}
+
+func releaseNestedSchedulerReservationsTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, at string) error {
+	result, err := tx.Exec(ctx, `UPDATE nested_scheduler_resource_reservations
+		SET state = ?, heartbeat_at = ?, updated_at = ?
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ? AND state = ?`,
+		schedulerReservationStateReleased, at, at, childRunID, executorID, claimGeneration, schedulerReservationStateActive)
+	if err != nil {
+		return fmt.Errorf("release nested scheduler reservations: %w", err)
+	}
+	_, _ = result.RowsAffected()
+	return nil
 }
 
 func claimLeaseActive(leaseExpiresAt, now string) bool {

@@ -593,6 +593,10 @@ func RegisterAgent(ctx context.Context, store Store, req AgentRegistrationReques
 }
 
 func ClaimAndRegisterNativeChild(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, req AgentRegistrationRequest) (ClaimResult, AgentRegistration, error) {
+	return ClaimAndRegisterNativeChildWithReservations(ctx, store, parentRunID, childRunID, executorID, now, leaseUntil, req, SchedulerResourceReservationRequest{})
+}
+
+func ClaimAndRegisterNativeChildWithReservations(ctx context.Context, store Store, parentRunID, childRunID, executorID string, now, leaseUntil time.Time, req AgentRegistrationRequest, reservation SchedulerResourceReservationRequest) (ClaimResult, AgentRegistration, error) {
 	if store == nil {
 		return ClaimResult{}, AgentRegistration{}, federationError(ErrAgentRegistrationRequiredCode, "store is required")
 	}
@@ -623,6 +627,9 @@ func ClaimAndRegisterNativeChild(ctx context.Context, store Store, parentRunID, 
 			}
 			switch claim.Outcome {
 			case ClaimOutcomeClaimed, ClaimOutcomeStaleClaim:
+				if err := reserveNestedSchedulerResourcesTx(ctx, tx, claim, parentRunID, reservation, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
+					return err
+				}
 			default:
 				return nil
 			}

@@ -289,7 +289,10 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 		if _, err := tx.Exec(ctx, `DROP TABLE handoff_transactions`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version IN (25, 26)`)
+		if _, err := tx.Exec(ctx, `DROP TABLE nested_scheduler_resource_reservations`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version IN (25, 26, 27)`)
 		return err
 	}); err != nil {
 		t.Fatalf("simulate v24 database: %v", err)

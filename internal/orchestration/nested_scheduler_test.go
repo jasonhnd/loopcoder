@@ -1308,6 +1308,176 @@ func TestScheduleNestedRunsConcurrentReplayTwoProcessesObservesActiveOwner(t *te
 	}
 }
 
+func TestScheduleNestedRunsGlobalReservationsPreventConcurrentProviderOversubscription(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
+	storeA, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open B: %v", err)
+	}
+	defer storeB.Close()
+
+	planA := durableReplayTestPlan()
+	planA.PlanID = "plan-global-reservation-a"
+	planA.Items[0].ChildKey = "global-a"
+	planA.Items[0].Title = "global-a"
+	planB := durableReplayTestPlan()
+	planB.PlanID = "plan-global-reservation-b"
+	planB.ParentRunID = "run-20260709T000001Z-wave"
+	planB.RootRunID = "run-20260709T000001Z-wave"
+	planB.Items[0].ChildKey = "global-b"
+	planB.Items[0].Title = "global-b"
+
+	executeStarted := make(chan struct{})
+	releaseExecute := make(chan struct{})
+	var executeCount int64
+	doneA := make(chan struct {
+		report NestedScheduleReport
+		err    error
+	}, 1)
+	go func() {
+		report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+			RepoPath:         repo,
+			MaxChildren:      1,
+			ConcurrencyLimit: 1,
+			Now:              nestedTestNow(),
+			Clock:            func() time.Time { return nestedTestNow() },
+			Plan:             &planA,
+			Store:            storeA,
+			RecordEvent: func(string, string, state.Event) error {
+				return nil
+			},
+			Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+				atomic.AddInt64(&executeCount, 1)
+				close(executeStarted)
+				<-releaseExecute
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			},
+		})
+		doneA <- struct {
+			report NestedScheduleReport
+			err    error
+		}{report: report, err: err}
+	}()
+	waitForNestedSignal(t, executeStarted, "first child execution")
+
+	reportB, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:         repo,
+		MaxChildren:      1,
+		ConcurrencyLimit: 1,
+		Now:              nestedTestNow().Add(time.Minute),
+		Clock:            func() time.Time { return nestedTestNow().Add(time.Minute) },
+		Plan:             &planB,
+		Store:            storeB,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			atomic.AddInt64(&executeCount, 1)
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("contending ScheduleNestedRuns returned error: %v", err)
+	}
+	if got := reportB.Children[0].Status; got != NestedStatusNeedsHuman {
+		t.Fatalf("contending child status = %q, want needs-human", got)
+	}
+	if !strings.Contains(reportB.Children[0].Error, "nested scheduler resource exhausted") {
+		t.Fatalf("contending child error = %q", reportB.Children[0].Error)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count before release = %d, want 1", got)
+	}
+
+	close(releaseExecute)
+	outcomeA := <-doneA
+	if outcomeA.err != nil {
+		t.Fatalf("owner ScheduleNestedRuns returned error: %v", outcomeA.err)
+	}
+	if got := atomic.LoadInt64(&executeCount); got != 1 {
+		t.Fatalf("execute count after release = %d, want 1", got)
+	}
+	var active, released int
+	if err := storeA.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE state = 'active'`).Scan(&active); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE state = 'released'`).Scan(&released)
+	}); err != nil {
+		t.Fatalf("query scheduler reservations: %v", err)
+	}
+	if active != 0 || released != 3 {
+		t.Fatalf("reservation states active/released = %d/%d, want 0/3", active, released)
+	}
+}
+
+func TestScheduleNestedRunsRollsBackClaimWhenReservationPersistenceFails(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	baseStore, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer baseStore.Close()
+	store := failExecStore{
+		Store: baseStore,
+		match: func(query string) bool {
+			return strings.Contains(query, "INSERT INTO nested_scheduler_resource_reservations")
+		},
+		err: errors.New("injected reservation persistence failure"),
+	}
+
+	plan := durableReplayTestPlan()
+	plan.PlanID = "plan-reservation-rollback"
+	plan.Items[0].ChildKey = "rollback-child"
+	executed := false
+	_, err = ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:         repo,
+		MaxChildren:      1,
+		ConcurrencyLimit: 1,
+		Now:              nestedTestNow(),
+		Clock:            func() time.Time { return nestedTestNow() },
+		Plan:             &plan,
+		Store:            store,
+		RecordEvent: func(string, string, state.Event) error {
+			return nil
+		},
+		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected reservation persistence failure") {
+		t.Fatalf("ScheduleNestedRuns error = %v, want injected reservation persistence failure", err)
+	}
+	if executed {
+		t.Fatal("child executed after reservation persistence failure")
+	}
+	var claims, reservations int
+	var childStatus string
+	if err := baseStore.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims`).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations`).Scan(&reservations); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT status FROM runs WHERE parent_run_id = ?`, plan.ParentRunID).Scan(&childStatus)
+	}); err != nil {
+		t.Fatalf("query rollback state: %v", err)
+	}
+	if claims != 0 || reservations != 0 || childStatus != NestedStatusQueued {
+		t.Fatalf("rollback state claims/reservations/status = %d/%d/%q, want 0/0/queued", claims, reservations, childStatus)
+	}
+}
+
 func TestScheduleNestedRunsRenewsClaimDuringLongExecution(t *testing.T) {
 	oldLease := nestedClaimLeaseDuration
 	oldRenew := nestedClaimRenewEvery

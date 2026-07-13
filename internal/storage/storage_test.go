@@ -36,19 +36,19 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions", "nested_scheduler_resource_reservations"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
 	}
 	var migrationName string
 	if err := store.WithTx(ctx, func(tx Tx) error {
-		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 26`).Scan(&migrationName)
+		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 27`).Scan(&migrationName)
 	}); err != nil {
-		t.Fatalf("query migration 26: %v", err)
+		t.Fatalf("query migration 27: %v", err)
 	}
-	if migrationName != "durable handoff transactions" {
-		t.Fatalf("migration 26 name = %q", migrationName)
+	if migrationName != "nested scheduler resource reservations" {
+		t.Fatalf("migration 27 name = %q", migrationName)
 	}
 	if tableColumnExists(t, store, "routing_decisions", "alternatives_json") {
 		t.Fatalf("routing_decisions includes non-v1 alternatives_json column")

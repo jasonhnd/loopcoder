@@ -418,11 +418,23 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 				results[index] = withNestedDecision(result)
 				return
 			}
-			claim, nativeRegistration, err = storage.ClaimAndRegisterNativeChild(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration), req)
+			claim, nativeRegistration, err = storage.ClaimAndRegisterNativeChildWithReservations(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration), req, nestedSchedulerReservationRequest(opts, child, req))
 		} else {
-			claim, err = storage.ClaimChildRunExecution(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration))
+			claim, err = storage.ClaimChildRunExecutionWithReservations(ctx, opts.Store, opts.ParentRunID, child.RunID, executorID, claimAt, claimAt.Add(nestedClaimLeaseDuration), nestedSchedulerReservationRequest(opts, child, storage.AgentRegistrationRequest{}))
 		}
 		if err != nil {
+			if storage.IsNestedSchedulerResourceExhausted(err) {
+				result.Status = NestedStatusNeedsHuman
+				result.Error = err.Error()
+				result.NextAction = "wait for nested scheduler reservations to release before replaying"
+				result.FinishedAt = state.FormatTimestamp(clock().UTC())
+				if persistErr := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested scheduler reservation gate"); persistErr != nil {
+					setCompleteErr(persistErr)
+					return
+				}
+				results[index] = withNestedDecision(result)
+				return
+			}
 			if nativeAgent {
 				result.Status = NestedStatusNeedsHuman
 				result.Error = err.Error()
@@ -1216,6 +1228,37 @@ func applyClaimResult(result ChildRunResult, claim storage.ClaimResult) ChildRun
 		result.StartedAt = claim.ClaimedAt
 	}
 	return result
+}
+
+func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRunPlan, native storage.AgentRegistrationRequest) storage.SchedulerResourceReservationRequest {
+	limit := opts.ConcurrencyLimit
+	if limit <= 0 {
+		limit = lcdefaults.NestedSchedulerMaxConcurrency
+	}
+	return storage.SchedulerResourceReservationRequest{
+		RootRunID:              opts.RootRunID,
+		ProviderKey:            nestedSchedulerProviderRoute(child, native),
+		RootMaxConcurrency:     limit,
+		ParentMaxConcurrency:   limit,
+		ProviderMaxConcurrency: limit,
+	}
+}
+
+func nestedSchedulerProviderRoute(child ChildRunPlan, native storage.AgentRegistrationRequest) string {
+	parts := []string{
+		strings.TrimSpace(native.AdapterID),
+		strings.TrimSpace(native.AccountProfileID),
+		strings.TrimSpace(native.ModelCapabilityID),
+	}
+	if strings.TrimSpace(strings.Join(parts, "")) == "" {
+		parts = []string{"loopcoder", strings.TrimSpace(child.Role), strings.TrimSpace(child.Permission)}
+	}
+	for i := range parts {
+		if parts[i] == "" {
+			parts[i] = "_"
+		}
+	}
+	return strings.Join(parts, ":")
 }
 
 func startNestedClaimHeartbeat(store storage.Store, childRunID, executorID string, generation int64, clock func() time.Time) func() error {
