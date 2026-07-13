@@ -8,6 +8,8 @@ import (
 	"testing"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 )
 
 func TestCommandDocsCoverRegisteredCommands(t *testing.T) {
@@ -104,6 +106,7 @@ func isCommandTokenRune(r rune) bool {
 func commandDocsGitRoot(t *testing.T) string {
 	t.Helper()
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git rev-parse --show-toplevel: %v", err)

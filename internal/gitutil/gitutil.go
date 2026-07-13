@@ -56,6 +56,7 @@ func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) (
 	}
 	allArgs := buildGitArgs(repoPath, args...)
 	cmd := exec.CommandContext(ctx, gitCommand, allArgs...)
+	cmd.Env = CleanEnv(os.Environ())
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -93,6 +94,32 @@ func (ExecRunner) RunGit(ctx context.Context, repoPath string, args ...string) (
 func gitArgs(repoPath string, args ...string) []string {
 	allArgs := append([]string{"-C", repoPath}, args...)
 	return allArgs
+}
+
+// CleanEnv removes Git repository-scoping environment variables that override
+// explicit -C paths and temporary fixture repositories.
+func CleanEnv(environ []string) []string {
+	blocked := map[string]bool{
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+		"GIT_COMMON_DIR":                   true,
+		"GIT_DIR":                          true,
+		"GIT_INDEX_FILE":                   true,
+		"GIT_NAMESPACE":                    true,
+		"GIT_OBJECT_DIRECTORY":             true,
+		"GIT_WORK_TREE":                    true,
+	}
+	cleaned := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if blocked[key] || strings.HasPrefix(key, "GIT_CONFIG") {
+			continue
+		}
+		cleaned = append(cleaned, entry)
+	}
+	return cleaned
 }
 
 func (c *Client) run(ctx context.Context, repoPath string, args ...string) ([]byte, error) {

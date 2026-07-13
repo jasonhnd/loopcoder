@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 )
 
 func TestBuildPlanUsesGoDefaultsWhenAuditConfigAbsent(t *testing.T) {
@@ -788,6 +789,7 @@ func runAuditTestGit(t *testing.T, repo string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repo
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))

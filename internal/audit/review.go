@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -337,6 +338,7 @@ func gitTrackedFiles(ctx context.Context, repoPath string) ([]string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, lcdefaults.GitCommandHardCap)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "git", "-C", repoPath, "ls-files")
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = io.Discard
@@ -441,6 +443,7 @@ func runGitMetadata(ctx context.Context, repoPath string, args ...string) (strin
 	defer cancel()
 	fullArgs := append([]string{"-C", repoPath}, args...)
 	cmd := exec.CommandContext(runCtx, "git", fullArgs...)
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

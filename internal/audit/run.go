@@ -14,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -286,10 +287,12 @@ func resolveRepo(repoPath string) (string, error) {
 
 func trackedStatus(repoPath string) (string, bool, error) {
 	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--is-inside-work-tree")
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	if output, err := cmd.Output(); err != nil || strings.TrimSpace(string(output)) != "true" {
 		return "", false, nil
 	}
 	statusCmd := exec.Command("git", "-C", repoPath, "status", "--porcelain", "--untracked-files=no")
+	statusCmd.Env = gitutil.CleanEnv(os.Environ())
 	var output bytes.Buffer
 	statusCmd.Stdout = &output
 	statusCmd.Stderr = &output

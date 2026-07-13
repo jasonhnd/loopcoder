@@ -49,3 +49,18 @@ configuration or selecting an explicit empty configuration file, the adapter
 can replace project-config fail-closed behavior with that explicit profile.
 Until then, project-local inherited configuration is blocked rather than
 trusted.
+
+Workspace boundary inspection is path based. Symlinks and junctions are
+resolved before launch and any broken link or link resolving outside the
+accepted physical workspace fails closed. This can reject legitimate broken or
+external links and can be expensive in very large trees, but it preserves the
+bounded workspace contract without trusting provider-side filtering. Filesystem
+hard links are not distinguishable through this scan, so the adapter cannot
+prove that a workspace file is not another hard link to content reachable by a
+different path.
+
+On Windows, user-writable profile/config roots are replaced, but machine-wide
+operating system roots required for process startup and normal CLI execution
+remain inherited. In particular, `ALLUSERSPROFILE` and `ProgramData` may still
+point at host-level configuration locations. Operators should not treat the
+bounded Grok profile as a full machine-wide Windows configuration sandbox.
