@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 24
+	CurrentSchemaVersion = 25
 
 	driverName = "sqlite"
 
@@ -360,6 +360,11 @@ var migrations = []migration{
 		name:       "independent verification decisions",
 		statements: verificationDecisionSchemaStatements,
 	},
+	{
+		version:    25,
+		name:       "canonical progress receipts",
+		statements: progressReceiptSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -413,6 +418,7 @@ var requiredTables = []string{
 	"fallback_decisions",
 	"replan_decisions",
 	"verification_decisions",
+	"progress_receipts",
 	"agent_scope_grants",
 	"agent_registrations",
 	"agent_ownership_locks",
