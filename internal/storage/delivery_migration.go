@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 const deliveryV10BackupStreamBufferSize = 128 * 1024
@@ -76,19 +75,31 @@ func createDeliveryV10BackupImage(ctx context.Context, db *sql.DB, sourcePath st
 	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		return "", "", err
 	}
+	backupRoot, err := os.OpenRoot(backupDir)
+	if err != nil {
+		return "", "", err
+	}
+	defer backupRoot.Close()
+
 	temp, err := os.CreateTemp(backupDir, ".schema-v9-*.tmp")
 	if err != nil {
 		return "", "", err
 	}
 	tempPath := temp.Name()
+	tempName, err := backupRootName(backupDir, tempPath)
+	if err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return "", "", err
+	}
 	if err := temp.Close(); err != nil {
 		_ = os.Remove(tempPath)
 		return "", "", err
 	}
-	if err := os.Remove(tempPath); err != nil {
+	if err := backupRoot.Remove(tempName); err != nil {
 		return "", "", err
 	}
-	defer os.Remove(tempPath)
+	defer backupRoot.Remove(tempName)
 
 	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseBeforeVacuum, tempPath); err != nil {
 		return "", "", err
@@ -96,17 +107,17 @@ func createDeliveryV10BackupImage(ctx context.Context, db *sql.DB, sourcePath st
 	if err := vacuumInto(ctx, db, tempPath); err != nil {
 		return "", "", err
 	}
-	if err := os.Chmod(tempPath, 0o600); err != nil {
+	if err := backupRoot.Chmod(tempName, 0o600); err != nil {
 		return "", "", err
 	}
-	if err := syncFile(tempPath); err != nil {
+	if err := syncFile(backupRoot, tempName); err != nil {
 		return "", "", err
 	}
 	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseAfterVacuum, tempPath); err != nil {
 		return "", "", err
 	}
 
-	sourceHash, err := fileSHA256(ctx, tempPath, opts.bufferFactory)
+	sourceHash, err := fileSHA256(ctx, backupRoot, tempName, opts.bufferFactory)
 	if err != nil {
 		return "", "", err
 	}
@@ -114,9 +125,13 @@ func createDeliveryV10BackupImage(ctx context.Context, db *sql.DB, sourcePath st
 		return "", "", err
 	}
 
-	backupPath := filepath.Join(backupDir, "schema-v9-"+sourceHash[:16]+".db")
-	if _, err := os.Stat(backupPath); err == nil {
-		existingHash, err := fileSHA256(ctx, backupPath, opts.bufferFactory)
+	backupName := "schema-v9-" + sourceHash[:16] + ".db"
+	if err := validateBackupRootName(backupName); err != nil {
+		return "", "", err
+	}
+	backupPath := filepath.Join(backupDir, backupName)
+	if _, err := backupRoot.Stat(backupName); err == nil {
+		existingHash, err := fileSHA256(ctx, backupRoot, backupName, opts.bufferFactory)
 		if err != nil {
 			return "", "", err
 		}
@@ -131,10 +146,28 @@ func createDeliveryV10BackupImage(ctx context.Context, db *sql.DB, sourcePath st
 	if err := runDeliveryV10BackupHook(ctx, opts.hook, deliveryV10BackupPhaseBeforeRename, tempPath); err != nil {
 		return "", "", err
 	}
-	if err := os.Rename(tempPath, backupPath); err != nil {
+	if err := backupRoot.Rename(tempName, backupName); err != nil {
 		return "", "", err
 	}
 	return sourceHash, backupPath, nil
+}
+
+func backupRootName(backupDir, path string) (string, error) {
+	name, err := filepath.Rel(backupDir, path)
+	if err != nil {
+		return "", err
+	}
+	if err := validateBackupRootName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func validateBackupRootName(name string) error {
+	if name == "" || name == "." || !filepath.IsLocal(name) || filepath.Dir(name) != "." {
+		return fmt.Errorf("backup path %q is outside the verified backup directory", name)
+	}
+	return nil
 }
 
 func runDeliveryV10BackupHook(ctx context.Context, hook deliveryV10BackupHookForTest, phase deliveryV10BackupPhase, path string) error {
@@ -151,16 +184,15 @@ func runDeliveryV10BackupHook(ctx context.Context, hook deliveryV10BackupHookFor
 }
 
 func vacuumInto(ctx context.Context, db *sql.DB, path string) error {
-	_, err := db.ExecContext(ctx, "VACUUM main INTO "+sqliteStringLiteral(path))
+	_, err := db.ExecContext(ctx, "VACUUM main INTO ?", path)
 	return err
 }
 
-func sqliteStringLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
-func syncFile(path string) error {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0)
+func syncFile(root *os.Root, name string) error {
+	if err := validateBackupRootName(name); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(name, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
@@ -612,8 +644,11 @@ var deliveryContractSchemaStatements = []string{
 	)`,
 }
 
-func fileSHA256(ctx context.Context, path string, bufferFactory func() []byte) (string, error) {
-	file, err := os.Open(path)
+func fileSHA256(ctx context.Context, root *os.Root, name string, bufferFactory func() []byte) (string, error) {
+	if err := validateBackupRootName(name); err != nil {
+		return "", err
+	}
+	file, err := root.Open(name)
 	if err != nil {
 		return "", err
 	}

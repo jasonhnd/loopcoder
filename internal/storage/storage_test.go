@@ -418,7 +418,7 @@ func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
 	if first.SourceDBPath != filepath.Clean(path) || first.SourceSchemaVersion != 9 || first.BackupPath != wantBackupPath {
 		t.Fatalf("backup metadata = %#v, want real v9 backup path %q", first, wantBackupPath)
 	}
-	backupHash, err := fileSHA256(ctx, wantBackupPath, nil)
+	backupHash, err := backupPathSHA256(t, ctx, wantBackupPath)
 	if err != nil {
 		t.Fatalf("hash backup image: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
 	if err := appendFile(wantBackupPath, []byte("corrupt")); err != nil {
 		t.Fatalf("corrupt backup image: %v", err)
 	}
-	corruptHash, err := fileSHA256(ctx, wantBackupPath, nil)
+	corruptHash, err := backupPathSHA256(t, ctx, wantBackupPath)
 	if err != nil {
 		t.Fatalf("hash corrupt backup image: %v", err)
 	}
@@ -463,6 +463,53 @@ func TestOpenMigratesExistingV9DatabaseCreatesRealBackupMetadata(t *testing.T) {
 		t.Fatalf("backup metadata changed after reopen:\nfirst:  %#v\nsecond: %#v", first, second)
 	}
 	assertCountInStore(t, ctx, reopened, `SELECT COUNT(*) FROM delivery_migration_backups`, 1)
+}
+
+func TestOpenMigratesExistingV9DatabaseBackupCanRestoreAndReopen(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "loopcoder.db")
+	raw := createRawDB(t, path)
+	createV9NestedClaimLifecycleSchema(t, raw)
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE restore_markers(id TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create restore marker table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO restore_markers(id, value) VALUES ('marker', 'restored')`); err != nil {
+		t.Fatalf("insert restore marker: %v", err)
+	}
+	closeRawDB(t, raw)
+
+	store, err := Open(ctx, Options{Path: path, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	backup := readOnlyDeliveryMigrationBackup(t, ctx, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	restoredPath := filepath.Join(root, "restored.db")
+	copyWithinRoot(t, root, filepath.Join("backups", filepath.Base(backup.BackupPath)), filepath.Base(restoredPath))
+	restoredRaw, err := sql.Open(driverName, restoredPath)
+	if err != nil {
+		t.Fatalf("open restored backup: %v", err)
+	}
+	version, err := schemaVersion(ctx, restoredRaw)
+	if err != nil {
+		_ = restoredRaw.Close()
+		t.Fatalf("query restored schema version: %v", err)
+	}
+	var marker string
+	if err := restoredRaw.QueryRowContext(ctx, `SELECT value FROM restore_markers WHERE id = 'marker'`).Scan(&marker); err != nil {
+		_ = restoredRaw.Close()
+		t.Fatalf("query restored marker: %v", err)
+	}
+	if err := restoredRaw.Close(); err != nil {
+		t.Fatalf("close restored backup: %v", err)
+	}
+	if version != 9 || marker != "restored" {
+		t.Fatalf("restored backup = version %d marker %q, want version 9 marker restored", version, marker)
+	}
 }
 
 func TestOpenMigratesLargeV9DatabaseWithBoundedBackupHashBuffer(t *testing.T) {
@@ -514,7 +561,7 @@ func TestOpenMigratesLargeV9DatabaseWithBoundedBackupHashBuffer(t *testing.T) {
 	if info.Size() <= int64(largePayloadSize) {
 		t.Fatalf("backup size = %d, want larger than large fixture payload %d", info.Size(), largePayloadSize)
 	}
-	backupHash, err := fileSHA256(ctx, backup.BackupPath, nil)
+	backupHash, err := backupPathSHA256(t, ctx, backup.BackupPath)
 	if err != nil {
 		t.Fatalf("hash backup image: %v", err)
 	}
@@ -616,6 +663,109 @@ func TestOpenV9MigrationCancellationCleansPartialBackup(t *testing.T) {
 				t.Fatalf("source schema after cancelled migration = %d, want 9", version)
 			}
 		})
+	}
+}
+
+func TestOpenV9MigrationCancellationAfterVacuumAndHashReleasesBackupFiles(t *testing.T) {
+	ctx := context.Background()
+	for _, phase := range []deliveryV10BackupPhase{
+		deliveryV10BackupPhaseAfterVacuum,
+		deliveryV10BackupPhaseAfterHash,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "loopcoder.db")
+			raw := createRawDB(t, path)
+			createV9NestedClaimLifecycleSchema(t, raw)
+			closeRawDB(t, raw)
+
+			_, err := Open(ctx, Options{
+				Path: path,
+				Now:  fixedNow,
+				deliveryV10BackupHookForTest: func(_ context.Context, got deliveryV10BackupPhase, _ string) error {
+					if got == phase {
+						return context.Canceled
+					}
+					return nil
+				},
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Open error = %v, want context.Canceled", err)
+			}
+			assertBackupDirEmpty(t, path)
+			if err := os.RemoveAll(root); err != nil {
+				t.Fatalf("remove cancelled migration tree: %v", err)
+			}
+		})
+	}
+}
+
+func TestVacuumIntoBindsQuotedDestinationPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "loopcoder.db")
+	raw := createRawDB(t, sourcePath)
+	createV9NestedClaimLifecycleSchema(t, raw)
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE quoted_backup_markers(id TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create quoted marker table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO quoted_backup_markers(id, value) VALUES ('marker', 'quoted path')`); err != nil {
+		t.Fatalf("insert quoted marker: %v", err)
+	}
+	defer closeRawDB(t, raw)
+
+	backupDir := filepath.Join(root, "backups")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatalf("mkdir backup dir: %v", err)
+	}
+	backupPath := filepath.Join(backupDir, "schema-v9-'quoted'.tmp")
+	if err := vacuumInto(ctx, raw, backupPath); err != nil {
+		t.Fatalf("vacuum into quoted destination: %v", err)
+	}
+	backupRaw, err := sql.Open(driverName, backupPath)
+	if err != nil {
+		t.Fatalf("open quoted backup: %v", err)
+	}
+	var value string
+	if err := backupRaw.QueryRowContext(ctx, `SELECT value FROM quoted_backup_markers WHERE id = 'marker'`).Scan(&value); err != nil {
+		_ = backupRaw.Close()
+		t.Fatalf("query quoted backup marker: %v", err)
+	}
+	if err := backupRaw.Close(); err != nil {
+		t.Fatalf("close quoted backup: %v", err)
+	}
+	if value != "quoted path" {
+		t.Fatalf("quoted backup marker = %q, want quoted path", value)
+	}
+}
+
+func TestSyncFileUsesClosableWriteCapableHandle(t *testing.T) {
+	rootPath := t.TempDir()
+	backupRoot, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open backup root: %v", err)
+	}
+	defer backupRoot.Close()
+
+	file, err := backupRoot.OpenFile("snapshot.db", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("create snapshot: %v", err)
+	}
+	if _, err := file.WriteString("snapshot"); err != nil {
+		_ = file.Close()
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close snapshot before sync: %v", err)
+	}
+	if err := syncFile(backupRoot, "snapshot.db"); err != nil {
+		t.Fatalf("sync snapshot: %v", err)
+	}
+	if err := backupRoot.Rename("snapshot.db", "snapshot-renamed.db"); err != nil {
+		t.Fatalf("rename synced snapshot: %v", err)
+	}
+	if err := backupRoot.Remove("snapshot-renamed.db"); err != nil {
+		t.Fatalf("remove synced snapshot: %v", err)
 	}
 }
 
@@ -1533,6 +1683,48 @@ func appendFile(path string, data []byte) error {
 		return err
 	}
 	return file.Close()
+}
+
+func backupPathSHA256(t *testing.T, ctx context.Context, path string) (string, error) {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("open backup root: %v", err)
+	}
+	defer root.Close()
+	return fileSHA256(ctx, root, filepath.Base(path), nil)
+}
+
+func copyWithinRoot(t *testing.T, rootPath, sourceName, targetName string) {
+	t.Helper()
+	if !filepath.IsLocal(sourceName) || sourceName == "." {
+		t.Fatalf("source path %q is not local to root", sourceName)
+	}
+	if !filepath.IsLocal(targetName) || targetName == "." {
+		t.Fatalf("target path %q is not local to root", targetName)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open copy root: %v", err)
+	}
+	defer root.Close()
+
+	source, err := root.Open(sourceName)
+	if err != nil {
+		t.Fatalf("open copy source: %v", err)
+	}
+	defer source.Close()
+	target, err := root.OpenFile(targetName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open copy target: %v", err)
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		t.Fatalf("copy backup: %v", err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatalf("close copy target: %v", err)
+	}
 }
 
 func assertBackupDirEmpty(t *testing.T, dbPath string) {
