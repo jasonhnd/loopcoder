@@ -98,6 +98,50 @@ type HandoffTransaction struct {
 	UpdatedAt                   string   `json:"updated_at"`
 }
 
+type HandoffSuccessorCandidate struct {
+	RoutingDecisionID      string
+	RoutingCandidateID     string
+	AdapterID              string
+	ProviderInstallationID string
+	AccountProfileID       string
+	ModelCapabilityID      string
+}
+
+type HandoffSuccessorRequest struct {
+	HandoffID           string
+	HandoffGeneration   int64
+	SourceAttemptID     string
+	RoutingDecisionID   string
+	RoutingFingerprint  string
+	BudgetReservationID string
+	BudgetPolicyIDs     []string
+	ReusableEvidenceIDs []string
+	Candidate           HandoffSuccessorCandidate
+	Cancelled           bool
+	CreatedAt           string
+	ActorJSON           string
+	HostJSON            string
+}
+
+type HandoffSuccessorLaunch struct {
+	HandoffID              string   `json:"handoff_id"`
+	HandoffGeneration      int64    `json:"handoff_generation"`
+	AttemptID              string   `json:"attempt_id"`
+	SourceAttemptID        string   `json:"source_attempt_id"`
+	TaskID                 string   `json:"task_id"`
+	DeliveryRunID          string   `json:"delivery_run_id"`
+	ProjectID              string   `json:"project_id"`
+	ExecutorID             string   `json:"executor_id"`
+	ClaimGeneration        int64    `json:"claim_generation"`
+	ProviderIdempotencyKey string   `json:"provider_idempotency_key"`
+	RoutingDecisionID      string   `json:"routing_decision_id"`
+	RoutingCandidateID     string   `json:"routing_candidate_id"`
+	BudgetReservationID    string   `json:"budget_reservation_id"`
+	ReusableEvidenceIDs    []string `json:"reusable_evidence_ids"`
+	LaunchExposed          bool     `json:"launch_exposed"`
+	Replay                 bool     `json:"replay"`
+}
+
 type handoffReplayConflict struct {
 	existing HandoffTransaction
 }
@@ -145,6 +189,51 @@ func RecordHandoffTransaction(ctx context.Context, store Store, req HandoffReque
 			}
 		}
 	}
+	return out, err
+}
+
+func LoadHandoffTransaction(ctx context.Context, store Store, handoffID string) (HandoffTransaction, error) {
+	if store == nil {
+		return HandoffTransaction{}, federationError(ErrHandoffRequiredCode, "store is required")
+	}
+	handoffID = strings.TrimSpace(handoffID)
+	if handoffID == "" {
+		return HandoffTransaction{}, federationError(ErrHandoffRequiredCode, "handoff_id is required")
+	}
+	var out HandoffTransaction
+	err := store.WithTx(ctx, func(tx Tx) error {
+		record, ok, err := loadHandoffTx(ctx, tx, `WHERE handoff_id = ?`, handoffID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return federationError(ErrHandoffRequiredCode, "handoff %s is missing", handoffID)
+		}
+		out = record
+		return nil
+	})
+	return out, err
+}
+
+func PrepareHandoffSuccessorLaunch(ctx context.Context, store Store, req HandoffSuccessorRequest) (HandoffSuccessorLaunch, error) {
+	if store == nil {
+		return HandoffSuccessorLaunch{}, federationError(ErrHandoffRequiredCode, "store is required")
+	}
+	req = normalizeHandoffSuccessorRequest(req, store.Now())
+	if err := validateHandoffSuccessorRequest(req); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	var out HandoffSuccessorLaunch
+	err := withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			launch, err := prepareHandoffSuccessorLaunchTx(ctx, tx, req)
+			if err != nil {
+				return err
+			}
+			out = launch
+			return nil
+		})
+	})
 	return out, err
 }
 
@@ -795,6 +884,104 @@ func normalizeHandoffRequest(req HandoffRequest, now time.Time) HandoffRequest {
 	return req
 }
 
+func normalizeHandoffSuccessorRequest(req HandoffSuccessorRequest, now time.Time) HandoffSuccessorRequest {
+	req.HandoffID = strings.TrimSpace(req.HandoffID)
+	req.SourceAttemptID = strings.TrimSpace(req.SourceAttemptID)
+	req.RoutingDecisionID = strings.TrimSpace(req.RoutingDecisionID)
+	req.RoutingFingerprint = strings.TrimSpace(req.RoutingFingerprint)
+	req.BudgetReservationID = strings.TrimSpace(req.BudgetReservationID)
+	req.BudgetPolicyIDs = sortedCopyAgent(req.BudgetPolicyIDs)
+	req.ReusableEvidenceIDs = sortedCopyAgent(req.ReusableEvidenceIDs)
+	req.Candidate.RoutingDecisionID = strings.TrimSpace(firstNonEmptyAgent(req.Candidate.RoutingDecisionID, req.RoutingDecisionID))
+	req.Candidate.RoutingCandidateID = strings.TrimSpace(req.Candidate.RoutingCandidateID)
+	req.Candidate.AdapterID = strings.TrimSpace(req.Candidate.AdapterID)
+	req.Candidate.ProviderInstallationID = strings.TrimSpace(req.Candidate.ProviderInstallationID)
+	req.Candidate.AccountProfileID = strings.TrimSpace(req.Candidate.AccountProfileID)
+	req.Candidate.ModelCapabilityID = strings.TrimSpace(req.Candidate.ModelCapabilityID)
+	req.CreatedAt = strings.TrimSpace(req.CreatedAt)
+	if req.CreatedAt == "" {
+		req.CreatedAt = formatTimestamp(now.UTC())
+	}
+	req.ActorJSON = compactJSONString(req.ActorJSON)
+	if req.ActorJSON == "" || req.ActorJSON == "null" {
+		req.ActorJSON = "{}"
+	}
+	req.HostJSON = compactJSONString(req.HostJSON)
+	if req.HostJSON == "" || req.HostJSON == "null" {
+		req.HostJSON = "{}"
+	}
+	return req
+}
+
+func validateHandoffSuccessorRequest(req HandoffSuccessorRequest) error {
+	required := map[string]string{
+		"handoff_id":            req.HandoffID,
+		"source_attempt_id":     req.SourceAttemptID,
+		"routing_decision_id":   req.RoutingDecisionID,
+		"routing_candidate_id":  req.Candidate.RoutingCandidateID,
+		"adapter_id":            req.Candidate.AdapterID,
+		"provider_installation": req.Candidate.ProviderInstallationID,
+		"account_profile_id":    req.Candidate.AccountProfileID,
+		"model_capability_id":   req.Candidate.ModelCapabilityID,
+		"budget_reservation_id": req.BudgetReservationID,
+		"created_at":            req.CreatedAt,
+	}
+	for field, value := range required {
+		if strings.TrimSpace(value) == "" {
+			return federationError(ErrHandoffRequiredCode, "%s is required", field)
+		}
+	}
+	if req.HandoffGeneration <= 0 {
+		return federationError(ErrHandoffRequiredCode, "handoff_generation must be positive")
+	}
+	if err := requireNonZeroTimestamp(req.CreatedAt, "created_at"); err != nil {
+		return err
+	}
+	if !json.Valid([]byte(req.ActorJSON)) || !json.Valid([]byte(req.HostJSON)) {
+		return federationError(ErrInvalidRecordCode, "actor_json and host_json must be valid JSON")
+	}
+	if len(req.BudgetPolicyIDs) == 0 {
+		return federationError(ErrChildBudgetRequiredCode, "at least one budget policy id is required")
+	}
+	if len(req.ReusableEvidenceIDs) > 32 {
+		return federationError(ErrInvalidRecordCode, "too many reusable evidence refs")
+	}
+	for _, ref := range req.ReusableEvidenceIDs {
+		if !validHandoffReusableRef(ref) {
+			return federationError(ErrInvalidRecordCode, "invalid reusable evidence ref %q", ref)
+		}
+	}
+	return nil
+}
+
+func validHandoffReusableRef(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || len(ref) > 160 || strings.Contains(ref, "/") || strings.Contains(ref, "\\") || strings.Contains(ref, "..") {
+		return false
+	}
+	lower := strings.ToLower(ref)
+	for _, banned := range []string{"token", "secret", "credential", "session", "akia"} {
+		if strings.Contains(lower, banned) {
+			return false
+		}
+	}
+	for _, r := range ref {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == ':' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func handoffSuccessorAttemptID(handoff HandoffTransaction) string {
+	return stableID("att_handoff_", handoff.HandoffID, fmt.Sprint(handoff.HandoffGeneration), handoff.SourceAttemptID)
+}
+
+func handoffSuccessorProviderKey(handoff HandoffTransaction) string {
+	return "handoff-successor:" + handoff.HandoffID + ":" + fmt.Sprint(handoff.HandoffGeneration)
+}
+
 func validateHandoffRequest(req HandoffRequest) error {
 	required := map[string]string{
 		"idempotency_key":    req.IdempotencyKey,
@@ -841,6 +1028,333 @@ func loadHandoffByIdempotencyTx(ctx context.Context, tx Tx, projectID, deliveryR
 
 func loadHandoffBySourceAttemptTx(ctx context.Context, tx Tx, projectID, deliveryRunID, taskID, sourceAttemptID string) (HandoffTransaction, bool, error) {
 	return loadHandoffTx(ctx, tx, `WHERE project_id = ? AND delivery_run_id = ? AND task_id = ? AND source_attempt_id = ?`, projectID, deliveryRunID, taskID, sourceAttemptID)
+}
+
+func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSuccessorRequest) (HandoffSuccessorLaunch, error) {
+	handoff, ok, err := loadHandoffTx(ctx, tx, `WHERE handoff_id = ?`, req.HandoffID)
+	if err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if !ok {
+		return HandoffSuccessorLaunch{}, federationError(ErrHandoffRequiredCode, "handoff %s is missing", req.HandoffID)
+	}
+	if err := validateHandoffLaunchFenceTx(ctx, tx, handoff, req); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	attemptID := handoffSuccessorAttemptID(handoff)
+	providerKey := handoffSuccessorProviderKey(handoff)
+	if existing, ok, err := loadHandoffSuccessorAttemptTx(ctx, tx, handoff, attemptID); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	} else if ok {
+		if existing.HandoffID != handoff.HandoffID || existing.HandoffGeneration != handoff.HandoffGeneration ||
+			existing.SourceAttemptID != handoff.SourceAttemptID || existing.RoutingDecisionID != req.RoutingDecisionID ||
+			existing.RoutingCandidateID != req.Candidate.RoutingCandidateID || existing.BudgetReservationID != req.BudgetReservationID ||
+			existing.ExecutorID != handoff.DestinationExecutorID || existing.ClaimGeneration != handoff.HandoffGeneration {
+			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed handoff payload")
+		}
+		existing.Replay = true
+		return existing, nil
+	}
+	if req.Cancelled {
+		return HandoffSuccessorLaunch{}, federationError(ErrHandoffAuthorityMismatchCode, "handoff successor launch cancelled before authority exposure")
+	}
+	sourceOrdinal, sideEffectClass, err := sourceAttemptForSuccessorTx(ctx, tx, handoff)
+	if err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if err := bindSuccessorBudgetTx(ctx, tx, handoff, req); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	registration, ok, err := loadAgentRegistrationByRunTx(ctx, tx, handoff.ChildRunID)
+	if err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if !ok {
+		return HandoffSuccessorLaunch{}, federationError(ErrAgentRegistrationRequiredCode, "run %s has no registration", handoff.ChildRunID)
+	}
+	if err := updateHandoffSuccessorRegistrationTx(ctx, tx, registration, req, attemptID, providerKey); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if err := insertHandoffSuccessorAttemptTx(ctx, tx, handoff, req, attemptID, providerKey, sourceOrdinal+1, sideEffectClass); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if err := insertHandoffSuccessorDecisionTx(ctx, tx, handoff, req, attemptID, providerKey); err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE delivery_tasks
+		SET state = 'claimed', active_attempt_id = ?, attempt_count = CASE WHEN attempt_count < ? THEN ? ELSE attempt_count END,
+			updated_at = ?, terminal_error_code = '', error_message = ''
+		WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+		attemptID, sourceOrdinal+1, sourceOrdinal+1, req.CreatedAt, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID); err != nil {
+		return HandoffSuccessorLaunch{}, fmt.Errorf("handoff successor: update task: %w", err)
+	}
+	return HandoffSuccessorLaunch{
+		HandoffID:              handoff.HandoffID,
+		HandoffGeneration:      handoff.HandoffGeneration,
+		AttemptID:              attemptID,
+		SourceAttemptID:        handoff.SourceAttemptID,
+		TaskID:                 handoff.TaskID,
+		DeliveryRunID:          handoff.DeliveryRunID,
+		ProjectID:              handoff.ProjectID,
+		ExecutorID:             handoff.DestinationExecutorID,
+		ClaimGeneration:        handoff.HandoffGeneration,
+		ProviderIdempotencyKey: providerKey,
+		RoutingDecisionID:      req.RoutingDecisionID,
+		RoutingCandidateID:     req.Candidate.RoutingCandidateID,
+		BudgetReservationID:    req.BudgetReservationID,
+		ReusableEvidenceIDs:    sortedCopyAgent(req.ReusableEvidenceIDs),
+		LaunchExposed:          true,
+	}, nil
+}
+
+func validateHandoffLaunchFenceTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest) error {
+	if handoff.HandoffStatus != HandoffStatusTransferred || handoff.NextAction != "await-successor-route" {
+		return federationError(ErrHandoffAuthorityMismatchCode, "handoff %s is %s/%s, not approved for successor routing", handoff.HandoffID, handoff.HandoffStatus, handoff.NextAction)
+	}
+	if handoff.HandoffGeneration != req.HandoffGeneration || handoff.SourceAttemptID != req.SourceAttemptID {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff generation or source attempt mismatch")
+	}
+	var claimExecutor string
+	var claimGeneration int64
+	if err := tx.QueryRow(ctx, `SELECT executor_id, claim_generation FROM run_claims WHERE run_id = ?`, handoff.ChildRunID).Scan(&claimExecutor, &claimGeneration); err != nil {
+		return federationError(ErrAgentRegistrationRequiredCode, "claim for %s is missing", handoff.ChildRunID)
+	}
+	if claimExecutor != handoff.DestinationExecutorID || claimGeneration != handoff.HandoffGeneration {
+		return federationError(ErrStaleClaimCode, "handoff successor no longer owns run %s", handoff.ChildRunID)
+	}
+	var runInput, runPolicy, runPlan, runAuth string
+	if err := tx.QueryRow(ctx, `SELECT input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint
+		FROM delivery_runs WHERE delivery_run_id = ? AND project_id = ?`, handoff.DeliveryRunID, handoff.ProjectID).Scan(&runInput, &runPolicy, &runPlan, &runAuth); err != nil {
+		return federationError(ErrHandoffAcceptedTaskStaleCode, "delivery run %s is missing", handoff.DeliveryRunID)
+	}
+	if runInput != handoff.InputFingerprint || runPolicy != handoff.PolicyFingerprint || runPlan != handoff.PlanFingerprint || runAuth != handoff.AuthorizationFingerprint {
+		return federationError(ErrHandoffAcceptedTaskStaleCode, "delivery run authority changed after handoff approval")
+	}
+	var taskPlan, taskAuth string
+	if err := tx.QueryRow(ctx, `SELECT plan_fingerprint, authorization_fingerprint FROM delivery_tasks
+		WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID).Scan(&taskPlan, &taskAuth); err != nil {
+		return federationError(ErrHandoffAcceptedTaskStaleCode, "delivery task %s is missing", handoff.TaskID)
+	}
+	if taskPlan != handoff.PlanFingerprint || taskAuth != handoff.AuthorizationFingerprint {
+		return federationError(ErrHandoffAcceptedTaskStaleCode, "delivery task authority changed after handoff approval")
+	}
+	if req.RoutingFingerprint != "" {
+		var routeProject, routeRun, routeTask, routePlan, routePolicy, routeStatus, routeChosen, routeFingerprint string
+		if err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, task_id, plan_fingerprint, policy_fingerprint, decision_status, chosen_candidate_id, routing_fingerprint
+			FROM routing_decisions WHERE routing_decision_id = ?`, req.RoutingDecisionID).Scan(&routeProject, &routeRun, &routeTask, &routePlan, &routePolicy, &routeStatus, &routeChosen, &routeFingerprint); err != nil {
+			return federationError(ErrHandoffAuthorityMismatchCode, "routing decision %s is missing", req.RoutingDecisionID)
+		}
+		if routeProject != handoff.ProjectID || routeRun != handoff.DeliveryRunID || routeTask != handoff.TaskID ||
+			routePlan != handoff.PlanFingerprint || routePolicy == "" || routeStatus != "selected" ||
+			routeChosen != req.Candidate.RoutingCandidateID || routeFingerprint != req.RoutingFingerprint {
+			return federationError(ErrHandoffAuthorityMismatchCode, "routing decision does not match approved handoff authority")
+		}
+	}
+	return nil
+}
+
+func sourceAttemptForSuccessorTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (int, string, error) {
+	var ordinal int
+	var sideEffectClass string
+	err := tx.QueryRow(ctx, `SELECT attempt_ordinal, side_effect_class FROM delivery_attempts WHERE attempt_id = ?`, handoff.SourceAttemptID).Scan(&ordinal, &sideEffectClass)
+	if err != nil {
+		return 0, "", federationError(ErrHandoffAcceptedTaskStaleCode, "source attempt %s is missing", handoff.SourceAttemptID)
+	}
+	return ordinal, sideEffectClass, nil
+}
+
+func bindSuccessorBudgetTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest) error {
+	registration, ok, err := loadAgentRegistrationByRunTx(ctx, tx, handoff.ChildRunID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return federationError(ErrAgentRegistrationRequiredCode, "run %s has no registration", handoff.ChildRunID)
+	}
+	var reservationProject, reservationRun, reservationTask, reservationSubAgent, adapterID, accountID, modelID, state, lease string
+	var generation, reserved int64
+	var policyIDsJSON string
+	if err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+			model_capability_id, reserved_value, state, generation, lease_expires_at, policy_ids_json
+		FROM budget_reservations WHERE budget_reservation_id = ?`, req.BudgetReservationID).Scan(
+		&reservationProject, &reservationRun, &reservationTask, &reservationSubAgent, &adapterID, &accountID, &modelID, &reserved, &state, &generation, &lease, &policyIDsJSON); err != nil {
+		return federationError(ErrChildBudgetRequiredCode, "successor reservation %s is missing", req.BudgetReservationID)
+	}
+	if reservationProject != handoff.ProjectID || reservationRun != handoff.DeliveryRunID || reservationTask != handoff.TaskID ||
+		reservationSubAgent != registration.ChildAgentID || adapterID != req.Candidate.AdapterID || accountID != req.Candidate.AccountProfileID ||
+		modelID != req.Candidate.ModelCapabilityID || reserved <= 0 || (state != BudgetReservationStateActive && state != BudgetReservationStatePartiallyCommitted) {
+		return federationError(ErrChildBudgetRequiredCode, "successor reservation does not match destination candidate")
+	}
+	leaseTime, err := time.Parse(time.RFC3339Nano, lease)
+	createdAt, parseErr := time.Parse(time.RFC3339Nano, req.CreatedAt)
+	if err != nil || parseErr != nil || !leaseTime.After(createdAt.UTC()) {
+		return federationError(ErrChildBudgetRequiredCode, "successor reservation lease is invalid")
+	}
+	policyIDs := decodeStringList(policyIDsJSON)
+	for _, want := range req.BudgetPolicyIDs {
+		if !containsStringAgent(policyIDs, want) {
+			return federationError(ErrChildBudgetRequiredCode, "successor reservation missing policy %s", want)
+		}
+	}
+	binding := normalizeBudgetBinding(AgentBudgetBinding{
+		ProjectID:           handoff.ProjectID,
+		DeliveryRunID:       handoff.DeliveryRunID,
+		ChildAgentID:        registration.ChildAgentID,
+		BudgetPolicyID:      firstNonEmptyAgent(req.BudgetPolicyIDs...),
+		BudgetReservationID: req.BudgetReservationID,
+	}, AgentRegistrationRequest{ProjectID: handoff.ProjectID, DeliveryRunID: handoff.DeliveryRunID}, registration.ChildAgentID)
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_budget_bindings(
+			id, project_id, delivery_run_id, child_agent_id, budget_policy_id, budget_reservation_id,
+			reservation_scope, reserved_quantities_json, ancestor_budget_refs_json, reservation_state, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		binding.AgentBudgetBindingID, binding.ProjectID, binding.DeliveryRunID, binding.ChildAgentID, binding.BudgetPolicyID, binding.BudgetReservationID,
+		"sub-agent", `{"local-policy":`+fmt.Sprint(reserved)+`}`, state, req.CreatedAt, req.CreatedAt); err != nil {
+		return fmt.Errorf("handoff successor: bind budget reservation: %w", err)
+	}
+	return nil
+}
+
+func updateHandoffSuccessorRegistrationTx(ctx context.Context, tx Tx, record AgentRegistration, req HandoffSuccessorRequest, attemptID, providerKey string) error {
+	scope, err := loadScopeGrantTx(ctx, tx, record)
+	if err != nil {
+		return err
+	}
+	bindingID := stableID("abudget_", record.ChildAgentID, req.BudgetReservationID, firstNonEmptyAgent(req.BudgetPolicyIDs...))
+	record.AttemptID = attemptID
+	record.AdapterID = req.Candidate.AdapterID
+	record.ProviderInstallationID = req.Candidate.ProviderInstallationID
+	record.AccountProfileID = req.Candidate.AccountProfileID
+	record.ModelCapabilityID = req.Candidate.ModelCapabilityID
+	record.RoutingDecisionID = req.RoutingDecisionID
+	record.ProviderSessionRef = ""
+	record.ProviderIDempotencyKey = providerKey
+	record.BudgetBindingIDs = sortedCopyAgent([]string{bindingID})
+	record.RegistrationState = AgentStateRegistered
+	record.TerminalErrorCode = ""
+	record.GapReasons = []string{}
+	record.UpdatedAt = req.CreatedAt
+	record.RecordVersion++
+	fingerprint, payloadHash, err := handoffAgentRegistrationFingerprints(record, scope)
+	if err != nil {
+		return err
+	}
+	record.AgentFederationFingerprint = fingerprint
+	record.RegistrationPayloadHash = payloadHash
+	scope.AgentFederationFingerprint = fingerprint
+	if _, err := tx.Exec(ctx, `UPDATE agent_scope_grants
+		SET agent_federation_fingerprint = ?, updated_at = ?
+		WHERE id = ? AND child_agent_id = ?`,
+		scope.AgentFederationFingerprint, req.CreatedAt, record.ScopeGrantID, record.ChildAgentID); err != nil {
+		return fmt.Errorf("handoff successor: update scope fingerprint: %w", err)
+	}
+	budgetBindingJSON, err := json.Marshal(record.BudgetBindingIDs)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_registrations
+		SET attempt_id = ?, adapter_id = ?, provider_installation_id = ?, account_profile_id = ?, model_capability_id = ?,
+			routing_decision_id = ?, provider_session_ref = '', provider_idempotency_key = ?, budget_binding_ids_json = ?,
+			registration_state = ?, terminal_error_code = '', gap_reasons_json = '[]', agent_federation_fingerprint = ?,
+			registration_payload_hash = ?, updated_at = ?, record_version = ?
+		WHERE id = ? AND child_run_id = ? AND executor_id = ? AND claim_generation = ?`,
+		record.AttemptID, record.AdapterID, record.ProviderInstallationID, record.AccountProfileID, record.ModelCapabilityID,
+		record.RoutingDecisionID, record.ProviderIDempotencyKey, string(budgetBindingJSON), record.RegistrationState,
+		record.AgentFederationFingerprint, record.RegistrationPayloadHash, record.UpdatedAt, record.RecordVersion,
+		record.ChildAgentID, record.RunID, record.ExecutorID, record.ClaimGeneration); err != nil {
+		return fmt.Errorf("handoff successor: update agent registration: %w", err)
+	}
+	return nil
+}
+
+func insertHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest, attemptID, providerKey string, ordinal int, sideEffectClass string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO delivery_attempts(
+			attempt_id, schema_version, record_version, project_id, delivery_run_id, task_id, attempt_ordinal, state,
+			claim_generation, executor_id, provider_idempotency_key, side_effect_class, started_at, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+		VALUES (?, 'loopcoder.attempt.v1', 1, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+		attemptID, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID, ordinal, handoff.HandoffGeneration,
+		handoff.DestinationExecutorID, providerKey, sideEffectClass, req.CreatedAt, req.CreatedAt, req.ActorJSON, req.ActorJSON, req.HostJSON)
+	return err
+}
+
+func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest, attemptID, providerKey string) error {
+	output, err := compactJSON(map[string]any{
+		"schema_version":           "loopcoder.handoff_successor_launch.v1",
+		"handoff_id":               handoff.HandoffID,
+		"handoff_generation":       handoff.HandoffGeneration,
+		"source_attempt_id":        handoff.SourceAttemptID,
+		"successor_attempt_id":     attemptID,
+		"routing_decision_id":      req.RoutingDecisionID,
+		"routing_candidate_id":     req.Candidate.RoutingCandidateID,
+		"budget_reservation_id":    req.BudgetReservationID,
+		"reusable_evidence_ids":    sortedCopyAgent(req.ReusableEvidenceIDs),
+		"provider_idempotency_key": providerKey,
+		"provider_session_ref":     "",
+		"launch_exposed":           true,
+	})
+	if err != nil {
+		return err
+	}
+	decisionID := stableID("ddec_", handoff.HandoffID, fmt.Sprint(handoff.HandoffGeneration), attemptID)
+	_, err = tx.Exec(ctx, `INSERT INTO delivery_decisions(
+			decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, decision_key, decision_kind,
+			decided_by_json, inputs_fingerprint, output_json, alternatives_json, heuristic, heuristic_reason, policy_version,
+			side_effect_class, created_at, created_by_json, host_json)
+		VALUES (?, 'loopcoder.delivery_decision.v1', 1, ?, ?, ?, ?, 'handoff-successor-launch', ?, ?, ?, 'null', 0, '', ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, delivery_run_id, decision_key) DO NOTHING`,
+		decisionID, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID, "handoff-successor:"+handoff.HandoffID,
+		req.ActorJSON, digestJSON(map[string]any{"handoff_id": handoff.HandoffID, "routing_fingerprint": req.RoutingFingerprint, "reservation_id": req.BudgetReservationID}),
+		output, HandoffPolicyVersion, SideEffectStateProviderStart, req.CreatedAt, req.ActorJSON, req.HostJSON)
+	return err
+}
+
+func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTransaction, attemptID string) (HandoffSuccessorLaunch, bool, error) {
+	var projectID, deliveryRunID, taskID, executorID, providerKey string
+	var generation int64
+	err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id, task_id, executor_id, claim_generation, provider_idempotency_key
+		FROM delivery_attempts WHERE attempt_id = ?`, attemptID).Scan(&projectID, &deliveryRunID, &taskID, &executorID, &generation, &providerKey)
+	if err == sql.ErrNoRows {
+		return HandoffSuccessorLaunch{}, false, nil
+	}
+	if err != nil {
+		return HandoffSuccessorLaunch{}, false, err
+	}
+	var outputJSON string
+	err = tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ?`,
+		projectID, deliveryRunID, "handoff-successor:"+handoff.HandoffID).Scan(&outputJSON)
+	if err != nil && err != sql.ErrNoRows {
+		return HandoffSuccessorLaunch{}, false, err
+	}
+	var payload struct {
+		HandoffID           string   `json:"handoff_id"`
+		HandoffGeneration   int64    `json:"handoff_generation"`
+		SourceAttemptID     string   `json:"source_attempt_id"`
+		RoutingDecisionID   string   `json:"routing_decision_id"`
+		RoutingCandidateID  string   `json:"routing_candidate_id"`
+		BudgetReservationID string   `json:"budget_reservation_id"`
+		ReusableEvidenceIDs []string `json:"reusable_evidence_ids"`
+	}
+	if outputJSON != "" {
+		_ = json.Unmarshal([]byte(outputJSON), &payload)
+	}
+	return HandoffSuccessorLaunch{
+		HandoffID:              payload.HandoffID,
+		HandoffGeneration:      firstPositiveAgent(payload.HandoffGeneration, generation),
+		AttemptID:              attemptID,
+		SourceAttemptID:        payload.SourceAttemptID,
+		TaskID:                 taskID,
+		DeliveryRunID:          deliveryRunID,
+		ProjectID:              projectID,
+		ExecutorID:             executorID,
+		ClaimGeneration:        generation,
+		ProviderIdempotencyKey: providerKey,
+		RoutingDecisionID:      payload.RoutingDecisionID,
+		RoutingCandidateID:     payload.RoutingCandidateID,
+		BudgetReservationID:    payload.BudgetReservationID,
+		ReusableEvidenceIDs:    sortedCopyAgent(payload.ReusableEvidenceIDs),
+		LaunchExposed:          true,
+	}, true, nil
 }
 
 func loadHandoffTx(ctx context.Context, tx Tx, where string, args ...any) (HandoffTransaction, bool, error) {
