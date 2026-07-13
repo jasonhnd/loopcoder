@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
@@ -116,7 +117,6 @@ func ResolveRoleDefinition(roleKey string, custom []RoleDefinition) (RoleDefinit
 		}
 	}
 	for _, role := range custom {
-		role = normalizeRoleDefinition(role)
 		if normalizeRoleKey(role.RoleKey) == roleKey {
 			return role, true
 		}
@@ -125,6 +125,9 @@ func ResolveRoleDefinition(roleKey string, custom []RoleDefinition) (RoleDefinit
 }
 
 func ComposeRoleRequirement(req taskrequirements.TaskRequirement, role RoleDefinition) (taskrequirements.TaskRequirement, error) {
+	if err := ValidateRoleDefinition(role); err != nil {
+		return req, err
+	}
 	role = normalizeRoleDefinition(role)
 	if normalizeRoleKey(req.RoleKey) != normalizeRoleKey(role.RoleKey) {
 		return req, &taskrequirements.TypedError{Code: taskrequirements.ErrRoleUnsupportedCode, Message: "role definition key does not match task role"}
@@ -145,8 +148,164 @@ func ComposeRoleRequirement(req taskrequirements.TaskRequirement, role RoleDefin
 		req.RequiredOutput = role.DefaultOutputContract
 	}
 	req.RequiredCapabilities = append(req.RequiredCapabilities, role.MinimumCapabilities...)
+	if role.MinimumContextWindowTokens > 0 {
+		req.RequiredCapabilities = append(req.RequiredCapabilities, taskrequirements.CapabilityRequirement{
+			Dimension:         taskrequirements.CapabilityContextWindowTokens,
+			RequiredValue:     role.MinimumContextWindowTokens,
+			MinimumConfidence: providerinventory.ConfidenceExact,
+			FreshnessRequired: providerinventory.FreshnessFresh,
+			Source:            "role." + role.RoleKey + ".minimum_context_window_tokens",
+		})
+	}
+	if len(role.RequiredTools) > 0 {
+		req.RequiredCapabilities = append(req.RequiredCapabilities, taskrequirements.CapabilityRequirement{
+			Dimension:         taskrequirements.CapabilityToolSupport,
+			RequiredValue:     append([]string(nil), role.RequiredTools...),
+			MinimumConfidence: providerinventory.ConfidenceExact,
+			FreshnessRequired: providerinventory.FreshnessFresh,
+			Source:            "role." + role.RoleKey + ".required_tools",
+		})
+	}
+	if level, ok := role.IndependenceRequirements[req.RiskTier]; ok && level != taskrequirements.IndependenceNone {
+		req.VerificationRequirements = append(req.VerificationRequirements, taskrequirements.VerificationRequirement{
+			VerificationKind:     taskrequirements.VerificationLoopReview,
+			RequiredForRiskTiers: []taskrequirements.RiskTier{req.RiskTier},
+			IndependenceLevel:    level,
+			PermissionRequired:   taskrequirements.PermissionReadOnly,
+			OutputContract:       taskrequirements.OutputVerificationVerdict,
+			Source:               "role." + role.RoleKey + ".independence_requirements",
+		})
+	}
 	req.VerificationRequirements = append(req.VerificationRequirements, role.VerificationRequirements...)
 	return req, nil
+}
+
+func RoleDefinitionsFromConfig(roles []config.RoleDefinition) ([]RoleDefinition, error) {
+	out := make([]RoleDefinition, 0, len(roles))
+	for index, role := range roles {
+		converted, err := RoleDefinitionFromConfig(role)
+		if err != nil {
+			return nil, fmt.Errorf("role_definitions[%d]: %w", index, err)
+		}
+		out = append(out, converted)
+	}
+	return out, nil
+}
+
+func RoleDefinitionFromConfig(role config.RoleDefinition) (RoleDefinition, error) {
+	out := RoleDefinition{
+		SchemaVersion:              strings.TrimSpace(role.SchemaVersion),
+		RecordVersion:              role.RecordVersion,
+		RoleDefinitionID:           strings.TrimSpace(role.RoleDefinitionID),
+		RoleKey:                    strings.TrimSpace(role.RoleKey),
+		RoleVersion:                strings.TrimSpace(role.RoleVersion),
+		Description:                strings.TrimSpace(role.Description),
+		AllowedRiskTiers:           make([]taskrequirements.RiskTier, 0, len(role.AllowedRiskTiers)),
+		MinimumCapabilities:        make([]taskrequirements.CapabilityRequirement, 0, len(role.MinimumCapabilities)),
+		PermissionFloor:            taskrequirements.Permission(strings.TrimSpace(role.PermissionFloor)),
+		PermissionCeiling:          taskrequirements.Permission(strings.TrimSpace(role.PermissionCeiling)),
+		DefaultOutputContract:      taskrequirements.OutputContract(strings.TrimSpace(role.DefaultOutputContract)),
+		IndependenceRequirements:   map[taskrequirements.RiskTier]taskrequirements.IndependenceLevel{},
+		ForbiddenBindings:          append([]string(nil), role.ForbiddenBindings...),
+		QualityFloor:               taskrequirements.QualityFloor(strings.TrimSpace(role.QualityFloor)),
+		ReasoningDepth:             ReasoningDepth(strings.TrimSpace(role.ReasoningDepth)),
+		RequiredTools:              append([]string(nil), role.RequiredTools...),
+		MinimumContextWindowTokens: role.MinimumContextWindowTokens,
+		MaxSideEffectClass:         taskrequirements.SideEffectClass(strings.TrimSpace(role.MaxSideEffectClass)),
+		VerificationRequirements:   make([]taskrequirements.VerificationRequirement, 0, len(role.VerificationRequirements)),
+		LatencyTolerance:           LatencyTolerance(strings.TrimSpace(role.LatencyTolerance)),
+		CostTolerance:              CostTolerance(strings.TrimSpace(role.CostTolerance)),
+		PolicyVersion:              strings.TrimSpace(role.PolicyVersion),
+	}
+	for _, risk := range role.AllowedRiskTiers {
+		out.AllowedRiskTiers = append(out.AllowedRiskTiers, taskrequirements.RiskTier(strings.TrimSpace(risk)))
+	}
+	for risk, independence := range role.IndependenceRequirements {
+		out.IndependenceRequirements[taskrequirements.RiskTier(strings.TrimSpace(risk))] = taskrequirements.IndependenceLevel(strings.TrimSpace(independence))
+	}
+	for _, capability := range role.MinimumCapabilities {
+		converted := taskrequirements.CapabilityRequirement{
+			Dimension:         taskrequirements.CapabilityDimension(strings.TrimSpace(capability.Dimension)),
+			RequiredValue:     normalizeCapabilityValue(taskrequirements.CapabilityDimension(strings.TrimSpace(capability.Dimension)), capability.RequiredValue),
+			MinimumConfidence: providerinventory.Confidence(strings.TrimSpace(capability.MinimumConfidence)),
+			FreshnessRequired: providerinventory.FreshnessState(strings.TrimSpace(capability.FreshnessRequired)),
+			Source:            strings.TrimSpace(capability.Source),
+		}
+		out.MinimumCapabilities = append(out.MinimumCapabilities, converted)
+	}
+	for _, verification := range role.VerificationRequirements {
+		converted := taskrequirements.VerificationRequirement{
+			VerificationKind:     taskrequirements.VerificationKind(strings.TrimSpace(verification.VerificationKind)),
+			RequiredForRiskTiers: make([]taskrequirements.RiskTier, 0, len(verification.RequiredForRiskTiers)),
+			IndependenceLevel:    taskrequirements.IndependenceLevel(strings.TrimSpace(verification.IndependenceLevel)),
+			PermissionRequired:   taskrequirements.Permission(strings.TrimSpace(verification.PermissionRequired)),
+			OutputContract:       taskrequirements.OutputContract(strings.TrimSpace(verification.OutputContract)),
+			Source:               strings.TrimSpace(verification.Source),
+		}
+		for _, risk := range verification.RequiredForRiskTiers {
+			converted.RequiredForRiskTiers = append(converted.RequiredForRiskTiers, taskrequirements.RiskTier(strings.TrimSpace(risk)))
+		}
+		out.VerificationRequirements = append(out.VerificationRequirements, converted)
+	}
+	out = normalizeRoleDefinition(out)
+	if err := ValidateRoleDefinition(out); err != nil {
+		return RoleDefinition{}, err
+	}
+	return out, nil
+}
+
+func ValidateRoleDefinition(role RoleDefinition) error {
+	if strings.TrimSpace(role.SchemaVersion) != RoleDefinitionSchema {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrUnknownRecordVersionCode, Message: fmt.Sprintf("unsupported role schema_version %q", role.SchemaVersion)}
+	}
+	if role.RecordVersion != 1 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrUnknownRecordVersionCode, Message: fmt.Sprintf("unsupported role record_version %d", role.RecordVersion)}
+	}
+	if strings.TrimSpace(role.RoleKey) == "" || strings.TrimSpace(role.RoleVersion) == "" || strings.TrimSpace(role.Description) == "" || strings.TrimSpace(role.PolicyVersion) == "" {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "role definition has missing role key, version, or description"}
+	}
+	role = normalizeRoleDefinition(role)
+	if want := RoleDefinitionID(role.RoleKey, role.RoleVersion, role.PolicyVersion); role.RoleDefinitionID != "" && role.RoleDefinitionID != want {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "role_definition_id does not match role key, version, and policy version"}
+	}
+	if len(role.AllowedRiskTiers) == 0 || len(role.MinimumCapabilities) == 0 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "role definition requires risk tiers and minimum capabilities"}
+	}
+	if !validPermission(role.PermissionFloor) || !validPermission(role.PermissionCeiling) || permissionRank(role.PermissionFloor) > permissionRank(role.PermissionCeiling) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "role permission floor and ceiling are invalid"}
+	}
+	if !validOutputContract(role.DefaultOutputContract) || !validQuality(role.QualityFloor) || !validReasoningDepth(role.ReasoningDepth) || !validSideEffect(role.MaxSideEffectClass) || !validLatency(role.LatencyTolerance) || !validCost(role.CostTolerance) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "role definition contains an unknown enum value"}
+	}
+	if role.MinimumContextWindowTokens < 0 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "minimum_context_window_tokens must be non-negative"}
+	}
+	for _, risk := range role.AllowedRiskTiers {
+		if !validRiskTier(risk) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown allowed risk tier %q", risk)}
+		}
+	}
+	for risk, independence := range role.IndependenceRequirements {
+		if !validRiskTier(risk) || !validIndependence(independence) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown independence requirement"}
+		}
+	}
+	for _, capability := range role.MinimumCapabilities {
+		if err := validateCapabilityRequirement(capability); err != nil {
+			return err
+		}
+	}
+	for _, verification := range role.VerificationRequirements {
+		if !validVerificationKind(verification.VerificationKind) || !validIndependence(verification.IndependenceLevel) || !validPermission(verification.PermissionRequired) || !validOutputContract(verification.OutputContract) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown verification requirement field"}
+		}
+		for _, risk := range verification.RequiredForRiskTiers {
+			if !validRiskTier(risk) {
+				return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown verification risk tier %q", risk)}
+			}
+		}
+	}
+	return nil
 }
 
 func RoleDefinitionID(roleKey, roleVersion, policyVersion string) string {
@@ -235,6 +394,158 @@ func normalizeRoleDefinition(role RoleDefinition) RoleDefinition {
 	role.RequiredTools = dedupeStrings(role.RequiredTools)
 	sort.Slice(role.AllowedRiskTiers, func(i, j int) bool { return role.AllowedRiskTiers[i] < role.AllowedRiskTiers[j] })
 	return role
+}
+
+func normalizeCapabilityValue(dimension taskrequirements.CapabilityDimension, value any) any {
+	switch dimension {
+	case taskrequirements.CapabilityRolesSupported, taskrequirements.CapabilityToolSupport:
+		if values, ok := stringListRequirement(value); ok {
+			return values
+		}
+		return value
+	case taskrequirements.CapabilityContextWindowTokens:
+		if numeric, ok := numericRequirementValue(value); ok {
+			return numeric
+		}
+		return value
+	default:
+		return value
+	}
+}
+
+func validateCapabilityRequirement(capability taskrequirements.CapabilityRequirement) error {
+	if !validCapabilityDimension(capability.Dimension) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown capability dimension %q", capability.Dimension)}
+	}
+	if !validHardConfidence(capability.MinimumConfidence) || capability.FreshnessRequired != providerinventory.FreshnessFresh {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "capability requires fresh exact or estimated evidence"}
+	}
+	switch capability.Dimension {
+	case taskrequirements.CapabilityRolesSupported, taskrequirements.CapabilityToolSupport:
+		values, ok := stringListRequirement(capability.RequiredValue)
+		if !ok || len(values) == 0 {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("%s requires a non-empty string list", capability.Dimension)}
+		}
+	case taskrequirements.CapabilityContextWindowTokens:
+		value, ok := numericRequirementValue(capability.RequiredValue)
+		if !ok || value < 0 {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "context_window_tokens must be non-negative"}
+		}
+	case taskrequirements.CapabilityReadOnly, taskrequirements.CapabilityJSONOutput, taskrequirements.CapabilityNestedSubagents, taskrequirements.CapabilityMCPConfig, taskrequirements.CapabilityCancellation, taskrequirements.CapabilityTokenUsageReporting, taskrequirements.CapabilityImageInput, taskrequirements.CapabilityImageOutput:
+		required, ok := capability.RequiredValue.(bool)
+		if !ok || !required {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("%s requires required_value true", capability.Dimension)}
+		}
+	}
+	return nil
+}
+
+func validRiskTier(value taskrequirements.RiskTier) bool {
+	switch value {
+	case taskrequirements.RiskLow, taskrequirements.RiskMedium, taskrequirements.RiskHigh, taskrequirements.RiskCritical:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPermission(value taskrequirements.Permission) bool {
+	switch value {
+	case taskrequirements.PermissionReadOnly, taskrequirements.PermissionWrite, taskrequirements.PermissionOrchestrate:
+		return true
+	default:
+		return false
+	}
+}
+
+func validSideEffect(value taskrequirements.SideEffectClass) bool {
+	switch value {
+	case taskrequirements.SideEffectNone, taskrequirements.SideEffectLocalRead, taskrequirements.SideEffectLocalWrite, taskrequirements.SideEffectRepoWrite, taskrequirements.SideEffectProviderLaunch, taskrequirements.SideEffectGitRemoteWrite, taskrequirements.SideEffectGitHubWrite, taskrequirements.SideEffectExternalWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+func validOutputContract(value taskrequirements.OutputContract) bool {
+	switch value {
+	case taskrequirements.OutputFreeform, taskrequirements.OutputMarkdown, taskrequirements.OutputJSON, taskrequirements.OutputJSONSchema, taskrequirements.OutputPatch, taskrequirements.OutputBranch, taskrequirements.OutputPR, taskrequirements.OutputReport, taskrequirements.OutputVerificationVerdict:
+		return true
+	default:
+		return false
+	}
+}
+
+func validQuality(value taskrequirements.QualityFloor) bool {
+	switch value {
+	case taskrequirements.QualityStandard, taskrequirements.QualityStrong, taskrequirements.QualityAdversarial:
+		return true
+	default:
+		return false
+	}
+}
+
+func validReasoningDepth(value ReasoningDepth) bool {
+	switch value {
+	case ReasoningDepthStandard, ReasoningDepthDeep, ReasoningDepthAdversarial:
+		return true
+	default:
+		return false
+	}
+}
+
+func validLatency(value LatencyTolerance) bool {
+	switch value {
+	case LatencyToleranceLow, LatencyToleranceStandard, LatencyToleranceRelaxed:
+		return true
+	default:
+		return false
+	}
+}
+
+func validCost(value CostTolerance) bool {
+	switch value {
+	case CostToleranceLow, CostToleranceStandard, CostToleranceHigh:
+		return true
+	default:
+		return false
+	}
+}
+
+func validIndependence(value taskrequirements.IndependenceLevel) bool {
+	switch value {
+	case taskrequirements.IndependenceNone, taskrequirements.IndependenceDifferentModel, taskrequirements.IndependenceDifferentAccount, taskrequirements.IndependenceDifferentProvider, taskrequirements.IndependenceHuman:
+		return true
+	default:
+		return false
+	}
+}
+
+func validVerificationKind(value taskrequirements.VerificationKind) bool {
+	switch value {
+	case taskrequirements.VerificationNone, taskrequirements.VerificationSelfCheck, taskrequirements.VerificationLocalCommand, taskrequirements.VerificationHostedCheck, taskrequirements.VerificationLoopReview, taskrequirements.VerificationSecurityReview, taskrequirements.VerificationHumanApproval, taskrequirements.VerificationOverride:
+		return true
+	default:
+		return false
+	}
+}
+
+func validCapabilityDimension(value taskrequirements.CapabilityDimension) bool {
+	switch value {
+	case taskrequirements.CapabilityRolesSupported, taskrequirements.CapabilityReadOnly, taskrequirements.CapabilityJSONOutput, taskrequirements.CapabilityNestedSubagents, taskrequirements.CapabilityMCPConfig, taskrequirements.CapabilityCancellation, taskrequirements.CapabilityTokenUsageReporting, taskrequirements.CapabilityContextWindowTokens, taskrequirements.CapabilityToolSupport, taskrequirements.CapabilityImageInput, taskrequirements.CapabilityImageOutput:
+		return true
+	default:
+		return false
+	}
+}
+
+func validHardConfidence(value providerinventory.Confidence) bool {
+	switch value {
+	case providerinventory.ConfidenceExact, providerinventory.ConfidenceEstimated:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeRoleKey(roleKey string) string {

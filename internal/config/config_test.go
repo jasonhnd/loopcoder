@@ -188,6 +188,68 @@ role_definitions:
 	}
 }
 
+func TestParseRejectsInvalidCustomRoleDefinitions(t *testing.T) {
+	valid := `
+version: 1
+role_definitions:
+  - schema_version: loopcoder.role_definition.v1
+    record_version: 1
+    role_key: docs-auditor
+    role_version: "1"
+    description: Custom read-only docs auditor
+    allowed_risk_tiers: [medium]
+    minimum_capabilities:
+      - dimension: roles_supported
+        required_value: verifier
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+      - dimension: json_output
+        required_value: true
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+    permission_floor: read-only
+    permission_ceiling: read-only
+    default_output_contract: verification-verdict
+    independence_requirements:
+      high: different-provider
+    quality_floor: strong
+    reasoning_depth: deep
+    minimum_context_window_tokens: 120000
+    max_side_effect_class: provider-launch
+    verification_requirements:
+      - verification_kind: loopreview
+        required_for_risk_tiers: [high]
+        independence_level: different-provider
+        permission_required: read-only
+        output_contract: verification-verdict
+        source: fixture
+    latency_tolerance: relaxed
+    cost_tolerance: high
+    policy_version: fixture-policy-v1
+`
+	cases := map[string]string{
+		"record version": strings.Replace(valid, "record_version: 1", "record_version: 2", 1),
+		"role id":        strings.Replace(valid, "role_key: docs-auditor", "role_definition_id: roledef_mismatch\n    role_key: docs-auditor", 1),
+		"dimension":      strings.Replace(valid, "dimension: json_output", "dimension: future_capability", 1),
+		"capability":     strings.Replace(valid, "required_value: true", "required_value: false", 1),
+		"confidence":     strings.Replace(valid, "minimum_confidence: exact", "minimum_confidence: unknown", 1),
+		"freshness":      strings.Replace(valid, "freshness_required: fresh", "freshness_required: stale", 1),
+		"permission":     strings.Replace(valid, "permission_floor: read-only\n    permission_ceiling: read-only", "permission_floor: orchestrate\n    permission_ceiling: write", 1),
+		"context":        strings.Replace(valid, "minimum_context_window_tokens: 120000", "minimum_context_window_tokens: -1", 1),
+		"independence":   strings.Replace(valid, "high: different-provider", "unknown: same-session", 1),
+		"verification":   strings.Replace(valid, "verification_kind: loopreview", "verification_kind: future-review", 1),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(data)); err == nil {
+				t.Fatal("Parse returned nil error, want invalid custom role rejected")
+			}
+		})
+	}
+}
+
 func TestParseRejectsUnknownHostProfile(t *testing.T) {
 	_, err := Parse([]byte("version: 1\nhost:\n  profile: unknown-host\n"))
 	if err == nil {

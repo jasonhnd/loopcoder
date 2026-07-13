@@ -164,6 +164,9 @@ func FilterHardEligibility(inputs Inputs) Result {
 	roleDef, hasRoleDef := ResolveRoleDefinition(requirement.RoleKey, inputs.RoleDefinitions)
 	var roleErr error
 	if hasRoleDef {
+		roleErr = ValidateRoleDefinition(roleDef)
+	}
+	if hasRoleDef && roleErr == nil {
 		requirement, roleErr = ComposeRoleRequirement(requirement, roleDef)
 	}
 	candidates := normalizeCandidates(inputs.Candidates, requirement, inputs.Inventory, roleDef, hasRoleDef)
@@ -426,28 +429,38 @@ func evaluateCapability(req taskrequirements.CapabilityRequirement, candidate Ca
 	}
 	switch req.Dimension {
 	case taskrequirements.CapabilityRolesSupported:
-		for _, want := range requiredRoles(req.RequiredValue) {
+		roles, ok := stringListRequirement(req.RequiredValue)
+		if !ok || len(roles) == 0 {
+			return []RejectionReason{reason(RejectUnknownRecordVersion, taskrequirements.ErrInvalidRecordCode, "roles_supported capability requirement is malformed", evidence, nil)}
+		}
+		for _, want := range roles {
 			if !roleSupported(want, model.RolesSupported) {
 				return []RejectionReason{reason(RejectRoleUnsupported, taskrequirements.ErrRoleUnsupportedCode, "model does not support role capability "+want, evidence, nil)}
 			}
 		}
 		return nil
 	case taskrequirements.CapabilityContextWindowTokens:
-		required := numericRequirement(req.RequiredValue)
-		if required > 0 && (model.ContextWindowTokens == nil || model.ContextWindowTokens.Value < required || !confidenceAllowed(model.ContextWindowTokens.Confidence, policy)) {
+		required, ok := numericRequirementValue(req.RequiredValue)
+		if !ok || required < 0 {
+			return []RejectionReason{reason(RejectUnknownRecordVersion, taskrequirements.ErrInvalidRecordCode, "context_window_tokens capability requirement is malformed", evidence, nil)}
+		}
+		if required > 0 && (model.ContextWindowTokens == nil || model.ContextWindowTokens.Value < required || !meetsMinimumConfidence(model.ContextWindowTokens.Confidence, req.MinimumConfidence, policy)) {
 			return []RejectionReason{reason(RejectContextWindowInsufficient, taskrequirements.ErrCapabilityUnsupportedCode, "context window capability is insufficient", evidence, nil)}
 		}
 		return nil
 	case taskrequirements.CapabilityToolSupport:
-		tools := requiredRoles(req.RequiredValue)
-		if len(tools) > 0 && !toolsSupported(tools, model.ToolSupport, policy) {
+		tools, ok := stringListRequirement(req.RequiredValue)
+		if !ok || len(tools) == 0 {
+			return []RejectionReason{reason(RejectUnknownRecordVersion, taskrequirements.ErrInvalidRecordCode, "tool_support capability requirement is malformed", evidence, nil)}
+		}
+		if !toolsSupportedWithMinimum(tools, model.ToolSupport, req.MinimumConfidence, policy) {
 			return []RejectionReason{reason(RejectToolSupportUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "tool support is unsupported", evidence, nil)}
 		}
 		return nil
 	}
 	requiredBool, boolRequired := req.RequiredValue.(bool)
 	if !boolRequired || !requiredBool {
-		return nil
+		return []RejectionReason{reason(RejectUnknownRecordVersion, taskrequirements.ErrInvalidRecordCode, "boolean capability requirement is malformed", evidence, nil)}
 	}
 	switch req.Dimension {
 	case taskrequirements.CapabilityReadOnly:
@@ -482,6 +495,8 @@ func evaluateCapability(req taskrequirements.CapabilityRequirement, candidate Ca
 		if model.ImageOutput != providerinventory.CapabilityTrue {
 			return []RejectionReason{reason(RejectImageOutputUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "image output is unsupported", evidence, nil)}
 		}
+	default:
+		return []RejectionReason{reason(RejectUnknownRecordVersion, taskrequirements.ErrInvalidRecordCode, "unknown capability dimension "+string(req.Dimension), evidence, nil)}
 	}
 	return nil
 }
@@ -493,6 +508,9 @@ func evaluatePermissionAndSideEffects(requirement taskrequirements.TaskRequireme
 	}
 	if hasRole && permissionRank(candidate.Permission) > permissionRank(role.PermissionCeiling) {
 		reasons = append(reasons, reason(RejectPermissionUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "candidate permission exceeds role envelope ceiling", []string{role.RoleDefinitionID}, nil))
+	}
+	if normalizeRoleKey(requirement.RoleKey) == RoleKeyNestedSubagent && permissionRank(candidate.Permission) > permissionRank(requirement.PermissionRequired) {
+		reasons = append(reasons, reason(RejectPermissionUnsupported, taskrequirements.ErrCapabilityUnsupportedCode, "nested sub-agent permission exceeds parent-delegated task permission", nil, nil))
 	}
 	if sideEffectRank(candidate.LaunchSideEffectClass) > sideEffectRank(requirement.SideEffectClass) && requirement.SideEffectClass != "" {
 		reasons = append(reasons, reason(RejectSideEffectClassExceeded, taskrequirements.ErrCapabilityUnsupportedCode, "candidate side-effect class exceeds task authorization", nil, nil))
@@ -641,9 +659,6 @@ func evaluateRiskAndVerification(requirement taskrequirements.TaskRequirement, w
 	if requirement.RiskTier == taskrequirements.RiskCritical {
 		reasons = append(reasons, reason(RejectRiskTierUnsupported, taskrequirements.ErrRequirementConfidenceInsufficientCode, "critical risk requires explicit approval outside automatic routing", nil, nil))
 	}
-	if requirement.RoleKey != "verifier" {
-		return reasons
-	}
 	required := policy.VerifierIndependence
 	for _, verification := range requirement.VerificationRequirements {
 		if riskApplies(requirement.RiskTier, verification.RequiredForRiskTiers) && independenceRank(verification.IndependenceLevel) > independenceRank(required) {
@@ -758,44 +773,70 @@ func runtimeRoleForRequirement(requirement taskrequirements.TaskRequirement, rol
 }
 
 func requiredRoles(value any) []string {
+	values, ok := stringListRequirement(value)
+	if ok {
+		return values
+	}
+	return nil
+}
+
+func stringListRequirement(value any) ([]string, bool) {
 	switch v := value.(type) {
 	case string:
-		return dedupeStrings([]string{v})
+		values := dedupeStrings([]string{v})
+		return values, len(values) > 0
 	case []string:
-		return dedupeStrings(v)
+		values := dedupeStrings(v)
+		return values, len(values) > 0
 	case []any:
 		out := make([]string, 0, len(v))
 		for _, item := range v {
-			if text, ok := item.(string); ok {
-				out = append(out, text)
+			text, ok := item.(string)
+			if !ok {
+				return nil, false
 			}
+			out = append(out, text)
 		}
-		return dedupeStrings(out)
+		values := dedupeStrings(out)
+		return values, len(values) > 0
 	default:
-		return nil
+		return nil, false
 	}
 }
 
-func numericRequirement(value any) int {
+func numericRequirementValue(value any) (int, bool) {
 	switch v := value.(type) {
 	case int:
-		return v
+		return v, true
+	case int32:
+		return int(v), true
 	case int64:
 		if v > int64(^uint(0)>>1) {
-			return int(^uint(0) >> 1)
+			return int(^uint(0) >> 1), true
 		}
-		return int(v)
+		return int(v), true
 	case float64:
-		return int(v)
+		if v != float64(int(v)) {
+			return 0, false
+		}
+		return int(v), true
 	default:
-		return 0
+		return 0, false
 	}
 }
 
 func toolsSupported(required []string, facts []providerinventory.CapabilityFact, policy Policy) bool {
+	return toolsSupportedWithMinimum(required, facts, "", policy)
+}
+
+func toolsSupportedWithMinimum(required []string, facts []providerinventory.CapabilityFact, minimum providerinventory.Confidence, policy Policy) bool {
 	have := map[string]bool{}
 	for _, fact := range facts {
-		if !confidenceAllowed(fact.Confidence, policy) {
+		if minimum != "" {
+			if !meetsMinimumConfidence(fact.Confidence, minimum, policy) {
+				continue
+			}
+		} else if !confidenceAllowed(fact.Confidence, policy) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(fact.Value), "true") || strings.EqualFold(strings.TrimSpace(fact.Value), "supported") {
