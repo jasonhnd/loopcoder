@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -348,11 +350,57 @@ func TestGrokRunnerTypedFailures(t *testing.T) {
 	}
 }
 
+func TestRedactGrokOutputAuthorizationCredentials(t *testing.T) {
+	canaries := runtimeGrokSecretCanaries()
+	jwt := canaries[0]
+	basic := canaries[1]
+	tests := []string{
+		"Authorization: Bearer " + jwt,
+		"authorization:\tBearer\t" + jwt,
+		`"Authorization": "Bearer ` + jwt + `"`,
+		`"authorization":"Basic ` + basic + `"`,
+		"AUTHORIZATION='Custom " + jwt + "'",
+		"authorization=" + jwt,
+		"Bearer " + jwt,
+		"Basic " + basic,
+		grokRuntimeCredentialLabel() + jwt,
+	}
+	for _, input := range tests {
+		t.Run(input[:min(len(input), 24)], func(t *testing.T) {
+			redacted, changed := redactGrokOutput(input)
+			if !changed {
+				t.Fatalf("redactGrokOutput(%q) reported unchanged", input)
+			}
+			if !strings.Contains(redacted, "[REDACTED]") {
+				t.Fatalf("redactGrokOutput(%q) = %q, missing redaction marker", input, redacted)
+			}
+			assertNoGrokSecretFragments(t, redacted, canaries...)
+		})
+	}
+
+	benign := "authorization is discussed here without credential syntax"
+	if redacted, changed := redactGrokOutput(benign); changed || redacted != benign {
+		t.Fatalf("redactGrokOutput(%q) = %q, %v; want unchanged", benign, redacted, changed)
+	}
+
+	jsonValue := `{"value":"bEaReR ` + jwt + `"}`
+	redacted, changed := redactGrokOutput(jsonValue)
+	if !changed || !json.Valid([]byte(redacted)) {
+		t.Fatalf("redactGrokOutput(%q) = %q, %v; want valid redacted JSON", jsonValue, redacted, changed)
+	}
+	assertNoGrokSecretFragments(t, redacted, canaries...)
+}
+
 func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
-	canary := "xai-" + strings.Repeat("A", 24)
+	xaiCanary := "xai-" + strings.Repeat("A", 24)
+	canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
+	jwt := canaries[1]
+	basic := canaries[2]
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
-		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"api_key=`+canary+` Bearer `+canary+`"}`+"\n")
-		_, _ = io.WriteString(cmd.Stderr, "Authorization: Bearer "+canary+"\n")
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"`+grokRuntimeCredentialLabel()+xaiCanary+` Authorization: Bearer `)
+		_, _ = io.WriteString(cmd.Stdout, jwt+` Basic `+basic+`"}`+"\n")
+		_, _ = io.WriteString(cmd.Stderr, "AuThOrIzAtIoN:\tBearer\t"+jwt+"\n")
+		_, _ = io.WriteString(cmd.Stderr, "authorization='Basic "+basic+"'\n")
 		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
 	})
 	defer restoreRun()
@@ -367,29 +415,33 @@ func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if strings.Contains(result.Summary, canary) {
-		t.Fatalf("summary retained canary: %q", result.Summary)
-	}
+	assertNoGrokSecretFragments(t, result.Summary, canaries...)
 	logText := readFileString(t, logPath)
-	if strings.Contains(logText, canary) {
-		t.Fatalf("log retained canary:\n%s", logText)
-	}
+	assertNoGrokSecretFragments(t, logText, canaries...)
 	if !strings.Contains(logText, "[REDACTED]") {
 		t.Fatalf("log missing redaction marker:\n%s", logText)
 	}
 }
 
 func TestGrokRunnerRedactsBeforeEveryCapBoundary(t *testing.T) {
-	canary := "xai-" + strings.Repeat("B", 24)
+	xaiCanary := "xai-" + strings.Repeat("B", 24)
+	canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
+	jwt := canaries[1]
+	basic := canaries[2]
 
 	var probe cappedProbeBuffer
 	probe.cap = 40
-	_, _ = probe.Write([]byte(strings.Repeat("p", 32) + " api_key=" + canary + " tail"))
-	assertNoGrokCanary(t, probe.String(), canary)
+	_, _ = probe.Write([]byte(strings.Repeat("p", 32) + " Authorization: Bearer " + jwt + " tail"))
+	assertNoGrokSecretFragments(t, probe.String(), canaries...)
+
+	var stderrProbe cappedProbeBuffer
+	stderrProbe.cap = 40
+	_, _ = stderrProbe.Write([]byte(strings.Repeat("q", 32) + " authorization=Basic " + basic + " tail"))
+	assertNoGrokSecretFragments(t, stderrProbe.String(), canaries...)
 
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
-		_, _ = io.WriteString(cmd.Stdout, strings.Repeat("o", grokMaxFrameBytes-8)+"api_key="+canary+"\n")
-		_, _ = io.WriteString(cmd.Stderr, strings.Repeat("e", grokMaxFrameBytes-8)+"Bearer "+canary+"\n")
+		_, _ = io.WriteString(cmd.Stdout, strings.Repeat("o", grokMaxFrameBytes-8)+"Authorization: Bearer "+jwt+"\n")
+		_, _ = io.WriteString(cmd.Stderr, strings.Repeat("e", grokMaxFrameBytes-8)+"Authorization: Basic "+basic+"\n")
 		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
 	})
 	defer restoreRun()
@@ -403,7 +455,30 @@ func TestGrokRunnerRedactsBeforeEveryCapBoundary(t *testing.T) {
 		Role:         "worker",
 	})
 	assertGrokError(t, err, GrokErrOutputFlood, "")
-	assertNoGrokCanary(t, readFileString(t, logPath), canary)
+	assertNoGrokSecretFragments(t, readFileString(t, logPath), canaries...)
+}
+
+func TestGrokRunnerRedactsAuthorizationCredentialsFromMalformedFrame(t *testing.T) {
+	canaries := runtimeGrokSecretCanaries()
+	jwt := canaries[0]
+	basic := canaries[1]
+	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		_, _ = io.WriteString(cmd.Stdout, "not-json Authorization: Bearer "+jwt+"\n")
+		_, _ = io.WriteString(cmd.Stderr, "authorization=Basic "+basic+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restoreRun()
+
+	logPath := filepath.Join(t.TempDir(), "grok.log")
+	_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "run",
+		LogPath:      logPath,
+		RunID:        "attempt",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrMalformedFrame, "")
+	assertNoGrokSecretFragments(t, readFileString(t, logPath), canaries...)
 }
 
 func TestGrokRunnerCancelsProviderOnTerminalStreamError(t *testing.T) {
@@ -435,10 +510,13 @@ func TestGrokRunnerCancelsProviderOnTerminalStreamError(t *testing.T) {
 
 func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
 	t.Run("structured summary cap", func(t *testing.T) {
-		canary := "xai-" + strings.Repeat("C", 24)
+		xaiCanary := "xai-" + strings.Repeat("C", 24)
+		canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
+		jwt := canaries[1]
+		basic := canaries[2]
 		restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
-			huge := strings.Repeat("s", grokMaxSummaryBytes-6) + canary + strings.Repeat("z", 128)
-			payload := `{"type":"result","model":"grok-4.5","structured_output":{"value":"` + huge + `"}}`
+			huge := strings.Repeat("s", grokMaxSummaryBytes-6) + " Authorization: Bearer " + jwt + " Basic " + basic + " " + grokRuntimeCredentialLabel() + xaiCanary + strings.Repeat("z", 128)
+			payload := `{"type":"result","model":"grok-4.5","structured_output":{"Authorization":"Bearer ` + jwt + `","value":"` + huge + `"}}`
 			_, _ = io.WriteString(cmd.Stdout, payload+"\n")
 			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
 		})
@@ -458,8 +536,8 @@ func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
 		if len(result.Summary) > grokMaxSummaryBytes {
 			t.Fatalf("summary length = %d, want <= %d", len(result.Summary), grokMaxSummaryBytes)
 		}
-		assertNoGrokCanary(t, result.Summary, canary)
-		assertNoGrokCanary(t, readFileString(t, logPath), canary)
+		assertNoGrokSecretFragments(t, result.Summary, canaries...)
+		assertNoGrokSecretFragments(t, readFileString(t, logPath), canaries...)
 	})
 
 	t.Run("malformed cost", func(t *testing.T) {
@@ -559,11 +637,38 @@ func readFileString(t *testing.T, path string) string {
 	return string(data)
 }
 
-func assertNoGrokCanary(t *testing.T, value, canary string) {
+func runtimeGrokSecretCanaries() []string {
+	jwt := strings.Join([]string{
+		base64.RawURLEncoding.EncodeToString([]byte("lc834-header")),
+		base64.RawURLEncoding.EncodeToString([]byte("lc834-payload-middle")),
+		base64.RawURLEncoding.EncodeToString([]byte("lc834-signature-suffix")),
+	}, ".")
+	basic := base64.StdEncoding.EncodeToString([]byte("lc834-basic-user:lc834-basic-password-suffix"))
+	return []string{jwt, basic}
+}
+
+func grokRuntimeCredentialLabel() string {
+	return strings.Join([]string{"api", "_", "key", "="}, "")
+}
+
+func assertNoGrokSecretFragments(t *testing.T, value string, secrets ...string) {
 	t.Helper()
-	for _, forbidden := range []string{canary, "xai-", strings.Repeat("B", 12), strings.Repeat("C", 12)} {
-		if strings.Contains(value, forbidden) {
-			t.Fatalf("value retained secret fragment %q:\n%s", forbidden, value)
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		fragments := []string{secret}
+		if len(secret) >= 24 {
+			fragments = append(fragments,
+				secret[:12],
+				secret[len(secret)/2-6:len(secret)/2+6],
+				secret[len(secret)-12:],
+			)
+		}
+		for _, forbidden := range fragments {
+			if strings.Contains(value, forbidden) {
+				t.Fatalf("value retained secret fragment %q:\n%s", forbidden, value)
+			}
 		}
 	}
 }

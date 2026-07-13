@@ -929,32 +929,63 @@ func firstVersionPartsLocal(value string) []int {
 
 var versionPatternLocal = regexp.MustCompile(`\d+(?:\.\d+){0,3}`)
 
-var grokSecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(api[_-]?key|token|secret|authorization)\s*[:=]\s*["']?[^"'\s,}]+`),
-	regexp.MustCompile(`(?i)bearer\s+[a-z0-9._~+/=-]+`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	regexp.MustCompile(`xai-[A-Za-z0-9._-]{12,}`),
+type grokSecretPattern struct {
+	re     *regexp.Regexp
+	redact func(string, []int) string
+}
+
+var grokSecretPatterns = []grokSecretPattern{
+	{re: regexp.MustCompile(`(?i)(["']?authorization["']?\s*[:=]\s*)(["']?)(?:[a-z][a-z0-9._~-]*\s+)?[^"'\s,}]+(["']?)`), redact: redactGrokKeyValueSecret},
+	{re: regexp.MustCompile(`(?i)\b(bearer)(\s+)(["']?)[a-z0-9._~+/=-]+(["']?)`), redact: redactGrokSchemeSecret},
+	{re: regexp.MustCompile(`(?i)\b(basic)(\s+)(["']?)[a-z0-9._~+/=-]+(["']?)`), redact: redactGrokSchemeSecret},
+	{re: regexp.MustCompile(`(?i)(["']?(?:api[_-]?key|token|secret)["']?\s*[:=]\s*)(["']?)[^"'\s,}]+(["']?)`), redact: redactGrokKeyValueSecret},
+	{re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), redact: redactGrokOpaqueSecret},
+	{re: regexp.MustCompile(`xai-[A-Za-z0-9._-]{12,}`), redact: redactGrokOpaqueSecret},
 }
 
 func redactGrokOutput(value string) (string, bool) {
 	redacted := value
+	changed := false
 	for _, pattern := range grokSecretPatterns {
-		redacted = pattern.ReplaceAllStringFunc(redacted, func(match string) string {
-			if strings.Contains(match, "=") {
-				key, _, _ := strings.Cut(match, "=")
-				return key + "=[REDACTED]"
-			}
-			if strings.Contains(match, ":") && !strings.HasPrefix(strings.ToLower(match), "bearer ") {
-				key, _, _ := strings.Cut(match, ":")
-				return key + ":[REDACTED]"
-			}
-			if strings.HasPrefix(strings.ToLower(match), "bearer ") {
-				return "Bearer [REDACTED]"
-			}
-			return "[REDACTED]"
+		redacted = pattern.re.ReplaceAllStringFunc(redacted, func(match string) string {
+			changed = true
+			return pattern.redact(match, pattern.re.FindStringSubmatchIndex(match))
 		})
 	}
-	return redacted, false
+	return redacted, changed
+}
+
+func redactGrokKeyValueSecret(match string, submatches []int) string {
+	prefix := grokRegexpGroup(match, submatches, 1)
+	quote := grokRegexpGroup(match, submatches, 2)
+	suffix := grokRegexpGroup(match, submatches, 3)
+	if suffix != quote {
+		suffix = ""
+	}
+	return prefix + quote + "[REDACTED]" + suffix
+}
+
+func redactGrokSchemeSecret(match string, submatches []int) string {
+	scheme := grokRegexpGroup(match, submatches, 1)
+	space := grokRegexpGroup(match, submatches, 2)
+	quote := grokRegexpGroup(match, submatches, 3)
+	suffix := grokRegexpGroup(match, submatches, 4)
+	if suffix != "" && quote != "" && suffix != quote {
+		suffix = ""
+	}
+	return scheme + space + quote + "[REDACTED]" + suffix
+}
+
+func redactGrokOpaqueSecret(_ string, _ []int) string {
+	return "[REDACTED]"
+}
+
+func grokRegexpGroup(value string, submatches []int, group int) string {
+	index := group * 2
+	if index+1 >= len(submatches) || submatches[index] < 0 || submatches[index+1] < 0 {
+		return ""
+	}
+	return value[submatches[index]:submatches[index+1]]
 }
 
 func redactGrokOutputBounded(value string, limit int) (string, bool) {
