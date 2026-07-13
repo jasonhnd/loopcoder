@@ -798,6 +798,7 @@ type grokNormalizedRecord struct {
 	Usage            reporter.Usage  `json:"usage,omitempty"`
 	CostUSD          *float64        `json:"cost_usd,omitempty"`
 	Cost             string          `json:"cost,omitempty"`
+	GapReasons       []string        `json:"gap_reasons,omitempty"`
 }
 
 func normalizeGrokFrame(payload map[string]any) (grokNormalizedRecord, error) {
@@ -844,9 +845,10 @@ func normalizeGrokFrame(payload map[string]any) (grokNormalizedRecord, error) {
 	}
 	costUSD, err := firstFloat64Value(payload, "cost_usd", "costUsd", "costUSD")
 	if err != nil {
-		return grokNormalizedRecord{}, grokError(GrokErrMalformedFrame, "invalid cost_usd field", err)
+		record.GapReasons = append(record.GapReasons, "malformed-cost-usd")
+	} else {
+		record.CostUSD = costUSD
 	}
-	record.CostUSD = costUSD
 	record.Cost = firstStringValue(payload, "cost")
 	return sanitizeGrokRecord(record), nil
 }

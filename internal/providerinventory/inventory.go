@@ -601,6 +601,7 @@ type Deps struct {
 	RunProbe     func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
 	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
 	RunClaudePTY func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
+	RunGrokACP   func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
 	MkdirTemp    func(string, string) (string, error)
 	RemoveAll    func(string) error
 	WriteFile    func(string, []byte, os.FileMode) error
@@ -645,6 +646,7 @@ func DefaultDeps() Deps {
 		RunProbe:     runProbeCommand,
 		RunCodexRPC:  runCodexAppServer,
 		RunClaudePTY: runClaudeUsagePTY,
+		RunGrokACP:   runGrokACPBilling,
 		MkdirTemp:    os.MkdirTemp,
 		RemoveAll:    os.RemoveAll,
 		WriteFile:    os.WriteFile,
@@ -789,6 +791,14 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
+				if adapter.AdapterID == "grok" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectGrokACPBilling(ctx, discovery, adapter, candidate, installation, now, deps)
+					quotaTelemetrySources = append(quotaTelemetrySources, source)
+					quotaSnapshots = append(quotaSnapshots, snapshots...)
+					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
+					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0
+				}
 			} else {
 				readiness := unsupportedAuthReadiness(adapter, &installation.ProviderInstallationID, now, firstNonEmpty(installation.TerminalErrorCode, "installation-not-usable"))
 				readiness.EvidenceKind = EvidenceNotRun
@@ -810,7 +820,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			probes = append(probes, probe)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-not-installed")
 		}
-		if (adapter.AdapterID != "codex" && adapter.AdapterID != "claude") || (!adapterQuotaCollected && !adapterQuotaAttempted) {
+		if !adapterQuotaCollected && !adapterQuotaAttempted {
 			if adapter.AdapterID == "codex" {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
@@ -3717,6 +3727,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunClaudePTY == nil {
 		deps.RunClaudePTY = defaults.RunClaudePTY
+	}
+	if deps.RunGrokACP == nil {
+		deps.RunGrokACP = defaults.RunGrokACP
 	}
 	if deps.MkdirTemp == nil {
 		deps.MkdirTemp = defaults.MkdirTemp

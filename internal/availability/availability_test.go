@@ -217,6 +217,63 @@ func TestBreakerTransitionsAreScopedByErrorClass(t *testing.T) {
 	}
 }
 
+func TestGrokQuotaObservationCannotOpenProviderWideBreaker(t *testing.T) {
+	now := fixedNow()
+	installationID := "pinst_grok"
+	accountID := "acct_grok"
+	modelID := "mcap_grok_45"
+	remaining := int64(0)
+	inventory := providerinventory.Report{
+		SchemaVersion: providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:   now.Format(time.RFC3339Nano),
+		Confidence:    providerinventory.ConfidenceExact,
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			SchemaVersion:          providerinventory.QuotaSnapshotSchema,
+			RecordVersion:          1,
+			QuotaSnapshotID:        "qsnap_grok_rate_limited",
+			QuotaSourceID:          "qsrc_grok_acp_billing",
+			SourceKind:             providerinventory.QuotaSourceOfficialCLICommand,
+			AdapterID:              "grok",
+			ProviderInstallationID: &installationID,
+			AccountProfileID:       &accountID,
+			ModelCapabilityID:      &modelID,
+			ScopeKey:               "provider:grok/account:acct_grok/model:grok-4.5/detail:rate_limit_remaining",
+			QuantityKind:           providerinventory.QuantityProviderDefined,
+			ProviderQuantityName:   "rate_limit_remaining",
+			Unit:                   "request",
+			WindowKind:             providerinventory.WindowUnknown,
+			ResetSemantics:         providerinventory.ResetUnknown,
+			RemainingValue:         &remaining,
+			ValueScale:             0,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339Nano),
+			StaleAfter:             now.Add(time.Hour).Format(time.RFC3339Nano),
+			GapReasons:             []string{"rate-limited-429"},
+			TerminalErrorCode:      "ErrRateLimited",
+		}},
+	}
+
+	result := Derive(Inputs{
+		Inventory: inventory,
+		Policy:    Policy{BaseCooldown: time.Minute},
+		Now:       now,
+	})
+	if len(result.CircuitBreakers) != 1 {
+		t.Fatalf("breakers = %#v, want one scoped rate-limit breaker", result.CircuitBreakers)
+	}
+	breaker := result.CircuitBreakers[0]
+	if breaker.BreakerKind != BreakerRateLimit || breaker.State != BreakerOpen {
+		t.Fatalf("breaker = %#v, want open rate-limit breaker", breaker)
+	}
+	if breaker.Scope.AdapterID != "grok" || breaker.Scope.ProviderInstallationID != installationID || breaker.Scope.AccountProfileID != accountID || breaker.Scope.ModelCapabilityID != modelID {
+		t.Fatalf("breaker scope widened or lost dimensions: %#v", breaker.Scope)
+	}
+	if breaker.Scope.AccountProfileID == "" || breaker.Scope.ModelCapabilityID == "" {
+		t.Fatalf("breaker scope is provider-wide: %#v", breaker.Scope)
+	}
+}
+
 func TestBreakerReplayDoesNotExtendCooldown(t *testing.T) {
 	now := fixedNow()
 	scope := Scope{AdapterID: "codex", AccountProfileID: "acct_codex", ModelCapabilityID: "mcap_codex_gpt55"}
