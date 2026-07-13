@@ -940,7 +940,8 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		return
 	}
 
-	emitCIWaitProgress(ctx, opts.Progress, opts.RunID, item.Issue, item.PR, "risk-gate", fmt.Sprintf("pr-%d", prNumber), "waiting for PR checks", false)
+	riskGateRecordID := fmt.Sprintf("pr-%d", prNumber)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for PR checks", false)
 	decision, err := opts.RiskGate(ctx, RiskGateOptions{
 		Reader:             gateReader,
 		PRNumber:           prNumber,
@@ -960,6 +961,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	if err != nil {
 		gateResult.Status = RiskGateStatusNeedsHuman
 		gateResult.Error = err.Error()
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusNeedsHuman, progress.KnownBlocked, "risk gate check read failed: "+err.Error(), true)
 		tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "risk-gate",
@@ -971,6 +973,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	}
 	tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
 	if decision.Status != RiskGateStatusClean || len(decision.RedLines) > 0 {
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusNeedsHuman, progress.KnownBlocked, "risk gate requires human review", true)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "risk-gate",
 			Issue:  item.Issue,
@@ -979,6 +982,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		})
 		return
 	}
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusClean, progress.KnownTerminal, "risk gate checks are clean", true)
 
 	if detail := preProdBranchProblem(opts.PreProdBranch, opts.BaseBranch); detail != "" {
 		tickReport.PreProdMerges = append(tickReport.PreProdMerges, TickPreProdMergeResult{
@@ -1086,7 +1090,8 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 
-	emitCIWaitProgress(ctx, opts.Progress, opts.RunID, item.Issue, item.PR, "pre-prod-health", opts.PreProdBranch, "waiting for pre-prod branch checks", false)
+	preProdRecordID := firstNonEmpty(mergeResult.SHA, opts.PreProdBranch)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for pre-prod branch checks", false)
 	branchChecks, err := healthReader.BranchChecks(ctx, opts.PreProdBranch)
 	health := TickPreProdHealthResult{
 		Issue:          item.Issue,
@@ -1102,6 +1107,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 	if err != nil {
 		health.Status = PreProdHealthStatusUnknown
 		health.Error = err.Error()
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, PreProdHealthStatusUnknown, progress.KnownBlocked, "pre-prod branch check read failed: "+err.Error(), true)
 		tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "pre-prod-health",
@@ -1112,6 +1118,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 	health.Status, health.Problems = preProdHealthStatus(health.RequiredChecks, health.Checks)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, health.Status, knownPreProdHealthState(health.Status), preProdHealthProgressSummary(health), true)
 	tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
 	switch health.Status {
 	case PreProdHealthStatusGreen:
@@ -1141,6 +1148,36 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 			PR:     item.PR,
 			Detail: detail,
 		})
+	}
+}
+
+func knownPreProdHealthState(status string) string {
+	switch status {
+	case PreProdHealthStatusPending:
+		return progress.KnownWaitingCI
+	case PreProdHealthStatusGreen:
+		return progress.KnownTerminal
+	default:
+		return progress.KnownBlocked
+	}
+}
+
+func preProdHealthProgressSummary(health TickPreProdHealthResult) string {
+	switch health.Status {
+	case PreProdHealthStatusGreen:
+		return "pre-prod branch checks are green"
+	case PreProdHealthStatusRed:
+		return "pre-prod branch checks are red"
+	case PreProdHealthStatusPending:
+		return "pre-prod branch checks are still pending"
+	default:
+		if strings.TrimSpace(health.Error) != "" {
+			return "pre-prod branch check status is unknown: " + health.Error
+		}
+		if len(health.Problems) > 0 {
+			return "pre-prod branch check status is unknown: " + strings.Join(health.Problems, ", ")
+		}
+		return "pre-prod branch check status is unknown"
 	}
 }
 

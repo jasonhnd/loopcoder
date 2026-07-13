@@ -14,12 +14,11 @@ func emitFallbackProgress(ctx context.Context, emitter progress.Recorder, decisi
 		return
 	}
 	known := progress.KnownFallbackInProgress
-	if decision.Trigger == FallbackTriggerQuotaExhausted || decision.Trigger == FallbackTriggerBudgetRefused {
-		known = progress.KnownQuotaBlocked
-	}
-	if decision.DecisionStatus == FallbackStatusBlocked || decision.DecisionStatus == FallbackStatusNeedsHuman || decision.DecisionStatus == FallbackStatusReplanRequired {
-		if known != progress.KnownQuotaBlocked {
-			known = progress.KnownBlocked
+	terminal := fallbackProgressTerminal(decision.DecisionStatus)
+	if terminal {
+		known = progress.KnownBlocked
+		if decision.Trigger == FallbackTriggerQuotaExhausted || decision.Trigger == FallbackTriggerBudgetRefused {
+			known = progress.KnownQuotaBlocked
 		}
 	}
 	observation := progress.Observation{
@@ -40,10 +39,25 @@ func emitFallbackProgress(ctx context.Context, emitter progress.Recorder, decisi
 			Confidence:     "exact",
 		}},
 		OccurredAt: now,
+		Terminal:   terminal,
 	}
-	_, err := emitter.Emit(ctx, observation)
+	var err error
+	if terminal {
+		_, err = emitter.Terminal(ctx, observation)
+	} else {
+		_, err = emitter.Emit(ctx, observation)
+	}
 	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
 		progress.ReportDiagnostic(ctx, emitter, observation, err)
 		return
+	}
+}
+
+func fallbackProgressTerminal(status string) bool {
+	switch strings.TrimSpace(status) {
+	case FallbackStatusBlocked, FallbackStatusNeedsHuman, FallbackStatusReplanRequired:
+		return true
+	default:
+		return false
 	}
 }

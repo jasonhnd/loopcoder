@@ -130,33 +130,53 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	return decision, nil
 }
 
-func emitCIWaitProgress(ctx context.Context, recorder progress.Recorder, runID string, issue int, pr, phase, recordID, summary string, terminal bool) {
+func ciProgressCorrelation(runID string, issue int, pr, phase, recordID string) string {
+	parts := []string{
+		"ci",
+		strings.TrimSpace(runID),
+		strings.TrimSpace(phase),
+	}
+	if issue > 0 {
+		parts = append(parts, fmt.Sprintf("issue-%d", issue))
+	}
+	if strings.TrimSpace(pr) != "" {
+		parts = append(parts, "pr-"+strings.TrimSpace(pr))
+	}
+	parts = append(parts, strings.TrimSpace(firstNonEmpty(recordID, pr, runID)))
+	return strings.Join(parts, ":")
+}
+
+func emitCIProgress(ctx context.Context, recorder progress.Recorder, now time.Time, runID string, issue int, pr, phase, recordID, status, knownState, summary string, terminal bool) {
 	if recorder == nil {
 		return
 	}
-	now := time.Now().UTC()
 	taskID := ""
 	if issue > 0 {
 		taskID = fmt.Sprintf("issue-%d", issue)
+	}
+	status = strings.TrimSpace(status)
+	knownState = strings.TrimSpace(knownState)
+	if status == "" {
+		status = knownState
 	}
 	observation := progress.Observation{
 		DeliveryRunID: runID,
 		RunID:         runID,
 		TaskID:        taskID,
-		CorrelationID: "ci:" + strings.TrimSpace(firstNonEmpty(recordID, pr, runID)),
+		CorrelationID: ciProgressCorrelation(runID, issue, pr, phase, recordID),
 		Phase:         strings.TrimSpace(phase),
-		Status:        progress.KnownWaitingCI,
-		KnownState:    progress.KnownWaitingCI,
+		Status:        status,
+		KnownState:    knownState,
 		Reason:        progress.ReasonStateChange,
-		TaskCounts:    progress.TaskCounts{Total: 1, Blocked: 1},
+		TaskCounts:    ciProgressTaskCounts(knownState),
 		Evidence: []progress.EvidenceRef{{
-			RecordKind:     "ci-check-wait",
+			RecordKind:     "ci-check-observation",
 			RecordID:       strings.TrimSpace(firstNonEmpty(recordID, pr, runID)),
-			Summary:        strings.TrimSpace(firstNonEmpty(summary, "waiting for CI checks")),
+			Summary:        strings.TrimSpace(firstNonEmpty(summary, "CI check state observed")),
 			Classification: "local-diagnostic",
 			Confidence:     "exact",
 		}},
-		OccurredAt: now,
+		OccurredAt: now.UTC(),
 		Terminal:   terminal,
 	}
 	var err error
@@ -167,6 +187,17 @@ func emitCIWaitProgress(ctx context.Context, recorder progress.Recorder, runID s
 	}
 	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
 		progress.ReportDiagnostic(ctx, recorder, observation, err)
+	}
+}
+
+func ciProgressTaskCounts(knownState string) progress.TaskCounts {
+	switch knownState {
+	case progress.KnownTerminal:
+		return progress.TaskCounts{Total: 1, Succeeded: 1}
+	case progress.KnownWaitingCI, progress.KnownBlocked:
+		return progress.TaskCounts{Total: 1, Blocked: 1}
+	default:
+		return progress.TaskCounts{Total: 1, Unknown: 1}
 	}
 }
 

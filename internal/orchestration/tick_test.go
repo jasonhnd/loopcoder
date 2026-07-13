@@ -127,11 +127,141 @@ func TestTickHappyPass(t *testing.T) {
 	if !progressRecorder.hasKnown(progress.KnownWaitingCI) {
 		t.Fatalf("tick did not emit waiting-for-ci progress observation: %#v", progressRecorder.observations)
 	}
+	if !progressRecorder.hasTerminal("risk-gate", RiskGateStatusClean) || !progressRecorder.hasTerminal("pre-prod-health", PreProdHealthStatusGreen) {
+		t.Fatalf("tick did not terminalize CI progress observations: %#v", progressRecorder.observations)
+	}
+	for _, observation := range progressRecorder.observations {
+		if !observation.OccurredAt.Equal(now) {
+			t.Fatalf("progress observation occurred_at = %s, want injected clock %s", observation.OccurredAt, now)
+		}
+	}
 	if report.Summary.DispatchedPRCount != 1 || report.Summary.ReviewPassCount != 1 || report.Summary.RiskGateCleanCount != 1 || report.Summary.PreProdMergeCount != 1 || report.Summary.FailureCount != 0 {
 		t.Fatalf("summary = %#v", report.Summary)
 	}
 	if report.StatePush == nil || !report.StatePush.Pushed {
 		t.Fatalf("state push = %#v, want pushed", report.StatePush)
+	}
+}
+
+func TestTickPreProdHealthProgressCorrelationsArePerItem(t *testing.T) {
+	progressRecorder := &recordingProgressRecorder{}
+	opts := reviewReadyTickOptions(t.TempDir(), 41, "https://github.com/owner/repo/pull/410")
+	opts.Progress = progressRecorder
+	opts.Reader = fakeReader{
+		checks: map[int][]gh.Check{
+			410: passChecks(),
+			411: passChecks(),
+		},
+		diffFiles: map[int][]string{
+			410: {"README.md"},
+			411: {"docs/README.md"},
+		},
+		diffs: map[int]string{
+			410: modifiedDiff("README.md"),
+			411: modifiedDiff("docs/README.md"),
+		},
+		branchChecks: map[string]gh.BranchChecksResult{
+			"pre-prod": {Branch: "pre-prod", HeadSHA: "shared-preprod-head", Checks: passChecks()},
+		},
+	}
+	opts.ComputeReadySet = func(context.Context, Options) (report.ReadySetReport, error) {
+		out := readySetReport(41)
+		out.Ready = append(out.Ready, report.ReadyIssue{Issue: 42, Title: "Issue 42", Reason: "ready"})
+		return out, nil
+	}
+	opts.DispatchWave = func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
+		return tickWaveReport(
+			DispatchWaveIssueResult{Issue: 41, Status: DispatchWaveStatusSucceeded, PR: "https://github.com/owner/repo/pull/410"},
+			DispatchWaveIssueResult{Issue: 42, Status: DispatchWaveStatusSucceeded, PR: "https://github.com/owner/repo/pull/411"},
+		), nil
+	}
+	opts.PreProdWriter = tickPreProdWriterFunc(func(_ context.Context, prNumber int, branch string) (gh.PreProdMergeResult, error) {
+		return gh.PreProdMergeResult{PRNumber: prNumber, Branch: branch, Head: "loop/issue-test", SHA: "shared-merge-sha"}, nil
+	})
+
+	reportResult, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if reportResult.Status != TickStatusSucceeded || len(reportResult.PreProdHealth) != 2 {
+		t.Fatalf("tick status=%s health=%#v", reportResult.Status, reportResult.PreProdHealth)
+	}
+	correlations := progressRecorder.correlationsFor("pre-prod-health", PreProdHealthStatusGreen, true)
+	if len(correlations) != 2 {
+		t.Fatalf("pre-prod terminal correlations = %#v, want two distinct issue/PR-scoped correlations", correlations)
+	}
+}
+
+func TestTickPreProdHealthProgressTerminalizesEveryReadOutcome(t *testing.T) {
+	now := time.Date(2026, 7, 2, 13, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		checks     []gh.Check
+		readErr    error
+		wantStatus string
+	}{
+		{name: "red", checks: []gh.Check{{Name: "verify", Bucket: "fail"}}, wantStatus: PreProdHealthStatusRed},
+		{name: "pending", checks: []gh.Check{{Name: "verify", Bucket: "pending"}}, wantStatus: PreProdHealthStatusPending},
+		{name: "read error", readErr: errors.New("branch checks unavailable"), wantStatus: PreProdHealthStatusUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			progressRecorder := &recordingProgressRecorder{}
+			opts := reviewReadyTickOptions(t.TempDir(), 43, "https://github.com/owner/repo/pull/430")
+			opts.Progress = progressRecorder
+			opts.Clock = func() time.Time { return now }
+			opts.Reader = fakeReader{
+				checks:    map[int][]gh.Check{430: passChecks()},
+				diffFiles: map[int][]string{430: {"README.md"}},
+				diffs:     map[int]string{430: modifiedDiff("README.md")},
+				branchChecks: map[string]gh.BranchChecksResult{
+					"pre-prod": {Branch: "pre-prod", HeadSHA: "merge-sha", Checks: tt.checks},
+				},
+				branchCheckErrs: map[string]error{"pre-prod": tt.readErr},
+			}
+			opts.PreProdWriter = &recordingPreProdWriter{
+				mergeResult:  gh.PreProdMergeResult{PRNumber: 430, Branch: "pre-prod", Head: "loop/issue-43", SHA: "merge-sha"},
+				revertResult: gh.PreProdRevertResult{PRNumber: 430, Branch: "pre-prod", RevertedSHA: "merge-sha", SHA: "revert-sha"},
+			}
+
+			_, err := Tick(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("Tick returned error: %v", err)
+			}
+			if !progressRecorder.hasTerminal("pre-prod-health", tt.wantStatus) {
+				t.Fatalf("progress observations = %#v, want terminal pre-prod-health status %s", progressRecorder.observations, tt.wantStatus)
+			}
+			for _, observation := range progressRecorder.observations {
+				if observation.Phase == "pre-prod-health" && !observation.OccurredAt.Equal(now) {
+					t.Fatalf("pre-prod progress occurred_at = %s, want injected clock %s", observation.OccurredAt, now)
+				}
+			}
+		})
+	}
+}
+
+func TestTickRiskGateProgressTerminalizesNeedsHumanWithInjectedClock(t *testing.T) {
+	now := time.Date(2026, 7, 2, 14, 0, 0, 0, time.UTC)
+	progressRecorder := &recordingProgressRecorder{}
+	opts := reviewReadyTickOptions(t.TempDir(), 44, "https://github.com/owner/repo/pull/440")
+	opts.Progress = progressRecorder
+	opts.Clock = func() time.Time { return now }
+	opts.Reader = destructiveRiskReader(440)
+
+	report, err := Tick(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if report.Status != TickStatusNeedsHuman || report.StopReason != TickStopRiskGateNeedsHuman {
+		t.Fatalf("tick status = %s stop = %s", report.Status, report.StopReason)
+	}
+	if !progressRecorder.hasTerminal("risk-gate", RiskGateStatusNeedsHuman) {
+		t.Fatalf("progress observations = %#v, want terminal risk-gate needs-human", progressRecorder.observations)
+	}
+	for _, observation := range progressRecorder.observations {
+		if observation.Phase == "risk-gate" && !observation.OccurredAt.Equal(now) {
+			t.Fatalf("risk-gate progress occurred_at = %s, want injected clock %s", observation.OccurredAt, now)
+		}
 	}
 }
 
@@ -1339,14 +1469,21 @@ func TestTickReportUsesClockForNonZeroDuration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tick returned error: %v", err)
 	}
-	if report.StartedAt != "2026-07-02T12:00:00Z" || report.FinishedAt != "2026-07-02T12:01:30Z" {
-		t.Fatalf("timing = started %q finished %q", report.StartedAt, report.FinishedAt)
+	if report.StartedAt != "2026-07-02T12:00:00Z" {
+		t.Fatalf("started = %q", report.StartedAt)
+	}
+	finishedAt, err := time.Parse(time.RFC3339Nano, report.FinishedAt)
+	if err != nil {
+		t.Fatalf("parse finished_at %q: %v", report.FinishedAt, err)
+	}
+	if !finishedAt.After(started) {
+		t.Fatalf("finished_at = %s, want after %s", finishedAt, started)
 	}
 	if report.StartedAt == report.FinishedAt {
 		t.Fatalf("started and finished timestamps should differ: %q", report.StartedAt)
 	}
-	if calls != 2 {
-		t.Fatalf("clock calls = %d, want 2", calls)
+	if calls < 2 {
+		t.Fatalf("clock calls = %d, want at least start and finish", calls)
 	}
 }
 
@@ -1756,4 +1893,28 @@ func (r *recordingProgressRecorder) hasStatus(status string) bool {
 		}
 	}
 	return false
+}
+
+func (r *recordingProgressRecorder) hasTerminal(phase, status string) bool {
+	for _, observation := range r.observations {
+		if observation.Phase == phase && observation.Status == status && observation.Terminal {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingProgressRecorder) correlationsFor(phase, status string, terminal bool) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, observation := range r.observations {
+		if observation.Phase != phase || observation.Status != status || observation.Terminal != terminal {
+			continue
+		}
+		if !seen[observation.CorrelationID] {
+			seen[observation.CorrelationID] = true
+			out = append(out, observation.CorrelationID)
+		}
+	}
+	return out
 }

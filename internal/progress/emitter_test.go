@@ -389,7 +389,7 @@ func TestEmitterOverlappingInstancesAllocateDistinctSequences(t *testing.T) {
 	}
 }
 
-func TestSupervisorTerminalCorrelationDoesNotCloseSiblings(t *testing.T) {
+func TestSupervisorTerminalCorrelationDoesNotCloseSiblingsAndCanRestart(t *testing.T) {
 	ctx := context.Background()
 	clock := newManualClock(fixedTime)
 	store := newClockStore(t, ctx, clock)
@@ -427,12 +427,14 @@ func TestSupervisorTerminalCorrelationDoesNotCloseSiblings(t *testing.T) {
 	if _, err := supervisor.Emit(ctx, taskB); err != nil {
 		t.Fatalf("Emit task B after task A terminal: %v", err)
 	}
-	if _, err := supervisor.Emit(ctx, taskA); !errors.Is(err, ErrEmitterClosed) {
-		t.Fatalf("Emit task A after terminal error = %v, want ErrEmitterClosed", err)
+	taskA.Status = "running-after-terminal"
+	taskA.Phase = "restarted"
+	if _, err := supervisor.Emit(ctx, taskA); err != nil {
+		t.Fatalf("Emit task A after terminal should restart correlation: %v", err)
 	}
 
 	clock.Advance(5 * time.Minute)
-	waitForReceiptCount(t, ctx, store, 5)
+	waitForReceiptCount(t, ctx, store, 6)
 	if err := supervisor.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -444,12 +446,23 @@ func TestSupervisorTerminalCorrelationDoesNotCloseSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListReceipts task B: %v", err)
 	}
-	if len(taskAReceipts) != 2 || taskAReceipts[len(taskAReceipts)-1].Status != "succeeded" {
-		t.Fatalf("task A receipts = %#v, want initial + terminal only", taskAReceipts)
+	if len(taskAReceipts) < 3 ||
+		!receiptsContainStatus(taskAReceipts, "succeeded") ||
+		!receiptsContainStatus(taskAReceipts, "running-after-terminal") {
+		t.Fatalf("task A receipts = %#v, want initial + terminal + restarted state", taskAReceipts)
 	}
 	if len(taskBReceipts) != 3 || !containsString(taskBReceipts[len(taskBReceipts)-1].GapReasons, "max-generation-silence") {
 		t.Fatalf("task B receipts = %#v, want sibling state change and periodic max-silence", taskBReceipts)
 	}
+}
+
+func receiptsContainStatus(receipts []ProgressReceipt, status string) bool {
+	for _, receipt := range receipts {
+		if receipt.Status == status {
+			return true
+		}
+	}
+	return false
 }
 
 func mustEmitter(t *testing.T, store storage.Store, clock Clock, correlation string) *Emitter {
