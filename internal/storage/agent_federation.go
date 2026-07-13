@@ -673,6 +673,20 @@ func registerAgentTx(ctx context.Context, tx Tx, req AgentRegistrationRequest) (
 			return AgentRegistration{}, err
 		}
 	}
+	root, err := physicalProjectRootTx(ctx, tx, req.ProjectID)
+	if err != nil {
+		return AgentRegistration{}, err
+	}
+	for i := range req.OwnershipLocks {
+		if strings.TrimSpace(req.OwnershipLocks[i].ResourceKind) != "repo-path" {
+			continue
+		}
+		key, err := physicalRepoResourceKey(root, req.OwnershipLocks[i].ResourceKey)
+		if err != nil {
+			return AgentRegistration{}, err
+		}
+		req.OwnershipLocks[i].ResourceKey = key
+	}
 	scopeBytes, err := json.Marshal(scopePayload(scope))
 	if err != nil {
 		return AgentRegistration{}, federationError(ErrInvalidRecordCode, "marshal scope: %v", err)
@@ -992,6 +1006,13 @@ func validateAgentRegistrationOwnershipFence(ctx context.Context, store Store, f
 		}
 		if !ok || record.RunID != fence.RunID {
 			return federationError(ErrOwnershipRequiredCode, "registration ownership is missing")
+		}
+		if fence.ResourceKind == "repo-path" {
+			physicalKey, err := physicalRepoResourceKeyTx(ctx, tx, record.ProjectID, fence.ResourceKey)
+			if err != nil {
+				return err
+			}
+			fence.ResourceKey = physicalKey
 		}
 		if err := validateRegistrationClaimTx(ctx, tx, record, fence.ExecutorID, fence.ClaimGeneration); err != nil {
 			return federationError(ErrOwnershipStaleCode, "registration claim is stale")
@@ -1607,6 +1628,10 @@ func validatePhysicalRepoScopeTx(ctx context.Context, tx Tx, record AgentRegistr
 	if err != nil {
 		return err
 	}
+	return validatePhysicalRepoScopeRoot(root, scope)
+}
+
+func validatePhysicalRepoScopeRoot(root string, scope AgentScopeGrant) error {
 	for _, item := range []struct {
 		name  string
 		paths []string
@@ -1645,23 +1670,39 @@ func physicalProjectRootTx(ctx context.Context, tx Tx, projectID string) (string
 }
 
 func validateRepoRelativePhysicalPath(root, dimension, rel string) error {
-	normalized, err := normalizeRepoResource(rel)
-	if err != nil {
+	if _, err := physicalRepoResourceKey(root, rel); err != nil {
 		return err
 	}
-	if normalized == "" {
-		return nil
+	return nil
+}
+
+func physicalRepoResourceKey(root, rel string) (string, error) {
+	normalized, err := normalizeRepoResource(rel)
+	if err != nil {
+		return "", err
 	}
+	if normalized == "" {
+		return ".", nil
+	}
+	root = filepath.Clean(root)
 	target := filepath.Join(root, filepath.FromSlash(normalized))
 	identity, err := pathid.Identity(target)
 	if err != nil {
-		return federationError(ErrScopeUnknownCode, "%s %q physical path is ambiguous: %v", dimension, rel, err)
+		return "", federationError(ErrScopeUnknownCode, "repo path %q physical path is ambiguous: %v", rel, err)
 	}
 	identity = filepath.Clean(identity)
-	if sameOrDescendantPath(root, identity) {
-		return nil
+	if !sameOrDescendantPath(root, identity) {
+		return "", federationError(ErrScopeWideningCode, "repo path %q resolves outside project root", rel)
 	}
-	return federationError(ErrScopeWideningCode, "%s %q resolves outside project root", dimension, rel)
+	relative, err := filepath.Rel(root, identity)
+	if err != nil {
+		return "", federationError(ErrScopeUnknownCode, "repo path %q physical path is ambiguous: %v", rel, err)
+	}
+	relative = filepath.ToSlash(filepath.Clean(relative))
+	if relative == "." {
+		return ".", nil
+	}
+	return relative, nil
 }
 
 func sameOrDescendantPath(root, child string) bool {
@@ -1820,10 +1861,18 @@ func validateLiveOwnershipLocksTx(ctx context.Context, tx Tx, record AgentRegist
 	if err != nil {
 		return err
 	}
+	root, err := physicalProjectRootTx(ctx, tx, record.ProjectID)
+	if err != nil {
+		return err
+	}
 	for _, writePath := range writeScope {
+		physicalWritePath, err := physicalRepoResourceKey(root, writePath)
+		if err != nil {
+			return err
+		}
 		covered := false
 		for _, lock := range locks {
-			if lock.resourceKind == "repo-path" && resourceKeyCovers(lock.resourceKind, lock.resourceKey, writePath) {
+			if lock.resourceKind == "repo-path" && resourceKeyCovers(lock.resourceKind, lock.resourceKey, physicalWritePath) {
 				covered = true
 				break
 			}
@@ -2522,6 +2571,11 @@ func insertOwnershipLockTx(ctx context.Context, tx Tx, lock AgentOwnershipLock) 
 }
 
 func acquireAgentOwnershipLeaseTx(ctx context.Context, tx Tx, req AgentOwnershipLeaseRequest, resources []AgentOwnershipResource) (AgentOwnershipLease, error) {
+	var err error
+	resources, err = physicalOwnershipResourcesTx(ctx, tx, req.ProjectID, resources)
+	if err != nil {
+		return AgentOwnershipLease{}, err
+	}
 	if existing, ok, err := reusableAgentOwnershipLeaseTx(ctx, tx, req, resources); err != nil {
 		return AgentOwnershipLease{}, err
 	} else if ok {
@@ -2981,6 +3035,47 @@ func pathBoundaryByte(b byte) bool {
 	default:
 		return false
 	}
+}
+
+func physicalOwnershipResourcesTx(ctx context.Context, tx Tx, projectID string, resources []AgentOwnershipResource) ([]AgentOwnershipResource, error) {
+	out := make([]AgentOwnershipResource, 0, len(resources))
+	root := ""
+	for _, resource := range resources {
+		if resource.ResourceKind == "repo-path" {
+			if canonicalResourceKey(resource.ResourceKind, resource.ResourceKey) == "." {
+				resource.ResourceKey = "."
+				out = append(out, resource)
+				continue
+			}
+			if root == "" {
+				var err error
+				root, err = physicalProjectRootTx(ctx, tx, projectID)
+				if err != nil {
+					if errors.Is(err, ErrCrossProjectReference) {
+						resource.ResourceKey = canonicalResourceKey(resource.ResourceKind, resource.ResourceKey)
+						out = append(out, resource)
+						continue
+					}
+					return nil, err
+				}
+			}
+			key, err := physicalRepoResourceKey(root, resource.ResourceKey)
+			if err != nil {
+				return nil, err
+			}
+			resource.ResourceKey = key
+		}
+		out = append(out, resource)
+	}
+	return out, nil
+}
+
+func physicalRepoResourceKeyTx(ctx context.Context, tx Tx, projectID, rel string) (string, error) {
+	root, err := physicalProjectRootTx(ctx, tx, projectID)
+	if err != nil {
+		return "", err
+	}
+	return physicalRepoResourceKey(root, rel)
 }
 
 func pathTerminatorRune(r rune) bool {
