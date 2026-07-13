@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,10 +458,136 @@ func TestDependencyEdgeCycleDetectedIsAtomic(t *testing.T) {
 	assertCount(t, ctx, store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
 }
 
+func TestDependencyEdgeCycleDetectorInjectionIsRaceSafeAcrossInstances(t *testing.T) {
+	fixtureCtx := context.Background()
+
+	const workers = 2
+	type detectorRun struct {
+		index    int
+		store    storage.Store
+		edge     DependencyEdge
+		injected error
+		calls    atomic.Int32
+	}
+	runs := make([]*detectorRun, 0, workers)
+	for i := 0; i < workers; i++ {
+		store := openDeliveryStore(t)
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+		})
+		runID := fmt.Sprintf("run_cycle_detector_parallel_%02d", i)
+		run, taskA, taskB := seedTwoTaskDependencyRun(t, fixtureCtx, store, "proj_a", runID)
+
+		edgeAB := DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskA.TaskID, ToTaskID: taskB.TaskID, PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()}
+		if _, err := AddDependencyEdge(fixtureCtx, store, edgeAB, PersistOptions{IdempotencyKey: runID + "-edge-ab", Now: fixedTime()}); err != nil {
+			t.Fatalf("AddDependencyEdge seed %d: %v", i, err)
+		}
+		runs = append(runs, &detectorRun{
+			index:    i,
+			store:    store,
+			edge:     DependencyEdge{ProjectID: run.ProjectID, DeliveryRunID: run.DeliveryRunID, FromTaskID: taskB.TaskID, ToTaskID: taskA.TaskID, EdgeKind: "orders-after", PlanFingerprint: run.PlanFingerprint, CreatedBy: actor(), Host: host()},
+			injected: fmt.Errorf("cte scan failed %02d", i),
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ready := make(chan int, workers)
+	start := make(chan struct{})
+	var startOnce sync.Once
+	closeStart := func() {
+		startOnce.Do(func() {
+			close(start)
+		})
+	}
+	defer closeStart()
+
+	type result struct {
+		index int
+		err   error
+	}
+	results := make(chan result, workers)
+	for _, run := range runs {
+		run := run
+		go func() {
+			opts := PersistOptions{
+				IdempotencyKey: fmt.Sprintf("edge-cycle-query-failure-%02d", run.index),
+				Now:            fixedTime(),
+				cycleDetector: func(context.Context, storage.Tx, string, string, string) (bool, error) {
+					if got := run.calls.Add(1); got != 1 {
+						return false, fmt.Errorf("detector %d called %d times", run.index, got)
+					}
+					ready <- run.index
+					select {
+					case <-start:
+						return false, run.injected
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+				},
+			}
+			_, err := AddDependencyEdge(ctx, run.store, run.edge, opts)
+			results <- result{index: run.index, err: err}
+		}()
+	}
+
+	readyByIndex := make(map[int]bool, workers)
+	resultsByIndex := make(map[int]error, workers)
+	var barrierErr error
+	for len(readyByIndex) < len(runs) && barrierErr == nil {
+		select {
+		case index := <-ready:
+			if readyByIndex[index] {
+				barrierErr = fmt.Errorf("detector %d reached barrier more than once", index)
+				break
+			}
+			readyByIndex[index] = true
+		case res := <-results:
+			resultsByIndex[res.index] = res.err
+			barrierErr = fmt.Errorf("AddDependencyEdge %d returned before detector barrier: %v", res.index, res.err)
+		case <-ctx.Done():
+			barrierErr = fmt.Errorf("waiting for detector barrier: %w", ctx.Err())
+		}
+	}
+	closeStart()
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	for len(resultsByIndex) < len(runs) {
+		select {
+		case res := <-results:
+			if _, ok := resultsByIndex[res.index]; ok {
+				t.Fatalf("AddDependencyEdge %d returned more than once", res.index)
+			}
+			resultsByIndex[res.index] = res.err
+		case <-drainCtx.Done():
+			t.Fatalf("waiting for detector result after barrier release: %v", drainCtx.Err())
+		}
+	}
+	if barrierErr != nil {
+		t.Fatal(barrierErr)
+	}
+
+	for _, run := range runs {
+		err, ok := resultsByIndex[run.index]
+		if !ok {
+			t.Fatalf("missing AddDependencyEdge result %d", run.index)
+		}
+		if err == nil || errors.Is(err, ErrCycleDetected) || !errors.Is(err, run.injected) {
+			t.Fatalf("cycle query failure %d error = %v, want wrapped injected error", run.index, err)
+		}
+		if got := run.calls.Load(); got != 1 {
+			t.Fatalf("detector %d calls = %d, want 1", run.index, got)
+		}
+		assertCount(t, fixtureCtx, run.store, `SELECT COUNT(*) FROM delivery_dependency_edges`, 1)
+	}
+}
+
 func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	for _, tt := range []struct {
 		name      string
@@ -479,7 +607,12 @@ func TestDependencyEdgeConcurrentDuplicateRaceIsTyped(t *testing.T) {
 			wantErr:   ErrDuplicateRecord,
 		},
 	} {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
 			dbPath := filepath.Join(t.TempDir(), "loopcoder.db")
 			seedStore, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: fixedTime})
 			if err != nil {
