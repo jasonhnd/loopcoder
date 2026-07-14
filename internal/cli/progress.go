@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/progresshost"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
@@ -52,6 +53,7 @@ func progressSupervisorForStore(store storage.Store, projectID, runID string, di
 		DeliveryRunID:      runID,
 		RunID:              runID,
 		MaxSilenceInterval: progress.DefaultMaxSilenceInterval,
+		DeliveryObligation: progresshost.CurrentObligationFactory(),
 		Diagnostic: func(_ context.Context, diagnostic progress.Diagnostic) {
 			fmt.Fprintf(diagnostics, "[loopcoder] warning: progress receipt diagnostic code=%s correlation=%s phase=%s status=%s error=%s\n",
 				progress.DiagnosticMessage(diagnostic.Code),

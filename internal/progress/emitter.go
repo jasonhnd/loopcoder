@@ -131,13 +131,16 @@ type EmitterOptions struct {
 	MaxSilenceInterval time.Duration
 	Clock              Clock
 	Deliver            DeliveryFunc
+	DeliveryObligation DeliveryObligationFunc
 }
 
 type EmitResult struct {
 	WriteResult
-	Emitted           bool
-	DeliveryAttempted bool
-	DeliveryErr       error
+	Emitted                    bool
+	DeliveryAttempted          bool
+	DeliveryErr                error
+	DeliveryObligation         DeliveryObligation
+	DeliveryObligationInserted bool
 }
 
 type Emitter struct {
@@ -149,6 +152,7 @@ type Emitter struct {
 	interval      time.Duration
 	clock         Clock
 	deliver       DeliveryFunc
+	obligation    DeliveryObligationFunc
 
 	mu                 sync.Mutex
 	latest             Observation
@@ -239,6 +243,7 @@ func newEmitterFromOptions(opts EmitterOptions, requireIdentity bool) (*Emitter,
 		interval:       interval,
 		clock:          clock,
 		deliver:        opts.Deliver,
+		obligation:     opts.DeliveryObligation,
 		stopCh:         make(chan struct{}),
 		wakeupCh:       make(chan struct{}, 1),
 		doneCh:         make(chan struct{}),
@@ -422,7 +427,7 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 	}
 
 	receipt := e.receiptFor(observation, now, periodic)
-	result, err := PersistReceiptNextSequence(ctx, e.store, receipt)
+	result, obligation, obligationInserted, err := e.persistReceipt(ctx, receipt)
 	if err != nil {
 		if periodic {
 			e.nextRetryAt = now.Add(e.periodicRetryDelay())
@@ -438,7 +443,12 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 	if !periodic {
 		e.wakeSchedulerLocked()
 	}
-	out := EmitResult{WriteResult: result, Emitted: result.Inserted}
+	out := EmitResult{
+		WriteResult:                result,
+		Emitted:                    result.Inserted,
+		DeliveryObligation:         obligation,
+		DeliveryObligationInserted: obligationInserted,
+	}
 	if observation.Terminal {
 		e.closed = true
 	}
@@ -453,6 +463,15 @@ func (e *Emitter) emit(ctx context.Context, observation Observation, periodic bo
 		out.DeliveryAttempted, out.DeliveryErr = e.deliverReceipt(ctx, result.Receipt, waitForDelivery)
 	}
 	return out, err
+}
+
+func (e *Emitter) persistReceipt(ctx context.Context, receipt ProgressReceipt) (WriteResult, DeliveryObligation, bool, error) {
+	if e.obligation == nil {
+		result, err := PersistReceiptNextSequence(ctx, e.store, receipt)
+		return result, DeliveryObligation{}, false, err
+	}
+	result, err := PersistReceiptNextSequenceWithObligationFunc(ctx, e.store, receipt, e.obligation)
+	return result.Receipt, result.Obligation, result.Inserted, err
 }
 
 func (e *Emitter) deliverReceipt(ctx context.Context, receipt ProgressReceipt, wait bool) (bool, error) {

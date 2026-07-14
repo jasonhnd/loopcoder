@@ -70,6 +70,54 @@ func TestEmitterTwentyMinuteFixtureHonorsMaxSilence(t *testing.T) {
 	}
 }
 
+func TestEmitterOutboxObligationFailureRollsBackReceipt(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+	emitter, err := NewEmitter(EmitterOptions{
+		Store:              store,
+		ProjectID:          "proj_progress",
+		DeliveryRunID:      "run_progress",
+		RunID:              "run_progress",
+		CorrelationID:      "corr_atomic_obligation",
+		MaxSilenceInterval: 5 * time.Minute,
+		DeliveryObligation: func(receipt ProgressReceipt) (DeliveryObligation, bool) {
+			return DeliveryObligation{
+				ProjectID:         receipt.ProjectID,
+				DeliveryRunID:     receipt.DeliveryRunID,
+				ProgressReceiptID: receipt.ProgressReceiptID,
+				OriginKind:        "host-run-origin",
+				OriginID:          "sha256-origin",
+				SinkKind:          "host",
+				SinkID:            "horigin_atomic",
+				TransportContract: "known-origin-next-invocation-replay",
+				AckPolicy:         "not-a-valid-ack-policy",
+			}, true
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	_, err = emitter.Emit(ctx, runningObservation(fixedTime))
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Emit error = %v, want ErrInvalidRecord", err)
+	}
+	if got := countReceipts(t, ctx, store); got != 0 {
+		t.Fatalf("receipt count after obligation failure = %d, want rollback", got)
+	}
+	obligations, err := ListDeliveryObligations(ctx, store, DeliveryObligationFilter{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 0 {
+		t.Fatalf("delivery obligations after failed transaction = %#v, want none", obligations)
+	}
+}
+
 func TestEmitterMaxSilenceRearmsAfterMisalignedStateChange(t *testing.T) {
 	ctx := context.Background()
 	clock := newPreciseManualClock(fixedTime)

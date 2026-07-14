@@ -13,6 +13,7 @@ import (
 )
 
 var requiredV080Contexts = []string{"verify", "test", "race", "security"}
+var requiredV080ReleaseJobs = []string{"build", "sign", "draft", "smoke", "publish", "failed-draft"}
 
 func TestV080WorkflowPolicy(t *testing.T) {
 	root := repositoryPolicyRoot(t)
@@ -21,6 +22,50 @@ func TestV080WorkflowPolicy(t *testing.T) {
 
 	if err := validateV080WorkflowPolicy(workflow, checks); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestV080ReleaseWorkflowPolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	workflow := loadWorkflowPolicy(t, filepath.Join(root, ".github", "workflows", "release.yml"))
+
+	if err := validateV080ReleaseWorkflowPolicy(workflow); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "scripts", "release-smoke.ps1"))
+	if err != nil {
+		t.Fatalf("read release smoke script: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`Join-Path $scriptRoot "install.sh"`,
+		`Invoke-CandidateInstall -Server $mockReleaseApi`,
+		`Assert-CandidateInstalledBinary -BinaryPath $binary`,
+		`$candidateBinaryHash = Get-SHA256 $candidateBinary`,
+		`LOOPCODER_INSTALL_DIR`,
+		`LOOPCODER_INSTALL_OS`,
+		`LOOPCODER_INSTALL_ARCH`,
+		`LOOPCODER_SMOKE_MV_READY`,
+		`Stop-Process -Id ([int]$mvPid)`,
+		`Assert-CandidateInstalledBinary -BinaryPath $upgradedStableBinary`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("release smoke does not contain required candidate-backed installer seam %q", want)
+		}
+	}
+
+	migrationIndex := strings.Index(script, `& $binary migrate local-state`)
+	installIndex := strings.Index(script, `Invoke-CandidateInstall -Server $mockReleaseApi`)
+	if installIndex < 0 || migrationIndex < 0 || installIndex > migrationIndex {
+		t.Fatalf("release smoke must install the staged candidate before migration smoke")
+	}
+	selfBootstrapIndex := strings.Index(script, `& $selfBootstrapScript -Repo $sourceRepo -Binary $binary`)
+	if selfBootstrapIndex < 0 || installIndex > selfBootstrapIndex {
+		t.Fatalf("release smoke must install the staged candidate before self-bootstrap smoke")
 	}
 }
 
@@ -167,6 +212,127 @@ func TestV080WorkflowPolicyRejectsUnsupportedShapes(t *testing.T) {
 	}
 }
 
+func TestV080ReleaseWorkflowPolicyRejectsUnsupportedShapes(t *testing.T) {
+	baseWorkflow := workflowPolicy{
+		Jobs: map[string]workflowJobPolicy{
+			"build": {
+				RunsOn: yamlScalarOrSequence{Values: []string{"macos-15"}},
+				Steps: []workflowStepPolicy{
+					{Name: "Assert darwin/arm64 Go host", Run: darwinARM64AssertionScript()},
+					{
+						Name: "Build archive",
+						Env: map[string]any{
+							"GOOS":   "darwin",
+							"GOARCH": "arm64",
+							"FORMAT": "tar.gz",
+						},
+						Run: "archive=\"loopcoder_${version}_darwin_arm64.tar.gz\"\nCGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/loopcoder",
+					},
+				},
+			},
+			"sign":         releasePolicyFixtureJob("sign"),
+			"draft":        releasePolicyFixtureJob("draft"),
+			"smoke":        releasePolicyFixtureJob("smoke"),
+			"publish":      releasePolicyFixtureJob("publish"),
+			"failed-draft": releasePolicyFixtureJob("failed-draft"),
+		},
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*workflowPolicy)
+		wantErr string
+	}{
+		{
+			name: "unsupported runner",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["sign"]
+				job.RunsOn = yamlScalarOrSequence{Values: []string{"ubuntu-latest"}}
+				workflow.Jobs["sign"] = job
+			},
+			wantErr: "unsupported runner",
+		},
+		{
+			name: "release matrix",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["smoke"]
+				job.Strategy.Matrix = map[string]any{"os": []any{"macos-15", "windows-latest"}}
+				workflow.Jobs["smoke"] = job
+			},
+			wantErr: "must not define a matrix",
+		},
+		{
+			name: "unsupported build goos",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["build"]
+				job.Steps[1].Env["GOOS"] = "linux"
+				workflow.Jobs["build"] = job
+			},
+			wantErr: "unsupported GOOS",
+		},
+		{
+			name: "unsupported build goarch",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["build"]
+				job.Steps[1].Env["GOARCH"] = "amd64"
+				workflow.Jobs["build"] = job
+			},
+			wantErr: "unsupported GOARCH",
+		},
+		{
+			name: "zip artifact",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["build"]
+				job.Steps[1].Env["FORMAT"] = "zip"
+				workflow.Jobs["build"] = job
+			},
+			wantErr: "unsupported archive format",
+		},
+		{
+			name: "unsupported artifact name",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["build"]
+				job.Steps[1].Run = "archive=\"loopcoder_${version}_windows_amd64.zip\""
+				workflow.Jobs["build"] = job
+			},
+			wantErr: "unsupported release token",
+		},
+		{
+			name: "native smoke targets",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["smoke"]
+				job.Steps = append(job.Steps, workflowStepPolicy{Name: "Smoke matrix", Run: "pwsh scripts/release-smoke.ps1 -Target windows-latest"})
+				workflow.Jobs["smoke"] = job
+			},
+			wantErr: "unsupported release token",
+		},
+		{
+			name: "missing tuple assertion",
+			mutate: func(workflow *workflowPolicy) {
+				job := workflow.Jobs["publish"]
+				job.Steps = []workflowStepPolicy{{Name: "Publish", Run: "gh release view v0.8.0"}}
+				workflow.Jobs["publish"] = job
+			},
+			wantErr: "does not assert darwin/arm64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := cloneWorkflowPolicy(baseWorkflow)
+			tt.mutate(&workflow)
+
+			err := validateV080ReleaseWorkflowPolicy(workflow)
+			if err == nil {
+				t.Fatal("validateV080ReleaseWorkflowPolicy returned nil error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateV080ReleaseWorkflowPolicy error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 type workflowPolicy struct {
 	Jobs map[string]workflowJobPolicy `yaml:"jobs"`
 }
@@ -175,6 +341,7 @@ type workflowJobPolicy struct {
 	Name     string                 `yaml:"name"`
 	RunsOn   yamlScalarOrSequence   `yaml:"runs-on"`
 	Strategy workflowStrategyPolicy `yaml:"strategy"`
+	Env      map[string]any         `yaml:"env"`
 	Steps    []workflowStepPolicy   `yaml:"steps"`
 }
 
@@ -183,8 +350,9 @@ type workflowStrategyPolicy struct {
 }
 
 type workflowStepPolicy struct {
-	Name string `yaml:"name"`
-	Run  string `yaml:"run"`
+	Name string         `yaml:"name"`
+	Run  string         `yaml:"run"`
+	Env  map[string]any `yaml:"env"`
 }
 
 type yamlScalarOrSequence struct {
@@ -241,6 +409,38 @@ func validateV080WorkflowPolicy(workflow workflowPolicy, deliveryChecks []string
 		}
 	}
 
+	return nil
+}
+
+func validateV080ReleaseWorkflowPolicy(workflow workflowPolicy) error {
+	jobIDs := make([]string, 0, len(workflow.Jobs))
+	for jobID := range workflow.Jobs {
+		jobIDs = append(jobIDs, jobID)
+	}
+	if !sameStringSet(jobIDs, requiredV080ReleaseJobs) {
+		return fmt.Errorf("release workflow job contexts = %v, want exactly %v", sortedStrings(jobIDs), requiredV080ReleaseJobs)
+	}
+
+	for _, jobID := range requiredV080ReleaseJobs {
+		job := workflow.Jobs[jobID]
+		if !reflect.DeepEqual(job.RunsOn.Values, []string{"macos-15"}) {
+			return fmt.Errorf("%s uses unsupported runner %v; want [macos-15]", jobID, job.RunsOn.Values)
+		}
+		for _, runner := range job.RunsOn.Values {
+			if unsupportedWorkflowValue(runner) {
+				return fmt.Errorf("%s uses unsupported runner %q", jobID, runner)
+			}
+		}
+		if len(job.Strategy.Matrix) != 0 {
+			return fmt.Errorf("%s must not define a matrix", jobID)
+		}
+		if err := validateWorkflowJobSteps(jobID, job); err != nil {
+			return err
+		}
+		if err := validateReleaseJobContent(jobID, job); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -346,6 +546,95 @@ func unsupportedWorkflowValue(value string) bool {
 		strings.Contains(normalized, "x64")
 }
 
+func validateReleaseJobContent(jobID string, job workflowJobPolicy) error {
+	for key, value := range flattenWorkflowEnv(job.Env) {
+		if err := validateReleaseEnvValue(jobID, key, value); err != nil {
+			return err
+		}
+	}
+	for _, step := range job.Steps {
+		for key, value := range flattenWorkflowEnv(step.Env) {
+			if err := validateReleaseEnvValue(jobID, key, value); err != nil {
+				return err
+			}
+		}
+		if err := validateReleaseRunContent(jobID, step.Run); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateReleaseEnvValue(jobID, key, value string) error {
+	switch key {
+	case "GOOS":
+		if value != "darwin" {
+			return fmt.Errorf("%s has unsupported GOOS %q", jobID, value)
+		}
+	case "GOARCH":
+		if value != "arm64" {
+			return fmt.Errorf("%s has unsupported GOARCH %q", jobID, value)
+		}
+	case "FORMAT":
+		if value != "tar.gz" {
+			return fmt.Errorf("%s has unsupported archive format %q", jobID, value)
+		}
+	}
+	return nil
+}
+
+func validateReleaseRunContent(jobID, run string) error {
+	normalizedRun := strings.ToLower(run)
+	for _, unsupported := range []string{
+		"ubuntu-latest",
+		"windows-latest",
+		"macos-latest",
+		"macos-13",
+		"_linux_",
+		"_windows_",
+		"_amd64",
+		".zip",
+	} {
+		if strings.Contains(normalizedRun, unsupported) {
+			return fmt.Errorf("%s contains unsupported release token %q", jobID, unsupported)
+		}
+	}
+	for _, token := range strings.FieldsFunc(run, func(r rune) bool {
+		return !(r == '_' || r == '-' || r == '.' || r == '/' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
+	}) {
+		normalized := strings.ToLower(strings.TrimSpace(token))
+		if normalized == "" {
+			continue
+		}
+		switch {
+		case normalized == "ubuntu-latest" ||
+			normalized == "windows-latest" ||
+			normalized == "macos-latest" ||
+			normalized == "macos-13" ||
+			normalized == "linux" ||
+			normalized == "windows" ||
+			normalized == "amd64" ||
+			normalized == "x64" ||
+			normalized == "zip":
+			return fmt.Errorf("%s contains unsupported release token %q", jobID, token)
+		case strings.HasPrefix(normalized, "loopcoder_") &&
+			normalized != "loopcoder_" &&
+			!strings.Contains(normalized, "loopcoder_${version}_darwin_arm64.tar.gz") &&
+			!strings.Contains(normalized, "loopcoder_${asset_version}_darwin_arm64.tar.gz"):
+			return fmt.Errorf("%s contains unsupported release token %q", jobID, token)
+		}
+	}
+	return nil
+}
+
+func flattenWorkflowEnv(env map[string]any) map[string]string {
+	out := make(map[string]string, len(env))
+	for key, value := range env {
+		out[key] = fmt.Sprint(value)
+	}
+	return out
+}
+
 func flattenWorkflowValues(value any) []string {
 	switch typed := value.(type) {
 	case nil:
@@ -385,6 +674,10 @@ func cloneWorkflowPolicy(workflow workflowPolicy) workflowPolicy {
 		job.RunsOn.Values = append([]string(nil), job.RunsOn.Values...)
 		job.Steps = append([]workflowStepPolicy(nil), job.Steps...)
 		job.Strategy.Matrix = cloneWorkflowMap(job.Strategy.Matrix)
+		job.Env = cloneWorkflowMap(job.Env)
+		for index := range job.Steps {
+			job.Steps[index].Env = cloneWorkflowMap(job.Steps[index].Env)
+		}
 		clone.Jobs[jobID] = job
 	}
 	return clone
@@ -418,4 +711,14 @@ func cloneWorkflowValue(value any) any {
 
 func darwinARM64AssertionScript() string {
 	return "test \"$(go env GOOS)\" = darwin\ntest \"$(go env GOARCH)\" = arm64"
+}
+
+func releasePolicyFixtureJob(name string) workflowJobPolicy {
+	return workflowJobPolicy{
+		RunsOn: yamlScalarOrSequence{Values: []string{"macos-15"}},
+		Steps: []workflowStepPolicy{
+			{Name: "Assert darwin/arm64 Go host", Run: darwinARM64AssertionScript()},
+			{Name: name, Run: "printf '%s\\n' loopcoder_${version}_darwin_arm64.tar.gz"},
+		},
+	}
 }

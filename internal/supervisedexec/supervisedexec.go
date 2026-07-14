@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/process"
 )
 
 // DefaultHardCap is the package-level fallback used when Options.HardCap is
@@ -82,6 +83,9 @@ type Options struct {
 	// a per-run kill-group (spec 0390, Decision 11). Both may be empty.
 	RunID string
 	Role  string
+	// OnStart is called after the provider process starts and is adopted into
+	// its kill-group, before Run reports any running state to callers.
+	OnStart func(StartedProcess) error
 }
 
 // Result reports the outcome of a supervised command.
@@ -90,6 +94,16 @@ type Result struct {
 	ExitCode int
 	Killed   bool
 	Elapsed  time.Duration
+}
+
+type StartedProcess struct {
+	PID                   int
+	PGID                  int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ObservedAt            time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
 }
 
 type waitResult struct {
@@ -153,6 +167,17 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		deregisterProc(managedPID)
 		group.close()
 	}()
+	if opts.OnStart != nil {
+		started, snapshotErr := startedProcessSnapshot(managedPID, start)
+		if snapshotErr != nil {
+			_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, snapshotErr)
+			return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, snapshotErr
+		}
+		if err := opts.OnStart(started); err != nil {
+			_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, err)
+			return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, err
+		}
+	}
 
 	waitCh := make(chan waitResult, 1)
 	go func() {
@@ -259,6 +284,31 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			}
 		}
 	}
+}
+
+func startedProcessSnapshot(pid int, observedAt time.Time) (StartedProcess, error) {
+	identity, err := process.Snapshot(pid, observedAt)
+	if err != nil {
+		return StartedProcess{}, err
+	}
+	return StartedProcess{
+		PID:                   identity.PID,
+		PGID:                  identity.PGID,
+		ProcessBirthIdentity:  identity.ProcessBirthIdentity,
+		ExecutableIdentity:    identity.ExecutableIdentity,
+		ObservedAt:            identity.ObservedAt,
+		IdentityAmbiguous:     identity.Ambiguous,
+		IdentityAmbiguityNote: identity.AmbiguityReason,
+	}, nil
+}
+
+func waitStartedProcess(cmd *exec.Cmd) <-chan waitResult {
+	waitCh := make(chan waitResult, 1)
+	go func() {
+		err := cmd.Wait()
+		waitCh <- waitResult{err: err, state: cmd.ProcessState}
+	}()
+	return waitCh
 }
 
 func normalizeOptions(opts Options) Options {

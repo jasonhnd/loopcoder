@@ -104,19 +104,23 @@ type DispatchOptions struct {
 }
 
 type DispatchResult struct {
-	OK          bool             `json:"ok"`
-	Issue       int              `json:"issue"`
-	Branch      string           `json:"branch"`
-	RunID       string           `json:"run_id"`
-	PR          string           `json:"pr"`
-	Summary     string           `json:"summary"`
-	AttemptPath string           `json:"attempt_path"`
-	Status      string           `json:"status"`
-	ExitCode    int              `json:"exit_code"`
-	LogBytes    int64            `json:"log_bytes"`
-	Reason      string           `json:"reason,omitempty"`
-	NextAction  string           `json:"next_action,omitempty"`
-	Report      *reporter.Report `json:"report,omitempty"`
+	OK              bool             `json:"ok"`
+	Issue           int              `json:"issue"`
+	Branch          string           `json:"branch"`
+	RunID           string           `json:"run_id"`
+	PR              string           `json:"pr"`
+	Summary         string           `json:"summary"`
+	AttemptPath     string           `json:"attempt_path"`
+	Status          string           `json:"status"`
+	Outcome         string           `json:"outcome,omitempty"`
+	ProviderOutcome string           `json:"provider_outcome,omitempty"`
+	DeliveryOutcome string           `json:"delivery_outcome,omitempty"`
+	Evidence        []string         `json:"evidence,omitempty"`
+	ExitCode        int              `json:"exit_code"`
+	LogBytes        int64            `json:"log_bytes"`
+	Reason          string           `json:"reason,omitempty"`
+	NextAction      string           `json:"next_action,omitempty"`
+	Report          *reporter.Report `json:"report,omitempty"`
 }
 
 type Result struct {
@@ -431,6 +435,20 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				record.Status = StatusHung
 				record.Error = ensureHungReason(record.Error)
 			}
+			if dispatchProviderWorkReusable(dispatchResult) {
+				record.Status = "needs-human"
+				if strings.EqualFold(dispatchResult.Outcome, "delivery_failed") {
+					record.Status = "failed"
+				}
+				_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+				recoveryAttempts = append(recoveryAttempts, record)
+				if data, marshalErr := json.Marshal(dispatchResult); marshalErr == nil {
+					report.WriteString(string(data) + "\n")
+				}
+				report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, "provider work completed; retry only delivery finalization: "+record.Error))
+				emitRecoveryProgress(ctx, opts, "recovery-blocked", "provider work reusable; delivery finalization failed", true)
+				return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+			}
 			if opts.CircuitBreaker.Enabled() {
 				decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, record.Error)
 				if !decision.Allowed {
@@ -586,6 +604,18 @@ func emitRecoveryProgress(ctx context.Context, opts Options, status, detail stri
 	}
 	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
 		progress.ReportDiagnostic(ctx, opts.Progress, observation, err)
+	}
+}
+
+func dispatchProviderWorkReusable(result DispatchResult) bool {
+	if !strings.EqualFold(strings.TrimSpace(result.ProviderOutcome), "provider_completed") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Outcome)) {
+	case "delivery_failed", "push_conflict":
+		return true
+	default:
+		return false
 	}
 }
 

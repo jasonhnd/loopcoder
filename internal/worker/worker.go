@@ -59,20 +59,39 @@ type Options struct {
 }
 
 type Result struct {
-	OK          bool             `json:"ok"`
-	Issue       int              `json:"issue"`
-	Branch      string           `json:"branch"`
-	RunID       string           `json:"run_id"`
-	PR          string           `json:"pr"`
-	Summary     string           `json:"summary"`
-	AttemptPath string           `json:"attempt_path"`
-	Status      string           `json:"status"`
-	ExitCode    int              `json:"exit_code"`
-	LogBytes    int64            `json:"log_bytes"`
-	Reason      string           `json:"reason,omitempty"`
-	NextAction  string           `json:"next_action,omitempty"`
-	Report      *reporter.Report `json:"report,omitempty"`
+	OK              bool             `json:"ok"`
+	Issue           int              `json:"issue"`
+	Branch          string           `json:"branch"`
+	RunID           string           `json:"run_id"`
+	PR              string           `json:"pr"`
+	Summary         string           `json:"summary"`
+	AttemptPath     string           `json:"attempt_path"`
+	Status          string           `json:"status"`
+	Outcome         string           `json:"outcome,omitempty"`
+	ProviderOutcome string           `json:"provider_outcome,omitempty"`
+	DeliveryOutcome string           `json:"delivery_outcome,omitempty"`
+	Evidence        []string         `json:"evidence,omitempty"`
+	ExitCode        int              `json:"exit_code"`
+	LogBytes        int64            `json:"log_bytes"`
+	Reason          string           `json:"reason,omitempty"`
+	NextAction      string           `json:"next_action,omitempty"`
+	Report          *reporter.Report `json:"report,omitempty"`
 }
+
+type Outcome string
+
+const (
+	OutcomeProviderFailed     Outcome = "provider_failed"
+	OutcomeProviderCompleted  Outcome = "provider_completed"
+	OutcomeNoChangesExpected  Outcome = "no_changes_expected"
+	OutcomeNoChangesInvalid   Outcome = "no_changes_invalid"
+	OutcomePushAlreadyApplied Outcome = "push_already_applied"
+	OutcomePushConflict       Outcome = "push_conflict"
+	OutcomePRCreated          Outcome = "pr_created"
+	OutcomePRAdopted          Outcome = "pr_adopted"
+	OutcomeDeliveryFailed     Outcome = "delivery_failed"
+	OutcomeNeedsHuman         Outcome = "needs_human"
+)
 
 type GitClient interface {
 	FetchOriginBase(ctx context.Context, repoPath, baseBranch string) error
@@ -155,17 +174,18 @@ type dispatchContext struct {
 	github   GitHubClient
 	agentRun agent.Runner
 
-	scratch        string
-	worktreePath   string
-	promptPath     string
-	summaryPath    string
-	logPath        string
-	runtimeRoots   runtimepath.Roots
-	ownershipStore storage.Store
-	ownershipLease *storage.AgentOwnershipLease
-	jobID          string
-	attemptPath    string
-	tracker        *attemptTracker
+	scratch                string
+	worktreePath           string
+	promptPath             string
+	summaryPath            string
+	logPath                string
+	runtimeRoots           runtimepath.Roots
+	ownershipStore         storage.Store
+	ownershipLease         *storage.AgentOwnershipLease
+	providerAuthorityFence *storage.ProviderExecutionAuthorityFence
+	jobID                  string
+	attemptPath            string
+	tracker                *attemptTracker
 
 	domainPolicy      domainWorkerPolicy
 	progressRecorder  *progressRecorder
@@ -181,6 +201,11 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	dispatch, err := prepareDispatch(ctx, opts, deps)
 	if err != nil {
 		return Result{}, err
+	}
+	if adopted, ok, err := adoptExistingBranchPRPreflight(ctx, dispatch); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: preflight branch PR lookup failed; continuing provider execution: %v\n", err)
+	} else if ok {
+		return adopted, nil
 	}
 	if err := prepareWorktree(ctx, dispatch); err != nil {
 		writeRecovery(ctx, dispatch, err)
@@ -200,10 +225,11 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		return result, err
 	}
 	if agentErr != nil {
-		return Result{}, fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
+		return providerFailureResult(dispatch, agentResult, fmt.Sprintf("%s exec failed: %v", dispatch.opts.Provider, agentErr)), fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
 	}
 	if agentResult.ExitCode != 0 {
-		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
+		err := fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
+		return providerFailureResult(dispatch, agentResult, err.Error()), err
 	}
 	return commitAndOpenPR(ctx, dispatch, agentResult)
 }
@@ -385,8 +411,8 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
 
-	dispatch.activePhase = "codex_started"
-	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	dispatch.activePhase = "codex_launching"
+	dispatch.tracker.snapshot(dispatch.activePhase, state.StatusLaunching)
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
 	if err != nil {
 		return agent.Invocation{}, err
@@ -416,6 +442,15 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
 		MCPServers:      mcpServers,
+		OnProviderStart: func(started agent.ProviderProcess) error {
+			if err := persistProviderExecutionAuthority(ctx, dispatch, started); err != nil {
+				return err
+			}
+			dispatch.tracker.setPID(started.PID)
+			dispatch.activePhase = "codex_started"
+			dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
+			return nil
+		},
 	}, nil
 }
 
@@ -426,6 +461,10 @@ func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.I
 	agentResult, agentErr := dispatch.agentRun.Run(ctx, invocation)
 	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
 		return agentResult, err
+	}
+	if dispatch.activePhase == "codex_launching" {
+		dispatch.activePhase = "codex_started"
+		dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
 	}
 	dispatch.activePhase = "codex_exited"
 	var exitCodePtr *int
@@ -539,6 +578,11 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	if trimmed := strings.TrimSpace(agentResult.Summary); trimmed != "" {
 		summary = trimmed
 	}
+	if adopted, ok, err := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "existing branch PR found before finalization"); err != nil {
+		return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "failed to query existing branch PRs", []string{err.Error()}), fmt.Errorf("query existing branch PRs: %w", err)
+	} else if ok {
+		return adopted, nil
+	}
 
 	dispatch.activePhase = "dirty_checked"
 	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
@@ -549,7 +593,37 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 		return Result{}, fmt.Errorf("git status --porcelain: %w", err)
 	}
 	if strings.TrimSpace(dirty) == "" {
-		return Result{}, fmt.Errorf("codex made no file changes for issue #%d (nothing to commit)", dispatch.opts.IssueNumber)
+		outcome := OutcomeNoChangesInvalid
+		status := state.StatusFailed
+		ok := false
+		nextAction := "inspect the worker report and recover with implementation changes"
+		if noChangesExpected(summary) {
+			outcome = OutcomeNoChangesExpected
+			status = state.StatusSucceeded
+			ok = true
+			nextAction = "no action required; worker reported a valid no-op"
+			dispatch.dispatchSucceeded = true
+		}
+		evidence := []string{
+			"provider_completed",
+			"git status --porcelain returned no file changes",
+			"summary=" + summary,
+		}
+		result := finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+			OK:              ok,
+			Status:          status,
+			Outcome:         outcome,
+			DeliveryOutcome: outcome,
+			Evidence:        evidence,
+			NextAction:      nextAction,
+			PR:              "",
+		})
+		if ok {
+			dispatch.tracker.transition(dispatch.activePhase, status, dispatch.tracker.exitCode, nil)
+			return result, nil
+		}
+		err := fmt.Errorf("%s: %s", outcome, "provider completed but produced no file changes")
+		return result, err
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
@@ -573,7 +647,29 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 		return Result{}, err
 	}
 	if err := dispatch.deps.Git.PushUpstream(ctx, dispatch.worktreePath, dispatch.opts.Branch); err != nil {
-		return Result{}, fmt.Errorf("git push -u origin %s: %w", dispatch.opts.Branch, err)
+		if adopted, ok, adoptErr := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePushAlreadyApplied, "push failed but branch PR already exists"); adoptErr != nil {
+			return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "push failed and existing branch PR lookup failed", []string{err.Error(), adoptErr.Error()}), fmt.Errorf("git push -u origin %s: %w; PR lookup: %v", dispatch.opts.Branch, err, adoptErr)
+		} else if ok {
+			return adopted, nil
+		}
+		outcome := OutcomeDeliveryFailed
+		status := state.StatusFailed
+		nextAction := "retry delivery finalization after resolving the push failure"
+		if isPushConflict(err) {
+			outcome = OutcomePushConflict
+			status = state.StatusNeedsHuman
+			nextAction = "inspect the remote branch before retrying delivery; do not overwrite unrelated work"
+			dispatch.failureStatus = state.StatusNeedsHuman
+		}
+		result := finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+			OK:              false,
+			Status:          status,
+			Outcome:         outcome,
+			DeliveryOutcome: outcome,
+			Evidence:        []string{"provider_completed", "git push failed: " + err.Error()},
+			NextAction:      nextAction,
+		})
+		return result, fmt.Errorf("%s: git push -u origin %s: %w", outcome, dispatch.opts.Branch, err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
@@ -581,29 +677,34 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
 		return Result{}, err
 	}
+	if adopted, ok, err := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "existing branch PR found before PR creation"); err != nil {
+		return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "failed to query existing branch PRs before PR creation", []string{err.Error()}), fmt.Errorf("query existing branch PRs before PR creation: %w", err)
+	} else if ok {
+		return adopted, nil
+	}
 	body := buildPRBody(dispatch.opts.IssueNumber, summary)
 	prURL, err := dispatch.github.CreatePR(ctx, dispatch.opts.Branch, dispatch.opts.BaseBranch, dispatch.opts.IssueTitle, body)
 	if err != nil {
-		return Result{}, fmt.Errorf("gh pr create: %w", err)
+		if adopted, ok, adoptErr := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "PR creation failed but branch PR already exists"); adoptErr != nil {
+			return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "PR creation failed and existing branch PR lookup failed", []string{err.Error(), adoptErr.Error()}), fmt.Errorf("gh pr create: %w; PR lookup: %v", err, adoptErr)
+		} else if ok {
+			return adopted, nil
+		}
+		result := finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "GitHub PR creation failed after provider completed", []string{"provider_completed", "gh pr create failed: " + err.Error()})
+		return result, fmt.Errorf("%s: gh pr create: %w", OutcomeDeliveryFailed, err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "succeeded", dispatch.tracker.exitCode, nil)
 	dispatch.dispatchSucceeded = true
 
-	exitCode := 0
-	logBytes := fileSize(dispatch.logPath)
-	return Result{
-		OK:          true,
-		Issue:       dispatch.opts.IssueNumber,
-		Branch:      dispatch.opts.Branch,
-		RunID:       dispatch.opts.RunID,
-		PR:          prURL,
-		Summary:     summary,
-		AttemptPath: dispatch.attemptPath,
-		Status:      "succeeded",
-		ExitCode:    exitCode,
-		LogBytes:    logBytes,
-		Report:      &reportRecord,
-	}, nil
+	return finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+		OK:              true,
+		Status:          state.StatusSucceeded,
+		Outcome:         OutcomePRCreated,
+		DeliveryOutcome: OutcomePRCreated,
+		Evidence:        []string{"provider_completed", "pushed branch " + dispatch.opts.Branch, "created PR " + prURL},
+		NextAction:      "review the pull request",
+		PR:              prURL,
+	}), nil
 }
 
 func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error) {
@@ -665,6 +766,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 				reason = "keep-worktree requested"
 			}
 			preserveAttemptArtifacts(dispatch, reason, nil)
+			completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 			releaseWorkerOwnership(dispatch)
 			return
 		}
@@ -672,6 +774,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: refused cleanup without active ownership fence for %s: %v\n", dispatch.worktreePath, err)
 			selectArtifactPreservation(dispatch, "cleanup ownership refused", []string{err.Error()})
 			preserveAttemptArtifacts(dispatch, "cleanup ownership refused", []string{err.Error()})
+			completeProviderExecutionAuthority(dispatch, state.StatusNeedsHuman)
 			return
 		}
 		selectArtifactCleanup(dispatch, "successful attempt cleanup")
@@ -690,10 +793,12 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove scratch %s: %v", dispatch.scratch, cleanupErr))
 		}
 		completeArtifactCleanup(dispatch, cleanupErrors)
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if failure == nil {
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 		releaseWorkerOwnership(dispatch)
 		return
 	}
@@ -701,6 +806,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		dispatch.failureStatus = state.FailureStatus(failure)
 	}
 	writeRecovery(ctx, dispatch, failure)
+	completeProviderExecutionAuthority(dispatch, dispatch.failureStatus)
 	releaseWorkerOwnership(dispatch)
 }
 
@@ -817,6 +923,249 @@ func buildCommitMessage(title string, issueNumber int) string {
 
 func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
+}
+
+type finalizationResultOptions struct {
+	OK              bool
+	Status          string
+	Outcome         Outcome
+	DeliveryOutcome Outcome
+	Evidence        []string
+	NextAction      string
+	PR              string
+}
+
+func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, reason string) Result {
+	return Result{
+		OK:              false,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		AttemptPath:     dispatch.attemptPath,
+		Status:          state.FailureStatus(errors.New(reason)),
+		Outcome:         string(OutcomeProviderFailed),
+		ProviderOutcome: string(OutcomeProviderFailed),
+		Evidence:        []string{reason},
+		ExitCode:        agentResult.ExitCode,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          "outcome=provider_failed evidence=" + reason,
+		NextAction:      "inspect the provider log and retry provider execution if appropriate",
+	}
+}
+
+func finalizationFailureResult(dispatch *dispatchContext, report *reporter.Report, summary string, outcome Outcome, reason string, evidence []string) Result {
+	return finalizationResult(dispatch, report, summary, finalizationResultOptions{
+		OK:              false,
+		Status:          state.StatusFailed,
+		Outcome:         outcome,
+		DeliveryOutcome: outcome,
+		Evidence:        append([]string{reason}, evidence...),
+		NextAction:      "retry delivery finalization; provider work can be reused",
+	})
+}
+
+func finalizationResult(dispatch *dispatchContext, report *reporter.Report, summary string, opts finalizationResultOptions) Result {
+	status := firstNonEmpty(opts.Status, state.StatusFailed)
+	outcome := string(opts.Outcome)
+	evidence := compactEvidence(opts.Evidence)
+	return Result{
+		OK:              opts.OK,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		PR:              opts.PR,
+		Summary:         summary,
+		AttemptPath:     dispatch.attemptPath,
+		Status:          status,
+		Outcome:         outcome,
+		ProviderOutcome: string(OutcomeProviderCompleted),
+		DeliveryOutcome: string(opts.DeliveryOutcome),
+		Evidence:        evidence,
+		ExitCode:        0,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          finalizationReason(outcome, evidence),
+		NextAction:      opts.NextAction,
+		Report:          report,
+	}
+}
+
+func finalizationReason(outcome string, evidence []string) string {
+	if len(evidence) == 0 {
+		return "outcome=" + outcome
+	}
+	return "outcome=" + outcome + " evidence=" + strings.Join(evidence, "; ")
+}
+
+func compactEvidence(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func adoptExistingBranchPR(ctx context.Context, dispatch *dispatchContext, report *reporter.Report, summary string, outcome Outcome, evidence string) (Result, bool, error) {
+	if dispatch.github == nil {
+		return Result{}, false, nil
+	}
+	prs, err := dispatch.github.ListHeadPRs(ctx, dispatch.opts.Branch)
+	if err != nil {
+		return Result{}, false, err
+	}
+	if len(prs) == 0 {
+		return Result{}, false, nil
+	}
+	pr := prs[0]
+	prURL := strings.TrimSpace(pr.URL)
+	if prURL == "" && pr.Number > 0 {
+		prURL = fmt.Sprintf("#%d", pr.Number)
+	}
+	dispatch.tracker.transition(dispatch.activePhase, state.StatusSucceeded, dispatch.tracker.exitCode, nil)
+	dispatch.dispatchSucceeded = true
+	return finalizationResult(dispatch, report, summary, finalizationResultOptions{
+		OK:              true,
+		Status:          state.StatusSucceeded,
+		Outcome:         outcome,
+		DeliveryOutcome: outcome,
+		Evidence:        []string{"provider_completed", evidence, fmt.Sprintf("pr=%s", prURL)},
+		NextAction:      "review the existing pull request",
+		PR:              prURL,
+	}), true, nil
+}
+
+func adoptExistingBranchPRPreflight(ctx context.Context, dispatch *dispatchContext) (Result, bool, error) {
+	if dispatch.github == nil {
+		return Result{}, false, nil
+	}
+	prs, err := dispatch.github.ListHeadPRs(ctx, dispatch.opts.Branch)
+	if err != nil {
+		return Result{}, false, err
+	}
+	if len(prs) == 0 {
+		return Result{}, false, nil
+	}
+	reportRecord, attemptPath, foundReport := reusableBranchReport(dispatch)
+	if !foundReport && dispatch.opts.Attempt <= 1 {
+		return Result{}, false, nil
+	}
+	summary := "existing branch PR adopted without provider execution"
+	pr := prs[0]
+	prURL := strings.TrimSpace(pr.URL)
+	if prURL == "" && pr.Number > 0 {
+		prURL = fmt.Sprintf("#%d", pr.Number)
+	}
+	evidence := []string{"existing branch PR found before provider launch", fmt.Sprintf("pr=%s", prURL)}
+	if attemptPath != "" {
+		evidence = append(evidence, "reused_report_attempt="+attemptPath)
+	}
+	result := Result{
+		OK:              true,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		PR:              prURL,
+		Summary:         summary,
+		AttemptPath:     attemptPath,
+		Status:          state.StatusSucceeded,
+		Outcome:         string(OutcomePRAdopted),
+		ProviderOutcome: string(OutcomeProviderCompleted),
+		DeliveryOutcome: string(OutcomePRAdopted),
+		Evidence:        compactEvidence(evidence),
+		ExitCode:        0,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          finalizationReason(string(OutcomePRAdopted), evidence),
+		NextAction:      "review the existing pull request",
+		Report:          reportRecord,
+	}
+	return result, true, nil
+}
+
+func reusableBranchReport(dispatch *dispatchContext) (*reporter.Report, string, bool) {
+	attempts, err := state.LoadAttempts(dispatch.repoPath, dispatch.opts.RunID)
+	if err == nil {
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if attempt.Issue != dispatch.opts.IssueNumber || attempt.Branch != dispatch.opts.Branch || attempt.Report == nil {
+				continue
+			}
+			return attempt.Report, attempt.Path, true
+		}
+	}
+	now := state.FormatTimestamp(dispatch.deps.Now())
+	zero := int64(0)
+	return &reporter.Report{
+		WorkID:      dispatch.opts.RunID,
+		Issue:       dispatch.opts.IssueNumber,
+		Branch:      dispatch.opts.Branch,
+		Role:        reporter.RoleWorker,
+		Provider:    firstNonEmpty(dispatch.opts.Provider, "local"),
+		Model:       firstNonEmpty(dispatch.opts.Model, "unknown"),
+		ModelSource: reporter.ModelSourceForProvider(dispatch.opts.Provider),
+		Effort:      dispatch.opts.Effort,
+		Permission:  reporter.PermissionWrite,
+		Action:      fmt.Sprintf("adopt existing PR for issue #%d", dispatch.opts.IssueNumber),
+		ExitCode:    0,
+		StartedAt:   now,
+		EndedAt:     now,
+		DurationMS:  0,
+		Usage: reporter.Usage{
+			TotalTokens: &zero,
+		},
+		Verified: true,
+	}, "", false
+}
+
+func noChangesExpected(summary string) bool {
+	summary = strings.ToLower(strings.TrimSpace(summary))
+	if summary == "" {
+		return false
+	}
+	for _, signal := range []string{
+		"no changes expected",
+		"no file changes expected",
+		"valid no-op",
+		"valid noop",
+		"no-op",
+		"noop",
+		"already implemented",
+		"already satisfied",
+		"nothing to change",
+		"no changes needed",
+	} {
+		if strings.Contains(summary, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPushConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrExist) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, signal := range []string{
+		"non-fast-forward",
+		"fetch first",
+		"rejected",
+		"failed to push some refs",
+		"stale info",
+		"already exists",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 type scratchOwnerRecord struct {
@@ -1741,6 +2090,62 @@ func validateWorkerOwnership(ctx context.Context, dispatch *dispatchContext) err
 	return nil
 }
 
+func persistProviderExecutionAuthority(ctx context.Context, dispatch *dispatchContext, started agent.ProviderProcess) error {
+	if dispatch == nil || dispatch.tracker == nil {
+		return errors.New("provider execution authority dispatch context is missing")
+	}
+	if started.PID <= 0 {
+		return errors.New("provider execution authority provider pid is missing")
+	}
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return err
+	}
+	if dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return nil
+	}
+	startedAt := started.ObservedAt
+	if startedAt.IsZero() {
+		startedAt = dispatch.deps.Now()
+	}
+	authority := storage.ProviderExecutionAuthority{
+		ProjectID:            dispatch.runtimeRoots.ProjectID,
+		RunID:                dispatch.opts.RunID,
+		AttemptID:            dispatch.jobID,
+		ProviderPID:          started.PID,
+		ProviderPGID:         started.PGID,
+		ProcessBirthIdentity: started.ProcessBirthIdentity,
+		ExecutableIdentity:   started.ExecutableIdentity,
+		OwnerID:              dispatch.ownershipLease.OwnerID,
+		ClaimGeneration:      dispatch.ownershipLease.ClaimGeneration,
+		StartedAt:            state.FormatTimestamp(startedAt),
+		HeartbeatAt:          state.FormatTimestamp(startedAt),
+		WorktreePath:         dispatch.worktreePath,
+		LogPath:              dispatch.logPath,
+		IdentityAmbiguous:    started.IdentityAmbiguous,
+		AmbiguityReason:      started.IdentityAmbiguityNote,
+	}
+	if _, err := storage.PersistProviderExecutionAuthority(ctx, dispatch.ownershipStore, authority, startedAt); err != nil {
+		return fmt.Errorf("persist provider execution authority: %w", err)
+	}
+	dispatch.providerAuthorityFence = &storage.ProviderExecutionAuthorityFence{
+		ProjectID:       authority.ProjectID,
+		RunID:           authority.RunID,
+		AttemptID:       authority.AttemptID,
+		OwnerID:         authority.OwnerID,
+		ClaimGeneration: authority.ClaimGeneration,
+	}
+	return nil
+}
+
+func completeProviderExecutionAuthority(dispatch *dispatchContext, terminalState string) {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.providerAuthorityFence == nil {
+		return
+	}
+	if err := storage.CompleteProviderExecutionAuthority(context.Background(), dispatch.ownershipStore, *dispatch.providerAuthorityFence, dispatch.deps.Now(), terminalState); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to complete provider execution authority for %s/%s: %v\n", dispatch.opts.RunID, dispatch.jobID, err)
+	}
+}
+
 func releaseWorkerOwnership(dispatch *dispatchContext) {
 	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
 		return
@@ -1854,8 +2259,26 @@ func (t *attemptTracker) setReport(record reporter.Report) {
 	t.reporter = cloneReport(&record)
 }
 
+func (t *attemptTracker) setPID(pid int) {
+	if pid > 0 {
+		t.pid = pid
+	}
+}
+
 func (t *attemptTracker) setArtifactDecision(decision state.ArtifactDecision) {
 	t.artifactDecision = cloneArtifactDecision(&decision)
+}
+
+func (t *attemptTracker) snapshot(phase, status string) {
+	now := state.FormatTimestamp(t.now())
+	if strings.TrimSpace(phase) != "" {
+		t.phase = phase
+	}
+	if strings.TrimSpace(status) != "" {
+		t.status = status
+	}
+	t.heartbeatAt = now
+	t.writeAttempt()
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
