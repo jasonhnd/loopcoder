@@ -98,6 +98,36 @@ func TestV080WorkflowPolicyRejectsUnsupportedShapes(t *testing.T) {
 			wantErr: "does not assert darwin/arm64",
 		},
 		{
+			name: "tuple assertion after substantive work",
+			mutate: func(workflow *workflowPolicy, checks *[]string) {
+				job := workflow.Jobs["test"]
+				job.Steps = []workflowStepPolicy{
+					{Name: "Go test", Run: "go test ./..."},
+					{Name: "Assert darwin/arm64 Go host", Run: darwinARM64AssertionScript()},
+				}
+				workflow.Jobs["test"] = job
+			},
+			wantErr: "before substantive work",
+		},
+		{
+			name: "mapfile bash4 builtin",
+			mutate: func(workflow *workflowPolicy, checks *[]string) {
+				job := workflow.Jobs["verify"]
+				job.Steps = append(job.Steps, workflowStepPolicy{Name: "YAML", Run: "mapfile -t yaml_files < paths.txt"})
+				workflow.Jobs["verify"] = job
+			},
+			wantErr: "Bash 4-only builtin",
+		},
+		{
+			name: "readarray bash4 builtin",
+			mutate: func(workflow *workflowPolicy, checks *[]string) {
+				job := workflow.Jobs["verify"]
+				job.Steps = append(job.Steps, workflowStepPolicy{Name: "YAML", Run: "readarray -t yaml_files < paths.txt"})
+				workflow.Jobs["verify"] = job
+			},
+			wantErr: "Bash 4-only builtin",
+		},
+		{
 			name: "legacy context",
 			mutate: func(workflow *workflowPolicy, checks *[]string) {
 				workflow.Jobs["go"] = workflow.Jobs["test"]
@@ -206,8 +236,8 @@ func validateV080WorkflowPolicy(workflow workflowPolicy, deliveryChecks []string
 				return fmt.Errorf("%s has unsupported matrix value %q", jobID, value)
 			}
 		}
-		if !jobAssertsDarwinARM64(job) {
-			return fmt.Errorf("%s does not assert darwin/arm64 before substantive work", jobID)
+		if err := validateWorkflowJobSteps(jobID, job); err != nil {
+			return err
 		}
 	}
 
@@ -262,13 +292,43 @@ func repositoryPolicyRoot(t *testing.T) string {
 	}
 }
 
-func jobAssertsDarwinARM64(job workflowJobPolicy) bool {
-	for _, step := range job.Steps {
+func validateWorkflowJobSteps(jobID string, job workflowJobPolicy) error {
+	asserted := false
+	for index, step := range job.Steps {
 		run := step.Run
-		if strings.Contains(run, "go env GOOS") &&
-			strings.Contains(run, "go env GOARCH") &&
-			strings.Contains(run, "darwin") &&
-			strings.Contains(run, "arm64") {
+		if run == "" {
+			continue
+		}
+		if usesBash4OnlyBuiltin(run) {
+			return fmt.Errorf("%s step %q uses Bash 4-only builtin", jobID, step.Name)
+		}
+		if assertsDarwinARM64(run) {
+			asserted = true
+			continue
+		}
+		if !asserted {
+			return fmt.Errorf("%s does not assert darwin/arm64 before substantive work; first run step %d is %q", jobID, index+1, step.Name)
+		}
+	}
+	if !asserted {
+		return fmt.Errorf("%s does not assert darwin/arm64 before substantive work", jobID)
+	}
+	return nil
+}
+
+func assertsDarwinARM64(run string) bool {
+	return strings.Contains(run, "go env GOOS") &&
+		strings.Contains(run, "go env GOARCH") &&
+		strings.Contains(run, "darwin") &&
+		strings.Contains(run, "arm64")
+}
+
+func usesBash4OnlyBuiltin(run string) bool {
+	for _, field := range strings.FieldsFunc(run, func(r rune) bool {
+		return !(r == '_' || r == '-' || r == '/' || r == '.' || r == ':' || r == '$' || r == '{' || r == '}' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
+	}) {
+		switch field {
+		case "mapfile", "readarray":
 			return true
 		}
 	}

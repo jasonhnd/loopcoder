@@ -41,53 +41,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t yaml_files < <(
-            {
-              printf '%s\n' '.delivery.yml'
-              find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print
-            } | sort
-          )
+          ruby -e '
+            require "yaml"
 
-          if command -v yq >/dev/null 2>&1; then
-            for file in "${yaml_files[@]}"; do
-              yq '.' "$file" >/dev/null
-            done
-            exit 0
-          fi
-
-          ruby -e 'require "yaml"; ARGV.each { |path| YAML.load_file(path) }' "${yaml_files[@]}"
+            paths = [".delivery.yml"] + Dir.glob([".github/workflows/**/*.yml", ".github/workflows/**/*.yaml"]).select { |path| File.file?(path) }
+            paths.sort.each { |path| YAML.load_file(path) }
+          '
 
       - name: CI check mapping check
-        run: |
-          set -euo pipefail
-
-          if command -v yq >/dev/null 2>&1; then
-            mapfile -t required_checks < <(yq -r '(.ci.checks // []) | .[]' '.delivery.yml')
-            mapfile -t workflow_files < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print | sort)
-            job_ids_file="$(mktemp)"
-            trap 'rm -f "$job_ids_file"' EXIT
-
-            for file in "${workflow_files[@]}"; do
-              yq -r '(.jobs // {}) | keys | .[]' "$file" >>"$job_ids_file"
-            done
-
-            missing=()
-            for check in "${required_checks[@]}"; do
-              if ! grep -Fxq "$check" "$job_ids_file"; then
-                missing+=("$check")
-              fi
-            done
-
-            if ((${#missing[@]} > 0)); then
-              echo "The following ci.checks entries do not match any workflow job id:"
-              printf '  - %s\n' "${missing[@]}"
-              exit 1
-            fi
-
-            exit 0
-          fi
-
-          go test . -run TestV080WorkflowPolicy -count=1
+        run: go test . -run TestV080WorkflowPolicy -count=1
 
       - name: Repository workflow policy
         run: go test . -run TestV080WorkflowPolicy -count=1
