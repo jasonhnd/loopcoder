@@ -4550,8 +4550,17 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	result, err := deps.Dispatch(context.Background(), opts)
 	if err != nil {
+		if result.Report == nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
+		}
+		if strings.TrimSpace(result.Reason) == "" {
+			result.Reason = err.Error()
+		}
+		if strings.TrimSpace(result.NextAction) == "" {
+			result.NextAction = "retry or recover the failed dispatch phase"
+		}
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
-		return 1
 	}
 	if result.Report == nil {
 		fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
