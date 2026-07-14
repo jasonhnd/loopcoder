@@ -259,6 +259,17 @@ type MCPAuth struct {
 type ProviderInventory struct {
 	Executables      map[string][]string `yaml:"executables,omitempty"`
 	ProfileSelection map[string]string   `yaml:"profile_selection,omitempty"`
+	CodexBar         CodexBar            `yaml:"codexbar,omitempty"`
+}
+
+type CodexBar struct {
+	Enabled   bool                  `yaml:"enabled,omitempty"`
+	Providers []CodexBarProviderOpt `yaml:"providers,omitempty"`
+}
+
+type CodexBarProviderOpt struct {
+	Provider   string `yaml:"provider,omitempty"`
+	TrustClass string `yaml:"trust_class,omitempty"`
 }
 
 type RoleDefinition struct {
@@ -614,6 +625,27 @@ func validateProviderInventory(inventory ProviderInventory) error {
 		accountProfileID = strings.TrimSpace(accountProfileID)
 		if !strings.HasPrefix(accountProfileID, "acct_") || len(accountProfileID) < len("acct_")+8 {
 			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection.%s must be an opaque acct_ account profile id", provider)
+		}
+	}
+	if inventory.CodexBar.Enabled {
+		if len(inventory.CodexBar.Providers) == 0 {
+			return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers must list at least one provider when enabled")
+		}
+		seen := map[string]bool{}
+		for index, provider := range inventory.CodexBar.Providers {
+			name := strings.TrimSpace(provider.Provider)
+			if !validMCPServerName(name) {
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].provider %q is not a safe provider key", index, provider.Provider)
+			}
+			if seen[name] {
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].provider %q is duplicated", index, name)
+			}
+			seen[name] = true
+			switch strings.TrimSpace(provider.TrustClass) {
+			case "local-machine", "credential-delegated", "internal-protocol", "browser-session":
+			default:
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].trust_class %q is not allowlisted", index, provider.TrustClass)
+			}
 		}
 	}
 	return nil

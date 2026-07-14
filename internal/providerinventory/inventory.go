@@ -602,6 +602,7 @@ type Deps struct {
 	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
 	RunClaudePTY func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
 	RunGrokACP   func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
+	RunCodexBar  func(context.Context, CodexBarRequest) (CodexBarResult, error)
 	MkdirTemp    func(string, string) (string, error)
 	RemoveAll    func(string) error
 	WriteFile    func(string, []byte, os.FileMode) error
@@ -647,6 +648,7 @@ func DefaultDeps() Deps {
 		RunCodexRPC:  runCodexAppServer,
 		RunClaudePTY: runClaudeUsagePTY,
 		RunGrokACP:   runGrokACPBilling,
+		RunCodexBar:  runCodexBarQuota,
 		MkdirTemp:    os.MkdirTemp,
 		RemoveAll:    os.RemoveAll,
 		WriteFile:    os.WriteFile,
@@ -830,6 +832,17 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
 			quotaSnapshots = append(quotaSnapshots, quotaSnapshot)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
+		}
+	}
+	if opts.Config.ProviderInventory.CodexBar.Enabled {
+		sources, snapshots, codexbarProbes := inspectCodexBarQuota(ctx, opts.Config.ProviderInventory.CodexBar, now, deps)
+		quotaTelemetrySources = append(quotaTelemetrySources, sources...)
+		quotaSnapshots = append(quotaSnapshots, snapshots...)
+		probes = append(probes, codexbarProbes...)
+		for _, snapshot := range snapshots {
+			if snapshot.Confidence == ConfidenceUnavailable {
+				gaps = append(gaps, "provider-"+snapshot.AdapterID+"-codexbar-quota-unavailable")
+			}
 		}
 	}
 	quotaSnapshots = LinkQuotaConflicts(quotaSnapshots)
@@ -2871,6 +2884,16 @@ func configuredProviderNames(cfg config.Config) []string {
 			out = append(out, provider)
 		}
 	}
+	if cfg.ProviderInventory.CodexBar.Enabled {
+		for _, provider := range cfg.ProviderInventory.CodexBar.Providers {
+			name := strings.TrimSpace(provider.Provider)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
 	if len(out) == 0 {
 		out = []string{"codex", "claude"}
 	}
@@ -3730,6 +3753,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunGrokACP == nil {
 		deps.RunGrokACP = defaults.RunGrokACP
+	}
+	if deps.RunCodexBar == nil {
+		deps.RunCodexBar = defaults.RunCodexBar
 	}
 	if deps.MkdirTemp == nil {
 		deps.MkdirTemp = defaults.MkdirTemp

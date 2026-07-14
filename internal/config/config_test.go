@@ -123,6 +123,61 @@ func TestParseReadsProviderInventoryProfileSelection(t *testing.T) {
 	}
 }
 
+func TestParseReadsAndValidatesCodexBarOptIn(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+provider_inventory:
+  codexbar:
+    enabled: true
+    providers:
+      - provider: codex
+        trust_class: internal-protocol
+      - provider: claude
+        trust_class: credential-delegated
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if !cfg.ProviderInventory.CodexBar.Enabled || len(cfg.ProviderInventory.CodexBar.Providers) != 2 {
+		t.Fatalf("CodexBar config = %#v", cfg.ProviderInventory.CodexBar)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "enabled with no providers",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n",
+			want: "provider_inventory.codexbar.providers",
+		},
+		{
+			name: "unsafe provider",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: \"codex;all\"\n        trust_class: local-machine\n",
+			want: "safe provider key",
+		},
+		{
+			name: "unknown trust",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: codex\n        trust_class: unknown\n",
+			want: "trust_class",
+		},
+		{
+			name: "duplicate provider",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: codex\n        trust_class: local-machine\n      - provider: codex\n        trust_class: local-machine\n",
+			want: "duplicated",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Parse error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestCustomRoleDefinitionsRoundTripThroughConfigAndJSON(t *testing.T) {
 	cfg, err := Parse([]byte(`
 version: 1
