@@ -17,6 +17,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -283,6 +284,7 @@ func TestDispatchRegisteredRunEmitsProgressReceiptsFromTracker(t *testing.T) {
 	repo := t.TempDir()
 	homeDir := t.TempDir()
 	t.Setenv("LOOPCODER_HOME", homeDir)
+	t.Setenv("CODEX_THREAD_ID", "thread-worker-progress-secret-canary")
 	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
 	clock := newWorkerManualClock(fixedNow())
 	registerWorkerProgressProject(t, ctx, dbPath, repo, clock.Now)
@@ -374,6 +376,55 @@ func TestDispatchRegisteredRunEmitsProgressReceiptsFromTracker(t *testing.T) {
 	receiptsJSON := mustWorkerJSON(t, receipts)
 	if strings.Contains(receiptsJSON, "input_tokens") || strings.Contains(receiptsJSON, "output_tokens") {
 		t.Fatalf("progress receipts unexpectedly contain provider token usage: %s", receiptsJSON)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		Limit:         100,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != len(receipts) {
+		t.Fatalf("delivery obligation count = %d, want one per receipt (%d)", len(obligations), len(receipts))
+	}
+	receiptIDs := map[string]bool{}
+	for _, receipt := range receipts {
+		receiptIDs[receipt.ProgressReceiptID] = true
+	}
+	for _, obligation := range obligations {
+		if !receiptIDs[obligation.ProgressReceiptID] {
+			t.Fatalf("delivery obligation references unknown receipt: %#v", obligation)
+		}
+		if obligation.OriginKind != "host-run-origin" || obligation.SinkKind != "host" {
+			t.Fatalf("delivery obligation origin/sink = %s/%s, want host-run-origin/host", obligation.OriginKind, obligation.SinkKind)
+		}
+		if obligation.TransportContract != runtimecap.HostProgressKnownOriginReplay {
+			t.Fatalf("transport contract = %q, want %q", obligation.TransportContract, runtimecap.HostProgressKnownOriginReplay)
+		}
+		if obligation.AckPolicy != progress.DeliveryAckPolicyNone || obligation.RequiredAck {
+			t.Fatalf("ack policy = %q required=%v, want no-ack", obligation.AckPolicy, obligation.RequiredAck)
+		}
+		if obligation.Status != progress.DeliveryPending {
+			t.Fatalf("delivery obligation status = %q, want pending without host evidence", obligation.Status)
+		}
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{
+		ProjectID:     "proj_worker_progress",
+		DeliveryRunID: "run-progress",
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("delivery acknowledgments = %#v, want none without host evidence", acks)
+	}
+	obligationsJSON := mustWorkerJSON(t, obligations)
+	for _, forbidden := range []string{"thread-worker-progress-secret-canary", repo, "Body", "Implemented dispatch.", "internal/worker/worker.go"} {
+		if strings.Contains(obligationsJSON, forbidden) {
+			t.Fatalf("delivery obligation leaked forbidden value %q: %s", forbidden, obligationsJSON)
+		}
 	}
 }
 
