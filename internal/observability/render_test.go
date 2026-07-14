@@ -3,6 +3,8 @@ package observability
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,6 +43,34 @@ func TestRenderHumanCapabilitiesNarrowWideUnicodeASCII(t *testing.T) {
 		if len([]rune(line)) > 44 {
 			t.Fatalf("narrow line length = %d, want <= 44: %q\n%s", len([]rune(line)), line, narrowASCII)
 		}
+	}
+}
+
+func TestRenderHumanColorAndStableRecordIDPathBehavior(t *testing.T) {
+	attemptPath := filepath.Join(string(os.PathSeparator), "tmp", "repo", ".loopcoder", "runs", "run-color", "workers", "job-1.attempt.json")
+	doc := NewDocument("dispatch", Correlation{DeliveryRunID: "run-color"}, []RenderItem{{
+		ID:         "job-1",
+		Kind:       "worker",
+		Status:     "succeeded",
+		Confidence: "exact",
+		Freshness:  "durable",
+		SourceRefs: []SourceRef{{Table: "worker_attempts", RecordID: attemptPath, Provenance: "durable"}},
+	}}, nil)
+
+	colored := RenderHuman(doc, Capabilities{Width: 100, Unicode: true, Color: true})
+	if !strings.Contains(colored, "\x1b[32m✓") || !strings.Contains(colored, "\x1b[0m") {
+		t.Fatalf("color-capable output did not include ANSI success marker:\n%q", colored)
+	}
+	redirected := RenderHuman(doc, Capabilities{Width: 100, Unicode: true, Color: true, Redirected: true})
+	if strings.Contains(redirected, "\x1b[") {
+		t.Fatalf("redirected output used ANSI color:\n%q", redirected)
+	}
+
+	if got := StableRecordID(attemptPath); got != "job-1" {
+		t.Fatalf("known attempt path id = %q, want job-1", got)
+	}
+	if a, b := StableRecordID("tenant/a/run"), StableRecordID("tenant/b/run"); a == b || a == "run" || b == "run" {
+		t.Fatalf("slash durable ids collapsed: a=%q b=%q", a, b)
 	}
 }
 

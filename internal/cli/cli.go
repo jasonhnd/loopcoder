@@ -73,6 +73,7 @@ type Deps struct {
 	ProcessAlive                func(pid int) bool
 	Now                         func() time.Time
 	IsTerminal                  func(w io.Writer) bool
+	TerminalWidth               func(w io.Writer) int
 	Stdin                       io.Reader
 	BuildInfo                   BuildInfo
 	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
@@ -409,7 +410,7 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runAttach(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "report" {
-		return runReport(args[1:], stdout, stderr)
+		return runReport(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
@@ -595,7 +596,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
 		fmt.Fprintln(w, "  --detach                    launch a bounded detached supervisor and return a run record")
-		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string             output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                 suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
@@ -657,7 +658,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue int        filter by issue number")
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
-		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string    output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose          include raw canonical records in text output")
 	}
 	if command.Name == "models" {
@@ -665,7 +666,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "audit" {
 		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
-		fmt.Fprintln(w, "  --format string               output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string               output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                     include raw audit details in text output")
 		fmt.Fprintln(w, "  --layer string                audit layer to run; repeatable or comma-separated (default \"sast\")")
 		fmt.Fprintln(w, "  --layers string               alias for --layer")
@@ -745,7 +746,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
-		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --format string        output format: text, json, jsonl, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
@@ -762,7 +763,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue int        filter by GitHub issue number")
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to render (default 20)")
-		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string    output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "resume" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -792,7 +793,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                        reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --detached                      reconcile detached supervisor state by --run-id without retrying worker dispatch")
-		fmt.Fprintln(w, "  --format string                 output format for --detached: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string                 output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "cancel" {
 		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
@@ -842,7 +843,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
-		fmt.Fprintln(w, "  --format string            output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string            output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                  include raw wave report details in text output")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty reports on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty reports on stdout (LOOPCODER_NO_PRETTY)")
@@ -2782,6 +2783,14 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
 		return 1
 	}
+	if _, err := fmt.Fprintln(stderr); err != nil {
+		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+		return 1
+	}
+	if err := renderCanonicalHuman(stderr, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
+		fmt.Fprintf(stderr, "tick: write observability summary: %v\n", err)
+		return 1
+	}
 	if renderPretty {
 		if err := renderTickPrettyReports(stderr, tickReport, prettyMode); err != nil {
 			fmt.Fprintf(stderr, "tick: write pretty report: %v\n", err)
@@ -4333,12 +4342,12 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		format = formatAlias
 	}
 	verbose = verbose || verboseAlias
-	outputMode, ok := normalizeCommandOutputMode("dispatch", format, verbose, stderr)
+	outputMode, ok := normalizeCommandOutputModeWithFormats("dispatch", format, verbose, stderr, "text", "json", "jsonl")
 	if !ok {
 		return 2
 	}
 	opts.Stderr = stderr
-	if outputMode.Format == "json" {
+	if outputMode.Format == "json" || outputMode.Format == "jsonl" {
 		opts.Stderr = io.Discard
 	}
 
@@ -4438,10 +4447,21 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
 			}
+			if err := renderCanonicalHuman(stderr, dispatchObservability(result), deps); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write observability summary: %v\n", err)
+				return 1
+			}
 		}
 	}
 	if outputMode.Format == "json" {
 		if err := renderDispatchJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
+		}
+		return dispatchResultExitCode(result)
+	}
+	if outputMode.Format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, dispatchObservability(result), "jsonl"); err != nil {
 			fmt.Fprintf(stderr, "dispatch: %v\n", err)
 			return 1
 		}
@@ -5101,7 +5121,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		format = formatAlias
 	}
 	verbose = verbose || verboseAlias
-	outputMode, ok := normalizeCommandOutputMode("dispatch-wave", format, verbose, stderr)
+	outputMode, ok := normalizeCommandOutputModeWithFormats("dispatch-wave", format, verbose, stderr, "text", "json", "jsonl")
 	if !ok {
 		return 2
 	}
@@ -5285,8 +5305,17 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		var writeErr error
 		if outputMode.Format == "json" {
 			writeErr = writeJSONLine(stdout, orchestration.SanitizeDispatchWaveReportForOutput(waveReport))
+		} else if outputMode.Format == "jsonl" {
+			writeErr = renderCanonicalMachine(stdout, orchestration.DispatchWaveObservabilityDocument(waveReport), "jsonl")
 		} else {
-			_, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport)))
+			if _, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); writeErr == nil {
+				if !renderPretty {
+					_, writeErr = fmt.Fprintln(stdout)
+				}
+			}
+			if writeErr == nil && !renderPretty {
+				writeErr = renderCanonicalHuman(stdout, orchestration.DispatchWaveObservabilityDocument(waveReport), deps)
+			}
 		}
 		if writeErr != nil {
 			fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", writeErr)
@@ -5462,7 +5491,16 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	switch format {
+	case "text", "json", "jsonl":
+	default:
+		fmt.Fprintf(stderr, "recover: invalid --format %q; want text, json, or jsonl\n", format)
+		return 2
+	}
 	opts.Stderr = stderr
+	if format == "json" || format == "jsonl" {
+		opts.Stderr = io.Discard
+	}
 
 	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
 	if err != nil {
@@ -5553,9 +5591,38 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
 
 	result, err := deps.Recover(context.Background(), opts)
-	if result.Report != "" {
+	if format == "json" {
+		payload := struct {
+			SchemaVersion string `json:"schema_version"`
+			Observability any    `json:"observability"`
+			Action        string `json:"action"`
+			Dispatch      any    `json:"dispatch_result,omitempty"`
+			Review        any    `json:"review_result,omitempty"`
+			Attempts      any    `json:"recovery_attempts,omitempty"`
+		}{
+			SchemaVersion: "loopcoder.recover_result.v1",
+			Observability: recoveryObservability(opts, result),
+			Action:        string(result.Action),
+			Dispatch:      result.DispatchResult,
+			Review:        result.ReviewResult,
+			Attempts:      result.RecoveryAttempts,
+		}
+		if err := renderCanonicalJSONLine(stdout, payload); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
+		}
+	} else if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, recoveryObservability(opts, result), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
+		}
+	} else if result.Report != "" {
 		if _, writeErr := stdout.Write([]byte(result.Report)); writeErr != nil {
 			fmt.Fprintf(stderr, "recover: write output: %v\n", writeErr)
+			return 1
+		}
+		if err := renderCanonicalHuman(stdout, recoveryObservability(opts, result), deps); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
 			return 1
 		}
 	}
@@ -5992,12 +6059,7 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	receiptMode := receipts || replay || follow || cursor != "" || correlationID != "" || taskID != ""
 	switch format {
-	case "text", "json":
-	case "jsonl":
-		if !receiptMode {
-			fmt.Fprintf(stderr, "status: --format jsonl requires --receipts or --follow\n")
-			return 2
-		}
+	case "text", "json", "jsonl":
 	default:
 		fmt.Fprintf(stderr, "status: invalid --format %q; want text, json, or jsonl\n", format)
 		return 2
@@ -6049,7 +6111,22 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		return 0
 	}
+	if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, runstatus.ObservabilityDocument(report), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	if err := renderCanonicalHuman(stdout, runstatus.ObservabilityDocument(report), deps); err != nil {
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
 	}
@@ -6153,7 +6230,7 @@ func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Wri
 	return 0
 }
 
-func runReport(args []string, stdout, stderr io.Writer) int {
+func runReport(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -6222,9 +6299,9 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 	verbose = verbose || verboseAlias
 	switch format {
-	case "text", "json":
+	case "text", "json", "jsonl":
 	default:
-		fmt.Fprintf(stderr, "report: invalid --format %q; want text or json\n", format)
+		fmt.Fprintf(stderr, "report: invalid --format %q; want text, json, or jsonl\n", format)
 		return 2
 	}
 	reportRole := reporter.Role(strings.TrimSpace(role))
@@ -6281,7 +6358,22 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
+	if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, reportquery.ObservabilityDocument(records), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "report: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(reportquery.RenderTextWithOptions(records, reportquery.RenderOptions{Verbose: verbose}))); err != nil {
+		fmt.Fprintf(stderr, "report: write output: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout); err != nil {
+		fmt.Fprintf(stderr, "report: write output: %v\n", err)
+		return 1
+	}
+	if err := renderCanonicalHuman(stdout, reportquery.ObservabilityDocument(records), deps); err != nil {
 		fmt.Fprintf(stderr, "report: write output: %v\n", err)
 		return 1
 	}
@@ -6355,9 +6447,9 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	switch outputFormat {
-	case "text", "json", "both":
+	case "text", "json", "jsonl", "both":
 	default:
-		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, or both\n", outputFormat)
+		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, jsonl, or both\n", outputFormat)
 		return 2
 	}
 
@@ -6412,9 +6504,21 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	if outputFormat == "text" || outputFormat == "both" {
 		fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+		fmt.Fprintln(stdout)
+		if err := renderCanonicalHuman(stdout, report.ObservabilityDocument(resumeReport), deps); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
 	}
 	if outputFormat == "both" {
 		fmt.Fprintln(stdout)
+	}
+	if outputFormat == "jsonl" {
+		if err := renderCanonicalMachine(stdout, report.ObservabilityDocument(resumeReport), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if outputFormat == "json" || outputFormat == "both" {
 		data, err := report.MarshalResumeJSON(resumeReport)

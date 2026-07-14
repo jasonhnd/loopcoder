@@ -1,12 +1,14 @@
 package reportquery
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 
 	"github.com/jasonhnd/loopcoder/internal/observability"
 )
 
-func reportQueryObservability(records []Record) observability.Document {
+func ObservabilityDocument(records []Record) observability.Document {
 	items := make([]observability.RenderItem, 0, len(records))
 	for _, record := range records {
 		r := record.Report
@@ -38,5 +40,9 @@ func reportItemID(record Record) string {
 	if record.Source != "" {
 		return "report-" + observability.StableRecordID(record.Source)
 	}
-	return "report-" + observability.StableRecordID(record.Path)
+	if record.Path != "" {
+		sum := sha256.Sum256([]byte(record.Path))
+		return "report-path-" + hex.EncodeToString(sum[:])[:16]
+	}
+	return "report-unknown"
 }

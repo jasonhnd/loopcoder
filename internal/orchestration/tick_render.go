@@ -20,7 +20,7 @@ func MarshalTickJSON(report TickReport) ([]byte, error) {
 		TickReport
 	}{
 		SchemaVersion: "loopcoder.tick_result.v1",
-		Observability: tickObservability(report),
+		Observability: TickObservabilityDocument(report),
 		TickReport:    report,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
@@ -38,7 +38,7 @@ func sanitizeTickReportForOutput(report TickReport) TickReport {
 	return report
 }
 
-func tickObservability(report TickReport) observability.Document {
+func TickObservabilityDocument(report TickReport) observability.Document {
 	items := []observability.RenderItem{}
 	if report.DispatchWave != nil {
 		for _, result := range report.DispatchWave.Results {

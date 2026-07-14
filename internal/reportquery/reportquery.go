@@ -220,7 +220,7 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 		RunTree       any                    `json:"run_tree,omitempty"`
 	}{
 		SchemaVersion: SchemaVersion,
-		Observability: reportQueryObservability(records),
+		Observability: ObservabilityDocument(records),
 		Reports:       reports,
 		Records:       jsonRecords,
 		RunTree:       runTree,

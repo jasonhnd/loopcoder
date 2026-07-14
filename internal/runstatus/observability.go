@@ -92,6 +92,10 @@ func runStatusObservability(report Report) observability.Document {
 	}, items, nil)
 }
 
+func ObservabilityDocument(report Report) observability.Document {
+	return runStatusObservability(normalizeReport(report))
+}
+
 func parseTokenPtr(value string) *int64 {
 	value = strings.TrimSpace(value)
 	if value == "" || value == NotReported {

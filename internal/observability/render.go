@@ -2,6 +2,8 @@ package observability
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"path"
@@ -119,16 +121,15 @@ func StableRecordID(value string) string {
 		return "unknown"
 	}
 	normalized := strings.ReplaceAll(value, "\\", "/")
-	if strings.Contains(normalized, "/") {
-		normalized = strings.TrimRight(normalized, "/")
-		base := path.Base(normalized)
-		if base != "." && base != "/" && strings.TrimSpace(base) != "" {
-			normalized = base
+	if looksLikeRecordPath(normalized) {
+		if id := stablePathRecordBase(normalized); id != "" {
+			return id
 		}
+		return "path-" + shortRecordHash(normalized)
 	}
 	normalized = strings.TrimSpace(sanitize.Text(normalized))
 	if strings.Contains(normalized, sanitize.RedactedPath) {
-		return "redacted-path"
+		return "redacted-path-" + shortRecordHash(value)
 	}
 	for _, suffix := range []string{".attempt.json", ".report.json", ".jsonl", ".json", ".attest", ".txt", ".md"} {
 		normalized = strings.TrimSuffix(normalized, suffix)
@@ -137,8 +138,12 @@ func StableRecordID(value string) string {
 	if normalized == "" {
 		return "unknown"
 	}
+	return stableRecordIDToken(normalized)
+}
+
+func stableRecordIDToken(value string) string {
 	var b strings.Builder
-	for _, r := range normalized {
+	for _, r := range strings.TrimSpace(value) {
 		switch {
 		case r >= 'a' && r <= 'z':
 			b.WriteRune(r)
@@ -160,6 +165,55 @@ func StableRecordID(value string) string {
 		return string([]rune(out)[:128])
 	}
 	return out
+}
+
+func looksLikeRecordPath(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") {
+		return true
+	}
+	if len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && value[2] == '/' {
+		return true
+	}
+	pathishMarkers := []string{"/.loopcoder/", ".loopcoder/", "/runs/", "/workers/", "/recovery/"}
+	for _, marker := range pathishMarkers {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	base := path.Base(strings.TrimRight(value, "/"))
+	if strings.Contains(value, "/") && strings.Contains(base, ".") {
+		switch {
+		case strings.HasSuffix(base, ".json"),
+			strings.HasSuffix(base, ".jsonl"),
+			strings.HasSuffix(base, ".md"),
+			strings.HasSuffix(base, ".txt"),
+			strings.HasSuffix(base, ".attest"):
+			return true
+		}
+	}
+	return false
+}
+
+func stablePathRecordBase(value string) string {
+	base := path.Base(strings.TrimRight(value, "/"))
+	if base == "." || base == "/" || strings.TrimSpace(base) == "" {
+		return ""
+	}
+	for _, suffix := range []string{".attempt.json", ".report.json", ".jsonl", ".json", ".attest", ".txt", ".md"} {
+		if strings.HasSuffix(base, suffix) {
+			return stableRecordIDToken(strings.TrimSuffix(base, suffix))
+		}
+	}
+	return ""
+}
+
+func shortRecordHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func RenderJSON(w io.Writer, doc Document) error {
@@ -211,6 +265,7 @@ func RenderHuman(doc Document, caps Capabilities) string {
 	if caps.Unicode {
 		markerOK, markerWarn = "✓", "!"
 	}
+	color := caps.Color && !caps.Redirected
 	var out bytes.Buffer
 	title := "OBSERVABILITY"
 	if doc.Command != "" {
@@ -230,9 +285,17 @@ func RenderHuman(doc Document, caps Capabilities) string {
 			marker = markerWarn
 		}
 		head := fmt.Sprintf("%s %s %s", marker, display(item.ID), display(item.Status))
-		fmt.Fprintln(&out, boundForWidth(head, width))
-		line := fmt.Sprintf("  %s/%s duration=%s usage=%s confidence=%s freshness=%s", display(item.Provider), display(item.Model), display(item.Duration), renderUsage(item.Usage), display(item.Confidence), display(item.Freshness))
-		fmt.Fprintln(&out, boundForWidth(line, width))
+		line := boundForWidth(head, width)
+		if color {
+			if marker == markerOK {
+				line = "\x1b[32m" + line + "\x1b[0m"
+			} else {
+				line = "\x1b[33m" + line + "\x1b[0m"
+			}
+		}
+		fmt.Fprintln(&out, line)
+		detail := fmt.Sprintf("  %s/%s duration=%s usage=%s confidence=%s freshness=%s", display(item.Provider), display(item.Model), display(item.Duration), renderUsage(item.Usage), display(item.Confidence), display(item.Freshness))
+		fmt.Fprintln(&out, boundForWidth(detail, width))
 		if item.Reason != "" {
 			fmt.Fprintln(&out, boundForWidth("  reason: "+item.Reason, width))
 		}

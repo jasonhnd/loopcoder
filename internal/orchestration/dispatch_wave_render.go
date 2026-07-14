@@ -67,6 +67,38 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 	return out.String()
 }
 
+func DispatchWaveObservabilityDocument(report DispatchWaveReport) observability.Document {
+	report = SanitizeDispatchWaveReportForOutput(report)
+	items := make([]observability.RenderItem, 0, len(report.Results))
+	for _, result := range report.Results {
+		if result.Report != nil {
+			items = append(items, observability.ItemFromReport(fmt.Sprintf("issue-%d", result.Issue), "worker", result.Status, result.Reason, result.NextAction, *result.Report, []observability.SourceRef{{
+				Table:         "dispatch_wave",
+				RecordID:      result.AttemptPath,
+				DeliveryRunID: report.RunID,
+				Provenance:    "dispatch-wave",
+			}}))
+			continue
+		}
+		items = append(items, observability.RenderItem{
+			ID:         fmt.Sprintf("issue-%d", result.Issue),
+			Kind:       "worker",
+			Status:     result.Status,
+			Reason:     result.Reason,
+			NextAction: result.NextAction,
+			Confidence: "exact",
+			Freshness:  "durable",
+			SourceRefs: []observability.SourceRef{{
+				Table:         "dispatch_wave",
+				RecordID:      firstNonEmpty(result.AttemptPath, fmt.Sprintf("issue-%d", result.Issue)),
+				DeliveryRunID: report.RunID,
+				Provenance:    "dispatch-wave",
+			}},
+		})
+	}
+	return observability.NewDocument("dispatch-wave", observability.Correlation{DeliveryRunID: report.RunID, Source: "dispatch-wave"}, items, nil)
+}
+
 func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty string) string {
 	result = sanitizeDispatchWaveIssueResultForOutput(result)
 	var out bytes.Buffer

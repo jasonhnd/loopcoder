@@ -15,7 +15,7 @@ func RenderJSON(w io.Writer, result Result) error {
 		Observability observability.Document `json:"observability"`
 		Result
 	}{
-		Observability: auditObservability(result),
+		Observability: ObservabilityDocument(result),
 		Result:        result,
 	}
 	encoder := json.NewEncoder(w)
@@ -23,7 +23,7 @@ func RenderJSON(w io.Writer, result Result) error {
 	return encoder.Encode(payload)
 }
 
-func auditObservability(result Result) observability.Document {
+func ObservabilityDocument(result Result) observability.Document {
 	items := make([]observability.RenderItem, 0, 1)
 	if result.Report != nil {
 		receipt := DecisionReceipt(result)

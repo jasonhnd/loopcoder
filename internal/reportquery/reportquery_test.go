@@ -287,6 +287,20 @@ func TestReportObservabilityFallbackDoesNotUseRecordPath(t *testing.T) {
 	}
 }
 
+func TestReportObservabilityPathFallbackIsCollisionResistant(t *testing.T) {
+	a := Record{
+		Report: testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement fallback", "2026-07-13T00:00:00Z"),
+		Path:   filepath.Join(string(os.PathSeparator), "tmp", "a", ".loopcoder", "runs", "run-a", "worker.report.json"),
+	}
+	b := Record{
+		Report: testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement fallback", "2026-07-13T00:00:00Z"),
+		Path:   filepath.Join(string(os.PathSeparator), "tmp", "b", ".loopcoder", "runs", "run-b", "worker.report.json"),
+	}
+	if gotA, gotB := reportItemID(a), reportItemID(b); gotA == gotB || strings.Contains(gotA, "/") || strings.Contains(gotB, "/") {
+		t.Fatalf("path fallback ids collided or leaked paths: %q %q", gotA, gotB)
+	}
+}
+
 func testReport(role reporter.Role, provider, model, effort, action, ended string) reporter.Report {
 	total := int64(42)
 	return reporter.Report{
