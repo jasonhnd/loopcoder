@@ -125,8 +125,7 @@ func replayCodexHostProgressForBinding(ctx context.Context, store storage.Store,
 	if limit <= 0 {
 		return 0, nil
 	}
-	var views []progress.ReceiptView
-	_, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+	result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
 		ProjectID:     projectID,
 		DeliveryRunID: runID,
 		OriginKind:    "host-run-origin",
@@ -135,17 +134,15 @@ func replayCodexHostProgressForBinding(ctx context.Context, store storage.Store,
 		Limit:         limit,
 		Now:           now().UTC(),
 	}, func(view progress.ReceiptView) error {
-		views = append(views, view)
-		return nil
+		if _, err := fmt.Fprintf(stderr, "[loopcoder] replaying 1 pending progress receipt for Codex origin %s\n", bindingID); err != nil {
+			return err
+		}
+		return progress.RenderHuman(stderr, []progress.ReceiptView{view})
 	})
 	if err != nil {
 		return 0, err
 	}
-	if len(views) == 0 {
-		return 0, nil
-	}
-	fmt.Fprintf(stderr, "[loopcoder] replaying %d pending progress receipt(s) for Codex origin %s\n", len(views), bindingID)
-	return len(views), progress.RenderHuman(stderr, views)
+	return result.Replayed, nil
 }
 
 func codexHostReplayCandidates(ctx context.Context, store storage.Store, projectID, stableOriginRef string, now time.Time, limit int) ([]codexHostReplayCandidate, error) {

@@ -2557,6 +2557,118 @@ func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
 	}
 }
 
+func TestCodexHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-render-failure")
+	t.Setenv("CODEX_CLI", "1")
+	created, binding := persistCodexReplayFixture(t, store, projectID, runID, "", "receipt survives failed stderr render", 7)
+
+	renderErr := errors.New("stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retry replay count = %d, want 1", count)
+	}
+	if !strings.Contains(stderr.String(), "receipt survives failed stderr render") {
+		t.Fatalf("retry stderr missing receipt:\n%s", stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want one unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
 func TestCodexHostReplayCandidatesSkipExhaustedCursorGroupsBeforeLimit(t *testing.T) {
 	_, _, store := setupStatusProgressFixture(t)
 	defer store.Close()
@@ -9308,6 +9420,39 @@ type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("writer closed")
+}
+
+type partialFailingWriter struct {
+	buf          bytes.Buffer
+	writes       int
+	failOnWrite  int
+	partialBytes int
+	err          error
+}
+
+func (w *partialFailingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failOnWrite {
+		n := w.partialBytes
+		if n < 0 {
+			n = 0
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		if w.err != nil {
+			return n, w.err
+		}
+		return n, errors.New("partial write failed")
+	}
+	return w.buf.Write(p)
+}
+
+func (w *partialFailingWriter) String() string {
+	return w.buf.String()
 }
 
 func beginCLISQLiteImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB, *sql.Conn) {
