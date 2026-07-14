@@ -5628,6 +5628,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	result, err := deps.Recover(context.Background(), opts)
 	if format == "json" {
+		outputResult := recoveryResultForOutput(result)
 		payload := struct {
 			SchemaVersion string `json:"schema_version"`
 			Observability any    `json:"observability"`
@@ -5639,9 +5640,9 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 			SchemaVersion: "loopcoder.recover_result.v1",
 			Observability: recoveryObservability(opts, result),
 			Action:        string(result.Action),
-			Dispatch:      result.DispatchResult,
+			Dispatch:      outputResult.DispatchResult,
 			Review:        result.ReviewResult,
-			Attempts:      result.RecoveryAttempts,
+			Attempts:      outputResult.RecoveryAttempts,
 		}
 		if err := renderCanonicalJSONLine(stdout, payload); err != nil {
 			fmt.Fprintf(stderr, "recover: write output: %v\n", err)

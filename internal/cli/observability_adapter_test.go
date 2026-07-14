@@ -314,6 +314,225 @@ func TestObservabilityLegacyJSONKeepsSchemaAndEmbedsCanonicalDocument(t *testing
 	}
 }
 
+func TestRecoverJSONRedactsLegacyLocalPathsWithoutMutatingResult(t *testing.T) {
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("GH_REPO", "")
+	repo := t.TempDir()
+	runID := "run-recover-json-redaction"
+	topAttemptPath := filepath.Join(repo, ".loopcoder", "runs", runID, "workers", "job-864-top.attempt.json")
+	firstContextPath := filepath.Join(repo, ".loopcoder", "runs", runID, "recovery", "job-864-2-context.md")
+	secondContextPath := filepath.Join(repo, ".loopcoder", "runs", runID, "recovery", "job-864-3-context.md")
+	firstNestedAttemptPath := filepath.Join(repo, ".loopcoder", "runs", runID, "workers", "job-864-retry-2.attempt.json")
+	secondNestedAttemptPath := filepath.Join(repo, ".loopcoder", "runs", runID, "workers", "job-864-retry-3.attempt.json")
+	record := validDispatchReport()
+	record.WorkID = runID
+	record.Issue = 864
+	original := recovery.Result{
+		Action: recovery.ActionRetry,
+		DispatchResult: &recovery.DispatchResult{
+			OK:          true,
+			Issue:       864,
+			Branch:      "loop/issue-864",
+			RunID:       runID,
+			PR:          "https://github.com/owner/repo/pull/864",
+			Summary:     "Recovered issue.",
+			AttemptPath: topAttemptPath,
+			Status:      "succeeded",
+			ExitCode:    0,
+			LogBytes:    64,
+			Reason:      "retry succeeded",
+			NextAction:  "loopreview",
+			Report:      &record,
+		},
+		RecoveryAttempts: []recovery.AttemptRecord{
+			{
+				Version:             1,
+				Issue:               864,
+				RunID:               runID,
+				Attempt:             2,
+				Strategy:            recovery.AttemptStrategySameConfig,
+				Status:              "failed",
+				Branch:              "loop/issue-864",
+				RecoveryContextPath: firstContextPath,
+				Model:               "gpt-5.5",
+				Effort:              "xhigh",
+				Error:               "worker failed",
+				DispatchResult: &recovery.DispatchResult{
+					OK:          false,
+					Issue:       864,
+					Branch:      "loop/issue-864",
+					RunID:       runID,
+					AttemptPath: firstNestedAttemptPath,
+					Status:      "failed",
+					ExitCode:    1,
+					LogBytes:    32,
+				},
+			},
+			{
+				Version:             1,
+				Issue:               864,
+				RunID:               runID,
+				Attempt:             3,
+				Strategy:            recovery.AttemptStrategyUpgradedConfig,
+				Status:              "succeeded",
+				Branch:              "loop/issue-864",
+				PR:                  "https://github.com/owner/repo/pull/864",
+				RecoveryContextPath: secondContextPath,
+				Model:               "gpt-5.5",
+				Effort:              "xhigh",
+				DispatchResult: &recovery.DispatchResult{
+					OK:          true,
+					Issue:       864,
+					Branch:      "loop/issue-864",
+					RunID:       runID,
+					PR:          "https://github.com/owner/repo/pull/864",
+					AttemptPath: secondNestedAttemptPath,
+					Status:      "succeeded",
+					ExitCode:    0,
+					LogBytes:    48,
+				},
+			},
+		},
+	}
+	var captured recovery.Options
+	var stdout, stderr bytes.Buffer
+	code := RunWithDeps([]string{"recover", "--repo", repo, "--issue-number", "864", "--issue-title", "Observability", "--run-id", runID, "--format", "json"}, &stdout, &stderr, Deps{
+		Recover: func(_ context.Context, opts recovery.Options) (recovery.Result, error) {
+			captured = opts
+			return original, nil
+		},
+	})
+	if code != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr diagnostics for machine JSON = %q", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "warning:") || strings.Contains(stdout.String(), "OBSERVABILITY ") {
+		t.Fatalf("stdout contains diagnostic/human text:\n%s", stdout.String())
+	}
+
+	type legacyDispatch struct {
+		OK          bool             `json:"ok"`
+		Issue       int              `json:"issue"`
+		Branch      string           `json:"branch"`
+		RunID       string           `json:"run_id"`
+		PR          string           `json:"pr"`
+		Summary     string           `json:"summary"`
+		AttemptPath string           `json:"attempt_path"`
+		Status      string           `json:"status"`
+		ExitCode    int              `json:"exit_code"`
+		LogBytes    int64            `json:"log_bytes"`
+		Reason      string           `json:"reason,omitempty"`
+		NextAction  string           `json:"next_action,omitempty"`
+		Report      *reporter.Report `json:"report,omitempty"`
+	}
+	type legacyAttempt struct {
+		Version             int             `json:"version"`
+		Issue               int             `json:"issue"`
+		RunID               string          `json:"run_id"`
+		Attempt             int             `json:"attempt"`
+		Strategy            string          `json:"strategy"`
+		Status              string          `json:"status"`
+		Branch              string          `json:"branch,omitempty"`
+		PR                  string          `json:"pr,omitempty"`
+		RecoveryContextPath string          `json:"recovery_context_path,omitempty"`
+		Model               string          `json:"model,omitempty"`
+		Effort              string          `json:"effort,omitempty"`
+		Error               string          `json:"error,omitempty"`
+		DispatchResult      *legacyDispatch `json:"dispatch_result,omitempty"`
+	}
+	var payload struct {
+		SchemaVersion string                 `json:"schema_version"`
+		Observability observability.Document `json:"observability"`
+		Action        string                 `json:"action"`
+		Dispatch      *legacyDispatch        `json:"dispatch_result,omitempty"`
+		Attempts      []legacyAttempt        `json:"recovery_attempts,omitempty"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &payload)
+	if payload.SchemaVersion != "loopcoder.recover_result.v1" || payload.Action != string(recovery.ActionRetry) {
+		t.Fatalf("recover payload schema/action = %q/%q", payload.SchemaVersion, payload.Action)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal raw payload: %v", err)
+	}
+	for _, key := range []string{"schema_version", "observability", "action", "dispatch_result", "recovery_attempts"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("recover JSON missing legacy key %q: %s", key, stdout.String())
+		}
+	}
+	var dispatchKeys map[string]json.RawMessage
+	if err := json.Unmarshal(raw["dispatch_result"], &dispatchKeys); err != nil {
+		t.Fatalf("unmarshal dispatch_result: %v", err)
+	}
+	for _, key := range []string{"ok", "issue", "branch", "run_id", "pr", "summary", "attempt_path", "status", "exit_code", "log_bytes", "reason", "next_action", "report"} {
+		if _, ok := dispatchKeys[key]; !ok {
+			t.Fatalf("dispatch_result missing key %q: %s", key, string(raw["dispatch_result"]))
+		}
+	}
+	var attemptKeys []map[string]json.RawMessage
+	if err := json.Unmarshal(raw["recovery_attempts"], &attemptKeys); err != nil {
+		t.Fatalf("unmarshal recovery_attempts keys: %v", err)
+	}
+	if len(attemptKeys) != 2 || len(payload.Attempts) != 2 {
+		t.Fatalf("recovery_attempts length = keys:%d payload:%d", len(attemptKeys), len(payload.Attempts))
+	}
+	for i, keys := range attemptKeys {
+		for _, key := range []string{"version", "issue", "run_id", "attempt", "strategy", "status", "branch", "recovery_context_path", "model", "effort", "dispatch_result"} {
+			if _, ok := keys[key]; !ok {
+				t.Fatalf("recovery_attempts[%d] missing key %q: %s", i, key, string(raw["recovery_attempts"]))
+			}
+		}
+	}
+
+	assertStableLegacyRecoverID(t, "dispatch_result.attempt_path", payload.Dispatch.AttemptPath, topAttemptPath, repo, ".attempt.json")
+	assertStableLegacyRecoverID(t, "recovery_attempts[0].recovery_context_path", payload.Attempts[0].RecoveryContextPath, firstContextPath, repo, ".md")
+	assertStableLegacyRecoverID(t, "recovery_attempts[1].recovery_context_path", payload.Attempts[1].RecoveryContextPath, secondContextPath, repo, ".md")
+	assertStableLegacyRecoverID(t, "recovery_attempts[0].dispatch_result.attempt_path", payload.Attempts[0].DispatchResult.AttemptPath, firstNestedAttemptPath, repo, ".attempt.json")
+	assertStableLegacyRecoverID(t, "recovery_attempts[1].dispatch_result.attempt_path", payload.Attempts[1].DispatchResult.AttemptPath, secondNestedAttemptPath, repo, ".attempt.json")
+	if payload.Dispatch.Issue != 864 || payload.Dispatch.RunID != runID || payload.Dispatch.Status != "succeeded" || payload.Dispatch.LogBytes != 64 {
+		t.Fatalf("dispatch_result non-path fields changed: %#v", payload.Dispatch)
+	}
+	if payload.Attempts[0].Strategy != recovery.AttemptStrategySameConfig || payload.Attempts[1].Strategy != recovery.AttemptStrategyUpgradedConfig {
+		t.Fatalf("attempt non-path fields changed: %#v", payload.Attempts)
+	}
+
+	if original.DispatchResult.AttemptPath != topAttemptPath ||
+		original.RecoveryAttempts[0].RecoveryContextPath != firstContextPath ||
+		original.RecoveryAttempts[1].RecoveryContextPath != secondContextPath ||
+		original.RecoveryAttempts[0].DispatchResult.AttemptPath != firstNestedAttemptPath ||
+		original.RecoveryAttempts[1].DispatchResult.AttemptPath != secondNestedAttemptPath {
+		t.Fatalf("recover output projection mutated original result: %#v", original)
+	}
+	var gotDoc, wantDoc bytes.Buffer
+	if err := observability.RenderJSON(&gotDoc, payload.Observability); err != nil {
+		t.Fatalf("render got observability: %v", err)
+	}
+	if err := observability.RenderJSON(&wantDoc, recoveryObservability(captured, original)); err != nil {
+		t.Fatalf("render want observability: %v", err)
+	}
+	if gotDoc.String() != wantDoc.String() {
+		t.Fatalf("observability document changed\nwant:\n%s\ngot:\n%s", wantDoc.String(), gotDoc.String())
+	}
+}
+
+func assertStableLegacyRecoverID(t *testing.T, name, got, original string, disallowed ...string) {
+	t.Helper()
+	want := observability.StableRecordID(original)
+	if got != want {
+		t.Fatalf("%s = %q, want stable id %q from %q", name, got, want, original)
+	}
+	if strings.ContainsAny(got, `/\`) {
+		t.Fatalf("%s = %q contains a path separator", name, got)
+	}
+	for _, value := range disallowed {
+		if value != "" && strings.Contains(got, value) {
+			t.Fatalf("%s = %q contains disallowed path fragment %q", name, got, value)
+		}
+	}
+}
+
 func TestObservabilityHumanAdapterUsesInjectedTerminalCapabilities(t *testing.T) {
 	clearPrettyEnv(t)
 	var stdout, stderr bytes.Buffer

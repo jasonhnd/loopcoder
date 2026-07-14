@@ -132,6 +132,33 @@ func dispatchResultForOutput(result worker.Result) worker.Result {
 	return result
 }
 
+func recoveryResultForOutput(result recovery.Result) recovery.Result {
+	if result.DispatchResult != nil {
+		dispatch := recoveryDispatchResultForOutput(*result.DispatchResult)
+		result.DispatchResult = &dispatch
+	}
+	if len(result.RecoveryAttempts) > 0 {
+		result.RecoveryAttempts = append([]recovery.AttemptRecord(nil), result.RecoveryAttempts...)
+		for i := range result.RecoveryAttempts {
+			if strings.TrimSpace(result.RecoveryAttempts[i].RecoveryContextPath) != "" {
+				result.RecoveryAttempts[i].RecoveryContextPath = observability.StableRecordID(result.RecoveryAttempts[i].RecoveryContextPath)
+			}
+			if result.RecoveryAttempts[i].DispatchResult != nil {
+				dispatch := recoveryDispatchResultForOutput(*result.RecoveryAttempts[i].DispatchResult)
+				result.RecoveryAttempts[i].DispatchResult = &dispatch
+			}
+		}
+	}
+	return result
+}
+
+func recoveryDispatchResultForOutput(result recovery.DispatchResult) recovery.DispatchResult {
+	if strings.TrimSpace(result.AttemptPath) != "" {
+		result.AttemptPath = observability.StableRecordID(result.AttemptPath)
+	}
+	return result
+}
+
 func nestedJSONPayload(report orchestration.NestedScheduleReport) any {
 	return struct {
 		SchemaVersion string                 `json:"schema_version"`
