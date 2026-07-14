@@ -95,9 +95,26 @@ gh api \
 JSON
 ```
 
-Configure `main` to require pull requests and the documented checks. Adjust the
-check list to the exact check names shown by GitHub for the current workflow
-matrix:
+Configure `main` to require pull requests and the documented checks. For
+v0.8.0, pull-request CI emits exactly four stable contexts: `verify`, `test`,
+`race`, and `security`, all running on pinned `macos-15` with a fail-fast
+`darwin/arm64` Go tuple assertion.
+
+Branch-protection changes are a human-controlled promotion boundary. Do not
+remove old required contexts from live protection until a fresh pull request has
+shown the four new contexts. Use this order so `main` is never left requiring
+permanently un-emitted contexts:
+
+1. Confirm a fresh pull request emits green `verify`, `test`, `race`, and
+   `security` contexts.
+2. Update `main` branch protection to require exactly those four contexts.
+3. Read back the effective GitHub branch-protection configuration and confirm
+   no legacy `go`, `staticcheck`, `govulncheck`, `audit`, native Ubuntu,
+   native Windows, or `macos-latest` contexts remain required.
+4. Only after that confirmation, continue with the human-controlled promotion
+   decision.
+
+The branch-protection update payload is:
 
 ```bash
 gh api \
@@ -110,13 +127,9 @@ gh api \
     "strict": true,
     "contexts": [
       "verify",
-      "go",
-      "staticcheck",
-      "govulncheck",
-      "audit",
-      "native (ubuntu-latest)",
-      "native (macos-latest)",
-      "native (windows-latest)"
+      "test",
+      "race",
+      "security"
     ]
   },
   "enforce_admins": true,
