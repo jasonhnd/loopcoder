@@ -15,11 +15,13 @@ import (
 const (
 	SchemaDeliveryObligation = "loopcoder.progress_delivery_obligation.v1"
 	SchemaDeliveryAttempt    = "loopcoder.progress_delivery_attempt.v1"
+	SchemaDeliveryResult     = "loopcoder.progress_delivery_attempt_result.v1"
 	SchemaDeliveryAck        = "loopcoder.progress_delivery_acknowledgment.v1"
 	SchemaDeliveryCursor     = "loopcoder.progress_delivery_replay_cursor.v1"
 
 	DeliveryPending                 = "pending"
 	DeliveryAttempting              = "attempting"
+	DeliveryNeedsReconciliation     = "needs-reconciliation"
 	DeliveryDeliveredUnacknowledged = "delivered-unacknowledged"
 	DeliveryAcknowledged            = "acknowledged"
 	DeliveryUnsupported             = "unsupported"
@@ -92,23 +94,37 @@ type ClaimResult struct {
 }
 
 type AttemptResultRequest struct {
-	ObligationID  string
-	ClaimOwner    string
-	Generation    int64
-	ResultStatus  string
-	Evidence      DeliveryEvidence
-	ErrorCode     string
-	NextAttemptAt string
-	StartedAt     string
-	CompletedAt   string
+	ObligationID           string
+	AttemptRecordID        string
+	AttemptOrdinal         int
+	ClaimOwner             string
+	Generation             int64
+	ProviderIdempotencyKey string
+	ResultStatus           string
+	Evidence               DeliveryEvidence
+	ErrorCode              string
+	NextAttemptAt          string
+	StartedAt              string
+	CompletedAt            string
 }
 
 type AcknowledgmentRequest struct {
+	ObligationID           string
+	AttemptRecordID        string
+	AttemptOrdinal         int
+	ResultRecordID         string
+	ClaimOwner             string
+	Generation             int64
+	ProviderIdempotencyKey string
+	Evidence               DeliveryEvidence
+	AckedAt                string
+}
+
+type BeginAttemptRequest struct {
 	ObligationID string
 	ClaimOwner   string
 	Generation   int64
-	Evidence     DeliveryEvidence
-	AckedAt      string
+	PreparedAt   string
 }
 
 type CursorAdvanceRequest struct {
@@ -154,32 +170,59 @@ type DeliveryCursorFilter struct {
 }
 
 type DeliveryAttempt struct {
-	SchemaVersion   string           `json:"schema_version"`
-	RecordVersion   int              `json:"record_version"`
-	AttemptRecordID string           `json:"attempt_record_id"`
-	ObligationID    string           `json:"obligation_id"`
-	AttemptOrdinal  int              `json:"attempt_ordinal"`
-	ClaimOwner      string           `json:"claim_owner"`
-	ClaimGeneration int64            `json:"claim_generation"`
-	ResultStatus    string           `json:"result_status"`
-	NextAttemptAt   string           `json:"next_attempt_at,omitempty"`
-	Evidence        DeliveryEvidence `json:"evidence"`
-	ErrorCode       string           `json:"error_code,omitempty"`
-	StartedAt       string           `json:"started_at"`
-	CompletedAt     string           `json:"completed_at"`
+	SchemaVersion          string           `json:"schema_version"`
+	RecordVersion          int              `json:"record_version"`
+	AttemptRecordID        string           `json:"attempt_record_id"`
+	ObligationID           string           `json:"obligation_id"`
+	AttemptOrdinal         int              `json:"attempt_ordinal"`
+	ClaimOwner             string           `json:"claim_owner"`
+	ClaimGeneration        int64            `json:"claim_generation"`
+	TransportContract      string           `json:"transport_contract"`
+	ProviderIdempotencyKey string           `json:"provider_idempotency_key"`
+	ResultRecordID         string           `json:"result_record_id,omitempty"`
+	ResultStatus           string           `json:"result_status,omitempty"`
+	NextAttemptAt          string           `json:"next_attempt_at,omitempty"`
+	Evidence               DeliveryEvidence `json:"evidence,omitempty"`
+	ErrorCode              string           `json:"error_code,omitempty"`
+	PreparedAt             string           `json:"prepared_at"`
+	StartedAt              string           `json:"started_at,omitempty"`
+	CompletedAt            string           `json:"completed_at,omitempty"`
+}
+
+type DeliveryAttemptResult struct {
+	SchemaVersion          string           `json:"schema_version"`
+	RecordVersion          int              `json:"record_version"`
+	ResultRecordID         string           `json:"result_record_id"`
+	AttemptRecordID        string           `json:"attempt_record_id"`
+	ObligationID           string           `json:"obligation_id"`
+	AttemptOrdinal         int              `json:"attempt_ordinal"`
+	ClaimOwner             string           `json:"claim_owner"`
+	ClaimGeneration        int64            `json:"claim_generation"`
+	TransportContract      string           `json:"transport_contract"`
+	ProviderIdempotencyKey string           `json:"provider_idempotency_key"`
+	ResultStatus           string           `json:"result_status"`
+	NextAttemptAt          string           `json:"next_attempt_at,omitempty"`
+	Evidence               DeliveryEvidence `json:"evidence"`
+	ErrorCode              string           `json:"error_code,omitempty"`
+	StartedAt              string           `json:"started_at"`
+	CompletedAt            string           `json:"completed_at"`
 }
 
 type DeliveryAcknowledgment struct {
-	SchemaVersion     string           `json:"schema_version"`
-	RecordVersion     int              `json:"record_version"`
-	AcknowledgmentID  string           `json:"acknowledgment_id"`
-	ObligationID      string           `json:"obligation_id"`
-	SemanticIdentity  string           `json:"semantic_identity"`
-	ClaimOwner        string           `json:"claim_owner"`
-	ClaimGeneration   int64            `json:"claim_generation"`
-	TransportContract string           `json:"transport_contract"`
-	Evidence          DeliveryEvidence `json:"evidence"`
-	AcknowledgedAt    string           `json:"acknowledged_at"`
+	SchemaVersion          string           `json:"schema_version"`
+	RecordVersion          int              `json:"record_version"`
+	AcknowledgmentID       string           `json:"acknowledgment_id"`
+	ObligationID           string           `json:"obligation_id"`
+	SemanticIdentity       string           `json:"semantic_identity"`
+	AttemptRecordID        string           `json:"attempt_record_id"`
+	AttemptOrdinal         int              `json:"attempt_ordinal"`
+	ResultRecordID         string           `json:"result_record_id"`
+	ClaimOwner             string           `json:"claim_owner"`
+	ClaimGeneration        int64            `json:"claim_generation"`
+	TransportContract      string           `json:"transport_contract"`
+	ProviderIdempotencyKey string           `json:"provider_idempotency_key"`
+	Evidence               DeliveryEvidence `json:"evidence"`
+	AcknowledgedAt         string           `json:"acknowledged_at"`
 }
 
 type DeliveryReplayCursor struct {
@@ -244,6 +287,7 @@ func ClaimDeliveryObligation(ctx context.Context, store storage.Store, req Claim
 		return ClaimResult{}, typed(ErrInvalidRecordCode, "lease_expires_at must be after now")
 	}
 	var result ClaimResult
+	var committedConflict error
 	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		obligation, err := loadDeliveryObligationTx(ctx, tx, obligationID)
 		if err != nil {
@@ -257,6 +301,33 @@ func ClaimDeliveryObligation(ctx context.Context, store storage.Store, req Claim
 		}
 		if obligation.Status == DeliveryRetryableFailure && obligation.NextAttemptAt != "" && timestampAfter(obligation.NextAttemptAt, now) {
 			return typed(ErrClaimConflictCode, "obligation %s retry is scheduled for %s", obligationID, obligation.NextAttemptAt)
+		}
+		if obligation.Status == DeliveryNeedsReconciliation {
+			return typed(ErrClaimConflictCode, "obligation %s needs delivery reconciliation", obligationID)
+		}
+		if obligation.Status == DeliveryAttempting && (obligation.ClaimExpiresAt == "" || !timestampAfter(obligation.ClaimExpiresAt, now)) {
+			attempt, found, err := loadUnresolvedDeliveryAttemptTx(ctx, tx, obligation.ObligationID)
+			if err != nil {
+				return err
+			}
+			if found {
+				updatedAt := canonicalTimestamp(now)
+				res, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations SET status = ?, updated_at = ?
+					WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ?`,
+					DeliveryNeedsReconciliation, updatedAt, obligation.ObligationID, DeliveryAttempting, attempt.ClaimOwner, attempt.ClaimGeneration)
+				if err != nil {
+					return fmt.Errorf("mark delivery obligation needs reconciliation: %w", err)
+				}
+				rows, err := res.RowsAffected()
+				if err != nil {
+					return fmt.Errorf("mark delivery obligation needs reconciliation rows affected: %w", err)
+				}
+				if rows != 1 {
+					return typed(ErrStaleClaimCode, "obligation %s reconciliation lost active claim fence", obligationID)
+				}
+				committedConflict = typed(ErrClaimConflictCode, "obligation %s has prepared attempt %s with unknown result", obligationID, attempt.AttemptRecordID)
+				return nil
+			}
 		}
 		if obligation.Status == DeliveryAttempting && obligation.ClaimExpiresAt != "" && timestampAfter(obligation.ClaimExpiresAt, now) &&
 			(obligation.ClaimOwner != owner || obligation.ClaimGeneration > 0) {
@@ -281,7 +352,106 @@ func ClaimDeliveryObligation(ctx context.Context, store storage.Store, req Claim
 		result = ClaimResult{ObligationID: obligationID, ClaimOwner: owner, ClaimGeneration: nextGeneration, LeaseExpiresAt: leaseExpiresAt, Status: DeliveryAttempting}
 		return nil
 	})
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	if committedConflict != nil {
+		return result, committedConflict
+	}
+	return result, nil
+}
+
+func BeginDeliveryAttempt(ctx context.Context, store storage.Store, req BeginAttemptRequest) (DeliveryAttempt, error) {
+	if store == nil {
+		return DeliveryAttempt{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	now := store.Now()
+	req.ObligationID = sanitizeID(req.ObligationID)
+	req.ClaimOwner = sanitizeID(req.ClaimOwner)
+	req.PreparedAt = normalizeTimestampOr(req.PreparedAt, canonicalTimestamp(now))
+	if req.ObligationID == "" || req.ClaimOwner == "" || req.Generation <= 0 {
+		return DeliveryAttempt{}, typed(ErrInvalidRecordCode, "obligation_id, claim_owner, and generation are required")
+	}
+	var prepared DeliveryAttempt
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		obligation, err := loadDeliveryObligationTx(ctx, tx, req.ObligationID)
+		if err != nil {
+			return err
+		}
+		if existing, found, err := loadDeliveryAttemptForGenerationTx(ctx, tx, req.ObligationID, req.Generation); err != nil {
+			return err
+		} else if found {
+			if existing.ClaimOwner != req.ClaimOwner || existing.ClaimGeneration != req.Generation {
+				return typed(ErrDuplicateReplayCode, "prepared delivery attempt generation %d conflicts with claimant", req.Generation)
+			}
+			prepared = existing
+			return nil
+		}
+		if obligation.Status != DeliveryAttempting {
+			return typed(ErrStaleClaimCode, "obligation %s is not actively attempting", obligation.ObligationID)
+		}
+		if err := requireCurrentClaim(obligation, req.ClaimOwner, req.Generation, now); err != nil {
+			return err
+		}
+		if obligation.AttemptCount >= obligation.MaxAttempts {
+			return typed(ErrClaimConflictCode, "obligation %s exhausted %d delivery attempts", obligation.ObligationID, obligation.MaxAttempts)
+		}
+		nextAttempt := obligation.AttemptCount + 1
+		attemptID := prefixedDigest("pdelatt", map[string]any{
+			"schema_version": SchemaDeliveryAttempt,
+			"obligation_id":  req.ObligationID,
+			"attempt":        nextAttempt,
+		})
+		idempotencyKey := prefixedDigest("pdelidem", map[string]any{
+			"schema_version":      "loopcoder.progress_delivery_provider_idempotency.v1",
+			"obligation_identity": obligation.SemanticIdentity,
+			"transport_contract":  obligation.TransportContract,
+			"attempt":             nextAttempt,
+		})
+		payload := map[string]any{
+			"schema_version":           SchemaDeliveryAttempt,
+			"record_version":           1,
+			"attempt_record_id":        attemptID,
+			"obligation_id":            req.ObligationID,
+			"attempt_ordinal":          nextAttempt,
+			"claim_owner":              req.ClaimOwner,
+			"claim_generation":         req.Generation,
+			"transport_contract":       obligation.TransportContract,
+			"provider_idempotency_key": idempotencyKey,
+			"prepared_at":              req.PreparedAt,
+		}
+		payloadJSON, err := canonicalJSON(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO progress_delivery_attempts(
+				attempt_record_id, schema_version, record_version, project_id, delivery_run_id, obligation_id,
+				attempt_ordinal, claim_owner, claim_generation, transport_contract, provider_idempotency_key,
+				prepared_at, payload_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			attemptID, SchemaDeliveryAttempt, 1, obligation.ProjectID, obligation.DeliveryRunID, obligation.ObligationID,
+			nextAttempt, req.ClaimOwner, req.Generation, obligation.TransportContract, idempotencyKey, req.PreparedAt, string(payloadJSON)); err != nil {
+			return fmt.Errorf("prepare delivery attempt: %w", err)
+		}
+		updatedAt := canonicalTimestamp(now)
+		update, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
+			SET attempt_count = ?, updated_at = ?
+			WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ? AND attempt_count = ?`,
+			nextAttempt, updatedAt, req.ObligationID, DeliveryAttempting, req.ClaimOwner, req.Generation, obligation.AttemptCount)
+		if err != nil {
+			return fmt.Errorf("update delivery obligation prepared attempt: %w", err)
+		}
+		rows, err := update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("update delivery obligation prepared attempt rows affected: %w", err)
+		}
+		if rows != 1 {
+			return typed(ErrStaleClaimCode, "obligation %s prepared attempt lost active claim fence", obligation.ObligationID)
+		}
+		prepared, err = loadDeliveryAttemptTx(ctx, tx, attemptID)
+		return err
+	})
+	return prepared, err
 }
 
 func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req AttemptResultRequest) (DeliveryObligation, error) {
@@ -290,15 +460,18 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 	}
 	now := store.Now()
 	req.ObligationID = sanitizeID(req.ObligationID)
+	req.AttemptRecordID = sanitizeID(req.AttemptRecordID)
 	req.ClaimOwner = sanitizeID(req.ClaimOwner)
+	req.ProviderIdempotencyKey = sanitizeID(req.ProviderIdempotencyKey)
 	req.ResultStatus = sanitizeEnum(req.ResultStatus)
 	req.ErrorCode = sanitizeID(req.ErrorCode)
 	req.NextAttemptAt = normalizeTimestampOr(req.NextAttemptAt, "")
 	req.StartedAt = normalizeTimestampOr(req.StartedAt, canonicalTimestamp(now))
 	req.CompletedAt = normalizeTimestampOr(req.CompletedAt, canonicalTimestamp(now))
 	req.Evidence = normalizeDeliveryEvidence(req.Evidence)
-	if req.ObligationID == "" || req.ClaimOwner == "" || req.Generation <= 0 {
-		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id, claim_owner, and generation are required")
+	if req.ObligationID == "" || req.AttemptRecordID == "" || req.AttemptOrdinal <= 0 ||
+		req.ClaimOwner == "" || req.Generation <= 0 || req.ProviderIdempotencyKey == "" {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id, attempt identity, claim, and idempotency key are required")
 	}
 	if !attemptResultStatus(req.ResultStatus) {
 		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "unsupported attempt result status %q", req.ResultStatus)
@@ -312,72 +485,81 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		if err != nil {
 			return err
 		}
-		if obligation.Status != DeliveryAttempting {
-			attempt, found, err := loadDeliveryAttemptForGenerationTx(ctx, tx, req.ObligationID, req.Generation)
-			if err != nil {
-				return err
-			}
-			if found {
-				if deliveryAttemptMatchesRequest(attempt, req) {
-					stored = obligation
-					stored.LatestEvidence = attempt.Evidence
-					return nil
-				}
-				return typed(ErrDuplicateReplayCode, "delivery attempt generation %d already recorded with different result", req.Generation)
-			}
-			return typed(ErrStaleClaimCode, "obligation %s is not actively attempting", obligation.ObligationID)
-		}
-		if err := requireCurrentClaim(obligation, req.ClaimOwner, req.Generation, now); err != nil {
+		attempt, err := loadDeliveryAttemptTx(ctx, tx, req.AttemptRecordID)
+		if err != nil {
 			return err
 		}
-		nextAttempt := obligation.AttemptCount + 1
+		if !deliveryAttemptMatchesResultRequest(attempt, req) {
+			return typed(ErrStaleClaimCode, "delivery attempt result does not match prepared attempt authority")
+		}
+		if result, found, err := loadDeliveryAttemptResultForAttemptTx(ctx, tx, req.AttemptRecordID); err != nil {
+			return err
+		} else if found {
+			if deliveryAttemptResultMatchesRequest(result, req) {
+				stored = obligation
+				stored.LatestEvidence = result.Evidence
+				return nil
+			}
+			return typed(ErrDuplicateReplayCode, "delivery attempt %s already recorded with different result", req.AttemptRecordID)
+		}
+		if obligation.Status != DeliveryAttempting && obligation.Status != DeliveryNeedsReconciliation {
+			return typed(ErrStaleClaimCode, "obligation %s is not awaiting this attempt result", obligation.ObligationID)
+		}
+		if obligation.ClaimOwner != req.ClaimOwner || obligation.ClaimGeneration != req.Generation {
+			return typed(ErrStaleClaimCode, "obligation %s claim is stale", obligation.ObligationID)
+		}
+		if obligation.AttemptCount != req.AttemptOrdinal {
+			return typed(ErrStaleClaimCode, "obligation %s attempt ordinal is stale", obligation.ObligationID)
+		}
 		status := req.ResultStatus
 		errorCode := req.ErrorCode
 		nextAttemptAt := ""
-		exhaustedRetry := status == DeliveryRetryableFailure && nextAttempt >= obligation.MaxAttempts
+		exhaustedRetry := status == DeliveryRetryableFailure && req.AttemptOrdinal >= obligation.MaxAttempts
 		if status == DeliveryRetryableFailure && !exhaustedRetry {
-			nextAttemptAt = firstNonEmpty(req.NextAttemptAt, canonicalTimestamp(now.Add(retryDelayForAttempt(nextAttempt))))
+			nextAttemptAt = firstNonEmpty(req.NextAttemptAt, canonicalTimestamp(now.Add(retryDelayForAttempt(req.AttemptOrdinal))))
 			if !timestampAfter(nextAttemptAt, now) {
 				return typed(ErrInvalidRecordCode, "next_attempt_at must be after now for retryable failure")
 			}
 		}
-		attemptID := prefixedDigest("pdelatt", map[string]any{
-			"obligation_id": req.ObligationID,
-			"attempt":       nextAttempt,
-			"generation":    req.Generation,
+		resultID := prefixedDigest("pdelres", map[string]any{
+			"schema_version":    SchemaDeliveryResult,
+			"attempt_record_id": req.AttemptRecordID,
 		})
 		evidenceJSON, err := canonicalJSON(req.Evidence)
 		if err != nil {
 			return err
 		}
 		payload := map[string]any{
-			"schema_version":    SchemaDeliveryAttempt,
-			"record_version":    1,
-			"attempt_record_id": attemptID,
-			"obligation_id":     req.ObligationID,
-			"attempt_ordinal":   nextAttempt,
-			"claim_owner":       req.ClaimOwner,
-			"claim_generation":  req.Generation,
-			"result_status":     status,
-			"next_attempt_at":   nextAttemptAt,
-			"evidence":          req.Evidence,
-			"error_code":        errorCode,
-			"started_at":        req.StartedAt,
-			"completed_at":      req.CompletedAt,
+			"schema_version":           SchemaDeliveryResult,
+			"record_version":           1,
+			"result_record_id":         resultID,
+			"attempt_record_id":        req.AttemptRecordID,
+			"obligation_id":            req.ObligationID,
+			"attempt_ordinal":          req.AttemptOrdinal,
+			"claim_owner":              req.ClaimOwner,
+			"claim_generation":         req.Generation,
+			"transport_contract":       attempt.TransportContract,
+			"provider_idempotency_key": req.ProviderIdempotencyKey,
+			"result_status":            status,
+			"next_attempt_at":          nextAttemptAt,
+			"evidence":                 req.Evidence,
+			"error_code":               errorCode,
+			"started_at":               req.StartedAt,
+			"completed_at":             req.CompletedAt,
 		}
 		payloadJSON, err := canonicalJSON(payload)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO progress_delivery_attempts(
-				attempt_record_id, schema_version, record_version, project_id, delivery_run_id, obligation_id,
-				attempt_ordinal, claim_owner, claim_generation, result_status, next_attempt_at, evidence_kind, evidence_ref,
-				evidence_json, error_code, started_at, completed_at, payload_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			attemptID, SchemaDeliveryAttempt, 1, obligation.ProjectID, obligation.DeliveryRunID, obligation.ObligationID,
-			nextAttempt, req.ClaimOwner, req.Generation, status, nextAttemptAt, req.Evidence.EvidenceKind, req.Evidence.EvidenceRef,
-			string(evidenceJSON), errorCode, req.StartedAt, req.CompletedAt, string(payloadJSON)); err != nil {
-			return fmt.Errorf("record delivery attempt: %w", err)
+		if _, err := tx.Exec(ctx, `INSERT INTO progress_delivery_attempt_results(
+				result_record_id, schema_version, record_version, project_id, delivery_run_id, obligation_id,
+				attempt_record_id, attempt_ordinal, claim_owner, claim_generation, transport_contract, provider_idempotency_key,
+				result_status, next_attempt_at, evidence_kind, evidence_ref, evidence_json, error_code, started_at, completed_at, payload_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			resultID, SchemaDeliveryResult, 1, obligation.ProjectID, obligation.DeliveryRunID, obligation.ObligationID,
+			req.AttemptRecordID, req.AttemptOrdinal, req.ClaimOwner, req.Generation, attempt.TransportContract, req.ProviderIdempotencyKey,
+			status, nextAttemptAt, req.Evidence.EvidenceKind, req.Evidence.EvidenceRef, string(evidenceJSON), errorCode, req.StartedAt, req.CompletedAt, string(payloadJSON)); err != nil {
+			return fmt.Errorf("record delivery attempt result: %w", err)
 		}
 		obligationStatus := status
 		if status == DeliveryDeliveredUnacknowledged && obligation.AckPolicy == DeliveryAckPolicyNone {
@@ -396,10 +578,10 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 			claimExpiresAt = ""
 		}
 		update, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-			SET status = ?, claim_owner = ?, claimed_at = ?, claim_expires_at = ?, attempt_count = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
-			WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ? AND attempt_count = ?`,
-			obligationStatus, claimOwner, claimedAt, claimExpiresAt, nextAttempt, nextAttemptAt, errorCode, updatedAt,
-			req.ObligationID, DeliveryAttempting, req.ClaimOwner, req.Generation, obligation.AttemptCount)
+			SET status = ?, claim_owner = ?, claimed_at = ?, claim_expires_at = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
+			WHERE obligation_id = ? AND status IN (?, ?) AND claim_owner = ? AND claim_generation = ? AND attempt_count = ?`,
+			obligationStatus, claimOwner, claimedAt, claimExpiresAt, nextAttemptAt, errorCode, updatedAt,
+			req.ObligationID, DeliveryAttempting, DeliveryNeedsReconciliation, req.ClaimOwner, req.Generation, req.AttemptOrdinal)
 		if err != nil {
 			return fmt.Errorf("update delivery obligation attempt result: %w", err)
 		}
@@ -426,11 +608,15 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 	}
 	now := store.Now()
 	req.ObligationID = sanitizeID(req.ObligationID)
+	req.AttemptRecordID = sanitizeID(req.AttemptRecordID)
+	req.ResultRecordID = sanitizeID(req.ResultRecordID)
 	req.ClaimOwner = sanitizeID(req.ClaimOwner)
+	req.ProviderIdempotencyKey = sanitizeID(req.ProviderIdempotencyKey)
 	req.Evidence = normalizeDeliveryEvidence(req.Evidence)
 	req.AckedAt = normalizeTimestampOr(req.AckedAt, canonicalTimestamp(now))
-	if req.ObligationID == "" || req.ClaimOwner == "" || req.Generation <= 0 {
-		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id, claim_owner, and generation are required")
+	if req.ObligationID == "" || req.AttemptRecordID == "" || req.AttemptOrdinal <= 0 || req.ResultRecordID == "" ||
+		req.ClaimOwner == "" || req.Generation <= 0 || req.ProviderIdempotencyKey == "" {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id, attempt/result identity, claim, and idempotency key are required")
 	}
 	var stored DeliveryObligation
 	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
@@ -447,7 +633,23 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 		if err := validateAcknowledgmentEvidence(obligation.TransportContract, req.Evidence); err != nil {
 			return err
 		}
-		semantic := ackSemanticIdentity(obligation, req.Evidence)
+		result, found, err := loadDeliveryAttemptResultByIDTx(ctx, tx, req.ResultRecordID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return typed(ErrEvidenceRejectedCode, "delivery result %s not found for acknowledgment", req.ResultRecordID)
+		}
+		if !deliveryResultMatchesAckRequest(result, req) {
+			return typed(ErrStaleClaimCode, "acknowledgment does not match successful delivery result authority")
+		}
+		if result.ResultStatus != DeliveryDeliveredUnacknowledged {
+			return typed(ErrEvidenceRejectedCode, "acknowledgment requires successful delivery result, got %s", result.ResultStatus)
+		}
+		if result.TransportContract != obligation.TransportContract {
+			return typed(ErrEvidenceRejectedCode, "delivery result transport %q does not match obligation contract %q", result.TransportContract, obligation.TransportContract)
+		}
+		semantic := ackSemanticIdentity(obligation, result, req.Evidence)
 		if obligation.Status == DeliveryAcknowledged {
 			ack, found, err := loadDeliveryAckByObligationTx(ctx, tx, obligation.ObligationID)
 			if err != nil {
@@ -475,16 +677,20 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 			return err
 		}
 		payload := map[string]any{
-			"schema_version":     SchemaDeliveryAck,
-			"record_version":     1,
-			"acknowledgment_id":  ackID,
-			"obligation_id":      obligation.ObligationID,
-			"semantic_identity":  semantic,
-			"claim_owner":        req.ClaimOwner,
-			"claim_generation":   req.Generation,
-			"transport_contract": obligation.TransportContract,
-			"evidence":           req.Evidence,
-			"acknowledged_at":    req.AckedAt,
+			"schema_version":           SchemaDeliveryAck,
+			"record_version":           1,
+			"acknowledgment_id":        ackID,
+			"obligation_id":            obligation.ObligationID,
+			"semantic_identity":        semantic,
+			"attempt_record_id":        req.AttemptRecordID,
+			"attempt_ordinal":          req.AttemptOrdinal,
+			"result_record_id":         req.ResultRecordID,
+			"claim_owner":              req.ClaimOwner,
+			"claim_generation":         req.Generation,
+			"transport_contract":       obligation.TransportContract,
+			"provider_idempotency_key": req.ProviderIdempotencyKey,
+			"evidence":                 req.Evidence,
+			"acknowledged_at":          req.AckedAt,
 		}
 		payloadJSON, err := canonicalJSON(payload)
 		if err != nil {
@@ -492,11 +698,12 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 		}
 		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO progress_delivery_acknowledgments(
 				acknowledgment_id, schema_version, record_version, project_id, delivery_run_id, obligation_id,
-				semantic_identity, claim_owner, claim_generation, transport_contract, evidence_kind, evidence_ref,
-				evidence_json, acknowledged_at, payload_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				semantic_identity, attempt_record_id, attempt_ordinal, result_record_id, claim_owner, claim_generation,
+				transport_contract, provider_idempotency_key, evidence_kind, evidence_ref, evidence_json, acknowledged_at, payload_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ackID, SchemaDeliveryAck, 1, obligation.ProjectID, obligation.DeliveryRunID, obligation.ObligationID,
-			semantic, req.ClaimOwner, req.Generation, obligation.TransportContract, req.Evidence.EvidenceKind,
+			semantic, req.AttemptRecordID, req.AttemptOrdinal, req.ResultRecordID, req.ClaimOwner, req.Generation,
+			obligation.TransportContract, req.ProviderIdempotencyKey, req.Evidence.EvidenceKind,
 			req.Evidence.EvidenceRef, string(evidenceJSON), req.AckedAt, string(payloadJSON)); err != nil {
 			return fmt.Errorf("record delivery acknowledgment: %w", err)
 		}
@@ -696,13 +903,16 @@ func ListDeliveryAttempts(ctx context.Context, store storage.Store, filter Deliv
 	if projectID == "" || deliveryRunID == "" {
 		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
 	}
-	query := `SELECT payload_json, next_attempt_at FROM progress_delivery_attempts WHERE project_id = ? AND delivery_run_id = ?`
+	query := `SELECT a.payload_json, COALESCE(r.payload_json, '')
+		FROM progress_delivery_attempts a
+		LEFT JOIN progress_delivery_attempt_results r ON r.attempt_record_id = a.attempt_record_id
+		WHERE a.project_id = ? AND a.delivery_run_id = ?`
 	args := []any{projectID, deliveryRunID}
 	if obligationID := sanitizeID(filter.ObligationID); strings.TrimSpace(filter.ObligationID) != "" {
-		query += ` AND obligation_id = ?`
+		query += ` AND a.obligation_id = ?`
 		args = append(args, obligationID)
 	}
-	query += ` ORDER BY obligation_id, attempt_ordinal, attempt_record_id LIMIT ?`
+	query += ` ORDER BY a.obligation_id, a.attempt_ordinal, a.attempt_record_id LIMIT ?`
 	args = append(args, boundedLimit(filter.Limit))
 	out := []DeliveryAttempt{}
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
@@ -712,15 +922,21 @@ func ListDeliveryAttempts(ctx context.Context, store storage.Store, filter Deliv
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var payload, nextAttemptAt string
-			if err := rows.Scan(&payload, &nextAttemptAt); err != nil {
+			var payload, resultPayload string
+			if err := rows.Scan(&payload, &resultPayload); err != nil {
 				return fmt.Errorf("list delivery attempts scan: %w", err)
 			}
 			attempt, err := decodeDeliveryAttemptPayload([]byte(payload))
 			if err != nil {
 				return err
 			}
-			attempt.NextAttemptAt = nextAttemptAt
+			if resultPayload != "" {
+				result, err := decodeDeliveryAttemptResultPayload([]byte(resultPayload))
+				if err != nil {
+					return err
+				}
+				applyDeliveryAttemptResult(&attempt, result)
+			}
 			out = append(out, attempt)
 		}
 		if err := rows.Err(); err != nil {
@@ -990,23 +1206,93 @@ func requireClaimIdentity(obligation DeliveryObligation, owner string, generatio
 	return nil
 }
 
+func loadDeliveryAttemptTx(ctx context.Context, tx storage.Tx, attemptID string) (DeliveryAttempt, error) {
+	row := tx.QueryRow(ctx, `SELECT a.payload_json, COALESCE(r.payload_json, '')
+		FROM progress_delivery_attempts a
+		LEFT JOIN progress_delivery_attempt_results r ON r.attempt_record_id = a.attempt_record_id
+		WHERE a.attempt_record_id = ?`, attemptID)
+	var payload, resultPayload string
+	if err := row.Scan(&payload, &resultPayload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, typed(ErrMissingReferenceCode, "delivery attempt not found")
+		}
+		return DeliveryAttempt{}, fmt.Errorf("load delivery attempt: %w", err)
+	}
+	attempt, err := decodeDeliveryAttemptPayload([]byte(payload))
+	if err != nil {
+		return DeliveryAttempt{}, err
+	}
+	if resultPayload != "" {
+		result, err := decodeDeliveryAttemptResultPayload([]byte(resultPayload))
+		if err != nil {
+			return DeliveryAttempt{}, err
+		}
+		applyDeliveryAttemptResult(&attempt, result)
+	}
+	return attempt, nil
+}
+
 func loadDeliveryAttemptForGenerationTx(ctx context.Context, tx storage.Tx, obligationID string, generation int64) (DeliveryAttempt, bool, error) {
-	row := tx.QueryRow(ctx, `SELECT payload_json, next_attempt_at FROM progress_delivery_attempts
+	row := tx.QueryRow(ctx, `SELECT attempt_record_id FROM progress_delivery_attempts
 		WHERE obligation_id = ? AND claim_generation = ?
 		ORDER BY attempt_ordinal DESC LIMIT 1`, obligationID, generation)
-	var payload, nextAttemptAt string
-	if err := row.Scan(&payload, &nextAttemptAt); err != nil {
+	var attemptID string
+	if err := row.Scan(&attemptID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, false, nil
 		}
 		return DeliveryAttempt{}, false, fmt.Errorf("load delivery attempt replay: %w", err)
 	}
-	attempt, err := decodeDeliveryAttemptPayload([]byte(payload))
+	attempt, err := loadDeliveryAttemptTx(ctx, tx, attemptID)
 	if err != nil {
 		return DeliveryAttempt{}, false, err
 	}
-	attempt.NextAttemptAt = nextAttemptAt
 	return attempt, true, nil
+}
+
+func loadUnresolvedDeliveryAttemptTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryAttempt, bool, error) {
+	row := tx.QueryRow(ctx, `SELECT a.attempt_record_id FROM progress_delivery_attempts a
+		LEFT JOIN progress_delivery_attempt_results r ON r.attempt_record_id = a.attempt_record_id
+		WHERE a.obligation_id = ? AND r.result_record_id IS NULL
+		ORDER BY a.attempt_ordinal DESC LIMIT 1`, obligationID)
+	var attemptID string
+	if err := row.Scan(&attemptID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, false, nil
+		}
+		return DeliveryAttempt{}, false, fmt.Errorf("load unresolved delivery attempt: %w", err)
+	}
+	attempt, err := loadDeliveryAttemptTx(ctx, tx, attemptID)
+	if err != nil {
+		return DeliveryAttempt{}, false, err
+	}
+	return attempt, true, nil
+}
+
+func loadDeliveryAttemptResultForAttemptTx(ctx context.Context, tx storage.Tx, attemptID string) (DeliveryAttemptResult, bool, error) {
+	row := tx.QueryRow(ctx, `SELECT payload_json FROM progress_delivery_attempt_results WHERE attempt_record_id = ?`, attemptID)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttemptResult{}, false, nil
+		}
+		return DeliveryAttemptResult{}, false, fmt.Errorf("load delivery attempt result: %w", err)
+	}
+	result, err := decodeDeliveryAttemptResultPayload([]byte(payload))
+	return result, true, err
+}
+
+func loadDeliveryAttemptResultByIDTx(ctx context.Context, tx storage.Tx, resultID string) (DeliveryAttemptResult, bool, error) {
+	row := tx.QueryRow(ctx, `SELECT payload_json FROM progress_delivery_attempt_results WHERE result_record_id = ?`, resultID)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttemptResult{}, false, nil
+		}
+		return DeliveryAttemptResult{}, false, fmt.Errorf("load delivery attempt result by id: %w", err)
+	}
+	result, err := decodeDeliveryAttemptResultPayload([]byte(payload))
+	return result, true, err
 }
 
 func loadDeliveryAckByObligationTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryAcknowledgment, bool, error) {
@@ -1027,14 +1313,45 @@ func loadDeliveryAckByObligationTx(ctx context.Context, tx storage.Tx, obligatio
 	return ack, true, nil
 }
 
-func deliveryAttemptMatchesRequest(attempt DeliveryAttempt, req AttemptResultRequest) bool {
-	if attempt.ClaimOwner != req.ClaimOwner || attempt.ClaimGeneration != req.Generation {
+func deliveryAttemptMatchesResultRequest(attempt DeliveryAttempt, req AttemptResultRequest) bool {
+	return attempt.ObligationID == req.ObligationID &&
+		attempt.AttemptRecordID == req.AttemptRecordID &&
+		attempt.AttemptOrdinal == req.AttemptOrdinal &&
+		attempt.ClaimOwner == req.ClaimOwner &&
+		attempt.ClaimGeneration == req.Generation &&
+		attempt.ProviderIdempotencyKey == req.ProviderIdempotencyKey
+}
+
+func deliveryAttemptResultMatchesRequest(result DeliveryAttemptResult, req AttemptResultRequest) bool {
+	if result.ObligationID != req.ObligationID || result.AttemptRecordID != req.AttemptRecordID ||
+		result.AttemptOrdinal != req.AttemptOrdinal || result.ClaimOwner != req.ClaimOwner ||
+		result.ClaimGeneration != req.Generation || result.ProviderIdempotencyKey != req.ProviderIdempotencyKey {
 		return false
 	}
-	if attempt.ResultStatus != req.ResultStatus || attempt.ErrorCode != req.ErrorCode || attempt.Evidence != req.Evidence {
+	if result.ResultStatus != req.ResultStatus || result.ErrorCode != req.ErrorCode || result.Evidence != req.Evidence {
 		return false
 	}
-	return req.NextAttemptAt == "" || attempt.NextAttemptAt == req.NextAttemptAt
+	return req.NextAttemptAt == "" || result.NextAttemptAt == req.NextAttemptAt
+}
+
+func deliveryResultMatchesAckRequest(result DeliveryAttemptResult, req AcknowledgmentRequest) bool {
+	return result.ObligationID == req.ObligationID &&
+		result.AttemptRecordID == req.AttemptRecordID &&
+		result.AttemptOrdinal == req.AttemptOrdinal &&
+		result.ResultRecordID == req.ResultRecordID &&
+		result.ClaimOwner == req.ClaimOwner &&
+		result.ClaimGeneration == req.Generation &&
+		result.ProviderIdempotencyKey == req.ProviderIdempotencyKey
+}
+
+func applyDeliveryAttemptResult(attempt *DeliveryAttempt, result DeliveryAttemptResult) {
+	attempt.ResultRecordID = result.ResultRecordID
+	attempt.ResultStatus = result.ResultStatus
+	attempt.NextAttemptAt = result.NextAttemptAt
+	attempt.Evidence = result.Evidence
+	attempt.ErrorCode = result.ErrorCode
+	attempt.StartedAt = result.StartedAt
+	attempt.CompletedAt = result.CompletedAt
 }
 
 func loadDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryObligation, error) {
@@ -1161,6 +1478,17 @@ func decodeDeliveryAttemptPayload(data []byte) (DeliveryAttempt, error) {
 	return attempt, nil
 }
 
+func decodeDeliveryAttemptResultPayload(data []byte) (DeliveryAttemptResult, error) {
+	var result DeliveryAttemptResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return DeliveryAttemptResult{}, typed(ErrInvalidRecordCode, "decode persisted delivery attempt result: %v", err)
+	}
+	if result.SchemaVersion != SchemaDeliveryResult || result.RecordVersion != 1 {
+		return DeliveryAttemptResult{}, typed(ErrUnknownRecordVersionCode, "unsupported delivery attempt result %q record version %d", result.SchemaVersion, result.RecordVersion)
+	}
+	return result, nil
+}
+
 func decodeDeliveryAckPayload(data []byte) (DeliveryAcknowledgment, error) {
 	var ack DeliveryAcknowledgment
 	if err := json.Unmarshal(data, &ack); err != nil {
@@ -1204,10 +1532,12 @@ func deliveryObligationSemanticIdentity(obligation DeliveryObligation) string {
 	})
 }
 
-func ackSemanticIdentity(obligation DeliveryObligation, evidence DeliveryEvidence) string {
+func ackSemanticIdentity(obligation DeliveryObligation, result DeliveryAttemptResult, evidence DeliveryEvidence) string {
 	return prefixedDigest("sha256", map[string]any{
 		"schema_version":      SchemaDeliveryAck,
 		"obligation_identity": obligation.SemanticIdentity,
+		"attempt_record_id":   result.AttemptRecordID,
+		"result_record_id":    result.ResultRecordID,
 		"transport_contract":  obligation.TransportContract,
 		"evidence_kind":       evidence.EvidenceKind,
 		"evidence_ref":        evidence.EvidenceRef,
@@ -1228,7 +1558,7 @@ func prefixedDigest(prefix string, v any) string {
 
 func validDeliveryStatus(status string) bool {
 	switch status {
-	case DeliveryPending, DeliveryAttempting, DeliveryDeliveredUnacknowledged, DeliveryAcknowledged, DeliveryUnsupported, DeliveryRetryableFailure, DeliveryTerminalFailure, DeliveryExpired, DeliverySuperseded:
+	case DeliveryPending, DeliveryAttempting, DeliveryNeedsReconciliation, DeliveryDeliveredUnacknowledged, DeliveryAcknowledged, DeliveryUnsupported, DeliveryRetryableFailure, DeliveryTerminalFailure, DeliveryExpired, DeliverySuperseded:
 		return true
 	default:
 		return false

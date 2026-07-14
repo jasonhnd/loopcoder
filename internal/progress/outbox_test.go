@@ -181,11 +181,9 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 	}); !errors.Is(err, ErrClaimConflict) {
 		t.Fatalf("concurrent claim error = %v, want ErrClaimConflict", err)
 	}
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
 
-	attempted, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempted, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryDeliveredUnacknowledged,
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "host-accepted",
@@ -194,24 +192,21 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 			Confidence:        "exact",
 			TransportContract: "host-jsonl-v1",
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult: %v", err)
 	}
 	if attempted.Status != DeliveryDeliveredUnacknowledged || attempted.AttemptCount != 1 {
 		t.Fatalf("attempted = %#v, want delivered-unacknowledged attempt 1", attempted)
 	}
-	if _, err := AcknowledgeDelivery(ctx, store, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	if _, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "stdout-bytes",
 			EvidenceRef:       "stdout-1",
 			Confidence:        "exact",
 			TransportContract: "host-jsonl-v1",
 		},
-	}); !errors.Is(err, ErrEvidenceRejected) {
+	})); !errors.Is(err, ErrEvidenceRejected) {
 		t.Fatalf("stdout ack error = %v, want ErrEvidenceRejected", err)
 	}
 	if err := AdvanceDeliveryReplayCursor(ctx, store, CursorAdvanceRequest{
@@ -225,10 +220,7 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 		t.Fatalf("stale cursor advance error = %v, want ErrStaleClaim", err)
 	}
 
-	acked, err := AcknowledgeDelivery(ctx, store, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	acked, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "host-visible",
 			EvidenceRef:       "host-visible-1",
@@ -236,17 +228,14 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 			Confidence:        "exact",
 			TransportContract: "host-jsonl-v1",
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("AcknowledgeDelivery: %v", err)
 	}
 	if acked.Status != DeliveryAcknowledged {
 		t.Fatalf("acked status = %q, want acknowledged", acked.Status)
 	}
-	if _, err := AcknowledgeDelivery(ctx, store, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	if _, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "host-visible",
 			EvidenceRef:       "host-visible-1",
@@ -254,7 +243,7 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 			Confidence:        "exact",
 			TransportContract: "host-jsonl-v1",
 		},
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("duplicate AcknowledgeDelivery: %v", err)
 	}
 	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_acknowledgments`, 1)
@@ -287,16 +276,14 @@ func TestDeliveryOutboxAttemptResultReplayDoesNotDoubleCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	req := AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	req := bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryRetryableFailure,
 		Evidence:     DeliveryEvidence{EvidenceKind: "host-error", EvidenceRef: "host-error-replay", TransportContract: "host-jsonl-v1"},
 		ErrorCode:    "temporary",
 		StartedAt:    fixedTime.Format(time.RFC3339Nano),
 		CompletedAt:  fixedTime.Format(time.RFC3339Nano),
-	}
+	})
 	first, err := RecordDeliveryAttemptResult(ctx, store, req)
 	if err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult first: %v", err)
@@ -309,6 +296,7 @@ func TestDeliveryOutboxAttemptResultReplayDoesNotDoubleCount(t *testing.T) {
 		t.Fatalf("replay counts first=%#v second=%#v, want one recorded attempt at original generation", first, second)
 	}
 	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_attempts`, 1)
+	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_attempt_results`, 1)
 
 	conflict := req
 	conflict.Evidence.EvidenceRef = "host-error-conflict"
@@ -338,20 +326,18 @@ func TestDeliveryOutboxConcurrentAttemptResultReplayIsSingleTransition(t *testin
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close seed: %v", err)
 	}
 
-	req := AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	req := bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryRetryableFailure,
 		Evidence:     DeliveryEvidence{EvidenceKind: "host-error", EvidenceRef: "host-error-race", TransportContract: "host-jsonl-v1"},
 		ErrorCode:    "temporary",
 		StartedAt:    fixedTime.Format(time.RFC3339Nano),
 		CompletedAt:  fixedTime.Format(time.RFC3339Nano),
-	}
+	})
 	ready := make(chan struct{})
 	errs := make(chan error, 2)
 	for i := 0; i < 2; i++ {
@@ -380,6 +366,7 @@ func TestDeliveryOutboxConcurrentAttemptResultReplayIsSingleTransition(t *testin
 	}
 	defer verify.Close()
 	assertProgressCount(t, ctx, verify, `SELECT COUNT(*) FROM progress_delivery_attempts`, 1)
+	assertProgressCount(t, ctx, verify, `SELECT COUNT(*) FROM progress_delivery_attempt_results`, 1)
 	loaded, err := ReadDeliveryObligation(ctx, verify, "proj_progress", "run_progress", created.Obligation.ObligationID)
 	if err != nil {
 		t.Fatalf("ReadDeliveryObligation: %v", err)
@@ -414,14 +401,12 @@ func TestDeliveryOutboxRetrySchedulingAndScopedReadAPIsSurviveRestart(t *testing
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	retry, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	retry, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryRetryableFailure,
 		Evidence:     DeliveryEvidence{EvidenceKind: "host-error", EvidenceRef: "host-error-1", TransportContract: "host-jsonl-v1"},
 		ErrorCode:    "transport-timeout",
-	})
+	}))
 	if err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult retry: %v", err)
 	}
@@ -526,29 +511,24 @@ func TestDeliveryOutboxNoAckPolicyTerminalsWithoutAcknowledgment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	delivered, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	delivered, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryDeliveredUnacknowledged,
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "host-accepted",
 			EvidenceRef:       "host-event-noack",
 			TransportContract: "host-jsonl-v1",
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult: %v", err)
 	}
 	if delivered.Status != DeliveryAcknowledged || delivered.RequiredAck {
 		t.Fatalf("delivered no-ack state = %#v, want terminal acknowledged without required ack", delivered)
 	}
-	if _, err := AcknowledgeDelivery(ctx, store, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-noack", TransportContract: "host-jsonl-v1"},
-	}); !errors.Is(err, ErrEvidenceRejected) {
+	if _, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-noack", TransportContract: "host-jsonl-v1"},
+	})); !errors.Is(err, ErrEvidenceRejected) {
 		t.Fatalf("no-ack explicit ack error = %v, want ErrEvidenceRejected", err)
 	}
 	acks, err := ListDeliveryAcknowledgments(ctx, store, DeliveryAckFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress"})
@@ -604,15 +584,13 @@ func TestDeliveryOutboxStaleClaimCannotRecordAfterLeaseTakeover(t *testing.T) {
 	if second.ClaimGeneration != first.ClaimGeneration+1 {
 		t.Fatalf("takeover generation = %d, want %d", second.ClaimGeneration, first.ClaimGeneration+1)
 	}
-	_, err = RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
+	_, err = BeginDeliveryAttempt(ctx, store, BeginAttemptRequest{
 		ObligationID: created.Obligation.ObligationID,
 		ClaimOwner:   first.ClaimOwner,
 		Generation:   first.ClaimGeneration,
-		ResultStatus: DeliveryUnsupported,
-		Evidence:     DeliveryEvidence{EvidenceKind: "unsupported", EvidenceRef: "unsupported-1"},
 	})
 	if !errors.Is(err, ErrStaleClaim) {
-		t.Fatalf("stale attempt error = %v, want ErrStaleClaim", err)
+		t.Fatalf("stale begin error = %v, want ErrStaleClaim", err)
 	}
 }
 
@@ -725,88 +703,122 @@ func TestDeliveryOutboxCrashReplayAndMaxAttemptBoundaries(t *testing.T) {
 	if second.ClaimGeneration != first.ClaimGeneration+1 {
 		t.Fatalf("takeover generation = %d, want %d", second.ClaimGeneration, first.ClaimGeneration+1)
 	}
-	delivered, err := RecordDeliveryAttemptResult(ctx, reopened, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   second.ClaimOwner,
-		Generation:   second.ClaimGeneration,
-		ResultStatus: DeliveryDeliveredUnacknowledged,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-accepted", EvidenceRef: "host-event-crash-after-send", TransportContract: "host-jsonl-v1"},
-	})
-	if err != nil {
-		t.Fatalf("RecordDeliveryAttemptResult delivered: %v", err)
+	attempt := beginDeliveryAttemptForClaim(t, ctx, reopened, created.Obligation.ObligationID, second)
+	if attempt.AttemptOrdinal != 1 || attempt.ProviderIdempotencyKey == "" {
+		t.Fatalf("prepared attempt = %#v, want first bounded ordinal with idempotency key", attempt)
 	}
-	if delivered.Status != DeliveryDeliveredUnacknowledged {
-		t.Fatalf("delivered status = %q, want delivered-unacknowledged", delivered.Status)
+	afterBegin, err := ReadDeliveryObligation(ctx, reopened, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation after begin: %v", err)
+	}
+	if afterBegin.AttemptCount != 1 || afterBegin.Status != DeliveryAttempting {
+		t.Fatalf("after begin obligation = %#v, want attempting with consumed ordinal 1", afterBegin)
 	}
 	if err := reopened.Close(); err != nil {
-		t.Fatalf("Close after send: %v", err)
+		t.Fatalf("Close after simulated host side effect before result: %v", err)
 	}
 
-	replayed, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return now.Add(time.Minute) }})
+	replayed, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return now.Add(3 * time.Minute) }})
 	if err != nil {
 		t.Fatalf("replay after send: %v", err)
 	}
 	defer replayed.Close()
+	_, blindErr := ClaimDeliveryObligation(ctx, replayed, ClaimRequest{
+		ObligationID:   created.Obligation.ObligationID,
+		ClaimOwner:     "supervisor-blind-resend",
+		LeaseExpiresAt: now.Add(4 * time.Minute).Format(time.RFC3339Nano),
+	})
+	if !errors.Is(blindErr, ErrClaimConflict) {
+		t.Fatalf("blind resend claim error = %v, want ErrClaimConflict", blindErr)
+	}
 	loaded, err := ReadDeliveryObligation(ctx, replayed, "proj_progress", "run_progress", created.Obligation.ObligationID)
 	if err != nil {
 		t.Fatalf("ReadDeliveryObligation replay: %v", err)
 	}
-	if loaded.Status != DeliveryDeliveredUnacknowledged || loaded.AttemptCount != 1 {
-		t.Fatalf("replayed obligation = %#v, want delivered-unacknowledged attempt 1", loaded)
+	if loaded.Status != DeliveryNeedsReconciliation || loaded.AttemptCount != 1 {
+		t.Fatalf("blind resend error = %v; replayed obligation = %#v, want needs-reconciliation with consumed attempt 1", blindErr, loaded)
+	}
+	prepared, err := ListDeliveryAttempts(ctx, replayed, DeliveryAttemptFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", ObligationID: created.Obligation.ObligationID})
+	if err != nil {
+		t.Fatalf("ListDeliveryAttempts prepared: %v", err)
+	}
+	if len(prepared) != 1 || prepared[0].AttemptRecordID != attempt.AttemptRecordID ||
+		prepared[0].ProviderIdempotencyKey != attempt.ProviderIdempotencyKey || prepared[0].ResultStatus != "" {
+		t.Fatalf("prepared attempts after crash = %#v, want unresolved original attempt and key", prepared)
+	}
+	assertProgressCount(t, ctx, replayed, `SELECT COUNT(*) FROM progress_delivery_attempt_results`, 0)
+	delivered, err := RecordDeliveryAttemptResult(ctx, replayed, bindAttemptResult(attempt, AttemptResultRequest{
+		ResultStatus: DeliveryDeliveredUnacknowledged,
+		Evidence:     DeliveryEvidence{EvidenceKind: "host-accepted", EvidenceRef: "host-event-crash-after-send", TransportContract: "host-jsonl-v1"},
+	}))
+	if err != nil {
+		t.Fatalf("RecordDeliveryAttemptResult delivered after reconciliation: %v", err)
+	}
+	if delivered.Status != DeliveryDeliveredUnacknowledged || delivered.AttemptCount != 1 {
+		t.Fatalf("delivered after reconciliation = %#v, want delivered-unacknowledged attempt 1", delivered)
 	}
 	assertProgressCount(t, ctx, replayed, `SELECT COUNT(*) FROM progress_delivery_acknowledgments`, 0)
 	if _, err := ClaimDeliveryObligation(ctx, replayed, ClaimRequest{
 		ObligationID:   created.Obligation.ObligationID,
 		ClaimOwner:     "supervisor-after-send",
-		LeaseExpiresAt: now.Add(2 * time.Minute).Format(time.RFC3339Nano),
+		LeaseExpiresAt: now.Add(4 * time.Minute).Format(time.RFC3339Nano),
 	}); !errors.Is(err, ErrClaimConflict) {
 		t.Fatalf("delivered-unack claim error = %v, want ErrClaimConflict", err)
 	}
-	if _, err := AcknowledgeDelivery(ctx, replayed, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   second.ClaimOwner,
-		Generation:   second.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "wrong-contract"},
-	}); !errors.Is(err, ErrEvidenceRejected) {
+	if _, err := AcknowledgeDelivery(ctx, replayed, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "wrong-contract"},
+	})); !errors.Is(err, ErrEvidenceRejected) {
 		t.Fatalf("wrong transport ack error = %v, want ErrEvidenceRejected", err)
 	}
-	acked, err := AcknowledgeDelivery(ctx, replayed, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   second.ClaimOwner,
-		Generation:   second.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	wrongResult := bindAcknowledgment(attempt, AcknowledgmentRequest{
+		ResultRecordID: "pdelres_wrong",
+		Evidence:       DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
 	})
+	if _, err := AcknowledgeDelivery(ctx, replayed, wrongResult); !errors.Is(err, ErrEvidenceRejected) {
+		t.Fatalf("wrong result ack error = %v, want ErrEvidenceRejected", err)
+	}
+	wrongAttempt := bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	})
+	wrongAttempt.AttemptRecordID = "pdelatt_wrong"
+	if _, err := AcknowledgeDelivery(ctx, replayed, wrongAttempt); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("wrong attempt ack error = %v, want ErrStaleClaim", err)
+	}
+	wrongKey := bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	})
+	wrongKey.ProviderIdempotencyKey = "pdelidem_wrong"
+	if _, err := AcknowledgeDelivery(ctx, replayed, wrongKey); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("wrong idempotency key ack error = %v, want ErrStaleClaim", err)
+	}
+	acked, err := AcknowledgeDelivery(ctx, replayed, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	}))
 	if err != nil {
 		t.Fatalf("expired-lease AcknowledgeDelivery: %v", err)
 	}
 	if acked.Status != DeliveryAcknowledged || acked.AttemptCount != 1 {
 		t.Fatalf("acked after expired lease = %#v, want acknowledged once without resend", acked)
 	}
-	if _, err := AcknowledgeDelivery(ctx, replayed, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   second.ClaimOwner,
-		Generation:   second.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
-	}); err != nil {
+	if _, err := AcknowledgeDelivery(ctx, replayed, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	})); err != nil {
 		t.Fatalf("duplicate expired-lease AcknowledgeDelivery: %v", err)
 	}
-	if _, err := AcknowledgeDelivery(ctx, replayed, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   "supervisor-wrong",
-		Generation:   second.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
-	}); !errors.Is(err, ErrStaleClaim) {
+	if _, err := AcknowledgeDelivery(ctx, replayed, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		ClaimOwner: "supervisor-wrong",
+		Evidence:   DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	})); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("wrong owner ack error = %v, want ErrStaleClaim", err)
 	}
-	if _, err := AcknowledgeDelivery(ctx, replayed, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   second.ClaimOwner,
-		Generation:   second.ClaimGeneration + 1,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
-	}); !errors.Is(err, ErrStaleClaim) {
+	if _, err := AcknowledgeDelivery(ctx, replayed, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Generation: second.ClaimGeneration + 1,
+		Evidence:   DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-stale", TransportContract: "host-jsonl-v1"},
+	})); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("later generation ack error = %v, want ErrStaleClaim", err)
 	}
 	assertProgressCount(t, ctx, replayed, `SELECT COUNT(*) FROM progress_delivery_attempts`, 1)
+	assertProgressCount(t, ctx, replayed, `SELECT COUNT(*) FROM progress_delivery_attempt_results`, 1)
 	assertProgressCount(t, ctx, replayed, `SELECT COUNT(*) FROM progress_delivery_acknowledgments`, 1)
 }
 
@@ -839,14 +851,15 @@ func TestDeliveryOutboxMaxAttemptBoundsPersistFinalAttempt(t *testing.T) {
 				if err != nil {
 					t.Fatalf("claim %d: %v", attempt, err)
 				}
-				terminal, err = RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-					ObligationID: created.Obligation.ObligationID,
-					ClaimOwner:   claim.ClaimOwner,
-					Generation:   claim.ClaimGeneration,
+				prepared := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+				if prepared.AttemptOrdinal != attempt {
+					t.Fatalf("prepared ordinal %d = %d, want %d", attempt, prepared.AttemptOrdinal, attempt)
+				}
+				terminal, err = RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(prepared, AttemptResultRequest{
 					ResultStatus: DeliveryRetryableFailure,
 					Evidence:     DeliveryEvidence{EvidenceKind: "host-error", EvidenceRef: fmt.Sprintf("host-error-%d", attempt), TransportContract: "host-jsonl-v1"},
 					ErrorCode:    "temporary",
-				})
+				}))
 				if err != nil {
 					t.Fatalf("attempt result %d: %v", attempt, err)
 				}
@@ -887,6 +900,62 @@ func TestDeliveryOutboxMaxAttemptBoundsPersistFinalAttempt(t *testing.T) {
 	}
 }
 
+func TestDeliveryOutboxMaxAttemptBoundsAreConsumedAtBegin(t *testing.T) {
+	ctx := context.Background()
+	now := fixedTime
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	insertProject(t, ctx, store)
+	defer store.Close()
+
+	obligation := baseObligation()
+	obligation.MaxAttempts = 1
+	created, err := PersistReceiptWithObligation(ctx, store, baseReceipt(), obligation)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation: %v", err)
+	}
+	claim, err := ClaimDeliveryObligation(ctx, store, ClaimRequest{
+		ObligationID:   created.Obligation.ObligationID,
+		ClaimOwner:     "supervisor-max-begin",
+		LeaseExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("ClaimDeliveryObligation: %v", err)
+	}
+	first := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	replayed, err := BeginDeliveryAttempt(ctx, store, BeginAttemptRequest{
+		ObligationID: created.Obligation.ObligationID,
+		ClaimOwner:   claim.ClaimOwner,
+		Generation:   claim.ClaimGeneration,
+		PreparedAt:   fixedTime.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("duplicate BeginDeliveryAttempt: %v", err)
+	}
+	if replayed.AttemptRecordID != first.AttemptRecordID || replayed.AttemptOrdinal != 1 {
+		t.Fatalf("duplicate begin = %#v, want same prepared attempt %#v", replayed, first)
+	}
+	now = fixedTime.Add(2 * time.Minute)
+	if _, err := ClaimDeliveryObligation(ctx, store, ClaimRequest{
+		ObligationID:   created.Obligation.ObligationID,
+		ClaimOwner:     "supervisor-extra",
+		LeaseExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	}); !errors.Is(err, ErrClaimConflict) {
+		t.Fatalf("extra claim after missing result = %v, want ErrClaimConflict", err)
+	}
+	loaded, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation: %v", err)
+	}
+	if loaded.Status != DeliveryNeedsReconciliation || loaded.AttemptCount != 1 {
+		t.Fatalf("loaded = %#v, want needs-reconciliation with one consumed attempt", loaded)
+	}
+	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_attempts`, 1)
+	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_attempt_results`, 0)
+}
+
 func TestDeliveryOutboxListAPIsFailClosedOnFuturePayloadVersions(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, ctx)
@@ -900,15 +969,28 @@ func TestDeliveryOutboxListAPIsFailClosedOnFuturePayloadVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	if _, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	if _, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryRetryableFailure,
 		Evidence:     DeliveryEvidence{EvidenceKind: "host-error", EvidenceRef: "host-error-future", TransportContract: "host-jsonl-v1"},
 		ErrorCode:    "temporary",
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE progress_delivery_attempt_results SET payload_json = json_set(payload_json, '$.schema_version', 'loopcoder.progress_delivery_attempt_result.v2')`)
+		return err
+	}); err != nil {
+		t.Fatalf("mutate result payload: %v", err)
+	}
+	if _, err := ListDeliveryAttempts(ctx, store, DeliveryAttemptFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress"}); !errors.Is(err, ErrUnknownRecordVersion) {
+		t.Fatalf("future attempt result list error = %v, want ErrUnknownRecordVersion", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE progress_delivery_attempt_results SET payload_json = json_set(payload_json, '$.schema_version', ?)`, SchemaDeliveryResult)
+		return err
+	}); err != nil {
+		t.Fatalf("restore result payload: %v", err)
 	}
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE progress_delivery_attempts SET payload_json = json_set(payload_json, '$.schema_version', 'loopcoder.progress_delivery_attempt.v2')`)
@@ -946,10 +1028,8 @@ func TestDeliveryOutboxRedactsEvidenceBeforePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	if _, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	if _, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryRetryableFailure,
 		Evidence: DeliveryEvidence{
 			EvidenceKind:      "host-error",
@@ -959,7 +1039,7 @@ func TestDeliveryOutboxRedactsEvidenceBeforePersistence(t *testing.T) {
 			TransportContract: "host-jsonl-v1",
 		},
 		ErrorCode: "transport",
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -1010,21 +1090,16 @@ func TestDeliveryOutboxDoesNotMutateUnrelatedAuthorityTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDeliveryObligation: %v", err)
 	}
-	if _, err := RecordDeliveryAttemptResult(ctx, store, AttemptResultRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+	if _, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
 		ResultStatus: DeliveryDeliveredUnacknowledged,
 		Evidence:     DeliveryEvidence{EvidenceKind: "host-accepted", EvidenceRef: "host-event-boundary", TransportContract: "host-jsonl-v1"},
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("RecordDeliveryAttemptResult: %v", err)
 	}
-	if _, err := AcknowledgeDelivery(ctx, store, AcknowledgmentRequest{
-		ObligationID: created.Obligation.ObligationID,
-		ClaimOwner:   claim.ClaimOwner,
-		Generation:   claim.ClaimGeneration,
-		Evidence:     DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-boundary", TransportContract: "host-jsonl-v1"},
-	}); err != nil {
+	if _, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "host-visible-boundary", TransportContract: "host-jsonl-v1"},
+	})); err != nil {
 		t.Fatalf("AcknowledgeDelivery: %v", err)
 	}
 	after := snapshotOutboxAuthorityTables(t, ctx, store)
@@ -1065,6 +1140,54 @@ func assertProgressCount(t *testing.T, ctx context.Context, store storage.Store,
 	if count != want {
 		t.Fatalf("count for %q = %d, want %d", query, count, want)
 	}
+}
+
+func beginDeliveryAttemptForClaim(t *testing.T, ctx context.Context, store storage.Store, obligationID string, claim ClaimResult) DeliveryAttempt {
+	t.Helper()
+	attempt, err := BeginDeliveryAttempt(ctx, store, BeginAttemptRequest{
+		ObligationID: obligationID,
+		ClaimOwner:   claim.ClaimOwner,
+		Generation:   claim.ClaimGeneration,
+		PreparedAt:   fixedTime.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("BeginDeliveryAttempt: %v", err)
+	}
+	return attempt
+}
+
+func bindAttemptResult(attempt DeliveryAttempt, req AttemptResultRequest) AttemptResultRequest {
+	req.ObligationID = attempt.ObligationID
+	req.AttemptRecordID = attempt.AttemptRecordID
+	req.AttemptOrdinal = attempt.AttemptOrdinal
+	req.ClaimOwner = attempt.ClaimOwner
+	req.Generation = attempt.ClaimGeneration
+	req.ProviderIdempotencyKey = attempt.ProviderIdempotencyKey
+	return req
+}
+
+func resultIDForAttempt(attempt DeliveryAttempt) string {
+	return prefixedDigest("pdelres", map[string]any{
+		"schema_version":    SchemaDeliveryResult,
+		"attempt_record_id": attempt.AttemptRecordID,
+	})
+}
+
+func bindAcknowledgment(attempt DeliveryAttempt, req AcknowledgmentRequest) AcknowledgmentRequest {
+	req.ObligationID = attempt.ObligationID
+	req.AttemptRecordID = attempt.AttemptRecordID
+	req.AttemptOrdinal = attempt.AttemptOrdinal
+	if req.ResultRecordID == "" {
+		req.ResultRecordID = resultIDForAttempt(attempt)
+	}
+	if req.ClaimOwner == "" {
+		req.ClaimOwner = attempt.ClaimOwner
+	}
+	if req.Generation == 0 {
+		req.Generation = attempt.ClaimGeneration
+	}
+	req.ProviderIdempotencyKey = attempt.ProviderIdempotencyKey
+	return req
 }
 
 func deliveryObligationPayload(t *testing.T, ctx context.Context, store storage.Store, obligationID string) string {

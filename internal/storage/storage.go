@@ -492,6 +492,7 @@ var requiredTables = []string{
 	"progress_receipts",
 	"progress_delivery_obligations",
 	"progress_delivery_attempts",
+	"progress_delivery_attempt_results",
 	"progress_delivery_acknowledgments",
 	"progress_delivery_replay_cursors",
 	"handoff_transactions",

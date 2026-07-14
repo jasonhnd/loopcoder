@@ -292,7 +292,7 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 		if _, err := tx.Exec(ctx, `DROP TABLE nested_scheduler_resource_reservations`); err != nil {
 			return err
 		}
-		for _, table := range []string{"progress_delivery_replay_cursors", "progress_delivery_acknowledgments", "progress_delivery_attempts", "progress_delivery_obligations"} {
+		for _, table := range []string{"progress_delivery_replay_cursors", "progress_delivery_acknowledgments", "progress_delivery_attempt_results", "progress_delivery_attempts", "progress_delivery_obligations"} {
 			if _, err := tx.Exec(ctx, `DROP TABLE `+table); err != nil {
 				return err
 			}
