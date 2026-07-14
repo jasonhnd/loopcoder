@@ -28,3 +28,12 @@ migration row, and older binaries that only support v24 reject the database as a
 future schema. Downgrade by restoring a pre-v25 database copy or exporting local
 runtime state before opening it with an older binary; the v25 migration does
 not rewrite existing tables.
+
+Schema v28 adds the provider-neutral durable delivery outbox for progress
+receipts. Delivery obligations, bounded attempts, negotiated acknowledgments,
+and per-origin replay cursors are stored as separate project-scoped facts with
+stable semantic identities. Claim owner, claim generation, and lease expiry
+fence every result, acknowledgment, and cursor movement; stale claimants cannot
+advance delivery state. Acknowledgment requires typed host/transport evidence
+matching the obligation contract, and stdout bytes alone are not acknowledgment
+unless the explicit transport contract says so.

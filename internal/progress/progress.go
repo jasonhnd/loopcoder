@@ -32,6 +32,9 @@ const (
 	ErrDuplicateReplayCode      ErrorCode = "ErrDuplicateReplay"
 	ErrUnknownRecordVersionCode ErrorCode = "ErrUnknownRecordVersion"
 	ErrMissingReferenceCode     ErrorCode = "ErrMissingReference"
+	ErrClaimConflictCode        ErrorCode = "ErrClaimConflict"
+	ErrStaleClaimCode           ErrorCode = "ErrStaleClaim"
+	ErrEvidenceRejectedCode     ErrorCode = "ErrEvidenceRejected"
 )
 
 var (
@@ -39,6 +42,9 @@ var (
 	ErrDuplicateReplay      = &TypedError{Code: ErrDuplicateReplayCode}
 	ErrUnknownRecordVersion = &TypedError{Code: ErrUnknownRecordVersionCode}
 	ErrMissingReference     = &TypedError{Code: ErrMissingReferenceCode}
+	ErrClaimConflict        = &TypedError{Code: ErrClaimConflictCode}
+	ErrStaleClaim           = &TypedError{Code: ErrStaleClaimCode}
+	ErrEvidenceRejected     = &TypedError{Code: ErrEvidenceRejectedCode}
 )
 
 type TypedError struct {
@@ -206,100 +212,106 @@ func persistReceipt(ctx context.Context, store storage.Store, receipt ProgressRe
 	}
 	var result WriteResult
 	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		if err := ensureProject(ctx, tx, normalized.ProjectID); err != nil {
-			return err
-		}
-		if nextSequence {
-			var sequence int64
-			if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(correlation_sequence), 0) + 1
-				FROM progress_receipts
-				WHERE project_id = ? AND delivery_run_id = ? AND correlation_id = ?`,
-				normalized.ProjectID, normalized.DeliveryRunID, normalized.CorrelationID).Scan(&sequence); err != nil {
-				return fmt.Errorf("allocate progress receipt sequence: %w", err)
-			}
-			normalized.CorrelationSequence = sequence
-			normalized.ProgressReceiptID = ""
-			normalized.SemanticFingerprint = ""
-			normalized, err = NormalizeReceipt(normalized, now)
-			if err != nil {
-				return err
-			}
-		}
-		payload, err := canonicalJSON(normalized)
-		if err != nil {
-			return typed(ErrInvalidRecordCode, "canonical progress receipt: %v", err)
-		}
-		taskCounts, err := canonicalJSON(normalized.TaskCounts)
-		if err != nil {
-			return err
-		}
-		provider, err := canonicalJSON(normalized.Provider)
-		if err != nil {
-			return err
-		}
-		heartbeat, err := canonicalJSON(normalized.Heartbeat)
-		if err != nil {
-			return err
-		}
-		progressAge, err := canonicalJSON(normalized.Progress)
-		if err != nil {
-			return err
-		}
-		evidence, err := canonicalJSON(normalized.Evidence)
-		if err != nil {
-			return err
-		}
-		quotaBudget, err := canonicalJSON(normalized.QuotaBudget)
-		if err != nil {
-			return err
-		}
-		blocker, err := canonicalJSON(normalized.Blocker)
-		if err != nil {
-			return err
-		}
-		nextAction, err := canonicalJSON(normalized.NextAction)
-		if err != nil {
-			return err
-		}
-		redaction, err := canonicalJSON(normalized.Redaction)
-		if err != nil {
-			return err
-		}
-		gaps, err := canonicalJSON(normalized.GapReasons)
-		if err != nil {
-			return err
-		}
-		insert, err := tx.Exec(ctx, `INSERT OR IGNORE INTO progress_receipts(
-				progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
-				attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
-				provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
-				task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
-				blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			normalized.ProgressReceiptID, normalized.SchemaVersion, normalized.RecordVersion, normalized.ProjectID, normalized.DeliveryRunID,
-			normalized.RunID, normalized.TaskID, normalized.AttemptID, normalized.AttemptOrdinal, normalized.CorrelationID,
-			normalized.CorrelationSequence, normalized.SemanticFingerprint, normalized.Phase, normalized.Status,
-			normalized.Provider.ProviderID, normalized.Provider.ModelID, normalized.Heartbeat.AgeMillis, normalized.Progress.AgeMillis,
-			normalized.OccurredAt, normalized.PersistedAt, string(taskCounts), string(provider), string(heartbeat), string(progressAge),
-			string(evidence), string(quotaBudget), string(blocker), string(nextAction), string(redaction), string(gaps), string(payload))
-		if err != nil {
-			return fmt.Errorf("persist progress receipt: %w", err)
-		}
-		rows, err := insert.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("persist progress receipt: rows affected: %w", err)
-		}
-		stored, order, err := receiptBySemantic(ctx, tx, normalized.ProjectID, normalized.DeliveryRunID, normalized.CorrelationID, normalized.SemanticFingerprint)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return typed(ErrDuplicateReplayCode, "progress_receipt_id %q already exists for different semantic content", normalized.ProgressReceiptID)
-			}
-			return err
-		}
-		result = WriteResult{Receipt: stored, Inserted: rows == 1, StorageOrder: order}
-		return nil
+		var err error
+		result, err = persistNormalizedReceiptTx(ctx, tx, normalized, now, nextSequence)
+		return err
 	})
 	return result, err
+}
+
+func persistNormalizedReceiptTx(ctx context.Context, tx storage.Tx, normalized ProgressReceipt, now time.Time, nextSequence bool) (WriteResult, error) {
+	if err := ensureProject(ctx, tx, normalized.ProjectID); err != nil {
+		return WriteResult{}, err
+	}
+	if nextSequence {
+		var sequence int64
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(correlation_sequence), 0) + 1
+			FROM progress_receipts
+			WHERE project_id = ? AND delivery_run_id = ? AND correlation_id = ?`,
+			normalized.ProjectID, normalized.DeliveryRunID, normalized.CorrelationID).Scan(&sequence); err != nil {
+			return WriteResult{}, fmt.Errorf("allocate progress receipt sequence: %w", err)
+		}
+		normalized.CorrelationSequence = sequence
+		normalized.ProgressReceiptID = ""
+		normalized.SemanticFingerprint = ""
+		var err error
+		normalized, err = NormalizeReceipt(normalized, now)
+		if err != nil {
+			return WriteResult{}, err
+		}
+	}
+	payload, err := canonicalJSON(normalized)
+	if err != nil {
+		return WriteResult{}, typed(ErrInvalidRecordCode, "canonical progress receipt: %v", err)
+	}
+	taskCounts, err := canonicalJSON(normalized.TaskCounts)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	provider, err := canonicalJSON(normalized.Provider)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	heartbeat, err := canonicalJSON(normalized.Heartbeat)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	progressAge, err := canonicalJSON(normalized.Progress)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	evidence, err := canonicalJSON(normalized.Evidence)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	quotaBudget, err := canonicalJSON(normalized.QuotaBudget)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	blocker, err := canonicalJSON(normalized.Blocker)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	nextAction, err := canonicalJSON(normalized.NextAction)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	redaction, err := canonicalJSON(normalized.Redaction)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	gaps, err := canonicalJSON(normalized.GapReasons)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	insert, err := tx.Exec(ctx, `INSERT OR IGNORE INTO progress_receipts(
+			progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
+			attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
+			provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
+			task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
+			blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		normalized.ProgressReceiptID, normalized.SchemaVersion, normalized.RecordVersion, normalized.ProjectID, normalized.DeliveryRunID,
+		normalized.RunID, normalized.TaskID, normalized.AttemptID, normalized.AttemptOrdinal, normalized.CorrelationID,
+		normalized.CorrelationSequence, normalized.SemanticFingerprint, normalized.Phase, normalized.Status,
+		normalized.Provider.ProviderID, normalized.Provider.ModelID, normalized.Heartbeat.AgeMillis, normalized.Progress.AgeMillis,
+		normalized.OccurredAt, normalized.PersistedAt, string(taskCounts), string(provider), string(heartbeat), string(progressAge),
+		string(evidence), string(quotaBudget), string(blocker), string(nextAction), string(redaction), string(gaps), string(payload))
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("persist progress receipt: %w", err)
+	}
+	rows, err := insert.RowsAffected()
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("persist progress receipt: rows affected: %w", err)
+	}
+	stored, order, err := receiptBySemantic(ctx, tx, normalized.ProjectID, normalized.DeliveryRunID, normalized.CorrelationID, normalized.SemanticFingerprint)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WriteResult{}, typed(ErrDuplicateReplayCode, "progress_receipt_id %q already exists for different semantic content", normalized.ProgressReceiptID)
+		}
+		return WriteResult{}, err
+	}
+	return WriteResult{Receipt: stored, Inserted: rows == 1, StorageOrder: order}, nil
 }
 
 func LoadReceipt(ctx context.Context, store storage.Store, progressReceiptID string) (ProgressReceipt, error) {

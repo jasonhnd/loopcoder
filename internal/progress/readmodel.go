@@ -2,8 +2,10 @@ package progress
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -153,6 +155,16 @@ func ReadReceipts(ctx context.Context, store storage.Store, filter ReadFilter, n
 			continue
 		}
 		view := ViewReceipt(receipt, row.storageOrder, cursor, now)
+		state, err := deliveryStateForReceipt(ctx, store, receipt.ProgressReceiptID)
+		if err != nil {
+			batch.Diagnostics = append(batch.Diagnostics, ReadDiagnostic{
+				Code:         "progress-delivery-state-skipped",
+				Message:      boundedDiagnostic(err.Error()),
+				StorageOrder: row.storageOrder,
+			})
+		} else {
+			view.DeliveryState = state
+		}
 		batch.Views = append(batch.Views, view)
 	}
 	return batch, nil
@@ -385,6 +397,31 @@ func unsupportedDeliveryState() DeliveryStateView {
 		Authority: "durable-delivery-evidence",
 		Reason:    "no durable acknowledgement, acceptance, or wake evidence is present in this schema",
 	}
+}
+
+func deliveryStateForReceipt(ctx context.Context, store storage.Store, progressReceiptID string) (DeliveryStateView, error) {
+	state := unsupportedDeliveryState()
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT status, transport_contract
+			FROM progress_delivery_obligations
+			WHERE progress_receipt_id = ?
+			ORDER BY updated_at DESC, obligation_id DESC
+			LIMIT 1`, progressReceiptID)
+		var status, contract string
+		if err := row.Scan(&status, &contract); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return fmt.Errorf("read progress delivery state: %w", err)
+		}
+		state = DeliveryStateView{
+			State:     status,
+			Authority: "progress_delivery_obligations.status",
+			Reason:    "transport_contract=" + displayValue(contract),
+		}
+		return nil
+	})
+	return state, err
 }
 
 func boundFollowPollInterval(interval time.Duration) time.Duration {
