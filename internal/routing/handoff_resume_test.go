@@ -91,6 +91,169 @@ func TestResumeApprovedHandoffRoutesProviderAToProviderBOnce(t *testing.T) {
 	}
 }
 
+func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	receipt := "receipt-source-effect"
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = 'attempt-source'`, receipt)
+			return err
+		}); err != nil {
+			t.Fatalf("seed source receipt: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("receipt-backed resume: %v", err)
+	}
+	if executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateReceiptBacked || !result.Reconciliation.AutomaticContinuation {
+		t.Fatalf("receipt-backed result=%#v executions=%d, want automatic receipt reconciliation and one successor execution", result.Reconciliation, executions.Load())
+	}
+	evidence := handoffReconciliationEvidence(t, ctx, store, handoff.HandoffID)
+	if !strings.Contains(evidence, storage.HandoffSideEffectCodeReceiptBacked) || strings.Contains(evidence, receipt) || !strings.Contains(evidence, "provider_receipt_hash") {
+		t.Fatalf("receipt evidence = %s, want code + hash without raw receipt", evidence)
+	}
+
+	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if replayErr != nil {
+		t.Fatalf("receipt-backed replay: %v", replayErr)
+	}
+	if executions.Load() != 1 || replayed.Successor.LaunchExposed || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+		t.Fatalf("receipt replay result=%#v executions=%d attempts=%d, want observe-only replay", replayed, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
+func TestResumeApprovedHandoffReconcilesIdempotentSourceEffect(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := storage.UpdateChildRunClaimPhase(ctx, store, "run-routing", claim.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, fixture.now.Add(30*time.Second).Format(time.RFC3339Nano), ""); err != nil {
+			t.Fatalf("set source executing: %v", err)
+		}
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_idempotency_key = ? WHERE attempt_id = 'attempt-source'`, claim.ProviderKey)
+			return err
+		}); err != nil {
+			t.Fatalf("align source idempotency key: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("idempotent resume: %v", err)
+	}
+	if executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateIdempotent || !result.Reconciliation.AutomaticContinuation {
+		t.Fatalf("idempotent result=%#v executions=%d, want exact-key reconciliation and one successor execution", result.Reconciliation, executions.Load())
+	}
+}
+
+func TestResumeApprovedHandoffReceiptConflictFailsClosedWithoutLaunchMutation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = 'receipt-original' WHERE attempt_id = 'attempt-source'`)
+			return err
+		}); err != nil {
+			t.Fatalf("seed original source receipt: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = 'receipt-conflict' WHERE attempt_id = 'attempt-source'`)
+		return err
+	}); err != nil {
+		t.Fatalf("mutate source receipt conflict: %v", err)
+	}
+	var executions atomic.Int64
+	_, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, &storage.FederationError{Code: storage.ErrHandoffReplayMismatchCode}) {
+		t.Fatalf("receipt conflict error = %v, want ErrHandoffReplayMismatch", err)
+	}
+	if executions.Load() != 0 || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 0 {
+		t.Fatalf("receipt conflict executions=%d attempts=%d, want no successor mutation", executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+	if status, next := handoffStatusAndAction(t, ctx, store, handoff.HandoffID); status != storage.HandoffStatusTransferred || next != "await-successor-route" {
+		t.Fatalf("receipt conflict handoff status=%s next=%s, want original transferred state", status, next)
+	}
+}
+
+func TestResumeApprovedHandoffAmbiguousSourceStateDoesNotLaunchSuccessor(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := storage.UpdateChildRunClaimPhase(ctx, store, "run-routing", claim.RunID, claim.ExecutorID, claim.ClaimGeneration, storage.ClaimPhaseExecuting, fixture.now.Add(30*time.Second).Format(time.RFC3339Nano), ""); err != nil {
+			t.Fatalf("set ambiguous source executing: %v", err)
+		}
+	})
+	defer store.Close()
+	if handoff.HandoffStatus != storage.HandoffStatusNeedsHuman || handoff.SideEffectState != storage.SideEffectStateAmbiguous {
+		t.Fatalf("ambiguous handoff = %s/%s, want needs-human/ambiguous", handoff.HandoffStatus, handoff.SideEffectState)
+	}
+	var executions atomic.Int64
+	_, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) || executions.Load() != 0 || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 0 {
+		t.Fatalf("ambiguous resume err=%v executions=%d attempts=%d, want blocked before successor", err, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
 func TestResumeApprovedHandoffRoutesProviderAToGrokOrdinaryWorkerOnce(t *testing.T) {
 	ctx := context.Background()
 	fixture := withGrokOrdinaryWorkerFixture(newFixture(t))
@@ -1810,6 +1973,10 @@ func handoffResumeOwnershipFixtureAtPath(t *testing.T, ctx context.Context, fixt
 }
 
 func handoffResumeFixtureAtPathWithOwnership(t *testing.T, ctx context.Context, fixture hardFixture, path string, withOwnership bool) (storage.Store, storage.HandoffTransaction, DecisionInput) {
+	return handoffResumeFixtureWithSourceMutation(t, ctx, fixture, path, withOwnership, nil)
+}
+
+func handoffResumeFixtureWithSourceMutation(t *testing.T, ctx context.Context, fixture hardFixture, path string, withOwnership bool, mutateSource func(storage.Store, storage.ClaimResult)) (storage.Store, storage.HandoffTransaction, DecisionInput) {
 	t.Helper()
 	store, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
 	if err != nil {
@@ -1852,6 +2019,9 @@ func handoffResumeFixtureAtPathWithOwnership(t *testing.T, ctx context.Context, 
 		t.Fatalf("ClaimChildRunExecution: %v", err)
 	}
 	seedHandoffAgentAuthority(t, ctx, store, fixture, claim, input, withOwnership)
+	if mutateSource != nil {
+		mutateSource(store, claim)
+	}
 	handoff, err := storage.RecordHandoffTransaction(ctx, store, storage.HandoffRequest{
 		IdempotencyKey:            "handoff-quota-a",
 		ProjectID:                 "proj-routing",
@@ -2080,6 +2250,28 @@ func countSuccessorAttempts(t *testing.T, ctx context.Context, store storage.Sto
 		t.Fatalf("count successor attempts: %v", err)
 	}
 	return count
+}
+
+func handoffReconciliationEvidence(t *testing.T, ctx context.Context, store storage.Store, handoffID string) string {
+	t.Helper()
+	var raw string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions WHERE decision_key = ?`, "handoff-side-effect:"+handoffID).Scan(&raw)
+	}); err != nil {
+		t.Fatalf("handoff reconciliation evidence: %v", err)
+	}
+	return raw
+}
+
+func handoffStatusAndAction(t *testing.T, ctx context.Context, store storage.Store, handoffID string) (string, string) {
+	t.Helper()
+	var status, next string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT handoff_status, next_action FROM handoff_transactions WHERE handoff_id = ?`, handoffID).Scan(&status, &next)
+	}); err != nil {
+		t.Fatalf("handoff status/action: %v", err)
+	}
+	return status, next
 }
 
 func reservationState(t *testing.T, ctx context.Context, store storage.Store, reservationID string) string {

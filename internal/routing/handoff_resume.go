@@ -62,6 +62,7 @@ const (
 
 type HandoffResumeResult struct {
 	Handoff         storage.HandoffTransaction
+	Reconciliation  storage.HandoffSideEffectReconciliation
 	RoutingDecision RoutingDecision
 	Reservation     budget.Reservation
 	Successor       storage.HandoffSuccessorLaunch
@@ -81,6 +82,15 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	if handoff.HandoffStatus != storage.HandoffStatusTransferred {
 		return HandoffResumeResult{Handoff: handoff, Blocked: true}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff is not approved for automatic successor launch"}
 	}
+	reconciliation, err := storage.ReconcileHandoffSideEffect(ctx, store, handoff)
+	if err != nil {
+		return HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}, err
+	}
+	if !reconciliation.AutomaticContinuation || reconciliation.NeedsHuman {
+		result := HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}
+		markErr := storage.MarkHandoffSideEffectNeedsHuman(ctx, store, handoff, reconciliation)
+		return result, errors.Join(markErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff side-effect reconciliation requires human review before successor launch"})
+	}
 	routeInput := input.DecisionInput
 	routeInput.ProjectID = handoff.ProjectID
 	routeInput.DeliveryRunID = handoff.DeliveryRunID
@@ -95,7 +105,7 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		return HandoffResumeResult{Handoff: handoff}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "handoff successor requirement does not match approved task authority"}
 	}
 	decision, routeErr := DecideAndPersistRoute(ctx, store, routeInput)
-	result := HandoffResumeResult{Handoff: handoff, RoutingDecision: decision}
+	result := HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, RoutingDecision: decision}
 	if routeErr != nil {
 		if errors.Is(routeErr, taskrequirements.ErrNoEligibleCandidate) {
 			result.Blocked = true
