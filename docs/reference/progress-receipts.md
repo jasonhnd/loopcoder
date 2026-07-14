@@ -59,14 +59,16 @@ Codex host replay is bounded and cursor ordered. Before dispatch starts worker
 mechanics, an explicit `--run-id` replays only that run's exact Codex origin
 binding; an ordinary later dispatch without `--run-id` scans at most the host
 replay limit of prior project delivery-run candidates with pending or due
-retryable host obligations, ordered by first obligation `created_at`, run ID,
-and correlation/origin ID. Each candidate recomputes the run-scoped Codex
-origin binding from the current opaque host origin and replays only exact
-`sink_id` matches, so other hosts, projects, runs, and non-matching chatter are
-ignored. Within a run, receipts replay in obligation `created_at, obligation_id`
-order and advance a per-origin cursor only after a claim-fenced human emit
-succeeds; a non-empty cursor whose anchor cannot be read is a fail-closed
-diagnostic instead of "start from zero."
+retryable host obligations for the current redacted stable Codex origin
+reference, ordered by first eligible obligation `created_at`, run ID, origin
+reference, and sink ID. Candidate discovery is cursor-aware: groups whose
+per-run replay cursor has already passed all eligible obligations do not consume
+the bounded candidate window, while a non-empty cursor whose anchor cannot be
+read remains discoverable for the fail-closed diagnostic instead of "start from
+zero." Each candidate replays only the exact persisted run-scoped `sink_id`
+binding, so other hosts, projects, runs, and non-matching chatter are ignored.
+Within a run, receipts replay in obligation `created_at, obligation_id` order
+and advance a per-origin cursor only after a claim-fenced human emit succeeds.
 
 Adapters and recovery readers must use project/delivery-run scoped read APIs:
 `ReadDeliveryObligation`, `ListDeliveryObligations`,
@@ -87,11 +89,11 @@ The Codex CLI host adapter uses only local documented host surfaces:
 foreground stdout/stderr, machine JSON stdout, durable local polling through
 `loopcoder status --receipts`, resumable following through `loopcoder attach`,
 and detached-run cancellation through `loopcoder cancel`. It declares callback,
-wake-up, host-managed background ownership, and acknowledgment unsupported
-unless a future documented Codex host API provides exact evidence. A Codex
-environment marker can identify an origin candidate, but it is not capability
-proof and does not create callback, wake-up, visibility, or acknowledgment
-evidence.
+wake-up, host-managed background ownership, and acknowledgment unsupported, and
+leaves detached steering unknown unless a future documented Codex host API
+provides exact evidence. A Codex environment marker can identify an origin
+candidate, but it is not capability proof and does not create callback, wake-up,
+visibility, steering, or acknowledgment evidence.
 
 When `CODEX_THREAD_ID` or `CODEX_SESSION_ID` is present, LoopCoder binds the
 active Codex origin by hashing the opaque thread/session value and storing only
@@ -112,12 +114,12 @@ receipt store and the delivery outbox. If the host goes offline, the run remains
 observable through `loopcoder status --repo . --run <run-id> --receipts` and
 `loopcoder attach --repo . --run <run-id>`; no notification is claimed.
 
-On the next invocation with the same project, run ID, and Codex origin binding,
-`dispatch` replays pending terminal and consequential receipts before launching
-new worker mechanics. Replay advances a bounded per-origin cursor and leaves
-the delivery obligation pending and unacknowledged. Replaying, polling,
-following, or attaching never records host acceptance, user visibility, wake-up,
-or acknowledgment.
+On a later invocation with the same project and Codex origin reference,
+`dispatch` replays pending terminal and consequential receipts for matching
+run-scoped bindings before launching new worker mechanics. Replay advances a
+bounded per-origin cursor and leaves the delivery obligation pending and
+unacknowledged. Replaying, polling, following, or attaching never records host
+acceptance, user visibility, wake-up, or acknowledgment.
 
 Origin mismatch produces no automatic replay. Stale cursors are bounded and
 safe: the next explicit status/follow command can still read receipts by run ID,

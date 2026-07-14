@@ -195,7 +195,7 @@ func TestCodexHostDeclaresOnlyDocumentedProgressCapabilities(t *testing.T) {
 	for capability, want := range map[runtimecap.HostCapability]runtimecap.HostCapabilitySupport{
 		runtimecap.HostDurablePolling:        runtimecap.HostCapabilitySupported,
 		runtimecap.HostResumableFollow:       runtimecap.HostCapabilitySupported,
-		runtimecap.HostDetachedSteering:      runtimecap.HostCapabilitySupported,
+		runtimecap.HostDetachedSteering:      runtimecap.HostCapabilityUnknown,
 		runtimecap.HostDetachedCancellation:  runtimecap.HostCapabilitySupported,
 		runtimecap.HostCallbacks:             runtimecap.HostCapabilityUnsupported,
 		runtimecap.HostWakeUp:                runtimecap.HostCapabilityUnsupported,

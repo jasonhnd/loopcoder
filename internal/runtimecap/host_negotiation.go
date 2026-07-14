@@ -279,7 +279,7 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 	if host.Name == "codex-cli" {
 		for i := range declarations {
 			switch declarations[i].Capability {
-			case HostDurablePolling, HostResumableFollow, HostDetachedSteering, HostDetachedCancellation:
+			case HostDurablePolling, HostResumableFollow, HostDetachedCancellation:
 				declarations[i].Support = HostCapabilitySupported
 				declarations[i].Source = "codex-cli-documented-local-surface"
 			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:

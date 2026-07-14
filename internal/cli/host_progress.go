@@ -29,12 +29,20 @@ func codexHostOriginBinding(projectID, deliveryRunID, correlationID string) runt
 	return runtimecap.BindHostRunOrigin(req)
 }
 
-func codexHostSink(projectID, deliveryRunID, correlationID, fallbackSinkID string) (sinkID, transport string) {
+func codexHostSink(projectID, deliveryRunID, correlationID, fallbackSinkID string) (sinkID, originID, transport string) {
 	binding := codexHostOriginBinding(projectID, deliveryRunID, correlationID)
 	if binding.Bound && strings.TrimSpace(binding.BindingID) != "" {
-		return binding.BindingID, runtimecap.HostProgressKnownOriginReplay
+		return binding.BindingID, binding.OriginRef, runtimecap.HostProgressKnownOriginReplay
 	}
-	return fallbackSinkID, "host-jsonl-v1"
+	return fallbackSinkID, correlationID, "host-jsonl-v1"
+}
+
+func codexHostStableOriginRef(projectID string) string {
+	binding := codexHostOriginBinding(projectID, "codex-host-replay-origin", "codex-host-replay-origin")
+	if !binding.Bound {
+		return ""
+	}
+	return strings.TrimSpace(binding.OriginRef)
 }
 
 func replayCodexHostProgressBeforeDispatch(ctx context.Context, repoPath, runID string, stderr io.Writer, deps Deps) error {
@@ -63,36 +71,34 @@ func replayCodexHostProgressBeforeDispatch(ctx context.Context, repoPath, runID 
 		_, err := replayCodexHostProgressForRun(ctx, store, roots.ProjectID, runID, runID, stderr, now, progress.DefaultHostReplayLimit)
 		return err
 	}
-	candidates, err := codexHostReplayCandidates(ctx, store, roots.ProjectID, now().UTC(), progress.DefaultHostReplayLimit)
+	stableOriginRef := codexHostStableOriginRef(roots.ProjectID)
+	if stableOriginRef == "" {
+		return nil
+	}
+	candidates, err := codexHostReplayCandidates(ctx, store, roots.ProjectID, stableOriginRef, now().UTC(), progress.DefaultHostReplayLimit)
 	if err != nil {
 		return err
 	}
 	seen := map[string]bool{}
 	replayed := 0
 	for _, candidate := range candidates {
-		for _, correlationID := range candidate.correlationIDs() {
-			if replayed >= progress.DefaultHostReplayLimit {
-				return nil
-			}
-			binding := codexHostOriginBinding(roots.ProjectID, candidate.deliveryRunID, correlationID)
-			if !binding.Bound {
-				continue
-			}
-			key := candidate.deliveryRunID + "\x00" + binding.BindingID
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			count, err := replayCodexHostProgressForRun(ctx, store, roots.ProjectID, candidate.deliveryRunID, correlationID, stderr, now, progress.DefaultHostReplayLimit-replayed)
-			if err != nil {
-				if errors.Is(err, progress.ErrMissingReference) {
-					fmt.Fprintf(stderr, "[loopcoder] skipped Codex progress replay for run %s: %v. Use `loopcoder status --repo %s --run %s --receipts` or `loopcoder attach --repo %s --run %s` to inspect durable receipts.\n", candidate.deliveryRunID, err, repoPath, candidate.deliveryRunID, repoPath, candidate.deliveryRunID)
-					continue
-				}
-				return err
-			}
-			replayed += count
+		if replayed >= progress.DefaultHostReplayLimit {
+			return nil
 		}
+		key := candidate.deliveryRunID + "\x00" + candidate.sinkID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		count, err := replayCodexHostProgressForBinding(ctx, store, roots.ProjectID, candidate.deliveryRunID, candidate.sinkID, stderr, now, progress.DefaultHostReplayLimit-replayed)
+		if err != nil {
+			if errors.Is(err, progress.ErrMissingReference) {
+				fmt.Fprintf(stderr, "[loopcoder] skipped Codex progress replay for run %s: %v. Use `loopcoder status --repo %s --run %s --receipts` or `loopcoder attach --repo %s --run %s` to inspect durable receipts.\n", candidate.deliveryRunID, err, repoPath, candidate.deliveryRunID, repoPath, candidate.deliveryRunID)
+				continue
+			}
+			return err
+		}
+		replayed += count
 	}
 	return nil
 }
@@ -100,20 +106,20 @@ func replayCodexHostProgressBeforeDispatch(ctx context.Context, repoPath, runID 
 type codexHostReplayCandidate struct {
 	deliveryRunID string
 	originID      string
-}
-
-func (c codexHostReplayCandidate) correlationIDs() []string {
-	runID := strings.TrimSpace(c.deliveryRunID)
-	originID := strings.TrimSpace(c.originID)
-	if originID == "" || originID == runID {
-		return []string{runID}
-	}
-	return []string{runID, originID}
+	sinkID        string
 }
 
 func replayCodexHostProgressForRun(ctx context.Context, store storage.Store, projectID, runID, correlationID string, stderr io.Writer, now func() time.Time, limit int) (int, error) {
 	binding := codexHostOriginBinding(projectID, runID, correlationID)
 	if !binding.Bound {
+		return 0, nil
+	}
+	return replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, stderr, now, limit)
+}
+
+func replayCodexHostProgressForBinding(ctx context.Context, store storage.Store, projectID, runID, bindingID string, stderr io.Writer, now func() time.Time, limit int) (int, error) {
+	bindingID = strings.TrimSpace(bindingID)
+	if bindingID == "" {
 		return 0, nil
 	}
 	if limit <= 0 {
@@ -124,7 +130,7 @@ func replayCodexHostProgressForRun(ctx context.Context, store storage.Store, pro
 		ProjectID:     projectID,
 		DeliveryRunID: runID,
 		OriginKind:    "host-run-origin",
-		OriginID:      binding.BindingID,
+		OriginID:      bindingID,
 		ClaimOwner:    "codex-host-replay",
 		Limit:         limit,
 		Now:           now().UTC(),
@@ -138,16 +144,28 @@ func replayCodexHostProgressForRun(ctx context.Context, store storage.Store, pro
 	if len(views) == 0 {
 		return 0, nil
 	}
-	fmt.Fprintf(stderr, "[loopcoder] replaying %d pending progress receipt(s) for Codex origin %s\n", len(views), binding.BindingID)
+	fmt.Fprintf(stderr, "[loopcoder] replaying %d pending progress receipt(s) for Codex origin %s\n", len(views), bindingID)
 	return len(views), progress.RenderHuman(stderr, views)
 }
 
-func codexHostReplayCandidates(ctx context.Context, store storage.Store, projectID string, now time.Time, limit int) ([]codexHostReplayCandidate, error) {
+func codexHostReplayCandidates(ctx context.Context, store storage.Store, projectID, stableOriginRef string, now time.Time, limit int) ([]codexHostReplayCandidate, error) {
 	limit = codexHostReplayCandidateLimit(limit)
-	query := `SELECT o.delivery_run_id, o.origin_id, MIN(o.created_at) AS first_created_at
+	stableOriginRef = strings.TrimSpace(stableOriginRef)
+	if stableOriginRef == "" {
+		return nil, nil
+	}
+	query := `SELECT o.delivery_run_id, o.origin_id, o.sink_id, MIN(o.created_at) AS first_created_at
 		FROM progress_delivery_obligations o
 		JOIN progress_receipts r ON r.progress_receipt_id = o.progress_receipt_id
+		LEFT JOIN progress_delivery_replay_cursors c
+			ON c.project_id = o.project_id
+			AND c.delivery_run_id = o.delivery_run_id
+			AND c.origin_kind = 'host-run-origin'
+			AND c.origin_id = o.sink_id
+		LEFT JOIN progress_delivery_obligations anchor
+			ON anchor.obligation_id = COALESCE(json_extract(c.payload_json, '$.obligation_id'), c.obligation_id)
 		WHERE o.project_id = ? AND o.sink_kind = 'host' AND o.transport_contract = ?
+			AND o.origin_id = ?
 			AND (o.status = ? OR (o.status = ? AND (o.next_attempt_at = '' OR o.next_attempt_at <= ?)))
 			AND (
 				COALESCE(json_extract(r.progress_json, '$.state'), '') = 'terminal'
@@ -155,10 +173,16 @@ func codexHostReplayCandidates(ctx context.Context, store storage.Store, project
 				OR r.status IN ('succeeded', 'failed', 'cancelled', 'needs-human', 'timed-out', 'abandoned')
 				OR COALESCE(json_extract(r.blocker_json, '$.state'), '') NOT IN ('', 'none', 'unknown')
 			)
-		GROUP BY o.delivery_run_id, o.origin_id
-		ORDER BY first_created_at, o.delivery_run_id, o.origin_id
+			AND (
+				c.obligation_id IS NULL
+				OR anchor.obligation_id IS NULL
+				OR o.created_at > anchor.created_at
+				OR (o.created_at = anchor.created_at AND o.obligation_id > anchor.obligation_id)
+			)
+		GROUP BY o.delivery_run_id, o.origin_id, o.sink_id
+		ORDER BY first_created_at, o.delivery_run_id, o.origin_id, o.sink_id
 		LIMIT ?`
-	args := []any{strings.TrimSpace(projectID), runtimecap.HostProgressKnownOriginReplay, progress.DeliveryPending, progress.DeliveryRetryableFailure, now.UTC().Format(time.RFC3339Nano), limit}
+	args := []any{strings.TrimSpace(projectID), runtimecap.HostProgressKnownOriginReplay, stableOriginRef, progress.DeliveryPending, progress.DeliveryRetryableFailure, now.UTC().Format(time.RFC3339Nano), limit}
 	var out []codexHostReplayCandidate
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		rows, err := tx.Query(ctx, query, args...)
@@ -169,7 +193,7 @@ func codexHostReplayCandidates(ctx context.Context, store storage.Store, project
 		for rows.Next() {
 			var candidate codexHostReplayCandidate
 			var firstCreatedAt string
-			if err := rows.Scan(&candidate.deliveryRunID, &candidate.originID, &firstCreatedAt); err != nil {
+			if err := rows.Scan(&candidate.deliveryRunID, &candidate.originID, &candidate.sinkID, &firstCreatedAt); err != nil {
 				return fmt.Errorf("list Codex host replay candidates scan: %w", err)
 			}
 			out = append(out, candidate)
