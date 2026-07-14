@@ -17,6 +17,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/sanitize"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
@@ -30,6 +31,12 @@ const (
 	CandidateGenerationFull  = "complete"
 	DecisionStatusSelected   = "selected"
 	DecisionStatusNoEligible = "no-eligible-candidate"
+
+	StrategyQualityFirst     = "quality-first"
+	StrategyBalanced         = "balanced"
+	StrategyBurnBeforeReset  = "burn-before-reset"
+	StrategyVersion          = "reset-aware-v1"
+	DefaultTargetUtilization = int64(9200)
 )
 
 type ComponentName string
@@ -37,7 +44,11 @@ type ComponentName string
 const (
 	ComponentQualityFit     ComponentName = "quality_fit"
 	ComponentQuotaHeadroom  ComponentName = "quota_headroom"
+	ComponentExpiryUrgency  ComponentName = "expiry_urgency"
+	ComponentTaskHeadroom   ComponentName = "task_equivalent_headroom"
+	ComponentCapacityTrust  ComponentName = "capacity_trust"
 	ComponentAvailability   ComponentName = "availability"
+	ComponentHealth         ComponentName = "health"
 	ComponentCost           ComponentName = "cost"
 	ComponentLatency        ComponentName = "latency"
 	ComponentDiversity      ComponentName = "diversity"
@@ -48,21 +59,29 @@ const (
 var supportedComponents = map[ComponentName]bool{
 	ComponentAvailability:   true,
 	ComponentQuotaHeadroom:  true,
+	ComponentExpiryUrgency:  true,
+	ComponentTaskHeadroom:   true,
+	ComponentCapacityTrust:  true,
 	ComponentQualityFit:     true,
 	ComponentLatency:        true,
 	ComponentCost:           true,
 	ComponentDiversity:      true,
+	ComponentHealth:         true,
 	ComponentLocality:       true,
 	ComponentUserPreference: true,
 }
 
 var scoringComponentOrder = []ComponentName{
+	ComponentExpiryUrgency,
+	ComponentTaskHeadroom,
+	ComponentCapacityTrust,
 	ComponentAvailability,
 	ComponentQuotaHeadroom,
 	ComponentQualityFit,
 	ComponentLatency,
 	ComponentCost,
 	ComponentDiversity,
+	ComponentHealth,
 	ComponentLocality,
 	ComponentUserPreference,
 }
@@ -73,12 +92,28 @@ type OptimizationPolicy struct {
 	ProfileKey             string                `json:"profile_key"`
 	ProfileVersion         string                `json:"profile_version"`
 	PolicyVersion          string                `json:"policy_version"`
+	StrategyKey            string                `json:"strategy_key"`
+	StrategyVersion        string                `json:"strategy_version"`
+	TargetUtilizationBP    int64                 `json:"target_utilization_basis_points"`
+	CompletionReserveBP    int64                 `json:"completion_reserve_basis_points"`
+	VerificationReserveBP  int64                 `json:"verification_reserve_basis_points"`
+	AllowPaidOverage       bool                  `json:"allow_paid_overage"`
+	ResetBands             []ResetBand           `json:"reset_bands"`
 	Weights                map[ComponentName]int `json:"weights"`
 	TieBreakSeed           string                `json:"tie_break_seed"`
 	LocalAdapterIDs        []string              `json:"local_adapter_ids"`
 	PreferredCandidateIDs  []string              `json:"preferred_candidate_ids"`
 	DiversityHistory       []SelectedRouteRef    `json:"diversity_history"`
 	PolicyFingerprint      string                `json:"policy_fingerprint"`
+}
+
+type ResetBand struct {
+	Name                 string `json:"name"`
+	MinResetSeconds      int64  `json:"min_reset_seconds"`
+	MaxResetSeconds      int64  `json:"max_reset_seconds,omitempty"`
+	MaxTaskClass         string `json:"max_task_class"`
+	ExpiryUrgencyScore   int    `json:"expiry_urgency_score"`
+	ExpectedWasteAvoided int64  `json:"expected_waste_avoided,omitempty"`
 }
 
 type SelectedRouteRef struct {
@@ -121,6 +156,11 @@ type ComponentScore struct {
 	Weight            int                              `json:"weight"`
 	WeightedScore     string                           `json:"weighted_score"`
 	EvidenceValue     *int64                           `json:"evidence_value,omitempty"`
+	ResetAt           string                           `json:"reset_at,omitempty"`
+	ResetWindow       string                           `json:"reset_window,omitempty"`
+	TaskClass         string                           `json:"task_class,omitempty"`
+	ReserveBasisBP    int64                            `json:"reserve_basis_points,omitempty"`
+	ExpectedWaste     *int64                           `json:"expected_waste_avoided,omitempty"`
 	Confidence        providerinventory.Confidence     `json:"confidence"`
 	Heuristic         bool                             `json:"heuristic"`
 	HeuristicReason   string                           `json:"heuristic_reason,omitempty"`
@@ -179,6 +219,92 @@ type RoutingDecision struct {
 	DecidedBy                 delivery.Actor             `json:"decided_by"`
 	Host                      delivery.Host              `json:"host"`
 	TerminalErrorCode         taskrequirements.ErrorCode `json:"terminal_error_code,omitempty"`
+}
+
+type DryRunExplain struct {
+	Decision RoutingDecision `json:"decision"`
+	Human    string          `json:"human"`
+	Stable   json.RawMessage `json:"stable_json"`
+}
+
+type ReevaluateRouteTrigger string
+
+const (
+	ReevaluateAtTaskBoundary       ReevaluateRouteTrigger = "task-boundary"
+	ReevaluateAtFreshCapacityEvent ReevaluateRouteTrigger = "fresh-capacity-event"
+)
+
+type ReevaluateRouteInput struct {
+	DecisionInput DecisionInput
+	Trigger       ReevaluateRouteTrigger
+	DryRun        bool
+}
+
+type ReevaluateRouteResult struct {
+	Decision RoutingDecision        `json:"decision"`
+	Trigger  ReevaluateRouteTrigger `json:"trigger"`
+	DryRun   bool                   `json:"dry_run"`
+	Changed  bool                   `json:"changed"`
+}
+
+func ReevaluateRoute(ctx context.Context, store storage.Store, input ReevaluateRouteInput) (ReevaluateRouteResult, error) {
+	if input.Trigger != ReevaluateAtTaskBoundary && input.Trigger != ReevaluateAtFreshCapacityEvent {
+		return ReevaluateRouteResult{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing re-evaluation trigger must be task-boundary or fresh-capacity-event"}
+	}
+	if store == nil {
+		return ReevaluateRouteResult{}, errors.New("routing re-evaluation: storage store is required")
+	}
+	decisionInput := input.DecisionInput
+	decisionInput.Now = store.Now()
+	prepared, err := prepareDecisionInputFromStore(ctx, store, decisionInput)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	decision, err := BuildRoutingDecision(prepared)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	changed, err := routingDecisionFingerprintChanged(ctx, store, decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.RoutingFingerprint)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	if !input.DryRun {
+		if err := PersistRoutingDecision(ctx, store, decision); err != nil {
+			return ReevaluateRouteResult{}, err
+		}
+	}
+	if decision.TerminalErrorCode != "" {
+		return ReevaluateRouteResult{Decision: decision, Trigger: input.Trigger, DryRun: input.DryRun, Changed: changed}, routingTerminalError(decision.TerminalErrorCode)
+	}
+	return ReevaluateRouteResult{Decision: decision, Trigger: input.Trigger, DryRun: input.DryRun, Changed: changed}, nil
+}
+
+func routingDecisionFingerprintChanged(ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey, routingFingerprint string) (bool, error) {
+	count := 0
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM routing_decisions WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ? AND routing_fingerprint = ?`,
+			strings.TrimSpace(projectID), strings.TrimSpace(deliveryRunID), strings.TrimSpace(decisionKey), strings.TrimSpace(routingFingerprint)).Scan(&count)
+	})
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+func DryRunExplainRoute(input DecisionInput) (DryRunExplain, error) {
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		return DryRunExplain{}, err
+	}
+	stable, err := ExplainJSON(decision)
+	if err != nil {
+		return DryRunExplain{}, err
+	}
+	return DryRunExplain{
+		Decision: decision,
+		Human:    ExplainHuman(decision),
+		Stable:   json.RawMessage(stable),
+	}, nil
 }
 
 func DecideAndPersistRoute(ctx context.Context, store storage.Store, input DecisionInput) (RoutingDecision, error) {
@@ -244,9 +370,16 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if diagnostics := ValidateOverrideProvenance(input.OverrideProvenance, input.Now, expectedPolicyFingerprint, input.AuthorizationFingerprint); len(diagnostics) > 0 {
 		return RoutingDecision{}, &taskrequirements.TypedError{Code: diagnostics[0].Code, Message: diagnostics[0].Message}
 	}
+	if err := validateOverrideDecisionScope(input.OverrideProvenance, input.DeliveryRunID, input.Inputs.Requirement.TaskID); err != nil {
+		return RoutingDecision{}, err
+	}
 	if err := validateDecisionInput(input, policy); err != nil {
 		return RoutingDecision{}, err
 	}
+	input.Inputs.OptimizationPolicy = policy
+	input.Inputs.Now = input.Now
+	input.Inputs = applyManualRoutingOverrides(input.Inputs, input.OverrideProvenance, input.DeliveryRunID, input.Now)
+	input.OverrideProvenance = redactOverrideProvenance(input.OverrideProvenance)
 	eligibility := FilterHardEligibility(input.Inputs)
 	refs := inputRefs(input, eligibility)
 	routingFingerprint, err := routingFingerprint(input, policy, eligibility, refs)
@@ -292,7 +425,7 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 		decision.RoutingPolicyProfile = &profile
 	}
 	decision.RoutingDecisionID = routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint)
-	decision.ScoredCandidates = scoreCandidates(eligibility.Eligible, input.Inputs, policy)
+	decision.ScoredCandidates = scoreCandidates(eligibility.Eligible, input.Inputs, policy, input.Now)
 	decision.HeuristicComponents = heuristicComponents(decision.ScoredCandidates)
 	if len(decision.ScoredCandidates) == 0 {
 		decision.DecisionStatus = DecisionStatusNoEligible
@@ -453,6 +586,147 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 	return input, nil
 }
 
+func applyManualRoutingOverrides(inputs Inputs, overrides []OverrideProvenance, deliveryRunID string, now time.Time) Inputs {
+	if len(overrides) == 0 {
+		return inputs
+	}
+	out := inputs
+	out.Candidates = append([]Candidate(nil), inputs.Candidates...)
+	out.Inventory.QuotaSnapshots = append([]providerinventory.QuotaSnapshot(nil), inputs.Inventory.QuotaSnapshots...)
+	out.ManualUnavailable = append([]ManualUnavailableOverride(nil), inputs.ManualUnavailable...)
+	for _, override := range overrides {
+		if !manualOverrideScopeMatches(override, deliveryRunID, inputs.Requirement.TaskID) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(override.OverrideKind)) {
+		case "manual-unavailable-until":
+			until, ok := parseTime(override.ManualUnavailableUntil)
+			if !ok || !until.After(now.UTC()) {
+				continue
+			}
+			out.ManualUnavailable = append(out.ManualUnavailable, ManualUnavailableOverride{
+				OverrideID: strings.TrimSpace(override.OverrideID),
+				Constraint: override.CandidateConstraint,
+				Until:      delivery.CanonicalTimestamp(until),
+			})
+		case "manual-reset":
+			for candidateIndex := range out.Candidates {
+				candidate := out.Candidates[candidateIndex]
+				if !constraintMatchesCandidate(override.CandidateConstraint, candidate) {
+					continue
+				}
+				out.Candidates[candidateIndex].QuotaSnapshotIDs = manualResetQuotaSnapshotIDs(out.Candidates[candidateIndex], override, &out.Inventory.QuotaSnapshots, now)
+				out.Candidates[candidateIndex].CandidateFingerprint = candidateFingerprint(out.Candidates[candidateIndex])
+			}
+		}
+	}
+	return out
+}
+
+func manualResetQuotaSnapshotIDs(candidate Candidate, override OverrideProvenance, snapshots *[]providerinventory.QuotaSnapshot, now time.Time) []string {
+	if len(candidate.QuotaSnapshotIDs) == 0 {
+		return candidate.QuotaSnapshotIDs
+	}
+	out := append([]string(nil), candidate.QuotaSnapshotIDs...)
+	for i, id := range candidate.QuotaSnapshotIDs {
+		snapshotIndex := quotaSnapshotIndex(*snapshots, id)
+		if snapshotIndex < 0 {
+			continue
+		}
+		snapshot := (*snapshots)[snapshotIndex]
+		if override.ClearManualReset {
+			snapshot.ResetAt = ""
+			snapshot.WindowEnd = ""
+			snapshot.ValidUntil = ""
+		} else {
+			resetAt, ok := parseTime(override.ManualResetAt)
+			if !ok || !resetAt.After(now.UTC()) {
+				continue
+			}
+			canonical := delivery.CanonicalTimestamp(resetAt)
+			snapshot.ResetAt = canonical
+			snapshot.WindowEnd = canonical
+			snapshot.ValidUntil = canonical
+		}
+		snapshot.QuotaSnapshotID = manualResetQuotaSnapshotID(snapshot.QuotaSnapshotID, override.OverrideID, candidate.RoutingCandidateID)
+		*snapshots = append(*snapshots, snapshot)
+		out[i] = snapshot.QuotaSnapshotID
+	}
+	return dedupeStrings(out)
+}
+
+func quotaSnapshotIndex(snapshots []providerinventory.QuotaSnapshot, id string) int {
+	for i, snapshot := range snapshots {
+		if snapshot.QuotaSnapshotID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func manualResetQuotaSnapshotID(snapshotID, overrideID, candidateID string) string {
+	return "manual-reset:" + shortDigest(hashHex("manual_reset_quota", snapshotID, overrideID, candidateID))
+}
+
+func manualOverrideScopeMatches(override OverrideProvenance, deliveryRunID, taskID string) bool {
+	run := strings.TrimSpace(override.DeliveryRunID)
+	task := strings.TrimSpace(override.TaskID)
+	if run == "" && task == "" {
+		return false
+	}
+	if strings.TrimSpace(override.Scope) != canonicalManualOverrideScope(override) {
+		return false
+	}
+	if run != "" && run != strings.TrimSpace(deliveryRunID) {
+		return false
+	}
+	if task != "" && task != strings.TrimSpace(taskID) {
+		return false
+	}
+	return true
+}
+
+func validateOverrideDecisionScope(overrides []OverrideProvenance, deliveryRunID, taskID string) error {
+	for _, override := range overrides {
+		if !manualOverrideScopeMatches(override, deliveryRunID, taskID) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "manual override task/run scope does not match routing decision authority"}
+		}
+	}
+	return nil
+}
+
+func canonicalManualOverrideScope(override OverrideProvenance) string {
+	kind := strings.ToLower(strings.TrimSpace(override.OverrideKind))
+	var parts []string
+	if run := strings.TrimSpace(override.DeliveryRunID); run != "" {
+		parts = append(parts, "run:"+run)
+	}
+	if task := strings.TrimSpace(override.TaskID); task != "" {
+		parts = append(parts, "task:"+task)
+	}
+	if kind == "" || len(parts) == 0 {
+		return strings.Join(parts, " ")
+	}
+	return kind + " " + strings.Join(parts, " ")
+}
+
+func redactOverrideProvenance(overrides []OverrideProvenance) []OverrideProvenance {
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := append([]OverrideProvenance(nil), overrides...)
+	for i := range out {
+		out[i].Reason = redactSensitiveText(out[i].Reason)
+		out[i].Source = redactSensitiveText(out[i].Source)
+		out[i].Scope = canonicalManualOverrideScope(out[i])
+	}
+	return out
+}
+
+func redactSensitiveText(value string) string {
+	return sanitize.Text(value)
+}
+
 func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {
 	profileID := strings.TrimSpace(input.RoutingPolicyProfileID)
 	callerProfile := input.RoutingPolicyProfile
@@ -566,8 +840,29 @@ func ExplainHuman(decision RoutingDecision) string {
 	if decision.RoutingPolicyProfile != nil {
 		fmt.Fprintf(&b, "profile %s version %s fingerprint %s\n", decision.RoutingPolicyProfile.ProfileKey, decision.RoutingPolicyProfile.ProfileVersion, decision.RoutingPolicyProfile.PolicyFingerprint)
 	}
+	policy := decision.OptimizationPolicy
+	fmt.Fprintf(&b, "strategy %s version %s target_utilization=%s completion_reserve=%s verification_reserve=%s paid_overage=%t\n",
+		firstNonEmpty(policy.StrategyKey, StrategyBalanced), firstNonEmpty(policy.StrategyVersion, StrategyVersion),
+		formatBasisPoints(int(policy.TargetUtilizationBP*100)), formatBasisPoints(int(policy.CompletionReserveBP*100)),
+		formatBasisPoints(int(policy.VerificationReserveBP*100)), policy.AllowPaidOverage)
+	for _, band := range policy.ResetBands {
+		fmt.Fprintf(&b, "reset window %s: min=%ds max=%ds max_task=%s urgency=%d\n", band.Name, band.MinResetSeconds, band.MaxResetSeconds, band.MaxTaskClass, band.ExpiryUrgencyScore)
+	}
 	for _, override := range decision.OverrideProvenance {
 		fmt.Fprintf(&b, "override %s: %s scope=%s actor=%s expires=%s fingerprint=%s\n", override.OverrideID, override.Reason, override.Scope, override.Actor.ActorID, firstNonEmpty(override.ExpiresAt, "none"), override.PolicyFingerprint)
+	}
+	for _, candidate := range decision.ScoredCandidates {
+		fmt.Fprintf(&b, "candidate %s rank=%d total=%s confidence=%s\n", candidate.RoutingCandidateID, candidate.Rank, candidate.TotalScore, candidate.Confidence)
+		for _, component := range candidate.Components {
+			fmt.Fprintf(&b, "  component %s score=%d weight=%d weighted=%s confidence=%s freshness=%s", component.Name, component.Score, component.Weight, component.WeightedScore, component.Confidence, component.FreshnessState)
+			if component.ResetWindow != "" || component.ResetAt != "" {
+				fmt.Fprintf(&b, " window=%s reset_at=%s", component.ResetWindow, component.ResetAt)
+			}
+			if component.ExpectedWaste != nil {
+				fmt.Fprintf(&b, " expected_waste_avoided=%d", *component.ExpectedWaste)
+			}
+			fmt.Fprintln(&b)
+		}
 	}
 	for _, candidate := range decision.ScoredCandidates {
 		if candidate.RoutingCandidateID == decision.ChosenCandidateID {
@@ -604,15 +899,36 @@ func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (O
 	if strings.TrimSpace(policy.TieBreakSeed) == "" {
 		policy.TieBreakSeed = DefaultTieBreakSeed
 	}
+	if strings.TrimSpace(policy.StrategyKey) == "" {
+		policy.StrategyKey = strategyFromProfileKey(policy.ProfileKey)
+	}
+	if !validStrategy(policy.StrategyKey) {
+		return OptimizationPolicy{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unsupported routing strategy %q", policy.StrategyKey)}
+	}
+	if strings.TrimSpace(policy.StrategyVersion) == "" {
+		policy.StrategyVersion = StrategyVersion
+	}
+	if policy.TargetUtilizationBP == 0 {
+		policy.TargetUtilizationBP = DefaultTargetUtilization
+	}
+	if policy.CompletionReserveBP == 0 {
+		policy.CompletionReserveBP = 500
+	}
+	if policy.VerificationReserveBP == 0 {
+		policy.VerificationReserveBP = 800
+	}
+	if policy.TargetUtilizationBP < 1 || policy.TargetUtilizationBP > 10000 || policy.CompletionReserveBP < 0 || policy.VerificationReserveBP < 0 || policy.CompletionReserveBP+policy.VerificationReserveBP > policy.TargetUtilizationBP {
+		return OptimizationPolicy{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing strategy utilization and reserve basis points are invalid"}
+	}
+	if len(policy.ResetBands) == 0 {
+		policy.ResetBands = defaultResetBands()
+	}
+	policy.ResetBands = normalizeResetBands(policy.ResetBands)
+	if err := validateResetBands(policy.ResetBands); err != nil {
+		return OptimizationPolicy{}, err
+	}
 	if len(policy.Weights) == 0 {
-		policy.Weights = map[ComponentName]int{
-			ComponentAvailability:  30,
-			ComponentQuotaHeadroom: 20,
-			ComponentQualityFit:    20,
-			ComponentLatency:       10,
-			ComponentCost:          10,
-			ComponentDiversity:     10,
-		}
+		policy.Weights = strategyWeights(policy.StrategyKey)
 	}
 	total := 0
 	for name, weight := range policy.Weights {
@@ -640,6 +956,13 @@ func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (O
 		"routing_policy_profile_id": policy.RoutingPolicyProfileID,
 		"profile_key":               policy.ProfileKey,
 		"profile_version":           policy.ProfileVersion,
+		"strategy_key":              policy.StrategyKey,
+		"strategy_version":          policy.StrategyVersion,
+		"target_utilization_bp":     policy.TargetUtilizationBP,
+		"completion_reserve_bp":     policy.CompletionReserveBP,
+		"verification_reserve_bp":   policy.VerificationReserveBP,
+		"allow_paid_overage":        policy.AllowPaidOverage,
+		"reset_bands":               policy.ResetBands,
 		"weights":                   policy.Weights,
 		"tie_break_seed":            policy.TieBreakSeed,
 		"local_adapter_ids":         policy.LocalAdapterIDs,
@@ -654,6 +977,68 @@ func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (O
 		policy.PolicyVersion = "routing-optimization-" + shortDigest(fp)
 	}
 	return policy, nil
+}
+
+func validStrategy(value string) bool {
+	switch strings.TrimSpace(value) {
+	case StrategyQualityFirst, StrategyBalanced, StrategyBurnBeforeReset:
+		return true
+	default:
+		return false
+	}
+}
+
+func strategyFromProfileKey(profileKey string) string {
+	switch strings.TrimSpace(profileKey) {
+	case StrategyQualityFirst, ProfileKeyDeep:
+		return StrategyQualityFirst
+	case StrategyBurnBeforeReset, ProfileKeyFast:
+		return StrategyBurnBeforeReset
+	default:
+		return StrategyBalanced
+	}
+}
+
+func strategyWeights(strategy string) map[ComponentName]int {
+	switch strategy {
+	case StrategyQualityFirst:
+		return map[ComponentName]int{ComponentExpiryUrgency: 5, ComponentTaskHeadroom: 10, ComponentCapacityTrust: 10, ComponentQualityFit: 35, ComponentCost: 10, ComponentLatency: 10, ComponentHealth: 10, ComponentDiversity: 10}
+	case StrategyBurnBeforeReset:
+		return map[ComponentName]int{ComponentExpiryUrgency: 30, ComponentTaskHeadroom: 15, ComponentCapacityTrust: 10, ComponentQualityFit: 15, ComponentCost: 10, ComponentLatency: 5, ComponentHealth: 10, ComponentDiversity: 5}
+	default:
+		return map[ComponentName]int{ComponentExpiryUrgency: 15, ComponentTaskHeadroom: 15, ComponentCapacityTrust: 10, ComponentQualityFit: 20, ComponentCost: 10, ComponentLatency: 10, ComponentHealth: 10, ComponentDiversity: 10}
+	}
+}
+
+func defaultResetBands() []ResetBand {
+	return []ResetBand{
+		{Name: "under-15m", MinResetSeconds: 0, MaxResetSeconds: int64((15 * time.Minute).Seconds()), MaxTaskClass: "very-short", ExpiryUrgencyScore: 100},
+		{Name: "15-60m", MinResetSeconds: int64((15 * time.Minute).Seconds()), MaxResetSeconds: int64(time.Hour.Seconds()), MaxTaskClass: "short", ExpiryUrgencyScore: 80},
+		{Name: "over-1h", MinResetSeconds: int64(time.Hour.Seconds()), MaxTaskClass: "medium", ExpiryUrgencyScore: 40},
+	}
+}
+
+func normalizeResetBands(bands []ResetBand) []ResetBand {
+	out := append([]ResetBand(nil), bands...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].MinResetSeconds != out[j].MinResetSeconds {
+			return out[i].MinResetSeconds < out[j].MinResetSeconds
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func validateResetBands(bands []ResetBand) error {
+	if len(bands) == 0 {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing reset bands are required"}
+	}
+	for _, band := range bands {
+		if strings.TrimSpace(band.Name) == "" || strings.TrimSpace(band.MaxTaskClass) == "" || band.MinResetSeconds < 0 || band.MaxResetSeconds < 0 || (band.MaxResetSeconds > 0 && band.MaxResetSeconds <= band.MinResetSeconds) || band.ExpiryUrgencyScore < 0 || band.ExpiryUrgencyScore > 100 {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing reset band is invalid"}
+		}
+	}
+	return nil
 }
 
 func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result Result, refs []InputRecordRef) (string, error) {
@@ -689,7 +1074,7 @@ func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result R
 	return digest, err
 }
 
-func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationPolicy) []ScoredCandidate {
+func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationPolicy, now time.Time) []ScoredCandidate {
 	quotaByID := mapQuotaSnapshots(inputs.Inventory.QuotaSnapshots)
 	scoreByID, scoreByCandidate := mapAvailabilityScores(inputs.Availability)
 	budgetByID := mapBudgets(inputs.Budgets)
@@ -701,6 +1086,12 @@ func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationP
 				continue
 			}
 			switch name {
+			case ComponentExpiryUrgency:
+				components = append(components, scoreExpiryUrgency(candidate, inputs.Requirement, quotaByID, policy, now))
+			case ComponentTaskHeadroom:
+				components = append(components, scoreTaskHeadroom(candidate, inputs.Requirement, quotaByID, policy, now))
+			case ComponentCapacityTrust:
+				components = append(components, scoreCapacityTrust(candidate, quotaByID, policy))
 			case ComponentAvailability:
 				components = append(components, scoreAvailability(candidate, scoreByID, scoreByCandidate, policy))
 			case ComponentQuotaHeadroom:
@@ -713,6 +1104,8 @@ func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationP
 				components = append(components, scoreCost(candidate, budgetByID, policy))
 			case ComponentDiversity:
 				components = append(components, scoreDiversity(candidate, policy))
+			case ComponentHealth:
+				components = append(components, scoreHealth(candidate, scoreByID, scoreByCandidate, policy))
 			case ComponentLocality:
 				components = append(components, scoreLocality(candidate, policy))
 			case ComponentUserPreference:
@@ -765,6 +1158,84 @@ func scoreQuality(candidate Candidate, requirement taskrequirements.TaskRequirem
 	return component(ComponentQualityFit, score, policy, providerinventory.ConfidenceEstimated, true, "quality fit uses policy quality floor until conformance records are persisted", nil, nil, nil)
 }
 
+func scoreExpiryUrgency(candidate Candidate, requirement taskrequirements.TaskRequirement, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+	selected, ok := selectedQuotaSnapshot(candidate, quotaByID)
+	if !ok {
+		return component(ComponentExpiryUrgency, 0, policy, providerinventory.ConfidenceUnknown, true, "expiry urgency requires fresh quota reset evidence", nil, candidate.QuotaSnapshotIDs, nil)
+	}
+	score := 0
+	windowName := "unknown"
+	taskClass := taskClassForRequirement(requirement)
+	var resetAt string
+	var expectedWaste *int64
+	if reset, resetOK := parseTime(selected.ResetAt); resetOK && reset.After(now.UTC()) {
+		resetAt = delivery.CanonicalTimestamp(reset)
+		band := resetBandForDuration(policy.ResetBands, reset.Sub(now.UTC()))
+		windowName = band.Name
+		if taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
+			score = band.ExpiryUrgencyScore
+			if selected.RemainingValue != nil {
+				waste := expectedWasteAvoided(*selected.RemainingValue, policy.TargetUtilizationBP)
+				expectedWaste = &waste
+			}
+		}
+	}
+	c := component(ComponentExpiryUrgency, score, policy, selected.Confidence, selected.Confidence != providerinventory.ConfidenceExact, "expiry urgency rewards eligible task-fit capacity before known reset windows", nil, []string{selected.QuotaSnapshotID}, selected.RemainingValue)
+	c.ResetAt = resetAt
+	c.ResetWindow = windowName
+	c.TaskClass = taskClass
+	c.ExpectedWaste = expectedWaste
+	c.FreshnessState = selected.FreshnessState
+	return c
+}
+
+func scoreTaskHeadroom(candidate Candidate, requirement taskrequirements.TaskRequirement, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+	selected, ok := selectedQuotaSnapshot(candidate, quotaByID)
+	if !ok || selected.RemainingValue == nil {
+		return component(ComponentTaskHeadroom, 0, policy, providerinventory.ConfidenceUnknown, true, "task-equivalent headroom requires remaining quota evidence", nil, candidate.QuotaSnapshotIDs, nil)
+	}
+	taskClass := taskClassForRequirement(requirement)
+	taskUnits := taskUnitsForClass(taskClass)
+	usable := usableAfterReserves(*selected.RemainingValue, policy)
+	headroom := int64(0)
+	if taskUnits > 0 {
+		headroom = usable / taskUnits
+	}
+	score := int(minInt64(headroom*25, 100))
+	windowName := "unknown"
+	var resetAt string
+	if reset, resetOK := parseTime(selected.ResetAt); resetOK && reset.After(now.UTC()) {
+		resetAt = delivery.CanonicalTimestamp(reset)
+		band := resetBandForDuration(policy.ResetBands, reset.Sub(now.UTC()))
+		windowName = band.Name
+		if !taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
+			score = 0
+		}
+	}
+	value := headroom
+	c := component(ComponentTaskHeadroom, score, policy, selected.Confidence, selected.Confidence != providerinventory.ConfidenceExact, "task-equivalent headroom applies target utilization and reserves before scoring capacity", nil, []string{selected.QuotaSnapshotID}, &value)
+	c.ResetAt = resetAt
+	c.ResetWindow = windowName
+	c.TaskClass = taskClass
+	c.ReserveBasisBP = policy.CompletionReserveBP + policy.VerificationReserveBP
+	c.FreshnessState = selected.FreshnessState
+	return c
+}
+
+func scoreCapacityTrust(candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy) ComponentScore {
+	selected, ok := selectedQuotaSnapshot(candidate, quotaByID)
+	if !ok {
+		return component(ComponentCapacityTrust, 0, policy, providerinventory.ConfidenceUnknown, true, "capacity trust requires quota evidence", nil, candidate.QuotaSnapshotIDs, nil)
+	}
+	score := confidenceRank(selected.Confidence) * 35
+	if selected.FreshnessState == providerinventory.FreshnessFresh {
+		score += 30
+	}
+	c := component(ComponentCapacityTrust, score, policy, selected.Confidence, selected.Confidence != providerinventory.ConfidenceExact, "capacity trust combines quota confidence and freshness", nil, []string{selected.QuotaSnapshotID}, selected.RemainingValue)
+	c.FreshnessState = selected.FreshnessState
+	return c
+}
+
 func scoreQuota(candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy) ComponentScore {
 	score := 0
 	confidence := providerinventory.ConfidenceUnknown
@@ -788,6 +1259,115 @@ func scoreQuota(candidate Candidate, quotaByID map[string]providerinventory.Quot
 		snapshots = []string{selected.QuotaSnapshotID}
 	}
 	return component(ComponentQuotaHeadroom, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "quota headroom is capped at 100 from selected remaining capacity evidence", nil, snapshots, value)
+}
+
+func selectedQuotaSnapshot(candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot) (providerinventory.QuotaSnapshot, bool) {
+	var selected *providerinventory.QuotaSnapshot
+	for _, id := range candidate.QuotaSnapshotIDs {
+		snapshot, ok := quotaByID[id]
+		if !ok || snapshot.RemainingValue == nil {
+			continue
+		}
+		if selected == nil || quotaSnapshotBetterForScore(snapshot, *selected) {
+			selectedSnapshot := snapshot
+			selected = &selectedSnapshot
+		}
+	}
+	if selected == nil {
+		return providerinventory.QuotaSnapshot{}, false
+	}
+	return *selected, true
+}
+
+func parseTime(value string) (time.Time, bool) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed.UTC(), true
+}
+
+func resetBandForDuration(bands []ResetBand, d time.Duration) ResetBand {
+	seconds := int64(d.Seconds())
+	for _, band := range bands {
+		if seconds < band.MinResetSeconds {
+			continue
+		}
+		if band.MaxResetSeconds == 0 || seconds < band.MaxResetSeconds {
+			return band
+		}
+	}
+	return ResetBand{Name: "unknown", MaxTaskClass: "very-short"}
+}
+
+func taskClassForRequirement(requirement taskrequirements.TaskRequirement) string {
+	if requirement.RiskTier == taskrequirements.RiskHigh || requirement.RiskTier == taskrequirements.RiskCritical || requirement.QualityFloor == taskrequirements.QualityAdversarial || requirement.NestedAllowed {
+		return "medium"
+	}
+	if requirement.RiskTier == taskrequirements.RiskMedium {
+		return "short"
+	}
+	return "very-short"
+}
+
+func taskClassAllowedInBand(taskClass, maxClass string) bool {
+	return taskClassRank(taskClass) <= taskClassRank(maxClass)
+}
+
+func taskClassRank(value string) int {
+	switch strings.TrimSpace(value) {
+	case "very-short":
+		return 1
+	case "short":
+		return 2
+	case "medium":
+		return 3
+	default:
+		return 100
+	}
+}
+
+func taskUnitsForClass(value string) int64 {
+	switch strings.TrimSpace(value) {
+	case "very-short":
+		return 10
+	case "short":
+		return 35
+	case "medium":
+		return 70
+	default:
+		return 100
+	}
+}
+
+func usableAfterReserves(remaining int64, policy OptimizationPolicy) int64 {
+	target := ceilDiv(remaining*policy.TargetUtilizationBP, 10000)
+	completion := ceilDiv(remaining*policy.CompletionReserveBP, 10000)
+	verification := ceilDiv(remaining*policy.VerificationReserveBP, 10000)
+	usable := target - completion - verification
+	if usable < 0 {
+		return 0
+	}
+	return usable
+}
+
+func expectedWasteAvoided(remaining, targetBP int64) int64 {
+	target := ceilDiv(remaining*targetBP, 10000)
+	waste := remaining - target
+	if waste < 0 {
+		return 0
+	}
+	return waste
+}
+
+func ceilDiv(value, divisor int64) int64 {
+	if divisor <= 0 || value <= 0 {
+		return 0
+	}
+	return (value + divisor - 1) / divisor
 }
 
 func scoreCost(candidate Candidate, budgetByID map[string]budget.Summary, policy OptimizationPolicy) ComponentScore {
@@ -845,6 +1425,19 @@ func scoreAvailability(candidate Candidate, scoreByID map[string]availability.Sc
 		evidence = append(evidence, av.EvidenceRecordIDs...)
 	}
 	return component(ComponentAvailability, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "availability score comes from the persisted AvailabilityScore record", evidence, nil, nil)
+}
+
+func scoreHealth(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy OptimizationPolicy) ComponentScore {
+	score := 50
+	confidence := providerinventory.ConfidenceEstimated
+	evidence := []string{}
+	if av, ok := availabilityForCandidate(candidate, scoreByID, scoreByCandidate); ok {
+		score = av.Score
+		confidence = av.ScoreConfidence
+		evidence = append(evidence, av.AvailabilityScoreID)
+		evidence = append(evidence, av.EvidenceRecordIDs...)
+	}
+	return component(ComponentHealth, score, policy, confidence, confidence != providerinventory.ConfidenceExact, "health score uses the persisted availability score after hard availability gates pass", evidence, nil, nil)
 }
 
 func scoreDiversity(candidate Candidate, policy OptimizationPolicy) ComponentScore {
@@ -971,7 +1564,11 @@ func rejectionExplanation(reasons []RejectionReason) string {
 	}
 	parts := make([]string, 0, len(reasons))
 	for _, reason := range reasons {
-		parts = append(parts, string(reason.Code))
+		if strings.TrimSpace(reason.Message) == "" {
+			parts = append(parts, string(reason.Code))
+			continue
+		}
+		parts = append(parts, string(reason.Code)+" ("+reason.Message+")")
 	}
 	sort.Strings(parts)
 	return "rejected by hard eligibility: " + strings.Join(parts, ", ")
@@ -1017,6 +1614,7 @@ func routingTerminalError(code taskrequirements.ErrorCode) error {
 
 func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	refs := []InputRecordRef{}
+	quotaByID := mapQuotaSnapshots(input.Inputs.Inventory.QuotaSnapshots)
 	addRef := func(kind, id, fingerprint string) {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -1032,7 +1630,7 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	for _, candidate := range append([]Candidate{}, result.Eligible...) {
 		addRef("routing_candidate", candidate.RoutingCandidateID, candidate.CandidateFingerprint)
 		for _, id := range candidate.QuotaSnapshotIDs {
-			addRef("quota_snapshot", id, "")
+			addRef("quota_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
 		}
 		for _, id := range candidate.BudgetPolicyIDs {
 			addRef("budget_policy", id, "")
@@ -1052,7 +1650,7 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 				addRef("rejection_evidence", id, "")
 			}
 			for _, id := range reason.SnapshotIDs {
-				addRef("rejection_snapshot", id, "")
+				addRef("rejection_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
 			}
 		}
 	}
@@ -1091,6 +1689,14 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		deduped = append(deduped, ref)
 	}
 	return deduped
+}
+
+func quotaSnapshotFingerprint(quotaByID map[string]providerinventory.QuotaSnapshot, id string) string {
+	snapshot, ok := quotaByID[id]
+	if !ok {
+		return ""
+	}
+	return "sha256:" + hashCanonical(snapshot)
 }
 
 func breakerRefs(result Result) []string {
@@ -1227,6 +1833,7 @@ func isZeroHardPolicy(policy Policy) bool {
 		!policy.RequireBoundedScope &&
 		policy.ContextReserveTokens == 0 &&
 		policy.VerifierIndependence == "" &&
+		!policy.AllowPaidOverage &&
 		!policy.AllowHalfOpenBreakerProbe
 }
 

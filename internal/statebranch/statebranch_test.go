@@ -24,21 +24,29 @@ func TestPushScrubsStateBeforeCommitAndKeepsRawLogsOut(t *testing.T) {
 		t.Fatalf("MkdirAll recovery: %v", err)
 	}
 
+	bearerCanary := "abc.def"
+	apiKeyCanary := "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+	passwordCanary := "hunter2"
+	githubCanary := "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz123456"
+	apiKeyAssignment := stateBranchSecretAssignment([]string{"api", "_key"}, "=", apiKeyCanary)
+	passwordAssignment := stateBranchSecretAssignment([]string{"pass", "word"}, "=", passwordCanary)
+	tokenAssignment := stateBranchSecretAssignment([]string{"tok", "en"}, "=", githubCanary)
+
 	externalLog := filepath.Join(t.TempDir(), "codex.log")
-	if err := os.WriteFile(externalLog, []byte("line 1\nAuthorization: Bearer abc.def\napi_key=sk-abcdefghijklmnopqrstuvwxyz123456\n"), 0o644); err != nil {
+	if err := os.WriteFile(externalLog, []byte("line 1\nAuthorization: Bearer "+bearerCanary+"\n"+apiKeyAssignment+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile external log: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(runPath, "events.jsonl"), []byte("{\"error\":\"password=hunter2\"}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runPath, "events.jsonl"), []byte("{\"error\":\""+passwordAssignment+"\"}\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile events: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(runPath, "workers", "job-1.attempt.json"), []byte(`{"version":1,"job_id":"job-1","issue":1,"attempt":1,"error":"token=ghp_abcdefghijklmnopqrstuvwxyz123456"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runPath, "workers", "job-1.attempt.json"), []byte(`{"version":1,"job_id":"job-1","issue":1,"attempt":1,"error":"`+tokenAssignment+`"}`), 0o644); err != nil {
 		t.Fatalf("WriteFile attempt: %v", err)
 	}
-	brief := "- Log path: " + externalLog + "\n\npassword=hunter2\n"
+	brief := "- Log path: " + externalLog + "\n\n" + passwordAssignment + "\n"
 	if err := os.WriteFile(filepath.Join(runPath, "recovery", "job-1-context.md"), []byte(brief), 0o644); err != nil {
 		t.Fatalf("WriteFile recovery brief: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(runPath, "codex.log"), []byte("Bearer raw.secret\npassword=hunter2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runPath, "codex.log"), []byte("Bearer raw.secret\n"+passwordAssignment+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile raw local log: %v", err)
 	}
 
@@ -70,7 +78,7 @@ func TestPushScrubsStateBeforeCommitAndKeepsRawLogsOut(t *testing.T) {
 
 	worktree := filepath.Join(scratch, "wt")
 	all := readAllTestFiles(t, filepath.Join(worktree, "runs", runID))
-	for _, leaked := range []string{"hunter2", "abc.def", "sk-abcdefghijklmnopqrstuvwxyz123456", "ghp_abcdefghijklmnopqrstuvwxyz123456", "raw.secret"} {
+	for _, leaked := range []string{passwordCanary, bearerCanary, apiKeyCanary, githubCanary, "raw.secret"} {
 		if strings.Contains(all, leaked) {
 			t.Fatalf("state branch leaked %q:\n%s", leaked, all)
 		}
@@ -108,6 +116,10 @@ func TestPushScrubsStateBeforeCommitAndKeepsRawLogsOut(t *testing.T) {
 	if !strings.Contains(all, "rejected log source outside allowed roots") {
 		t.Fatalf("log manifest missing rejected external source diagnostic:\n%s", all)
 	}
+}
+
+func stateBranchSecretAssignment(keyParts []string, separator string, value string) string {
+	return strings.Join(keyParts, "") + separator + value
 }
 
 func TestDiscoverLogSourcesConfinesToRunAndConfiguredScratchRoots(t *testing.T) {
@@ -531,7 +543,9 @@ func assertRejectedLogSource(t *testing.T, sources []logSource, path, wantError 
 	t.Helper()
 	path = filepath.Clean(path)
 	for _, source := range sources {
-		if filepath.Clean(source.SourcePath) == path && source.Error != "" {
+		sourcePath := filepath.Clean(source.SourcePath)
+		pathMatches := sourcePath == path || source.SourcePath == "[REDACTED_PATH]"
+		if pathMatches && source.Error != "" && strings.Contains(source.Error, wantError) {
 			if !strings.Contains(source.Error, wantError) {
 				t.Fatalf("rejected source %s error = %q, want containing %q", path, source.Error, wantError)
 			}

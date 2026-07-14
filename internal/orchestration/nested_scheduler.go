@@ -61,6 +61,15 @@ var (
 
 type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
+type TaskBoundaryRouteReevaluationFunc func(context.Context, TaskBoundaryRouteReevaluationEvent) error
+
+type TaskBoundaryRouteReevaluationEvent struct {
+	ParentRunID string
+	ChildRunID  string
+	ChildKey    string
+	Status      string
+	FinishedAt  time.Time
+}
 
 type NestedScheduleOptions struct {
 	RepoPath         string
@@ -82,8 +91,9 @@ type NestedScheduleOptions struct {
 	Store            storage.Store
 	Progress         progress.Recorder
 
-	Execute     ChildRunExecutor
-	RecordEvent RecordNestedEventFunc
+	Execute                       ChildRunExecutor
+	RecordEvent                   RecordNestedEventFunc
+	TaskBoundaryRouteReevaluation TaskBoundaryRouteReevaluationFunc
 }
 
 type ChildRunPlan struct {
@@ -624,6 +634,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			setCompleteErr(err)
 		}
 		emitNestedChildProgress(ctx, opts, child, result, NestedEventChildFinished, finishedAt, true)
+		setCompleteErr(notifyTaskBoundaryRouteReevaluation(ctx, opts, child, result, finishedAt))
 	}
 	pending := map[int]bool{}
 	for _, index := range dispatchJobs {
@@ -761,6 +772,22 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		return report, completeErr
 	}
 	return report, nil
+}
+
+func notifyTaskBoundaryRouteReevaluation(ctx context.Context, opts NestedScheduleOptions, child ChildRunPlan, result ChildRunResult, finishedAt time.Time) error {
+	if opts.TaskBoundaryRouteReevaluation == nil || !nestedStatusTerminal(result.Status) {
+		return nil
+	}
+	if finishedAt.IsZero() {
+		finishedAt = parseOrClock(result.FinishedAt, opts.Clock)
+	}
+	return opts.TaskBoundaryRouteReevaluation(ctx, TaskBoundaryRouteReevaluationEvent{
+		ParentRunID: opts.ParentRunID,
+		ChildRunID:  child.RunID,
+		ChildKey:    child.ChildKey,
+		Status:      result.Status,
+		FinishedAt:  finishedAt.UTC(),
+	})
 }
 
 func emitNestedChildProgress(ctx context.Context, opts NestedScheduleOptions, child ChildRunPlan, result ChildRunResult, event string, at time.Time, terminal bool) {

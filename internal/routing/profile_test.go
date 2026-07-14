@@ -36,6 +36,15 @@ func TestBuiltInRoutingPolicyProfilesAreProviderNeutralAndVersioned(t *testing.T
 		if profile.BudgetSettings.AllowPaidOverage {
 			t.Fatalf("profile %s allows paid overage", profile.ProfileKey)
 		}
+		if profile.ProfileKey == ProfileKeyBalanced {
+			if profile.OptimizationPolicy.StrategyKey != StrategyBalanced ||
+				profile.OptimizationPolicy.TargetUtilizationBP != DefaultTargetUtilization ||
+				profile.OptimizationPolicy.CompletionReserveBP != 500 ||
+				profile.OptimizationPolicy.VerificationReserveBP != 800 ||
+				profile.OptimizationPolicy.AllowPaidOverage {
+				t.Fatalf("balanced profile strategy defaults = %#v", profile.OptimizationPolicy)
+			}
+		}
 	}
 	for _, key := range []string{ProfileKeyFast, ProfileKeyBalanced, ProfileKeyDeep} {
 		if !seen[key] {
@@ -216,6 +225,52 @@ func TestOverrideProvenanceCannotBypassHardGates(t *testing.T) {
 	}
 }
 
+func TestManualResetAndUnavailableOverridesAreBoundedAndExpiring(t *testing.T) {
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	for _, override := range []OverrideProvenance{
+		{
+			OverrideID:               "ovr-manual-reset",
+			OverrideKind:             "manual-reset",
+			Reason:                   "operator cleared a stale cooldown after fresh capacity event",
+			Scope:                    "manual-reset run:drun-routing task:task-a",
+			TaskID:                   "task-a",
+			DeliveryRunID:            "drun-routing",
+			CandidateConstraint:      CandidateConstraint{AdapterID: "codex", AccountProfileID: "acct-a", ModelCapabilityID: "codex-good"},
+			ManualResetAt:            now.Add(time.Hour).Format(time.RFC3339Nano),
+			ExpiresAt:                now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+			Actor:                    delivery.Actor{ActorKind: "user", ActorID: "local-user", DecisionAuthority: "user", Source: "test"},
+			Host:                     routingHost(),
+			PolicyFingerprint:        testFingerprint("policy"),
+			AuthorizationFingerprint: testFingerprint("auth"),
+			Source:                   "test",
+		},
+		{
+			OverrideID:               "ovr-unavailable",
+			OverrideKind:             "manual-unavailable-until",
+			Reason:                   "operator marked candidate unavailable until reset",
+			Scope:                    "manual-unavailable-until run:drun-routing task:task-a",
+			TaskID:                   "task-a",
+			DeliveryRunID:            "drun-routing",
+			CandidateConstraint:      CandidateConstraint{AdapterID: "codex", AccountProfileID: "acct-a", ModelCapabilityID: "codex-good"},
+			ManualUnavailableUntil:   now.Add(5 * time.Minute).Format(time.RFC3339Nano),
+			ExpiresAt:                now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+			Actor:                    delivery.Actor{ActorKind: "user", ActorID: "local-user", DecisionAuthority: "user", Source: "test"},
+			Host:                     routingHost(),
+			PolicyFingerprint:        testFingerprint("policy"),
+			AuthorizationFingerprint: testFingerprint("auth"),
+			Source:                   "test",
+		},
+	} {
+		if diagnostics := ValidateOverrideProvenance([]OverrideProvenance{override}, now, testFingerprint("policy"), testFingerprint("auth")); len(diagnostics) != 0 {
+			t.Fatalf("override %s diagnostics = %#v, want valid bounded override", override.OverrideID, diagnostics)
+		}
+		override.ExpiresAt = now.Add(-time.Minute).Format(time.RFC3339Nano)
+		if diagnostics := ValidateOverrideProvenance([]OverrideProvenance{override}, now, testFingerprint("policy"), testFingerprint("auth")); len(diagnostics) == 0 {
+			t.Fatalf("override %s with expired unavailable/reset override unexpectedly valid", override.OverrideID)
+		}
+	}
+}
+
 func TestOverrideProvenanceRequiresExactActiveBindingsThroughRouting(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -234,7 +289,9 @@ func TestOverrideProvenanceRequiresExactActiveBindingsThroughRouting(t *testing.
 		OverrideID:               "ovr-routing",
 		OverrideKind:             "routing",
 		Reason:                   "prefer a bounded route",
-		Scope:                    "routing-preference task-a",
+		Scope:                    "routing run:drun-routing task:task-a",
+		TaskID:                   "task-a",
+		DeliveryRunID:            "drun-routing",
 		ExpiresAt:                "2026-07-14T00:00:00Z",
 		PolicyFingerprint:        testFingerprint("wrong-policy-but-well-formed"),
 		AuthorizationFingerprint: testFingerprint("auth"),
@@ -287,7 +344,9 @@ func TestProfileAwareExplainNamesProfileAndSafeOverrideProvenance(t *testing.T) 
 		OverrideID:               "ovr-routing",
 		OverrideKind:             "routing",
 		Reason:                   "prefer stored route for this task",
-		Scope:                    "routing-preference task-a",
+		Scope:                    "routing run:drun-routing task:task-a",
+		TaskID:                   "task-a",
+		DeliveryRunID:            "drun-routing",
 		ExpiresAt:                "2026-07-14T00:00:00Z",
 		PolicyFingerprint:        profile.PolicyFingerprint,
 		AuthorizationFingerprint: testFingerprint("auth"),

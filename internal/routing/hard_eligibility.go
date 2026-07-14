@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/availability"
 	"github.com/jasonhnd/loopcoder/internal/budget"
@@ -44,6 +45,8 @@ const (
 	RejectAccountProfileAmbiguous          RejectionCode = "account-profile-ambiguous"
 	RejectQuotaConfidenceInsufficient      RejectionCode = "quota-confidence-insufficient"
 	RejectQuotaExhausted                   RejectionCode = "quota-exhausted"
+	RejectQuotaResetIncompatible           RejectionCode = "quota-reset-incompatible"
+	RejectManualUnavailable                RejectionCode = "manual-unavailable-until"
 	RejectBudgetExhausted                  RejectionCode = "budget-exhausted"
 	RejectAvailabilityHardIneligible       RejectionCode = "availability-hard-ineligible"
 	RejectBreakerOpen                      RejectionCode = "breaker-open"
@@ -122,23 +125,33 @@ type Policy struct {
 	RequireBoundedScope         bool
 	ContextReserveTokens        int
 	VerifierIndependence        taskrequirements.IndependenceLevel
+	AllowPaidOverage            bool
 	AllowHalfOpenBreakerProbe   bool
 }
 
 type Inputs struct {
-	Requirement     taskrequirements.TaskRequirement
-	RoleDefinitions []RoleDefinition
-	Candidates      []Candidate
-	Inventory       providerinventory.Report
-	Availability    []availability.Score
-	CircuitBreakers []availability.CircuitBreaker
-	Budgets         []budget.Summary
-	RuntimeContract runtimecap.Contract
-	HostName        string
-	Policy          Policy
-	Pins            []Pin
-	Exclusions      []Exclusion
-	WorkerRoute     *Candidate
+	Requirement        taskrequirements.TaskRequirement
+	RoleDefinitions    []RoleDefinition
+	Candidates         []Candidate
+	Inventory          providerinventory.Report
+	Availability       []availability.Score
+	CircuitBreakers    []availability.CircuitBreaker
+	Budgets            []budget.Summary
+	RuntimeContract    runtimecap.Contract
+	HostName           string
+	Policy             Policy
+	OptimizationPolicy OptimizationPolicy
+	Now                time.Time
+	Pins               []Pin
+	Exclusions         []Exclusion
+	ManualUnavailable  []ManualUnavailableOverride
+	WorkerRoute        *Candidate
+}
+
+type ManualUnavailableOverride struct {
+	OverrideID string
+	Constraint CandidateConstraint
+	Until      string
 }
 
 func InputsWithCachedInventory(ctx context.Context, store storage.Store, inputs Inputs) (Inputs, error) {
@@ -261,10 +274,11 @@ func FilterHardEligibility(inputs Inputs) Result {
 		}
 		reasons = append(reasons, evaluatePermissionAndSideEffects(requirement, candidate, roleDef, hasRoleDef)...)
 		reasons = append(reasons, evaluateRuntimeCompatibility(contract, hostName, requirement, candidate, roleDef, hasRoleDef)...)
-		reasons = append(reasons, evaluateQuota(candidate, quotaByID, policy)...)
+		reasons = append(reasons, evaluateQuota(requirement, candidate, quotaByID, policy, inputs.OptimizationPolicy, inputs.Now)...)
 		reasons = append(reasons, evaluateBudgets(candidate, budgetByID, policy)...)
 		reasons = append(reasons, evaluateAvailability(candidate, scoreByID, scoreByCandidate, policy)...)
 		reasons = append(reasons, evaluateBreakers(candidate, breakerByID, policy)...)
+		reasons = append(reasons, evaluateManualUnavailable(candidate, inputs.ManualUnavailable)...)
 		reasons = append(reasons, evaluateNetwork(requirement, candidate)...)
 		reasons = append(reasons, evaluateClassificationAndQuality(requirement, candidate)...)
 		reasons = append(reasons, evaluateRiskAndVerification(requirement, inputs.WorkerRoute, candidate, policy)...)
@@ -560,19 +574,34 @@ func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string,
 	return nil
 }
 
-func evaluateQuota(candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy) []RejectionReason {
+func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
 	var reasons []RejectionReason
 	var sawFreshExact bool
 	var sawFreshEstimate bool
+	var sawUsableCapacity bool
+	if len(candidate.QuotaSnapshotIDs) == 0 {
+		return []RejectionReason{reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "fresh quota capacity evidence is required", nil, nil)}
+	}
+	optimization = normalizeHardOptimizationPolicy(optimization)
+	taskClass := taskClassForRequirement(requirement)
 	for _, id := range candidate.QuotaSnapshotIDs {
 		snapshot, ok := quotaByID[id]
 		if !ok {
 			reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota snapshot is missing", nil, []string{id}))
 			continue
 		}
+		snapshotUsable := true
 		reasons = append(reasons, staleReason(snapshot.QuotaSnapshotID, snapshot.FreshnessState, snapshot.Confidence, policy)...)
+		if snapshot.FreshnessState != providerinventory.FreshnessFresh {
+			snapshotUsable = false
+		}
 		if len(snapshot.ConflictSet) > 0 {
 			reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota snapshots conflict", snapshot.ConflictSet, []string{snapshot.QuotaSnapshotID}))
+			snapshotUsable = false
+		}
+		if hasString(snapshot.GapReasons, "paid-overage") && !policy.AllowPaidOverage {
+			reasons = append(reasons, reason(RejectBudgetExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "paid overage is disabled by routing policy", nil, []string{snapshot.QuotaSnapshotID}))
+			snapshotUsable = false
 		}
 		if snapshot.Confidence == providerinventory.ConfidenceExact && snapshot.FreshnessState == providerinventory.FreshnessFresh {
 			sawFreshExact = true
@@ -580,8 +609,31 @@ func evaluateQuota(candidate Candidate, quotaByID map[string]providerinventory.Q
 		if snapshot.Confidence == providerinventory.ConfidenceEstimated && snapshot.FreshnessState == providerinventory.FreshnessFresh {
 			sawFreshEstimate = true
 		}
-		if snapshot.RemainingValue != nil && *snapshot.RemainingValue <= 0 {
+		if !quotaConfidenceAllowedForCapacity(snapshot.Confidence, policy) {
+			snapshotUsable = false
+		}
+		if snapshot.RemainingValue == nil {
+			reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota remaining capacity evidence is missing", nil, []string{snapshot.QuotaSnapshotID}))
+			snapshotUsable = false
+		} else if *snapshot.RemainingValue <= 0 {
 			reasons = append(reasons, reason(RejectQuotaExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reports no remaining capacity", nil, []string{snapshot.QuotaSnapshotID}))
+			snapshotUsable = false
+		}
+		if !now.IsZero() {
+			resetAt, ok := parseTime(snapshot.ResetAt)
+			if !ok || !resetAt.After(now.UTC()) {
+				reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reset evidence is missing or expired", nil, []string{snapshot.QuotaSnapshotID}))
+				snapshotUsable = false
+			} else {
+				band := resetBandForDuration(optimization.ResetBands, resetAt.Sub(now.UTC()))
+				if !taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
+					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "task class "+taskClass+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
+					snapshotUsable = false
+				}
+			}
+		}
+		if snapshotUsable {
+			sawUsableCapacity = true
 		}
 	}
 	if policy.RequireExactQuota && !sawFreshExact {
@@ -590,7 +642,34 @@ func evaluateQuota(candidate Candidate, quotaByID map[string]providerinventory.Q
 	if !policy.RequireExactQuota && len(candidate.QuotaSnapshotIDs) > 0 && !sawFreshExact && !sawFreshEstimate && policy.EvidencePolicy == EvidenceRejectUnknownStale {
 		reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota confidence is insufficient", nil, candidate.QuotaSnapshotIDs))
 	}
+	if !sawUsableCapacity {
+		reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "no usable fresh quota capacity evidence remains", nil, candidate.QuotaSnapshotIDs))
+	}
 	return reasons
+}
+
+func normalizeHardOptimizationPolicy(policy OptimizationPolicy) OptimizationPolicy {
+	if policy.TargetUtilizationBP == 0 {
+		policy.TargetUtilizationBP = DefaultTargetUtilization
+	}
+	if policy.CompletionReserveBP == 0 {
+		policy.CompletionReserveBP = 500
+	}
+	if policy.VerificationReserveBP == 0 {
+		policy.VerificationReserveBP = 800
+	}
+	if len(policy.ResetBands) == 0 {
+		policy.ResetBands = defaultResetBands()
+	}
+	policy.ResetBands = normalizeResetBands(policy.ResetBands)
+	return policy
+}
+
+func quotaConfidenceAllowedForCapacity(confidence providerinventory.Confidence, policy Policy) bool {
+	if confidence == providerinventory.ConfidenceExact {
+		return true
+	}
+	return !policy.RequireExactQuota && policy.EvidencePolicy == EvidenceAllowEstimated && confidence == providerinventory.ConfidenceEstimated
 }
 
 func evaluateBudgets(candidate Candidate, budgetByID map[string]budget.Summary, policy Policy) []RejectionReason {
@@ -645,6 +724,17 @@ func evaluateBreakers(candidate Candidate, breakerByID map[string]availability.C
 		if breaker.State == availability.BreakerOpen || (breaker.State == availability.BreakerHalfOpen && !policy.AllowHalfOpenBreakerProbe) {
 			reasons = append(reasons, reason(RejectBreakerOpen, taskrequirements.ErrRequirementConfidenceInsufficientCode, "circuit breaker blocks candidate", []string{id}, nil))
 		}
+	}
+	return reasons
+}
+
+func evaluateManualUnavailable(candidate Candidate, overrides []ManualUnavailableOverride) []RejectionReason {
+	var reasons []RejectionReason
+	for _, override := range overrides {
+		if !constraintMatchesCandidate(override.Constraint, candidate) {
+			continue
+		}
+		reasons = append(reasons, reason(RejectManualUnavailable, taskrequirements.ErrNoEligibleCandidateCode, "candidate is manually unavailable until "+override.Until, []string{override.OverrideID}, nil))
 	}
 	return reasons
 }
@@ -751,6 +841,15 @@ func confidenceRank(value providerinventory.Confidence) int {
 	default:
 		return 0
 	}
+}
+
+func hasString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func roleSupported(role string, roles []providerinventory.CatalogRole) bool {
@@ -1105,6 +1204,14 @@ func breakerIDsForCandidate(candidate Candidate, breakers []availability.Circuit
 func scopeMatchesCandidate(scopeValue, candidateValue string) bool {
 	scopeValue = strings.TrimSpace(scopeValue)
 	return scopeValue == "" || scopeValue == strings.TrimSpace(candidateValue)
+}
+
+func constraintMatchesCandidate(constraint CandidateConstraint, candidate Candidate) bool {
+	return scopeMatchesCandidate(constraint.AdapterID, candidate.AdapterID) &&
+		scopeMatchesCandidate(constraint.ProviderInstallationID, candidate.ProviderInstallationID) &&
+		scopeMatchesCandidate(constraint.AccountProfileID, candidate.AccountProfileID) &&
+		scopeMatchesCandidate(constraint.ModelCapabilityID, candidate.ModelCapabilityID) &&
+		scopeMatchesCandidate(constraint.InvocationProfileKey, candidate.InvocationProfileKey)
 }
 
 func availabilityKey(candidate Candidate) string {

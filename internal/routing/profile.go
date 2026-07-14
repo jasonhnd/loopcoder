@@ -159,16 +159,22 @@ type PolicyDiagnostic struct {
 }
 
 type OverrideProvenance struct {
-	OverrideID               string         `json:"override_id"`
-	OverrideKind             string         `json:"override_kind"`
-	Reason                   string         `json:"reason"`
-	Scope                    string         `json:"scope"`
-	ExpiresAt                string         `json:"expires_at,omitempty"`
-	Actor                    delivery.Actor `json:"actor"`
-	Host                     delivery.Host  `json:"host"`
-	PolicyFingerprint        string         `json:"policy_fingerprint"`
-	AuthorizationFingerprint string         `json:"authorization_fingerprint"`
-	Source                   string         `json:"source"`
+	OverrideID               string              `json:"override_id"`
+	OverrideKind             string              `json:"override_kind"`
+	Reason                   string              `json:"reason"`
+	Scope                    string              `json:"scope"`
+	ExpiresAt                string              `json:"expires_at,omitempty"`
+	TaskID                   string              `json:"task_id,omitempty"`
+	DeliveryRunID            string              `json:"delivery_run_id,omitempty"`
+	CandidateConstraint      CandidateConstraint `json:"candidate_constraint,omitempty"`
+	ManualUnavailableUntil   string              `json:"manual_unavailable_until,omitempty"`
+	ManualResetAt            string              `json:"manual_reset_at,omitempty"`
+	ClearManualReset         bool                `json:"clear_manual_reset,omitempty"`
+	Actor                    delivery.Actor      `json:"actor"`
+	Host                     delivery.Host       `json:"host"`
+	PolicyFingerprint        string              `json:"policy_fingerprint"`
+	AuthorizationFingerprint string              `json:"authorization_fingerprint"`
+	Source                   string              `json:"source"`
 }
 
 type LegacyModelMapping struct {
@@ -569,11 +575,39 @@ func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time, a
 		if strings.TrimSpace(override.ExpiresAt) == "" || err != nil || (!now.IsZero() && !expiresAt.After(now.UTC())) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrExpiredApprovalCode), "stale", "expires_at", id, "override requires a future expiry", nil, "record a fresh override with a future expiry"))
 		}
+		if strings.TrimSpace(override.TaskID) == "" && strings.TrimSpace(override.DeliveryRunID) == "" {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "scope", id, "override requires an explicit structured task_id or delivery_run_id binding", nil, "bind the override to an exact task or delivery run"))
+		} else if strings.TrimSpace(override.Scope) != canonicalManualOverrideScope(override) {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "scope", id, "override scope must exactly match structured task/run binding", nil, "use the canonical structured scope representation"))
+		}
 		if isHardGateOverride(override.OverrideKind, override.Scope) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrPolicyDeniedCode), "invalid", "override_kind", id, "override cannot weaken hard eligibility, permission, side-effect, scope, approval, independence, budget, or release gates", nil, "change the plan or choose an eligible route instead"))
 		}
 		if !supportedBoundedOverride(override.OverrideKind, override.Scope) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "override_kind", id, "unsupported routing override kind or scope", nil, "use a bounded routing, fallback, replan, or budget preference override"))
+		}
+		switch strings.ToLower(strings.TrimSpace(override.OverrideKind)) {
+		case "manual-unavailable-until":
+			if emptyCandidateConstraint(override.CandidateConstraint) {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "candidate_constraint", id, "manual unavailable override requires an explicit candidate constraint", nil, "bind the override to adapter/account/model evidence"))
+			}
+			if _, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(override.ManualUnavailableUntil)); strings.TrimSpace(override.ManualUnavailableUntil) == "" || err != nil {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_unavailable_until", id, "manual unavailable override requires a bounded unavailable-until timestamp", nil, "record a bounded unavailable-until timestamp"))
+			}
+		case "manual-reset":
+			if emptyCandidateConstraint(override.CandidateConstraint) {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "candidate_constraint", id, "manual reset override requires an explicit candidate constraint", nil, "bind the override to adapter/account/model evidence"))
+			}
+			resetAt := strings.TrimSpace(override.ManualResetAt)
+			if !override.ClearManualReset {
+				parsed, err := time.Parse(time.RFC3339Nano, resetAt)
+				if resetAt == "" || err != nil || (!now.IsZero() && !parsed.After(now.UTC())) {
+					diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_reset_at", id, "manual reset override requires a future reset timestamp or explicit clear flag", nil, "record explicit bounded reset evidence"))
+				}
+			}
+			if override.ClearManualReset && resetAt != "" {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_reset_at", id, "manual reset override cannot both replace and clear reset evidence", nil, "choose replacement reset evidence or clear the reset assumption"))
+			}
 		}
 	}
 	sortDiagnostics(diagnostics)
@@ -732,6 +766,7 @@ func profileTemplate(key string, now time.Time, weights map[ComponentName]int, b
 			RequireBoundedScope:         true,
 			ContextReserveTokens:        8000,
 			VerifierIndependence:        highIndependence,
+			AllowPaidOverage:            false,
 		},
 		OptimizationPolicy: OptimizationPolicy{
 			SchemaVersion:  "loopcoder.routing_optimization_policy.v1",
@@ -807,6 +842,7 @@ func normalizeRoutingPolicyProfile(profile RoutingPolicyProfile) RoutingPolicyPr
 	profile.OptimizationPolicy.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
 	profile.OptimizationPolicy.ProfileKey = firstNonEmpty(profile.OptimizationPolicy.ProfileKey, profile.ProfileKey)
 	profile.OptimizationPolicy.ProfileVersion = firstNonEmpty(profile.OptimizationPolicy.ProfileVersion, profile.ProfileVersion)
+	profile.OptimizationPolicy.AllowPaidOverage = profile.BudgetSettings.AllowPaidOverage
 	opt, err := normalizeOptimizationPolicy(profile.OptimizationPolicy, profile.RoutingPolicyProfileID)
 	if err == nil {
 		profile.OptimizationPolicy = opt
@@ -1016,9 +1052,9 @@ func supportedBoundedOverride(kind, scope string) bool {
 	if kind == "" || scope == "" {
 		return false
 	}
-	for _, allowedKind := range []string{"routing", "routing-preference", "fallback", "fallback-preference", "replan", "budget", "budget-preference"} {
+	for _, allowedKind := range []string{"routing", "routing-preference", "manual-unavailable-until", "manual-reset", "fallback", "fallback-preference", "replan", "budget", "budget-preference"} {
 		if kind == allowedKind {
-			for _, allowedScope := range []string{"routing-preference", "fallback-preference", "replan", "budget-preference", "task:", "run:"} {
+			for _, allowedScope := range []string{"routing-preference", "manual-unavailable-until", "manual-reset", "fallback-preference", "replan", "budget-preference", "task:", "run:"} {
 				if strings.Contains(scope, allowedScope) {
 					return true
 				}
@@ -1026,6 +1062,14 @@ func supportedBoundedOverride(kind, scope string) bool {
 		}
 	}
 	return false
+}
+
+func emptyCandidateConstraint(c CandidateConstraint) bool {
+	return strings.TrimSpace(c.AdapterID) == "" &&
+		strings.TrimSpace(c.ProviderInstallationID) == "" &&
+		strings.TrimSpace(c.AccountProfileID) == "" &&
+		strings.TrimSpace(c.ModelCapabilityID) == "" &&
+		strings.TrimSpace(c.InvocationProfileKey) == ""
 }
 
 func verifyProfileRoleReferences(ctx context.Context, tx storage.Tx, profile RoutingPolicyProfile) error {
