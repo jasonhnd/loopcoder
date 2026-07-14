@@ -197,7 +197,10 @@ create issues by itself; those remain conductor actions. Design rationale:
 ### Verification
 
 Current verification combines three signals. Hosted CI checks listed in
-`.delivery.yml ci.checks` are read through GitHub by the conductor. The
+`.delivery.yml ci.checks` are read through GitHub by the conductor. For the
+v0.8.0 macOS Apple Silicon contract, that list is exactly `verify`, `test`,
+`race`, and `security`; each context runs on `macos-15` and asserts the actual
+Go host tuple is `darwin/arm64` before substantive work. The
 `loopcoder verify-local` command creates an isolated worktree for a PR or branch
 and runs configured `ci.tests`, `ci.typecheck`, and `ci.build` command groups,
 returning `pass`, `fail`, or `needs-human`. `loopcoder loopreview` runs the
