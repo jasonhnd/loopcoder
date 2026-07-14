@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
@@ -35,6 +36,59 @@ func TestRunCompletedExitCodeZero(t *testing.T) {
 	}
 	if result.Killed {
 		t.Fatal("Killed = true, want false")
+	}
+}
+
+func TestRunDarwinArm64ProviderAuthorityIdentifiesProviderProcessGroup(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 process authority fixture")
+	}
+	outerPID := os.Getpid()
+	var started StartedProcess
+	cmd := exec.Command("/bin/sleep", "0.1")
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap: 5 * time.Second,
+		RunID:   "run-authority-fixture",
+		Role:    "worker",
+		OnStart: func(startedProcess StartedProcess) error {
+			started = startedProcess
+			identity := process.Identity{
+				PID:                  startedProcess.PID,
+				PGID:                 startedProcess.PGID,
+				ProcessBirthIdentity: startedProcess.ProcessBirthIdentity,
+				ExecutableIdentity:   startedProcess.ExecutableIdentity,
+				Ambiguous:            startedProcess.IdentityAmbiguous,
+			}
+			if err := process.VerifySnapshot(identity); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want completed sleep", result)
+	}
+	if started.PID <= 0 || started.PID == outerPID {
+		t.Fatalf("started PID = %d, outer PID = %d; want provider child PID", started.PID, outerPID)
+	}
+	if started.PGID != started.PID {
+		t.Fatalf("started PGID = %d, PID = %d; want provider-led process group", started.PGID, started.PID)
+	}
+	if started.ProcessBirthIdentity == "" || started.ExecutableIdentity == "" || started.IdentityAmbiguous {
+		t.Fatalf("started process authority = %#v, want complete identity", started)
+	}
+	identity := process.Identity{
+		PID:                  started.PID,
+		PGID:                 started.PGID,
+		ProcessBirthIdentity: started.ProcessBirthIdentity,
+		ExecutableIdentity:   started.ExecutableIdentity,
+		Ambiguous:            started.IdentityAmbiguous,
+	}
+	if err := process.VerifySnapshot(identity); err == nil {
+		t.Fatalf("VerifySnapshot succeeded after sleep exited; fixture should not treat exited/PID-reused process as proof")
 	}
 }
 
