@@ -715,6 +715,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --format string                  output format: text, json, or jsonl (default \"json\")")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty reports on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty reports on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -769,7 +770,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
-		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --format string        output format: text, json, jsonl, or both (default \"text\")")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
@@ -2545,6 +2546,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	outputFormat := "json"
+	var outputFormatAlias string
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -2578,6 +2581,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable reports on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable reports on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable reports on stderr")
+	fs.StringVar(&outputFormat, "format", "json", "output format")
+	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -2624,6 +2629,16 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	if outputFormatAlias != "" {
+		outputFormat = outputFormatAlias
+	}
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	switch outputFormat {
+	case "text", "json", "jsonl":
+	default:
+		fmt.Fprintf(stderr, "tick: invalid --format %q; want text, json, or jsonl\n", outputFormat)
+		return 2
+	}
 
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "tick: unexpected argument %q\n", fs.Arg(0))
@@ -2759,14 +2774,9 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 1
 	}
-	data, err := orchestration.MarshalTickJSON(tickReport)
-	if err != nil {
-		fmt.Fprintf(stderr, "tick: %v\n", err)
-		return 1
-	}
 	var ownRelayRecords []relaygate.Record
 	prettyMode := reporter.PrettyModePlain
-	renderPretty := shouldRenderPretty(noPretty)
+	renderPretty := outputFormat != "jsonl" && shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
 		ownRelayRecords, err = writeTickRelayRecords(resolvedRepo, tickReport, prettyMode, preExistingRelayNonces)
@@ -2775,21 +2785,47 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return 1
 		}
 	}
-	if _, err := stdout.Write(data); err != nil {
-		fmt.Fprintf(stderr, "tick: write output: %v\n", err)
-		return 1
-	}
-	if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
-		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
-		return 1
-	}
-	if _, err := fmt.Fprintln(stderr); err != nil {
-		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
-		return 1
-	}
-	if err := renderCanonicalHuman(stderr, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
-		fmt.Fprintf(stderr, "tick: write observability summary: %v\n", err)
-		return 1
+	switch outputFormat {
+	case "json":
+		data, err := orchestration.MarshalTickJSON(tickReport)
+		if err != nil {
+			fmt.Fprintf(stderr, "tick: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+			fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+			return 1
+		}
+		if _, err := fmt.Fprintln(stderr); err != nil {
+			fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+			return 1
+		}
+		if err := renderCanonicalHuman(stderr, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
+			fmt.Fprintf(stderr, "tick: write observability summary: %v\n", err)
+			return 1
+		}
+	case "jsonl":
+		if err := renderCanonicalMachine(stdout, orchestration.TickObservabilityDocument(tickReport), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+	case "text":
+		if _, err := stdout.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if _, err := fmt.Fprintln(stdout); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if err := renderCanonicalHuman(stdout, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
 	}
 	if renderPretty {
 		if err := renderTickPrettyReports(stderr, tickReport, prettyMode); err != nil {
