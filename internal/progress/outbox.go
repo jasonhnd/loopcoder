@@ -195,6 +195,11 @@ type DeliveryReplayCursor struct {
 	AdvancedAt      string `json:"advanced_at"`
 }
 
+type deliveryObligationReplayCandidate struct {
+	Current DeliveryObligation
+	Initial DeliveryObligation
+}
+
 func PersistReceiptWithObligation(ctx context.Context, store storage.Store, receipt ProgressReceipt, obligation DeliveryObligation) (PersistReceiptWithObligationResult, error) {
 	if store == nil {
 		return PersistReceiptWithObligationResult{}, typed(ErrInvalidRecordCode, "store is required")
@@ -307,6 +312,21 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		if err != nil {
 			return err
 		}
+		if obligation.Status != DeliveryAttempting {
+			attempt, found, err := loadDeliveryAttemptForGenerationTx(ctx, tx, req.ObligationID, req.Generation)
+			if err != nil {
+				return err
+			}
+			if found {
+				if deliveryAttemptMatchesRequest(attempt, req) {
+					stored = obligation
+					stored.LatestEvidence = attempt.Evidence
+					return nil
+				}
+				return typed(ErrDuplicateReplayCode, "delivery attempt generation %d already recorded with different result", req.Generation)
+			}
+			return typed(ErrStaleClaimCode, "obligation %s is not actively attempting", obligation.ObligationID)
+		}
 		if err := requireCurrentClaim(obligation, req.ClaimOwner, req.Generation, now); err != nil {
 			return err
 		}
@@ -314,22 +334,12 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		status := req.ResultStatus
 		errorCode := req.ErrorCode
 		nextAttemptAt := ""
-		if status == DeliveryRetryableFailure {
+		exhaustedRetry := status == DeliveryRetryableFailure && nextAttempt >= obligation.MaxAttempts
+		if status == DeliveryRetryableFailure && !exhaustedRetry {
 			nextAttemptAt = firstNonEmpty(req.NextAttemptAt, canonicalTimestamp(now.Add(retryDelayForAttempt(nextAttempt))))
 			if !timestampAfter(nextAttemptAt, now) {
 				return typed(ErrInvalidRecordCode, "next_attempt_at must be after now for retryable failure")
 			}
-		}
-		if nextAttempt > obligation.MaxAttempts {
-			updatedAt := canonicalTimestamp(now)
-			if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-				SET status = ?, next_attempt_at = '', last_error_code = ?, updated_at = ?
-				WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
-				DeliveryTerminalFailure, firstNonEmpty(errorCode, "max-attempts-exceeded"), updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
-				return fmt.Errorf("record bounded delivery attempt failure: %w", err)
-			}
-			stored, err = loadDeliveryObligationTx(ctx, tx, req.ObligationID)
-			return err
 		}
 		attemptID := prefixedDigest("pdelatt", map[string]any{
 			"obligation_id": req.ObligationID,
@@ -373,12 +383,32 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		if status == DeliveryDeliveredUnacknowledged && obligation.AckPolicy == DeliveryAckPolicyNone {
 			obligationStatus = DeliveryAcknowledged
 		}
+		if exhaustedRetry {
+			obligationStatus = DeliveryTerminalFailure
+		}
 		updatedAt := canonicalTimestamp(now)
-		if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-			SET status = ?, attempt_count = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
-			WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
-			obligationStatus, nextAttempt, nextAttemptAt, errorCode, updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
+		claimOwner := req.ClaimOwner
+		claimedAt := obligation.ClaimedAt
+		claimExpiresAt := obligation.ClaimExpiresAt
+		if terminalDeliveryStatus(obligationStatus) {
+			claimOwner = ""
+			claimedAt = ""
+			claimExpiresAt = ""
+		}
+		update, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
+			SET status = ?, claim_owner = ?, claimed_at = ?, claim_expires_at = ?, attempt_count = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
+			WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ? AND attempt_count = ?`,
+			obligationStatus, claimOwner, claimedAt, claimExpiresAt, nextAttempt, nextAttemptAt, errorCode, updatedAt,
+			req.ObligationID, DeliveryAttempting, req.ClaimOwner, req.Generation, obligation.AttemptCount)
+		if err != nil {
 			return fmt.Errorf("update delivery obligation attempt result: %w", err)
+		}
+		rows, err := update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("update delivery obligation attempt result rows affected: %w", err)
+		}
+		if rows != 1 {
+			return typed(ErrStaleClaimCode, "obligation %s attempt result lost active claim fence", obligation.ObligationID)
 		}
 		stored, err = loadDeliveryObligationTx(ctx, tx, req.ObligationID)
 		if err != nil {
@@ -408,9 +438,6 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 		if err != nil {
 			return err
 		}
-		if err := requireCurrentClaim(obligation, req.ClaimOwner, req.Generation, now); err != nil {
-			return err
-		}
 		if obligation.AckPolicy == DeliveryAckPolicyNone {
 			return typed(ErrEvidenceRejectedCode, "obligation %s uses no-ack delivery policy", obligation.ObligationID)
 		}
@@ -421,6 +448,27 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 			return err
 		}
 		semantic := ackSemanticIdentity(obligation, req.Evidence)
+		if obligation.Status == DeliveryAcknowledged {
+			ack, found, err := loadDeliveryAckByObligationTx(ctx, tx, obligation.ObligationID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return typed(ErrEvidenceRejectedCode, "acknowledged obligation %s is missing acknowledgment evidence", obligation.ObligationID)
+			}
+			if ack.ClaimOwner != req.ClaimOwner || ack.ClaimGeneration != req.Generation {
+				return typed(ErrStaleClaimCode, "obligation %s acknowledgment claim is stale", obligation.ObligationID)
+			}
+			if ack.SemanticIdentity != semantic || ack.Evidence != req.Evidence {
+				return typed(ErrDuplicateReplayCode, "obligation %s acknowledgment already recorded with different evidence", obligation.ObligationID)
+			}
+			stored = obligation
+			stored.LatestEvidence = ack.Evidence
+			return nil
+		}
+		if err := requireClaimIdentity(obligation, req.ClaimOwner, req.Generation); err != nil {
+			return err
+		}
 		ackID := prefixedDigest("pdelack", semantic)
 		evidenceJSON, err := canonicalJSON(req.Evidence)
 		if err != nil {
@@ -453,11 +501,19 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 			return fmt.Errorf("record delivery acknowledgment: %w", err)
 		}
 		updatedAt := canonicalTimestamp(now)
-		if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-			SET status = ?, next_attempt_at = '', updated_at = ?
-			WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
-			DeliveryAcknowledged, updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
+		update, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
+			SET status = ?, claim_owner = '', claimed_at = '', claim_expires_at = '', next_attempt_at = '', updated_at = ?
+			WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ?`,
+			DeliveryAcknowledged, updatedAt, req.ObligationID, DeliveryDeliveredUnacknowledged, req.ClaimOwner, req.Generation)
+		if err != nil {
 			return fmt.Errorf("acknowledge delivery obligation: %w", err)
+		}
+		rows, err := update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("acknowledge delivery obligation rows affected: %w", err)
+		}
+		if rows != 1 {
+			return typed(ErrStaleClaimCode, "obligation %s acknowledgment lost delivery fence", obligation.ObligationID)
 		}
 		stored, err = loadDeliveryObligationTx(ctx, tx, req.ObligationID)
 		if err != nil {
@@ -766,6 +822,16 @@ func ListDeliveryReplayCursors(ctx context.Context, store storage.Store, filter 
 }
 
 func persistDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligation DeliveryObligation) (DeliveryObligation, bool, error) {
+	candidate, found, err := findDeliveryObligationReplayCandidateTx(ctx, tx, obligation)
+	if err != nil {
+		return DeliveryObligation{}, false, err
+	}
+	if found {
+		if deliveryObligationImmutableEqual(candidate.Initial, obligation) {
+			return candidate.Current, false, nil
+		}
+		return DeliveryObligation{}, false, typed(ErrDuplicateReplayCode, "delivery obligation replay conflicts with immutable negotiated contract")
+	}
 	payload, err := canonicalJSON(obligation)
 	if err != nil {
 		return DeliveryObligation{}, false, typed(ErrInvalidRecordCode, "canonical delivery obligation: %v", err)
@@ -789,11 +855,28 @@ func persistDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligation 
 	if err != nil {
 		return DeliveryObligation{}, false, fmt.Errorf("persist delivery obligation rows affected: %w", err)
 	}
-	stored, err := loadDeliveryObligationBySemanticTx(ctx, tx, obligation.ProjectID, obligation.DeliveryRunID, obligation.SemanticIdentity)
+	if rows == 0 {
+		stored, err := loadDeliveryObligationTx(ctx, tx, obligation.ObligationID)
+		if err != nil {
+			stored, err = loadDeliveryObligationBySemanticTx(ctx, tx, obligation.ProjectID, obligation.DeliveryRunID, obligation.SemanticIdentity)
+		}
+		if err != nil {
+			return DeliveryObligation{}, false, err
+		}
+		initial, err := loadDeliveryObligationInitialTx(ctx, tx, stored.ObligationID)
+		if err != nil {
+			return DeliveryObligation{}, false, err
+		}
+		if !deliveryObligationImmutableEqual(initial, obligation) {
+			return DeliveryObligation{}, false, typed(ErrDuplicateReplayCode, "delivery obligation replay conflicts with immutable negotiated contract")
+		}
+		return stored, false, nil
+	}
+	stored, err := loadDeliveryObligationTx(ctx, tx, obligation.ObligationID)
 	if err != nil {
 		return DeliveryObligation{}, false, err
 	}
-	return stored, rows == 1, nil
+	return stored, true, nil
 }
 
 func normalizeDeliveryObligation(obligation DeliveryObligation, receipt ProgressReceipt, now time.Time) (DeliveryObligation, error) {
@@ -891,13 +974,67 @@ func validateAcknowledgmentEvidence(contract string, evidence DeliveryEvidence) 
 }
 
 func requireCurrentClaim(obligation DeliveryObligation, owner string, generation int64, now time.Time) error {
-	if obligation.ClaimOwner != owner || obligation.ClaimGeneration != generation || generation <= 0 {
-		return typed(ErrStaleClaimCode, "obligation %s claim is stale", obligation.ObligationID)
+	if err := requireClaimIdentity(obligation, owner, generation); err != nil {
+		return err
 	}
 	if obligation.ClaimExpiresAt == "" || !timestampAfter(obligation.ClaimExpiresAt, now) {
 		return typed(ErrStaleClaimCode, "obligation %s claim lease expired", obligation.ObligationID)
 	}
 	return nil
+}
+
+func requireClaimIdentity(obligation DeliveryObligation, owner string, generation int64) error {
+	if obligation.ClaimOwner != owner || obligation.ClaimGeneration != generation || generation <= 0 {
+		return typed(ErrStaleClaimCode, "obligation %s claim is stale", obligation.ObligationID)
+	}
+	return nil
+}
+
+func loadDeliveryAttemptForGenerationTx(ctx context.Context, tx storage.Tx, obligationID string, generation int64) (DeliveryAttempt, bool, error) {
+	row := tx.QueryRow(ctx, `SELECT payload_json, next_attempt_at FROM progress_delivery_attempts
+		WHERE obligation_id = ? AND claim_generation = ?
+		ORDER BY attempt_ordinal DESC LIMIT 1`, obligationID, generation)
+	var payload, nextAttemptAt string
+	if err := row.Scan(&payload, &nextAttemptAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, false, nil
+		}
+		return DeliveryAttempt{}, false, fmt.Errorf("load delivery attempt replay: %w", err)
+	}
+	attempt, err := decodeDeliveryAttemptPayload([]byte(payload))
+	if err != nil {
+		return DeliveryAttempt{}, false, err
+	}
+	attempt.NextAttemptAt = nextAttemptAt
+	return attempt, true, nil
+}
+
+func loadDeliveryAckByObligationTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryAcknowledgment, bool, error) {
+	row := tx.QueryRow(ctx, `SELECT payload_json FROM progress_delivery_acknowledgments
+		WHERE obligation_id = ?
+		ORDER BY acknowledged_at, acknowledgment_id LIMIT 1`, obligationID)
+	var payload string
+	if err := row.Scan(&payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAcknowledgment{}, false, nil
+		}
+		return DeliveryAcknowledgment{}, false, fmt.Errorf("load delivery acknowledgment replay: %w", err)
+	}
+	ack, err := decodeDeliveryAckPayload([]byte(payload))
+	if err != nil {
+		return DeliveryAcknowledgment{}, false, err
+	}
+	return ack, true, nil
+}
+
+func deliveryAttemptMatchesRequest(attempt DeliveryAttempt, req AttemptResultRequest) bool {
+	if attempt.ClaimOwner != req.ClaimOwner || attempt.ClaimGeneration != req.Generation {
+		return false
+	}
+	if attempt.ResultStatus != req.ResultStatus || attempt.ErrorCode != req.ErrorCode || attempt.Evidence != req.Evidence {
+		return false
+	}
+	return req.NextAttemptAt == "" || attempt.NextAttemptAt == req.NextAttemptAt
 }
 
 func loadDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryObligation, error) {
@@ -935,6 +1072,20 @@ func loadDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligationID s
 	return obligation, nil
 }
 
+func loadDeliveryObligationInitialTx(ctx context.Context, tx storage.Tx, obligationID string) (DeliveryObligation, error) {
+	if obligationID == "" {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id is required")
+	}
+	var payload string
+	if err := tx.QueryRow(ctx, `SELECT payload_json FROM progress_delivery_obligations WHERE obligation_id = ?`, obligationID).Scan(&payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryObligation{}, typed(ErrMissingReferenceCode, "delivery obligation not found")
+		}
+		return DeliveryObligation{}, fmt.Errorf("load initial delivery obligation: %w", err)
+	}
+	return decodeDeliveryObligationPayload([]byte(payload))
+}
+
 func loadDeliveryObligationBySemanticTx(ctx context.Context, tx storage.Tx, projectID, deliveryRunID, semantic string) (DeliveryObligation, error) {
 	var obligationID string
 	if err := tx.QueryRow(ctx, `SELECT obligation_id FROM progress_delivery_obligations
@@ -943,6 +1094,49 @@ func loadDeliveryObligationBySemanticTx(ctx context.Context, tx storage.Tx, proj
 		return DeliveryObligation{}, err
 	}
 	return loadDeliveryObligationTx(ctx, tx, obligationID)
+}
+
+func findDeliveryObligationReplayCandidateTx(ctx context.Context, tx storage.Tx, obligation DeliveryObligation) (deliveryObligationReplayCandidate, bool, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT obligation_id FROM progress_delivery_obligations
+		WHERE project_id = ? AND delivery_run_id = ? AND progress_receipt_id = ? AND origin_kind = ? AND origin_id = ?
+		ORDER BY created_at, obligation_id LIMIT 1`,
+		obligation.ProjectID, obligation.DeliveryRunID, obligation.ProgressReceiptID, obligation.OriginKind, obligation.OriginID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return deliveryObligationReplayCandidate{}, false, nil
+		}
+		return deliveryObligationReplayCandidate{}, false, fmt.Errorf("find delivery obligation replay: %w", err)
+	}
+	current, err := loadDeliveryObligationTx(ctx, tx, id)
+	if err != nil {
+		return deliveryObligationReplayCandidate{}, false, err
+	}
+	initial, err := loadDeliveryObligationInitialTx(ctx, tx, id)
+	if err != nil {
+		return deliveryObligationReplayCandidate{}, false, err
+	}
+	return deliveryObligationReplayCandidate{Current: current, Initial: initial}, true, nil
+}
+
+func deliveryObligationImmutableEqual(a, b DeliveryObligation) bool {
+	return a.SchemaVersion == b.SchemaVersion &&
+		a.RecordVersion == b.RecordVersion &&
+		a.ProjectID == b.ProjectID &&
+		a.DeliveryRunID == b.DeliveryRunID &&
+		a.ProgressReceiptID == b.ProgressReceiptID &&
+		a.OriginKind == b.OriginKind &&
+		a.OriginID == b.OriginID &&
+		a.SinkKind == b.SinkKind &&
+		a.SinkID == b.SinkID &&
+		a.TransportContract == b.TransportContract &&
+		a.Status == b.Status &&
+		a.MaxAttempts == b.MaxAttempts &&
+		a.AckPolicy == b.AckPolicy &&
+		a.RequiredAck == b.RequiredAck &&
+		a.ExpiresAt == b.ExpiresAt &&
+		a.SupersededByObligationID == b.SupersededByObligationID &&
+		a.NextAttemptAt == b.NextAttemptAt
 }
 
 func decodeDeliveryObligationPayload(data []byte) (DeliveryObligation, error) {
@@ -1000,6 +1194,13 @@ func deliveryObligationSemanticIdentity(obligation DeliveryObligation) string {
 		"sink_kind":           obligation.SinkKind,
 		"sink_id":             obligation.SinkID,
 		"transport_contract":  obligation.TransportContract,
+		"status":              obligation.Status,
+		"max_attempts":        obligation.MaxAttempts,
+		"ack_policy":          obligation.AckPolicy,
+		"required_ack":        obligation.RequiredAck,
+		"expires_at":          obligation.ExpiresAt,
+		"superseded_by":       obligation.SupersededByObligationID,
+		"next_attempt_at":     obligation.NextAttemptAt,
 	})
 }
 
