@@ -66,40 +66,43 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter           func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive             func(pid int) bool
-	Now                      func() time.Time
-	IsTerminal               func(w io.Writer) bool
-	Stdin                    io.Reader
-	BuildInfo                BuildInfo
-	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify                   func(ctx context.Context, opts verify.Options) verify.Result
-	Audit                    func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
-	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
-	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
-	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
-	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
-	Init                     func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade                  func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState        func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	SkillInstall             func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush                func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull                func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	StartDetachedDispatch    func(ctx context.Context, args []string, logPath string) (int, error)
-	KillProcessTree          func(pid int) error
+	NewGitHubReader           func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter            func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter          func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter          func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive              func(pid int) bool
+	Now                       func() time.Time
+	IsTerminal                func(w io.Writer) bool
+	Stdin                     io.Reader
+	BuildInfo                 BuildInfo
+	ComputeReadySet           func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                      func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                  func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                   func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                  func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview                func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                   func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                   func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                    func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                     func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                    func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory         func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh  func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus       func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	Init                      func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                   func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState         func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall              func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                 func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                 func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire              func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease              func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch     func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree           func(pid int) error
+	ProcessAuthority          func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority    func(pid int, authority string) error
+	DetachedSupervisorCadence time.Duration
 }
 
 var commands = []Command{
@@ -262,8 +265,10 @@ func DefaultDeps() Deps {
 		LeaseRelease: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
-		StartDetachedDispatch: startDetachedDispatchProcess,
-		KillProcessTree:       process.KillTree,
+		StartDetachedDispatch:  startDetachedDispatchProcess,
+		KillProcessTree:        process.KillTree,
+		ProcessAuthority:       process.Authority,
+		VerifyProcessAuthority: process.VerifyAuthority,
 	}
 }
 
@@ -5343,6 +5348,9 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var strictAlias bool
 	var detached bool
 	var detachedAlias bool
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
 	format := "text"
 	var formatAlias string
 
@@ -5372,6 +5380,9 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&detached, "detached", false, "reconcile a detached run supervisor by run id")
 	fs.BoolVar(&detachedAlias, "Detached", false, "reconcile a detached run supervisor by run id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
@@ -5472,7 +5483,7 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "recover: %v\n", err)
 			return 2
 		}
-		return runDetachedRecover(resolvedRepo, opts.RunID, format, stdout, stderr, deps)
+		return runDetachedRecover(resolvedRepo, opts.RunID, format, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, supervisorLease, stdout, stderr, deps)
 	}
 	if opts.IssueNumber <= 0 {
 		fmt.Fprintln(stderr, "recover: --issue-number is required")
@@ -5937,6 +5948,9 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var cursor string
 	var correlationID string
 	var taskID string
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
 	var limit int
 	var pollInterval time.Duration
 	var followFor time.Duration
@@ -5955,6 +5969,9 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&cursor, "cursor", "", "opaque progress receipt cursor")
 	fs.StringVar(&correlationID, "correlation", "", "progress receipt correlation id")
 	fs.StringVar(&taskID, "task", "", "progress receipt task id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
 	fs.IntVar(&limit, "limit", 500, "maximum progress receipts per read")
 	fs.DurationVar(&pollInterval, "poll", progress.DefaultFollowPollInterval, "follow poll interval")
 	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
@@ -6002,6 +6019,8 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 			Cursor:        progress.Cursor(cursor),
 			CorrelationID: correlationID,
 			TaskID:        taskID,
+			Fence:         detachedrun.Fence{RunID: runID, Owner: supervisorOwner, Generation: supervisorGeneration},
+			ExpectedLease: supervisorLease,
 			Limit:         limit,
 			PollInterval:  pollInterval,
 			FollowFor:     followFor,
@@ -6043,6 +6062,8 @@ type statusProgressOptions struct {
 	Cursor        progress.Cursor
 	CorrelationID string
 	TaskID        string
+	Fence         detachedrun.Fence
+	ExpectedLease string
 	Limit         int
 	PollInterval  time.Duration
 	FollowFor     time.Duration
@@ -6078,6 +6099,10 @@ func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Wri
 		return 1
 	}
 	defer store.Close()
+	if err := validateDetachedStatusFence(ctx, store, runID, opts.Fence, opts.ExpectedLease); err != nil {
+		fmt.Fprintf(stderr, "status: %v\n", err)
+		return 1
+	}
 
 	filter := progress.ReadFilter{
 		ProjectID:     roots.ProjectID,

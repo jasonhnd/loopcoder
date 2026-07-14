@@ -2,6 +2,7 @@ package detachedrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -231,7 +232,7 @@ func TestReconcileCrashWindows(t *testing.T) {
 		{
 			name: "provider exposure without receipt needs human",
 			mutate: func(store storage.Store, r Record) {
-				_, err := MarkProviderExposed(ctx, store, r.Fence(), "", now.Add(time.Second))
+				_, err := MarkProviderExposed(ctx, store, r.Fence(), "receipt-provider", now.Add(time.Second))
 				if err != nil {
 					t.Fatalf("MarkProviderExposed: %v", err)
 				}
@@ -265,6 +266,46 @@ func TestReconcileCrashWindows(t *testing.T) {
 				t.Fatalf("Reconcile = %#v, want action=%s human=%v recover=%v execute=false", got, tt.wantAction, tt.wantHuman, tt.wantRecover)
 			}
 		})
+	}
+}
+
+func TestValidateCurrentFenceAndRedactedJSON(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 3, 30, 0, 0, time.UTC)
+	store := newDetachedStore(t, now)
+	record, err := Claim(ctx, store, ClaimRequest{
+		ProjectID:      "proj_detached",
+		RunID:          "run-fence-redact",
+		Owner:          "supervisor-a",
+		LeaseExpiresAt: now.Add(time.Hour),
+		Payload: map[string]any{
+			"issue_title":     "Redact JSON",
+			"issue_body_path": "/tmp/private/issue-body.txt",
+			"api_token":       "secret-canary",
+		},
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := ValidateCurrentFence(ctx, store, record.Fence(), record.LeaseExpiresAt); err != nil {
+		t.Fatalf("ValidateCurrentFence current: %v", err)
+	}
+	if _, err := ValidateCurrentFence(ctx, store, Fence{RunID: record.RunID, Owner: record.Owner, Generation: record.Generation + 1}, record.LeaseExpiresAt); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("ValidateCurrentFence stale = %v, want ErrStaleClaim", err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal record: %v", err)
+	}
+	text := string(data)
+	for _, leaked := range []string{"/tmp/private/issue-body.txt", "secret-canary"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("record JSON leaked %q: %s", leaked, text)
+		}
+	}
+	if !strings.Contains(text, "Redact JSON") {
+		t.Fatalf("record JSON lost safe payload field: %s", text)
 	}
 }
 

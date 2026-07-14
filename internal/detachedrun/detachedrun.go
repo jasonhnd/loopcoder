@@ -163,6 +163,13 @@ type StatusResult struct {
 	Reason       string `json:"reason,omitempty"`
 }
 
+func (r Record) MarshalJSON() ([]byte, error) {
+	type recordJSON Record
+	out := recordJSON(r)
+	out.Payload = redactedPayload(r.Payload)
+	return json.Marshal(out)
+}
+
 type TransitionRequest struct {
 	Fence             Fence
 	Phase             string
@@ -364,6 +371,35 @@ func Reconcile(ctx context.Context, store storage.Store, runID string, now time.
 	return result, nil
 }
 
+func ValidateCurrentFence(ctx context.Context, store storage.Store, fence Fence, expectedLeaseExpiresAt string) (Record, error) {
+	if store == nil {
+		return Record{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	if err := validateFence(fence); err != nil {
+		return Record{}, err
+	}
+	expectedLeaseExpiresAt = strings.TrimSpace(expectedLeaseExpiresAt)
+	if expectedLeaseExpiresAt == "" {
+		return Record{}, typed(ErrInvalidRecordCode, "expected lease is required")
+	}
+	var out Record
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		record, ok, err := loadTx(ctx, tx, fence.RunID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		if record.Owner != fence.Owner || record.Generation != fence.Generation || record.LeaseExpiresAt != expectedLeaseExpiresAt {
+			return typed(ErrStaleClaimCode, "detached supervisor fence for %s no longer matches", fence.RunID)
+		}
+		out = record
+		return nil
+	})
+	return out, err
+}
+
 func MarkSpawned(ctx context.Context, store storage.Store, fence Fence, pid int, authority string, now time.Time) (Record, error) {
 	return Transition(ctx, store, TransitionRequest{
 		Fence:            fence,
@@ -387,6 +423,9 @@ func MarkWorkerStarted(ctx context.Context, store storage.Store, fence Fence, no
 }
 
 func MarkProviderExposed(ctx context.Context, store storage.Store, fence Fence, receiptID string, now time.Time) (Record, error) {
+	if strings.TrimSpace(receiptID) == "" {
+		return Record{}, typed(ErrInvalidRecordCode, "provider exposure requires durable receipt evidence")
+	}
 	return Transition(ctx, store, TransitionRequest{
 		Fence:           fence,
 		Phase:           PhaseProviderOpen,
@@ -962,4 +1001,31 @@ func redactBound(value string, limit int) string {
 	value = absolutePathPattern.ReplaceAllString(value, "[redacted-path]")
 	value = secretPattern.ReplaceAllString(value, `$1$2[redacted-secret]`)
 	return bound(value, limit)
+}
+
+func redactedPayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	out := make(map[string]any, len(payload))
+	for key, value := range payload {
+		cleanKey := strings.ToLower(strings.TrimSpace(key))
+		switch {
+		case strings.Contains(cleanKey, "path"),
+			strings.Contains(cleanKey, "root"),
+			strings.Contains(cleanKey, "credential"),
+			strings.Contains(cleanKey, "token"),
+			strings.Contains(cleanKey, "secret"),
+			strings.Contains(cleanKey, "password"),
+			strings.Contains(cleanKey, "authorization"):
+			out[key] = "[redacted]"
+		default:
+			if s, ok := value.(string); ok {
+				out[key] = redactBound(s, 500)
+			} else {
+				out[key] = value
+			}
+		}
+	}
+	return out
 }
