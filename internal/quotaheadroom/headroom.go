@@ -4,8 +4,10 @@
 // The estimator is provider-neutral and deterministic. Quantiles use the
 // nearest-rank rule over sorted integer samples: rank=ceil(q*n), clamped to
 // [1,n]. With one sample, P50 and P95 are the same observed value and the
-// result is marked sparse; with no samples, consumption stays unknown. The
-// estimator never upgrades local usage history to provider truth.
+// result is marked sparse; sparse history is not feasible unless the caller
+// explicitly lowers the minimum-history policy. With no samples, consumption
+// stays unknown. The estimator never upgrades local usage history to provider
+// truth.
 package quotaheadroom
 
 import (
@@ -32,6 +34,7 @@ const (
 	defaultMaxSnapshots      = 500
 	defaultMaxGroups         = 256
 	defaultMaxDiagnostics    = 128
+	defaultMinHistorySamples = 3
 )
 
 type Dimension struct {
@@ -56,6 +59,7 @@ type Policy struct {
 	MaxSnapshots                   int   `json:"max_snapshots,omitempty"`
 	MaxGroups                      int   `json:"max_groups,omitempty"`
 	MaxDiagnostics                 int   `json:"max_diagnostics,omitempty"`
+	MinHistorySamples              int   `json:"min_history_samples,omitempty"`
 	AllowPaidOverage               bool  `json:"allow_paid_overage,omitempty"`
 }
 
@@ -160,7 +164,7 @@ func Estimate(req Request) Result {
 	estimate := estimateConsumption(req.UsageRecords, target, policy, now)
 	result.Estimate = estimate
 	result.GapReasons = append(result.GapReasons, estimate.GapReasons...)
-	if estimate.SampleCount == 0 || estimate.P95Value <= 0 {
+	if !estimateSufficient(estimate, policy) {
 		result.TerminalErrorCode = "ErrQuotaConfidenceInsufficient"
 	}
 
@@ -180,7 +184,7 @@ func Estimate(req Request) Result {
 		result.RequiredBurnMultiplierBasisPoints = selected.RequiredBurnMultiplierBasisPoints
 		result.CompletionReserveValue = selected.CompletionReserveValue
 		result.IndependentVerificationReserveValue = selected.VerificationReserveValue
-		result.Feasible = selected.Eligible && estimate.P95Value > 0 && selected.TaskEquivalentHeadroom > 0
+		result.Feasible = selected.Eligible && estimateSufficient(estimate, policy) && selected.TaskEquivalentHeadroom > 0
 	}
 	if len(windows) == 0 {
 		result.GapReasons = append(result.GapReasons, "missing-quota")
@@ -233,6 +237,14 @@ func estimateConsumption(records []usageledger.UsageRecord, target Dimension, po
 			gaps = append(gaps, "clock-skew-history-future")
 			continue
 		}
+		if historyConflict(record.GapReasons) {
+			gaps = append(gaps, "conflicting-history")
+			continue
+		}
+		if record.Confidence != providerinventory.ConfidenceExact && record.Confidence != providerinventory.ConfidenceEstimated {
+			gaps = append(gaps, "history-confidence-insufficient")
+			continue
+		}
 		if record.Value <= 0 {
 			gaps = append(gaps, "non-positive-history-sample")
 			continue
@@ -277,6 +289,13 @@ func estimateConsumption(records []usageledger.UsageRecord, target Dimension, po
 	if len(values) < 3 {
 		out.GapReasons = append(out.GapReasons, "sparse-history")
 	}
+	if len(values) < policy.MinHistorySamples {
+		out.Confidence = providerinventory.ConfidenceUnknown
+		out.GapReasons = append(out.GapReasons, "insufficient-history-samples")
+	}
+	if containsString(out.GapReasons, "conflicting-history") || containsString(out.GapReasons, "history-confidence-insufficient") {
+		out.Confidence = providerinventory.ConfidenceUnknown
+	}
 	if policy.HistoryFreshAfterMS > 0 && freshest.Add(time.Duration(policy.HistoryFreshAfterMS)*time.Millisecond).Before(now) {
 		out.FreshnessState = providerinventory.FreshnessStale
 		out.Confidence = providerinventory.ConfidenceStale
@@ -305,7 +324,7 @@ func evaluateWindows(snapshots []providerinventory.QuotaSnapshot, target Dimensi
 		out = append(out, evaluation)
 		gaps = append(gaps, evaluation.GapReasons...)
 		if !evaluation.Eligible && terminal == "" {
-			terminal = "ErrQuotaConfidenceInsufficient"
+			terminal = windowTerminalCode(evaluation)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -353,7 +372,19 @@ func evaluateWindow(snapshot providerinventory.QuotaSnapshot, policy Policy, est
 	if snapshot.Confidence != providerinventory.ConfidenceExact && snapshot.Confidence != providerinventory.ConfidenceEstimated {
 		block("quota-confidence-insufficient")
 	}
-	if snapshot.FreshnessState == providerinventory.FreshnessStale || snapshot.FreshnessState == providerinventory.FreshnessExpired {
+	switch snapshot.FreshnessState {
+	case providerinventory.FreshnessFresh:
+	case providerinventory.FreshnessStale:
+		block("stale-quota")
+	case providerinventory.FreshnessExpired:
+		block("expired-quota")
+	default:
+		block("quota-freshness-insufficient")
+	}
+	if validUntil, ok := parseOptionalTime(snapshot.ValidUntil); ok && !validUntil.After(now) {
+		block("expired-quota")
+	}
+	if staleAfter, ok := parseOptionalTime(snapshot.StaleAfter); ok && !staleAfter.After(now) {
 		block("stale-quota")
 	}
 	if containsString(snapshot.GapReasons, "paid-overage") && !policy.AllowPaidOverage {
@@ -374,17 +405,20 @@ func evaluateWindow(snapshot providerinventory.QuotaSnapshot, policy Policy, est
 		e.ResetState = "malformed"
 		block("malformed-reset-at")
 	}
-	remaining, ok := available(snapshot)
-	if !ok {
+	remaining, hasAvailable := available(snapshot)
+	if !hasAvailable {
 		block("missing-quota")
 	} else {
 		e.AvailableValue = remaining
 	}
-	if e.AvailableValue < 0 {
+	if hasAvailable && e.AvailableValue <= 0 {
 		block("quota-exhausted")
 	}
 	if estimate.P95Value <= 0 {
 		block("missing-history")
+	}
+	if !estimateSufficient(estimate, policy) {
+		block("history-confidence-insufficient")
 	}
 	if e.AvailableValue > 0 && estimate.P95Value > 0 {
 		completionReserve, ok := percentCeil(e.AvailableValue, policy.CompletionReserveBasisPoints)
@@ -419,7 +453,7 @@ func evaluateWindow(snapshot providerinventory.QuotaSnapshot, policy Policy, est
 		e.RequiredBurnMultiplierBasisPoints = multiplierBP(e.AvailableValue, estimate.P95Value)
 	}
 	if e.TaskEquivalentHeadroom <= 0 {
-		e.GapReasons = append(e.GapReasons, "insufficient-task-equivalent-headroom")
+		block("insufficient-task-equivalent-headroom")
 	}
 	e.BlockedReasons = limitStrings(dedupeStrings(e.BlockedReasons), policy.MaxDiagnostics)
 	e.GapReasons = limitStrings(dedupeStrings(e.GapReasons), policy.MaxDiagnostics)
@@ -453,19 +487,102 @@ func available(snapshot providerinventory.QuotaSnapshot) (int64, bool) {
 func mostConstraining(windows []WindowEvaluation) *WindowEvaluation {
 	var best *WindowEvaluation
 	for i := range windows {
-		w := windows[i]
-		if !w.Eligible {
-			if best == nil {
-				best = &windows[i]
-			}
-			continue
-		}
-		if best == nil || !best.Eligible || w.TaskEquivalentHeadroom < best.TaskEquivalentHeadroom ||
-			(w.TaskEquivalentHeadroom == best.TaskEquivalentHeadroom && windowSortKey(w) < windowSortKey(*best)) {
+		if best == nil || windowMoreConstraining(windows[i], *best) {
 			best = &windows[i]
 		}
 	}
 	return best
+}
+
+func windowMoreConstraining(candidate, best WindowEvaluation) bool {
+	candidateClass := constraintClass(candidate)
+	bestClass := constraintClass(best)
+	if candidateClass != bestClass {
+		return candidateClass < bestClass
+	}
+	if !candidate.Eligible {
+		candidateRank := blockerRank(candidate)
+		bestRank := blockerRank(best)
+		if candidateRank != bestRank {
+			return candidateRank < bestRank
+		}
+	}
+	if candidate.TaskEquivalentHeadroom != best.TaskEquivalentHeadroom {
+		return candidate.TaskEquivalentHeadroom < best.TaskEquivalentHeadroom
+	}
+	if candidate.AvailableValue != best.AvailableValue {
+		return candidate.AvailableValue < best.AvailableValue
+	}
+	return windowSortKey(candidate) < windowSortKey(best)
+}
+
+func constraintClass(window WindowEvaluation) int {
+	if !window.Eligible && gatesFeasibility(window) {
+		return 0
+	}
+	if window.Eligible {
+		return 1
+	}
+	return 2
+}
+
+func gatesFeasibility(window WindowEvaluation) bool {
+	if len(window.BlockedReasons) == 0 {
+		return !window.Eligible
+	}
+	for _, reason := range window.BlockedReasons {
+		if reason != "already-reset" {
+			return true
+		}
+	}
+	return false
+}
+
+func windowTerminalCode(window WindowEvaluation) string {
+	for _, reason := range window.BlockedReasons {
+		switch reason {
+		case "conflicting-quota-snapshots", "quota-confidence-insufficient", "stale-quota", "expired-quota", "quota-freshness-insufficient", "missing-quota", "malformed-reset-at", "missing-history", "history-confidence-insufficient":
+			return "ErrQuotaConfidenceInsufficient"
+		case "arithmetic-overflow":
+			return "ErrHeadroomBoundExceeded"
+		}
+	}
+	return "ErrBudgetExhausted"
+}
+
+func blockerRank(window WindowEvaluation) int {
+	rank := 1000
+	for _, reason := range window.BlockedReasons {
+		if value := blockerReasonRank(reason); value < rank {
+			rank = value
+		}
+	}
+	return rank
+}
+
+func blockerReasonRank(reason string) int {
+	switch reason {
+	case "arithmetic-overflow":
+		return 10
+	case "conflicting-quota-snapshots":
+		return 20
+	case "quota-exhausted":
+		return 30
+	case "missing-quota":
+		return 40
+	case "quota-confidence-insufficient", "quota-freshness-insufficient", "expired-quota", "stale-quota":
+		return 50
+	case "already-reset", "malformed-reset-at":
+		return 60
+	case "paid-overage-disabled":
+		return 70
+	case "history-confidence-insufficient", "missing-history":
+		return 80
+	case "insufficient-task-equivalent-headroom":
+		return 90
+	default:
+		return 900
+	}
 }
 
 func normalizePolicy(policy Policy) (Policy, []string) {
@@ -488,11 +605,14 @@ func normalizePolicy(policy Policy) (Policy, []string) {
 	if policy.MaxDiagnostics == 0 {
 		policy.MaxDiagnostics = defaultMaxDiagnostics
 	}
+	if policy.MinHistorySamples == 0 {
+		policy.MinHistorySamples = defaultMinHistorySamples
+	}
 	if policy.CompletionReserveBasisPoints < 0 || policy.CompletionReserveBasisPoints > 10000 ||
 		policy.VerificationReserveBasisPoints < 0 || policy.VerificationReserveBasisPoints > 10000 {
 		gaps = append(gaps, "invalid-reserve-policy")
 	}
-	if policy.MaxHistoryRecords < 0 || policy.MaxSnapshots < 0 || policy.MaxGroups < 0 || policy.MaxDiagnostics < 0 || policy.HistoryFreshAfterMS < 0 {
+	if policy.MaxHistoryRecords < 0 || policy.MaxSnapshots < 0 || policy.MaxGroups < 0 || policy.MaxDiagnostics < 0 || policy.HistoryFreshAfterMS < 0 || policy.MinHistorySamples < 1 {
 		gaps = append(gaps, "invalid-bound-policy")
 	}
 	return policy, gaps
@@ -700,6 +820,35 @@ func cloneInt64(value *int64) *int64 {
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func estimateSufficient(estimate ConsumptionEstimate, policy Policy) bool {
+	if policy.MinHistorySamples < 1 {
+		return false
+	}
+	if estimate.P95Value <= 0 || estimate.SampleCount < policy.MinHistorySamples {
+		return false
+	}
+	if estimate.FreshnessState != providerinventory.FreshnessFresh {
+		return false
+	}
+	if estimate.Confidence != providerinventory.ConfidenceExact && estimate.Confidence != providerinventory.ConfidenceEstimated {
+		return false
+	}
+	if containsString(estimate.GapReasons, "conflicting-history") || containsString(estimate.GapReasons, "history-confidence-insufficient") {
+		return false
+	}
+	return true
+}
+
+func historyConflict(gaps []string) bool {
+	for _, gap := range gaps {
+		normalized := strings.ToLower(strings.TrimSpace(gap))
+		if strings.Contains(normalized, "conflict") {
 			return true
 		}
 	}
