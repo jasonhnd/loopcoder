@@ -188,6 +188,57 @@ func TestEstimateSparseHistoryRequiresExplicitPolicy(t *testing.T) {
 	}
 }
 
+func TestEstimateInvalidPolicyFieldsFailClosedAndStable(t *testing.T) {
+	now := fixedNow()
+	target := targetDimension()
+	records := validHistory(target, now)
+	snapshots := []providerinventory.QuotaSnapshot{
+		snapshot("qsnap_quota", target, providerinventory.WindowRolling, 5000, now.Add(time.Hour), nil, nil),
+	}
+	tooFresh := int64(math.MaxInt64/int64(time.Millisecond) + 1)
+	cases := []struct {
+		name     string
+		policy   Policy
+		wantGaps []string
+	}{
+		{name: "negative-completion-reserve", policy: Policy{CompletionReserveBasisPoints: -1}, wantGaps: []string{"invalid-reserve-policy"}},
+		{name: "overflow-completion-reserve", policy: Policy{CompletionReserveBasisPoints: 10001}, wantGaps: []string{"invalid-reserve-policy"}},
+		{name: "negative-verification-reserve", policy: Policy{VerificationReserveBasisPoints: -1}, wantGaps: []string{"invalid-reserve-policy"}},
+		{name: "overflow-verification-reserve", policy: Policy{VerificationReserveBasisPoints: 10001}, wantGaps: []string{"invalid-reserve-policy"}},
+		{name: "negative-history-freshness", policy: Policy{HistoryFreshAfterMS: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "overflow-history-freshness", policy: Policy{HistoryFreshAfterMS: tooFresh}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "negative-history-limit", policy: Policy{MaxHistoryRecords: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "negative-snapshot-limit", policy: Policy{MaxSnapshots: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "negative-group-limit", policy: Policy{MaxGroups: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "negative-diagnostics-limit", policy: Policy{MaxDiagnostics: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "negative-min-samples", policy: Policy{MinHistorySamples: -1}, wantGaps: []string{"invalid-bound-policy"}},
+		{name: "min-samples-exceeds-history-limit", policy: Policy{MaxHistoryRecords: 2, MinHistorySamples: 3}, wantGaps: []string{"invalid-bound-policy"}},
+		{
+			name:     "combined-invalid-reserve-and-bound",
+			policy:   Policy{CompletionReserveBasisPoints: -1, HistoryFreshAfterMS: -1, MaxSnapshots: -1},
+			wantGaps: []string{"invalid-reserve-policy", "invalid-bound-policy"},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Estimate(Request{Now: now, Target: target, Policy: tt.policy, Snapshots: snapshots, UsageRecords: records})
+			if got.Feasible || got.TerminalErrorCode != "ErrHeadroomBoundExceeded" {
+				t.Fatalf("result = %#v, want fail-closed ErrHeadroomBoundExceeded", got)
+			}
+			for _, gap := range tt.wantGaps {
+				if !contains(got.GapReasons, gap) {
+					t.Fatalf("gaps = %#v, want %q", got.GapReasons, gap)
+				}
+			}
+			reversedRecords := append([]usageledger.UsageRecord(nil), records...)
+			slices.Reverse(reversedRecords)
+			replayed := Estimate(Request{Now: now, Target: target, Policy: tt.policy, Snapshots: snapshots, UsageRecords: reversedRecords})
+			assertStableResultBytes(t, got, replayed)
+		})
+	}
+}
+
 func TestEstimateQuotaFreshnessAndConfidenceGateFeasibility(t *testing.T) {
 	now := fixedNow()
 	target := targetDimension()
@@ -312,6 +363,139 @@ func TestEstimateWindowPermutationDoesNotChangeBlockerOrResultBytes(t *testing.T
 		if string(firstBytes) != string(data) {
 			t.Fatalf("order %v changed result bytes\nfirst=%s\nthis=%s", order, firstBytes, data)
 		}
+	}
+}
+
+func TestEstimateAlreadyResetHistoricalWindowDoesNotSetTerminal(t *testing.T) {
+	now := fixedNow()
+	target := targetDimension()
+	records := validHistory(target, now)
+	current := snapshot("qsnap_current", target, providerinventory.WindowRolling, 5000, now.Add(2*time.Hour), nil, nil)
+	historical := snapshot("qsnap_historical", target, providerinventory.WindowFixedHour, 0, now.Add(-time.Hour), nil, nil)
+	historical.FreshnessState = providerinventory.FreshnessStale
+	historical.ConflictSet = []string{"qsnap_old_conflict"}
+	windows := []providerinventory.QuotaSnapshot{current, historical}
+	permutations := [][]int{{0, 1}, {1, 0}}
+
+	var first Result
+	for i, order := range permutations {
+		ordered := []providerinventory.QuotaSnapshot{windows[order[0]], windows[order[1]]}
+		got := Estimate(Request{Now: now, Target: target, Snapshots: ordered, UsageRecords: records})
+		if !got.Feasible || got.TerminalErrorCode != "" {
+			t.Fatalf("order %v result = %#v, want feasible with empty terminal", order, got)
+		}
+		if got.MostConstrainingWindow == nil || got.MostConstrainingWindow.QuotaSnapshotID != "qsnap_current" {
+			t.Fatalf("order %v most constraining = %#v, want current window", order, got.MostConstrainingWindow)
+		}
+		var sawHistorical bool
+		for _, window := range got.Windows {
+			if window.QuotaSnapshotID == "qsnap_historical" {
+				sawHistorical = window.ResetState == "already-reset" && contains(window.BlockedReasons, "already-reset")
+			}
+		}
+		if !sawHistorical {
+			t.Fatalf("order %v windows = %#v, want already-reset evidence retained", order, got.Windows)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		assertStableResultBytes(t, first, got)
+	}
+}
+
+func TestEstimateOnlyObsoleteMalformedOrUnknownWindowsFailAsEvidenceGap(t *testing.T) {
+	now := fixedNow()
+	target := targetDimension()
+	records := validHistory(target, now)
+	malformedReset := "not-a-time"
+	obsolete := snapshot("qsnap_obsolete", target, providerinventory.WindowFixedHour, 5000, now.Add(-time.Hour), nil, nil)
+	malformed := snapshot("qsnap_malformed", target, providerinventory.WindowFixedHour, 5000, now.Add(time.Hour), nil, &malformedReset)
+	unknown := snapshot("qsnap_unknown", target, providerinventory.WindowUnknown, 5000, now.Add(time.Hour), nil, nil)
+	unknown.ResetSemantics = providerinventory.ResetUnknown
+
+	cases := []struct {
+		name       string
+		snapshots  []providerinventory.QuotaSnapshot
+		wantReason string
+	}{
+		{name: "obsolete-only", snapshots: []providerinventory.QuotaSnapshot{obsolete}, wantReason: "already-reset"},
+		{name: "malformed-only", snapshots: []providerinventory.QuotaSnapshot{malformed}, wantReason: "malformed-reset-at"},
+		{name: "unknown-only", snapshots: []providerinventory.QuotaSnapshot{unknown}, wantReason: "unknown-reset"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Estimate(Request{Now: now, Target: target, Snapshots: tt.snapshots, UsageRecords: records})
+			if got.Feasible || got.TerminalErrorCode != "ErrQuotaConfidenceInsufficient" {
+				t.Fatalf("result = %#v, want non-feasible evidence gap", got)
+			}
+			if got.MostConstrainingWindow == nil || !contains(got.MostConstrainingWindow.BlockedReasons, tt.wantReason) {
+				t.Fatalf("most constraining = %#v, want reason %q", got.MostConstrainingWindow, tt.wantReason)
+			}
+		})
+	}
+
+	windows := []providerinventory.QuotaSnapshot{obsolete, malformed, unknown}
+	permutations := [][]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+	var first Result
+	for i, order := range permutations {
+		ordered := []providerinventory.QuotaSnapshot{windows[order[0]], windows[order[1]], windows[order[2]]}
+		got := Estimate(Request{Now: now, Target: target, Snapshots: ordered, UsageRecords: records})
+		if got.Feasible || got.TerminalErrorCode != "ErrQuotaConfidenceInsufficient" {
+			t.Fatalf("order %v result = %#v, want non-feasible evidence gap", order, got)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		assertStableResultBytes(t, first, got)
+	}
+}
+
+func TestEstimateMultipleBlockerTerminalTracksSelectedWindowStable(t *testing.T) {
+	now := fixedNow()
+	target := targetDimension()
+	records := validHistory(target, now)
+	stale := snapshot("qsnap_stale", target, providerinventory.WindowRolling, 5000, now.Add(2*time.Hour), nil, nil)
+	stale.FreshnessState = providerinventory.FreshnessStale
+	conflicting := snapshot("qsnap_conflicting", target, providerinventory.WindowFixedDay, 5000, now.Add(24*time.Hour), nil, nil)
+	conflicting.ConflictSet = []string{"qsnap_other"}
+	exhausted := snapshot("qsnap_exhausted", target, providerinventory.WindowFixedWeek, 0, now.Add(7*24*time.Hour), nil, nil)
+	windows := []providerinventory.QuotaSnapshot{stale, conflicting, exhausted}
+	permutations := [][]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+
+	var first Result
+	for i, order := range permutations {
+		ordered := []providerinventory.QuotaSnapshot{windows[order[0]], windows[order[1]], windows[order[2]]}
+		got := Estimate(Request{Now: now, Target: target, Snapshots: ordered, UsageRecords: records})
+		if got.Feasible || got.TerminalErrorCode != "ErrQuotaConfidenceInsufficient" {
+			t.Fatalf("order %v result = %#v, want selected conflict evidence terminal", order, got)
+		}
+		if got.MostConstrainingWindow == nil || got.MostConstrainingWindow.QuotaSnapshotID != "qsnap_conflicting" {
+			t.Fatalf("order %v most constraining = %#v, want conflicting quota", order, got.MostConstrainingWindow)
+		}
+		if !contains(got.MostConstrainingWindow.BlockedReasons, "conflicting-quota-snapshots") {
+			t.Fatalf("order %v selected reasons = %#v, want conflicting-quota-snapshots", order, got.MostConstrainingWindow.BlockedReasons)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		assertStableResultBytes(t, first, got)
 	}
 }
 
@@ -459,6 +643,14 @@ func metaFixture() meta {
 	return meta{Role: "worker", TaskClass: "code", Effort: "high", ContextBand: "medium"}
 }
 
+func validHistory(target Dimension, now time.Time) []usageledger.UsageRecord {
+	return []usageledger.UsageRecord{
+		history("usage_a", target, 1000, now.Add(-4*time.Hour), metaFixture()),
+		history("usage_b", target, 1000, now.Add(-3*time.Hour), metaFixture()),
+		history("usage_c", target, 1000, now.Add(-2*time.Hour), metaFixture()),
+	}
+}
+
 func history(id string, target Dimension, value int64, at time.Time, m meta) usageledger.UsageRecord {
 	return historyForTask(id, target, value, at, id+"-task", m)
 }
@@ -538,4 +730,19 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertStableResultBytes(t *testing.T, first, second Result) {
+	t.Helper()
+	firstBytes, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBytes, err := json.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstBytes) != string(secondBytes) {
+		t.Fatalf("result bytes changed\nfirst=%s\nsecond=%s", firstBytes, secondBytes)
+	}
 }
