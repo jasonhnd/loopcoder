@@ -371,16 +371,12 @@ func Reconcile(ctx context.Context, store storage.Store, runID string, now time.
 	return result, nil
 }
 
-func ValidateCurrentFence(ctx context.Context, store storage.Store, fence Fence, expectedLeaseExpiresAt string) (Record, error) {
+func ValidateCurrentFence(ctx context.Context, store storage.Store, fence Fence, _ string) (Record, error) {
 	if store == nil {
 		return Record{}, typed(ErrInvalidRecordCode, "store is required")
 	}
 	if err := validateFence(fence); err != nil {
 		return Record{}, err
-	}
-	expectedLeaseExpiresAt = strings.TrimSpace(expectedLeaseExpiresAt)
-	if expectedLeaseExpiresAt == "" {
-		return Record{}, typed(ErrInvalidRecordCode, "expected lease is required")
 	}
 	var out Record
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
@@ -391,7 +387,7 @@ func ValidateCurrentFence(ctx context.Context, store storage.Store, fence Fence,
 		if !ok {
 			return sql.ErrNoRows
 		}
-		if record.Owner != fence.Owner || record.Generation != fence.Generation || record.LeaseExpiresAt != expectedLeaseExpiresAt {
+		if record.Owner != fence.Owner || record.Generation != fence.Generation {
 			return typed(ErrStaleClaimCode, "detached supervisor fence for %s no longer matches", fence.RunID)
 		}
 		out = record
@@ -486,7 +482,7 @@ func RequestCancelFenced(ctx context.Context, store storage.Store, fence Fence, 
 			out = record
 			return nil
 		}
-		if record.Owner != fence.Owner || record.Generation != fence.Generation || record.LeaseExpiresAt != strings.TrimSpace(expectedLeaseExpiresAt) {
+		if record.Owner != fence.Owner || record.Generation != fence.Generation {
 			return typed(ErrStaleClaimCode, "cancel fence for %s no longer matches", fence.RunID)
 		}
 		res, err := tx.Exec(ctx, `UPDATE detached_run_supervisors

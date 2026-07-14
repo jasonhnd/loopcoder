@@ -291,6 +291,16 @@ func TestValidateCurrentFenceAndRedactedJSON(t *testing.T) {
 	if _, err := ValidateCurrentFence(ctx, store, record.Fence(), record.LeaseExpiresAt); err != nil {
 		t.Fatalf("ValidateCurrentFence current: %v", err)
 	}
+	renewed, err := RenewLease(ctx, store, record.Fence(), now.Add(2*time.Hour), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+	if renewed.LeaseExpiresAt == record.LeaseExpiresAt {
+		t.Fatalf("RenewLease did not change lease: before=%s after=%s", record.LeaseExpiresAt, renewed.LeaseExpiresAt)
+	}
+	if _, err := ValidateCurrentFence(ctx, store, record.Fence(), record.LeaseExpiresAt); err != nil {
+		t.Fatalf("ValidateCurrentFence with original launch lease after renewal: %v", err)
+	}
 	if _, err := ValidateCurrentFence(ctx, store, Fence{RunID: record.RunID, Owner: record.Owner, Generation: record.Generation + 1}, record.LeaseExpiresAt); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("ValidateCurrentFence stale = %v, want ErrStaleClaim", err)
 	}

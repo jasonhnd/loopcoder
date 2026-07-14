@@ -430,6 +430,15 @@ func runDetachedRecover(repoPath, runID, format string, fence detachedrun.Fence,
 				fmt.Fprintf(stderr, "recover: kill old process tree %d: %v\n", result.Record.ProcessPID, err)
 				return 2
 			}
+			alive := process.Alive
+			if deps.ProcessAlive != nil {
+				alive = deps.ProcessAlive
+			}
+			if alive(result.Record.ProcessPID) {
+				_, _ = detachedrun.Complete(ctx, store, result.Record.Fence(), detachedrun.StatusNeedsHuman, "", "recover-kill-unproven", "process remained observable after recovery kill signal", now)
+				fmt.Fprintf(stderr, "recover: process tree %d still appears alive after kill\n", result.Record.ProcessPID)
+				return 2
+			}
 		}
 		owner := detachedOwner(runID, now)
 		acquired, err := detachedrun.AcquireRecovery(ctx, store, detachedrun.RecoveryRequest{
@@ -573,7 +582,7 @@ func startDetachedSupervisorCadence(ctx context.Context, store storage.Store, op
 			case <-c.stopCh:
 				return
 			case <-ticker.C:
-				if err := detachedSupervisorCadenceTick(context.Background(), store, opts, fence, deps); err != nil {
+				if err := detachedSupervisorCadenceTick(ctx, store, opts, fence, deps); err != nil {
 					c.setErr(err)
 					if onError != nil {
 						onError()
@@ -631,8 +640,8 @@ func detachedSupervisorCadenceTick(ctx context.Context, store storage.Store, opt
 func detachedCommandFence(command, runID, owner string, generation int64, lease string, stderr io.Writer) (detachedrun.Fence, string, bool) {
 	fence := detachedrun.Fence{RunID: strings.TrimSpace(runID), Owner: strings.TrimSpace(owner), Generation: generation}
 	lease = strings.TrimSpace(lease)
-	if fence.Owner == "" || fence.Generation <= 0 || lease == "" {
-		fmt.Fprintf(stderr, "%s: --supervisor-owner, --supervisor-generation, and --supervisor-lease are required for detached run authority\n", command)
+	if fence.Owner == "" || fence.Generation <= 0 {
+		fmt.Fprintf(stderr, "%s: --supervisor-owner and --supervisor-generation are required for detached run authority\n", command)
 		return detachedrun.Fence{}, "", false
 	}
 	return fence, lease, true
@@ -649,8 +658,8 @@ func validateDetachedStatusFence(ctx context.Context, store storage.Store, runID
 	if strings.TrimSpace(record.RunID) == "" {
 		return nil
 	}
-	if strings.TrimSpace(fence.Owner) == "" && fence.Generation == 0 && strings.TrimSpace(expectedLease) == "" {
-		return fmt.Errorf("--supervisor-owner, --supervisor-generation, and --supervisor-lease are required for detached run authority")
+	if strings.TrimSpace(fence.Owner) == "" && fence.Generation == 0 {
+		return fmt.Errorf("--supervisor-owner and --supervisor-generation are required for detached run authority")
 	}
 	_, err = detachedrun.ValidateCurrentFence(ctx, store, detachedrun.Fence{RunID: runID, Owner: fence.Owner, Generation: fence.Generation}, expectedLease)
 	return err
@@ -671,12 +680,11 @@ func verifyDetachedProcessAuthority(record detachedrun.Record, deps Deps) error 
 }
 
 func detachedFenceCommand(prefix string, record detachedrun.Record) string {
-	return fmt.Sprintf("%s --run %s --supervisor-owner %s --supervisor-generation %d --supervisor-lease %s",
+	return fmt.Sprintf("%s --run %s --supervisor-owner %s --supervisor-generation %d",
 		prefix,
 		shellQuote(record.RunID),
 		shellQuote(record.Owner),
-		record.Generation,
-		shellQuote(record.LeaseExpiresAt))
+		record.Generation)
 }
 
 func detachedDispatchArgs(opts worker.Options, fence detachedrun.Fence, issueBodyFile string) []string {
