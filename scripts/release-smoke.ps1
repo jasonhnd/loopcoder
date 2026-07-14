@@ -107,6 +107,50 @@ function Expand-LoopcoderArchive([string]$Archive, [string]$Destination) {
     }
 }
 
+function Get-SHA256([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Fail "expected file does not exist: $Path"
+    }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Get-DarwinFileMode([string]$Path) {
+    $mode = (& stat -f "%Lp" $Path).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($mode)) {
+        Fail "failed to inspect file mode for $Path"
+    }
+    return $mode
+}
+
+function Assert-CandidateInstalledBinary([string]$BinaryPath, [string]$ExpectedHash, [string]$ExpectedVersion, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $BinaryPath)) {
+        Fail "$Label binary was not installed at $BinaryPath"
+    }
+    $actualHash = Get-SHA256 $BinaryPath
+    if ($actualHash -ne $ExpectedHash) {
+        Fail "$Label binary hash mismatch: expected staged candidate hash $ExpectedHash, got $actualHash"
+    }
+    $mode = Get-DarwinFileMode $BinaryPath
+    if ($mode -ne "755") {
+        Fail "$Label binary mode is $mode, want 755"
+    }
+
+    $versionOutput = @(& $BinaryPath version)
+    $versionOutput | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) {
+        Fail "$Label binary version command failed"
+    }
+    $versionLines = @($versionOutput | Where-Object { $_ -match '(^|\s)version=' })
+    if ($versionLines.Count -ne 1) {
+        Fail "$Label binary emitted $($versionLines.Count) version lines; want exactly one"
+    }
+    $versionLine = [string]$versionLines[0]
+    $versionPattern = "(^|\s)version=$([regex]::Escape($ExpectedVersion))(\s|$)"
+    if ($versionLine -notmatch $versionPattern -or $versionLine -match "(^|\s)(commit|date)=unknown(\s|$)") {
+        Fail "$Label binary did not report $ExpectedVersion with non-placeholder commit/date"
+    }
+}
+
 function Assert-AssetNameSet([string[]]$Names, [string[]]$Expected, [string]$Label) {
     $actual = @($Names | Sort-Object)
     $want = @($Expected | Sort-Object)
@@ -281,6 +325,25 @@ function Start-LocalReleaseApi([object]$Release) {
                         continue
                     }
 
+                    $downloadPrefix = "/$RepoName/releases/download/$TagName/"
+                    if ($path.StartsWith($downloadPrefix, [System.StringComparison]::Ordinal)) {
+                        $assetName = $path.Substring($downloadPrefix.Length)
+                        if ($Assets.ContainsKey($assetName) -and (Test-Path -LiteralPath $Assets[$assetName])) {
+                            $stream = [System.IO.File]::OpenRead($Assets[$assetName])
+                            try {
+                                $context.Response.StatusCode = 200
+                                $context.Response.ContentType = "application/octet-stream"
+                                $context.Response.ContentLength64 = $stream.Length
+                                $stream.CopyTo($context.Response.OutputStream)
+                                $context.Response.OutputStream.Close()
+                            }
+                            finally {
+                                $stream.Dispose()
+                            }
+                            continue
+                        }
+                    }
+
                     if ($path.StartsWith("/assets/", [System.StringComparison]::Ordinal)) {
                         $assetName = $path.Substring("/assets/".Length)
                         if ($Assets.ContainsKey($assetName) -and (Test-Path -LiteralPath $Assets[$assetName])) {
@@ -378,11 +441,170 @@ function Invoke-WithMockReleaseApi([object]$Server, [scriptblock]$Block) {
     }
 }
 
+function Invoke-WithEnvironment([hashtable]$Values, [scriptblock]$Block) {
+    $previous = @{}
+    foreach ($key in $Values.Keys) {
+        $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, [string]$Values[$key], "Process")
+    }
+    try {
+        & $Block
+    }
+    finally {
+        foreach ($key in $Values.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
+        }
+    }
+}
+
+function CandidateInstallEnvironment([object]$Server, [string]$InstallDir, [string]$InstallTmpDir, [string]$PathPrefix = "") {
+    $releaseIdentity = "$GitHubBaseUrl/$Repo/.github/workflows/release.yml@refs/tags/$tag"
+    $pathParts = @()
+    if (-not [string]::IsNullOrWhiteSpace($PathPrefix)) {
+        $pathParts += $PathPrefix
+    }
+    $pathParts += $InstallDir
+    $pathParts += [Environment]::GetEnvironmentVariable("PATH", "Process")
+    $pathValue = $pathParts -join ":"
+    $installHome = Join-Path (Split-Path -Parent $InstallTmpDir) "home"
+    return @{
+        "GITHUB_BASE_URL" = $Server.Url
+        "GITHUB_API_URL" = $Server.Url
+        "LOOPCODER_COSIGN_IDENTITY" = $releaseIdentity
+        "LOOPCODER_INSTALL_REPO" = $Repo
+        "LOOPCODER_UPGRADE_REPO" = $Repo
+        "LOOPCODER_INSTALL_DIR" = $InstallDir
+        "LOOPCODER_INSTALL_OS" = "darwin"
+        "LOOPCODER_INSTALL_ARCH" = "arm64"
+        "TMPDIR" = $InstallTmpDir
+        "HOME" = $installHome
+        "PATH" = $pathValue
+    }
+}
+
+function Invoke-CandidateInstall([object]$Server, [string]$InstallDir, [string]$InstallTmpDir, [string]$Label) {
+    $installScript = Join-Path $scriptRoot "install.sh"
+    if (-not (Test-Path -LiteralPath $installScript)) {
+        Fail "install.sh not found at $installScript"
+    }
+    New-Item -ItemType Directory -Path $InstallTmpDir -Force | Out-Null
+    $envValues = CandidateInstallEnvironment -Server $Server -InstallDir $InstallDir -InstallTmpDir $InstallTmpDir
+    Invoke-WithEnvironment -Values $envValues -Block {
+        & /bin/sh $installScript --version $plainVersion | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Fail "$Label install.sh failed with exit code $LASTEXITCODE"
+        }
+    }
+}
+
+function Invoke-InterruptedCandidateInstallSeam([object]$Server, [string]$ExpectedHash) {
+    $installScript = Join-Path $scriptRoot "install.sh"
+    $caseDir = Join-Path $tmp "interrupted-install"
+    $installDir = Join-Path $caseDir "bin"
+    $installTmp = Join-Path $caseDir "tmp"
+    $shimDir = Join-Path $caseDir "shim"
+    New-Item -ItemType Directory -Path $installDir, $installTmp, $shimDir -Force | Out-Null
+
+    $preexisting = Join-Path $installDir "loopcoder"
+    @(
+        '#!/bin/sh',
+        'if [ "${1:-}" = "version" ] || [ "${1:-}" = "--version" ]; then',
+        "  printf '%s\n' 'version=0.7.0 commit=preexisting date=2026-07-01T00:00:00Z'",
+        '  exit 0',
+        'fi',
+        "printf '%s\n' 'preexisting loopcoder still usable'"
+    ) | Set-Content -LiteralPath $preexisting -Encoding utf8
+    chmod 755 $preexisting
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to make pre-existing rollback fixture executable"
+    }
+    $preexistingHash = Get-SHA256 $preexisting
+
+    $mvReady = Join-Path $caseDir "mv.ready"
+    $mvPidFile = Join-Path $caseDir "mv.pid"
+    @(
+        '#!/bin/sh',
+        'set -eu',
+        'printf ''%s\n'' "$$" >"$LOOPCODER_SMOKE_MV_PID"',
+        'touch "$LOOPCODER_SMOKE_MV_READY"',
+        'while :; do',
+        '  sleep 1',
+        'done'
+    ) | Set-Content -LiteralPath (Join-Path $shimDir "mv") -Encoding utf8
+    chmod 755 (Join-Path $shimDir "mv")
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to make mv interruption shim executable"
+    }
+
+    $stdoutPath = Join-Path $caseDir "install.stdout"
+    $stderrPath = Join-Path $caseDir "install.stderr"
+    $envValues = CandidateInstallEnvironment -Server $Server -InstallDir $installDir -InstallTmpDir $installTmp -PathPrefix $shimDir
+    $envValues["LOOPCODER_SMOKE_MV_READY"] = $mvReady
+    $envValues["LOOPCODER_SMOKE_MV_PID"] = $mvPidFile
+
+    Invoke-WithEnvironment -Values $envValues -Block {
+        $process = Start-Process -FilePath "/bin/sh" -ArgumentList @($installScript, "--version", $plainVersion) -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (-not (Test-Path -LiteralPath $mvReady) -and [DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) {
+                $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
+                $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
+                Fail "interrupted install exited before replacement seam was reached: exit=$($process.ExitCode)`nstdout:`n$stdout`nstderr:`n$stderr"
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $mvReady)) {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue
+            Fail "interrupted install did not reach the atomic replacement seam"
+        }
+
+        $mvPid = (Get-Content -LiteralPath $mvPidFile -Raw).Trim()
+        if ($mvPid -notmatch '^[0-9]+$') {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            Fail "interruption mv shim pid was not numeric: $mvPid"
+        }
+        $mvParent = (& ps -o ppid= -p $mvPid).Trim()
+        if ($LASTEXITCODE -ne 0 -or $mvParent -ne [string]$process.Id) {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            Fail "interruption mv pid $mvPid parent was $mvParent, want installer pid $($process.Id)"
+        }
+
+        Stop-Process -Id ([int]$mvPid) -ErrorAction Stop
+        Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
+        if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            Fail "interrupted install did not exit after replacement process was terminated"
+        }
+        if ($process.ExitCode -eq 0) {
+            Fail "interrupted install unexpectedly succeeded"
+        }
+    }
+
+    if ((Get-SHA256 $preexisting) -ne $preexistingHash) {
+        Fail "interrupted install changed the pre-existing binary"
+    }
+    $preexistingOutput = @(& $preexisting version)
+    if ($LASTEXITCODE -ne 0 -or -not (($preexistingOutput -join "`n") -match "version=0.7.0")) {
+        Fail "pre-existing binary was not usable after interrupted install"
+    }
+    if (Get-ChildItem -LiteralPath $installDir -Force | Where-Object { $_.Name -like ".loopcoder.tmp.*" }) {
+        Fail "interrupted install exposed a partial replacement in $installDir"
+    }
+    if (Get-ChildItem -LiteralPath $installTmp -Force | Where-Object { $_.Name -like "loopcoder-install.*" }) {
+        Fail "interrupted install left installer temporary artifacts in $installTmp"
+    }
+
+    Invoke-CandidateInstall -Server $Server -InstallDir $installDir -InstallTmpDir $installTmp -Label "retry after interrupted install"
+    Assert-CandidateInstalledBinary -BinaryPath (Join-Path $installDir "loopcoder") -ExpectedHash $ExpectedHash -ExpectedVersion $plainVersion -Label "retry after interrupted install"
+}
+
 Require-Command "go"
 Assert-DarwinArm64GoHost
 Require-Command "gh"
 Require-Command "git"
 Require-Command "cosign"
+Require-Command "stat"
 
 $tag = if ($Version.StartsWith("v")) { $Version } else { "v$Version" }
 $plainVersion = $tag.TrimStart("v")
@@ -410,22 +632,19 @@ try {
     $extractDir = Join-Path $tmp "extract"
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-LoopcoderArchive -Archive $release.ArchivePath -Destination $extractDir
-    $binary = Join-Path $extractDir "loopcoder"
-    if (-not (Test-Path -LiteralPath $binary)) {
+    $candidateBinary = Join-Path $extractDir "loopcoder"
+    if (-not (Test-Path -LiteralPath $candidateBinary)) {
         Fail "archive did not contain loopcoder binary"
     }
+    $candidateBinaryHash = Get-SHA256 $candidateBinary
 
-    $versionOutput = @(& $binary version)
-    $versionOutput | ForEach-Object { Write-Host $_ }
-    $versionLines = @($versionOutput | Where-Object { $_ -match '(^|\s)version=' })
-    if ($versionLines.Count -ne 1) {
-        Fail "downloaded binary emitted $($versionLines.Count) version lines; want exactly one"
-    }
-    $versionLine = [string]$versionLines[0]
-    $versionPattern = "(^|\s)version=$([regex]::Escape($plainVersion))(\s|$)"
-    if ($versionLine -notmatch $versionPattern -or $versionLine -match "(^|\s)(commit|date)=unknown(\s|$)") {
-        Fail "downloaded binary did not report $plainVersion with non-placeholder commit/date"
-    }
+    $installDir = Join-Path $tmp "fresh-install/bin"
+    $installTmpDir = Join-Path $tmp "fresh-install/tmp"
+    Invoke-CandidateInstall -Server $mockReleaseApi -InstallDir $installDir -InstallTmpDir $installTmpDir -Label "fresh install from staged candidate"
+    $binary = Join-Path $installDir "loopcoder"
+    Assert-CandidateInstalledBinary -BinaryPath $binary -ExpectedHash $candidateBinaryHash -ExpectedVersion $plainVersion -Label "fresh install from staged candidate"
+
+    Invoke-InterruptedCandidateInstallSeam -Server $mockReleaseApi -ExpectedHash $candidateBinaryHash
 
     Invoke-Checked "verify source checkout has no tracked .loopcoder files" {
         $script:trackedLocalState = @(git -C $sourceRepo ls-files .loopcoder)
@@ -626,6 +845,8 @@ try {
         if (-not (($previousUpgradeOutput -join "`n") -match "After: .*version=v?$([regex]::Escape($plainVersion))|Installed versioned binary:")) {
             Fail "previous-version upgrade output did not show installation of $plainVersion"
         }
+        $upgradedStableBinary = Join-Path $loopcoderHome "bin/loopcoder"
+        Assert-CandidateInstalledBinary -BinaryPath $upgradedStableBinary -ExpectedHash $candidateBinaryHash -ExpectedVersion $plainVersion -Label "previous-version upgrade from staged candidate"
     }
 
     Write-Host "release smoke verification passed for $tag"

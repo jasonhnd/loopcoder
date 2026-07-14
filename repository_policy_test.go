@@ -34,6 +34,41 @@ func TestV080ReleaseWorkflowPolicy(t *testing.T) {
 	}
 }
 
+func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "scripts", "release-smoke.ps1"))
+	if err != nil {
+		t.Fatalf("read release smoke script: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`Join-Path $scriptRoot "install.sh"`,
+		`Invoke-CandidateInstall -Server $mockReleaseApi`,
+		`Assert-CandidateInstalledBinary -BinaryPath $binary`,
+		`$candidateBinaryHash = Get-SHA256 $candidateBinary`,
+		`LOOPCODER_INSTALL_DIR`,
+		`LOOPCODER_INSTALL_OS`,
+		`LOOPCODER_INSTALL_ARCH`,
+		`LOOPCODER_SMOKE_MV_READY`,
+		`Stop-Process -Id ([int]$mvPid)`,
+		`Assert-CandidateInstalledBinary -BinaryPath $upgradedStableBinary`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("release smoke does not contain required candidate-backed installer seam %q", want)
+		}
+	}
+
+	migrationIndex := strings.Index(script, `& $binary migrate local-state`)
+	installIndex := strings.Index(script, `Invoke-CandidateInstall -Server $mockReleaseApi`)
+	if installIndex < 0 || migrationIndex < 0 || installIndex > migrationIndex {
+		t.Fatalf("release smoke must install the staged candidate before migration smoke")
+	}
+	selfBootstrapIndex := strings.Index(script, `& $selfBootstrapScript -Repo $sourceRepo -Binary $binary`)
+	if selfBootstrapIndex < 0 || installIndex > selfBootstrapIndex {
+		t.Fatalf("release smoke must install the staged candidate before self-bootstrap smoke")
+	}
+}
+
 func TestV080WorkflowPolicyRejectsUnsupportedShapes(t *testing.T) {
 	baseWorkflow := workflowPolicy{
 		Jobs: map[string]workflowJobPolicy{
