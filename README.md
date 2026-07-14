@@ -51,21 +51,21 @@ loop  > done. 2 PRs promoted, 0 blocked.
 
 ## Install
 
-Install v0.7.0 from GitHub Releases with the no-Go scripts:
+Install v0.8.0 from GitHub Releases on native macOS Apple Silicon
+(`darwin/arm64`) with the no-Go shell installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.7.0
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
 ```
 
-```powershell
-$env:LOOPCODER_VERSION = "0.7.0"
-irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
-```
+Windows, Linux, WSL, containers, and Intel macOS are not supported by the
+current v0.8.0 installer. Users who need those hosts should remain on the
+historical v0.7.0 release.
 
-Or install with Go:
+Or install with Go on the supported host:
 
 ```bash
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.7.0
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
 ```
 
 Then confirm the binary:
@@ -76,9 +76,9 @@ loopcoder version
 
 For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
 
-Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. The release install scripts verify signed `SHA256SUMS` before trusting checksums, using cosign on the script path. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
+Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. The release installer verifies signed `SHA256SUMS` before trusting checksums, using cosign on the script path. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
 
-Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell runtime. See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
+Current v0.8.0 support is native macOS Apple Silicon only (`darwin/arm64`). See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
 ## Upgrade From 0.6.1 To 0.7.0
 
