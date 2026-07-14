@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,10 +13,205 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
+
+func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	path := tempDB(t)
+	const sourceReceipt = "runtime-source-receipt-canary"
+	const secretCanary = "runtime-secret-canary"
+	const privatePathCanary = "/tmp/private/loopcoder/canonical"
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, path, false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = 'attempt-source'`, sourceReceipt)
+			return err
+		}); err != nil {
+			t.Fatalf("seed source receipt: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+
+	var sourceEffect, receiptReuse, destinationLaunch, continuedEffect, verifierEmission, reportEmission atomic.Int64
+	sourceEffect.Store(1)
+	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ReusableEvidenceIDs: []string{"qsnap-codex-a-good", "availability-observation-a"},
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			receiptReuse.Add(1)
+			destinationLaunch.Add(1)
+			continuedEffect.Add(1)
+			if execution.Candidate.AdapterID != "claude" {
+				t.Fatalf("destination adapter = %q, want provider B claude", execution.Candidate.AdapterID)
+			}
+			if execution.ContinuationProof.CheckpointID != support.CheckpointID ||
+				execution.ContinuationProof.State != storage.SideEffectStateReceiptBacked ||
+				execution.ContinuationProof.ProviderReceiptHash == "" {
+				t.Fatalf("continuation proof = %#v, want bound receipt-backed r2 checkpoint", execution.ContinuationProof)
+			}
+			return HandoffSuccessorExecutionResult{
+				ProviderReceipt:          "receipt-destination",
+				ContinuationCheckpointID: execution.ContinuationProof.CheckpointID,
+				ReusedSourceBoundary:     true,
+			}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("canonical handoff resume: %v\n%s", err, ExplainHuman(result.RoutingDecision))
+	}
+	assertCanonicalHandoffLineage(t, handoff, result, support)
+	if result.Reconciliation.ProviderReceiptHash == "" || strings.Contains(handoffReconciliationEvidence(t, ctx, store, handoff.HandoffID), sourceReceipt) {
+		t.Fatalf("reconciliation evidence leaked raw source receipt or missed hash")
+	}
+	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 0, 0)
+
+	restoreCodexVerifierQuota(&fixture)
+	verifierRoute := persistVerifierRouteForPlan(t, ctx, store, fixture, result.RoutingDecision, "canonical-verifier", result.RoutingDecision.PlanFingerprint, fixture.candidate("codex", "acct-b", "codex-verifier"), nil)
+	if verifierRoute.DecisionStatus != DecisionStatusSelected {
+		t.Fatalf("canonical verifier route status = %s\n%s", verifierRoute.DecisionStatus, ExplainHuman(verifierRoute))
+	}
+	verifierEmission.Add(1)
+	verification, err := DecideAndPersistVerification(ctx, store, VerificationDecisionInput{
+		WorkerRoutingDecisionID:   result.RoutingDecision.RoutingDecisionID,
+		VerifierRoutingDecisionID: verifierRoute.RoutingDecisionID,
+		DecisionKey:               "verify-canonical-handoff",
+		IdempotencyKey:            "verify-canonical-handoff-key",
+		VerifierVerdicts:          []VerifierVerdict{passVerdict(verifierRoute, "canonical handoff lineage accepted", "ev-canonical-handoff")},
+		AuthorityFingerprint:      verifierRoute.RoutingFingerprint,
+		DecidedBy:                 schedulerActor(),
+		Host:                      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("canonical verification decision: %v", err)
+	}
+	if verification.DecisionStatus != VerificationStatusAccepted || verification.WorkerRoutingDecisionID != result.RoutingDecision.RoutingDecisionID ||
+		verification.VerifierRoutingDecisionID != verifierRoute.RoutingDecisionID || verification.ActualIndependence != taskrequirements.IndependenceDifferentProvider {
+		t.Fatalf("verification = %#v, want independent accepted verifier correlated to worker route", verification)
+	}
+
+	reportEmission.Add(1)
+	humanReport, canonicalReport := canonicalReportEvidence(t, fixture.now, result, verification, secretCanary, privatePathCanary)
+	progressHuman, progressJSON := canonicalProgressEvidence(t, ctx, store, fixture.now, result, verification)
+	evidence := humanReport + "\n" + canonicalReport + "\n" + progressHuman + "\n" + progressJSON
+	for _, want := range []string{
+		handoff.ProjectID,
+		handoff.DeliveryRunID,
+		handoff.SourceAttemptID,
+		result.RoutingDecision.RoutingDecisionID,
+		result.Reservation.BudgetReservationID,
+		result.Successor.AttemptID,
+		result.Reconciliation.Code,
+		support.CheckpointID,
+		verification.VerificationDecisionID,
+		string(reporter.RoleVerifier),
+	} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("canonical evidence missing %q\n%s", want, evidence)
+		}
+	}
+	for _, forbidden := range []string{sourceReceipt, secretCanary, privatePathCanary} {
+		if strings.Contains(evidence, forbidden) {
+			t.Fatalf("canonical evidence leaked %q\n%s", forbidden, evidence)
+		}
+	}
+	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 1, 1)
+
+	replayInput := canonicalResumeInput(handoff, input, support, &receiptReuse, &destinationLaunch, &continuedEffect)
+	sameProcessReplay, err := ResumeApprovedHandoff(ctx, store, replayInput)
+	if err != nil {
+		t.Fatalf("same-process replay: %v", err)
+	}
+	assertCanonicalReplay(t, ctx, store, result, sameProcessReplay, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect)
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	store = reopened
+	reopenedReplay, err := ResumeApprovedHandoff(ctx, store, replayInput)
+	if err != nil {
+		t.Fatalf("close/reopen replay: %v", err)
+	}
+	assertCanonicalReplay(t, ctx, store, result, reopenedReplay, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect)
+
+	const concurrentReplays = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrentReplays)
+	start := make(chan struct{})
+	for i := 0; i < concurrentReplays; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			target := store
+			if i%2 == 1 {
+				other, openErr := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+				if openErr != nil {
+					errs <- openErr
+					return
+				}
+				defer other.Close()
+				target = other
+			}
+			<-start
+			concurrent, resumeErr := ResumeApprovedHandoff(ctx, target, replayInput)
+			if resumeErr != nil {
+				errs <- resumeErr
+				return
+			}
+			if concurrent.Successor.AttemptID != result.Successor.AttemptID || concurrent.Successor.LaunchExposed {
+				errs <- errors.New("concurrent replay exposed duplicate canonical launch")
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent canonical replay: %v", err)
+	}
+	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 1, 1)
+
+	cancelledReplay := replayInput
+	cancelledReplay.Cancelled = true
+	cancelled, err := ResumeApprovedHandoff(ctx, store, cancelledReplay)
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) {
+		t.Fatalf("cancelled reservation-boundary replay error = %v, want ErrReplanRequired", err)
+	}
+	if cancelled.Successor.AttemptID != "" || cancelled.Successor.LaunchExposed {
+		t.Fatalf("cancelled reservation-boundary replay = %#v, want no launch exposure", cancelled.Successor)
+	}
+	if cancelled.Reservation.BudgetReservationID == "" || reservationState(t, ctx, store, cancelled.Reservation.BudgetReservationID) != string(budget.StateReleased) {
+		t.Fatalf("cancelled reservation = %#v, want released reservation before launch", cancelled.Reservation)
+	}
+	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 1, 1)
+
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = 'stale-authoritative-completion' WHERE attempt_id = ?`, handoff.SourceAttemptID)
+		return err
+	}); err != nil {
+		t.Fatalf("mutate stale source completion: %v", err)
+	}
+	_, err = ResumeApprovedHandoff(ctx, store, replayInput)
+	if !errors.Is(err, &storage.FederationError{Code: storage.ErrHandoffReplayMismatchCode}) {
+		t.Fatalf("stale source authoritative completion error = %v, want ErrHandoffReplayMismatch", err)
+	}
+	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 1, 1)
+}
 
 func TestResumeApprovedHandoffRoutesProviderAToProviderBOnce(t *testing.T) {
 	ctx := context.Background()
@@ -2550,6 +2746,240 @@ func assertDestinationLockState(t *testing.T, ctx context.Context, store storage
 			t.Fatalf("destination lock states = %v, want all %q", states, want)
 		}
 	}
+}
+
+func assertCanonicalHandoffLineage(t *testing.T, handoff storage.HandoffTransaction, result HandoffResumeResult, support HandoffSuccessorContinuationSupport) {
+	t.Helper()
+	selected := selectedCandidate(result.RoutingDecision)
+	if selected.AdapterID != "claude" {
+		t.Fatalf("selected adapter = %q, want provider B claude", selected.AdapterID)
+	}
+	if result.Handoff.ProjectID != handoff.ProjectID || result.Handoff.DeliveryRunID != handoff.DeliveryRunID ||
+		result.Handoff.TaskID != handoff.TaskID || result.Handoff.SourceAttemptID != handoff.SourceAttemptID ||
+		result.Handoff.HandoffGeneration != handoff.HandoffGeneration {
+		t.Fatalf("handoff lineage changed: got %#v want source %#v", result.Handoff, handoff)
+	}
+	if result.Reconciliation.HandoffID != handoff.HandoffID || result.Reconciliation.HandoffGeneration != handoff.HandoffGeneration ||
+		result.Reconciliation.State != storage.SideEffectStateReceiptBacked || result.Reconciliation.ProviderReceiptHash == "" ||
+		!result.Reconciliation.AutomaticContinuation || result.Reconciliation.NeedsHuman {
+		t.Fatalf("reconciliation = %#v, want durable receipt-backed automatic continuation", result.Reconciliation)
+	}
+	if result.Reservation.BudgetReservationID == "" || result.Reservation.Scope.AdapterID != "claude" || result.Reservation.ReservedValue != 1 {
+		t.Fatalf("reservation = %#v, want provider B destination reservation", result.Reservation)
+	}
+	if result.Successor.HandoffID != handoff.HandoffID || result.Successor.HandoffGeneration != handoff.HandoffGeneration ||
+		result.Successor.SourceAttemptID != handoff.SourceAttemptID || result.Successor.RoutingDecisionID != result.RoutingDecision.RoutingDecisionID ||
+		result.Successor.RoutingCandidateID != selected.RoutingCandidateID || result.Successor.BudgetReservationID != result.Reservation.BudgetReservationID ||
+		result.Successor.ContinuationProof.CheckpointID != support.CheckpointID || result.Successor.ProviderReceipt != "receipt-destination" {
+		t.Fatalf("successor launch = %#v, want correlated route/reservation/reconciliation successor", result.Successor)
+	}
+	if result.Successor.ContinuationProof.ProviderReceiptHash != result.Reconciliation.ProviderReceiptHash ||
+		result.Successor.ContinuationProof.ProofFingerprint == "" || result.Successor.ProviderIdempotencyKey == "" {
+		t.Fatalf("successor proof = %#v, want receipt hash and provider launch key", result.Successor.ContinuationProof)
+	}
+	if result.Successor.LaunchPhase != storage.ClaimPhaseExecuting || !result.Successor.LaunchExposed {
+		t.Fatalf("successor phase/exposure = %s/%t, want first production launch", result.Successor.LaunchPhase, result.Successor.LaunchExposed)
+	}
+}
+
+func assertCanonicalReplay(t *testing.T, ctx context.Context, store storage.Store, first, replay HandoffResumeResult, sourceEffect, receiptReuse, destinationLaunch, continuedEffect *atomic.Int64) {
+	t.Helper()
+	if replay.Successor.AttemptID != first.Successor.AttemptID || replay.Successor.ProviderIdempotencyKey != first.Successor.ProviderIdempotencyKey ||
+		replay.Successor.LaunchExposed || replay.RoutingDecision.RoutingDecisionID != first.RoutingDecision.RoutingDecisionID ||
+		countSuccessorAttempts(t, ctx, store, first.Handoff.TaskID) != 1 {
+		t.Fatalf("canonical replay = %#v first=%#v attempts=%d, want observe-only replay", replay.Successor, first.Successor, countSuccessorAttempts(t, ctx, store, first.Handoff.TaskID))
+	}
+	if replay.Reconciliation.ProviderReceiptHash != first.Reconciliation.ProviderReceiptHash ||
+		replay.Successor.ContinuationProof.CheckpointID != first.Successor.ContinuationProof.CheckpointID {
+		t.Fatalf("canonical replay proof drifted: replay=%#v first=%#v", replay.Reconciliation, first.Reconciliation)
+	}
+	var zeroVerifier, zeroReport atomic.Int64
+	assertCanonicalCounters(t, sourceEffect, receiptReuse, destinationLaunch, continuedEffect, &zeroVerifier, &zeroReport, 1, 1, 1, 1, 0, 0)
+}
+
+func assertCanonicalCounters(t *testing.T, sourceEffect, receiptReuse, destinationLaunch, continuedEffect, verifierEmission, reportEmission *atomic.Int64, wantSource, wantReuse, wantLaunch, wantContinued, wantVerifier, wantReport int64) {
+	t.Helper()
+	got := map[string]int64{
+		"source_effect":      sourceEffect.Load(),
+		"receipt_reuse":      receiptReuse.Load(),
+		"destination_launch": destinationLaunch.Load(),
+		"continued_effect":   continuedEffect.Load(),
+		"verifier_emission":  verifierEmission.Load(),
+		"report_emission":    reportEmission.Load(),
+	}
+	want := map[string]int64{
+		"source_effect":      wantSource,
+		"receipt_reuse":      wantReuse,
+		"destination_launch": wantLaunch,
+		"continued_effect":   wantContinued,
+		"verifier_emission":  wantVerifier,
+		"report_emission":    wantReport,
+	}
+	for name, gotValue := range got {
+		if gotValue != want[name] {
+			t.Fatalf("%s Execute = %d, want %d (all counters: %#v)", name, gotValue, want[name], got)
+		}
+	}
+}
+
+func canonicalResumeInput(handoff storage.HandoffTransaction, input DecisionInput, support HandoffSuccessorContinuationSupport, receiptReuse, destinationLaunch, continuedEffect *atomic.Int64) HandoffResumeInput {
+	return HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ReusableEvidenceIDs: []string{"qsnap-codex-a-good", "availability-observation-a"},
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			receiptReuse.Add(1)
+			destinationLaunch.Add(1)
+			continuedEffect.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate-canonical-replay"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	}
+}
+
+func restoreCodexVerifierQuota(fixture *hardFixture) {
+	remaining := int64(400)
+	for i := range fixture.inventory.QuotaSnapshots {
+		if fixture.inventory.QuotaSnapshots[i].QuotaSnapshotID == "qsnap-codex-b-verifier" {
+			fixture.inventory.QuotaSnapshots[i].RemainingValue = &remaining
+			fixture.inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
+			fixture.inventory.QuotaSnapshots[i].FreshnessState = providerinventory.FreshnessFresh
+		}
+	}
+}
+
+func canonicalReportEvidence(t *testing.T, now time.Time, result HandoffResumeResult, verification VerificationDecision, secretCanary, privatePathCanary string) (string, string) {
+	t.Helper()
+	total := int64(42)
+	record := reporter.Report{
+		WorkID:      "canonical-handoff-" + result.Handoff.HandoffID,
+		Issue:       832,
+		Branch:      "loop/issue-832",
+		Role:        reporter.RoleVerifier,
+		Provider:    "codex",
+		Model:       "gpt-5.5-verify",
+		ModelSource: reporter.ModelSourceParsed,
+		Effort:      "medium",
+		Permission:  reporter.PermissionReadOnly,
+		Action:      "verify canonical handoff " + verification.VerificationDecisionID,
+		ExitCode:    0,
+		StartedAt:   now.Add(2 * time.Minute).Format(time.RFC3339Nano),
+		EndedAt:     now.Add(3 * time.Minute).Format(time.RFC3339Nano),
+		DurationMS:  int64(time.Minute / time.Millisecond),
+		Usage:       reporter.Usage{TotalTokens: &total},
+		Verified:    true,
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("canonical report validate: %v", err)
+	}
+	human := record.Pretty(reporter.PrettyOptions{
+		Mode:            reporter.PrettyModePlain,
+		Status:          "pass",
+		PR:              "#940",
+		Reason:          "accepted handoff lineage without canaries",
+		SpecConformance: "issue #832 canonical A-to-B handoff fixture",
+		NextAction:      "continue",
+	})
+	canonical, err := record.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical report JSON: %v", err)
+	}
+	combined := human + "\n" + string(canonical)
+	for _, forbidden := range []string{secretCanary, privatePathCanary} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("report evidence leaked %q\n%s", forbidden, combined)
+		}
+	}
+	return human, string(canonical)
+}
+
+func canonicalProgressEvidence(t *testing.T, ctx context.Context, store storage.Store, now time.Time, result HandoffResumeResult, verification VerificationDecision) (string, string) {
+	t.Helper()
+	written, err := progress.PersistReceipt(ctx, store, progress.ProgressReceipt{
+		ProjectID:           result.Handoff.ProjectID,
+		DeliveryRunID:       result.Handoff.DeliveryRunID,
+		RunID:               result.Handoff.ChildRunID,
+		TaskID:              result.Handoff.TaskID,
+		AttemptID:           result.Successor.AttemptID,
+		AttemptOrdinal:      2,
+		CorrelationID:       "canonical-handoff-" + result.Handoff.HandoffID,
+		CorrelationSequence: 1,
+		Phase:               "verify",
+		Status:              "succeeded",
+		TaskCounts:          progress.TaskCounts{Total: 1, Succeeded: 1},
+		Provider: progress.ProviderIdentity{
+			ProviderID:           "claude",
+			ModelID:              "claude-opus",
+			AccountProfileID:     "acct-c",
+			ModelCapabilityID:    "claude-good",
+			ProviderConfidence:   "exact",
+			ProviderInstallation: "pinst-claude",
+		},
+		Heartbeat: progress.AgeEvidence{State: "exact", ObservedAt: now.Add(3 * time.Minute).Format(time.RFC3339Nano), AgeMillis: 0},
+		Progress:  progress.AgeEvidence{State: "exact", ObservedAt: now.Add(3 * time.Minute).Format(time.RFC3339Nano), AgeMillis: 0},
+		Evidence: []progress.EvidenceRef{
+			{RecordKind: "source_attempt", RecordID: result.Handoff.SourceAttemptID, Summary: "provider A source boundary", Classification: "durable", Confidence: "exact"},
+			{RecordKind: "continuation_checkpoint", RecordID: result.Successor.ContinuationProof.CheckpointID, Summary: result.Successor.ContinuationProof.CompletedBoundary, Classification: "durable", Confidence: "exact"},
+			{RecordKind: "handoff", RecordID: result.Handoff.HandoffID, Summary: result.Reconciliation.Code, Classification: "durable", Confidence: "exact"},
+			{RecordKind: "routing_decision", RecordID: result.RoutingDecision.RoutingDecisionID, Summary: "provider B route", Classification: "durable", Confidence: "exact"},
+			{RecordKind: "budget_reservation", RecordID: result.Reservation.BudgetReservationID, Summary: "destination reservation", Classification: "durable", Confidence: "exact"},
+			{RecordKind: "verification_decision", RecordID: verification.VerificationDecisionID, Summary: "independent verifier accepted", Classification: "durable", Confidence: "exact"},
+		},
+		QuotaBudget: progress.QuotaBudgetState{
+			State:               "available",
+			Confidence:          "exact",
+			BudgetPolicyID:      result.Reservation.PolicyIDs[0],
+			BudgetReservationID: result.Reservation.BudgetReservationID,
+			RemainingQuantity:   result.Reservation.ReservedValue,
+			Unit:                result.Reservation.Unit,
+		},
+		Blocker:     progress.ActionState{State: "none"},
+		NextAction:  progress.ActionState{State: "complete", Summary: "canonical handoff verified"},
+		Redaction:   progress.RedactionState{Redacted: true, Markers: []string{"runtime-canary"}, OriginalBytes: 128, PersistedBytes: 64},
+		OccurredAt:  now.Add(3 * time.Minute).Format(time.RFC3339Nano),
+		PersistedAt: now.Add(3 * time.Minute).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("persist canonical progress receipt: %v", err)
+	}
+	if !written.Inserted {
+		t.Fatalf("canonical progress receipt replayed unexpectedly: %#v", written)
+	}
+	batch, err := progress.ReadReceipts(ctx, store, progress.ReadFilter{
+		ProjectID:     result.Handoff.ProjectID,
+		DeliveryRunID: result.Handoff.DeliveryRunID,
+		CorrelationID: "canonical-handoff-" + result.Handoff.HandoffID,
+		Limit:         10,
+	}, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("read canonical progress receipt: %v", err)
+	}
+	if len(batch.Views) != 1 || batch.Views[0].Receipt.ProgressReceiptID != written.Receipt.ProgressReceiptID ||
+		!progressEvidenceHas(batch.Views[0].Receipt.Evidence, "verification_decision", verification.VerificationDecisionID) ||
+		batch.Views[0].Receipt.QuotaBudget.BudgetReservationID != result.Reservation.BudgetReservationID {
+		t.Fatalf("progress read model = %#v, want correlated canonical receipt", batch)
+	}
+	var human bytes.Buffer
+	if err := progress.RenderHuman(&human, batch.Views); err != nil {
+		t.Fatalf("render canonical progress human: %v", err)
+	}
+	var canonical bytes.Buffer
+	if err := progress.RenderJSON(&canonical, batch); err != nil {
+		t.Fatalf("render canonical progress JSON: %v", err)
+	}
+	return human.String(), canonical.String()
+}
+
+func progressEvidenceHas(evidence []progress.EvidenceRef, kind, id string) bool {
+	for _, ref := range evidence {
+		if ref.RecordKind == kind && ref.RecordID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func handoffRegistrationState(t *testing.T, ctx context.Context, store storage.Store, childRunID string) struct {
