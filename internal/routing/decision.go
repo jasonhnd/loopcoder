@@ -226,6 +226,70 @@ type DryRunExplain struct {
 	Stable   json.RawMessage `json:"stable_json"`
 }
 
+type ReevaluateRouteTrigger string
+
+const (
+	ReevaluateAtTaskBoundary       ReevaluateRouteTrigger = "task-boundary"
+	ReevaluateAtFreshCapacityEvent ReevaluateRouteTrigger = "fresh-capacity-event"
+)
+
+type ReevaluateRouteInput struct {
+	DecisionInput DecisionInput
+	Trigger       ReevaluateRouteTrigger
+	DryRun        bool
+}
+
+type ReevaluateRouteResult struct {
+	Decision RoutingDecision        `json:"decision"`
+	Trigger  ReevaluateRouteTrigger `json:"trigger"`
+	DryRun   bool                   `json:"dry_run"`
+	Changed  bool                   `json:"changed"`
+}
+
+func ReevaluateRoute(ctx context.Context, store storage.Store, input ReevaluateRouteInput) (ReevaluateRouteResult, error) {
+	if input.Trigger != ReevaluateAtTaskBoundary && input.Trigger != ReevaluateAtFreshCapacityEvent {
+		return ReevaluateRouteResult{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing re-evaluation trigger must be task-boundary or fresh-capacity-event"}
+	}
+	if store == nil {
+		return ReevaluateRouteResult{}, errors.New("routing re-evaluation: storage store is required")
+	}
+	decisionInput := input.DecisionInput
+	decisionInput.Now = store.Now()
+	prepared, err := prepareDecisionInputFromStore(ctx, store, decisionInput)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	decision, err := BuildRoutingDecision(prepared)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	changed, err := routingDecisionFingerprintChanged(ctx, store, decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.RoutingFingerprint)
+	if err != nil {
+		return ReevaluateRouteResult{}, err
+	}
+	if !input.DryRun {
+		if err := PersistRoutingDecision(ctx, store, decision); err != nil {
+			return ReevaluateRouteResult{}, err
+		}
+	}
+	if decision.TerminalErrorCode != "" {
+		return ReevaluateRouteResult{Decision: decision, Trigger: input.Trigger, DryRun: input.DryRun, Changed: changed}, routingTerminalError(decision.TerminalErrorCode)
+	}
+	return ReevaluateRouteResult{Decision: decision, Trigger: input.Trigger, DryRun: input.DryRun, Changed: changed}, nil
+}
+
+func routingDecisionFingerprintChanged(ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey, routingFingerprint string) (bool, error) {
+	count := 0
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM routing_decisions WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ? AND routing_fingerprint = ?`,
+			strings.TrimSpace(projectID), strings.TrimSpace(deliveryRunID), strings.TrimSpace(decisionKey), strings.TrimSpace(routingFingerprint)).Scan(&count)
+	})
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
 func DryRunExplainRoute(input DecisionInput) (DryRunExplain, error) {
 	decision, err := BuildRoutingDecision(input)
 	if err != nil {
@@ -308,6 +372,10 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if err := validateDecisionInput(input, policy); err != nil {
 		return RoutingDecision{}, err
 	}
+	input.Inputs.OptimizationPolicy = policy
+	input.Inputs.Now = input.Now
+	input.Inputs = applyManualRoutingOverrides(input.Inputs, input.OverrideProvenance, input.DeliveryRunID, input.Now)
+	input.OverrideProvenance = redactOverrideProvenance(input.OverrideProvenance)
 	eligibility := FilterHardEligibility(input.Inputs)
 	refs := inputRefs(input, eligibility)
 	routingFingerprint, err := routingFingerprint(input, policy, eligibility, refs)
@@ -512,6 +580,92 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 		return input, err
 	}
 	return input, nil
+}
+
+func applyManualRoutingOverrides(inputs Inputs, overrides []OverrideProvenance, deliveryRunID string, now time.Time) Inputs {
+	if len(overrides) == 0 {
+		return inputs
+	}
+	out := inputs
+	out.Inventory.QuotaSnapshots = append([]providerinventory.QuotaSnapshot(nil), inputs.Inventory.QuotaSnapshots...)
+	out.ManualUnavailable = append([]ManualUnavailableOverride(nil), inputs.ManualUnavailable...)
+	for _, override := range overrides {
+		if !manualOverrideScopeMatches(override, deliveryRunID, inputs.Requirement.TaskID) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(override.OverrideKind)) {
+		case "manual-unavailable-until":
+			until, ok := parseTime(override.ManualUnavailableUntil)
+			if !ok || !until.After(now.UTC()) {
+				continue
+			}
+			out.ManualUnavailable = append(out.ManualUnavailable, ManualUnavailableOverride{
+				OverrideID: strings.TrimSpace(override.OverrideID),
+				Constraint: override.CandidateConstraint,
+				Until:      delivery.CanonicalTimestamp(until),
+			})
+		case "manual-reset":
+			for i := range out.Inventory.QuotaSnapshots {
+				if !constraintMatchesQuotaSnapshot(override.CandidateConstraint, out.Inventory.QuotaSnapshots[i]) {
+					continue
+				}
+				if override.ClearManualReset {
+					out.Inventory.QuotaSnapshots[i].ResetAt = ""
+					out.Inventory.QuotaSnapshots[i].WindowEnd = ""
+					out.Inventory.QuotaSnapshots[i].ValidUntil = ""
+					continue
+				}
+				resetAt, ok := parseTime(override.ManualResetAt)
+				if !ok || !resetAt.After(now.UTC()) {
+					continue
+				}
+				canonical := delivery.CanonicalTimestamp(resetAt)
+				out.Inventory.QuotaSnapshots[i].ResetAt = canonical
+				out.Inventory.QuotaSnapshots[i].WindowEnd = canonical
+				out.Inventory.QuotaSnapshots[i].ValidUntil = canonical
+			}
+		}
+	}
+	return out
+}
+
+func manualOverrideScopeMatches(override OverrideProvenance, deliveryRunID, taskID string) bool {
+	if strings.TrimSpace(override.DeliveryRunID) != "" && strings.TrimSpace(override.DeliveryRunID) != strings.TrimSpace(deliveryRunID) {
+		return false
+	}
+	if strings.TrimSpace(override.TaskID) != "" && strings.TrimSpace(override.TaskID) != strings.TrimSpace(taskID) {
+		return false
+	}
+	return true
+}
+
+func constraintMatchesQuotaSnapshot(constraint CandidateConstraint, snapshot providerinventory.QuotaSnapshot) bool {
+	return scopeMatchesCandidate(constraint.AdapterID, snapshot.AdapterID) &&
+		scopeMatchesCandidate(constraint.ProviderInstallationID, ptrValue(snapshot.ProviderInstallationID)) &&
+		scopeMatchesCandidate(constraint.AccountProfileID, ptrValue(snapshot.AccountProfileID)) &&
+		scopeMatchesCandidate(constraint.ModelCapabilityID, ptrValue(snapshot.ModelCapabilityID))
+}
+
+func redactOverrideProvenance(overrides []OverrideProvenance) []OverrideProvenance {
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := append([]OverrideProvenance(nil), overrides...)
+	for i := range out {
+		out[i].Reason = redactSensitiveText(out[i].Reason)
+		out[i].Source = redactSensitiveText(out[i].Source)
+	}
+	return out
+}
+
+func redactSensitiveText(value string) string {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"sk-", "ghp_", "github_pat_", "api_key", "token=", "authorization:", "bearer "} {
+		if strings.Contains(lower, marker) {
+			return "[redacted]"
+		}
+	}
+	return value
 }
 
 func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {
@@ -1351,7 +1505,11 @@ func rejectionExplanation(reasons []RejectionReason) string {
 	}
 	parts := make([]string, 0, len(reasons))
 	for _, reason := range reasons {
-		parts = append(parts, string(reason.Code))
+		if strings.TrimSpace(reason.Message) == "" {
+			parts = append(parts, string(reason.Code))
+			continue
+		}
+		parts = append(parts, string(reason.Code)+" ("+reason.Message+")")
 	}
 	sort.Strings(parts)
 	return "rejected by hard eligibility: " + strings.Join(parts, ", ")
@@ -1397,6 +1555,7 @@ func routingTerminalError(code taskrequirements.ErrorCode) error {
 
 func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	refs := []InputRecordRef{}
+	quotaByID := mapQuotaSnapshots(input.Inputs.Inventory.QuotaSnapshots)
 	addRef := func(kind, id, fingerprint string) {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -1412,7 +1571,7 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	for _, candidate := range append([]Candidate{}, result.Eligible...) {
 		addRef("routing_candidate", candidate.RoutingCandidateID, candidate.CandidateFingerprint)
 		for _, id := range candidate.QuotaSnapshotIDs {
-			addRef("quota_snapshot", id, "")
+			addRef("quota_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
 		}
 		for _, id := range candidate.BudgetPolicyIDs {
 			addRef("budget_policy", id, "")
@@ -1432,7 +1591,7 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 				addRef("rejection_evidence", id, "")
 			}
 			for _, id := range reason.SnapshotIDs {
-				addRef("rejection_snapshot", id, "")
+				addRef("rejection_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
 			}
 		}
 	}
@@ -1471,6 +1630,14 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		deduped = append(deduped, ref)
 	}
 	return deduped
+}
+
+func quotaSnapshotFingerprint(quotaByID map[string]providerinventory.QuotaSnapshot, id string) string {
+	snapshot, ok := quotaByID[id]
+	if !ok {
+		return ""
+	}
+	return "sha256:" + hashCanonical(snapshot)
 }
 
 func breakerRefs(result Result) []string {

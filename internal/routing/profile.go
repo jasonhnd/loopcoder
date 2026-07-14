@@ -159,16 +159,22 @@ type PolicyDiagnostic struct {
 }
 
 type OverrideProvenance struct {
-	OverrideID               string         `json:"override_id"`
-	OverrideKind             string         `json:"override_kind"`
-	Reason                   string         `json:"reason"`
-	Scope                    string         `json:"scope"`
-	ExpiresAt                string         `json:"expires_at,omitempty"`
-	Actor                    delivery.Actor `json:"actor"`
-	Host                     delivery.Host  `json:"host"`
-	PolicyFingerprint        string         `json:"policy_fingerprint"`
-	AuthorizationFingerprint string         `json:"authorization_fingerprint"`
-	Source                   string         `json:"source"`
+	OverrideID               string              `json:"override_id"`
+	OverrideKind             string              `json:"override_kind"`
+	Reason                   string              `json:"reason"`
+	Scope                    string              `json:"scope"`
+	ExpiresAt                string              `json:"expires_at,omitempty"`
+	TaskID                   string              `json:"task_id,omitempty"`
+	DeliveryRunID            string              `json:"delivery_run_id,omitempty"`
+	CandidateConstraint      CandidateConstraint `json:"candidate_constraint,omitempty"`
+	ManualUnavailableUntil   string              `json:"manual_unavailable_until,omitempty"`
+	ManualResetAt            string              `json:"manual_reset_at,omitempty"`
+	ClearManualReset         bool                `json:"clear_manual_reset,omitempty"`
+	Actor                    delivery.Actor      `json:"actor"`
+	Host                     delivery.Host       `json:"host"`
+	PolicyFingerprint        string              `json:"policy_fingerprint"`
+	AuthorizationFingerprint string              `json:"authorization_fingerprint"`
+	Source                   string              `json:"source"`
 }
 
 type LegacyModelMapping struct {
@@ -574,6 +580,29 @@ func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time, a
 		}
 		if !supportedBoundedOverride(override.OverrideKind, override.Scope) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "override_kind", id, "unsupported routing override kind or scope", nil, "use a bounded routing, fallback, replan, or budget preference override"))
+		}
+		switch strings.ToLower(strings.TrimSpace(override.OverrideKind)) {
+		case "manual-unavailable-until":
+			if emptyCandidateConstraint(override.CandidateConstraint) {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "candidate_constraint", id, "manual unavailable override requires an explicit candidate constraint", nil, "bind the override to adapter/account/model evidence"))
+			}
+			if _, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(override.ManualUnavailableUntil)); strings.TrimSpace(override.ManualUnavailableUntil) == "" || err != nil {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_unavailable_until", id, "manual unavailable override requires a bounded unavailable-until timestamp", nil, "record a bounded unavailable-until timestamp"))
+			}
+		case "manual-reset":
+			if emptyCandidateConstraint(override.CandidateConstraint) {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "candidate_constraint", id, "manual reset override requires an explicit candidate constraint", nil, "bind the override to adapter/account/model evidence"))
+			}
+			resetAt := strings.TrimSpace(override.ManualResetAt)
+			if !override.ClearManualReset {
+				parsed, err := time.Parse(time.RFC3339Nano, resetAt)
+				if resetAt == "" || err != nil || (!now.IsZero() && !parsed.After(now.UTC())) {
+					diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_reset_at", id, "manual reset override requires a future reset timestamp or explicit clear flag", nil, "record explicit bounded reset evidence"))
+				}
+			}
+			if override.ClearManualReset && resetAt != "" {
+				diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "manual_reset_at", id, "manual reset override cannot both replace and clear reset evidence", nil, "choose replacement reset evidence or clear the reset assumption"))
+			}
 		}
 	}
 	sortDiagnostics(diagnostics)
@@ -1028,6 +1057,14 @@ func supportedBoundedOverride(kind, scope string) bool {
 		}
 	}
 	return false
+}
+
+func emptyCandidateConstraint(c CandidateConstraint) bool {
+	return strings.TrimSpace(c.AdapterID) == "" &&
+		strings.TrimSpace(c.ProviderInstallationID) == "" &&
+		strings.TrimSpace(c.AccountProfileID) == "" &&
+		strings.TrimSpace(c.ModelCapabilityID) == "" &&
+		strings.TrimSpace(c.InvocationProfileKey) == ""
 }
 
 func verifyProfileRoleReferences(ctx context.Context, tx storage.Tx, profile RoutingPolicyProfile) error {

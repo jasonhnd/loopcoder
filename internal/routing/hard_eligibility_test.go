@@ -821,6 +821,7 @@ func TestModelRenameRemovalChangesCandidatesNotRoleIdentity(t *testing.T) {
 	oldModel.LifecycleState = providerinventory.LifecycleRemoved
 	oldModel.AvailabilityState = providerinventory.AvailabilityRemoved
 	fixture.inventory.ModelCapabilities = []providerinventory.ModelCapability{oldModel, newModel}
+	fixture.inventory.QuotaSnapshots = append(fixture.inventory.QuotaSnapshots, quota("qsnap-codex-renamed", "codex", "pinst-codex", "acct-a", "codex-renamed", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 500, fixture.now))
 	role, ok := ResolveRoleDefinition(RoleKeyTera, nil)
 	if !ok {
 		t.Fatal("tera role definition missing")
@@ -1160,6 +1161,9 @@ func quota(id, adapterID, installationID, accountID, modelID string, confidence 
 		FreshnessState:         freshness,
 		CapturedAt:             now.Format(time.RFC3339Nano),
 		StaleAfter:             now.Add(time.Hour).Format(time.RFC3339Nano),
+		ResetAt:                now.Add(2 * time.Hour).Format(time.RFC3339Nano),
+		WindowEnd:              now.Add(2 * time.Hour).Format(time.RFC3339Nano),
+		ValidUntil:             now.Add(2 * time.Hour).Format(time.RFC3339Nano),
 	}
 }
 
