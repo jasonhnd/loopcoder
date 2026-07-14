@@ -130,6 +130,54 @@ func TestCodexOriginBindingRequestAbsentMetadataIsNotCapabilityProof(t *testing.
 	}
 }
 
+func TestClaudeOriginBindingRequestRedactsSessionAndPaths(t *testing.T) {
+	secret := "AKIA" + strings.Repeat("B", 16)
+	req, ok := hostprofile.ClaudeOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_claude",
+		DeliveryRunID: "run_claude",
+		CorrelationID: "corr_claude",
+		Getenv: mapGetenv(map[string]string{
+			"CLAUDE_CODE_SESSION_ID": "session-" + secret,
+			"CLAUDECODE":             "1",
+			"CLAUDE_CODE_ENTRYPOINT": "/Users/alice/.claude/local",
+			"PWD":                    "/Users/alice/private/repo",
+		}),
+	})
+	if !ok {
+		t.Fatal("ClaudeOriginBindingRequest returned ok=false")
+	}
+	binding := runtimecap.BindHostRunOrigin(req)
+	if !binding.Bound || binding.Code != runtimecap.HostOriginBound || binding.BindingID == "" {
+		t.Fatalf("binding = %#v, want bound Claude origin", binding)
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatalf("marshal binding: %v", err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{secret, "session-", "/Users/alice", "CLAUDE_CODE_SESSION_ID\":\"session"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("binding leaked %q: %s", forbidden, text)
+		}
+	}
+	for _, want := range []string{"env.CLAUDE_CODE_SESSION_ID", "env.CLAUDECODE", "env.CLAUDE_CODE_ENTRYPOINT"} {
+		if !containsHostProfileString(binding.MetadataKeys, want) {
+			t.Fatalf("metadata keys = %#v, want marker %s", binding.MetadataKeys, want)
+		}
+	}
+}
+
+func TestClaudeOriginBindingRequestAbsentMetadataIsNotCapabilityProof(t *testing.T) {
+	if _, ok := hostprofile.ClaudeOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_claude",
+		DeliveryRunID: "run_claude",
+		CorrelationID: "corr_claude",
+		Getenv:        mapGetenv(map[string]string{"CLAUDECODE": "1"}),
+	}); ok {
+		t.Fatal("ClaudeOriginBindingRequest ok=true without session metadata")
+	}
+}
+
 func mapGetenv(values map[string]string) func(string) string {
 	return func(key string) string {
 		return values[key]

@@ -214,6 +214,41 @@ func TestCodexHostDeclaresOnlyDocumentedProgressCapabilities(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeHostDeclaresOnlyDocumentedProgressCapabilities(t *testing.T) {
+	host, ok := runtimecap.LookupHost("claude-code")
+	if !ok {
+		t.Fatal("LookupHost(claude-code) returned false")
+	}
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "fixture"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll || contract.Progress.AckPolicy != runtimecap.HostProgressAckNone {
+		t.Fatalf("Claude progress = %#v, want durable follow/poll without ack", contract.Progress)
+	}
+	for capability, want := range map[runtimecap.HostCapability]runtimecap.HostCapabilitySupport{
+		runtimecap.HostDurablePolling:        runtimecap.HostCapabilitySupported,
+		runtimecap.HostResumableFollow:       runtimecap.HostCapabilitySupported,
+		runtimecap.HostDetachedSteering:      runtimecap.HostCapabilityUnknown,
+		runtimecap.HostDetachedCancellation:  runtimecap.HostCapabilityUnknown,
+		runtimecap.HostCallbacks:             runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostWakeUp:                runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostAcknowledgment:        runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostManagedBackgroundWork: runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostHooks:                 runtimecap.HostCapabilitySupported,
+	} {
+		if got := capabilitySupport(contract.Capabilities, capability); got != want {
+			t.Fatalf("%s support = %q, want %q", capability, got, want)
+		}
+	}
+	for _, stage := range []runtimecap.HostProgressStage{runtimecap.HostProgressStageWakeUp, runtimecap.HostProgressStageUserVisibility, runtimecap.HostProgressStageAcknowledgment} {
+		if got := stageCode(contract.Progress.Stages, stage); got != runtimecap.HostStageUnsupported {
+			t.Fatalf("%s stage = %q, want unsupported", stage, got)
+		}
+	}
+}
+
 func TestRealCodexCLISmokeDocumentedCapabilities(t *testing.T) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		t.Skip("real Codex CLI smoke is limited to macOS Apple Silicon")
@@ -242,6 +277,37 @@ func TestRealCodexCLISmokeDocumentedCapabilities(t *testing.T) {
 		capabilitySupport(contract.Capabilities, runtimecap.HostWakeUp) != runtimecap.HostCapabilityUnsupported ||
 		capabilitySupport(contract.Capabilities, runtimecap.HostAcknowledgment) != runtimecap.HostCapabilityUnsupported {
 		t.Fatalf("real Codex smoke declared unsupported callback/wake/ack incorrectly: %#v", contract.Progress)
+	}
+}
+
+func TestRealClaudeCodeSmokeDocumentedCapabilities(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("real Claude Code smoke is limited to macOS Apple Silicon")
+	}
+	if testing.Short() {
+		t.Skip("real Claude Code smoke is opt-in")
+	}
+	if _, ok := os.LookupEnv("LOOPCODER_REAL_CLAUDE_CODE_SMOKE"); !ok {
+		t.Skip("set LOOPCODER_REAL_CLAUDE_CODE_SMOKE=1 to run the credential-free Claude Code smoke")
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skipf("claude CLI not on PATH: %v", err)
+	}
+	out, err := exec.Command("claude", "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("claude --version failed: %v\n%s", err, string(out))
+	}
+	host, _ := runtimecap.LookupHost("claude-code")
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "real-smoke"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostCallbacks) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostWakeUp) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostAcknowledgment) != runtimecap.HostCapabilityUnsupported {
+		t.Fatalf("real Claude Code smoke declared unsupported callback/wake/ack incorrectly: %#v", contract.Progress)
 	}
 }
 

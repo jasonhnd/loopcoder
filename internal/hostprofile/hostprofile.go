@@ -138,27 +138,48 @@ func detect(contract runtimecap.Contract, getenv func(string) string) Resolved {
 }
 
 func CodexOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "codex-cli", "codex-cli-thread", []string{
+		"CODEX_THREAD_ID",
+		"CODEX_SESSION_ID",
+	}, []string{
+		"CODEX_CLI",
+	})
+}
+
+func ClaudeOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "claude-code", "claude-code-session", []string{
+		"CLAUDE_CODE_SESSION_ID",
+	}, []string{
+		"CLAUDECODE",
+		"CLAUDE_CODE_ENTRYPOINT",
+	})
+}
+
+func originBindingRequest(opts OriginOptions, host, kind string, opaqueEnvNames, markerEnvNames []string) (runtimecap.HostRunOriginBindingRequest, bool) {
 	getenv := opts.Getenv
 	if getenv == nil {
 		getenv = func(string) string { return "" }
 	}
-	threadID := strings.TrimSpace(getenv("CODEX_THREAD_ID"))
-	sessionID := strings.TrimSpace(getenv("CODEX_SESSION_ID"))
-	opaque := firstNonEmpty(threadID, sessionID)
+	metadata := map[string]string{
+		"host": host,
+	}
+	var opaqueValues []string
+	for _, envName := range opaqueEnvNames {
+		value := strings.TrimSpace(getenv(envName))
+		if value == "" {
+			continue
+		}
+		opaqueValues = append(opaqueValues, value)
+		metadata["env."+envName] = "present"
+	}
+	opaque := firstNonEmpty(opaqueValues...)
 	if opaque == "" {
 		return runtimecap.HostRunOriginBindingRequest{}, false
 	}
-	metadata := map[string]string{
-		"host": "codex-cli",
-	}
-	if threadID != "" {
-		metadata["env.CODEX_THREAD_ID"] = "present"
-	}
-	if sessionID != "" {
-		metadata["env.CODEX_SESSION_ID"] = "present"
-	}
-	if strings.TrimSpace(getenv("CODEX_CLI")) != "" {
-		metadata["env.CODEX_CLI"] = "present"
+	for _, envName := range markerEnvNames {
+		if strings.TrimSpace(getenv(envName)) != "" {
+			metadata["env."+envName] = "present"
+		}
 	}
 	return runtimecap.HostRunOriginBindingRequest{
 		ProjectID:     strings.TrimSpace(opts.ProjectID),
@@ -166,7 +187,7 @@ func CodexOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBind
 		CorrelationID: strings.TrimSpace(opts.CorrelationID),
 		Origin: runtimecap.HostRunOriginDeclaration{
 			SchemaVersion: runtimecap.HostRunOriginSchemaVersion,
-			Kind:          "codex-cli-thread",
+			Kind:          kind,
 			OpaqueID:      opaque,
 			Metadata:      metadata,
 		},

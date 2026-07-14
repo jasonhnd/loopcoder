@@ -4400,8 +4400,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.Model = selection.Model
 	opts.Effort = selection.Effort
 
-	if err := replayCodexHostProgressBeforeDispatch(context.Background(), opts.RepoPath, opts.RunID, stderr, deps); err != nil {
-		fmt.Fprintf(stderr, "dispatch: replay Codex host progress: %v\n", err)
+	if err := replayCurrentHostProgressBeforeDispatch(context.Background(), opts.RepoPath, opts.RunID, stderr, deps); err != nil {
+		fmt.Fprintf(stderr, "dispatch: replay host progress: %v\n", err)
 		return 1
 	}
 
