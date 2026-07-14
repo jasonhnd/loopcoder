@@ -5422,16 +5422,21 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 		stdout string
 		stderr string
 	}
-	start := make(chan struct{})
+	recoverStart := make(chan struct{})
+	controlStart := make(chan struct{})
 	releaseLaunch := make(chan struct{})
 	launchedOnce := make(chan struct{}, 1)
 	results := make(chan commandResult, 4)
 	var wg sync.WaitGroup
+	var controlWG sync.WaitGroup
 	var mu sync.Mutex
 	var launched int
 	var launchedPIDs []int
-	run := func(name string, args []string, deps Deps) {
+	run := func(name string, args []string, deps Deps, start <-chan struct{}, control bool) {
 		defer wg.Done()
+		if control {
+			defer controlWG.Done()
+		}
 		<-start
 		var stdout, stderr bytes.Buffer
 		code := RunWithDeps(args, &stdout, &stderr, deps)
@@ -5463,23 +5468,51 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt, "--format", "json",
 	}
 	wg.Add(4)
+	controlWG.Add(2)
 	go run("attach", []string{
 		"attach", "--repo", repo, "--run", claim.RunID,
 		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
 		"--format", "jsonl", "--follow-for", "1ns", "--poll", "1ns",
-	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }}, controlStart, true)
 	go run("cancel", []string{
 		"cancel", "--repo", repo, "--run", claim.RunID,
 		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
 		"--format", "json",
-	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
-	go run("recover-a", recoverArgs, recoverDeps)
-	go run("recover-b", recoverArgs, recoverDeps)
-	close(start)
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }}, controlStart, true)
+	go run("recover-a", recoverArgs, recoverDeps, recoverStart, false)
+	go run("recover-b", recoverArgs, recoverDeps, recoverStart, false)
+	close(recoverStart)
 	select {
 	case <-launchedOnce:
 	case <-time.After(time.Second):
 		t.Fatal("recover attempts did not launch any detached supervisor")
+	}
+	close(controlStart)
+	controlDone := make(chan struct{})
+	go func() {
+		controlWG.Wait()
+		close(controlDone)
+	}()
+	select {
+	case <-controlDone:
+	case <-time.After(time.Second):
+		t.Fatal("old-generation attach/cancel did not complete while recovered launch was blocked")
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2*time.Minute + time.Second) }})
+	if err != nil {
+		t.Fatalf("reopen store during blocked launch: %v", err)
+	}
+	inFlightRecord, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		store.Close()
+		t.Fatalf("Get during blocked launch: %v", err)
+	}
+	store.Close()
+	if inFlightRecord.Generation != 2 || inFlightRecord.LaunchPhase != detachedrun.PhaseClaimed || inFlightRecord.ProcessPID != 0 {
+		t.Fatalf("record during blocked launch = %#v, want claimed generation 2 without pid", inFlightRecord)
+	}
+	if inFlightRecord.LaunchPhase == detachedrun.PhaseTerminal || inFlightRecord.TerminalAt != "" || inFlightRecord.TerminalReceiptID != "" {
+		t.Fatalf("old-generation controls terminalized recovered generation during blocked launch: %#v", inFlightRecord)
 	}
 	close(releaseLaunch)
 	wg.Wait()
@@ -5495,10 +5528,15 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	var gotResults []commandResult
+	resultsByName := make(map[string]commandResult)
 	recoverExecutors := 0
 	recoverResults := 0
 	for result := range results {
 		gotResults = append(gotResults, result)
+		if _, exists := resultsByName[result.name]; exists {
+			t.Fatalf("duplicate command result for %s: %#v", result.name, gotResults)
+		}
+		resultsByName[result.name] = result
 		if strings.HasPrefix(result.name, "recover-") {
 			if result.code == 0 {
 				var recovered detachedrun.StatusResult
@@ -5506,6 +5544,11 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 				recoverResults++
 				if recovered.Execute || recovered.ReplayAction == "recovered" {
 					recoverExecutors++
+					if recovered.Record.Generation != 2 || recovered.Record.LaunchPhase != detachedrun.PhaseSpawned {
+						t.Fatalf("winning recovery result = %#v, want spawned generation 2", recovered)
+					}
+				} else if recovered.Execute || recovered.Record.Generation != 2 {
+					t.Fatalf("losing recovery result mutated or left recovered generation: %#v", recovered)
 				}
 			} else if !strings.Contains(result.stderr, "no longer matches") {
 				t.Fatalf("recover command failed without stale-fence evidence: %#v", result)
@@ -5514,6 +5557,17 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 	}
 	if len(gotResults) != 4 {
 		t.Fatalf("results = %d, want 4: %#v", len(gotResults), gotResults)
+	}
+	for _, name := range []string{"attach", "cancel", "recover-a", "recover-b"} {
+		if _, ok := resultsByName[name]; !ok {
+			t.Fatalf("missing command result %q in %#v", name, gotResults)
+		}
+	}
+	for _, name := range []string{"attach", "cancel"} {
+		result := resultsByName[name]
+		if result.code == 0 || !strings.Contains(result.stderr, "no longer matches") {
+			t.Fatalf("%s old-generation command result = %#v, want stale-fence failure", name, result)
+		}
 	}
 	if recoverResults == 0 || recoverExecutors != 1 {
 		t.Fatalf("recover results = %d executor wins = %d, want at least one result and exactly one executor: %#v", recoverResults, recoverExecutors, gotResults)
