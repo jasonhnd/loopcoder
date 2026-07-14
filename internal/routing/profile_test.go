@@ -36,6 +36,15 @@ func TestBuiltInRoutingPolicyProfilesAreProviderNeutralAndVersioned(t *testing.T
 		if profile.BudgetSettings.AllowPaidOverage {
 			t.Fatalf("profile %s allows paid overage", profile.ProfileKey)
 		}
+		if profile.ProfileKey == ProfileKeyBalanced {
+			if profile.OptimizationPolicy.StrategyKey != StrategyBalanced ||
+				profile.OptimizationPolicy.TargetUtilizationBP != DefaultTargetUtilization ||
+				profile.OptimizationPolicy.CompletionReserveBP != 500 ||
+				profile.OptimizationPolicy.VerificationReserveBP != 800 ||
+				profile.OptimizationPolicy.AllowPaidOverage {
+				t.Fatalf("balanced profile strategy defaults = %#v", profile.OptimizationPolicy)
+			}
+		}
 	}
 	for _, key := range []string{ProfileKeyFast, ProfileKeyBalanced, ProfileKeyDeep} {
 		if !seen[key] {
@@ -213,6 +222,44 @@ func TestOverrideProvenanceCannotBypassHardGates(t *testing.T) {
 	}}, time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC))
 	if !diagnosticHasCode(diagnostics, taskrequirements.ErrorCode(delivery.ErrPolicyDeniedCode)) {
 		t.Fatalf("diagnostics = %#v, want hard-gate policy denial", diagnostics)
+	}
+}
+
+func TestManualResetAndUnavailableOverridesAreBoundedAndExpiring(t *testing.T) {
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	for _, override := range []OverrideProvenance{
+		{
+			OverrideID:               "ovr-manual-reset",
+			OverrideKind:             "manual-reset",
+			Reason:                   "operator cleared a stale cooldown after fresh capacity event",
+			Scope:                    "manual-reset task:task-a",
+			ExpiresAt:                now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+			Actor:                    delivery.Actor{ActorKind: "user", ActorID: "local-user", DecisionAuthority: "user", Source: "test"},
+			Host:                     routingHost(),
+			PolicyFingerprint:        testFingerprint("policy"),
+			AuthorizationFingerprint: testFingerprint("auth"),
+			Source:                   "test",
+		},
+		{
+			OverrideID:               "ovr-unavailable",
+			OverrideKind:             "manual-unavailable-until",
+			Reason:                   "operator marked candidate unavailable until reset",
+			Scope:                    "manual-unavailable-until run:drun-routing",
+			ExpiresAt:                now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+			Actor:                    delivery.Actor{ActorKind: "user", ActorID: "local-user", DecisionAuthority: "user", Source: "test"},
+			Host:                     routingHost(),
+			PolicyFingerprint:        testFingerprint("policy"),
+			AuthorizationFingerprint: testFingerprint("auth"),
+			Source:                   "test",
+		},
+	} {
+		if diagnostics := ValidateOverrideProvenance([]OverrideProvenance{override}, now, testFingerprint("policy"), testFingerprint("auth")); len(diagnostics) != 0 {
+			t.Fatalf("override %s diagnostics = %#v, want valid bounded override", override.OverrideID, diagnostics)
+		}
+		override.ExpiresAt = now.Add(-time.Minute).Format(time.RFC3339Nano)
+		if diagnostics := ValidateOverrideProvenance([]OverrideProvenance{override}, now, testFingerprint("policy"), testFingerprint("auth")); len(diagnostics) == 0 {
+			t.Fatalf("override %s with expired unavailable/reset override unexpectedly valid", override.OverrideID)
+		}
 	}
 }
 

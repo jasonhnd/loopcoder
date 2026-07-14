@@ -1163,6 +1163,15 @@ func quota(id, adapterID, installationID, accountID, modelID string, confidence 
 	}
 }
 
+func quotaWithReset(id, adapterID, installationID, accountID, modelID string, confidence providerinventory.Confidence, freshness providerinventory.FreshnessState, remaining int64, capturedAt, resetAt time.Time) providerinventory.QuotaSnapshot {
+	snapshot := quota(id, adapterID, installationID, accountID, modelID, confidence, freshness, remaining, capturedAt)
+	snapshot.ResetAt = resetAt.UTC().Format(time.RFC3339Nano)
+	snapshot.WindowEnd = snapshot.ResetAt
+	snapshot.ValidUntil = snapshot.ResetAt
+	snapshot.StaleAfter = resetAt.UTC().Format(time.RFC3339Nano)
+	return snapshot
+}
+
 func budgetSummary(id, adapterID, accountID, modelID string, available int64) budget.Summary {
 	return budget.Summary{
 		BudgetPolicyID: id,

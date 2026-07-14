@@ -260,9 +260,9 @@ func TestRouteDecisionQuotaAndCostEvidenceStayWithScoreProducingRecord(t *testin
 	if len(decision.ScoredCandidates) != 1 {
 		t.Fatalf("scored candidates = %#v, want one", decision.ScoredCandidates)
 	}
-	quotaScore := componentByName(t, decision.ScoredCandidates[0].Components, ComponentQuotaHeadroom)
-	if quotaScore.Confidence != providerinventory.ConfidenceEstimated || !quotaScore.Heuristic || quotaScore.EvidenceValue == nil || *quotaScore.EvidenceValue != 80 || len(quotaScore.SnapshotIDs) != 1 || quotaScore.SnapshotIDs[0] != highQuota.QuotaSnapshotID {
-		t.Fatalf("quota component mixed evidence: %#v", quotaScore)
+	trustScore := componentByName(t, decision.ScoredCandidates[0].Components, ComponentCapacityTrust)
+	if trustScore.Confidence != providerinventory.ConfidenceEstimated || !trustScore.Heuristic || trustScore.EvidenceValue == nil || *trustScore.EvidenceValue != 80 || len(trustScore.SnapshotIDs) != 1 || trustScore.SnapshotIDs[0] != highQuota.QuotaSnapshotID {
+		t.Fatalf("capacity trust component mixed evidence: %#v", trustScore)
 	}
 	costScore := componentByName(t, decision.ScoredCandidates[0].Components, ComponentCost)
 	if costScore.Confidence != providerinventory.ConfidenceEstimated || !costScore.Heuristic || costScore.EvidenceValue == nil || *costScore.EvidenceValue != 90 || len(costScore.EvidenceRecordIDs) != 1 || costScore.EvidenceRecordIDs[0] != highBudget.BudgetPolicyID {
@@ -298,11 +298,13 @@ func TestRouteDecisionDefaultBalancedV1WeightsAndAvailabilityComponent(t *testin
 		t.Fatalf("BuildRoutingDecision: %v", err)
 	}
 	wantWeights := map[ComponentName]int{
-		ComponentAvailability:  30,
-		ComponentQuotaHeadroom: 20,
+		ComponentExpiryUrgency: 15,
+		ComponentTaskHeadroom:  15,
+		ComponentCapacityTrust: 10,
 		ComponentQualityFit:    20,
-		ComponentLatency:       10,
 		ComponentCost:          10,
+		ComponentLatency:       10,
+		ComponentHealth:        10,
 		ComponentDiversity:     10,
 	}
 	if len(decision.OptimizationPolicy.Weights) != len(wantWeights) {
@@ -317,13 +319,223 @@ func TestRouteDecisionDefaultBalancedV1WeightsAndAvailabilityComponent(t *testin
 		if len(candidate.Components) != len(wantWeights) {
 			t.Fatalf("components = %#v, want exactly %d default components", candidate.Components, len(wantWeights))
 		}
-		if !hasComponent(candidate.Components, ComponentAvailability) {
-			t.Fatalf("components missing availability score: %#v", candidate.Components)
+		if !hasComponent(candidate.Components, ComponentHealth) {
+			t.Fatalf("components missing health score: %#v", candidate.Components)
 		}
-		if hasComponent(candidate.Components, "health") || hasComponent(candidate.Components, ComponentLocality) || hasComponent(candidate.Components, ComponentUserPreference) {
+		if hasComponent(candidate.Components, ComponentAvailability) || hasComponent(candidate.Components, ComponentQuotaHeadroom) || hasComponent(candidate.Components, ComponentLocality) || hasComponent(candidate.Components, ComponentUserPreference) {
 			t.Fatalf("balanced-v1 silently included non-default component: %#v", candidate.Components)
 		}
 	}
+}
+
+func TestRouteDecisionNearResetBurnWinsOnlyWhenTaskFitsResetBand(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	near := fixture.candidate("codex", "acct-a", "codex-good")
+	distant := fixture.candidate("claude", "acct-c", "claude-good")
+	nearQuota := quotaWithReset("qsnap-near-80", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 80, fixture.now, fixture.now.Add(10*time.Minute))
+	distantQuota := quotaWithReset("qsnap-distant-90", "claude", "pinst-claude", "acct-c", "claude-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 90, fixture.now, fixture.now.Add(2*time.Hour))
+	near.QuotaSnapshotIDs = []string{nearQuota.QuotaSnapshotID}
+	distant.QuotaSnapshotIDs = []string{distantQuota.QuotaSnapshotID}
+	near.BudgetPolicyIDs = []string{"bpol-codex-a"}
+	distant.BudgetPolicyIDs = []string{"bpol-claude"}
+	input.Inputs.Candidates = []Candidate{near, distant}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, nearQuota, distantQuota)
+	input.OptimizationPolicy = OptimizationPolicy{StrategyKey: StrategyBurnBeforeReset}
+	req := input.Inputs.Requirement
+	req.RiskTier = taskrequirements.RiskLow
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+	input.TaskRequirementID = req.TaskRequirementID
+	input.Inputs.Requirement = req
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision very-short: %v", err)
+	}
+	if selected := selectedCandidate(decision); selected.RoutingCandidateID != near.RoutingCandidateID {
+		t.Fatalf("selected = %s, rejected=%#v, want near reset 80%% candidate when task fits under-15m band", selected.RoutingCandidateID, decision.RejectedCandidates)
+	}
+	nearExpiry := componentByName(t, decision.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+	if nearExpiry.ResetWindow != "under-15m" || nearExpiry.TaskClass != "very-short" || nearExpiry.ExpectedWaste == nil {
+		t.Fatalf("near expiry component = %#v, want under-15m very-short with expected waste", nearExpiry)
+	}
+
+	req.RiskTier = taskrequirements.RiskHigh
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+	input.Inputs.Requirement = req
+	decision, err = BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision medium: %v", err)
+	}
+	if selected := selectedCandidate(decision); selected.RoutingCandidateID != distant.RoutingCandidateID {
+		t.Fatalf("selected = %s, want distant reset candidate when near under-15m window cannot fit medium task", selected.RoutingCandidateID)
+	}
+}
+
+func TestRouteDecisionStrategiesAndResetBandsAreDeterministic(t *testing.T) {
+	fixture := newFixture(t)
+	for _, strategy := range []string{StrategyQualityFirst, StrategyBalanced, StrategyBurnBeforeReset} {
+		for _, tc := range []struct {
+			name      string
+			reset     time.Duration
+			wantBand  string
+			wantClass string
+			risk      taskrequirements.RiskTier
+		}{
+			{name: "under-15m", reset: 10 * time.Minute, wantBand: "under-15m", wantClass: "very-short", risk: taskrequirements.RiskLow},
+			{name: "15-60m", reset: 30 * time.Minute, wantBand: "15-60m", wantClass: "short", risk: taskrequirements.RiskMedium},
+			{name: "over-1h", reset: 2 * time.Hour, wantBand: "over-1h", wantClass: "medium", risk: taskrequirements.RiskHigh},
+		} {
+			t.Run(strategy+"/"+tc.name, func(t *testing.T) {
+				input := replayDecisionInput(fixture)
+				candidate := fixture.candidate("codex", "acct-a", "codex-good")
+				snap := quotaWithReset("qsnap-"+strategy+"-"+tc.name, "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 100, fixture.now, fixture.now.Add(tc.reset))
+				candidate.QuotaSnapshotIDs = []string{snap.QuotaSnapshotID}
+				input.Inputs.Candidates = []Candidate{candidate}
+				input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, snap)
+				req := input.Inputs.Requirement
+				req.RiskTier = tc.risk
+				req.QualityFloor = taskrequirements.QualityStandard
+				req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+				input.TaskRequirementID = req.TaskRequirementID
+				input.Inputs.Requirement = req
+				input.OptimizationPolicy = OptimizationPolicy{StrategyKey: strategy}
+				decision, err := BuildRoutingDecision(input)
+				if err != nil {
+					t.Fatalf("BuildRoutingDecision: %v", err)
+				}
+				if got := decision.OptimizationPolicy.StrategyKey; got != strategy {
+					t.Fatalf("strategy = %s, want %s", got, strategy)
+				}
+				component := componentByName(t, decision.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+				if component.ResetWindow != tc.wantBand || component.TaskClass != tc.wantClass {
+					t.Fatalf("expiry component = %#v, want band %s class %s", component, tc.wantBand, tc.wantClass)
+				}
+			})
+		}
+	}
+}
+
+func TestRouteDecisionHardRequirementsBeatQuotaAbundanceAndUnknownCapacity(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	good := fixture.candidate("codex", "acct-a", "codex-good")
+	abundantBroken := fixture.candidate("codex", "acct-a", "codex-broken")
+	unknown := fixture.candidate("claude", "acct-c", "claude-good")
+	goodQuota := quotaWithReset("qsnap-good-10", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 10, fixture.now, fixture.now.Add(2*time.Hour))
+	abundantQuota := quotaWithReset("qsnap-broken-999", "codex", "pinst-codex", "acct-a", "codex-broken", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 999, fixture.now, fixture.now.Add(10*time.Minute))
+	good.QuotaSnapshotIDs = []string{goodQuota.QuotaSnapshotID}
+	abundantBroken.QuotaSnapshotIDs = []string{abundantQuota.QuotaSnapshotID}
+	unknown.QuotaSnapshotIDs = nil
+	input.Inputs.Candidates = []Candidate{good, abundantBroken, unknown}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, goodQuota, abundantQuota)
+	input.OptimizationPolicy = OptimizationPolicy{StrategyKey: StrategyBurnBeforeReset}
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if selected := selectedCandidate(decision); selected.RoutingCandidateID != good.RoutingCandidateID {
+		t.Fatalf("selected = %#v, want hard-eligible capable route", selected)
+	}
+	if containsScoredCandidate(decision.ScoredCandidates, abundantBroken.RoutingCandidateID) {
+		t.Fatalf("abundant hard-ineligible candidate was scored: %#v", decision.ScoredCandidates)
+	}
+	var sawUnknown bool
+	for _, scored := range decision.ScoredCandidates {
+		if scored.RoutingCandidateID == unknown.RoutingCandidateID {
+			sawUnknown = true
+			if componentByName(t, scored.Components, ComponentTaskHeadroom).Score != 0 || componentByName(t, scored.Components, ComponentCapacityTrust).Score != 0 {
+				t.Fatalf("unknown capacity scored as usable: %#v", scored.Components)
+			}
+		}
+	}
+	if !sawUnknown {
+		t.Fatalf("unknown-capacity candidate should remain eligible but score zero capacity when other hard requirements pass")
+	}
+}
+
+func TestRouteDecisionPaidOverageRequiresExplicitPolicy(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	snap := quotaWithReset("qsnap-paid-overage", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 100, fixture.now, fixture.now.Add(time.Hour))
+	snap.GapReasons = []string{"paid-overage"}
+	candidate.QuotaSnapshotIDs = []string{snap.QuotaSnapshotID}
+	input.Inputs.Candidates = []Candidate{candidate}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, snap)
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision default: %v", err)
+	}
+	if decision.DecisionStatus != DecisionStatusNoEligible || !rejectedHas(Result{Rejected: decision.RejectedCandidates}, candidate.RoutingCandidateID, RejectBudgetExhausted) {
+		t.Fatalf("decision = %#v, want paid overage rejected by default", decision)
+	}
+
+	input.Inputs.Policy.AllowPaidOverage = true
+	input.OptimizationPolicy.AllowPaidOverage = true
+	decision, err = BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision explicit overage: %v", err)
+	}
+	if selected := selectedCandidate(decision); selected.RoutingCandidateID != candidate.RoutingCandidateID {
+		t.Fatalf("selected = %#v, want explicit paid overage policy to allow candidate", selected)
+	}
+}
+
+func TestRouteDecisionExplainAndReevaluationIncludeResetStrategyEvidence(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	first := quotaWithReset("qsnap-reset-first", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 80, fixture.now, fixture.now.Add(30*time.Minute))
+	candidate.QuotaSnapshotIDs = []string{first.QuotaSnapshotID}
+	input.Inputs.Candidates = []Candidate{candidate}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, first)
+	input.OptimizationPolicy = OptimizationPolicy{StrategyKey: StrategyBalanced}
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision first: %v", err)
+	}
+	human := ExplainHuman(decision)
+	for _, want := range []string{"strategy balanced", "reset window 15-60m", "confidence=", "freshness=", "component expiry_urgency", "expected_waste_avoided"} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("human explain missing %q:\n%s", want, human)
+		}
+	}
+
+	second := quotaWithReset("qsnap-reset-second", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 80, fixture.now.Add(time.Minute), fixture.now.Add(10*time.Minute))
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, second)
+	input.Inputs.Candidates[0].QuotaSnapshotIDs = []string{second.QuotaSnapshotID}
+	secondDecision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision fresh event: %v", err)
+	}
+	if secondDecision.RoutingFingerprint == decision.RoutingFingerprint {
+		t.Fatalf("routing fingerprint did not change after fresh capacity event")
+	}
+	if componentByName(t, secondDecision.ScoredCandidates[0].Components, ComponentExpiryUrgency).ResetWindow != "under-15m" {
+		t.Fatalf("fresh event did not re-evaluate reset band: %#v", secondDecision.ScoredCandidates[0].Components)
+	}
+}
+
+func TestRouteDecisionDryRunExplainDoesNotPersist(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	input := replayDecisionInput(fixture)
+	explain, err := DryRunExplainRoute(input)
+	if err != nil {
+		t.Fatalf("DryRunExplainRoute: %v", err)
+	}
+	if explain.Decision.RoutingDecisionID == "" || !strings.Contains(explain.Human, "strategy balanced") || !strings.Contains(string(explain.Stable), `"scored_candidates"`) {
+		t.Fatalf("dry-run explain incomplete: %#v", explain)
+	}
+	assertRoutingDecisionCount(t, ctx, store, "proj-routing", "drun-routing", "route-worker", 0)
 }
 
 func TestRouteDecisionRejectsInvalidWeightsBeforeScoring(t *testing.T) {

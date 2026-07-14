@@ -281,7 +281,8 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 		if originalCandidateCount == 0 || len(evaluated.Candidates) > 0 {
 			eligibility = FilterHardEligibility(evaluated)
 		}
-		scored := scoreCandidates(eligibility.Eligible, evaluated, profile.OptimizationPolicy)
+		now := store.Now()
+		scored := scoreCandidates(eligibility.Eligible, evaluated, profile.OptimizationPolicy, now)
 		selected := Candidate{}
 		if len(scored) > 0 {
 			selected = scored[0].Candidate
@@ -291,7 +292,7 @@ func DecideAndPersistFallback(ctx context.Context, store storage.Store, input Fa
 			return err
 		}
 		used := len(chain)
-		decision := buildFallbackDecision(original, profile, input, selected, eligibility, fingerprint, idempotencyKey, used+1, store.Now())
+		decision := buildFallbackDecision(original, profile, input, selected, eligibility, fingerprint, idempotencyKey, used+1, now)
 		if used >= profile.FallbackPolicy.MaxFallbacks {
 			decision.FallbackCandidateID = ""
 			decision.SelectedCandidateID = ""

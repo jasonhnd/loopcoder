@@ -122,6 +122,7 @@ type Policy struct {
 	RequireBoundedScope         bool
 	ContextReserveTokens        int
 	VerifierIndependence        taskrequirements.IndependenceLevel
+	AllowPaidOverage            bool
 	AllowHalfOpenBreakerProbe   bool
 }
 
@@ -574,6 +575,9 @@ func evaluateQuota(candidate Candidate, quotaByID map[string]providerinventory.Q
 		if len(snapshot.ConflictSet) > 0 {
 			reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota snapshots conflict", snapshot.ConflictSet, []string{snapshot.QuotaSnapshotID}))
 		}
+		if hasString(snapshot.GapReasons, "paid-overage") && !policy.AllowPaidOverage {
+			reasons = append(reasons, reason(RejectBudgetExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "paid overage is disabled by routing policy", nil, []string{snapshot.QuotaSnapshotID}))
+		}
 		if snapshot.Confidence == providerinventory.ConfidenceExact && snapshot.FreshnessState == providerinventory.FreshnessFresh {
 			sawFreshExact = true
 		}
@@ -751,6 +755,15 @@ func confidenceRank(value providerinventory.Confidence) int {
 	default:
 		return 0
 	}
+}
+
+func hasString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func roleSupported(role string, roles []providerinventory.CatalogRole) bool {

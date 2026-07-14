@@ -732,6 +732,7 @@ func profileTemplate(key string, now time.Time, weights map[ComponentName]int, b
 			RequireBoundedScope:         true,
 			ContextReserveTokens:        8000,
 			VerifierIndependence:        highIndependence,
+			AllowPaidOverage:            false,
 		},
 		OptimizationPolicy: OptimizationPolicy{
 			SchemaVersion:  "loopcoder.routing_optimization_policy.v1",
@@ -807,6 +808,7 @@ func normalizeRoutingPolicyProfile(profile RoutingPolicyProfile) RoutingPolicyPr
 	profile.OptimizationPolicy.RoutingPolicyProfileID = profile.RoutingPolicyProfileID
 	profile.OptimizationPolicy.ProfileKey = firstNonEmpty(profile.OptimizationPolicy.ProfileKey, profile.ProfileKey)
 	profile.OptimizationPolicy.ProfileVersion = firstNonEmpty(profile.OptimizationPolicy.ProfileVersion, profile.ProfileVersion)
+	profile.OptimizationPolicy.AllowPaidOverage = profile.BudgetSettings.AllowPaidOverage
 	opt, err := normalizeOptimizationPolicy(profile.OptimizationPolicy, profile.RoutingPolicyProfileID)
 	if err == nil {
 		profile.OptimizationPolicy = opt
@@ -1016,9 +1018,9 @@ func supportedBoundedOverride(kind, scope string) bool {
 	if kind == "" || scope == "" {
 		return false
 	}
-	for _, allowedKind := range []string{"routing", "routing-preference", "fallback", "fallback-preference", "replan", "budget", "budget-preference"} {
+	for _, allowedKind := range []string{"routing", "routing-preference", "manual-unavailable-until", "manual-reset", "fallback", "fallback-preference", "replan", "budget", "budget-preference"} {
 		if kind == allowedKind {
-			for _, allowedScope := range []string{"routing-preference", "fallback-preference", "replan", "budget-preference", "task:", "run:"} {
+			for _, allowedScope := range []string{"routing-preference", "manual-unavailable-until", "manual-reset", "fallback-preference", "replan", "budget-preference", "task:", "run:"} {
 				if strings.Contains(scope, allowedScope) {
 					return true
 				}
