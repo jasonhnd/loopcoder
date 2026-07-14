@@ -1694,6 +1694,91 @@ func TestClaimChildRunExecutionExpiredExecutingClaimNeedsHuman(t *testing.T) {
 	}
 }
 
+func TestPropagateRunTreeTerminalClassifiesLaunchedChildLostAndReleasesAuthority(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	parent, children, plan, edges := validChildPlanGraphFixture()
+	if err := PersistChildPlanGraph(ctx, store, parent, children, plan, edges); err != nil {
+		t.Fatalf("PersistChildPlanGraph: %v", err)
+	}
+	childRunID := children[0].RunID
+	req := nestedSchedulerStorageBudgetRequest(childRunID)
+	if err := seedNestedSchedulerStorageBudgetAuthority(ctx, store, req, "codex", true); err != nil {
+		t.Fatalf("seed budget authority: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 0, 0, 1, 0, time.UTC)
+	claim, err := ClaimChildRunExecutionWithReservations(ctx, store, parent.RunID, childRunID, "executor-cancel", now, now.Add(time.Hour), req)
+	if err != nil {
+		t.Fatalf("ClaimChildRunExecutionWithReservations: %v", err)
+	}
+	if err := UpdateChildRunClaimPhase(ctx, store, parent.RunID, childRunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, formatTimestamp(now.Add(time.Second)), ""); err != nil {
+		t.Fatalf("UpdateChildRunClaimPhase executing: %v", err)
+	}
+
+	results, err := PropagateRunTreeTerminal(ctx, store, RunTreeTerminalRequest{
+		RunID:     parent.RunID,
+		Status:    "cancelled",
+		UpdatedAt: formatTimestamp(now.Add(2 * time.Second)),
+		Reason:    "parent cancellation",
+		Source:    "test",
+	})
+	if err != nil {
+		t.Fatalf("PropagateRunTreeTerminal: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v, want parent and child", results)
+	}
+
+	var childStatus, edgeStatus, resourceState, budgetState string
+	var activeResources, eventCount int
+	var aggregateReserved int64
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = ?`, childRunID).Scan(&childStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status FROM run_edges WHERE parent_run_id = ? AND child_run_id = ?`, parent.RunID, childRunID).Scan(&edgeStatus); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM nested_scheduler_resource_reservations WHERE run_id = ? AND state = 'active'`, childRunID).Scan(&activeResources); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state FROM nested_scheduler_resource_reservations WHERE run_id = ? LIMIT 1`, childRunID).Scan(&resourceState); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT state FROM budget_reservations WHERE sub_agent_id = ? LIMIT 1`, childRunID).Scan(&budgetState); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT reserved_value FROM budget_aggregates WHERE budget_policy_id = 'bpol-storage-project'`).Scan(&aggregateReserved); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id = ?`, childRunID).Scan(&eventCount)
+	}); err != nil {
+		t.Fatalf("query propagated state: %v", err)
+	}
+	if childStatus != "lost" || edgeStatus != "lost" || activeResources != 0 || resourceState != schedulerReservationStateReleased || budgetState != "cancelled" || aggregateReserved != 0 {
+		t.Fatalf("propagated state child=%q edge=%q active_resources=%d resource=%q budget=%q reserved=%d, want lost/lost released/cancelled/0",
+			childStatus, edgeStatus, activeResources, resourceState, budgetState, aggregateReserved)
+	}
+
+	if _, err := PropagateRunTreeTerminal(ctx, store, RunTreeTerminalRequest{RunID: parent.RunID, Status: "cancelled", UpdatedAt: formatTimestamp(now.Add(3 * time.Second)), Reason: "replay", Source: "test"}); err != nil {
+		t.Fatalf("PropagateRunTreeTerminal replay: %v", err)
+	}
+	var replayEventCount int
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id = ?`, childRunID).Scan(&replayEventCount)
+	}); err != nil {
+		t.Fatalf("query replay events: %v", err)
+	}
+	if replayEventCount != eventCount {
+		t.Fatalf("replay event count = %d, want unchanged %d", replayEventCount, eventCount)
+	}
+}
+
 func TestWithWriteTxRollbackFailureDiscardsConnection(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: fixedNow})

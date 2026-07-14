@@ -3655,7 +3655,7 @@ func actionRequiresClaim(action string) bool {
 
 func normalizeClosedChildStatus(status string) (string, bool) {
 	switch normalizeDurableStatus(status) {
-	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "launching", "running", "waiting", "queued", "blocked":
+	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "launching", "running", "waiting", "queued", "blocked", "lost":
 		return normalizeDurableStatus(status), true
 	default:
 		return "", false

@@ -47,6 +47,11 @@ func TestScrubRedactsSecretPatterns(t *testing.T) {
 			want: "key [REDACTED_API_KEY]",
 		},
 		{
+			name: "aws access key",
+			in:   "key " + "AKIA" + strings.Repeat("A", 16),
+			want: "key [REDACTED_AWS_ACCESS_KEY]",
+		},
+		{
 			name: "bearer token",
 			in:   "Authorization: Bearer abc.def_ghi~jkl+/=-",
 			want: "Authorization: Bearer [REDACTED_TOKEN]",

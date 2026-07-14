@@ -18,9 +18,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -400,10 +402,15 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 			if command == "" {
 				continue
 			}
-			cmd := shellCommand(runCtx, command)
+			cmd := shellCommand(context.Background(), command)
 			cmd.Dir = opts.RepoPath
-			out, err := cmd.CombinedOutput()
-			output.Write(out)
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{
+				HardCap: nestedSubprocessHardCap(metadata),
+				RunID:   child.RunID,
+				Role:    "nested-test-subprocess",
+			})
 			if err != nil {
 				status = normalizeExecutorFailureStatus(err)
 				exitCode = commandExitCode(err)
@@ -412,9 +419,22 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 				}
 				break
 			}
+			if result.Killed {
+				status = orchestration.NestedStatusTimedOut
+				exitCode = 1
+				if runCtx.Err() != nil {
+					status = normalizeExecutorFailureStatus(runCtx.Err())
+				}
+				break
+			}
+			if result.ExitCode != 0 {
+				status = orchestration.NestedStatusFailed
+				exitCode = result.ExitCode
+				break
+			}
 		}
 		ended := deps.Now().UTC()
-		summary := strings.TrimSpace(output.String())
+		summary := strings.TrimSpace(recovery.Scrub(output.String()))
 		if summary == "" {
 			summary = "test subprocess completed"
 		}
@@ -908,6 +928,13 @@ func normalizeExecutorFailureStatus(err error) string {
 		return orchestration.NestedStatusTimedOut
 	}
 	return orchestration.NestedStatusFailed
+}
+
+func nestedSubprocessHardCap(metadata nestedChildMetadata) time.Duration {
+	if metadata.TimeoutSeconds <= 0 {
+		return supervisedexec.DefaultHardCap
+	}
+	return time.Duration(metadata.TimeoutSeconds+1) * time.Second
 }
 
 func normalizeExecutorStatus(status string) string {
