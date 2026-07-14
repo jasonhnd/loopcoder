@@ -1,0 +1,197 @@
+{
+  "fixture_schema_version": "loopcoder.evaluation.release_regression_fixture.v3",
+  "policy_schema_version": "simulation-release-policy-v3",
+  "source_issue": "714",
+  "invariants": [
+    {
+      "invariant_id": "issue-714-decision-ownership-boundaries",
+      "source": "Issue #714 Decision ownership: user owns pins/exceptions, policy owns permissions/bounds, router owns eligible scoring, scheduler owns fallback/handoff without downgrade, provider-native sub-agents stay scoped.",
+      "scenarios": [
+        "routing-pin-verifier-diversity",
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-deterministic-simulations-cover-release-failures",
+      "source": "Issue #714 release acceptance requires deterministic simulations for churn, unknown/exhausted quota, reset boundaries, rate limits, outages, nested failures, recovery, handoff, and overrides.",
+      "scenarios": [
+        "routing-churn-quota-reset-fallback",
+        "fallback-rate-limit-outage-bounded",
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "unsupported-push-wake-truthful-follow"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-durable-reproducible-consequential-decisions",
+      "source": "Issue #714 requires every consequential decision to be reproducible from durable inputs or marked heuristic.",
+      "scenarios": [
+        "routing-churn-quota-reset-fallback",
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded",
+        "unsupported-push-wake-truthful-follow"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-host-provider-independent-worker-verifier-selection",
+      "source": "Issue #714 requires host/provider matrix evidence proving conductor host independence from Worker/Verifier provider/model selection.",
+      "scenarios": [
+        "routing-pin-verifier-diversity"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-human-json-inspection-explains-decisions",
+      "source": "Issue #714 requires human and JSON inspection to explain inventory, confidence, decomposition, routes, fallback, budgets, progress, handoff, and agent trees.",
+      "scenarios": [
+        "routing-churn-quota-reset-fallback",
+        "routing-pin-verifier-diversity",
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded",
+        "unsupported-push-wake-truthful-follow"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-no-fabricated-quota-or-quota-first-unsafe-selection",
+      "source": "Issue #714 non-goals reject fabricated exact quota and quota-first unsafe selection.",
+      "scenarios": [
+        "routing-churn-quota-reset-fallback",
+        "routing-pin-verifier-diversity"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-no-uncontrolled-child-recursion",
+      "source": "Issue #714 non-goals reject uncontrolled child recursion; release acceptance requires nested failure and recovery coverage.",
+      "scenarios": [
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-recovery-replay-does-not-duplicate-side-effects",
+      "source": "Issue #714 release acceptance requires recovery, rollback, and replay evidence; consequential side effects must remain idempotent.",
+      "scenarios": [
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-security-redaction-least-privilege-bounded-side-effects",
+      "source": "Issue #714 security review acceptance covers credential isolation, redaction, least privilege, bounded side effects, and provider-native child authority.",
+      "scenarios": [
+        "handoff-crash-replay-idempotent",
+        "federation-nested-bounds-concurrency",
+        "federation-ownership-conflict",
+        "unsupported-push-wake-truthful-follow"
+      ]
+    },
+    {
+      "invariant_id": "issue-714-truthful-degrade-for-unsupported-push-wake",
+      "source": "Issue #714 requires unsupported push/wake capabilities to degrade truthfully to durable follow/poll and replay.",
+      "scenarios": [
+        "unsupported-push-wake-truthful-follow"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "routing-churn-quota-reset-fallback",
+      "focus": "model churn plus unknown, stale, exhausted, and reset quota routes to the only eligible reset-window candidate",
+      "invariants": [
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-no-fabricated-quota-or-quota-first-unsafe-selection"
+      ]
+    },
+    {
+      "scenario_id": "routing-pin-verifier-diversity",
+      "focus": "user-pinned Worker route and user-overridden Verifier route stay provider-neutral and host-independent",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-host-provider-independent-worker-verifier-selection",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-no-fabricated-quota-or-quota-first-unsafe-selection"
+      ]
+    },
+    {
+      "scenario_id": "handoff-crash-replay-idempotent",
+      "focus": "provider call, budget commit, handoff, and ownership side effects survive close/reopen replay without duplication",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-recovery-replay-does-not-duplicate-side-effects",
+        "issue-714-security-redaction-least-privilege-bounded-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "federation-nested-bounds-concurrency",
+      "focus": "scripted nested agent ownership honors deterministic concurrency, depth, breadth, replay, and one-owner bounds",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-no-uncontrolled-child-recursion",
+        "issue-714-recovery-replay-does-not-duplicate-side-effects",
+        "issue-714-security-redaction-least-privilege-bounded-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "federation-cancellation-partial-result",
+      "focus": "nested child cancellation preserves a durable partial result without external provider calls",
+      "invariants": [
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-no-uncontrolled-child-recursion",
+        "issue-714-recovery-replay-does-not-duplicate-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "federation-ownership-conflict",
+      "focus": "ownership conflict records rejection against the existing owner without creating a second owner",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-security-redaction-least-privilege-bounded-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "fallback-rate-limit-outage-bounded",
+      "focus": "provider outage rejection, retryable rate-limit receipt, and handoff attempts stay bounded by event and step limits",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions"
+      ]
+    },
+    {
+      "scenario_id": "unsupported-push-wake-truthful-follow",
+      "focus": "unsupported host push/wake is represented as truthful follow/poll evidence with no external provider calls",
+      "invariants": [
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-security-redaction-least-privilege-bounded-side-effects",
+        "issue-714-truthful-degrade-for-unsupported-push-wake"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: federation-cancellation-partial-result
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:federation-cancellation-partial-result-policy plan=sha256:federation-cancellation-partial-result-plan authorization=sha256:federation-cancellation-partial-result-auth
+sources: project=project-release-regression delivery=delivery-federation-cancellation-partial-result inventory=inventory-federation-cancellation-partial-result budget=budget-federation-cancellation-partial-result routing=routing-federation-cancellation-partial-result agent_tree=agent-tree-federation-cancellation-partial-result handoff=handoff-federation-cancellation-partial-result state=durable-state-federation-cancellation-partial-result
+truncated: false
+decisions:
+- decision_e8d88c20c819359ff134752c6fe76c47 event=event-child-partial task=task-child kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+events:
+- 001 event-child-partial kind=partial_result task=task-child status=applied decision=decision_e8d88c20c819359ff134752c6fe76c47 receipt= idem=idem_e8d88c20c819359ff134752c6fe76c47 at=2026-07-14T00:00:00Z
+durable_state:
+- applied_events=event-child-partial
+- completed_tasks=none
+- provider_receipts:
+  - none
+- host_deliveries:
+  - none
+- partial_results:
+  - partial_result_95c3098346dcadc4b1a16d470cb0b9a8 event=event-child-partial task=task-child parent=task-a status=cancelled-partial durable=true external_call=false
+- owner_conflicts:
+  - none
+- handoffs:
+  - none
+- agent_owners:
+  - none
+invariants:
+- inv-child-cancelled-partial kind=partial_result_recorded passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:9436f17d0436e10b96e46f8ecaf92fdd0c06cec28b6dbd32fb77ca65c8cfcb7c added_events=event-child-partial added_decisions=decision_e8d88c20c819359ff134752c6fe76c47

@@ -52,6 +52,7 @@ type Scenario struct {
 	ScenarioID        string                     `json:"scenario_id"`
 	Seed              int64                      `json:"seed"`
 	Clock             ClockPlan                  `json:"clock"`
+	Host              HostRuntime                `json:"host,omitempty"`
 	Limits            Limits                     `json:"limits"`
 	DurableSourceIDs  DurableSourceIDs           `json:"durable_source_ids"`
 	PolicyProvenance  PolicyProvenance           `json:"policy_provenance"`
@@ -68,6 +69,19 @@ type Scenario struct {
 type ClockPlan struct {
 	Origin string `json:"origin"`
 	StepMS int64  `json:"step_ms"`
+}
+
+type HostRuntime struct {
+	ConductorHostID string           `json:"conductor_host_id,omitempty"`
+	AdapterID       string           `json:"adapter_id,omitempty"`
+	Capabilities    HostCapabilities `json:"capabilities,omitempty"`
+}
+
+type HostCapabilities struct {
+	SupportsPush   bool `json:"supports_push"`
+	SupportsWake   bool `json:"supports_wake"`
+	SupportsFollow bool `json:"supports_follow"`
+	SupportsPoll   bool `json:"supports_poll"`
 }
 
 type Limits struct {
@@ -171,6 +185,8 @@ type Task struct {
 	TaskID              string                         `json:"task_id"`
 	TaskKey             string                         `json:"task_key"`
 	Role                providerinventory.CatalogRole  `json:"role"`
+	UserPinnedModelID   string                         `json:"user_pinned_model_id,omitempty"`
+	UserOverrideModelID string                         `json:"user_override_model_id,omitempty"`
 	RequiredQuantity    int64                          `json:"required_quantity"`
 	QuantityKind        providerinventory.QuantityKind `json:"quantity_kind"`
 	BudgetAuthorityID   string                         `json:"budget_authority_id"`
@@ -246,6 +262,8 @@ type DecisionRecord struct {
 	DecisionKind             string      `json:"decision_kind"`
 	Accepted                 bool        `json:"accepted"`
 	ChosenCandidateID        string      `json:"chosen_candidate_id,omitempty"`
+	UserPinnedModelID        string      `json:"user_pinned_model_id,omitempty"`
+	UserOverrideModelID      string      `json:"user_override_model_id,omitempty"`
 	RejectedCandidates       []Rejection `json:"rejected_candidates"`
 	QuotaSnapshotIDs         []string    `json:"quota_snapshot_ids"`
 	BudgetAuthorityID        string      `json:"budget_authority_id,omitempty"`
@@ -279,6 +297,9 @@ type StableDiff struct {
 type DurableState struct {
 	AppliedEventIDs   []string           `json:"applied_event_ids,omitempty"`
 	ProviderReceipts  []ProviderReceipt  `json:"provider_receipts,omitempty"`
+	HostDeliveries    []HostDelivery     `json:"host_deliveries,omitempty"`
+	PartialResults    []PartialResult    `json:"partial_results,omitempty"`
+	OwnerConflicts    []OwnerConflict    `json:"owner_conflicts,omitempty"`
 	BudgetCommitments []BudgetCommitment `json:"budget_commitments,omitempty"`
 	Handoffs          []HandoffRecord    `json:"handoffs,omitempty"`
 	AgentOwners       []AgentOwner       `json:"agent_owners,omitempty"`
@@ -294,6 +315,43 @@ type ProviderReceipt struct {
 	FailureCode       string `json:"failure_code,omitempty"`
 	LatencyMS         int64  `json:"latency_ms"`
 	CostMicrounits    int64  `json:"cost_microunits"`
+}
+
+type HostDelivery struct {
+	DeliveryID        string `json:"delivery_id"`
+	EventID           string `json:"event_id"`
+	TaskID            string `json:"task_id"`
+	HostID            string `json:"host_id"`
+	PayloadRef        string `json:"payload_ref"`
+	Transport         string `json:"transport"`
+	Durable           bool   `json:"durable"`
+	FollowScheduled   bool   `json:"follow_scheduled"`
+	PollScheduled     bool   `json:"poll_scheduled"`
+	PushAttempted     bool   `json:"push_attempted"`
+	WakeAttempted     bool   `json:"wake_attempted"`
+	VisibilityClaimed bool   `json:"visibility_claimed"`
+	Acknowledged      bool   `json:"acknowledged"`
+	ExternalCall      bool   `json:"external_call"`
+}
+
+type PartialResult struct {
+	PartialResultID string `json:"partial_result_id"`
+	EventID         string `json:"event_id"`
+	TaskID          string `json:"task_id"`
+	ParentTaskID    string `json:"parent_task_id"`
+	Status          string `json:"status"`
+	Durable         bool   `json:"durable"`
+	ExternalCall    bool   `json:"external_call"`
+}
+
+type OwnerConflict struct {
+	ConflictID        string `json:"conflict_id"`
+	EventID           string `json:"event_id"`
+	TaskID            string `json:"task_id"`
+	ResourceKey       string `json:"resource_key"`
+	ExistingOwnerTask string `json:"existing_owner_task"`
+	ConflictState     string `json:"conflict_state"`
+	ExternalCall      bool   `json:"external_call"`
 }
 
 type BudgetCommitment struct {

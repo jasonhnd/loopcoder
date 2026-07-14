@@ -1,0 +1,36 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: federation-ownership-conflict
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:federation-ownership-conflict-policy plan=sha256:federation-ownership-conflict-plan authorization=sha256:federation-ownership-conflict-auth
+sources: project=project-release-regression delivery=delivery-federation-ownership-conflict inventory=inventory-federation-ownership-conflict budget=budget-federation-ownership-conflict routing=routing-federation-ownership-conflict agent_tree=agent-tree-federation-ownership-conflict handoff=handoff-federation-ownership-conflict state=durable-state-federation-ownership-conflict
+truncated: false
+decisions:
+- decision_d1a1ad1ef868eda93509a4d0d4793529 event=event-conflict-b task=task-b kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_e88f8e2402d689d68f243788481eb7e8 event=event-own-a task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+events:
+- 001 event-own-a kind=agent_own task=task-a status=applied decision=decision_e88f8e2402d689d68f243788481eb7e8 receipt= idem=idem_e88f8e2402d689d68f243788481eb7e8 at=2026-07-14T00:00:00Z
+- 002 event-conflict-b kind=ownership_conflict task=task-b status=applied decision=decision_d1a1ad1ef868eda93509a4d0d4793529 receipt= idem=idem_d1a1ad1ef868eda93509a4d0d4793529 at=2026-07-14T00:00:00.01Z
+durable_state:
+- applied_events=event-conflict-b,event-own-a
+- completed_tasks=none
+- provider_receipts:
+  - none
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
+  - owner_conflict_cb98628f9e2e8227860f4a9219fb8000 event=event-conflict-b task=task-b resource=resource-a existing_owner_task=task-a state=rejected-existing-owner external_call=false
+- handoffs:
+  - none
+- agent_owners:
+  - agent_owner_7f309668f00da50d7fbdb6cd2a5050e4 event=event-own-a task=task-a resource=resource-a state=held permission=orchestrate side_effect=provider-launch
+invariants:
+- inv-one-owner kind=one_owner_per_resource passed=true diagnostic=
+- inv-owner-conflict kind=ownership_conflict_recorded passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:aae2c80c5d567ddbd0b1e5de2e13614e5ee79ded30bb2e2b6817ca927e58a6a2 added_events=event-conflict-b,event-own-a added_decisions=decision_d1a1ad1ef868eda93509a4d0d4793529,decision_e88f8e2402d689d68f243788481eb7e8

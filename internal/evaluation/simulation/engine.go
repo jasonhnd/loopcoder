@@ -32,6 +32,7 @@ var scenarioFields = map[string]bool{
 	"scenario_id":        true,
 	"seed":               true,
 	"clock":              true,
+	"host":               true,
 	"limits":             true,
 	"durable_source_ids": true,
 	"policy_provenance":  true,
@@ -119,6 +120,9 @@ func Execute(ctx context.Context, scenario Scenario, opts Options) (Result, erro
 		applied:           stringSet(state.AppliedEventIDs),
 		receipts:          receiptSet(state.ProviderReceipts),
 		receiptRecords:    receiptMap(state.ProviderReceipts),
+		hostDeliveries:    hostDeliverySet(state.HostDeliveries),
+		partialResults:    partialResultSet(state.PartialResults),
+		ownerConflicts:    ownerConflictSet(state.OwnerConflicts),
 		commitments:       commitmentSet(state.BudgetCommitments),
 		handoffs:          handoffSet(state.Handoffs),
 		owners:            ownerSet(state.AgentOwners),
@@ -243,6 +247,9 @@ type runner struct {
 	applied           map[string]bool
 	receipts          map[string]bool
 	receiptRecords    map[string]ProviderReceipt
+	hostDeliveries    map[string]bool
+	partialResults    map[string]bool
+	ownerConflicts    map[string]bool
 	commitments       map[string]bool
 	handoffs          map[string]bool
 	owners            map[string]bool
@@ -288,6 +295,24 @@ func (r *runner) apply(ctx context.Context, event InjectedEvent, sequence int) (
 		record.DecisionID = decision.DecisionID
 		if err == nil {
 			record.ReceiptID, err = r.providerCall(event, decision)
+		}
+	case "host_deliver":
+		decision, err = r.route(event)
+		record.DecisionID = decision.DecisionID
+		if err == nil {
+			err = r.hostDeliver(event)
+		}
+	case "partial_result":
+		decision, err = r.route(event)
+		record.DecisionID = decision.DecisionID
+		if err == nil {
+			err = r.partialResult(event)
+		}
+	case "ownership_conflict":
+		decision, err = r.route(event)
+		record.DecisionID = decision.DecisionID
+		if err == nil {
+			err = r.ownerConflict(event)
 		}
 	case "budget_commit":
 		decision, err = r.route(event)
@@ -335,6 +360,8 @@ func (r *runner) canonicalRoute(event InjectedEvent) (DecisionRecord, error) {
 		EventID:                  event.EventID,
 		TaskID:                   task.TaskID,
 		DecisionKind:             "routing",
+		UserPinnedModelID:        task.UserPinnedModelID,
+		UserOverrideModelID:      task.UserOverrideModelID,
 		RejectedCandidates:       []Rejection{},
 		QuotaSnapshotIDs:         []string{},
 		BudgetAuthorityID:        task.BudgetAuthorityID,
@@ -347,8 +374,9 @@ func (r *runner) canonicalRoute(event InjectedEvent) (DecisionRecord, error) {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return scoreKey(r.scenario.Seed, task.TaskID, candidates[i]) < scoreKey(r.scenario.Seed, task.TaskID, candidates[j])
 	})
+	at := r.eventTime(event.EventID)
 	for _, model := range candidates {
-		rejection, quotaID, eligible := r.eligible(task, model)
+		rejection, quotaID, eligible := r.eligible(task, model, at)
 		if quotaID != "" {
 			decision.QuotaSnapshotIDs = appendUnique(decision.QuotaSnapshotIDs, quotaID)
 		}
@@ -411,6 +439,90 @@ func (r *runner) providerCall(event InjectedEvent, decision DecisionRecord) (str
 		return receipt.ReceiptID, nil
 	}
 	return receipt.ReceiptID, typedError(ErrProviderFailure, "simulated provider failure %s for model %s", failureCode, decision.ChosenCandidateID)
+}
+
+func (r *runner) hostDeliver(event InjectedEvent) error {
+	task, _ := taskByID(r.scenario.Tasks, event.TaskID)
+	if r.scenario.Host.ConductorHostID == "" {
+		return typedError(ErrMissingReference, "event %s requires conductor host identity", event.EventID)
+	}
+	if !r.scenario.Host.Capabilities.SupportsFollow || !r.scenario.Host.Capabilities.SupportsPoll {
+		return typedError(ErrMissingReference, "host %s cannot durable follow/poll", r.scenario.Host.ConductorHostID)
+	}
+	id := stableID("host_delivery", r.scenario.ScenarioID, event.EventID, r.scenario.Host.ConductorHostID, event.PayloadRef)
+	if r.hostDeliveries[id] {
+		return nil
+	}
+	r.hostDeliveries[id] = true
+	r.state.HostDeliveries = append(r.state.HostDeliveries, HostDelivery{
+		DeliveryID:        id,
+		EventID:           event.EventID,
+		TaskID:            task.TaskID,
+		HostID:            r.scenario.Host.ConductorHostID,
+		PayloadRef:        event.PayloadRef,
+		Transport:         "follow-poll",
+		Durable:           true,
+		FollowScheduled:   true,
+		PollScheduled:     true,
+		PushAttempted:     false,
+		WakeAttempted:     false,
+		VisibilityClaimed: false,
+		Acknowledged:      false,
+		ExternalCall:      false,
+	})
+	return nil
+}
+
+func (r *runner) partialResult(event InjectedEvent) error {
+	task, _ := taskByID(r.scenario.Tasks, event.TaskID)
+	id := stableID("partial_result", r.scenario.ScenarioID, event.EventID, task.TaskID, event.PayloadRef)
+	if r.partialResults[id] {
+		return nil
+	}
+	r.partialResults[id] = true
+	r.state.PartialResults = append(r.state.PartialResults, PartialResult{
+		PartialResultID: id,
+		EventID:         event.EventID,
+		TaskID:          task.TaskID,
+		ParentTaskID:    event.PayloadRef,
+		Status:          "cancelled-partial",
+		Durable:         true,
+		ExternalCall:    false,
+	})
+	return nil
+}
+
+func (r *runner) ownerConflict(event InjectedEvent) error {
+	task, _ := taskByID(r.scenario.Tasks, event.TaskID)
+	resource := event.PayloadRef
+	if resource == "" {
+		resource = task.OwnerResourceKey
+	}
+	existingOwnerTask := ""
+	for _, owner := range r.state.AgentOwners {
+		if owner.ResourceKey == resource {
+			existingOwnerTask = owner.TaskID
+			break
+		}
+	}
+	if existingOwnerTask == "" {
+		return typedError(ErrMissingReference, "ownership conflict event %s has no existing owner for resource %s", event.EventID, resource)
+	}
+	id := stableID("owner_conflict", r.scenario.ScenarioID, event.EventID, task.TaskID, resource, existingOwnerTask)
+	if r.ownerConflicts[id] {
+		return nil
+	}
+	r.ownerConflicts[id] = true
+	r.state.OwnerConflicts = append(r.state.OwnerConflicts, OwnerConflict{
+		ConflictID:        id,
+		EventID:           event.EventID,
+		TaskID:            task.TaskID,
+		ResourceKey:       resource,
+		ExistingOwnerTask: existingOwnerTask,
+		ConflictState:     "rejected-existing-owner",
+		ExternalCall:      false,
+	})
+	return nil
 }
 
 func (r *runner) commitBudget(event InjectedEvent, decision DecisionRecord) error {
@@ -495,6 +607,12 @@ func (r *runner) own(event InjectedEvent, decision DecisionRecord) error {
 
 func (r *runner) candidateModels(task Task) []Model {
 	allowed := stringSet(task.CandidateModelIDs)
+	if task.UserOverrideModelID != "" {
+		allowed = map[string]bool{task.UserOverrideModelID: true}
+	}
+	if task.UserPinnedModelID != "" {
+		allowed = map[string]bool{task.UserPinnedModelID: true}
+	}
 	out := []Model{}
 	for _, model := range r.scenario.Inventory.Models {
 		if len(allowed) > 0 && !allowed[model.ModelCapabilityID] {
@@ -508,7 +626,7 @@ func (r *runner) candidateModels(task Task) []Model {
 	return out
 }
 
-func (r *runner) eligible(task Task, model Model) (Rejection, string, bool) {
+func (r *runner) eligible(task Task, model Model, at time.Time) (Rejection, string, bool) {
 	if model.Availability != providerinventory.AvailabilityAvailable {
 		return reject(model.ModelCapabilityID, "model-unavailable", string(model.Availability)), "", false
 	}
@@ -520,7 +638,7 @@ func (r *runner) eligible(task Task, model Model) (Rejection, string, bool) {
 	if !ok || provider.State != providerinventory.InstallationInstalled {
 		return reject(model.ModelCapabilityID, "provider-not-installed", "provider installation is not installed"), "", false
 	}
-	quota, ok := quotaFor(r.scenario.Inventory.Quotas, task, model)
+	quota, ok := quotaForAt(r.scenario.Inventory.Quotas, task, model, at)
 	if !ok {
 		return reject(model.ModelCapabilityID, ErrQuotaUnknown, "quota evidence is missing"), "", false
 	}
@@ -561,11 +679,29 @@ func (r *runner) failure(modelID string, ordinal int) ProviderFailure {
 	return ProviderFailure{}
 }
 
+func (r *runner) eventTime(eventID string) time.Time {
+	ordered, err := orderEvents(r.scenario)
+	if err != nil {
+		return r.origin
+	}
+	for index, event := range ordered {
+		if event.EventID == eventID {
+			return r.origin.Add(time.Duration(index) * time.Duration(r.scenario.Clock.StepMS) * time.Millisecond)
+		}
+	}
+	return r.origin
+}
+
 func (r *runner) sortedState() DurableState {
 	state := normalizeDurableState(r.state)
 	sort.Strings(state.AppliedEventIDs)
 	sort.Strings(state.CompletedTaskIDs)
 	sort.Slice(state.ProviderReceipts, func(i, j int) bool { return state.ProviderReceipts[i].ReceiptID < state.ProviderReceipts[j].ReceiptID })
+	sort.Slice(state.HostDeliveries, func(i, j int) bool { return state.HostDeliveries[i].DeliveryID < state.HostDeliveries[j].DeliveryID })
+	sort.Slice(state.PartialResults, func(i, j int) bool {
+		return state.PartialResults[i].PartialResultID < state.PartialResults[j].PartialResultID
+	})
+	sort.Slice(state.OwnerConflicts, func(i, j int) bool { return state.OwnerConflicts[i].ConflictID < state.OwnerConflicts[j].ConflictID })
 	sort.Slice(state.BudgetCommitments, func(i, j int) bool {
 		return state.BudgetCommitments[i].CommitmentID < state.BudgetCommitments[j].CommitmentID
 	})
@@ -586,6 +722,9 @@ func validateScenario(s Scenario) error {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, s.Clock.Origin); err != nil {
 		return typedError(ErrInvalidFixture, "invalid clock origin: %v", err)
+	}
+	if s.Host.ConductorHostID != "" && s.Host.AdapterID == "" {
+		return typedError(ErrInvalidFixture, "host adapter ID is required when conductor host is set")
 	}
 	if s.DurableSourceIDs.ProjectID == "" || s.DurableSourceIDs.DeliveryRunID == "" || s.PolicyProvenance.PolicyFingerprint == "" || s.PolicyProvenance.PlanFingerprint == "" {
 		return typedError(ErrInvalidFixture, "durable source IDs and policy fingerprints are required")
@@ -681,6 +820,12 @@ func validateScenario(s Scenario) error {
 			if !models[candidate] {
 				return typedError(ErrMissingReference, "task %s references missing candidate model %s", task.TaskID, candidate)
 			}
+		}
+		if task.UserPinnedModelID != "" && !models[task.UserPinnedModelID] {
+			return typedError(ErrMissingReference, "task %s references missing pinned model %s", task.TaskID, task.UserPinnedModelID)
+		}
+		if task.UserOverrideModelID != "" && !models[task.UserOverrideModelID] {
+			return typedError(ErrMissingReference, "task %s references missing override model %s", task.TaskID, task.UserOverrideModelID)
 		}
 		tasks[task.TaskID] = task
 	}
@@ -830,6 +975,9 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 		if decision.DecisionKind != "routing" {
 			return typedError(ErrReplayMismatch, "replay journal decision %s has noncanonical kind %q", decision.DecisionID, decision.DecisionKind)
 		}
+		if decision.UserPinnedModelID != task.UserPinnedModelID || decision.UserOverrideModelID != task.UserOverrideModelID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s user pin/override does not match task", decision.DecisionID)
+		}
 		if decision.BudgetAuthorityID == "" || !budgets[decision.BudgetAuthorityID] || decision.BudgetAuthorityID != task.BudgetAuthorityID {
 			return typedError(ErrReplayMismatch, "replay journal decision %s references invalid budget authority %s", decision.DecisionID, decision.BudgetAuthorityID)
 		}
@@ -842,7 +990,7 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 		if decision.AuthorizationFingerprint != s.PolicyProvenance.AuthorizationFingerprint {
 			return typedError(ErrReplayMismatch, "replay journal decision %s authorization fingerprint does not match scenario", decision.DecisionID)
 		}
-		if err := validateReplayDecisionClosure(s, task, decision, models); err != nil {
+		if err := validateReplayDecisionClosure(s, event, task, decision, models); err != nil {
 			return err
 		}
 		if event.Kind == "provider_call" && eventRecord.ReceiptID != "" {
@@ -891,6 +1039,9 @@ func validateReplayCanonicalSimulation(s Scenario, replayEvents map[string]Event
 		applied:           map[string]bool{},
 		receipts:          map[string]bool{},
 		receiptRecords:    map[string]ProviderReceipt{},
+		hostDeliveries:    map[string]bool{},
+		partialResults:    map[string]bool{},
+		ownerConflicts:    map[string]bool{},
 		commitments:       map[string]bool{},
 		handoffs:          map[string]bool{},
 		owners:            map[string]bool{},
@@ -927,7 +1078,7 @@ func validateReplayCanonicalSimulation(s Scenario, replayEvents map[string]Event
 	return nil
 }
 
-func validateReplayDecisionClosure(s Scenario, task Task, decision DecisionRecord, models map[string]bool) error {
+func validateReplayDecisionClosure(s Scenario, event InjectedEvent, task Task, decision DecisionRecord, models map[string]bool) error {
 	candidates := candidateModelsForScenario(s, task)
 	candidateIDs := map[string]bool{}
 	for _, candidate := range candidates {
@@ -949,7 +1100,7 @@ func validateReplayDecisionClosure(s Scenario, task Task, decision DecisionRecor
 	if !sortedUniqueStrings(decision.QuotaSnapshotIDs) {
 		return typedError(ErrReplayMismatch, "replay journal decision %s quota snapshot IDs are not canonical", decision.DecisionID)
 	}
-	expectedQuotaIDs := expectedReplayQuotaSnapshotIDs(s, task, decision, candidates, rejected)
+	expectedQuotaIDs := expectedReplayQuotaSnapshotIDs(s, event, task, decision, candidates, rejected)
 	if !sameStringSlice(decision.QuotaSnapshotIDs, expectedQuotaIDs) {
 		return typedError(ErrReplayMismatch, "replay journal decision %s quota snapshot IDs do not match canonical evaluated candidates", decision.DecisionID)
 	}
@@ -993,13 +1144,14 @@ func validateReplayDecisionClosure(s Scenario, task Task, decision DecisionRecor
 	return nil
 }
 
-func expectedReplayQuotaSnapshotIDs(s Scenario, task Task, decision DecisionRecord, candidates []Model, rejected map[string]bool) []string {
+func expectedReplayQuotaSnapshotIDs(s Scenario, event InjectedEvent, task Task, decision DecisionRecord, candidates []Model, rejected map[string]bool) []string {
 	out := []string{}
+	at := scenarioEventTime(s, event.EventID)
 	for _, candidate := range candidates {
 		if decision.Accepted && candidate.ModelCapabilityID != decision.ChosenCandidateID && !rejected[candidate.ModelCapabilityID] {
 			continue
 		}
-		if quotaID := replayQuotaSnapshotID(s, task, candidate); quotaID != "" {
+		if quotaID := replayQuotaSnapshotID(s, task, candidate, at); quotaID != "" {
 			out = appendUnique(out, quotaID)
 		}
 		if decision.Accepted && candidate.ModelCapabilityID == decision.ChosenCandidateID {
@@ -1010,7 +1162,7 @@ func expectedReplayQuotaSnapshotIDs(s Scenario, task Task, decision DecisionReco
 	return out
 }
 
-func replayQuotaSnapshotID(s Scenario, task Task, model Model) string {
+func replayQuotaSnapshotID(s Scenario, task Task, model Model, at time.Time) string {
 	if model.Availability != providerinventory.AvailabilityAvailable {
 		return ""
 	}
@@ -1022,7 +1174,7 @@ func replayQuotaSnapshotID(s Scenario, task Task, model Model) string {
 	if !ok || provider.State != providerinventory.InstallationInstalled {
 		return ""
 	}
-	quota, ok := quotaFor(s.Inventory.Quotas, task, model)
+	quota, ok := quotaForAt(s.Inventory.Quotas, task, model, at)
 	if !ok {
 		return ""
 	}
@@ -1083,6 +1235,59 @@ func evaluateInvariants(s Scenario, state DurableState, decisions map[string]Dec
 			if !result.Passed {
 				result.Diagnostic = "route was not accepted"
 			}
+		case "chosen_candidate":
+			decision := decisions[invariant.TaskID]
+			result.Passed = decision.Accepted && decision.ChosenCandidateID == invariant.Expected
+			if !result.Passed {
+				result.Diagnostic = "chosen candidate was " + decision.ChosenCandidateID
+			}
+		case "host_truthful_follow_poll":
+			result.Passed = false
+			for _, delivery := range state.HostDeliveries {
+				if delivery.TaskID == invariant.TaskID &&
+					delivery.Transport == "follow-poll" &&
+					delivery.Durable &&
+					delivery.FollowScheduled &&
+					delivery.PollScheduled &&
+					!delivery.PushAttempted &&
+					!delivery.WakeAttempted &&
+					!delivery.VisibilityClaimed &&
+					!delivery.Acknowledged &&
+					!delivery.ExternalCall {
+					result.Passed = true
+					break
+				}
+			}
+			if !result.Passed {
+				result.Diagnostic = "truthful durable follow/poll delivery was not recorded"
+			}
+		case "no_provider_receipts":
+			result.Passed = len(state.ProviderReceipts) == 0
+			if !result.Passed {
+				result.Diagnostic = "provider receipts were recorded"
+			}
+		case "partial_result_recorded":
+			result.Passed = false
+			for _, partial := range state.PartialResults {
+				if partial.TaskID == invariant.TaskID && partial.Status == invariant.Expected && partial.Durable && !partial.ExternalCall {
+					result.Passed = true
+					break
+				}
+			}
+			if !result.Passed {
+				result.Diagnostic = "partial result was not recorded"
+			}
+		case "ownership_conflict_recorded":
+			result.Passed = false
+			for _, conflict := range state.OwnerConflicts {
+				if conflict.TaskID == invariant.TaskID && conflict.ConflictState == invariant.Expected && !conflict.ExternalCall {
+					result.Passed = true
+					break
+				}
+			}
+			if !result.Passed {
+				result.Diagnostic = "ownership conflict was not recorded"
+			}
 		case "one_owner_per_resource":
 			for resource, count := range ownersByResource {
 				if count > 1 {
@@ -1128,6 +1333,11 @@ func normalizeDurableState(state DurableState) DurableState {
 	state.AppliedEventIDs = sortedUnique(state.AppliedEventIDs)
 	state.CompletedTaskIDs = sortedUnique(state.CompletedTaskIDs)
 	sort.Slice(state.ProviderReceipts, func(i, j int) bool { return state.ProviderReceipts[i].ReceiptID < state.ProviderReceipts[j].ReceiptID })
+	sort.Slice(state.HostDeliveries, func(i, j int) bool { return state.HostDeliveries[i].DeliveryID < state.HostDeliveries[j].DeliveryID })
+	sort.Slice(state.PartialResults, func(i, j int) bool {
+		return state.PartialResults[i].PartialResultID < state.PartialResults[j].PartialResultID
+	})
+	sort.Slice(state.OwnerConflicts, func(i, j int) bool { return state.OwnerConflicts[i].ConflictID < state.OwnerConflicts[j].ConflictID })
 	sort.Slice(state.BudgetCommitments, func(i, j int) bool {
 		return state.BudgetCommitments[i].CommitmentID < state.BudgetCommitments[j].CommitmentID
 	})
@@ -1238,6 +1448,111 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 	}
 	if err := validateStartingStateProviderReceipts(s, receiptEvents); err != nil {
 		return err
+	}
+	hostDeliveries := map[string]bool{}
+	hostDeliveryEvents := map[string]bool{}
+	hostDeliverySemantics := map[string]bool{}
+	for _, delivery := range s.StartingState.HostDeliveries {
+		if delivery.DeliveryID == "" || delivery.EventID == "" || delivery.TaskID == "" || delivery.HostID == "" || delivery.PayloadRef == "" {
+			return typedError(ErrInvalidFixture, "starting state host delivery identity fields are required")
+		}
+		if delivery.DeliveryID != stableID("host_delivery", s.ScenarioID, delivery.EventID, delivery.HostID, delivery.PayloadRef) {
+			return typedError(ErrInvalidFixture, "starting state host delivery %s is not canonical", delivery.DeliveryID)
+		}
+		if hostDeliveries[delivery.DeliveryID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate host delivery %s", delivery.DeliveryID)
+		}
+		hostDeliveries[delivery.DeliveryID] = true
+		semantic := strings.Join([]string{delivery.EventID, delivery.TaskID, delivery.HostID, delivery.PayloadRef}, "\x00")
+		if hostDeliverySemantics[semantic] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic host delivery for event %s task %s host %s payload %s", delivery.EventID, delivery.TaskID, delivery.HostID, delivery.PayloadRef)
+		}
+		hostDeliverySemantics[semantic] = true
+		event, ok := events[delivery.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "host delivery %s references missing event %s", delivery.DeliveryID, delivery.EventID)
+		}
+		if event.Kind != "host_deliver" || event.TaskID != delivery.TaskID || event.PayloadRef != delivery.PayloadRef {
+			return typedError(ErrInvalidFixture, "host delivery %s does not match event %s", delivery.DeliveryID, delivery.EventID)
+		}
+		if !applied[delivery.EventID] {
+			return typedError(ErrInvalidFixture, "host delivery %s event %s is not applied", delivery.DeliveryID, delivery.EventID)
+		}
+		if _, ok := tasks[delivery.TaskID]; !ok {
+			return typedError(ErrMissingReference, "host delivery %s references missing task %s", delivery.DeliveryID, delivery.TaskID)
+		}
+		if delivery.HostID != s.Host.ConductorHostID || delivery.Transport != "follow-poll" || !delivery.Durable || !delivery.FollowScheduled || !delivery.PollScheduled || delivery.PushAttempted || delivery.WakeAttempted || delivery.VisibilityClaimed || delivery.Acknowledged || delivery.ExternalCall {
+			return typedError(ErrInvalidFixture, "host delivery %s truthful follow/poll fields are not canonical", delivery.DeliveryID)
+		}
+		hostDeliveryEvents[delivery.EventID] = true
+	}
+	partialResults := map[string]bool{}
+	partialResultEvents := map[string]bool{}
+	for _, partial := range s.StartingState.PartialResults {
+		if partial.PartialResultID == "" || partial.EventID == "" || partial.TaskID == "" || partial.ParentTaskID == "" {
+			return typedError(ErrInvalidFixture, "starting state partial result identity fields are required")
+		}
+		if partial.PartialResultID != stableID("partial_result", s.ScenarioID, partial.EventID, partial.TaskID, partial.ParentTaskID) {
+			return typedError(ErrInvalidFixture, "starting state partial result %s is not canonical", partial.PartialResultID)
+		}
+		if partialResults[partial.PartialResultID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate partial result %s", partial.PartialResultID)
+		}
+		partialResults[partial.PartialResultID] = true
+		event, ok := events[partial.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "partial result %s references missing event %s", partial.PartialResultID, partial.EventID)
+		}
+		if event.Kind != "partial_result" || event.TaskID != partial.TaskID || event.PayloadRef != partial.ParentTaskID {
+			return typedError(ErrInvalidFixture, "partial result %s does not match event %s", partial.PartialResultID, partial.EventID)
+		}
+		if !applied[partial.EventID] {
+			return typedError(ErrInvalidFixture, "partial result %s event %s is not applied", partial.PartialResultID, partial.EventID)
+		}
+		if _, ok := tasks[partial.TaskID]; !ok {
+			return typedError(ErrMissingReference, "partial result %s references missing task %s", partial.PartialResultID, partial.TaskID)
+		}
+		if _, ok := tasks[partial.ParentTaskID]; !ok {
+			return typedError(ErrMissingReference, "partial result %s references missing parent task %s", partial.PartialResultID, partial.ParentTaskID)
+		}
+		if partial.Status != "cancelled-partial" || !partial.Durable || partial.ExternalCall {
+			return typedError(ErrInvalidFixture, "partial result %s fields are not canonical", partial.PartialResultID)
+		}
+		partialResultEvents[partial.EventID] = true
+	}
+	ownerConflicts := map[string]bool{}
+	ownerConflictEvents := map[string]bool{}
+	for _, conflict := range s.StartingState.OwnerConflicts {
+		if conflict.ConflictID == "" || conflict.EventID == "" || conflict.TaskID == "" || conflict.ResourceKey == "" || conflict.ExistingOwnerTask == "" {
+			return typedError(ErrInvalidFixture, "starting state owner conflict identity fields are required")
+		}
+		if conflict.ConflictID != stableID("owner_conflict", s.ScenarioID, conflict.EventID, conflict.TaskID, conflict.ResourceKey, conflict.ExistingOwnerTask) {
+			return typedError(ErrInvalidFixture, "starting state owner conflict %s is not canonical", conflict.ConflictID)
+		}
+		if ownerConflicts[conflict.ConflictID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate owner conflict %s", conflict.ConflictID)
+		}
+		ownerConflicts[conflict.ConflictID] = true
+		event, ok := events[conflict.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "owner conflict %s references missing event %s", conflict.ConflictID, conflict.EventID)
+		}
+		if event.Kind != "ownership_conflict" || event.TaskID != conflict.TaskID || event.PayloadRef != conflict.ResourceKey {
+			return typedError(ErrInvalidFixture, "owner conflict %s does not match event %s", conflict.ConflictID, conflict.EventID)
+		}
+		if !applied[conflict.EventID] {
+			return typedError(ErrInvalidFixture, "owner conflict %s event %s is not applied", conflict.ConflictID, conflict.EventID)
+		}
+		if _, ok := tasks[conflict.TaskID]; !ok {
+			return typedError(ErrMissingReference, "owner conflict %s references missing task %s", conflict.ConflictID, conflict.TaskID)
+		}
+		if _, ok := tasks[conflict.ExistingOwnerTask]; !ok {
+			return typedError(ErrMissingReference, "owner conflict %s references missing existing owner task %s", conflict.ConflictID, conflict.ExistingOwnerTask)
+		}
+		if conflict.ConflictState != "rejected-existing-owner" || conflict.ExternalCall {
+			return typedError(ErrInvalidFixture, "owner conflict %s fields are not canonical", conflict.ConflictID)
+		}
+		ownerConflictEvents[conflict.EventID] = true
 	}
 	if _, err := budgetRemaining(s, s.StartingState.BudgetCommitments); err != nil {
 		return err
@@ -1390,6 +1705,18 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 			if !succeededReceiptEvents[eventID] {
 				return typedError(ErrInvalidFixture, "applied provider event %s has no succeeded durable receipt", eventID)
 			}
+		case "host_deliver":
+			if !hostDeliveryEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied host delivery event %s has no durable host delivery", eventID)
+			}
+		case "partial_result":
+			if !partialResultEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied partial result event %s has no durable partial result", eventID)
+			}
+		case "ownership_conflict":
+			if !ownerConflictEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied ownership conflict event %s has no durable conflict", eventID)
+			}
 		case "budget_commit":
 			if !commitmentEvents[eventID] {
 				return typedError(ErrInvalidFixture, "applied budget event %s has no durable commitment", eventID)
@@ -1478,6 +1805,57 @@ func validateReplayAgainstStartingState(s Scenario, replayEvents map[string]Even
 		}
 		if decision.ChosenCandidateID != receipt.ModelCapabilityID {
 			return typedError(ErrReplayMismatch, "replay journal decision %s chosen candidate %s does not match durable receipt model %s", decision.DecisionID, decision.ChosenCandidateID, receipt.ModelCapabilityID)
+		}
+	}
+	for _, delivery := range state.HostDeliveries {
+		durableEvents[delivery.EventID] = true
+		event, ok := replayEvents[delivery.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state host delivery %s event %s is missing from replay journal", delivery.DeliveryID, delivery.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable host delivery", delivery.EventID, event.Status)
+		}
+		decision, ok := replayDecisions[delivery.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state host delivery %s has no replay decision", delivery.DeliveryID)
+		}
+		if decision.TaskID != delivery.TaskID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s task %s does not match host delivery task %s", decision.DecisionID, decision.TaskID, delivery.TaskID)
+		}
+	}
+	for _, partial := range state.PartialResults {
+		durableEvents[partial.EventID] = true
+		event, ok := replayEvents[partial.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state partial result %s event %s is missing from replay journal", partial.PartialResultID, partial.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable partial result", partial.EventID, event.Status)
+		}
+		decision, ok := replayDecisions[partial.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state partial result %s has no replay decision", partial.PartialResultID)
+		}
+		if decision.TaskID != partial.TaskID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s task %s does not match partial result task %s", decision.DecisionID, decision.TaskID, partial.TaskID)
+		}
+	}
+	for _, conflict := range state.OwnerConflicts {
+		durableEvents[conflict.EventID] = true
+		event, ok := replayEvents[conflict.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state owner conflict %s event %s is missing from replay journal", conflict.ConflictID, conflict.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable owner conflict", conflict.EventID, event.Status)
+		}
+		decision, ok := replayDecisions[conflict.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state owner conflict %s has no replay decision", conflict.ConflictID)
+		}
+		if decision.TaskID != conflict.TaskID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s task %s does not match owner conflict task %s", decision.DecisionID, decision.TaskID, conflict.TaskID)
 		}
 	}
 	for _, commitment := range state.BudgetCommitments {
@@ -1646,6 +2024,30 @@ func receiptMap(values []ProviderReceipt) map[string]ProviderReceipt {
 	return out
 }
 
+func hostDeliverySet(values []HostDelivery) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		out[value.DeliveryID] = true
+	}
+	return out
+}
+
+func partialResultSet(values []PartialResult) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		out[value.PartialResultID] = true
+	}
+	return out
+}
+
+func ownerConflictSet(values []OwnerConflict) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		out[value.ConflictID] = true
+	}
+	return out
+}
+
 func commitmentSet(values []BudgetCommitment) map[string]bool {
 	out := map[string]bool{}
 	for _, value := range values {
@@ -1668,6 +2070,23 @@ func ownerSet(values []AgentOwner) map[string]bool {
 		out[value.OwnershipID] = true
 	}
 	return out
+}
+
+func scenarioEventTime(s Scenario, eventID string) time.Time {
+	origin, err := time.Parse(time.RFC3339Nano, s.Clock.Origin)
+	if err != nil {
+		return time.Time{}
+	}
+	ordered, err := orderEvents(s)
+	if err != nil {
+		return origin.UTC()
+	}
+	for index, event := range ordered {
+		if event.EventID == eventID {
+			return origin.UTC().Add(time.Duration(index) * time.Duration(s.Clock.StepMS) * time.Millisecond)
+		}
+	}
+	return origin.UTC()
 }
 
 func budgetRemaining(s Scenario, commitments []BudgetCommitment) (map[string]int64, error) {
@@ -1742,6 +2161,15 @@ func durableReplayEventSet(state DurableState) map[string]bool {
 	for _, receipt := range state.ProviderReceipts {
 		out[receipt.EventID] = true
 	}
+	for _, delivery := range state.HostDeliveries {
+		out[delivery.EventID] = true
+	}
+	for _, partial := range state.PartialResults {
+		out[partial.EventID] = true
+	}
+	for _, conflict := range state.OwnerConflicts {
+		out[conflict.EventID] = true
+	}
 	for _, commitment := range state.BudgetCommitments {
 		out[commitment.EventID] = true
 	}
@@ -1811,6 +2239,12 @@ func taskAllowsModel(task Task, modelID string) bool {
 
 func candidateModelsForScenario(s Scenario, task Task) []Model {
 	allowed := stringSet(task.CandidateModelIDs)
+	if task.UserOverrideModelID != "" {
+		allowed = map[string]bool{task.UserOverrideModelID: true}
+	}
+	if task.UserPinnedModelID != "" {
+		allowed = map[string]bool{task.UserPinnedModelID: true}
+	}
 	out := []Model{}
 	for _, model := range s.Inventory.Models {
 		if len(allowed) > 0 && !allowed[model.ModelCapabilityID] {
@@ -1896,11 +2330,14 @@ func providerByID(providers []Provider, id string) (Provider, bool) {
 	return Provider{}, false
 }
 
-func quotaFor(quotas []QuotaWindow, task Task, model Model) (QuotaWindow, bool) {
+func quotaForAt(quotas []QuotaWindow, task Task, model Model, at time.Time) (QuotaWindow, bool) {
 	var found QuotaWindow
 	ok := false
 	for _, quota := range quotas {
 		if quota.ModelCapabilityID != model.ModelCapabilityID || quota.AccountProfileID != model.AccountProfileID || quota.QuantityKind != task.QuantityKind {
+			continue
+		}
+		if !quotaActiveAt(quota, at) {
 			continue
 		}
 		if !ok || quota.QuotaSnapshotID < found.QuotaSnapshotID {
@@ -1909,6 +2346,25 @@ func quotaFor(quotas []QuotaWindow, task Task, model Model) (QuotaWindow, bool) 
 		}
 	}
 	return found, ok
+}
+
+func quotaActiveAt(quota QuotaWindow, at time.Time) bool {
+	if at.IsZero() {
+		return true
+	}
+	if quota.WindowStart != "" {
+		start, err := time.Parse(time.RFC3339Nano, quota.WindowStart)
+		if err == nil && at.Before(start) {
+			return false
+		}
+	}
+	if quota.WindowEnd != "" {
+		end, err := time.Parse(time.RFC3339Nano, quota.WindowEnd)
+		if err == nil && !at.Before(end) {
+			return false
+		}
+	}
+	return true
 }
 
 func roleSupported(roles []providerinventory.CatalogRole, role providerinventory.CatalogRole) bool {
