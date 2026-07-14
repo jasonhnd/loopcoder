@@ -4,10 +4,14 @@ set -eu
 REPO="${LOOPCODER_INSTALL_REPO:-jasonhnd/loopcoder}"
 GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
-BIN_DIR="${LOOPCODER_INSTALL_DIR:-$HOME/.loopcoder/bin}"
+BIN_DIR="${LOOPCODER_INSTALL_DIR:-}"
 REQUESTED_VERSION="${LOOPCODER_VERSION:-}"
 COSIGN_ISSUER="${LOOPCODER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 CHECKSUM_SIGNATURE_ASSET="SHA256SUMS.sigstore"
+SUPPORTED_OS="darwin"
+SUPPORTED_ARCH="arm64"
+UNSUPPORTED_PLATFORM_FIRST_LINE="LoopCoder v0.8.0 supports macOS Apple Silicon only (darwin/arm64)."
+UNSUPPORTED_PLATFORM_GUIDANCE="LoopCoder v0.7.0 is the final legacy multi-platform release for Windows, Linux, WSL, containers, and Intel macOS."
 
 usage() {
 	printf '%s\n' \
@@ -26,8 +30,55 @@ fail() {
 	exit 1
 }
 
+unsupported_platform() {
+	actual_os="$1"
+	actual_arch="$2"
+	printf >&2 '%s\n' "$UNSUPPORTED_PLATFORM_FIRST_LINE"
+	printf >&2 'Actual platform: %s/%s.\n' "$actual_os" "$actual_arch"
+	printf >&2 'Supported platform: %s/%s.\n' "$SUPPORTED_OS" "$SUPPORTED_ARCH"
+	printf >&2 '%s\n' "$UNSUPPORTED_PLATFORM_GUIDANCE"
+	exit 78
+}
+
 need_cmd() {
 	command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+normalize_os() {
+	case "$1" in
+		Darwin*|darwin) printf '%s\n' darwin ;;
+		Linux*|linux) printf '%s\n' linux ;;
+		MINGW*|MSYS*|CYGWIN*|Windows*|windows|windows*) printf '%s\n' windows ;;
+		"") printf '%s\n' unknown ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+normalize_arch() {
+	case "$1" in
+		x86_64|amd64) printf '%s\n' amd64 ;;
+		arm64|aarch64) printf '%s\n' arm64 ;;
+		"") printf '%s\n' unknown ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+detect_os() {
+	if [ -n "${LOOPCODER_INSTALL_OS:-}" ]; then
+		normalize_os "$LOOPCODER_INSTALL_OS"
+		return
+	fi
+	command -v uname >/dev/null 2>&1 || fail "uname is required"
+	normalize_os "$(uname -s)"
+}
+
+detect_arch() {
+	if [ -n "${LOOPCODER_INSTALL_ARCH:-}" ]; then
+		normalize_arch "$LOOPCODER_INSTALL_ARCH"
+		return
+	fi
+	command -v uname >/dev/null 2>&1 || fail "uname is required"
+	normalize_arch "$(uname -m)"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -56,10 +107,18 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
+OS="$(detect_os)"
+ARCH="$(detect_arch)"
+if [ "$OS" != "$SUPPORTED_OS" ] || [ "$ARCH" != "$SUPPORTED_ARCH" ]; then
+	unsupported_platform "$OS" "$ARCH"
+fi
+
 [ -n "${HOME:-}" ] || fail "HOME is not set"
+if [ -z "$BIN_DIR" ]; then
+	BIN_DIR="$HOME/.loopcoder/bin"
+fi
 
 need_cmd curl
-need_cmd uname
 need_cmd tar
 need_cmd awk
 need_cmd sed
@@ -76,22 +135,6 @@ elif command -v shasum >/dev/null 2>&1; then
 else
 	fail "sha256sum or shasum is required to verify SHA256SUMS"
 fi
-
-detect_os() {
-	case "$(uname -s)" in
-		Linux*) printf '%s\n' linux ;;
-		Darwin*) printf '%s\n' darwin ;;
-		*) fail "unsupported OS: $(uname -s). Use install.ps1 on Windows." ;;
-	esac
-}
-
-detect_arch() {
-	case "$(uname -m)" in
-		x86_64|amd64) printf '%s\n' amd64 ;;
-		arm64|aarch64) printf '%s\n' arm64 ;;
-		*) fail "unsupported architecture: $(uname -m)" ;;
-	esac
-}
 
 resolve_latest_tag() {
 	latest_json=""
@@ -225,13 +268,11 @@ ensure_path() {
 	fi
 }
 
-OS="$(detect_os)"
-ARCH="$(detect_arch)"
 TAG="$(normalize_tag "$REQUESTED_VERSION")"
 ASSET_VERSION="${TAG#v}"
 [ -n "$ASSET_VERSION" ] || fail "version resolved to an empty asset version"
 
-ARCHIVE="loopcoder_${ASSET_VERSION}_${OS}_${ARCH}.tar.gz"
+ARCHIVE="loopcoder_${ASSET_VERSION}_${SUPPORTED_OS}_${SUPPORTED_ARCH}.tar.gz"
 RELEASE_URL="$GITHUB_BASE_URL/$REPO/releases/download/$TAG"
 COSIGN_IDENTITY="${LOOPCODER_COSIGN_IDENTITY:-${GITHUB_BASE_URL%/}/$REPO/.github/workflows/release.yml@refs/tags/$TAG}"
 

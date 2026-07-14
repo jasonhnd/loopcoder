@@ -12,7 +12,7 @@ GitHub, git worktrees, worker providers, and PR review.
 
 Use this flow to onboard an existing repository from zero to a driven
 loopcoder loop. One installed binary can serve many local repositories. Each
-repository keeps its own `.delivery.yml`; in v0.7.0 candidate builds,
+repository keeps its own `.delivery.yml`; in v0.8.0 candidate builds,
 registered projects write new runtime payloads under `$LOOPCODER_HOME`
 instead of under the repository.
 
@@ -20,21 +20,16 @@ Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
 push access.
 
-1. Install the v0.6.1 binary once per machine, shared across all local
-   projects.
-
-   Unix-like systems:
+1. Install the v0.8.0 binary once per supported macOS Apple Silicon machine,
+   shared across all local projects.
 
    ```text
-   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
    ```
 
-   Windows PowerShell:
-
-   ```text
-   $env:LOOPCODER_VERSION = "0.6.1"
-   irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
-   ```
+   Windows, Linux, WSL, containers, and Intel macOS are not supported by the
+   v0.8.0 installer. Users who need those hosts should remain on the historical
+   v0.7.0 release.
 
    The installer puts `loopcoder` under `~/.loopcoder/bin`. Keep that directory
    on `PATH`, or set `LOOPCODER_BIN` to the full binary path.
@@ -147,37 +142,30 @@ default.
   The older direct `gemini` worker adapter remains experimental and is not part
   of the static model registry.
 - A GitHub repository with a configured remote.
-- For the no-Go installer: `curl`, `tar`, `cosign`, and `sha256sum` or
-  `shasum` on Unix-like systems, or PowerShell and cosign on Windows. The
-  install scripts verify signed `SHA256SUMS` before trusting checksums. Go is
-  optional for developer installs and local source builds.
+- For the no-Go installer on native macOS Apple Silicon: `curl`, `tar`,
+  `cosign`, and `sha256sum` or `shasum`. The installer verifies signed
+  `SHA256SUMS` before trusting checksums. Go is optional for developer installs
+  and local source builds.
 
 ## Install
 
-The supported consumer distribution is GitHub Releases. Tagged releases publish
-Windows, macOS, and Linux archives for `amd64` and `arm64`, plus `SHA256SUMS`
-and signature material. The install scripts select the matching release asset,
-verify the `SHA256SUMS` signature with cosign before trusting checksums, install
-under `~/.loopcoder/bin`, and update or print PATH instructions. The scripts
-do not require Go.
-
-On Unix-like systems:
-
-```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
-```
-
-To choose a different release, replace `0.6.1` with the desired version.
-
-On Windows PowerShell:
+The supported v0.8.0 consumer distribution is GitHub Releases on native macOS
+Apple Silicon only. Tagged v0.8.0 releases publish
+`loopcoder_<version>_darwin_arm64.tar.gz`, plus `SHA256SUMS` and signature
+material. The installer rejects unsupported hosts before release lookup,
+download, temporary directory creation, install directory creation, binary
+replacement, or PATH/profile mutation. On the supported host, it verifies the
+`SHA256SUMS` signature with cosign before trusting checksums, installs under
+`~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
+not require Go.
 
 ```text
-$env:LOOPCODER_VERSION = "0.6.1"
-irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
 ```
 
-To choose a different release on Windows, set `LOOPCODER_VERSION` to the
-desired version before invoking the installer.
+To choose a different supported v0.8.x release, replace `0.8.0` with the
+desired version. v0.7.0 remains the final legacy multi-platform release for
+Windows, Linux, WSL, containers, and Intel macOS.
 
 After installation, confirm the selected binary:
 
