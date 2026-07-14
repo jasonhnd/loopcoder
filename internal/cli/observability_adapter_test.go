@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -28,6 +29,8 @@ import (
 )
 
 func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("GH_REPO", "")
 	repoState := t.TempDir()
 	record := validDispatchReport()
 	record.WorkID = "run-jsonl"
@@ -76,7 +79,15 @@ func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
 						Blocked:     []report.BlockedIssue{},
 					}, nil
 				},
-				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+				NewGitHubReader: func(string) orchestration.GitHubReader {
+					return cliFakeReader{views: map[int]gh.Issue{
+						864: {Number: 864, Title: "Observability", Body: "Body", State: "OPEN"},
+					}}
+				},
+				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					if opts.IssueTitle != "Observability" || opts.IssueBody != "Body" {
+						return worker.Result{}, fmt.Errorf("dispatch-wave used issue fields title=%q body=%q, want injected fake issue", opts.IssueTitle, opts.IssueBody)
+					}
 					return result, nil
 				},
 			},
@@ -343,6 +354,8 @@ func TestObservabilityHostAndDirectProfilesRenderSameCanonicalFacts(t *testing.T
 
 func TestObservabilityGoldenMatrix(t *testing.T) {
 	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("GH_REPO", "")
 	repo := t.TempDir()
 	runID := "run-golden"
 	record := validDispatchReport()
@@ -394,7 +407,18 @@ func TestObservabilityGoldenMatrix(t *testing.T) {
 				ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
 					return report.ReadySetReport{Ready: []report.ReadyIssue{{Issue: 864, Title: "A", Reason: "ready"}, {Issue: 865, Title: "B", Reason: "ready"}}, Blocked: []report.BlockedIssue{}}, nil
 				},
+				NewGitHubReader: func(string) orchestration.GitHubReader {
+					return cliFakeReader{views: map[int]gh.Issue{
+						864: {Number: 864, Title: "A", Body: "Body A", State: "OPEN"},
+						865: {Number: 865, Title: "B", Body: "Body B", State: "OPEN"},
+					}}
+				},
 				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					wantTitle := map[int]string{864: "A", 865: "B"}[opts.IssueNumber]
+					wantBody := map[int]string{864: "Body A", 865: "Body B"}[opts.IssueNumber]
+					if opts.IssueTitle != wantTitle || opts.IssueBody != wantBody {
+						return worker.Result{}, fmt.Errorf("dispatch-wave used issue #%d fields title=%q body=%q, want injected fake issue", opts.IssueNumber, opts.IssueTitle, opts.IssueBody)
+					}
 					r := secondObservabilityReport(record, opts.IssueNumber)
 					out := validDispatchResult(r)
 					out.Issue = opts.IssueNumber
