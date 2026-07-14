@@ -56,7 +56,7 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 			activeStore = nil
 		}
 	})
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 
 	var sourceEffect, receiptReuse, destinationLaunch, continuedEffect, verifierEmission, reportEmission atomic.Int64
 	sourceEffect.Store(1)
@@ -328,7 +328,7 @@ func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) 
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	var sourceExternalEffect atomic.Int64
 	sourceExternalEffect.Store(1)
@@ -409,7 +409,7 @@ func TestResumeApprovedHandoffReconcilesIdempotentSourceEffect(t *testing.T) {
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	var sourceExternalEffect atomic.Int64
 	sourceExternalEffect.Store(1)
@@ -464,7 +464,7 @@ func TestResumeApprovedHandoffReceiptContinuationCheckpointMismatchDoesNotLaunch
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
 	support.CheckpointID = support.CheckpointID + "-changed"
 	var executions atomic.Int64
@@ -497,7 +497,7 @@ func TestResumeApprovedHandoffReceiptContinuationResultMustConfirmReuse(t *testi
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -533,7 +533,7 @@ func TestResumeApprovedHandoffReceiptConflictFailsClosedWithoutLaunchMutation(t 
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = 'receipt-conflict' WHERE attempt_id = 'attempt-source'`)
 		return err
