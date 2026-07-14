@@ -5416,39 +5416,74 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 	}
 	store.Close()
 
+	type commandResult struct {
+		name   string
+		code   int
+		stdout string
+		stderr string
+	}
 	start := make(chan struct{})
+	releaseLaunch := make(chan struct{})
+	launchedOnce := make(chan struct{}, 1)
+	results := make(chan commandResult, 4)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var launched int
-	run := func(args []string, deps Deps) int {
+	var launchedPIDs []int
+	run := func(name string, args []string, deps Deps) {
 		defer wg.Done()
 		<-start
 		var stdout, stderr bytes.Buffer
-		return RunWithDeps(args, &stdout, &stderr, deps)
+		code := RunWithDeps(args, &stdout, &stderr, deps)
+		results <- commandResult{name: name, code: code, stdout: stdout.String(), stderr: stderr.String()}
 	}
-	wg.Add(3)
-	go run([]string{
-		"status", "--repo", repo, "--receipts", "--run", claim.RunID,
-		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1",
-	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
-	go run([]string{
-		"cancel", "--repo", repo, "--run", claim.RunID,
-		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1",
-	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
-	go run([]string{
-		"recover", "--repo", repo, "--run-id", claim.RunID, "--detached",
-		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--format", "json",
-	}, Deps{
+	recoverDeps := Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
 		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
 			mu.Lock()
-			defer mu.Unlock()
 			launched++
-			return 6060 + launched, nil
+			pid := 6060 + launched
+			launchedPIDs = append(launchedPIDs, pid)
+			if launched == 1 {
+				select {
+				case launchedOnce <- struct{}{}:
+				default:
+				}
+			}
+			mu.Unlock()
+			<-releaseLaunch
+			return pid, nil
 		},
-	})
+		ProcessAuthority: func(pid int, observedAt time.Time) (string, error) {
+			return fmt.Sprintf("authority-%d-%s", pid, observedAt.Format(time.RFC3339Nano)), nil
+		},
+	}
+	recoverArgs := []string{
+		"recover", "--repo", repo, "--run-id", claim.RunID, "--detached",
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt, "--format", "json",
+	}
+	wg.Add(4)
+	go run("attach", []string{
+		"attach", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "jsonl", "--follow-for", "1ns", "--poll", "1ns",
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	go run("cancel", []string{
+		"cancel", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	go run("recover-a", recoverArgs, recoverDeps)
+	go run("recover-b", recoverArgs, recoverDeps)
 	close(start)
+	select {
+	case <-launchedOnce:
+	case <-time.After(time.Second):
+		t.Fatal("recover attempts did not launch any detached supervisor")
+	}
+	close(releaseLaunch)
 	wg.Wait()
+	close(results)
 
 	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
 	if err != nil {
@@ -5459,17 +5494,74 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
+	var gotResults []commandResult
+	recoverExecutors := 0
+	recoverResults := 0
+	for result := range results {
+		gotResults = append(gotResults, result)
+		if strings.HasPrefix(result.name, "recover-") {
+			if result.code == 0 {
+				var recovered detachedrun.StatusResult
+				assertSingleJSONValue(t, result.stdout, &recovered)
+				recoverResults++
+				if recovered.Execute || recovered.ReplayAction == "recovered" {
+					recoverExecutors++
+				}
+			} else if !strings.Contains(result.stderr, "no longer matches") {
+				t.Fatalf("recover command failed without stale-fence evidence: %#v", result)
+			}
+		}
+	}
+	if len(gotResults) != 4 {
+		t.Fatalf("results = %d, want 4: %#v", len(gotResults), gotResults)
+	}
+	if recoverResults == 0 || recoverExecutors != 1 {
+		t.Fatalf("recover results = %d executor wins = %d, want at least one result and exactly one executor: %#v", recoverResults, recoverExecutors, gotResults)
+	}
 	mu.Lock()
 	starts := launched
+	pids := append([]int(nil), launchedPIDs...)
 	mu.Unlock()
-	if starts > 1 {
-		t.Fatalf("launched supervisors = %d, want at most one", starts)
+	if starts != 1 {
+		t.Fatalf("launched supervisors = %d pids=%v, want exactly one", starts, pids)
 	}
-	if record.Generation > 2 {
-		t.Fatalf("generation = %d, want at most one recovery generation: %#v", record.Generation, record)
+	if record.Generation != 2 || record.ProcessPID != pids[0] || record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("record after recovery race = %#v, want exactly one spawned generation with pid %v", record, pids)
 	}
 	if record.LaunchPhase == detachedrun.PhaseTerminal || record.TerminalAt != "" || record.TerminalReceiptID != "" {
 		t.Fatalf("stale control race wrote terminal state: %#v", record)
+	}
+	beforeAttach := record
+	var attachOut, attachErr bytes.Buffer
+	attachCode := RunWithDeps([]string{
+		"attach", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", record.Owner, "--supervisor-generation", strconv.FormatInt(record.Generation, 10),
+		"--format", "jsonl", "--follow-for", "1ns", "--poll", "1ns",
+	}, &attachOut, &attachErr, Deps{Now: func() time.Time { return now.Add(4 * time.Minute) }})
+	if attachCode != 0 {
+		t.Fatalf("current attach exit=%d stdout=%q stderr=%q", attachCode, attachOut.String(), attachErr.String())
+	}
+	afterAttach, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after attach: %v", err)
+	}
+	if !reflect.DeepEqual(beforeAttach, afterAttach) {
+		t.Fatalf("attach mutated detached supervisor record:\nbefore=%#v\nafter=%#v", beforeAttach, afterAttach)
+	}
+	var staleCancelOut, staleCancelErr bytes.Buffer
+	staleCancelCode := RunWithDeps([]string{
+		"cancel", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+	}, &staleCancelOut, &staleCancelErr, Deps{Now: func() time.Time { return now.Add(5 * time.Minute) }})
+	if staleCancelCode == 0 {
+		t.Fatalf("stale cancel unexpectedly succeeded stdout=%q stderr=%q", staleCancelOut.String(), staleCancelErr.String())
+	}
+	afterStaleCancel, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after stale cancel: %v", err)
+	}
+	if !reflect.DeepEqual(afterAttach, afterStaleCancel) {
+		t.Fatalf("stale cancel mutated detached supervisor record:\nbefore=%#v\nafter=%#v", afterAttach, afterStaleCancel)
 	}
 }
 
@@ -5479,7 +5571,9 @@ func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	repo := t.TempDir()
 	now := time.Date(2026, 7, 14, 5, 12, 0, 0, time.UTC)
-	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	exitCode := RunWithDeps([]string{
@@ -5493,6 +5587,69 @@ func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
 	if exitCode != 1 {
 		t.Fatalf("dispatch with closed stdout exit=%d, want 1", exitCode)
 	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(30 * time.Second) }})
+	if err != nil {
+		t.Fatalf("reopen after closed stdout: %v", err)
+	}
+	stdoutRecord, err := detachedrun.Get(ctx, store, "run-closed-stdout")
+	if err != nil {
+		t.Fatalf("Get closed stdout record: %v", err)
+	}
+	if stdoutRecord.Status != detachedrun.StatusRunning || stdoutRecord.LaunchPhase != detachedrun.PhaseSpawned || stdoutRecord.ProcessPID != 4243 {
+		t.Fatalf("closed stdout launch record = %#v", stdoutRecord)
+	}
+	store.Close()
+
+	var supervisorOut, supervisorErr bytes.Buffer
+	supervisorCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Detached closed stdout",
+		"--run-id", stdoutRecord.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", stdoutRecord.Owner,
+		"--supervisor-generation", strconv.FormatInt(stdoutRecord.Generation, 10),
+		"--format", "json",
+	}, &supervisorOut, &supervisorErr, Deps{
+		Now: func() time.Time { return now.Add(time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return worker.Result{OK: true, Status: "succeeded", Issue: 898, RunID: stdoutRecord.RunID}, nil
+		},
+	})
+	if supervisorCode != 0 {
+		t.Fatalf("supervisor after closed stdout exit=%d stdout=%q stderr=%q", supervisorCode, supervisorOut.String(), supervisorErr.String())
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after supervisor: %v", err)
+	}
+	supervisedRecord, err := detachedrun.Get(ctx, store, stdoutRecord.RunID)
+	if err != nil {
+		t.Fatalf("Get supervised record: %v", err)
+	}
+	if supervisedRecord.Status != detachedrun.StatusSucceeded || supervisedRecord.TerminalReceiptID == "" || supervisedRecord.ProviderExposed || supervisedRecord.LaunchReceiptID != "" {
+		t.Fatalf("supervised record after closed stdout = %#v", supervisedRecord)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: stdoutRecord.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts after closed stdout supervisor: %v", err)
+	}
+	var sawWorkerStarted, sawTerminal bool
+	for _, receipt := range receipts {
+		switch receipt.Phase {
+		case "detached-worker-started":
+			sawWorkerStarted = true
+		case "detached-terminal":
+			sawTerminal = true
+		}
+	}
+	if !sawWorkerStarted || !sawTerminal {
+		t.Fatalf("closed stdout supervisor receipts missing worker-started or terminal: %#v", receipts)
+	}
+	store.Close()
+
 	exitCode = RunWithDeps([]string{
 		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stderr", "--run-id", "run-closed-stderr", "--detach",
 	}, io.Discard, errWriter{}, Deps{
@@ -5503,6 +5660,18 @@ func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
 	})
 	if exitCode != 1 {
 		t.Fatalf("dispatch with closed stderr exit=%d, want 1", exitCode)
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after closed stderr: %v", err)
+	}
+	defer store.Close()
+	stderrRecord, err := detachedrun.Get(ctx, store, "run-closed-stderr")
+	if err != nil {
+		t.Fatalf("Get closed stderr record: %v", err)
+	}
+	if stderrRecord.Status != detachedrun.StatusFailed || stderrRecord.LaunchPhase != detachedrun.PhaseTerminal || stderrRecord.TerminalErrorCode != "spawn-failed" {
+		t.Fatalf("closed stderr record = %#v", stderrRecord)
 	}
 }
 
@@ -5580,6 +5749,145 @@ func TestDispatchSupervisorFailsClosedWhenReceiptStoreFails(t *testing.T) {
 	}
 	if record.Status != detachedrun.StatusNeedsHuman || record.TerminalErrorCode != "worker-started-receipt-failed" {
 		t.Fatalf("record after receipt failure = %#v", record)
+	}
+}
+
+func TestDispatchSupervisorFailsClosedOnSQLiteBusyWriteBoundary(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 14, 30, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-sqlite-busy-supervisor",
+		Owner:          "owner-sqlite-busy",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 6163, "test-authority", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	dbPath := store.Path()
+	store.Close()
+
+	lockDB, lockConn := beginCLISQLiteImmediateLock(t, ctx, dbPath)
+	var dispatchCalled bool
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "SQLite busy supervisor",
+		"--run-id", claim.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			return worker.Result{OK: true, Status: "succeeded"}, nil
+		},
+		DetachedStorageBusyTimeout: time.Millisecond,
+		DetachedStorageWriteTxRetry: storage.WriteTxRetryOptions{
+			MaxAttempts: 1,
+			MaxElapsed:  time.Millisecond,
+		},
+	})
+	if exitCode != 1 || dispatchCalled {
+		t.Fatalf("busy supervisor exit=%d dispatchCalled=%t stdout=%q stderr=%q", exitCode, dispatchCalled, stdout.String(), stderr.String())
+	}
+	if _, err := lockConn.ExecContext(ctx, `ROLLBACK`); err != nil {
+		t.Fatalf("release sqlite busy lock: %v", err)
+	}
+	if err := lockConn.Close(); err != nil {
+		t.Fatalf("close lock conn: %v", err)
+	}
+	if err := lockDB.Close(); err != nil {
+		t.Fatalf("close lock db: %v", err)
+	}
+
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after sqlite busy: %v", err)
+	}
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after sqlite busy: %v", err)
+	}
+	if record.Generation != 1 || record.LaunchPhase != detachedrun.PhaseSpawned || record.Status != detachedrun.StatusRunning || record.WorkerStartedAt != "" || record.ProviderExposed || record.LaunchReceiptID != "" || record.TerminalReceiptID != "" {
+		t.Fatalf("busy write boundary mutated execution state: %#v", record)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts after sqlite busy: %v", err)
+	}
+	if len(receipts) != 0 {
+		t.Fatalf("busy write boundary created receipts: %#v", receipts)
+	}
+	reconciled, err := detachedrun.Reconcile(ctx, store, claim.RunID, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("Reconcile after sqlite busy: %v", err)
+	}
+	if !reconciled.CanRecover || reconciled.ReplayAction != "retryable" || reconciled.Record.Generation != 1 {
+		t.Fatalf("reconcile after sqlite busy = %#v", reconciled)
+	}
+	store.Close()
+
+	var recoverOut, recoverErr bytes.Buffer
+	recoverCode := RunWithDeps([]string{
+		"recover",
+		"--repo", repo,
+		"--run-id", claim.RunID,
+		"--detached",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, &recoverOut, &recoverErr, Deps{
+		Now: func() time.Time { return now.Add(4 * time.Minute) },
+		VerifyProcessAuthority: func(int, string) error {
+			return nil
+		},
+		KillProcessTree: func(int) error {
+			return nil
+		},
+		ProcessAlive: func(int) bool {
+			return false
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			return 6263, nil
+		},
+		ProcessAuthority: func(pid int, observedAt time.Time) (string, error) {
+			return fmt.Sprintf("recovered-authority-%d", pid), nil
+		},
+	})
+	if recoverCode != 0 {
+		t.Fatalf("recover after sqlite busy exit=%d stdout=%q stderr=%q", recoverCode, recoverOut.String(), recoverErr.String())
+	}
+	var recovered detachedrun.StatusResult
+	assertSingleJSONValue(t, recoverOut.String(), &recovered)
+	if recovered.Record.Generation != 2 || recovered.Record.ProcessPID != 6263 || recovered.Record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("recovered after sqlite busy = %#v", recovered)
 	}
 }
 
@@ -5988,20 +6296,43 @@ func TestDetachedSupervisorCadenceTickBoundsTwentyMinuteSilence(t *testing.T) {
 		t.Fatalf("MarkWorkerStarted: %v", err)
 	}
 	opts := worker.Options{RunID: claim.RunID}
+	var providerDispatchCalls int
 	for step := 1; step <= 4; step++ {
 		current = base.Add(time.Duration(step*5) * time.Minute)
-		if err := detachedSupervisorCadenceTick(ctx, store, opts, claim.Fence(), Deps{Now: func() time.Time { return current }}); err != nil {
+		if err := detachedSupervisorCadenceTick(ctx, store, opts, claim.Fence(), Deps{
+			Now: func() time.Time { return current },
+			Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+				providerDispatchCalls++
+				return worker.Result{}, errors.New("cadence must not dispatch provider work")
+			},
+		}); err != nil {
 			t.Fatalf("cadence tick %d: %v", step, err)
 		}
+	}
+	if providerDispatchCalls != 0 {
+		t.Fatalf("cadence dispatched provider work %d times", providerDispatchCalls)
 	}
 	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 20})
 	if err != nil {
 		t.Fatalf("ListReceipts: %v", err)
 	}
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after cadence: %v", err)
+	}
+	if record.ProviderExposed || record.LaunchReceiptID != "" {
+		t.Fatalf("cadence marked provider execution on supervisor record: %#v", record)
+	}
 	var heartbeatTimes []time.Time
 	for _, receipt := range receipts {
+		if receipt.Phase == "detached-provider-exposed" || receipt.Provider.ProviderConfidence == "exact" {
+			t.Fatalf("cadence created provider execution receipt: %#v", receipt)
+		}
 		if receipt.Phase != "detached-supervisor-heartbeat" {
 			continue
+		}
+		if receipt.Provider.ProviderConfidence != progress.Unknown || receipt.Progress.State != progress.KnownAliveNoMeaningfulProgress {
+			t.Fatalf("heartbeat receipt claimed provider execution/progress: %#v", receipt)
 		}
 		at, err := time.Parse(time.RFC3339Nano, receipt.OccurredAt)
 		if err != nil {
@@ -8351,6 +8682,30 @@ type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("writer closed")
+}
+
+func beginCLISQLiteImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB, *sql.Conn) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite lock db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+		_ = db.Close()
+		t.Fatalf("set sqlite lock busy timeout: %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("open sqlite lock conn: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("begin sqlite immediate lock: %v", err)
+	}
+	return db, conn
 }
 
 func (w *relayFlushAckSabotageWriter) Write(p []byte) (int, error) {

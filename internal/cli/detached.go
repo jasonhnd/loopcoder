@@ -374,14 +374,16 @@ func runAttach(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	_ = store.Close()
 	return runStatusProgressReceipts(statusProgressOptions{
-		RepoPath:     resolvedRepo,
-		RunID:        runID,
-		Format:       format,
-		Follow:       true,
-		Cursor:       progress.Cursor(cursor),
-		Limit:        500,
-		PollInterval: pollInterval,
-		FollowFor:    followFor,
+		RepoPath:      resolvedRepo,
+		RunID:         runID,
+		Format:        format,
+		Follow:        true,
+		Cursor:        progress.Cursor(cursor),
+		Fence:         fence,
+		ExpectedLease: expectedLease,
+		Limit:         500,
+		PollInterval:  pollInterval,
+		FollowFor:     followFor,
 	}, stdout, stderr, deps)
 }
 
@@ -498,7 +500,12 @@ func openDetachedStore(ctx context.Context, repoPath string, deps Deps) (storage
 	if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
 		return nil, roots, fmt.Errorf("%w: detached runs require a registered project", detachedrun.ErrUnsupported)
 	}
-	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: normalizedDepsNow(deps)})
+	store, err := storage.Open(ctx, storage.Options{
+		Path:         roots.DatabasePath,
+		Now:          normalizedDepsNow(deps),
+		BusyTimeout:  deps.DetachedStorageBusyTimeout,
+		WriteTxRetry: deps.DetachedStorageWriteTxRetry,
+	})
 	if err != nil {
 		return nil, roots, err
 	}

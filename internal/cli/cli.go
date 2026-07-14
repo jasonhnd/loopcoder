@@ -66,43 +66,45 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader           func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter            func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter          func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter          func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive              func(pid int) bool
-	Now                       func() time.Time
-	IsTerminal                func(w io.Writer) bool
-	Stdin                     io.Reader
-	BuildInfo                 BuildInfo
-	ComputeReadySet           func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                      func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                  func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                   func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                  func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview                func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote                   func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover                   func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify                    func(ctx context.Context, opts verify.Options) verify.Result
-	Audit                     func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor                    func(ctx context.Context, opts doctor.Options) doctor.Report
-	ProviderInventory         func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
-	ProviderInventoryRefresh  func(ctx context.Context, report providerinventory.Report, now time.Time) error
-	ProviderQuotaRefresh      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
-	ProviderQuotaStatus       func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
-	Init                      func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade                   func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState         func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	SkillInstall              func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush                 func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull                 func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire              func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease              func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	StartDetachedDispatch     func(ctx context.Context, args []string, logPath string) (int, error)
-	KillProcessTree           func(pid int) error
-	ProcessAuthority          func(pid int, observedAt time.Time) (string, error)
-	VerifyProcessAuthority    func(pid int, authority string) error
-	DetachedSupervisorCadence time.Duration
+	NewGitHubReader             func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter              func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter            func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive                func(pid int) bool
+	Now                         func() time.Time
+	IsTerminal                  func(w io.Writer) bool
+	Stdin                       io.Reader
+	BuildInfo                   BuildInfo
+	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                        func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                      func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                       func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                      func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory           func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree             func(pid int) error
+	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority      func(pid int, authority string) error
+	DetachedSupervisorCadence   time.Duration
+	DetachedStorageBusyTimeout  time.Duration
+	DetachedStorageWriteTxRetry storage.WriteTxRetryOptions
 }
 
 var commands = []Command{

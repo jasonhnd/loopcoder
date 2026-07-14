@@ -55,6 +55,8 @@ type Options struct {
 	Path string
 	Now  func() time.Time
 
+	BusyTimeout time.Duration
+
 	WriteTxCommitHookForTest WriteTxCommitHookForTest
 	WriteTxRetry             WriteTxRetryOptions
 
@@ -107,6 +109,7 @@ type sqliteStore struct {
 	path                                  string
 	db                                    *sql.DB
 	now                                   func() time.Time
+	busyTimeout                           time.Duration
 	writeTxCommitHookForTest              WriteTxCommitHookForTest
 	writeTxRetry                          writeTxRetryPolicy
 	sourceExistedBeforeOpen               bool
@@ -553,6 +556,7 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 			path:                                  path,
 			db:                                    db,
 			now:                                   normalizeNow(opts.Now),
+			busyTimeout:                           opts.BusyTimeout,
 			writeTxCommitHookForTest:              opts.WriteTxCommitHookForTest,
 			writeTxRetry:                          normalizeWriteTxRetryPolicy(opts.WriteTxRetry),
 			sourceExistedBeforeOpen:               sourceExistedBeforeOpen,
@@ -926,9 +930,13 @@ func (tx sqlConnTx) QueryRow(ctx context.Context, query string, args ...any) *sq
 }
 
 func (s *sqliteStore) configure(ctx context.Context) error {
+	busyTimeout := s.busyTimeout
+	if busyTimeout <= 0 {
+		busyTimeout = 5 * time.Second
+	}
 	for _, statement := range []string{
 		`PRAGMA foreign_keys = ON`,
-		`PRAGMA busy_timeout = 5000`,
+		fmt.Sprintf(`PRAGMA busy_timeout = %d`, busyTimeout.Milliseconds()),
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("open storage %s: configure sqlite: %w", s.path, err)
