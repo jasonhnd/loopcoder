@@ -1037,12 +1037,20 @@ func entryFromRaw(spec rowSpec, sc scope, row rawRow) Entry {
 		Redaction:      projectionRedaction(),
 		SourceRefs:     []SourceRef{source},
 	}
-	for field, value := range map[string]string{"payload_json": row.payloadJSON, "json_a": row.jsonA, "json_b": row.jsonB} {
-		if strings.TrimSpace(value) == "" {
+	jsonFields := []struct {
+		name  string
+		value string
+	}{
+		{name: "payload_json", value: row.payloadJSON},
+		{name: "json_a", value: row.jsonA},
+		{name: "json_b", value: row.jsonB},
+	}
+	for _, field := range jsonFields {
+		if strings.TrimSpace(field.value) == "" {
 			continue
 		}
-		digest, ev := digestJSONField(value, field, source)
-		if field == "payload_json" && digest != "" {
+		digest, ev := digestJSONField(field.value, field.name, source)
+		if field.name == "payload_json" && digest != "" {
 			entry.PayloadDigest = digest
 		}
 		if ev != nil {
@@ -1190,7 +1198,12 @@ func agentCycleEvidence(entries []Entry) []Evidence {
 		}
 	}
 	var out []Evidence
+	children := make([]string, 0, len(parents))
 	for child := range parents {
+		children = append(children, child)
+	}
+	sort.Strings(children)
+	for _, child := range children {
 		seen := map[string]bool{}
 		for cur := child; cur != ""; cur = parents[cur] {
 			if seen[cur] {

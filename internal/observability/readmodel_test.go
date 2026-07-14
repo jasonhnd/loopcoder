@@ -323,6 +323,66 @@ func TestDetailSurfacesCorruptJSONAndUnsupportedRecordVersion(t *testing.T) {
 	}
 }
 
+func TestDetailCanonicalStableWithMultipleCorruptJSONFields(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := openTestStoreAt(t, path)
+	seedBaseRun(t, ctx, store, "proj-a", "run-a")
+	insertProgressWithCorruptJSONFields(t, ctx, store, "proj-a", "run-a", "receipt-corrupt-fields")
+
+	opts := Options{
+		ProjectID:     "proj-a",
+		DeliveryRunID: "run-a",
+		Sections:      []string{"progress"},
+		Limit:         100,
+		Now:           func() time.Time { return fixedNow },
+	}
+	want := assertStableDetailJSON(t, ctx, store, opts, 300)
+	if got := strings.Count(string(want), `"code":"corrupt_json"`); got != 3 {
+		t.Fatalf("corrupt_json evidence count = %d, want 3:\n%s", got, want)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened := openTestStoreAt(t, path)
+	defer reopened.Close()
+	got := assertStableDetailJSON(t, ctx, reopened, opts, 300)
+	if string(got) != string(want) {
+		t.Fatalf("canonical corrupt JSON detail changed after reopen:\nfirst=%s\nreopened=%s", want, got)
+	}
+}
+
+func TestDetailCanonicalStableWithCyclicAgentGraph(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := openTestStoreAt(t, path)
+	seedBaseRun(t, ctx, store, "proj-a", "run-a")
+	insertCyclicAgentRegistrations(t, ctx, store, "proj-a", "run-a")
+
+	opts := Options{
+		ProjectID:     "proj-a",
+		DeliveryRunID: "run-a",
+		Sections:      []string{"agents"},
+		Limit:         100,
+		Now:           func() time.Time { return fixedNow },
+	}
+	want := assertStableDetailJSON(t, ctx, store, opts, 300)
+	if got := strings.Count(string(want), `"code":"agent_tree_cycle"`); got != 3 {
+		t.Fatalf("agent_tree_cycle evidence count = %d, want 3:\n%s", got, want)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened := openTestStoreAt(t, path)
+	defer reopened.Close()
+	got := assertStableDetailJSON(t, ctx, reopened, opts, 300)
+	if string(got) != string(want) {
+		t.Fatalf("canonical cyclic agent detail changed after reopen:\nfirst=%s\nreopened=%s", want, got)
+	}
+}
+
 func TestSummaryHighCountBoundsSourceIDs(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -434,6 +494,32 @@ func mustCanonical(t *testing.T, v any) []byte {
 	return data
 }
 
+func assertStableDetailJSON(t *testing.T, ctx context.Context, store storage.Store, opts Options, repeats int) []byte {
+	t.Helper()
+	detail, err := LoadDetail(ctx, store, opts)
+	if err != nil {
+		t.Fatalf("LoadDetail returned error: %v", err)
+	}
+	want, err := DetailJSON(detail)
+	if err != nil {
+		t.Fatalf("DetailJSON returned error: %v", err)
+	}
+	for i := 0; i < repeats; i++ {
+		detail, err := LoadDetail(ctx, store, opts)
+		if err != nil {
+			t.Fatalf("LoadDetail repeat %d returned error: %v", i, err)
+		}
+		got, err := DetailJSON(detail)
+		if err != nil {
+			t.Fatalf("DetailJSON repeat %d returned error: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("canonical detail changed on repeat %d:\nfirst=%s\nrepeat=%s", i, want, got)
+		}
+	}
+	return want
+}
+
 func seedBaseRun(t *testing.T, ctx context.Context, store storage.Store, projectID, runID string) {
 	t.Helper()
 	mustWrite(t, ctx, store, func(tx storage.Tx) error {
@@ -453,6 +539,80 @@ func seedBaseRun(t *testing.T, ctx context.Context, store storage.Store, project
 			runID, runID, "loopcoder.delivery_run.v1", 1, projectID, runID, "running",
 			"test run", "policy.v1", "local-write", "approved", "none", ts(), ts())
 		return err
+	})
+}
+
+func insertProgressWithCorruptJSONFields(t *testing.T, ctx context.Context, store storage.Store, projectID, runID, receiptID string) {
+	t.Helper()
+	insertProgress(t, ctx, store, projectID, runID, receiptID, "corr-corrupt-fields", `{"status":"ok"}`)
+	mustWrite(t, ctx, store, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `PRAGMA ignore_check_constraints = ON`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE progress_receipts
+			SET payload_json = ?, evidence_json = ?, redaction_json = ?
+			WHERE progress_receipt_id = ?`,
+			`{"payload":`, `["evidence"`, `{"redaction":`, receiptID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `PRAGMA ignore_check_constraints = OFF`)
+		return err
+	})
+}
+
+func insertCyclicAgentRegistrations(t *testing.T, ctx context.Context, store storage.Store, projectID, runID string) {
+	t.Helper()
+	type registration struct {
+		agentID       string
+		parentAgentID string
+		runID         string
+	}
+	registrations := []registration{
+		{agentID: "agent-a", parentAgentID: "agent-c", runID: "run-agent-a"},
+		{agentID: "agent-b", parentAgentID: "agent-a", runID: "run-agent-b"},
+		{agentID: "agent-c", parentAgentID: "agent-b", runID: "run-agent-c"},
+	}
+	mustWrite(t, ctx, store, func(tx storage.Tx) error {
+		for _, reg := range registrations {
+			if _, err := tx.Exec(ctx, `INSERT INTO runs(id, project_id, parent_run_id, root_run_id, status, created_at, updated_at)
+				VALUES (?, ?, ?, ?, 'running', ?, ?)`,
+				reg.runID, projectID, runID, runID, ts(), ts()); err != nil {
+				return err
+			}
+			scopeID := "scope-" + reg.agentID
+			if _, err := tx.Exec(ctx, `INSERT INTO agent_scope_grants(
+				id, project_id, delivery_run_id, child_agent_id, schema_version, record_version, scope_json, permission,
+				side_effect_class, policy_version, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+				agent_federation_fingerprint, created_at, updated_at)
+				VALUES (?, ?, ?, ?, 'loopcoder.agent_scope_grant.v1', 1, '{}', 'write',
+				'local-write', 'policy.v1', 'policy-fp', 'plan-fp', 'auth-fp', ?, ?, ?)`,
+				scopeID, projectID, runID, reg.agentID, "federation-"+reg.agentID, ts(), ts()); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO agent_registrations(
+				id, record_version, project_id, delivery_run_id, root_run_id, parent_run_id, child_run_id, parent_agent_id,
+				task_id, attempt_id, plan_id, child_key, adapter_id, provider_installation_id,
+				account_profile_id, model_capability_id, routing_decision_id, provider_session_ref,
+				scope_grant_id, permission, side_effect_class, budget_binding_ids_json,
+				ownership_lock_ids_json, claim_generation, executor_id, provider_idempotency_key,
+				provider_receipt, cancellation_channel, expected_outputs_json, registration_state,
+				depth, policy_version, plan_fingerprint, policy_fingerprint, authorization_fingerprint,
+				agent_federation_fingerprint, registration_payload_hash, classification,
+				gap_reasons_json, created_at, updated_at, terminal_error_code)
+				VALUES (?, 1, ?, ?, ?, ?, ?, ?,
+				?, ?, 'plan-cycle', ?, 'codex', 'pinst-codex',
+				'acct-codex', 'model-codex', '', '',
+				?, 'write', 'local-write', '[]',
+				'[]', 1, 'executor-cycle', ?, '', 'cancel-cycle', '{}', 'registered',
+				1, 'policy.v1', 'plan-fp', 'policy-fp', 'auth-fp',
+				?, ?, 'local-diagnostic', '[]', ?, ?, '')`,
+				reg.agentID, projectID, runID, runID, runID, reg.runID, reg.parentAgentID,
+				"task-"+reg.agentID, "attempt-"+reg.agentID, "child-key-"+reg.agentID,
+				scopeID, "idempotency-"+reg.agentID, "federation-"+reg.agentID, "payload-"+reg.agentID, ts(), ts()); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
