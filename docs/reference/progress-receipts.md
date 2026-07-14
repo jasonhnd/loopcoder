@@ -83,20 +83,22 @@ become terminal when delivery is durably recorded and do not create an
 acknowledgment row; the legacy `required_ack` column is a derived compatibility
 view of that typed policy.
 
-## Codex CLI And Claude Code Host Delivery
+## Codex CLI, Claude Code, And Paseo-Style Host Delivery
 
-The Codex CLI and Claude Code host adapters use only documented local host
-surfaces: foreground stdout/stderr, machine JSON stdout, durable local polling
-through `loopcoder status --receipts`, and resumable following through
-`loopcoder attach`. Codex additionally advertises detached-run cancellation
-through `loopcoder cancel`; Claude Code leaves detached cancellation unknown
-because LoopCoder has no documented host-owned cancellation proof for the
-original conductor session. Both adapters declare callback, wake-up,
-host-managed background ownership, and acknowledgment unsupported unless an
-opt-in future integration fixture proves targeted terminal delivery to the
-original host session. A host environment marker can identify an origin
-candidate, but it is not capability proof and does not create callback, wake-up,
-visibility, steering, or acknowledgment evidence.
+The Codex CLI, Claude Code, and Paseo-style host adapters use only documented
+or LoopCoder-owned local host surfaces: foreground stdout/stderr, machine JSON
+stdout, durable local polling through `loopcoder status --receipts`, and
+resumable following through `loopcoder attach`. For Paseo-style hosts, durable
+poll/follow is LoopCoder-local replay/follow, not a claimed documented Paseo
+poll/follow API. Codex additionally advertises detached-run cancellation
+through `loopcoder cancel`; Claude Code and Paseo-style hosts leave detached
+cancellation unknown because LoopCoder has no documented host-owned
+cancellation proof for the original conductor session. These adapters declare
+callback, wake-up, host-managed background ownership, and acknowledgment
+unsupported unless an opt-in future integration fixture proves targeted
+terminal delivery to the original host session. A host environment marker can
+identify an origin candidate, but it is not capability proof and does not create
+callback, wake-up, visibility, steering, or acknowledgment evidence.
 
 When `CODEX_THREAD_ID` / `CODEX_SESSION_ID` or `CLAUDE_CODE_SESSION_ID` is
 present, LoopCoder binds the active host origin by hashing the opaque

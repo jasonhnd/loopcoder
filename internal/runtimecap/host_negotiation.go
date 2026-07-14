@@ -307,13 +307,13 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 			switch declarations[i].Capability {
 			case HostDurablePolling, HostResumableFollow:
 				declarations[i].Support = HostCapabilitySupported
-				declarations[i].Source = "paseo-documented-cli-poll-follow"
+				declarations[i].Source = "loopcoder-local-durable-replay-follow-no-paseo-wake-proof"
 			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:
 				declarations[i].Support = HostCapabilityUnsupported
-				declarations[i].Source = "paseo-documented-cli-poll-follow"
+				declarations[i].Source = "loopcoder-local-durable-replay-follow-no-paseo-wake-proof"
 			case HostDetachedCancellation:
 				declarations[i].Support = HostCapabilityUnknown
-				declarations[i].Source = "paseo-documented-cli-poll-follow"
+				declarations[i].Source = "loopcoder-local-durable-replay-follow-no-paseo-wake-proof"
 			}
 		}
 	}

@@ -282,6 +282,22 @@ func TestPaseoHostDeclaresTruthfulPollFollowOnlyProgressCapabilities(t *testing.
 			t.Fatalf("%s support = %q, want %q", capability, got, want)
 		}
 	}
+	for _, capability := range []runtimecap.HostCapability{
+		runtimecap.HostDurablePolling,
+		runtimecap.HostResumableFollow,
+		runtimecap.HostCallbacks,
+		runtimecap.HostWakeUp,
+		runtimecap.HostAcknowledgment,
+		runtimecap.HostDetachedCancellation,
+	} {
+		source := capabilitySource(contract.Capabilities, capability)
+		if source != "loopcoder-local-durable-replay-follow-no-paseo-wake-proof" {
+			t.Fatalf("%s source = %q, want LoopCoder-local evidence source", capability, source)
+		}
+		if strings.Contains(source, "paseo-documented") {
+			t.Fatalf("%s source claims undocumented Paseo evidence: %q", capability, source)
+		}
+	}
 	if !contract.Origin.Bound || contract.Origin.BindingID == "" || contract.Origin.OriginRef == "" {
 		t.Fatalf("origin = %#v, want redacted Paseo origin binding", contract.Origin)
 	}
@@ -827,4 +843,13 @@ func capabilitySupport(capabilities []runtimecap.HostCapabilityDeclaration, capa
 		}
 	}
 	return runtimecap.HostCapabilityUnknown
+}
+
+func capabilitySource(capabilities []runtimecap.HostCapabilityDeclaration, capability runtimecap.HostCapability) string {
+	for _, declaration := range capabilities {
+		if declaration.Capability == capability {
+			return declaration.Source
+		}
+	}
+	return ""
 }

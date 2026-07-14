@@ -3286,6 +3286,128 @@ func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testi
 	}
 }
 
+func TestPaseoHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-render-failure")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	created, binding := persistPaseoReplayFixture(t, store, projectID, runID, "", "Paseo receipt survives failed stderr render", 49)
+
+	renderErr := errors.New("paseo stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	attempts, err := progress.ListDeliveryAttempts(ctx, store, progress.DeliveryAttemptFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		ObligationID:  created.Obligation.ObligationID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryAttempts after failure: %v", err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("attempts after failed render = %#v, want none", attempts)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 || !strings.Contains(stderr.String(), "Paseo receipt survives failed stderr render") {
+		t.Fatalf("retry replay count=%d stderr=%q, want Paseo receipt", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want one unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
 func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
 	_, runID, store := setupStatusProgressFixture(t)
 	defer store.Close()
@@ -3692,6 +3814,405 @@ func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUn
 	if len(acks) != 0 {
 		t.Fatalf("Claude cancelled replay acknowledgments = %#v, want none", acks)
 	}
+}
+
+func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnknown(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-cancelled-detached")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	host, ok := runtimecap.LookupHost("paseo-style")
+	if !ok {
+		t.Fatal("LookupHost(paseo-style) returned false")
+	}
+	capabilities := runtimecap.HostCapabilityDeclarations(host)
+	if got := hostCapabilitySupport(capabilities, runtimecap.HostDetachedCancellation); got != runtimecap.HostCapabilityUnknown {
+		t.Fatalf("Paseo detached cancellation support = %q, want unknown", got)
+	}
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-cancelled-detached-replay",
+		Owner:          "owner-paseo-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "gemini",
+		Model:          "gemini-3.1-pro",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before replay restart: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-paseo-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "903",
+		"--issue-title", "After Paseo cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Paseo origin") ||
+				!strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled Paseo receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := paseoHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 || obligations[0].ClaimOwner != "" {
+		t.Fatalf("Paseo cancelled obligation after replay = %#v, want pending unacknowledged with no claim", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("Paseo cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchPaseoHostReplayProviderModelMatrix(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{name: "codex", provider: "codex", model: "gpt-5.5"},
+		{name: "claude", provider: "claude", model: "claude-opus-4.5"},
+		{name: "gemini", provider: "gemini", model: "gemini-3.1-pro"},
+		{name: "grok", provider: "grok", model: "grok-build"},
+		{name: "synthetic-future-provider", provider: "synthetic-future", model: "future-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, priorRunID, store := setupStatusProgressFixture(t)
+			projectID := statusProgressProjectID(t, store)
+			t.Setenv(hostprofile.EnvName, "paseo")
+			t.Setenv("PASEO_AGENT_ID", "paseo-agent-provider-matrix-"+tt.name)
+			t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+			persistPaseoReplayFixture(t, store, projectID, priorRunID, "", "Paseo host replay before "+tt.provider, 50)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			record := validDispatchReport()
+			record.Provider = tt.provider
+			record.Model = tt.model
+			result := validDispatchResult(record)
+			result.RunID = "run-paseo-provider-independence-" + tt.name
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--repo", repo,
+				"--issue-number", "901",
+				"--issue-title", "Paseo host provider independence",
+				"--provider", tt.provider,
+				"--model", tt.model,
+				"--format", "json",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return time.Date(2026, 7, 14, 12, 6, 0, 0, time.UTC) },
+				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					if opts.Provider != tt.provider || opts.Model != tt.model {
+						return worker.Result{}, fmt.Errorf("worker selection = %s/%s, want %s/%s", opts.Provider, opts.Model, tt.provider, tt.model)
+					}
+					if !strings.Contains(stderr.String(), "Paseo host replay before "+tt.provider) {
+						return worker.Result{}, fmt.Errorf("Paseo host replay was not emitted before %s worker: %q", tt.provider, stderr.String())
+					}
+					if !strings.Contains(stderr.String(), "for Paseo origin") {
+						return worker.Result{}, fmt.Errorf("Paseo host replay did not identify host transport: %q", stderr.String())
+					}
+					return result, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var parsed worker.Result
+			assertSingleJSONValue(t, stdout.String(), &parsed)
+			if parsed.RunID != result.RunID {
+				t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+			}
+			if parsed.Report == nil || parsed.Report.Provider != tt.provider || parsed.Report.Model != tt.model {
+				t.Fatalf("stdout report provider/model = %#v, want %s/%s", parsed.Report, tt.provider, tt.model)
+			}
+			if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+				t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+func TestDispatchPaseoHostMarkerOnlyFallsBackWithoutReplayOrAck(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-marker-only-fallback",
+		Owner:          "owner-paseo-marker-only",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Model:          "gpt-5.5",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusSucceeded, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt marker-only: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusSucceeded, terminalReceiptID, "", "", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete marker-only: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before marker-only dispatch: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-paseo-marker-only"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "904",
+		"--issue-title", "After Paseo marker-only fallback",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if strings.Contains(stderr.String(), "replaying 1 pending progress receipt") ||
+				strings.Contains(stderr.String(), "status=succeeded") {
+				return worker.Result{}, fmt.Errorf("marker-only Paseo host replayed without origin proof: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after marker-only dispatch: %v", err)
+	}
+	defer store.Close()
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        "detached-run-status",
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations marker-only: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].TransportContract != "host-jsonl-v1" || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("marker-only obligations = %#v, want local fallback pending", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments marker-only: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("marker-only acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestPaseoClaudeRefreshFailureDoesNotMutateDetachedWorkerState(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-claude-refresh-race")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 8, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-2034-claude-refresh",
+		Owner:          "owner-paseo-2034",
+		LeaseExpiresAt: now.Add(10 * time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "claude",
+		Model:          "claude-opus-4.5",
+		Effort:         "high",
+		WorkerLease: map[string]any{
+			"watchdog_generation": float64(7),
+			"lease_expires_at":    now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+		},
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkWorkerStarted(ctx, store, claim.Fence(), now.Add(10*time.Second)); err != nil {
+		t.Fatalf("MarkWorkerStarted: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusSucceeded, true, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt succeeded: %v", err)
+	}
+	terminal, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusSucceeded, terminalReceiptID, "", "worker completed before Paseo host refresh failed", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("Complete succeeded: %v", err)
+	}
+	before, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get before replay failure: %v", err)
+	}
+	if before.TerminalReceiptID != terminal.TerminalReceiptID || before.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("before terminal record = %#v, want succeeded terminal", before)
+	}
+	binding := paseoHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	if !binding.Bound {
+		t.Fatalf("Paseo binding = %#v, want bound", binding)
+	}
+
+	hostErr := errors.New("paseo #2034 claude refresh timeout at host-delivery boundary")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 0, err: hostErr}
+	count, err := replayHostProgressForBinding(ctx, store, registered.Project.ProjectID, claim.RunID, binding.BindingID, failing, func() time.Time {
+		return now.Add(2 * time.Minute)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if !errors.Is(err, hostErr) {
+		t.Fatalf("host replay error = %v, want #2034 boundary error", err)
+	}
+	if count != 0 {
+		t.Fatalf("host replay count = %d, want 0 after failed boundary write", count)
+	}
+	after, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after replay failure: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("detached worker record mutated by host delivery failure\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if after.Generation != before.Generation ||
+		after.LeaseExpiresAt != before.LeaseExpiresAt ||
+		after.HeartbeatAt != before.HeartbeatAt ||
+		!reflect.DeepEqual(after.WorkerLease, before.WorkerLease) ||
+		after.Provider != "claude" ||
+		after.Model != "claude-opus-4.5" ||
+		after.TerminalReceiptID != terminalReceiptID ||
+		after.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("detached worker state changed after host failure: before=%#v after=%#v", before, after)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after #2034 fixture: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligations after #2034 fixture = %#v, want only retryable local obligation pending with no attempt", obligations)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after #2034 fixture: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after #2034 fixture = %#v, want none", cursors)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after #2034 fixture: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after #2034 fixture = %#v, want none", acks)
+	}
+	store.Close()
 }
 
 func TestDispatchClaudeHostReplayIsIndependentOfWorkerProvider(t *testing.T) {
