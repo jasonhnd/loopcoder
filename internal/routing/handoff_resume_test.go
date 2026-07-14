@@ -91,6 +91,166 @@ func TestResumeApprovedHandoffRoutesProviderAToProviderBOnce(t *testing.T) {
 	}
 }
 
+func TestResumeApprovedHandoffRoutesProviderAToGrokOrdinaryWorkerOnce(t *testing.T) {
+	ctx := context.Background()
+	fixture := withGrokOrdinaryWorkerFixture(newFixture(t))
+	path := tempDB(t)
+	store, handoff, input := handoffResumeOwnershipFixtureAtPath(t, ctx, fixture, path)
+	defer store.Close()
+	appendGrokHandoffCandidate(t, ctx, store, fixture, &input)
+	makeGrokEligibleOnly(input)
+	setSourceProviderSessionRef(t, ctx, store, handoff.ChildRunID, "opaque-source-session-authority")
+	var executions atomic.Int64
+
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ReusableEvidenceIDs: []string{"qsnap-codex-a-good", "availability-observation-a"},
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			if execution.Candidate.AdapterID != "grok" || execution.Candidate.ModelCapabilityID != "grok-good" {
+				t.Fatalf("executed candidate = %#v, want Grok ordinary worker", execution.Candidate)
+			}
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-grok"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("ResumeApprovedHandoff: %v\n%s", err, ExplainHuman(result.RoutingDecision))
+	}
+	if selected := selectedCandidate(result.RoutingDecision); selected.AdapterID != "grok" || selected.ModelCapabilityID != "grok-good" {
+		t.Fatalf("selected candidate = %#v, want valid Grok successor", selected)
+	}
+	if result.Handoff.AcceptedTaskFingerprint != handoff.AcceptedTaskFingerprint ||
+		result.Handoff.PlanFingerprint != handoff.PlanFingerprint ||
+		result.Handoff.AuthorizationFingerprint != handoff.AuthorizationFingerprint ||
+		result.RoutingDecision.PlanFingerprint != handoff.PlanFingerprint {
+		t.Fatalf("handoff authority fingerprints changed: result=%#v handoff=%#v route=%#v", result.Handoff, handoff, result.RoutingDecision)
+	}
+	if result.Reservation.BudgetReservationID == "" || result.Reservation.Scope.AdapterID != "grok" || result.Reservation.ReservedValue != 1 {
+		t.Fatalf("reservation = %#v, want reserved Grok capacity", result.Reservation)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("grok successor reservation state = %q, want active", state)
+	}
+	registration := handoffRegistrationState(t, ctx, store, handoff.ChildRunID)
+	if registration.adapterID != "grok" || registration.sessionRef != "" || registration.attemptID != result.Successor.AttemptID || registration.state != storage.AgentStateRunning {
+		t.Fatalf("registration after grok successor = %#v", registration)
+	}
+
+	replayed, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ReusableEvidenceIDs: []string{"qsnap-codex-a-good", "availability-observation-a"},
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("grok replay ResumeApprovedHandoff: %v", err)
+	}
+	if replayed.Successor.AttemptID != result.Successor.AttemptID || replayed.Successor.LaunchExposed || executions.Load() != 1 {
+		t.Fatalf("grok replay result=%#v executions=%d, want observe-only replay of first launch", replayed, executions.Load())
+	}
+
+	const concurrentReplays = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrentReplays)
+	start := make(chan struct{})
+	for i := 0; i < concurrentReplays; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			target := store
+			if i%2 == 1 {
+				other, openErr := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+				if openErr != nil {
+					errs <- openErr
+					return
+				}
+				defer other.Close()
+				target = other
+			}
+			<-start
+			concurrent, resumeErr := ResumeApprovedHandoff(ctx, target, HandoffResumeInput{
+				HandoffID:           handoff.HandoffID,
+				DecisionInput:       input,
+				ReservationValue:    1,
+				ReusableEvidenceIDs: []string{"qsnap-codex-a-good", "availability-observation-a"},
+				ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+					executions.Add(1)
+					return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate-concurrent"}, nil
+				},
+				DecidedBy: routerActor(),
+				Host:      routingHost(),
+			})
+			if resumeErr != nil {
+				errs <- resumeErr
+				return
+			}
+			if concurrent.Successor.AttemptID != result.Successor.AttemptID || concurrent.Successor.LaunchExposed {
+				errs <- errors.New("concurrent replay exposed a duplicate Grok launch")
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Grok replay: %v", err)
+	}
+	if executions.Load() != 1 || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 1 {
+		t.Fatalf("grok executions=%d attempts=%d, want at most one execution and one successor attempt", executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
+func TestResumeApprovedHandoffGrokFailureCannotCorruptOtherProviders(t *testing.T) {
+	ctx := context.Background()
+	fixture := withGrokOrdinaryWorkerFixture(newFixture(t))
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	appendGrokHandoffCandidate(t, ctx, store, fixture, &input)
+	makeGrokEligibleOnly(input)
+	beforeCodexRows := providerInventoryRowCount(t, ctx, store, "codex")
+	beforeClaudeRows := providerInventoryRowCount(t, ctx, store, "claude")
+	launchErr := errors.New("grok launch failed before provider accepted execution")
+
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			return HandoffSuccessorExecutionResult{Outcome: HandoffSuccessorExecutionNotStarted}, launchErr
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) || !errors.Is(err, launchErr) {
+		t.Fatalf("grok failure error = %v, want launchErr joined with ErrReplanRequired", err)
+	}
+	if selected := selectedCandidate(result.RoutingDecision); selected.AdapterID != "grok" {
+		t.Fatalf("selected candidate = %#v, want Grok before simulated failure", selected)
+	}
+	if result.Fallback.DecisionStatus != FallbackStatusReplanRequired || result.Fallback.FallbackDecisionID == "" {
+		t.Fatalf("grok failure fallback = %#v, want bounded replan fallback", result.Fallback)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("grok failure reservation state = %q, want released", state)
+	}
+	if got := providerInventoryRowCount(t, ctx, store, "codex"); got != beforeCodexRows {
+		t.Fatalf("codex inventory rows changed after grok failure: before=%d after=%d", beforeCodexRows, got)
+	}
+	if got := providerInventoryRowCount(t, ctx, store, "claude"); got != beforeClaudeRows {
+		t.Fatalf("claude inventory rows changed after grok failure: before=%d after=%d", beforeClaudeRows, got)
+	}
+}
+
 func TestResumeApprovedHandoffConcurrentReplayLaunchesOnce(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -1532,6 +1692,97 @@ func makeClaudeEligibleOnly(input DecisionInput) {
 	}
 }
 
+func appendGrokHandoffCandidate(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, input *DecisionInput) {
+	t.Helper()
+	candidate := fixture.candidate("grok", "acct-grok", "grok-good")
+	candidate.RoleKey = RoleKeyLuna
+	candidate.Permission = taskrequirements.PermissionWrite
+	candidate.LaunchSideEffectClass = taskrequirements.SideEffectLocalWrite
+	candidate.RoutingCandidateID = ""
+	candidate.CandidateFingerprint = ""
+	candidate.RoutingCandidateID = candidateID(candidate)
+	candidate.CandidateFingerprint = candidateFingerprint(candidate)
+	input.Inputs.Candidates = append(input.Inputs.Candidates, candidate)
+	scope := budget.Scope{
+		ScopeKind:         budget.ScopeSubAgent,
+		ProjectID:         "proj-routing",
+		DeliveryRunID:     "drun-routing",
+		TaskID:            "task-a",
+		SubAgentID:        "agent-source",
+		AdapterID:         candidate.AdapterID,
+		AccountProfileID:  candidate.AccountProfileID,
+		ModelCapabilityID: candidate.ModelCapabilityID,
+	}
+	if _, err := budget.UpsertPolicy(ctx, store, budget.PolicyInput{
+		Scope:         scope,
+		QuantityKind:  providerinventory.QuantityLocalPolicy,
+		WindowKind:    providerinventory.WindowUnbounded,
+		PolicyMode:    budget.PolicyHard,
+		CeilingValue:  100,
+		PolicyVersion: "handoff-test",
+		Ordinal:       "grok",
+		Actor:         budget.Actor{ActorID: "test"},
+		Host:          budget.Host{HostID: "test"},
+	}); err != nil {
+		t.Fatalf("upsert grok destination budget policy: %v", err)
+	}
+}
+
+func makeGrokEligibleOnly(input DecisionInput) {
+	for i := range input.Inputs.Inventory.QuotaSnapshots {
+		switch input.Inputs.Inventory.QuotaSnapshots[i].AdapterID {
+		case "codex", "claude":
+			remaining := int64(0)
+			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
+			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
+		case "grok":
+			remaining := int64(100)
+			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
+			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
+		}
+	}
+	for i := range input.Inputs.Availability {
+		input.Inputs.Availability[i].ScoreConfidence = providerinventory.ConfidenceExact
+		if input.Inputs.Availability[i].Scope.AdapterID == "grok" {
+			input.Inputs.Availability[i].Score = 95
+		} else {
+			input.Inputs.Availability[i].Score = 10
+		}
+	}
+}
+
+func setSourceProviderSessionRef(t *testing.T, ctx context.Context, store storage.Store, childRunID, sessionRef string) {
+	t.Helper()
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agent_registrations SET provider_session_ref = ? WHERE child_run_id = ?`, sessionRef, childRunID)
+		return err
+	}); err != nil {
+		t.Fatalf("set source provider session ref: %v", err)
+	}
+}
+
+func providerInventoryRowCount(t *testing.T, ctx context.Context, store storage.Store, adapterID string) int {
+	t.Helper()
+	var total int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		for _, query := range []string{
+			`SELECT COUNT(*) FROM provider_installations WHERE adapter_id = ?`,
+			`SELECT COUNT(*) FROM account_profiles WHERE adapter_id = ?`,
+			`SELECT COUNT(*) FROM model_capabilities WHERE adapter_id = ?`,
+		} {
+			var count int
+			if err := tx.QueryRow(ctx, query, adapterID).Scan(&count); err != nil {
+				return err
+			}
+			total += count
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("provider inventory row count: %v", err)
+	}
+	return total
+}
+
 func executeStarted(receipt string) HandoffSuccessorExecutor {
 	return func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
 		return HandoffSuccessorExecutionResult{ProviderReceipt: receipt, Outcome: HandoffSuccessorExecutionStarted}, nil
@@ -1689,7 +1940,13 @@ func seedProviderInventoryRows(t *testing.T, ctx context.Context, store storage.
 	t.Helper()
 	at := delivery.CanonicalTimestamp(fixture.now)
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		for _, adapter := range []string{"codex", "claude"} {
+		seenAdapters := map[string]bool{}
+		for _, installation := range fixture.inventory.Installations {
+			adapter := installation.AdapterID
+			if seenAdapters[adapter] {
+				continue
+			}
+			seenAdapters[adapter] = true
 			if _, err := tx.Exec(ctx, `INSERT INTO adapter_declarations(
 				adapter_declaration_id, schema_version, record_version, adapter_id, adapter_version, display_name,
 				executable_names_json, created_at, updated_at, payload_json)
@@ -1709,22 +1966,20 @@ func seedProviderInventoryRows(t *testing.T, ctx context.Context, store storage.
 				"pinst-"+adapter, adapter, "adecl-"+adapter, adapter, adapter, adapter, at, at, at, fixture.now.Add(time.Hour).Format(time.RFC3339Nano)); err != nil {
 				return err
 			}
-			accountID := "acct-a"
-			modelID := "codex-good"
-			if adapter == "claude" {
-				accountID = "acct-c"
-				modelID = "claude-good"
-			}
-			if _, err := tx.Exec(ctx, `INSERT INTO account_profiles(account_profile_id, adapter_id, provider_installation_id, payload_json)
-				VALUES (?, ?, ?, '{}') ON CONFLICT(account_profile_id) DO NOTHING`, accountID, adapter, "pinst-"+adapter); err != nil {
-				return err
-			}
 			if _, err := tx.Exec(ctx, `INSERT INTO model_catalog_snapshots(model_catalog_snapshot_id, adapter_id, provider_installation_id, payload_json)
 				VALUES (?, ?, ?, '{}') ON CONFLICT(model_catalog_snapshot_id) DO NOTHING`, "mcats-"+adapter, adapter, "pinst-"+adapter); err != nil {
 				return err
 			}
+		}
+		for _, account := range fixture.inventory.AccountProfiles {
+			if _, err := tx.Exec(ctx, `INSERT INTO account_profiles(account_profile_id, adapter_id, provider_installation_id, payload_json)
+				VALUES (?, ?, ?, '{}') ON CONFLICT(account_profile_id) DO NOTHING`, account.AccountProfileID, account.AdapterID, ptr(account.ProviderInstallationID)); err != nil {
+				return err
+			}
+		}
+		for _, model := range fixture.inventory.ModelCapabilities {
 			if _, err := tx.Exec(ctx, `INSERT INTO model_capabilities(model_capability_id, model_catalog_snapshot_id, adapter_id, payload_json)
-				VALUES (?, ?, ?, '{}') ON CONFLICT(model_capability_id) DO NOTHING`, modelID, "mcats-"+adapter, adapter); err != nil {
+				VALUES (?, ?, ?, '{}') ON CONFLICT(model_capability_id) DO NOTHING`, model.ModelCapabilityID, "mcats-"+model.AdapterID, model.AdapterID); err != nil {
 				return err
 			}
 		}

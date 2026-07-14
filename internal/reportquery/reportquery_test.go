@@ -188,6 +188,67 @@ func TestListAcceptsLegacyReportInputs(t *testing.T) {
 	}
 }
 
+func TestRenderTextAndJSONIncludesGrokAttributionWithoutSecrets(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-grok"
+	secretCanary := "xai_" + strings.Repeat("s", 24)
+	grokReport := testReport(reporter.RoleWorker, "grok", "grok-4.5", "high", "implement issue #838 [adapter=0.1.211 attempt=run-grok session=session-redacted]", "2026-07-13T00:00:00Z")
+	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:     1,
+		JobID:       "job-838-1",
+		Issue:       838,
+		Attempt:     1,
+		Provider:    "grok",
+		Status:      "succeeded",
+		Branch:      "loop/issue-838",
+		StartedAt:   "2026-07-13T00:00:00Z",
+		HeartbeatAt: "2026-07-13T00:00:01Z",
+		Report:      &grokReport,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	records, err := List(Options{RepoPath: repo, WorkID: runID})
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	text := RenderText(records)
+	for _, want := range []string{
+		"loopcoder report: worker succeeded",
+		"- worker: xAI Grok Build / grok / grok-4.5 (high) (parsed) / high",
+		`- action: "implement issue #838 [adapter=0.1.211 attempt=run-grok session=session-redacted]"`,
+		"- source: attempt",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Grok report text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, secretCanary) {
+		t.Fatalf("Grok report text leaked secret canary:\n%s", text)
+	}
+
+	data, err := MarshalJSON(records)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		Records []struct {
+			Report reporter.Report `json:"report"`
+			Source string          `json:"source"`
+			RunID  string          `json:"run_id"`
+		} `json:"records"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("JSON output invalid: %v\n%s", err, string(data))
+	}
+	if len(payload.Records) != 1 || payload.Records[0].Report.Provider != "grok" || payload.Records[0].Report.ModelSource != reporter.ModelSourceParsed || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != runID {
+		t.Fatalf("Grok JSON record = %#v", payload.Records)
+	}
+	if strings.Contains(string(data), secretCanary) {
+		t.Fatalf("Grok report JSON leaked secret canary: %s", string(data))
+	}
+}
+
 func testReport(role reporter.Role, provider, model, effort, action, ended string) reporter.Report {
 	total := int64(42)
 	return reporter.Report{

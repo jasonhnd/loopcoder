@@ -48,6 +48,47 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 	}
 }
 
+func TestRenderStatusIncludesGrokAttributionWithoutSecrets(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-grok"
+	secretCanary := "xai_" + strings.Repeat("s", 24)
+	writeAttempt(t, repo, runID, 838, 1, "job-838-1", grokWorkerReport(838, usageTotal(8380)))
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+	for _, want := range []string{
+		"RUN STATUS",
+		"| #838 | job-838-1 | not reported | grok | grok-4.5 | parsed | high | write | 42s | not reported | not reported | 8380 | true |",
+		"status is read-only and local-only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, secretCanary) {
+		t.Fatalf("rendered status leaked secret canary:\n%s", got)
+	}
+	data, err := MarshalJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		Rows []Row `json:"rows"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("status JSON did not unmarshal: %v\n%s", err, string(data))
+	}
+	if len(payload.Rows) != 1 || payload.Rows[0].WorkerProvider != "grok" || payload.Rows[0].WorkerModel != "grok-4.5" || payload.Rows[0].WorkerModelSource != "parsed" {
+		t.Fatalf("Grok status JSON rows = %#v", payload.Rows)
+	}
+	if strings.Contains(string(data), secretCanary) {
+		t.Fatalf("status JSON leaked secret canary: %s", string(data))
+	}
+}
+
 func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
 	repo := t.TempDir()
 	runID := "run-lifecycle"
@@ -551,6 +592,16 @@ func workerReport(issue int, usage reporter.Usage) reporter.Report {
 		Usage:       usage,
 		Verified:    true,
 	}
+}
+
+func grokWorkerReport(issue int, usage reporter.Usage) reporter.Report {
+	report := workerReport(issue, usage)
+	report.Provider = "grok"
+	report.Model = "grok-4.5"
+	report.ModelSource = reporter.ModelSourceParsed
+	report.Effort = "high"
+	report.Action = "implement issue #" + strconv.Itoa(issue) + " [adapter=0.1.211 attempt=run-grok session=session-redacted]"
+	return report
 }
 
 func verifierReport(pr int, usage reporter.Usage) reporter.Report {

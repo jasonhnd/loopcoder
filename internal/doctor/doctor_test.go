@@ -984,6 +984,131 @@ func TestRunChecksAntigravityProviderInstallOnly(t *testing.T) {
 	}
 }
 
+func TestRunReportsGrokAttributionAndTruthfulGaps(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Adapters.Worker = "grok"
+	env.paths["grok"] = "/bin/grok"
+	secretCanary := "xai_" + strings.Repeat("s", 24)
+	env.providerReport = func(cfg config.Config) providerinventory.Report {
+		report := env.providerInventory(cfg)
+		report.GapReasons = append(report.GapReasons, "provider-grok-native-federation-unsupported")
+		report.QuotaTelemetrySources = append(report.QuotaTelemetrySources, providerinventory.QuotaTelemetrySource{
+			SchemaVersion:       providerinventory.QuotaTelemetrySourceSchema,
+			RecordVersion:       1,
+			QuotaSourceID:       "qsrc_grok_fixture",
+			AdapterID:           "grok",
+			SourceKind:          providerinventory.QuotaSourceOfficialCLIError,
+			SourceKey:           "grok-acp-billing",
+			SourceSchemaVersion: "grok.acp.billing.v1",
+			UnsupportedReason:   "quota collection requires explicit telemetry grant",
+			GapReasons:          []string{"quota-collection-not-granted"},
+		})
+		report.QuotaSnapshots = append(report.QuotaSnapshots, providerinventory.QuotaSnapshot{
+			SchemaVersion:       providerinventory.QuotaSnapshotSchema,
+			RecordVersion:       1,
+			QuotaSnapshotID:     "qsnap_grok_grant_required",
+			QuotaSourceID:       "qsrc_grok_fixture",
+			SourceKind:          providerinventory.QuotaSourceOfficialCLIError,
+			AdapterID:           "grok",
+			ScopeKey:            "provider:grok",
+			QuantityKind:        providerinventory.QuantityRequests,
+			Unit:                "request",
+			WindowKind:          providerinventory.WindowUnknown,
+			ResetSemantics:      providerinventory.ResetUnknown,
+			Confidence:          providerinventory.ConfidenceUnavailable,
+			FreshnessState:      providerinventory.FreshnessNotApplicable,
+			TerminalErrorCode:   "ErrQuotaCollectionGrantRequired",
+			GapReasons:          []string{"quota-collection-not-granted"},
+			RedactedDiagnostics: "grok quota unavailable without explicit telemetry grant",
+		})
+		return report
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	providerCheck := requireCheck(t, report, "provider grok")
+	if providerCheck.Status != StatusOK || !strings.Contains(providerCheck.Message, `CLI "grok" discovered`) {
+		t.Fatalf("provider grok check = %#v", providerCheck)
+	}
+	quotaCheck := requireCheck(t, report, "quota telemetry")
+	if quotaCheck.Status != StatusOK || !strings.Contains(quotaCheck.Message, "grok") || !strings.Contains(quotaCheck.Message, "quota-collection-not-granted") {
+		t.Fatalf("quota telemetry check = %#v", quotaCheck)
+	}
+	nestedCheck := requireCheck(t, report, "provider compatibility grok nested-subagents")
+	if nestedCheck.Status != StatusInfo || nestedCheck.Hard || !strings.Contains(nestedCheck.Message, "native subagents") {
+		t.Fatalf("grok nested compatibility check = %#v", nestedCheck)
+	}
+	var human bytes.Buffer
+	if err := Render(&human, report); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, want := range []string{"provider grok", "quota-collection-not-granted", "provider compatibility grok nested-subagents"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("doctor text missing %q:\n%s", want, human.String())
+		}
+	}
+	if strings.Contains(human.String(), secretCanary) {
+		t.Fatalf("doctor text leaked secret canary:\n%s", human.String())
+	}
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		ProviderInventory struct {
+			GapReasons     []string `json:"gap_reasons"`
+			QuotaSnapshots []struct {
+				AdapterID         string   `json:"adapter_id"`
+				TerminalErrorCode string   `json:"terminal_error_code"`
+				GapReasons        []string `json:"gap_reasons"`
+			} `json:"quota_snapshots"`
+		} `json:"provider_inventory"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+			Host     string `json:"host"`
+			Role     string `json:"role"`
+			Support  string `json:"support"`
+			Status   Status `json:"status"`
+		} `json:"provider_compatibility"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if !containsString(payload.ProviderInventory.GapReasons, "provider-grok-native-federation-unsupported") {
+		t.Fatalf("provider inventory gaps = %#v", payload.ProviderInventory.GapReasons)
+	}
+	foundQuota := false
+	for _, snapshot := range payload.ProviderInventory.QuotaSnapshots {
+		if snapshot.AdapterID == "grok" {
+			foundQuota = true
+			if snapshot.TerminalErrorCode != "ErrQuotaCollectionGrantRequired" || !containsString(snapshot.GapReasons, "quota-collection-not-granted") {
+				t.Fatalf("grok quota snapshot = %#v", snapshot)
+			}
+		}
+	}
+	if !foundQuota {
+		t.Fatalf("Grok quota snapshot missing from JSON: %#v", payload.ProviderInventory.QuotaSnapshots)
+	}
+	foundCompat := false
+	for _, entry := range payload.ProviderCompatibility {
+		if entry.Provider == "grok" && entry.Host == "claude-code" && entry.Role == "worker" {
+			foundCompat = true
+			if entry.Support != "supported" || entry.Status != StatusOK {
+				t.Fatalf("grok worker compatibility = %#v", entry)
+			}
+		}
+	}
+	if !foundCompat {
+		t.Fatalf("Grok worker compatibility missing from JSON")
+	}
+	if strings.Contains(out.String(), secretCanary) {
+		t.Fatalf("doctor JSON leaked secret canary: %s", out.String())
+	}
+}
+
 func TestQuotaTelemetryHumanLineNamesConflictSetIDs(t *testing.T) {
 	check := checkQuotaTelemetry(providerinventory.Report{
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -2225,6 +2350,7 @@ type fakeDoctorEnv struct {
 	projectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 	projectDupes   func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	projectRepair  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	providerReport func(config.Config) providerinventory.Report
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -2316,6 +2442,9 @@ func (f *fakeDoctorEnv) deps() Deps {
 			return nil, nil
 		},
 		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			if f.providerReport != nil {
+				return f.providerReport(opts.Config), nil
+			}
 			return f.providerInventory(opts.Config), nil
 		},
 		Now: func() time.Time {

@@ -663,6 +663,30 @@ func newFixture(t *testing.T) hardFixture {
 	}
 }
 
+func withGrokOrdinaryWorkerFixture(f hardFixture) hardFixture {
+	projectID := "proj-routing"
+	f.inventory.Installations = append(f.inventory.Installations,
+		installation(projectID, "pinst-grok", "grok", f.now, providerinventory.FreshnessFresh, providerinventory.ConfidenceExact),
+	)
+	f.inventory.AccountProfiles = append(f.inventory.AccountProfiles,
+		account(projectID, "acct-grok", "grok", "pinst-grok", f.now, providerinventory.FreshnessFresh, providerinventory.ConfidenceExact),
+	)
+	f.inventory.AuthReadiness = append(f.inventory.AuthReadiness,
+		auth(projectID, "auth-acct-grok", "grok", "pinst-grok", "acct-grok", f.now, providerinventory.FreshnessFresh, providerinventory.ConfidenceExact),
+	)
+	f.inventory.ModelCapabilities = append(f.inventory.ModelCapabilities,
+		model("grok", "grok-good", "grok-4.5", []providerinventory.CatalogRole{providerinventory.CatalogRoleWorker}, f.now, goodCaps()),
+	)
+	f.inventory.QuotaSnapshots = append(f.inventory.QuotaSnapshots,
+		quota("qsnap-grok-good", "grok", "pinst-grok", "acct-grok", "grok-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 900, f.now),
+	)
+	f.budgets = append(f.budgets,
+		budgetSummary("bpol-grok", "grok", "acct-grok", "grok-good", 100),
+	)
+	f.contract.Providers = append(f.contract.Providers, providerRuntime("grok", true, false, true))
+	return f
+}
+
 func (f hardFixture) candidate(adapterID, accountID, modelID string) Candidate {
 	installationID := "pinst-" + adapterID
 	authID := "auth-" + accountID

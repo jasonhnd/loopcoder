@@ -16,6 +16,13 @@ require `read-only` and `dontAsk`; write calls require `strict` and `dontAsk`.
 If any required primitive is missing or cannot be probed, the adapter exits
 before launch with `unsupported-capability`.
 
+LoopCoder uses Grok only through the official local Grok Build CLI. It does not
+install or update the CLI, read credential files, perform login, call a direct
+xAI API, or assert exact subscription quota. Required tests use fake Grok
+Build/headless/ACP surfaces and do not consume provider credits. Live Grok
+smoke is an operator-owned diagnostic, disabled by default, and must be enabled
+explicitly with the documented environment gates in the test command.
+
 ## Inherited Source Inventory
 
 | Inherited source | Enforcement |
@@ -34,6 +41,7 @@ before launch with `unsupported-capability`.
 | Symlink and junction escapes | Workspace symlinks that resolve outside the accepted physical workspace cause fail-closed output before launch. |
 | Cancellation | Grok runs under LoopCoder supervised execution. Unix launches use a dedicated process group; Windows launches use a Job Object when available. Context cancellation, hard-cap expiry, and stall handling kill the full process tree. |
 | Durable session records | Streaming output is normalized and redacted before it is written. External session references are stored as redacted provider references only, not credentials or raw transcripts. |
+| Provider-native subagents | Not supported or required for Grok ordinary-worker conformance. Grok receives `--no-subagents`; any future native subagent support needs separate accepted capability evidence. |
 
 ## Residual Limitations
 
