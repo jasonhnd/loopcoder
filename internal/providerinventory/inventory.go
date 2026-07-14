@@ -801,6 +801,13 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0
 				}
+				if adapter.AdapterID == "grok" {
+					nativeProbe := inspectGrokNativeFederation(ctx, discovery, adapter, candidate, installation, now, deps)
+					probes = append(probes, nativeProbe)
+					if nativeProbe.Outcome != OutcomeInstalled {
+						gaps = append(gaps, "provider-grok-native-federation-unsupported")
+					}
+				}
 			} else {
 				readiness := unsupportedAuthReadiness(adapter, &installation.ProviderInstallationID, now, firstNonEmpty(installation.TerminalErrorCode, "installation-not-usable"))
 				readiness.EvidenceKind = EvidenceNotRun
@@ -3410,6 +3417,9 @@ func confidenceForInventory(installations []ProviderInstallation, probes []Probe
 		return ConfidenceUnavailable
 	}
 	for _, probe := range probes {
+		if probe.ProbeKind == "native-federation" {
+			continue
+		}
 		if probe.Outcome == OutcomeProbeFailed {
 			return ConfidenceUnknown
 		}
