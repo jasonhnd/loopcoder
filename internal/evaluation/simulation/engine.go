@@ -106,20 +106,25 @@ func Execute(ctx context.Context, scenario Scenario, opts Options) (Result, erro
 		return Result{}, typedError(ErrInvalidFixture, "digest starting state: %v", err)
 	}
 	state := normalizeDurableState(scenario.StartingState)
+	budgetRemaining, err := budgetRemaining(scenario, state.BudgetCommitments)
+	if err != nil {
+		return Result{}, err
+	}
 	run := runner{
 		scenario:          scenario,
 		origin:            origin.UTC(),
 		state:             state,
 		applied:           stringSet(state.AppliedEventIDs),
 		receipts:          receiptSet(state.ProviderReceipts),
+		receiptRecords:    receiptMap(state.ProviderReceipts),
 		commitments:       commitmentSet(state.BudgetCommitments),
 		handoffs:          handoffSet(state.Handoffs),
 		owners:            ownerSet(state.AgentOwners),
 		completed:         stringSet(state.CompletedTaskIDs),
 		decisionReplay:    mapByEvent(opts.ReplayJournal),
 		eventReplay:       eventMapByID(opts.ReplayJournal),
-		budgetRemaining:   budgetRemaining(scenario.BudgetAuthorities),
-		providerCallCount: map[string]int{},
+		budgetRemaining:   budgetRemaining,
+		providerCallCount: providerCallCount(state.ProviderReceipts),
 		decisionsByTask:   map[string]DecisionRecord{},
 	}
 	result := Result{
@@ -235,6 +240,7 @@ type runner struct {
 	state             DurableState
 	applied           map[string]bool
 	receipts          map[string]bool
+	receiptRecords    map[string]ProviderReceipt
 	commitments       map[string]bool
 	handoffs          map[string]bool
 	owners            map[string]bool
@@ -361,7 +367,14 @@ func (r *runner) route(event InjectedEvent) (DecisionRecord, error) {
 func (r *runner) providerCall(event InjectedEvent, decision DecisionRecord) (string, error) {
 	task, _ := taskByID(r.scenario.Tasks, event.TaskID)
 	model, _ := modelByID(r.scenario.Inventory.Models, decision.ChosenCandidateID)
-	callKey := event.TaskID + "\x00" + decision.ChosenCandidateID
+	receiptID := stableID("provider_receipt", r.scenario.ScenarioID, event.EventID, decision.ChosenCandidateID)
+	if receipt, ok := r.receiptRecords[receiptID]; ok {
+		if receipt.Status == "failed" {
+			return receiptID, typedError(ErrProviderFailure, "simulated provider failure %s for model %s", receipt.FailureCode, decision.ChosenCandidateID)
+		}
+		return receiptID, nil
+	}
+	callKey := providerCallKey(event.TaskID, decision.ChosenCandidateID)
 	r.providerCallCount[callKey]++
 	failure := r.failure(decision.ChosenCandidateID, r.providerCallCount[callKey])
 	status := "succeeded"
@@ -371,7 +384,7 @@ func (r *runner) providerCall(event InjectedEvent, decision DecisionRecord) (str
 		failureCode = failure.FailureCode
 	}
 	receipt := ProviderReceipt{
-		ReceiptID:         stableID("provider_receipt", r.scenario.ScenarioID, event.EventID, decision.ChosenCandidateID),
+		ReceiptID:         receiptID,
 		EventID:           event.EventID,
 		TaskID:            task.TaskID,
 		ModelCapabilityID: decision.ChosenCandidateID,
@@ -384,6 +397,7 @@ func (r *runner) providerCall(event InjectedEvent, decision DecisionRecord) (str
 		return receipt.ReceiptID, nil
 	}
 	r.receipts[receipt.ReceiptID] = true
+	r.receiptRecords[receipt.ReceiptID] = receipt
 	r.state.ProviderReceipts = append(r.state.ProviderReceipts, receipt)
 	if status == "succeeded" {
 		r.completed[task.TaskID] = true
@@ -568,12 +582,18 @@ func validateScenario(s Scenario) error {
 		if provider.ProviderInstallationID == "" || provider.AdapterID == "" {
 			return typedError(ErrInvalidFixture, "provider installation and adapter IDs are required")
 		}
+		if providers[provider.ProviderInstallationID] {
+			return typedError(ErrInvalidFixture, "duplicate provider installation %s", provider.ProviderInstallationID)
+		}
 		providers[provider.ProviderInstallationID] = true
 	}
 	accounts := map[string]bool{}
 	for _, account := range s.Inventory.Accounts {
 		if account.AccountProfileID == "" || account.AdapterID == "" || account.ProviderInstallationID == "" {
 			return typedError(ErrInvalidFixture, "account profile, adapter, and provider IDs are required")
+		}
+		if accounts[account.AccountProfileID] {
+			return typedError(ErrInvalidFixture, "duplicate account profile %s", account.AccountProfileID)
 		}
 		if !providers[account.ProviderInstallationID] {
 			return typedError(ErrMissingReference, "account %s references missing provider %s", account.AccountProfileID, account.ProviderInstallationID)
@@ -585,14 +605,21 @@ func validateScenario(s Scenario) error {
 		if model.ModelCapabilityID == "" || model.AdapterID == "" || model.AccountProfileID == "" {
 			return typedError(ErrInvalidFixture, "model capability, adapter, and account IDs are required")
 		}
+		if models[model.ModelCapabilityID] {
+			return typedError(ErrInvalidFixture, "duplicate model capability %s", model.ModelCapabilityID)
+		}
 		if !accounts[model.AccountProfileID] {
 			return typedError(ErrMissingReference, "model %s references missing account %s", model.ModelCapabilityID, model.AccountProfileID)
 		}
 		models[model.ModelCapabilityID] = true
 	}
+	quotas := map[string]bool{}
 	for _, quota := range s.Inventory.Quotas {
 		if quota.QuotaSnapshotID == "" || quota.ModelCapabilityID == "" || quota.AccountProfileID == "" {
 			return typedError(ErrInvalidFixture, "quota snapshot, model, and account IDs are required")
+		}
+		if quotas[quota.QuotaSnapshotID] {
+			return typedError(ErrInvalidFixture, "duplicate quota snapshot %s", quota.QuotaSnapshotID)
 		}
 		if !models[quota.ModelCapabilityID] {
 			return typedError(ErrMissingReference, "quota %s references missing model %s", quota.QuotaSnapshotID, quota.ModelCapabilityID)
@@ -600,24 +627,42 @@ func validateScenario(s Scenario) error {
 		if !accounts[quota.AccountProfileID] {
 			return typedError(ErrMissingReference, "quota %s references missing account %s", quota.QuotaSnapshotID, quota.AccountProfileID)
 		}
+		quotas[quota.QuotaSnapshotID] = true
 	}
 	budgets := map[string]bool{}
+	budgetByID := map[string]BudgetAuthority{}
 	for _, budget := range s.BudgetAuthorities {
 		if budget.BudgetAuthorityID == "" {
 			return typedError(ErrInvalidFixture, "budget authority ID is required")
+		}
+		if budgets[budget.BudgetAuthorityID] {
+			return typedError(ErrInvalidFixture, "duplicate budget authority %s", budget.BudgetAuthorityID)
+		}
+		if budget.LimitValue < 0 || budget.RemainingValue < 0 || budget.RemainingValue > budget.LimitValue {
+			return typedError(ErrInvalidFixture, "budget authority %s has invalid limit/remaining values", budget.BudgetAuthorityID)
 		}
 		if budget.Confidence != providerinventory.ConfidenceExact && budget.Confidence != providerinventory.ConfidenceEstimated {
 			return typedError(ErrInvalidFixture, "budget authority %s must have exact or estimated confidence", budget.BudgetAuthorityID)
 		}
 		budgets[budget.BudgetAuthorityID] = true
+		budgetByID[budget.BudgetAuthorityID] = budget
 	}
 	tasks := map[string]Task{}
 	for _, task := range s.Tasks {
 		if task.TaskID == "" || task.TaskKey == "" || task.BudgetAuthorityID == "" {
 			return typedError(ErrInvalidFixture, "task ID, key, and budget authority are required")
 		}
+		if _, exists := tasks[task.TaskID]; exists {
+			return typedError(ErrInvalidFixture, "duplicate task %s", task.TaskID)
+		}
+		if task.RequiredQuantity < 0 {
+			return typedError(ErrInvalidFixture, "task %s has negative required quantity", task.TaskID)
+		}
 		if !budgets[task.BudgetAuthorityID] {
 			return typedError(ErrMissingReference, "task %s references missing budget authority %s", task.TaskID, task.BudgetAuthorityID)
+		}
+		if budgetByID[task.BudgetAuthorityID].QuantityKind != task.QuantityKind {
+			return typedError(ErrInvalidFixture, "task %s quantity kind %s does not match budget authority %s quantity kind %s", task.TaskID, task.QuantityKind, task.BudgetAuthorityID, budgetByID[task.BudgetAuthorityID].QuantityKind)
 		}
 		for _, candidate := range task.CandidateModelIDs {
 			if !models[candidate] {
@@ -627,9 +672,13 @@ func validateScenario(s Scenario) error {
 		tasks[task.TaskID] = task
 	}
 	events := map[string]bool{}
+	eventByID := map[string]InjectedEvent{}
 	for _, event := range s.InjectedEvents {
 		if event.EventID == "" || event.Kind == "" {
 			return typedError(ErrInvalidFixture, "event ID and kind are required")
+		}
+		if events[event.EventID] {
+			return typedError(ErrInvalidFixture, "duplicate event %s", event.EventID)
 		}
 		if event.TaskID != "" {
 			if _, ok := tasks[event.TaskID]; !ok {
@@ -637,13 +686,23 @@ func validateScenario(s Scenario) error {
 			}
 		}
 		events[event.EventID] = true
+		eventByID[event.EventID] = event
 	}
 	for _, order := range s.ConcurrencyScript {
+		ordered := map[string]bool{}
 		for _, eventID := range order.EventIDs {
 			if !events[eventID] {
 				return typedError(ErrMissingReference, "concurrency group %s references missing event %s", order.Group, eventID)
 			}
+			key := order.Group + "\x00" + eventID
+			if ordered[key] {
+				return typedError(ErrInvalidFixture, "concurrency group %s repeats event %s", order.Group, eventID)
+			}
+			ordered[key] = true
 		}
+	}
+	if err := validateStartingState(s, tasks, models, budgetByID, eventByID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -660,6 +719,81 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 	}
 	if journal.Seed != s.Seed {
 		return typedError(ErrReplayMismatch, "replay journal seed %d does not match %d", journal.Seed, s.Seed)
+	}
+	tasks := taskMap(s.Tasks)
+	models := modelSet(s.Inventory.Models)
+	budgets := budgetSet(s.BudgetAuthorities)
+	events := eventMap(s.InjectedEvents)
+	eventRecords := map[string]EventRecord{}
+	for _, event := range journal.Events {
+		if event.EventID == "" {
+			return typedError(ErrReplayMismatch, "replay journal contains event with empty event_id")
+		}
+		if _, exists := eventRecords[event.EventID]; exists {
+			return typedError(ErrReplayMismatch, "replay journal contains duplicate event %s", event.EventID)
+		}
+		fixtureEvent, ok := events[event.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "replay journal event %s is not in scenario", event.EventID)
+		}
+		if event.EventKind != fixtureEvent.Kind {
+			return typedError(ErrReplayMismatch, "replay journal event %s kind %q does not match %q", event.EventID, event.EventKind, fixtureEvent.Kind)
+		}
+		if event.TaskID != fixtureEvent.TaskID {
+			return typedError(ErrReplayMismatch, "replay journal event %s task %q does not match %q", event.EventID, event.TaskID, fixtureEvent.TaskID)
+		}
+		eventRecords[event.EventID] = event
+	}
+	decisionsByEvent := map[string]DecisionRecord{}
+	decisionIDs := map[string]bool{}
+	for _, decision := range journal.Decisions {
+		if decision.DecisionID == "" || decision.EventID == "" {
+			return typedError(ErrReplayMismatch, "replay journal decision ID and event ID are required")
+		}
+		if decisionIDs[decision.DecisionID] {
+			return typedError(ErrReplayMismatch, "replay journal contains duplicate decision %s", decision.DecisionID)
+		}
+		decisionIDs[decision.DecisionID] = true
+		if _, exists := decisionsByEvent[decision.EventID]; exists {
+			return typedError(ErrReplayMismatch, "replay journal contains duplicate decision for event %s", decision.EventID)
+		}
+		event, ok := events[decision.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "replay journal decision %s references missing event %s", decision.DecisionID, decision.EventID)
+		}
+		task, ok := tasks[decision.TaskID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "replay journal decision %s references missing task %s", decision.DecisionID, decision.TaskID)
+		}
+		if event.TaskID != "" && event.TaskID != decision.TaskID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s task %s does not match event task %s", decision.DecisionID, decision.TaskID, event.TaskID)
+		}
+		if decision.BudgetAuthorityID != "" && (!budgets[decision.BudgetAuthorityID] || decision.BudgetAuthorityID != task.BudgetAuthorityID) {
+			return typedError(ErrReplayMismatch, "replay journal decision %s references invalid budget authority %s", decision.DecisionID, decision.BudgetAuthorityID)
+		}
+		if decision.ChosenCandidateID != "" {
+			if !models[decision.ChosenCandidateID] || !taskAllowsModel(task, decision.ChosenCandidateID) {
+				return typedError(ErrReplayMismatch, "replay journal decision %s references invalid chosen candidate %s", decision.DecisionID, decision.ChosenCandidateID)
+			}
+		}
+		for _, rejection := range decision.RejectedCandidates {
+			if rejection.CandidateID != "" && !models[rejection.CandidateID] {
+				return typedError(ErrReplayMismatch, "replay journal decision %s references invalid rejected candidate %s", decision.DecisionID, rejection.CandidateID)
+			}
+		}
+		decisionsByEvent[decision.EventID] = decision
+	}
+	for _, event := range journal.Events {
+		if event.DecisionID == "" {
+			continue
+		}
+		decision, ok := decisionsByEvent[event.EventID]
+		if !ok || decision.DecisionID != event.DecisionID {
+			return typedError(ErrReplayMismatch, "replay journal event %s decision %s has no matching decision", event.EventID, event.DecisionID)
+		}
+	}
+	if err := validateReplayAgainstStartingState(s.StartingState, eventRecords); err != nil {
+		return err
 	}
 	return nil
 }
@@ -771,6 +905,254 @@ func normalizeDurableState(state DurableState) DurableState {
 	return state
 }
 
+func validateStartingState(s Scenario, tasks map[string]Task, models map[string]bool, budgets map[string]BudgetAuthority, events map[string]InjectedEvent) error {
+	applied := map[string]bool{}
+	for _, eventID := range s.StartingState.AppliedEventIDs {
+		if eventID == "" {
+			return typedError(ErrInvalidFixture, "starting state contains empty applied event ID")
+		}
+		if applied[eventID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate applied event %s", eventID)
+		}
+		if _, ok := events[eventID]; !ok {
+			return typedError(ErrMissingReference, "starting state applied event %s is not in scenario", eventID)
+		}
+		applied[eventID] = true
+	}
+	completed := map[string]bool{}
+	for _, taskID := range s.StartingState.CompletedTaskIDs {
+		if taskID == "" {
+			return typedError(ErrInvalidFixture, "starting state contains empty completed task ID")
+		}
+		if completed[taskID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate completed task %s", taskID)
+		}
+		if _, ok := tasks[taskID]; !ok {
+			return typedError(ErrMissingReference, "starting state completed task %s is not in scenario", taskID)
+		}
+		completed[taskID] = true
+	}
+	receipts := map[string]bool{}
+	receiptSemantics := map[string]bool{}
+	succeededTasks := map[string]bool{}
+	for _, receipt := range s.StartingState.ProviderReceipts {
+		if receipt.ReceiptID == "" || receipt.EventID == "" || receipt.TaskID == "" || receipt.ModelCapabilityID == "" {
+			return typedError(ErrInvalidFixture, "starting state provider receipt identity fields are required")
+		}
+		if receipts[receipt.ReceiptID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate provider receipt %s", receipt.ReceiptID)
+		}
+		receipts[receipt.ReceiptID] = true
+		semantic := strings.Join([]string{receipt.EventID, receipt.TaskID, receipt.ModelCapabilityID}, "\x00")
+		if receiptSemantics[semantic] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic provider receipt for event %s task %s model %s", receipt.EventID, receipt.TaskID, receipt.ModelCapabilityID)
+		}
+		receiptSemantics[semantic] = true
+		event, ok := events[receipt.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "provider receipt %s references missing event %s", receipt.ReceiptID, receipt.EventID)
+		}
+		if event.Kind != "provider_call" {
+			return typedError(ErrInvalidFixture, "provider receipt %s references non-provider event %s", receipt.ReceiptID, receipt.EventID)
+		}
+		if event.TaskID != receipt.TaskID {
+			return typedError(ErrInvalidFixture, "provider receipt %s task %s does not match event task %s", receipt.ReceiptID, receipt.TaskID, event.TaskID)
+		}
+		task, ok := tasks[receipt.TaskID]
+		if !ok {
+			return typedError(ErrMissingReference, "provider receipt %s references missing task %s", receipt.ReceiptID, receipt.TaskID)
+		}
+		if !models[receipt.ModelCapabilityID] || !taskAllowsModel(task, receipt.ModelCapabilityID) {
+			return typedError(ErrMissingReference, "provider receipt %s references invalid model %s for task %s", receipt.ReceiptID, receipt.ModelCapabilityID, receipt.TaskID)
+		}
+		switch receipt.Status {
+		case "succeeded":
+			if receipt.FailureCode != "" {
+				return typedError(ErrInvalidFixture, "succeeded provider receipt %s has failure code", receipt.ReceiptID)
+			}
+			if !applied[receipt.EventID] {
+				return typedError(ErrInvalidFixture, "succeeded provider receipt %s event %s is not applied", receipt.ReceiptID, receipt.EventID)
+			}
+			succeededTasks[receipt.TaskID] = true
+		case "failed":
+			if receipt.FailureCode == "" {
+				return typedError(ErrInvalidFixture, "failed provider receipt %s is missing failure code", receipt.ReceiptID)
+			}
+			if applied[receipt.EventID] {
+				return typedError(ErrInvalidFixture, "failed provider receipt %s event %s is marked applied", receipt.ReceiptID, receipt.EventID)
+			}
+		default:
+			return typedError(ErrInvalidFixture, "provider receipt %s has invalid status %q", receipt.ReceiptID, receipt.Status)
+		}
+	}
+	for taskID := range completed {
+		if !succeededTasks[taskID] {
+			return typedError(ErrInvalidFixture, "completed task %s has no succeeded provider receipt", taskID)
+		}
+	}
+	for taskID := range succeededTasks {
+		if !completed[taskID] {
+			return typedError(ErrInvalidFixture, "task %s has succeeded provider receipt but is not completed", taskID)
+		}
+	}
+	if _, err := budgetRemaining(s, s.StartingState.BudgetCommitments); err != nil {
+		return err
+	}
+	commitments := map[string]bool{}
+	commitmentSemantics := map[string]bool{}
+	for _, commitment := range s.StartingState.BudgetCommitments {
+		if commitment.CommitmentID == "" || commitment.EventID == "" || commitment.TaskID == "" || commitment.BudgetAuthorityID == "" {
+			return typedError(ErrInvalidFixture, "starting state budget commitment identity fields are required")
+		}
+		if commitments[commitment.CommitmentID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate budget commitment %s", commitment.CommitmentID)
+		}
+		commitments[commitment.CommitmentID] = true
+		semantic := strings.Join([]string{commitment.EventID, commitment.TaskID, commitment.BudgetAuthorityID}, "\x00")
+		if commitmentSemantics[semantic] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic budget commitment for event %s task %s authority %s", commitment.EventID, commitment.TaskID, commitment.BudgetAuthorityID)
+		}
+		commitmentSemantics[semantic] = true
+		event, ok := events[commitment.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "budget commitment %s references missing event %s", commitment.CommitmentID, commitment.EventID)
+		}
+		if event.Kind != "budget_commit" {
+			return typedError(ErrInvalidFixture, "budget commitment %s references non-budget event %s", commitment.CommitmentID, commitment.EventID)
+		}
+		if event.TaskID != commitment.TaskID {
+			return typedError(ErrInvalidFixture, "budget commitment %s task %s does not match event task %s", commitment.CommitmentID, commitment.TaskID, event.TaskID)
+		}
+		if !applied[commitment.EventID] {
+			return typedError(ErrInvalidFixture, "budget commitment %s event %s is not applied", commitment.CommitmentID, commitment.EventID)
+		}
+		task, ok := tasks[commitment.TaskID]
+		if !ok {
+			return typedError(ErrMissingReference, "budget commitment %s references missing task %s", commitment.CommitmentID, commitment.TaskID)
+		}
+		budget, ok := budgets[commitment.BudgetAuthorityID]
+		if !ok {
+			return typedError(ErrMissingReference, "budget commitment %s references missing budget authority %s", commitment.CommitmentID, commitment.BudgetAuthorityID)
+		}
+		if task.BudgetAuthorityID != commitment.BudgetAuthorityID {
+			return typedError(ErrInvalidFixture, "budget commitment %s authority %s does not match task authority %s", commitment.CommitmentID, commitment.BudgetAuthorityID, task.BudgetAuthorityID)
+		}
+		if commitment.QuantityKind != string(task.QuantityKind) || budget.QuantityKind != task.QuantityKind {
+			return typedError(ErrInvalidFixture, "budget commitment %s quantity kind %s does not match task/budget quantity kind %s", commitment.CommitmentID, commitment.QuantityKind, task.QuantityKind)
+		}
+		if commitment.CommittedValue != task.RequiredQuantity {
+			return typedError(ErrInvalidFixture, "budget commitment %s committed value %d does not match task required quantity %d", commitment.CommitmentID, commitment.CommittedValue, task.RequiredQuantity)
+		}
+	}
+	handoffs := map[string]bool{}
+	handoffSemantics := map[string]bool{}
+	for _, handoff := range s.StartingState.Handoffs {
+		if handoff.HandoffID == "" || handoff.EventID == "" || handoff.SourceTaskID == "" || handoff.TargetTaskID == "" {
+			return typedError(ErrInvalidFixture, "starting state handoff identity fields are required")
+		}
+		if handoffs[handoff.HandoffID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate handoff %s", handoff.HandoffID)
+		}
+		handoffs[handoff.HandoffID] = true
+		semantic := strings.Join([]string{handoff.EventID, handoff.SourceTaskID, handoff.TargetTaskID}, "\x00")
+		if handoffSemantics[semantic] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic handoff for event %s source %s target %s", handoff.EventID, handoff.SourceTaskID, handoff.TargetTaskID)
+		}
+		handoffSemantics[semantic] = true
+		event, ok := events[handoff.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "handoff %s references missing event %s", handoff.HandoffID, handoff.EventID)
+		}
+		if event.Kind != "handoff" || event.TaskID != handoff.SourceTaskID {
+			return typedError(ErrInvalidFixture, "handoff %s does not match event %s", handoff.HandoffID, handoff.EventID)
+		}
+		if !applied[handoff.EventID] {
+			return typedError(ErrInvalidFixture, "handoff %s event %s is not applied", handoff.HandoffID, handoff.EventID)
+		}
+		source, ok := tasks[handoff.SourceTaskID]
+		if !ok {
+			return typedError(ErrMissingReference, "handoff %s references missing source task %s", handoff.HandoffID, handoff.SourceTaskID)
+		}
+		if _, ok := tasks[handoff.TargetTaskID]; !ok {
+			return typedError(ErrMissingReference, "handoff %s references missing target task %s", handoff.HandoffID, handoff.TargetTaskID)
+		}
+		if source.HandoffTargetTaskID != handoff.TargetTaskID {
+			return typedError(ErrInvalidFixture, "handoff %s target %s does not match source task target %s", handoff.HandoffID, handoff.TargetTaskID, source.HandoffTargetTaskID)
+		}
+	}
+	owners := map[string]bool{}
+	ownerSemantics := map[string]bool{}
+	for _, owner := range s.StartingState.AgentOwners {
+		if owner.OwnershipID == "" || owner.EventID == "" || owner.TaskID == "" || owner.ResourceKey == "" {
+			return typedError(ErrInvalidFixture, "starting state agent owner identity fields are required")
+		}
+		if owners[owner.OwnershipID] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate agent owner %s", owner.OwnershipID)
+		}
+		owners[owner.OwnershipID] = true
+		semantic := owner.ResourceKey
+		if ownerSemantics[semantic] {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic agent owner for resource %s", owner.ResourceKey)
+		}
+		ownerSemantics[semantic] = true
+		event, ok := events[owner.EventID]
+		if !ok {
+			return typedError(ErrMissingReference, "agent owner %s references missing event %s", owner.OwnershipID, owner.EventID)
+		}
+		if event.Kind != "agent_own" || event.TaskID != owner.TaskID {
+			return typedError(ErrInvalidFixture, "agent owner %s does not match event %s", owner.OwnershipID, owner.EventID)
+		}
+		if !applied[owner.EventID] {
+			return typedError(ErrInvalidFixture, "agent owner %s event %s is not applied", owner.OwnershipID, owner.EventID)
+		}
+		task, ok := tasks[owner.TaskID]
+		if !ok {
+			return typedError(ErrMissingReference, "agent owner %s references missing task %s", owner.OwnershipID, owner.TaskID)
+		}
+		resource := task.OwnerResourceKey
+		if resource == "" {
+			resource = task.TaskID
+		}
+		if owner.ResourceKey != resource {
+			return typedError(ErrInvalidFixture, "agent owner %s resource %s does not match task resource %s", owner.OwnershipID, owner.ResourceKey, resource)
+		}
+	}
+	return nil
+}
+
+func validateReplayAgainstStartingState(state DurableState, replayEvents map[string]EventRecord) error {
+	for _, eventID := range state.AppliedEventIDs {
+		if _, ok := replayEvents[eventID]; !ok {
+			return typedError(ErrReplayMismatch, "starting state applied event %s is missing from replay journal", eventID)
+		}
+	}
+	for _, receipt := range state.ProviderReceipts {
+		event, ok := replayEvents[receipt.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state provider receipt %s event %s is missing from replay journal", receipt.ReceiptID, receipt.EventID)
+		}
+		if event.ReceiptID != receipt.ReceiptID {
+			return typedError(ErrReplayMismatch, "replay journal event %s receipt %s does not match durable receipt %s", receipt.EventID, event.ReceiptID, receipt.ReceiptID)
+		}
+	}
+	for _, commitment := range state.BudgetCommitments {
+		if _, ok := replayEvents[commitment.EventID]; !ok {
+			return typedError(ErrReplayMismatch, "starting state budget commitment %s event %s is missing from replay journal", commitment.CommitmentID, commitment.EventID)
+		}
+	}
+	for _, handoff := range state.Handoffs {
+		if _, ok := replayEvents[handoff.EventID]; !ok {
+			return typedError(ErrReplayMismatch, "starting state handoff %s event %s is missing from replay journal", handoff.HandoffID, handoff.EventID)
+		}
+	}
+	for _, owner := range state.AgentOwners {
+		if _, ok := replayEvents[owner.EventID]; !ok {
+			return typedError(ErrReplayMismatch, "starting state agent owner %s event %s is missing from replay journal", owner.OwnershipID, owner.EventID)
+		}
+	}
+	return nil
+}
+
 func typedError(code, format string, args ...any) error {
 	return &TypedError{Code: code, Diagnostics: []Diagnostic{diagnostic(code, format, args...)}}
 }
@@ -874,6 +1256,14 @@ func receiptSet(values []ProviderReceipt) map[string]bool {
 	return out
 }
 
+func receiptMap(values []ProviderReceipt) map[string]ProviderReceipt {
+	out := map[string]ProviderReceipt{}
+	for _, value := range values {
+		out[value.ReceiptID] = value
+	}
+	return out
+}
+
 func commitmentSet(values []BudgetCommitment) map[string]bool {
 	out := map[string]bool{}
 	for _, value := range values {
@@ -898,12 +1288,40 @@ func ownerSet(values []AgentOwner) map[string]bool {
 	return out
 }
 
-func budgetRemaining(values []BudgetAuthority) map[string]int64 {
+func budgetRemaining(s Scenario, commitments []BudgetCommitment) (map[string]int64, error) {
 	out := map[string]int64{}
-	for _, value := range values {
+	for _, value := range s.BudgetAuthorities {
+		if value.LimitValue < 0 || value.RemainingValue < 0 || value.RemainingValue > value.LimitValue {
+			return nil, typedError(ErrInvalidFixture, "budget authority %s has invalid limit/remaining values", value.BudgetAuthorityID)
+		}
 		out[value.BudgetAuthorityID] = value.RemainingValue
 	}
+	for _, commitment := range commitments {
+		remaining, ok := out[commitment.BudgetAuthorityID]
+		if !ok {
+			return nil, typedError(ErrMissingReference, "budget commitment %s references missing budget authority %s", commitment.CommitmentID, commitment.BudgetAuthorityID)
+		}
+		if commitment.CommittedValue < 0 {
+			return nil, typedError(ErrInvalidFixture, "budget commitment %s has negative committed value %d", commitment.CommitmentID, commitment.CommittedValue)
+		}
+		if remaining < commitment.CommittedValue {
+			return nil, typedError(ErrBudgetDenied, "budget authority %s has %d remaining before durable commitment %s needs %d", commitment.BudgetAuthorityID, remaining, commitment.CommitmentID, commitment.CommittedValue)
+		}
+		out[commitment.BudgetAuthorityID] = remaining - commitment.CommittedValue
+	}
+	return out, nil
+}
+
+func providerCallCount(receipts []ProviderReceipt) map[string]int {
+	out := map[string]int{}
+	for _, receipt := range receipts {
+		out[providerCallKey(receipt.TaskID, receipt.ModelCapabilityID)]++
+	}
 	return out
+}
+
+func providerCallKey(taskID, modelID string) string {
+	return taskID + "\x00" + modelID
 }
 
 func mapByEvent(journal *ReplayJournal) map[string]DecisionRecord {
@@ -926,6 +1344,50 @@ func eventMapByID(journal *ReplayJournal) map[string]EventRecord {
 		out[event.EventID] = event
 	}
 	return out
+}
+
+func taskMap(tasks []Task) map[string]Task {
+	out := map[string]Task{}
+	for _, task := range tasks {
+		out[task.TaskID] = task
+	}
+	return out
+}
+
+func modelSet(models []Model) map[string]bool {
+	out := map[string]bool{}
+	for _, model := range models {
+		out[model.ModelCapabilityID] = true
+	}
+	return out
+}
+
+func budgetSet(budgets []BudgetAuthority) map[string]bool {
+	out := map[string]bool{}
+	for _, budget := range budgets {
+		out[budget.BudgetAuthorityID] = true
+	}
+	return out
+}
+
+func eventMap(events []InjectedEvent) map[string]InjectedEvent {
+	out := map[string]InjectedEvent{}
+	for _, event := range events {
+		out[event.EventID] = event
+	}
+	return out
+}
+
+func taskAllowsModel(task Task, modelID string) bool {
+	if len(task.CandidateModelIDs) == 0 {
+		return true
+	}
+	for _, candidate := range task.CandidateModelIDs {
+		if candidate == modelID {
+			return true
+		}
+	}
+	return false
 }
 
 func taskByID(tasks []Task, id string) (Task, bool) {

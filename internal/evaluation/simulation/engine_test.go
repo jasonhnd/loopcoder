@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
@@ -139,6 +140,216 @@ func TestExecuteCrashRestartPreservesIdempotency(t *testing.T) {
 	}
 	if got := len(result.DurableState.AgentOwners); got != 1 {
 		t.Fatalf("agent owners = %d, want exactly one", got)
+	}
+}
+
+func TestExecuteCrashRestartReconstructsBudgetAndProviderOrdinals(t *testing.T) {
+	scenario := restartAuthorityScenario()
+	uninterrupted, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute uninterrupted: %v", err)
+	}
+	crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 2})
+	if err != nil {
+		t.Fatalf("Execute crash: %v", err)
+	}
+	if !crashed.Truncated || crashed.TruncationReason != ErrCrashInjected {
+		t.Fatalf("crash result truncation = %t %q", crashed.Truncated, crashed.TruncationReason)
+	}
+	restart := scenario
+	restart.StartingState = crashed.DurableState
+	restarted, err := Execute(context.Background(), restart, Options{ReplayJournal: &crashed.ReplayJournal})
+	if err != nil {
+		t.Fatalf("Execute restart: %v", err)
+	}
+	if got, want := mustCanonicalDurableState(t, restarted.DurableState), mustCanonicalDurableState(t, uninterrupted.DurableState); !bytes.Equal(got, want) {
+		t.Fatalf("restart durable state mismatch\nrestart=%s\nuninterrupted=%s", got, want)
+	}
+	if got := len(restarted.DurableState.BudgetCommitments); got != 1 {
+		t.Fatalf("budget commitments = %d, want exactly one after restart", got)
+	}
+	receipt, ok := receiptByEvent(restarted.DurableState.ProviderReceipts, "event-call-2")
+	if !ok {
+		t.Fatalf("missing second provider receipt: %#v", restarted.DurableState.ProviderReceipts)
+	}
+	if receipt.Status != "failed" || receipt.FailureCode != "ordinal-two" {
+		t.Fatalf("second provider receipt = %#v, want ordinal-two failure", receipt)
+	}
+}
+
+func TestExecuteRejectsMalformedStartingState(t *testing.T) {
+	validCommitment := func() BudgetCommitment {
+		return BudgetCommitment{
+			CommitmentID:      stableID("budget_commitment", "scenario-a", "event-budget-1", "budget-a"),
+			EventID:           "event-budget-1",
+			TaskID:            "task-a",
+			BudgetAuthorityID: "budget-a",
+			QuantityKind:      string(providerinventory.QuantityRequests),
+			CommittedValue:    1,
+		}
+	}
+	validReceipt := func() ProviderReceipt {
+		return ProviderReceipt{
+			ReceiptID:         stableID("provider_receipt", "scenario-a", "event-call-1", "model-a"),
+			EventID:           "event-call-1",
+			TaskID:            "task-a",
+			ModelCapabilityID: "model-a",
+			Status:            "succeeded",
+			LatencyMS:         100,
+			CostMicrounits:    10,
+		}
+	}
+	tests := []struct {
+		name      string
+		mutate    func(*Scenario)
+		wantError string
+	}{
+		{
+			name: "unknown budget authority",
+			mutate: func(s *Scenario) {
+				commitment := validCommitment()
+				commitment.BudgetAuthorityID = "missing-budget"
+				s.StartingState.AppliedEventIDs = []string{"event-budget-1"}
+				s.StartingState.BudgetCommitments = []BudgetCommitment{commitment}
+			},
+			wantError: ErrMissingReference,
+		},
+		{
+			name: "quantity mismatch",
+			mutate: func(s *Scenario) {
+				commitment := validCommitment()
+				commitment.CommittedValue = 2
+				s.StartingState.AppliedEventIDs = []string{"event-budget-1"}
+				s.StartingState.BudgetCommitments = []BudgetCommitment{commitment}
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "duplicate semantic commitment",
+			mutate: func(s *Scenario) {
+				first := validCommitment()
+				second := validCommitment()
+				second.CommitmentID = "manual-duplicate-id"
+				s.StartingState.AppliedEventIDs = []string{"event-budget-1"}
+				s.StartingState.BudgetCommitments = []BudgetCommitment{first, second}
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "over limit reconstruction",
+			mutate: func(s *Scenario) {
+				commitment := validCommitment()
+				commitment.CommittedValue = 3
+				s.Tasks[0].RequiredQuantity = 3
+				s.BudgetAuthorities[0].RemainingValue = 2
+				s.StartingState.AppliedEventIDs = []string{"event-budget-1"}
+				s.StartingState.BudgetCommitments = []BudgetCommitment{commitment}
+			},
+			wantError: ErrBudgetDenied,
+		},
+		{
+			name: "duplicate semantic provider receipt",
+			mutate: func(s *Scenario) {
+				first := validReceipt()
+				second := validReceipt()
+				second.ReceiptID = "manual-duplicate-receipt"
+				s.StartingState.AppliedEventIDs = []string{"event-call-1"}
+				s.StartingState.CompletedTaskIDs = []string{"task-a"}
+				s.StartingState.ProviderReceipts = []ProviderReceipt{first, second}
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "duplicate semantic handoff",
+			mutate: func(s *Scenario) {
+				s.InjectedEvents = append(s.InjectedEvents, InjectedEvent{EventID: "event-handoff", Kind: "handoff", TaskID: "task-a"})
+				first := HandoffRecord{
+					HandoffID:        stableID("handoff", "scenario-a", "event-handoff", "task-a", "task-b"),
+					EventID:          "event-handoff",
+					SourceTaskID:     "task-a",
+					TargetTaskID:     "task-b",
+					AuthorizationRef: "sha256:auth",
+				}
+				second := first
+				second.HandoffID = "manual-duplicate-handoff"
+				s.StartingState.AppliedEventIDs = []string{"event-handoff"}
+				s.StartingState.Handoffs = []HandoffRecord{first, second}
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "duplicate semantic owner",
+			mutate: func(s *Scenario) {
+				s.InjectedEvents = append(s.InjectedEvents, InjectedEvent{EventID: "event-owner", Kind: "agent_own", TaskID: "task-a"})
+				first := AgentOwner{
+					OwnershipID:     stableID("agent_owner", "scenario-a", "resource-a"),
+					EventID:         "event-owner",
+					TaskID:          "task-a",
+					ResourceKey:     "resource-a",
+					OwnerState:      "held",
+					Permission:      "orchestrate",
+					SideEffectClass: "provider_launch",
+				}
+				second := first
+				second.OwnershipID = "manual-duplicate-owner"
+				s.StartingState.AppliedEventIDs = []string{"event-owner"}
+				s.StartingState.AgentOwners = []AgentOwner{first, second}
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "duplicate event identity",
+			mutate: func(s *Scenario) {
+				s.InjectedEvents = append(s.InjectedEvents, s.InjectedEvents[0])
+			},
+			wantError: ErrInvalidFixture,
+		},
+		{
+			name: "unknown completed task",
+			mutate: func(s *Scenario) {
+				s.StartingState.CompletedTaskIDs = []string{"missing-task"}
+			},
+			wantError: ErrMissingReference,
+		},
+		{
+			name: "unknown applied event",
+			mutate: func(s *Scenario) {
+				s.StartingState.AppliedEventIDs = []string{"missing-event"}
+			},
+			wantError: ErrMissingReference,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := restartAuthorityScenario()
+			tt.mutate(&scenario)
+			_, err := Execute(context.Background(), scenario, Options{})
+			if err == nil {
+				t.Fatal("Execute accepted malformed starting state")
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want %s", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalConflictingWithStartingState(t *testing.T) {
+	scenario := restartAuthorityScenario()
+	crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 1})
+	if err != nil {
+		t.Fatalf("Execute crash: %v", err)
+	}
+	restart := scenario
+	restart.StartingState = crashed.DurableState
+	conflicting := crashed.ReplayJournal
+	conflicting.Events[0].ReceiptID = "invented-receipt"
+	_, err = Execute(context.Background(), restart, Options{ReplayJournal: &conflicting})
+	if err == nil {
+		t.Fatal("Execute accepted conflicting replay journal")
+	}
+	if !strings.Contains(err.Error(), ErrReplayMismatch) {
+		t.Fatalf("error = %v, want replay mismatch", err)
 	}
 }
 
@@ -278,6 +489,49 @@ func mustCanonicalResult(t *testing.T, result Result) []byte {
 		t.Fatalf("CanonicalResultJSON: %v", err)
 	}
 	return data
+}
+
+func mustCanonicalDurableState(t *testing.T, state DurableState) []byte {
+	t.Helper()
+	data, err := delivery.CanonicalJSON(normalizeDurableState(state))
+	if err != nil {
+		t.Fatalf("CanonicalJSON durable state: %v", err)
+	}
+	return data
+}
+
+func receiptByEvent(receipts []ProviderReceipt, eventID string) (ProviderReceipt, bool) {
+	for _, receipt := range receipts {
+		if receipt.EventID == eventID {
+			return receipt, true
+		}
+	}
+	return ProviderReceipt{}, false
+}
+
+func restartAuthorityScenario() Scenario {
+	scenario := baseScenario()
+	scenario.BudgetAuthorities[0].LimitValue = 2
+	scenario.BudgetAuthorities[0].RemainingValue = 2
+	scenario.Tasks[0].RequiredQuantity = 1
+	scenario.Tasks[0].CandidateModelIDs = []string{"model-a"}
+	scenario.Tasks[1].RequiredQuantity = 2
+	scenario.Tasks[1].CandidateModelIDs = []string{"model-a"}
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-call-1", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget-1", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-call-2", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget-2", Kind: "budget_commit", TaskID: "task-b", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-call-1", "event-budget-1", "event-call-2", "event-budget-2"}}}
+	scenario.Inventory.Failures = []ProviderFailure{{
+		ModelCapabilityID: "model-a",
+		FailureCode:       "ordinal-two",
+		AtCallOrdinal:     2,
+		CostMicrounits:    10,
+	}}
+	scenario.Invariants = nil
+	return scenario
 }
 
 func baseScenario() Scenario {
