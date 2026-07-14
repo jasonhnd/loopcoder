@@ -23,6 +23,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
@@ -65,38 +66,45 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter           func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive             func(pid int) bool
-	Now                      func() time.Time
-	IsTerminal               func(w io.Writer) bool
-	Stdin                    io.Reader
-	BuildInfo                BuildInfo
-	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify                   func(ctx context.Context, opts verify.Options) verify.Result
-	Audit                    func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
-	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
-	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
-	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
-	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
-	Init                     func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade                  func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState        func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	SkillInstall             func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush                func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull                func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader             func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter              func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter            func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive                func(pid int) bool
+	Now                         func() time.Time
+	IsTerminal                  func(w io.Writer) bool
+	Stdin                       io.Reader
+	BuildInfo                   BuildInfo
+	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                        func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                      func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                       func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                      func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory           func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree             func(pid int) error
+	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority      func(pid int, authority string) error
+	DetachedSupervisorCadence   time.Duration
+	DetachedStorageBusyTimeout  time.Duration
+	DetachedStorageWriteTxRetry storage.WriteTxRetryOptions
 }
 
 var commands = []Command{
@@ -124,10 +132,12 @@ var commands = []Command{
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
+	{Name: "attach", Summary: "attach to durable detached run progress"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
+	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
@@ -257,6 +267,10 @@ func DefaultDeps() Deps {
 		LeaseRelease: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
+		StartDetachedDispatch:  startDetachedDispatchProcess,
+		KillProcessTree:        process.KillTree,
+		ProcessAuthority:       process.Authority,
+		VerifyProcessAuthority: process.VerifyAuthority,
 	}
 }
 
@@ -391,6 +405,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "status" {
 		return runStatus(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "attach" {
+		return runAttach(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "report" {
 		return runReport(args[1:], stdout, stderr)
 	}
@@ -468,6 +485,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "cancel" {
+		return runCancel(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "loopreview" {
 		return runLoopreview(args[1:], stdout, stderr, deps)
@@ -561,6 +581,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue-number int          GitHub issue number (required)")
 		fmt.Fprintln(w, "  --issue-title string        GitHub issue title (required)")
 		fmt.Fprintln(w, "  --issue-body string         GitHub issue body")
+		fmt.Fprintln(w, "  --issue-body-file string    path to GitHub issue body text")
 		fmt.Fprintln(w, "  --base-branch string        base branch to fetch and branch from (default \"main\")")
 		fmt.Fprintln(w, "  --branch string             worker branch (default loop/issue-<issue-number>)")
 		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
@@ -573,6 +594,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+		fmt.Fprintln(w, "  --detach                    launch a bounded detached supervisor and return a run record")
 		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -618,6 +640,15 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
 		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
+	}
+	if command.Name == "attach" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to attach")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --cursor string        opaque receipt cursor to resume after")
+		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
+		fmt.Fprintln(w, "  --format string        output format: text or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -760,6 +791,14 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
 		fmt.Fprintln(w, "  --strict                        reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --detached                      reconcile detached supervisor state by --run-id without retrying worker dispatch")
+		fmt.Fprintln(w, "  --format string                 output format for --detached: text or json (default \"text\")")
+	}
+	if command.Name == "cancel" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to cancel")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -4153,6 +4192,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var issueNumberAlias int
 	var issueTitleAlias string
 	var issueBodyAlias string
+	var issueBodyFile string
+	var issueBodyFileAlias string
 	var baseBranchAlias string
 	var branchAlias string
 	var runIDAlias string
@@ -4170,6 +4211,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var supervisorRun bool
+	var supervisorOwner string
+	var supervisorGeneration int64
 	format := "text"
 	var formatAlias string
 	var verbose bool
@@ -4183,6 +4229,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
 	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
 	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
+	fs.StringVar(&issueBodyFile, "issue-body-file", "", "path to issue body text")
+	fs.StringVar(&issueBodyFileAlias, "IssueBodyFile", "", "path to issue body text")
 	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&opts.Branch, "branch", "", "branch")
@@ -4207,6 +4255,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&supervisorRun, "supervisor-run", false, "run as detached supervisor child")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "detached supervisor generation")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
@@ -4230,6 +4283,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if issueBodyAlias != "" {
 		opts.IssueBody = issueBodyAlias
+	}
+	if issueBodyFileAlias != "" {
+		issueBodyFile = issueBodyFileAlias
+	}
+	if strings.TrimSpace(issueBodyFile) != "" {
+		// #nosec G304 -- --issue-body-file is an explicit local CLI input used to keep issue text out of child argv.
+		data, err := os.ReadFile(issueBodyFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch: read --issue-body-file: %v\n", err)
+			return 2
+		}
+		opts.IssueBody = string(data)
 	}
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias
@@ -4260,6 +4325,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	detach = detach || detachAlias
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -4290,6 +4356,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if opts.Timeout < 0 {
 		fmt.Fprintln(stderr, "dispatch: --timeout must not be negative")
+		return 2
+	}
+	if detach && supervisorRun {
+		fmt.Fprintln(stderr, "dispatch: --detach cannot be combined with --supervisor-run")
 		return 2
 	}
 
@@ -4329,6 +4399,13 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.Provider = selection.Provider
 	opts.Model = selection.Model
 	opts.Effort = selection.Effort
+
+	if detach {
+		return runDetachedDispatch(opts, outputMode.Format, stdout, stderr, deps)
+	}
+	if supervisorRun {
+		return runDispatchSupervisor(opts, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, deps)
+	}
 
 	result, err := deps.Dispatch(context.Background(), opts)
 	if err != nil {
@@ -5271,6 +5348,13 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var verifierTimeoutAlias time.Duration
 	var strict bool
 	var strictAlias bool
+	var detached bool
+	var detachedAlias bool
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
+	format := "text"
+	var formatAlias string
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -5296,6 +5380,13 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&detached, "detached", false, "reconcile a detached run supervisor by run id")
+	fs.BoolVar(&detachedAlias, "Detached", false, "reconcile a detached run supervisor by run id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
@@ -5367,6 +5458,10 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.VerifierTimeout = verifierTimeoutAlias
 	}
 	strict = strict || strictAlias
+	detached = detached || detachedAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
 	opts.Stderr = stderr
 
 	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
@@ -5379,6 +5474,18 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "recover: --repo is required")
 		return 2
+	}
+	if detached {
+		if strings.TrimSpace(opts.RunID) == "" {
+			fmt.Fprintln(stderr, "recover: --run-id is required")
+			return 2
+		}
+		resolvedRepo, err := resolveRepo(opts.RepoPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "recover: %v\n", err)
+			return 2
+		}
+		return runDetachedRecover(resolvedRepo, opts.RunID, format, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, supervisorLease, stdout, stderr, deps)
 	}
 	if opts.IssueNumber <= 0 {
 		fmt.Fprintln(stderr, "recover: --issue-number is required")
@@ -5843,6 +5950,9 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var cursor string
 	var correlationID string
 	var taskID string
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
 	var limit int
 	var pollInterval time.Duration
 	var followFor time.Duration
@@ -5861,6 +5971,9 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&cursor, "cursor", "", "opaque progress receipt cursor")
 	fs.StringVar(&correlationID, "correlation", "", "progress receipt correlation id")
 	fs.StringVar(&taskID, "task", "", "progress receipt task id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
 	fs.IntVar(&limit, "limit", 500, "maximum progress receipts per read")
 	fs.DurationVar(&pollInterval, "poll", progress.DefaultFollowPollInterval, "follow poll interval")
 	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
@@ -5908,6 +6021,8 @@ func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 			Cursor:        progress.Cursor(cursor),
 			CorrelationID: correlationID,
 			TaskID:        taskID,
+			Fence:         detachedrun.Fence{RunID: runID, Owner: supervisorOwner, Generation: supervisorGeneration},
+			ExpectedLease: supervisorLease,
 			Limit:         limit,
 			PollInterval:  pollInterval,
 			FollowFor:     followFor,
@@ -5949,6 +6064,8 @@ type statusProgressOptions struct {
 	Cursor        progress.Cursor
 	CorrelationID string
 	TaskID        string
+	Fence         detachedrun.Fence
+	ExpectedLease string
 	Limit         int
 	PollInterval  time.Duration
 	FollowFor     time.Duration
@@ -5984,6 +6101,10 @@ func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Wri
 		return 1
 	}
 	defer store.Close()
+	if err := validateDetachedStatusFence(ctx, store, runID, opts.Fence, opts.ExpectedLease); err != nil {
+		fmt.Fprintf(stderr, "status: %v\n", err)
+		return 1
+	}
 
 	filter := progress.ReadFilter{
 		ProjectID:     roots.ProjectID,
