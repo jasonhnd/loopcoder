@@ -4,6 +4,7 @@
 package observability
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -24,6 +25,13 @@ const (
 	defaultLimit = 100
 	maxLimit     = 1000
 	sourceIDCap  = 256
+
+	cursorMaxBytes       = 2048
+	cursorMaxOffset      = 10_000_000
+	fingerprintSampleCap = 256
+	orderingContract     = "section_spec_v1/record_id_asc"
+	maxSectionFilters    = 64
+	maxSectionNameBytes  = 64
 )
 
 type ErrorCode string
@@ -34,6 +42,8 @@ const (
 	ErrPartialMigrationCode ErrorCode = "partial_migration"
 	ErrStorageReadCode      ErrorCode = "storage_read"
 	ErrCorruptCursorCode    ErrorCode = "corrupt_cursor"
+	ErrStaleCursorCode      ErrorCode = "stale_cursor"
+	ErrConsistencyGapCode   ErrorCode = "consistency_gap"
 )
 
 type QueryError struct {
@@ -171,12 +181,17 @@ type rowSpec struct {
 type scope struct {
 	projectID string
 	runID     string
-	now       time.Time
 }
 
 type cursor struct {
-	SchemaVersion string `json:"schema_version"`
-	Offset        int    `json:"offset"`
+	SchemaVersion       string `json:"schema_version"`
+	Offset              int    `json:"offset"`
+	Limit               int    `json:"limit"`
+	Ordering            string `json:"ordering"`
+	ProjectDigest       string `json:"project_digest"`
+	DeliveryRunDigest   string `json:"delivery_run_digest"`
+	SectionsDigest      string `json:"sections_digest"`
+	SnapshotFingerprint string `json:"snapshot_fingerprint"`
 }
 
 type rawRow struct {
@@ -210,11 +225,11 @@ func LoadSummary(ctx context.Context, store storage.Store, opts Options) (Summar
 	specs := filteredSpecs(allowed)
 	var out Summary
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
-		snapshot, err := readSnapshot(ctx, tx, sc)
-		if err != nil {
+		if err := assertScopedRun(ctx, tx, sc); err != nil {
 			return err
 		}
-		if err := assertScopedRun(ctx, tx, sc); err != nil {
+		snapshot, err := readSnapshot(ctx, tx, sc, specs, opts.Now)
+		if err != nil {
 			return err
 		}
 		counts, evidence, err := loadCounts(ctx, tx, sc, specs)
@@ -252,19 +267,36 @@ func LoadDetail(ctx context.Context, store storage.Store, opts Options) (Detail,
 		return Detail{}, err
 	}
 	limit := boundedLimit(opts.Limit)
-	cur, err := decodeCursor(opts.Cursor)
+	allowed := sectionSet(opts.Sections)
+	specs := filteredSpecs(allowed)
+	sections := normalizedSections(specs)
+	binding, err := cursorBinding(sc, sections, limit)
 	if err != nil {
 		return Detail{}, err
 	}
-	allowed := sectionSet(opts.Sections)
-	specs := filteredSpecs(allowed)
+	cur, hasCursor, err := decodeCursor(opts.Cursor)
+	if err != nil {
+		return Detail{}, err
+	}
+	if hasCursor {
+		if err := validateCursorBinding(cur, binding); err != nil {
+			return Detail{}, err
+		}
+	}
 	var out Detail
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
-		snapshot, err := readSnapshot(ctx, tx, sc)
+		if err := assertScopedRun(ctx, tx, sc); err != nil {
+			return err
+		}
+		snapshotFingerprint, err := readSnapshotFingerprint(ctx, tx, sc, specs, sections)
 		if err != nil {
 			return err
 		}
-		if err := assertScopedRun(ctx, tx, sc); err != nil {
+		if hasCursor && cur.SnapshotFingerprint != snapshotFingerprint {
+			return &QueryError{Code: ErrConsistencyGapCode, Message: "cursor snapshot is stale"}
+		}
+		snapshot, err := readSnapshot(ctx, tx, sc, specs, opts.Now)
+		if err != nil {
 			return err
 		}
 		counts, evidence, err := loadCounts(ctx, tx, sc, specs)
@@ -283,7 +315,16 @@ func LoadDetail(ctx context.Context, store storage.Store, opts Options) (Detail,
 		evidence = append(evidence, validatePage(entries)...)
 		next := ""
 		if truncated {
-			next, err = encodeCursor(cursor{SchemaVersion: DetailSchemaVersion, Offset: nextOffset})
+			next, err = encodeCursor(cursor{
+				SchemaVersion:       DetailSchemaVersion,
+				Offset:              nextOffset,
+				Limit:               limit,
+				Ordering:            orderingContract,
+				ProjectDigest:       binding.ProjectDigest,
+				DeliveryRunDigest:   binding.DeliveryRunDigest,
+				SectionsDigest:      binding.SectionsDigest,
+				SnapshotFingerprint: snapshotFingerprint,
+			})
 			if err != nil {
 				return err
 			}
@@ -344,11 +385,15 @@ func validateOptions(store storage.Store, opts Options) (scope, error) {
 	if runID == "" {
 		return scope{}, &QueryError{Code: ErrInvalidQueryCode, Message: "delivery_run_id is required"}
 	}
-	now := time.Now().UTC()
-	if opts.Now != nil {
-		now = opts.Now().UTC()
+	if len(opts.Sections) > maxSectionFilters {
+		return scope{}, &QueryError{Code: ErrInvalidQueryCode, Message: "too many section filters"}
 	}
-	return scope{projectID: projectID, runID: runID, now: now}, nil
+	for _, section := range opts.Sections {
+		if len(strings.TrimSpace(section)) > maxSectionNameBytes {
+			return scope{}, &QueryError{Code: ErrInvalidQueryCode, Message: "section filter is too large"}
+		}
+	}
+	return scope{projectID: projectID, runID: runID}, nil
 }
 
 func boundedLimit(value int) int {
@@ -361,17 +406,27 @@ func boundedLimit(value int) int {
 	return value
 }
 
-func readSnapshot(ctx context.Context, tx storage.Tx, sc scope) (Snapshot, error) {
+func readSnapshot(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec, now func() time.Time) (Snapshot, error) {
 	var version int
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations`).Scan(&version); err != nil {
 		return Snapshot{}, fmt.Errorf("read schema snapshot: %w", err)
+	}
+	observedAt := ""
+	if now != nil {
+		observedAt = delivery.CanonicalTimestamp(now().UTC())
+	} else {
+		durable, err := deterministicObservedAt(ctx, tx, sc, specs)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		observedAt = durable
 	}
 	return Snapshot{
 		SchemaVersion:    version,
 		Consistency:      "single_sqlite_transaction",
 		Canonicalization: delivery.CanonicalJSONVersion,
 		ReadOnly:         true,
-		ObservedAt:       delivery.CanonicalTimestamp(sc.now),
+		ObservedAt:       observedAt,
 	}, nil
 }
 
@@ -384,6 +439,171 @@ func assertScopedRun(ctx context.Context, tx storage.Tx, sc scope) error {
 		return &QueryError{Code: ErrNotFoundCode, Message: "delivery run not found in requested project scope"}
 	}
 	return nil
+}
+
+func deterministicObservedAt(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec) (string, error) {
+	latest := ""
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), '') FROM delivery_runs WHERE project_id = ? AND delivery_run_id = ?`, sc.projectID, sc.runID).Scan(&latest); err != nil {
+		return "", fmt.Errorf("read durable observed_at: %w", err)
+	}
+	for _, spec := range specs {
+		candidate, err := latestSpecTimestamp(ctx, tx, sc, spec)
+		if err != nil {
+			return "", err
+		}
+		if candidate = strings.TrimSpace(candidate); candidate != "" && candidate > latest {
+			latest = candidate
+		}
+	}
+	if latest == "" {
+		return "1970-01-01T00:00:00Z", nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, latest)
+	if err != nil {
+		return "", fmt.Errorf("read durable observed_at: %w", err)
+	}
+	return delivery.CanonicalTimestamp(parsed.UTC()), nil
+}
+
+func latestSpecTimestamp(ctx context.Context, tx storage.Tx, sc scope, spec rowSpec) (string, error) {
+	query := `SELECT COALESCE(MAX(COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''))), '') FROM (SELECT ` + aliasedSelects(spec.selects) + ` ` + spec.from + `)`
+	var latest string
+	if err := tx.QueryRow(ctx, query, spec.args(sc)...).Scan(&latest); err != nil {
+		return "", fmt.Errorf("read latest source timestamp %s/%s: %w", spec.section, spec.kind, err)
+	}
+	return latest, nil
+}
+
+type cursorBindingData struct {
+	ProjectDigest     string
+	DeliveryRunDigest string
+	SectionsDigest    string
+	Limit             int
+	Ordering          string
+}
+
+func cursorBinding(sc scope, sections []string, limit int) (cursorBindingData, error) {
+	sectionJSON, err := delivery.CanonicalJSON(sections)
+	if err != nil {
+		return cursorBindingData{}, err
+	}
+	return cursorBindingData{
+		ProjectDigest:     digestString("project", sc.projectID),
+		DeliveryRunDigest: digestString("delivery_run", sc.runID),
+		SectionsDigest:    digestBytes("sections", sectionJSON),
+		Limit:             limit,
+		Ordering:          orderingContract,
+	}, nil
+}
+
+func validateCursorBinding(cur cursor, binding cursorBindingData) error {
+	if cur.Offset < 0 || cur.Offset > cursorMaxOffset {
+		return &QueryError{Code: ErrCorruptCursorCode, Message: "cursor offset is out of bounds"}
+	}
+	if cur.Limit <= 0 || cur.Limit > maxLimit {
+		return &QueryError{Code: ErrCorruptCursorCode, Message: "cursor limit is out of bounds"}
+	}
+	for _, value := range []string{cur.ProjectDigest, cur.DeliveryRunDigest, cur.SectionsDigest, cur.SnapshotFingerprint} {
+		if !validDigest(value) {
+			return &QueryError{Code: ErrCorruptCursorCode, Message: "cursor digest is invalid"}
+		}
+	}
+	if cur.Limit != binding.Limit ||
+		cur.Ordering != binding.Ordering ||
+		cur.ProjectDigest != binding.ProjectDigest ||
+		cur.DeliveryRunDigest != binding.DeliveryRunDigest ||
+		cur.SectionsDigest != binding.SectionsDigest {
+		return &QueryError{Code: ErrStaleCursorCode, Message: "cursor is not valid for this query"}
+	}
+	if !validDigest(cur.SnapshotFingerprint) {
+		return &QueryError{Code: ErrCorruptCursorCode, Message: "cursor snapshot fingerprint is invalid"}
+	}
+	return nil
+}
+
+func readSnapshotFingerprint(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec, sections []string) (string, error) {
+	type specFingerprint struct {
+		Section            string   `json:"section"`
+		Kind               string   `json:"kind"`
+		Count              int      `json:"count"`
+		LatestTimestamp    string   `json:"latest_timestamp"`
+		SourceRecordIDs    []string `json:"source_record_ids"`
+		SourceIDsTruncated bool     `json:"source_ids_truncated"`
+		Samples            []any    `json:"samples"`
+	}
+	payload := struct {
+		SchemaVersion string            `json:"schema_version"`
+		Ordering      string            `json:"ordering"`
+		Sections      []string          `json:"sections"`
+		Specs         []specFingerprint `json:"specs"`
+	}{
+		SchemaVersion: DetailSchemaVersion,
+		Ordering:      orderingContract,
+		Sections:      sections,
+		Specs:         make([]specFingerprint, 0, len(specs)),
+	}
+	for _, spec := range specs {
+		count, err := countSpec(ctx, tx, sc, spec)
+		if err != nil {
+			return "", err
+		}
+		latest, err := latestSpecTimestamp(ctx, tx, sc, spec)
+		if err != nil {
+			return "", err
+		}
+		ids, truncated, err := sourceIDs(ctx, tx, sc, spec)
+		if err != nil {
+			return "", err
+		}
+		samples := make([]any, 0, min(count, fingerprintSampleCap*2))
+		for _, sample := range []struct {
+			label  string
+			offset int
+		}{
+			{label: "head", offset: 0},
+			{label: "tail", offset: max(count-fingerprintSampleCap, fingerprintSampleCap)},
+		} {
+			if sample.offset >= count {
+				continue
+			}
+			rows, err := loadSpecRows(ctx, tx, sc, spec, fingerprintSampleCap, sample.offset)
+			if err != nil {
+				return "", err
+			}
+			for _, row := range rows {
+				samples = append(samples, map[string]any{
+					"sample":           sample.label,
+					"record_id":        row.recordID,
+					"project_scope":    row.projectID != "",
+					"run_scope":        row.deliveryRunID != "",
+					"schema_version":   row.schemaVersion,
+					"record_version":   row.recordVersion,
+					"created_at":       row.createdAt,
+					"updated_at":       row.updatedAt,
+					"status":           row.status,
+					"semantic_key":     row.semanticKey,
+					"payload_digest":   digestNullable("payload_json", row.payloadJSON),
+					"json_a_digest":    digestNullable("json_a", row.jsonA),
+					"json_b_digest":    digestNullable("json_b", row.jsonB),
+					"correlation_hash": digestString("correlation", canonicalCorrelation(row.correlation)),
+				})
+			}
+		}
+		payload.Specs = append(payload.Specs, specFingerprint{
+			Section:            spec.section,
+			Kind:               spec.kind,
+			Count:              count,
+			LatestTimestamp:    latest,
+			SourceRecordIDs:    ids,
+			SourceIDsTruncated: truncated,
+			Samples:            samples,
+		})
+	}
+	data, err := delivery.CanonicalJSON(payload)
+	if err != nil {
+		return "", err
+	}
+	return digestBytes("snapshot", data), nil
 }
 
 func loadCounts(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec) ([]SummaryCount, []Evidence, error) {
@@ -400,7 +620,7 @@ func loadCounts(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec) (
 		}
 		refs := make([]SourceRef, 0, len(ids))
 		for _, id := range ids {
-			refs = append(refs, SourceRef{Table: spec.table, RecordID: id, ProjectID: sc.projectID, DeliveryRunID: sc.runID, Provenance: "durable_sql"})
+			refs = append(refs, sourceRefForSpec(spec, sc, id))
 		}
 		var countEvidence []Evidence
 		if truncated {
@@ -434,6 +654,23 @@ func loadCounts(ctx context.Context, tx storage.Tx, sc scope, specs []rowSpec) (
 		return counts[i].Kind < counts[j].Kind
 	})
 	return counts, evidence, nil
+}
+
+func sourceRefForSpec(spec rowSpec, sc scope, recordID string) SourceRef {
+	ref := SourceRef{Table: spec.table, RecordID: recordID, ProjectID: sc.projectID, Provenance: "durable_sql"}
+	if specRunScoped(spec) {
+		ref.DeliveryRunID = sc.runID
+	}
+	return ref
+}
+
+func specRunScoped(spec rowSpec) bool {
+	switch spec.table {
+	case "inventory_events", "provider_installations", "provider_probe_results":
+		return false
+	default:
+		return true
+	}
 }
 
 func countSpec(ctx context.Context, tx storage.Tx, sc scope, spec rowSpec) (int, error) {
@@ -703,19 +940,85 @@ func loadSpecRows(ctx context.Context, tx storage.Tx, sc scope, spec rowSpec, li
 	return out, nil
 }
 
+func aliasedSelects(selects string) string {
+	parts := splitTopLevelCSV(selects)
+	aliases := []string{
+		"record_id",
+		"project_id",
+		"delivery_run_id",
+		"schema_version",
+		"record_version",
+		"created_at",
+		"updated_at",
+		"correlation",
+		"confidence",
+		"freshness",
+		"classification",
+		"status",
+		"payload_json",
+		"json_a",
+		"json_b",
+		"semantic_key",
+	}
+	if len(parts) != len(aliases) {
+		return selects
+	}
+	out := make([]string, 0, len(parts))
+	for i, part := range parts {
+		out = append(out, strings.TrimSpace(part)+" AS "+aliases[i])
+	}
+	return strings.Join(out, ", ")
+}
+
+func splitTopLevelCSV(value string) []string {
+	var out []string
+	start := 0
+	depth := 0
+	inString := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if inString {
+			if ch == '\'' {
+				if i+1 < len(value) && value[i+1] == '\'' {
+					i++
+					continue
+				}
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inString = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(value[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, strings.TrimSpace(value[start:]))
+	return out
+}
+
 func entryFromRaw(spec rowSpec, sc scope, row rawRow) Entry {
 	if row.projectID == "" {
 		row.projectID = sc.projectID
-	}
-	if row.deliveryRunID == "" {
-		row.deliveryRunID = sc.runID
 	}
 	if row.correlation == nil {
 		row.correlation = map[string]string{}
 	}
 	row.correlation["project_id"] = sc.projectID
-	row.correlation["delivery_run_id"] = sc.runID
-	source := SourceRef{Table: spec.table, RecordID: row.recordID, ProjectID: sc.projectID, DeliveryRunID: sc.runID, Provenance: "durable_sql"}
+	if row.deliveryRunID != "" {
+		row.correlation["delivery_run_id"] = row.deliveryRunID
+	}
+	source := SourceRef{Table: spec.table, RecordID: row.recordID, ProjectID: row.projectID, DeliveryRunID: row.deliveryRunID, Provenance: "durable_sql"}
 	entry := Entry{
 		Section:        spec.section,
 		Kind:           spec.kind,
@@ -794,6 +1097,42 @@ func digestJSONField(value, field string, source SourceRef) (string, *Evidence) 
 		}
 	}
 	return delivery.SHA256Digest(canonical), nil
+}
+
+func digestNullable(label, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	canonical, err := delivery.CanonicalJSONBytes([]byte(value))
+	if err != nil {
+		return digestString(label+":raw", value)
+	}
+	return digestBytes(label, canonical)
+}
+
+func digestString(label, value string) string {
+	return digestBytes(label, []byte(value))
+}
+
+func digestBytes(label string, value []byte) string {
+	data := make([]byte, 0, len(label)+1+len(value))
+	data = append(data, label...)
+	data = append(data, 0)
+	data = append(data, value...)
+	return delivery.SHA256Digest(data)
+}
+
+func validDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, ch := range value[len("sha256:"):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePage(entries []Entry) []Evidence {
@@ -937,23 +1276,38 @@ func encodeCursor(cur cursor) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-func decodeCursor(value string) (cursor, error) {
+func decodeCursor(value string) (cursor, bool, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return cursor{SchemaVersion: DetailSchemaVersion}, nil
+		return cursor{SchemaVersion: DetailSchemaVersion}, false, nil
+	}
+	if len(value) > cursorMaxBytes {
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor is too large"}
 	}
 	data, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
-		return cursor{}, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor is not valid base64url JSON"}
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor is not valid base64url JSON"}
+	}
+	if len(data) > cursorMaxBytes {
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor is too large"}
 	}
 	var cur cursor
-	if err := json.Unmarshal(data, &cur); err != nil {
-		return cursor{}, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor JSON is invalid"}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cur); err != nil {
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor JSON is invalid"}
+	}
+	if dec.More() {
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor JSON is invalid"}
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err == nil {
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor JSON is invalid"}
 	}
 	if cur.SchemaVersion != DetailSchemaVersion {
-		return cursor{}, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor schema version is unsupported"}
+		return cursor{}, false, &QueryError{Code: ErrCorruptCursorCode, Message: "cursor schema version is unsupported"}
 	}
-	return cur, nil
+	return cur, true, nil
 }
 
 func sectionSet(sections []string) map[string]bool {
@@ -968,6 +1322,30 @@ func sectionSet(sections []string) map[string]bool {
 		}
 	}
 	return out
+}
+
+func normalizedSections(specs []rowSpec) []string {
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		seen[spec.section] = true
+	}
+	out := make([]string, 0, len(seen))
+	for section := range seen {
+		out = append(out, section)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func canonicalCorrelation(correlation map[string]string) string {
+	if len(correlation) == 0 {
+		return ""
+	}
+	data, err := delivery.CanonicalJSON(correlation)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func filteredSpecs(allowed map[string]bool) []rowSpec {

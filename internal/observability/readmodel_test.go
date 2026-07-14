@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,7 +75,7 @@ func TestDetailCanonicalPaginationRedactionAndCrossProjectIsolation(t *testing.T
 		ProjectID:     "proj-a",
 		DeliveryRunID: "run-a",
 		Cursor:        detail.Page.NextCursor,
-		Limit:         100,
+		Limit:         3,
 		Now:           func() time.Time { return fixedNow },
 	})
 	if err != nil {
@@ -83,6 +84,210 @@ func TestDetailCanonicalPaginationRedactionAndCrossProjectIsolation(t *testing.T
 	if next.Page.Truncated {
 		t.Fatalf("second page unexpectedly truncated: %#v", next.Page)
 	}
+}
+
+func TestDefaultObservedAtIsDurableAndRestartStable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	store := openTestStoreAt(t, path)
+	seedBaseRun(t, ctx, store, "proj-a", "run-a")
+	insertProgress(t, ctx, store, "proj-a", "run-a", "receipt-a-1", "corr-a-1", `{"status":"ok"}`)
+	insertProgress(t, ctx, store, "proj-a", "run-a", "receipt-a-2", "corr-a-2", `{"status":"still-ok"}`)
+
+	firstSummary, err := LoadSummary(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a"})
+	if err != nil {
+		t.Fatalf("LoadSummary returned error: %v", err)
+	}
+	firstDetail, err := LoadDetail(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Limit: 1, Sections: []string{"progress"}})
+	if err != nil {
+		t.Fatalf("LoadDetail returned error: %v", err)
+	}
+	if firstSummary.Snapshot.ObservedAt != ts() || firstDetail.Snapshot.ObservedAt != ts() {
+		t.Fatalf("observed_at summary=%q detail=%q, want durable fixture time %q", firstSummary.Snapshot.ObservedAt, firstDetail.Snapshot.ObservedAt, ts())
+	}
+	firstSummaryJSON := mustCanonical(t, firstSummary)
+	firstDetailJSON := mustCanonical(t, firstDetail)
+	cursor := firstDetail.Page.NextCursor
+	if cursor == "" {
+		t.Fatal("first detail did not return a continuation cursor")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened := openTestStoreAt(t, path)
+	defer reopened.Close()
+	secondSummary, err := LoadSummary(ctx, reopened, Options{ProjectID: "proj-a", DeliveryRunID: "run-a"})
+	if err != nil {
+		t.Fatalf("LoadSummary after reopen returned error: %v", err)
+	}
+	secondDetail, err := LoadDetail(ctx, reopened, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Limit: 1, Sections: []string{"progress"}})
+	if err != nil {
+		t.Fatalf("LoadDetail after reopen returned error: %v", err)
+	}
+	if got := mustCanonical(t, secondSummary); string(got) != string(firstSummaryJSON) {
+		t.Fatalf("summary JSON changed after reopen:\nfirst=%s\nsecond=%s", firstSummaryJSON, got)
+	}
+	if got := mustCanonical(t, secondDetail); string(got) != string(firstDetailJSON) {
+		t.Fatalf("detail JSON changed after reopen:\nfirst=%s\nsecond=%s", firstDetailJSON, got)
+	}
+	if _, err := LoadDetail(ctx, reopened, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Limit: 1, Sections: []string{"progress"}, Cursor: cursor}); err != nil {
+		t.Fatalf("unchanged restart rejected continuation cursor: %v", err)
+	}
+}
+
+func TestDetailCursorDetectsRelevantMutationBetweenPages(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, context.Context, storage.Store)
+	}{
+		{
+			name: "insert",
+			mutate: func(t *testing.T, ctx context.Context, store storage.Store) {
+				insertProgress(t, ctx, store, "proj-a", "run-a", "receipt-page-999", "corr-page-999", `{"status":"inserted"}`)
+			},
+		},
+		{
+			name: "update",
+			mutate: func(t *testing.T, ctx context.Context, store storage.Store) {
+				mustWrite(t, ctx, store, func(tx storage.Tx) error {
+					_, err := tx.Exec(ctx, `UPDATE progress_receipts SET status = 'mutated', persisted_at = ?, payload_json = ? WHERE progress_receipt_id = 'receipt-page-002'`, "2026-01-02T03:04:06Z", `{"status":"mutated"}`)
+					return err
+				})
+			},
+		},
+		{
+			name: "delete",
+			mutate: func(t *testing.T, ctx context.Context, store storage.Store) {
+				mustWrite(t, ctx, store, func(tx storage.Tx) error {
+					_, err := tx.Exec(ctx, `DELETE FROM progress_receipts WHERE progress_receipt_id = 'receipt-page-003'`)
+					return err
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			defer store.Close()
+			seedBaseRun(t, ctx, store, "proj-a", "run-a")
+			for i := 0; i < 5; i++ {
+				insertProgress(t, ctx, store, "proj-a", "run-a", "receipt-page-"+pad3(i), "corr-page-"+pad3(i), `{"status":"ok"}`)
+			}
+			first, err := LoadDetail(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 2})
+			if err != nil {
+				t.Fatalf("LoadDetail first page returned error: %v", err)
+			}
+			if first.Page.NextCursor == "" {
+				t.Fatal("first page did not return a continuation cursor")
+			}
+			tc.mutate(t, ctx, store)
+			_, err = LoadDetail(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 2, Cursor: first.Page.NextCursor})
+			var qerr *QueryError
+			if !errors.As(err, &qerr) || qerr.Code != ErrConsistencyGapCode {
+				t.Fatalf("continuation error = %v, want consistency gap", err)
+			}
+		})
+	}
+}
+
+func TestDetailCursorReuseFailsClosedWithoutScopeLeak(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+	seedBaseRun(t, ctx, store, "proj-a", "run-a")
+	seedBaseRun(t, ctx, store, "proj-b", "run-b")
+	for i := 0; i < 4; i++ {
+		insertProgress(t, ctx, store, "proj-a", "run-a", "receipt-a-"+pad3(i), "corr-a-"+pad3(i), `{"status":"ok"}`)
+		insertProgress(t, ctx, store, "proj-b", "run-b", "receipt-b-"+pad3(i), "corr-b-"+pad3(i), `{"status":"ok"}`)
+	}
+	first, err := LoadDetail(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 2})
+	if err != nil {
+		t.Fatalf("LoadDetail first page returned error: %v", err)
+	}
+	if first.Page.NextCursor == "" {
+		t.Fatal("first page did not return a continuation cursor")
+	}
+	tampered, _, err := decodeCursor(first.Page.NextCursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	tampered.Ordering = "other-order"
+	tamperedCursor, err := encodeCursor(tampered)
+	if err != nil {
+		t.Fatalf("encode tampered cursor: %v", err)
+	}
+	cases := []struct {
+		name string
+		opts Options
+	}{
+		{name: "project", opts: Options{ProjectID: "proj-b", DeliveryRunID: "run-b", Sections: []string{"progress"}, Limit: 2, Cursor: first.Page.NextCursor}},
+		{name: "run", opts: Options{ProjectID: "proj-b", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 2, Cursor: first.Page.NextCursor}},
+		{name: "sections", opts: Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"plans_tasks"}, Limit: 2, Cursor: first.Page.NextCursor}},
+		{name: "limit", opts: Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 3, Cursor: first.Page.NextCursor}},
+		{name: "ordering", opts: Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"progress"}, Limit: 2, Cursor: tamperedCursor}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadDetail(ctx, store, tc.opts)
+			var qerr *QueryError
+			if !errors.As(err, &qerr) || qerr.Code != ErrStaleCursorCode {
+				t.Fatalf("cursor reuse error = %v, want stale_cursor", err)
+			}
+			for _, forbidden := range []string{"proj-a", "run-a", "proj-b", "run-b", "receipt-a", "receipt-b"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("cursor error leaked %q: %v", forbidden, err)
+				}
+			}
+		})
+	}
+}
+
+func TestInventoryProvenanceRemainsProjectScoped(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+	seedBaseRun(t, ctx, store, "proj-a", "run-a")
+	insertProviderInstallation(t, ctx, store, "proj-a", "pinst-a")
+
+	detail, err := LoadDetail(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"inventory"}, Limit: 10})
+	if err != nil {
+		t.Fatalf("LoadDetail returned error: %v", err)
+	}
+	var installation *Entry
+	for i := range detail.Entries {
+		if detail.Entries[i].Kind == "provider_installation" {
+			installation = &detail.Entries[i]
+			break
+		}
+	}
+	if installation == nil {
+		t.Fatalf("provider installation entry missing: %#v", detail.Entries)
+	}
+	if installation.DeliveryRunID != "" {
+		t.Fatalf("inventory entry delivery_run_id = %q, want project-only provenance", installation.DeliveryRunID)
+	}
+	if got := installation.Correlation["delivery_run_id"]; got != "" {
+		t.Fatalf("inventory correlation delivery_run_id = %q, want absent", got)
+	}
+	if len(installation.SourceRefs) != 1 || installation.SourceRefs[0].DeliveryRunID != "" || installation.SourceRefs[0].ProjectID != "proj-a" {
+		t.Fatalf("inventory source refs = %#v, want project-only source ref", installation.SourceRefs)
+	}
+
+	summary, err := LoadSummary(ctx, store, Options{ProjectID: "proj-a", DeliveryRunID: "run-a", Sections: []string{"inventory"}})
+	if err != nil {
+		t.Fatalf("LoadSummary returned error: %v", err)
+	}
+	for _, count := range summary.Counts {
+		if count.Kind != "provider_installation" {
+			continue
+		}
+		if len(count.SourceRefs) != 1 || count.SourceRefs[0].DeliveryRunID != "" {
+			t.Fatalf("summary inventory source refs = %#v, want project-only", count.SourceRefs)
+		}
+		return
+	}
+	t.Fatal("summary provider installation count missing")
 }
 
 func TestDetailSurfacesCorruptJSONAndUnsupportedRecordVersion(t *testing.T) {
@@ -205,14 +410,28 @@ func TestDetailSchemaGoldenFixture(t *testing.T) {
 
 func openTestStore(t *testing.T) storage.Store {
 	t.Helper()
+	return openTestStoreAt(t, filepath.Join(t.TempDir(), "state.db"))
+}
+
+func openTestStoreAt(t *testing.T, path string) storage.Store {
+	t.Helper()
 	store, err := storage.Open(context.Background(), storage.Options{
-		Path: filepath.Join(t.TempDir(), "state.db"),
+		Path: path,
 		Now:  func() time.Time { return fixedNow },
 	})
 	if err != nil {
 		t.Fatalf("open storage: %v", err)
 	}
 	return store
+}
+
+func mustCanonical(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := CanonicalJSON(v)
+	if err != nil {
+		t.Fatalf("CanonicalJSON returned error: %v", err)
+	}
+	return data
 }
 
 func seedBaseRun(t *testing.T, ctx context.Context, store storage.Store, projectID, runID string) {
@@ -288,6 +507,26 @@ func insertUsage(t *testing.T, ctx context.Context, store storage.Store, project
 			value, confidence, idempotency_key, payload_json
 		) VALUES (?, ?, ?, 'commit', ?, 'tokens', 'token', 7, 'observed', ?, '{}')`,
 			usageID, projectID, runID, ts(), "idem-"+usageID)
+		return err
+	})
+}
+
+func insertProviderInstallation(t *testing.T, ctx context.Context, store storage.Store, projectID, installationID string) {
+	t.Helper()
+	mustWrite(t, ctx, store, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO provider_installations(
+			provider_installation_id, schema_version, record_version, scope, project_id, adapter_id,
+			adapter_declaration_id, provider_display_name, executable_name, executable_identity_json,
+			canonical_path, canonical_path_redacted, discovery_source, discovery_order, platform,
+			version, version_confidence, installation_state, usable_for_invocation, known_limitations_json,
+			created_at, updated_at, created_by_json, updated_by_json, host_json, policy_version,
+			captured_at, stale_after, freshness_state, confidence, side_effect_class, classification,
+			source_json, evidence_json, gap_reasons_json, terminal_error_code, payload_json
+		) VALUES (?, 'loopcoder.provider_installation.v1', 1, 'project', ?, 'codex',
+			'adecl-codex', 'Codex', 'codex', '{}', '/usr/bin/codex', '<redacted>', 'fixture', 1, 'darwin',
+			'codex 1.0.0', 'exact', 'available', 'yes', '[]', ?, ?, '{}', '{}', '{}', 'policy.v1',
+			?, '', 'fresh', 'observed', 'local-read', 'available', '{}', '{}', '[]', '', ?)`,
+			installationID, projectID, ts(), ts(), ts(), fmt.Sprintf(`{"provider_installation_id":%q}`, installationID))
 		return err
 	})
 }
