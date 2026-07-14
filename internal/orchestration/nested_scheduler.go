@@ -29,6 +29,8 @@ const (
 	NestedStatusSucceededWithOptionalFailures = "succeeded_with_optional_failures"
 	NestedStatusFailed                        = "failed"
 	NestedStatusNeedsHuman                    = "needs-human"
+	NestedStatusBlocked                       = "blocked"
+	NestedStatusLost                          = "lost"
 	NestedStatusSkipped                       = "skipped"
 	NestedStatusCancelled                     = "cancelled"
 	NestedStatusTimedOut                      = "timed_out"
@@ -287,6 +289,17 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			children[i].ReplayAction = result.ReplayAction
 			switch result.ReplayAction {
 			case ReplayActionReused:
+				if nestedFailurePropagates(result.Status) {
+					if _, err := storage.PropagateRunTreeTerminal(ctx, opts.Store, storage.RunTreeTerminalRequest{
+						RunID:     child.RunID,
+						Status:    result.Status,
+						UpdatedAt: firstNonEmptyChild(result.FinishedAt, state.FormatTimestamp(started)),
+						Reason:    "replayed terminal child propagates to accepted descendants",
+						Source:    "nested-scheduler",
+					}); err != nil {
+						return NestedScheduleReport{}, err
+					}
+				}
 				results[i] = result
 				continue
 			case ReplayActionBlocked:
@@ -618,6 +631,29 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	emittedWaiting := map[int]bool{}
 	for len(pending) > 0 {
+		for index := range pending {
+			if blocked, ok := blockedByNestedDependency(children[index], children, results); ok {
+				delete(pending, index)
+				result := childResultFromPlan(children[index])
+				result.Status = NestedStatusBlocked
+				result.Error = blocked
+				finishedAt := clock().UTC()
+				result.FinishedAt = state.FormatTimestamp(finishedAt)
+				setCompleteErr(storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, children[index].RunID, result.Status, result.FinishedAt, "nested dependency blocked"))
+				eventMu.Lock()
+				err := recordNestedEvent(opts, opts.ParentRunID, children[index], result, NestedEventChildFinished, finishedAt)
+				eventMu.Unlock()
+				setCompleteErr(err)
+				if err := recordNestedEvent(opts, children[index].RunID, children[index], result, NestedEventChildFinished, finishedAt); err != nil {
+					setCompleteErr(err)
+				}
+				emitNestedChildProgress(ctx, opts, children[index], result, NestedEventChildFinished, finishedAt, true)
+				results[index] = withNestedDecision(result)
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
 		ready := readyNestedChildren(children, results, pending)
 		if len(ready) == 0 {
 			return NestedScheduleReport{}, fmt.Errorf("no ready nested children remain; dependency cycle or missing result escaped validation")
@@ -668,6 +704,31 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			}(index)
 		}
 		wg.Wait()
+	}
+
+	for _, result := range results {
+		if strings.TrimSpace(result.RunID) == "" || strings.TrimSpace(result.Status) == "" || !nestedFailurePropagates(result.Status) {
+			continue
+		}
+		updatedAt := firstNonEmptyChild(result.FinishedAt, state.FormatTimestamp(clock().UTC()))
+		propagateCtx := ctx
+		var cancelPropagate context.CancelFunc
+		if ctx.Err() != nil {
+			propagateCtx, cancelPropagate = nestedCleanupContext()
+		}
+		_, err := storage.PropagateRunTreeTerminal(propagateCtx, opts.Store, storage.RunTreeTerminalRequest{
+			RunID:     result.RunID,
+			Status:    result.Status,
+			UpdatedAt: updatedAt,
+			Reason:    "terminal child status propagates to accepted descendants",
+			Source:    "nested-scheduler",
+		})
+		if cancelPropagate != nil {
+			cancelPropagate()
+		}
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
 	}
 
 	finished := clock().UTC()
@@ -771,7 +832,7 @@ func knownNestedProgressState(status, event string) string {
 		return progress.KnownDeliveryPending
 	case status == NestedStatusCancelled:
 		return progress.KnownCancellationInProgress
-	case status == NestedStatusNeedsHuman || status == NestedStatusAbandoned:
+	case status == NestedStatusNeedsHuman || status == NestedStatusAbandoned || status == NestedStatusBlocked || status == NestedStatusLost:
 		return progress.KnownBlocked
 	case nestedStatusTerminal(status):
 		return progress.KnownTerminal
@@ -789,9 +850,9 @@ func nestedProgressCounts(status string) progress.TaskCounts {
 		counts.Running = 1
 	case NestedStatusSucceeded, NestedStatusSucceededWithOptionalFailures:
 		counts.Succeeded = 1
-	case NestedStatusFailed, NestedStatusTimedOut, NestedStatusCancelled, NestedStatusSkipped, NestedStatusAbandoned:
+	case NestedStatusFailed, NestedStatusTimedOut, NestedStatusCancelled, NestedStatusSkipped, NestedStatusAbandoned, NestedStatusLost:
 		counts.Failed = 1
-	case NestedStatusNeedsHuman:
+	case NestedStatusNeedsHuman, NestedStatusBlocked:
 		counts.Blocked = 1
 	default:
 		counts.Unknown = 1
@@ -801,7 +862,7 @@ func nestedProgressCounts(status string) progress.TaskCounts {
 
 func nestedStatusTerminal(status string) bool {
 	switch strings.TrimSpace(status) {
-	case NestedStatusSucceeded, NestedStatusSucceededWithOptionalFailures, NestedStatusFailed, NestedStatusNeedsHuman, NestedStatusSkipped, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned:
+	case NestedStatusSucceeded, NestedStatusSucceededWithOptionalFailures, NestedStatusFailed, NestedStatusNeedsHuman, NestedStatusBlocked, NestedStatusLost, NestedStatusSkipped, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned:
 		return true
 	default:
 		return false
@@ -1118,6 +1179,41 @@ func readyNestedChildren(children []ChildRunPlan, results []ChildRunResult, pend
 	}
 	sort.Ints(ready)
 	return ready
+}
+
+func blockedByNestedDependency(child ChildRunPlan, children []ChildRunPlan, results []ChildRunResult) (string, bool) {
+	indexByKey := map[string]int{}
+	for i, candidate := range children {
+		indexByKey[candidate.ChildKey] = i
+	}
+	for _, dep := range child.DependsOn {
+		depIndex, ok := indexByKey[dep]
+		if !ok {
+			continue
+		}
+		rawStatus := strings.TrimSpace(results[depIndex].Status)
+		if rawStatus == "" {
+			continue
+		}
+		status := normalizeNestedStatus(rawStatus)
+		if status == NestedStatusQueued || status == NestedStatusRunning || status == NestedStatusWaiting {
+			continue
+		}
+		if status == NestedStatusSucceeded || status == NestedStatusSucceededWithOptionalFailures {
+			continue
+		}
+		return fmt.Sprintf("dependency %q ended with status %s", dep, status), true
+	}
+	return "", false
+}
+
+func nestedFailurePropagates(status string) bool {
+	switch normalizeNestedStatus(status) {
+	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusNeedsHuman, NestedStatusBlocked, NestedStatusLost:
+		return true
+	default:
+		return false
+	}
 }
 
 func childResultFromPlan(child ChildRunPlan) ChildRunResult {
@@ -1511,6 +1607,10 @@ func normalizeNestedStatus(status string) string {
 		return NestedStatusSucceededWithOptionalFailures
 	case NestedStatusNeedsHuman, "needs_human", "needs human", "hung":
 		return NestedStatusNeedsHuman
+	case NestedStatusBlocked:
+		return NestedStatusBlocked
+	case NestedStatusLost:
+		return NestedStatusLost
 	case NestedStatusSkipped:
 		return NestedStatusSkipped
 	case NestedStatusCancelled, "canceled":
@@ -1678,7 +1778,7 @@ func replayActionForStatus(status string) string {
 		return ReplayActionResumed
 	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut:
 		return ReplayActionReused
-	case NestedStatusNeedsHuman, NestedStatusAbandoned, NestedStatusSkipped:
+	case NestedStatusNeedsHuman, NestedStatusBlocked, NestedStatusLost, NestedStatusAbandoned, NestedStatusSkipped:
 		return ReplayActionBlocked
 	default:
 		return ReplayActionResumed
@@ -1711,7 +1811,7 @@ func nestedParentStatus(results []ChildRunResult) string {
 		switch result.Status {
 		case NestedStatusRunning, NestedStatusQueued, NestedStatusWaiting, "pending":
 			return NestedStatusRunning
-		case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusSkipped, NestedStatusNeedsHuman, "hung", "idle", "blocked":
+		case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusSkipped, NestedStatusNeedsHuman, NestedStatusBlocked, NestedStatusLost, "hung", "idle":
 			needsHuman = true
 		}
 	}
@@ -1726,7 +1826,7 @@ func nestedParentStatus(results []ChildRunResult) string {
 
 func nestedOptionalFailureStatus(status string) bool {
 	switch normalizeNestedStatus(status) {
-	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusNeedsHuman:
+	case NestedStatusFailed, NestedStatusCancelled, NestedStatusTimedOut, NestedStatusAbandoned, NestedStatusNeedsHuman, NestedStatusBlocked, NestedStatusLost:
 		return true
 	default:
 		return false
@@ -1748,6 +1848,8 @@ func nestedSummary(results []ChildRunResult) NestedSummary {
 		case NestedStatusFailed:
 			summary.FailedCount++
 		case NestedStatusNeedsHuman:
+			summary.NeedsHumanCount++
+		case NestedStatusBlocked, NestedStatusLost:
 			summary.NeedsHumanCount++
 		case NestedStatusSkipped:
 			summary.SkippedCount++

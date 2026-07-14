@@ -706,6 +706,46 @@ func TestValidateChildPlanDefaultsMaxConcurrencyToNestedSpec(t *testing.T) {
 	}
 }
 
+func TestScheduleNestedRunsBlocksDependentChildAfterFailedJoin(t *testing.T) {
+	repo := t.TempDir()
+	now := nestedTestNow()
+	var executed []string
+	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+		RepoPath:         repo,
+		ParentRunID:      "run-20260709T000000Z-wave",
+		ConcurrencyLimit: 1,
+		MaxChildren:      2,
+		Now:              now,
+		Clock:            func() time.Time { return now },
+		Children: []ChildRunPlan{
+			{ID: "first", Issue: 1, Permission: "write", Required: true},
+			{ID: "second", Issue: 2, Permission: "write", Required: true, DependsOn: []string{"first"}},
+		},
+		Execute: func(_ context.Context, child ChildRunPlan) (ChildRunResult, error) {
+			executed = append(executed, child.ChildKey)
+			if child.ChildKey == "first" {
+				return ChildRunResult{Status: NestedStatusFailed, Error: "first failed"}, nil
+			}
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if !reflect.DeepEqual(executed, []string{"first"}) {
+		t.Fatalf("executed children = %#v, want only first", executed)
+	}
+	if got := report.Children[1].Status; got != NestedStatusBlocked {
+		t.Fatalf("dependent status = %q, want blocked", got)
+	}
+	if !strings.Contains(report.Children[1].Error, "dependency \"first\" ended with status failed") {
+		t.Fatalf("dependent error = %q, want dependency failure", report.Children[1].Error)
+	}
+	if report.Status != NestedStatusNeedsHuman {
+		t.Fatalf("parent status = %q, want needs-human", report.Status)
+	}
+}
+
 func TestScheduleNestedRunsHonorsDependencies(t *testing.T) {
 	repo := t.TempDir()
 	now := nestedTestNow()

@@ -149,6 +149,28 @@ type RunStatusTransition struct {
 	Source      string
 }
 
+// RunTreeTerminalRequest asks storage to classify every accepted descendant of
+// RunID after a parent-side stop condition. It never launches work; ambiguous
+// launched provider state is classified as lost or needs-human.
+type RunTreeTerminalRequest struct {
+	RunID     string
+	Status    string
+	UpdatedAt string
+	Reason    string
+	Source    string
+}
+
+type RunTreeTerminalResult struct {
+	RunID           string
+	ParentRunID     string
+	PreviousStatus  string
+	Status          string
+	Classification  string
+	ClaimOwner      string
+	ClaimGeneration int64
+	ClaimPhase      string
+}
+
 type ClaimResult struct {
 	Outcome         string
 	RunID           string
@@ -345,6 +367,98 @@ func TransitionParentRunStatus(ctx context.Context, store Store, parentRunID, st
 		Reason:    reason,
 		Source:    "nested-scheduler",
 	})
+}
+
+// PropagateRunTreeTerminal walks the accepted durable run tree below RunID and
+// atomically classifies every non-terminal node. It fails closed on release or
+// fencing errors so callers do not publish parent terminal evidence while child
+// authority is orphaned.
+func PropagateRunTreeTerminal(ctx context.Context, store Store, req RunTreeTerminalRequest) ([]RunTreeTerminalResult, error) {
+	if store == nil {
+		return nil, nil
+	}
+	req.RunID = strings.TrimSpace(req.RunID)
+	req.Status = normalizeDurableStatus(req.Status)
+	req.UpdatedAt = strings.TrimSpace(req.UpdatedAt)
+	req.Reason = strings.TrimSpace(req.Reason)
+	req.Source = strings.TrimSpace(req.Source)
+	if req.Source == "" {
+		req.Source = "nested-scheduler"
+	}
+	if req.RunID == "" || req.Status == "" || req.UpdatedAt == "" {
+		return nil, fmt.Errorf("propagate run tree terminal: run_id, status, and updated_at are required")
+	}
+	if !validDurableStatus(req.Status) {
+		return nil, fmt.Errorf("propagate run tree terminal: invalid status %q", req.Status)
+	}
+	if req.Status == "succeeded" || req.Status == "succeeded_with_optional_failures" {
+		return nil, fmt.Errorf("propagate run tree terminal: success status %q cannot cancel descendants", req.Status)
+	}
+	var results []RunTreeTerminalResult
+	err := withRetry(ctx, func() error {
+		var txResults []RunTreeTerminalResult
+		err := store.WithWriteTx(ctx, func(tx Tx) error {
+			rows, err := loadRunTreeTerminalRowsTx(ctx, tx, req.RunID)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				return fmt.Errorf("propagate run tree terminal: run %q is missing", req.RunID)
+			}
+			for _, row := range rows {
+				previous := normalizeDurableStatus(row.Status)
+				result := RunTreeTerminalResult{
+					RunID:           row.RunID,
+					ParentRunID:     row.ParentRunID,
+					PreviousStatus:  previous,
+					Status:          previous,
+					Classification:  "terminal",
+					ClaimOwner:      row.ExecutorID,
+					ClaimGeneration: row.ClaimGeneration,
+					ClaimPhase:      row.ClaimPhase,
+				}
+				if durableTerminalStatus(previous) {
+					txResults = append(txResults, result)
+					continue
+				}
+				nextStatus, classification := classifyRunTreeTerminal(row, req.Status)
+				if row.ClaimGeneration > 0 {
+					if err := completeRunTreeClaimAuthorityTx(ctx, tx, row, nextStatus, req.UpdatedAt); err != nil {
+						return err
+					}
+				}
+				transition := RunStatusTransition{
+					RunID:     row.RunID,
+					Status:    nextStatus,
+					UpdatedAt: req.UpdatedAt,
+					Reason:    firstNonEmptyNestedGraph(req.Reason, "parent terminal propagation"),
+					Source:    req.Source,
+				}
+				if row.ParentRunID != "" {
+					transition.ParentRunID = row.ParentRunID
+					transition.ChildRunID = row.RunID
+				}
+				if err := transitionRunStatusTx(ctx, tx, transition); err != nil {
+					return err
+				}
+				if nextStatus == "lost" || nextStatus == "needs-human" {
+					if err := markAgentRegistrationNeedsHumanForRunTx(ctx, tx, row.RunID, req.UpdatedAt, classification); err != nil {
+						return err
+					}
+				}
+				result.Status = nextStatus
+				result.Classification = classification
+				txResults = append(txResults, result)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		results = txResults
+		return nil
+	})
+	return results, err
 }
 
 // PersistChildPlanGraph upserts the accepted plan, its child run nodes, and its
@@ -764,11 +878,14 @@ func transitionRunStatusTx(ctx context.Context, tx Tx, transition RunStatusTrans
 			return fmt.Errorf("transition run edge %s/%s: %w", transition.ParentRunID, transition.ChildRunID, err)
 		}
 	}
+	if previous == transition.Status && (transition.ChildRunID == "" || previousEdge == transition.Status) {
+		return nil
+	}
 
 	if _, err := tx.Exec(ctx, `UPDATE runs SET
 			status = ?,
 			started_at = CASE WHEN ? IN ('launching', 'running') AND (started_at IS NULL OR started_at = '') THEN ? ELSE started_at END,
-			ended_at = CASE WHEN ? IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked') THEN ? WHEN ? IN ('queued', 'launching', 'running', 'waiting', 'finishing') THEN NULL ELSE ended_at END,
+			ended_at = CASE WHEN ? IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'skipped', 'hung', 'idle', 'blocked', 'lost') THEN ? WHEN ? IN ('queued', 'launching', 'running', 'waiting', 'finishing') THEN NULL ELSE ended_at END,
 			updated_at = ?
 		WHERE id = ?`,
 		transition.Status, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.Status, transition.UpdatedAt, transition.RunID); err != nil {
@@ -953,7 +1070,7 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
 			project_id = COALESCE(NULLIF(excluded.project_id, ''), runs.project_id),
 			parent_run_id = COALESCE(NULLIF(excluded.parent_run_id, ''), runs.parent_run_id),
 			status = CASE
-				WHEN runs.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN runs.status
+				WHEN runs.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped', 'blocked', 'lost') THEN runs.status
 				WHEN runs.status <> '' THEN runs.status
 				WHEN excluded.status <> '' THEN excluded.status
 				ELSE runs.status
@@ -1002,7 +1119,7 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
 			permission = excluded.permission,
 			aggregation_json = excluded.aggregation_json,
 			status = CASE
-				WHEN run_edges.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped') THEN run_edges.status
+				WHEN run_edges.status IN ('succeeded', 'succeeded_with_optional_failures', 'failed', 'cancelled', 'timed_out', 'abandoned', 'needs-human', 'hung', 'skipped', 'blocked', 'lost') THEN run_edges.status
 				WHEN run_edges.status <> '' THEN run_edges.status
 				ELSE excluded.status
 			END,
@@ -1026,6 +1143,92 @@ type storedRunEdge struct {
 	ChildRunID  string
 	RootRunID   string
 	Depth       int
+}
+
+type runTreeTerminalRow struct {
+	RunID           string
+	ParentRunID     string
+	Status          string
+	Depth           int
+	ExecutorID      string
+	ClaimGeneration int64
+	ClaimPhase      string
+	ProviderReceipt string
+	LeaseExpiresAt  string
+}
+
+func loadRunTreeTerminalRowsTx(ctx context.Context, tx Tx, runID string) ([]runTreeTerminalRow, error) {
+	rows, err := tx.Query(ctx, `WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM runs WHERE id = ?
+			UNION
+			SELECT e.child_run_id FROM run_edges e JOIN subtree s ON e.parent_run_id = s.id
+		)
+		SELECT r.id, COALESCE(r.parent_run_id, ''), COALESCE(r.status, ''), r.depth,
+			COALESCE(c.executor_id, ''), COALESCE(c.claim_generation, 0), COALESCE(c.phase, ''),
+			COALESCE(c.provider_receipt, ''), COALESCE(c.lease_expires_at, '')
+		FROM runs r
+		JOIN subtree s ON s.id = r.id
+		LEFT JOIN run_claims c ON c.run_id = r.id
+		ORDER BY r.depth DESC, r.id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load run tree terminal rows: %w", err)
+	}
+	defer rows.Close()
+	var out []runTreeTerminalRow
+	for rows.Next() {
+		var row runTreeTerminalRow
+		if err := rows.Scan(&row.RunID, &row.ParentRunID, &row.Status, &row.Depth, &row.ExecutorID, &row.ClaimGeneration, &row.ClaimPhase, &row.ProviderReceipt, &row.LeaseExpiresAt); err != nil {
+			return nil, fmt.Errorf("load run tree terminal row: %w", err)
+		}
+		row.Status = normalizeDurableStatus(row.Status)
+		row.ClaimPhase = normalizeClaimPhase(row.ClaimPhase)
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load run tree terminal rows: %w", err)
+	}
+	return out, nil
+}
+
+func classifyRunTreeTerminal(row runTreeTerminalRow, requested string) (string, string) {
+	requested = normalizeDurableStatus(requested)
+	phase := normalizeClaimPhase(row.ClaimPhase)
+	switch requested {
+	case "needs-human", "blocked", "lost":
+		return requested, "parent-" + requested
+	}
+	switch phase {
+	case "", ClaimPhaseClaimed:
+		if requested == "failed" {
+			return "cancelled", "parent-failed-before-launch"
+		}
+		return requested, "parent-" + requested
+	case ClaimPhaseLaunching, ClaimPhaseExecuting:
+		return "lost", "ambiguous-provider-session"
+	case ClaimPhaseCompleted:
+		return "needs-human", "completed-claim-without-terminal-run-status"
+	default:
+		return "needs-human", "unknown-claim-phase-" + phase
+	}
+}
+
+func completeRunTreeClaimAuthorityTx(ctx context.Context, tx Tx, row runTreeTerminalRow, status, at string) error {
+	if row.ExecutorID == "" || row.ClaimGeneration <= 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE run_claims
+		SET phase = ?, heartbeat_at = ?
+		WHERE run_id = ? AND executor_id = ? AND claim_generation = ?`,
+		ClaimPhaseCompleted, at, row.RunID, row.ExecutorID, row.ClaimGeneration); err != nil {
+		return fmt.Errorf("complete run tree claim authority: %w", err)
+	}
+	if err := releaseNestedSchedulerReservationsTx(ctx, tx, row.RunID, row.ExecutorID, row.ClaimGeneration, at); err != nil {
+		return err
+	}
+	if err := releaseNestedSchedulerBudgetTx(ctx, tx, row.RunID, row.ExecutorID, row.ClaimGeneration, status, at); err != nil {
+		return err
+	}
+	return nil
 }
 
 func lookupRunNode(ctx context.Context, tx Tx, runID string) (storedRunNode, bool, error) {
@@ -2080,7 +2283,7 @@ func claimLeaseActive(leaseExpiresAt, now string) bool {
 
 func durableTerminalStatus(status string) bool {
 	switch normalizeDurableStatus(status) {
-	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked":
+	case "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked", "lost":
 		return true
 	default:
 		return false
@@ -2089,7 +2292,7 @@ func durableTerminalStatus(status string) bool {
 
 func durableBlockedStatus(status string) bool {
 	switch normalizeDurableStatus(status) {
-	case "needs-human", "abandoned", "skipped", "blocked":
+	case "needs-human", "abandoned", "skipped", "blocked", "lost":
 		return true
 	default:
 		return false
@@ -2122,24 +2325,25 @@ func appendRunTransitionEvent(ctx context.Context, tx Tx, runID, at, eventType, 
 }
 
 var durableAllowedTransitions = map[string][]string{
-	"planned":                          {"queued", "launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped"},
-	"queued":                           {"launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped"},
-	"launching":                        {"running", "waiting", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked"},
-	"running":                          {"waiting", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked"},
-	"waiting":                          {"queued", "launching", "running", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked"},
-	"finishing":                        {"succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked"},
+	"planned":                          {"queued", "launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "blocked", "lost"},
+	"queued":                           {"launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "blocked", "lost"},
+	"launching":                        {"running", "waiting", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked", "lost"},
+	"running":                          {"waiting", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked", "lost"},
+	"waiting":                          {"queued", "launching", "running", "finishing", "succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked", "lost"},
+	"finishing":                        {"succeeded", "succeeded_with_optional_failures", "failed", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "hung", "idle", "blocked", "lost"},
 	"succeeded":                        nil,
 	"succeeded_with_optional_failures": nil,
-	"failed":                           {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
-	"cancelled":                        {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
-	"timed_out":                        {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
+	"failed":                           {"needs-human", "abandoned", "lost"},
+	"cancelled":                        {"needs-human", "abandoned", "lost"},
+	"timed_out":                        {"needs-human", "abandoned", "lost"},
 	"abandoned":                        nil,
 	"needs-human":                      nil,
 	"skipped":                          nil,
-	"hung":                             {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
-	"idle":                             {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
-	"blocked":                          {"queued", "launching", "running", "waiting", "needs-human", "abandoned"},
-	"pending":                          {"queued", "launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped"},
+	"hung":                             {"needs-human", "abandoned", "lost"},
+	"idle":                             {"needs-human", "abandoned", "lost"},
+	"blocked":                          {"needs-human", "abandoned", "lost"},
+	"lost":                             nil,
+	"pending":                          {"queued", "launching", "running", "waiting", "cancelled", "timed_out", "abandoned", "needs-human", "skipped", "blocked", "lost"},
 }
 
 func validateDurableTransition(from, to string) error {
@@ -2181,6 +2385,8 @@ func normalizeDurableStatus(status string) string {
 		return "timed_out"
 	case "needs_human", "needs human":
 		return "needs-human"
+	case "lost":
+		return "lost"
 	case "interrupted":
 		return "running"
 	default:

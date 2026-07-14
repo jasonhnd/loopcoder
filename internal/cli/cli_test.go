@@ -5440,6 +5440,52 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 	}
 }
 
+func TestNestedRunTestSubprocessRedactsOutputBeforePersistingAttempt(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	canary := "AKIA" + strings.Repeat("A", 16)
+	command := "printf '%s\n' '" + canary + "'; exit 1"
+	if runtime.GOOS == "windows" {
+		command = `Write-Output "` + canary + `"; exit 1`
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("redact", 701, nil, true, "read-only", []string{command}),
+	}, 1)
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", nestedTestSubprocessProvider,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	attempts, err := state.LoadAttempts(repo, report.Children[0].RunID)
+	if err != nil {
+		t.Fatalf("LoadAttempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Error == "" {
+		t.Fatalf("attempts = %#v, want failed attempt with redacted error", attempts)
+	}
+	if strings.Contains(attempts[0].Error, canary) || strings.Contains(attempts[0].Error, "AKIA") {
+		t.Fatalf("attempt error retained credential canary: %q", attempts[0].Error)
+	}
+	data, err := os.ReadFile(attempts[0].Path)
+	if err != nil {
+		t.Fatalf("read attempt file: %v", err)
+	}
+	if strings.Contains(string(data), canary) || strings.Contains(string(data), "AKIA") {
+		t.Fatalf("attempt file retained credential canary: %s", data)
+	}
+}
+
 func TestNestedRunReplaysSamePlanFileWithOmittedChildRunIDsIdempotently(t *testing.T) {
 	loopHome := t.TempDir()
 	t.Setenv("LOOPCODER_HOME", loopHome)

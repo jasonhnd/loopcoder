@@ -26,10 +26,11 @@ import (
 )
 
 var (
-	githubTokenPattern = regexp.MustCompile(`(?i)(ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+`)
-	apiKeyPattern      = regexp.MustCompile(`(?i)sk-[A-Za-z0-9_-]{20,}`)
-	bearerPattern      = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
-	assignmentPattern  = regexp.MustCompile(`(?i)((token|password|secret|api[_-]?key)\s*[=:]\s*)\S+`)
+	githubTokenPattern  = regexp.MustCompile(`(?i)(ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+`)
+	awsAccessKeyPattern = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	apiKeyPattern       = regexp.MustCompile(`(?i)sk-[A-Za-z0-9_-]{20,}`)
+	bearerPattern       = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
+	assignmentPattern   = regexp.MustCompile(`(?i)((token|password|secret|api[_-]?key)\s*[=:]\s*)\S+`)
 )
 
 type BriefInput struct {
@@ -193,6 +194,7 @@ type AttemptRecord struct {
 // Scrub redacts common secret shapes before text is written to recovery state.
 func Scrub(text string) string {
 	text = githubTokenPattern.ReplaceAllString(text, "[REDACTED_GITHUB_TOKEN]")
+	text = awsAccessKeyPattern.ReplaceAllString(text, "[REDACTED_AWS_ACCESS_KEY]")
 	text = apiKeyPattern.ReplaceAllString(text, "[REDACTED_API_KEY]")
 	text = bearerPattern.ReplaceAllString(text, "${1}[REDACTED_TOKEN]")
 	text = assignmentPattern.ReplaceAllString(text, "${1}[REDACTED_SECRET]")
