@@ -292,7 +292,12 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 		if _, err := tx.Exec(ctx, `DROP TABLE nested_scheduler_resource_reservations`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version IN (25, 26, 27)`)
+		for _, table := range []string{"progress_delivery_replay_cursors", "progress_delivery_acknowledgments", "progress_delivery_attempt_results", "progress_delivery_attempts", "progress_delivery_obligations"} {
+			if _, err := tx.Exec(ctx, `DROP TABLE `+table); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version IN (25, 26, 27, 28)`)
 		return err
 	}); err != nil {
 		t.Fatalf("simulate v24 database: %v", err)
@@ -307,6 +312,9 @@ func TestProgressReceiptMigrationV25Registered(t *testing.T) {
 	defer reopened.Close()
 	if !tableExists(t, ctx, reopened, "progress_receipts") {
 		t.Fatal("v25 migration did not recreate progress_receipts")
+	}
+	if !tableExists(t, ctx, reopened, "progress_delivery_obligations") {
+		t.Fatal("v28 migration did not recreate progress_delivery_obligations")
 	}
 }
 

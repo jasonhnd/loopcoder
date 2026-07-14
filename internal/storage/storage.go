@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 27
+	CurrentSchemaVersion = 28
 
 	driverName = "sqlite"
 
@@ -431,6 +431,11 @@ var migrations = []migration{
 		name:       "nested scheduler resource reservations",
 		statements: nestedSchedulerReservationSchemaStatements,
 	},
+	{
+		version:    28,
+		name:       "progress delivery outbox",
+		statements: progressDeliveryOutboxSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -485,6 +490,11 @@ var requiredTables = []string{
 	"replan_decisions",
 	"verification_decisions",
 	"progress_receipts",
+	"progress_delivery_obligations",
+	"progress_delivery_attempts",
+	"progress_delivery_attempt_results",
+	"progress_delivery_acknowledgments",
+	"progress_delivery_replay_cursors",
 	"handoff_transactions",
 	"nested_scheduler_resource_reservations",
 	"agent_scope_grants",
@@ -1020,7 +1030,9 @@ func scrubProjectRemoteURLs(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var current projectRemote
 		if err := rows.Scan(&current.id, &current.display, &current.normalized); err != nil {
-			rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return fmt.Errorf("close project remote rows after scan error: %v: %w", closeErr, err)
+			}
 			return err
 		}
 		nextDisplay, _ := gitremote.SanitizeDisplayURL(current.display)
@@ -1111,7 +1123,9 @@ func reconcilePhysicalProjectIdentities(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var project storedProjectIdentity
 		if err := rows.Scan(&project.id, &project.canonical, &project.localPath, &project.gitRoot, &project.createdAt, &project.detachedAt); err != nil {
-			rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return fmt.Errorf("close project identity rows after scan error: %v: %w", closeErr, err)
+			}
 			return err
 		}
 		physical := physicalProjectCanonical(firstNonEmpty(project.gitRoot, project.canonical, project.localPath))
