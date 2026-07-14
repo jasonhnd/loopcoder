@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/observability"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -26,6 +27,7 @@ import (
 )
 
 const (
+	SchemaVersion       = "loopcoder.report_query.v1"
 	DefaultLimit        = 20
 	notReported         = "not reported"
 	maxReportFileBytes  = 4 * 1024 * 1024
@@ -211,10 +213,18 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 		})
 	}
 	payload := struct {
-		Reports []reporter.Report `json:"reports"`
-		Records []jsonRecord      `json:"records"`
-		RunTree any               `json:"run_tree,omitempty"`
-	}{Reports: reports, Records: jsonRecords, RunTree: runTree}
+		SchemaVersion string                 `json:"schema_version"`
+		Observability observability.Document `json:"observability"`
+		Reports       []reporter.Report      `json:"reports"`
+		Records       []jsonRecord           `json:"records"`
+		RunTree       any                    `json:"run_tree,omitempty"`
+	}{
+		SchemaVersion: SchemaVersion,
+		Observability: reportQueryObservability(records),
+		Reports:       reports,
+		Records:       jsonRecords,
+		RunTree:       runTree,
+	}
 	return json.Marshal(payload)
 }
 

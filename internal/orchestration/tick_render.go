@@ -8,15 +8,54 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/observability"
 )
 
 func MarshalTickJSON(report TickReport) ([]byte, error) {
 	report = normalizeTickReport(report)
-	data, err := json.MarshalIndent(report, "", "  ")
+	payload := struct {
+		SchemaVersion string                 `json:"schema_version"`
+		Observability observability.Document `json:"observability"`
+		TickReport
+	}{
+		SchemaVersion: "loopcoder.tick_result.v1",
+		Observability: tickObservability(report),
+		TickReport:    report,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal tick JSON: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+func tickObservability(report TickReport) observability.Document {
+	items := []observability.RenderItem{}
+	if report.DispatchWave != nil {
+		for _, result := range report.DispatchWave.Results {
+			if result.Report == nil {
+				continue
+			}
+			items = append(items, observability.ItemFromReport(fmt.Sprintf("issue-%d", result.Issue), "worker", result.Status, result.Reason, result.NextAction, *result.Report, []observability.SourceRef{{
+				Table:         "dispatch_wave",
+				RecordID:      result.AttemptPath,
+				DeliveryRunID: report.RunID,
+				Provenance:    "tick-dispatch-wave",
+			}}))
+		}
+	}
+	for _, review := range report.Reviews {
+		if review.Report == nil {
+			continue
+		}
+		items = append(items, observability.ItemFromReport(fmt.Sprintf("pr-%d", review.PRNumber), "verifier", review.Verdict, review.Reason, review.NextAction, *review.Report, []observability.SourceRef{{
+			Table:         "reviews",
+			RecordID:      review.PR,
+			DeliveryRunID: report.RunID,
+			Provenance:    "tick-review",
+		}}))
+	}
+	return observability.NewDocument("tick", observability.Correlation{DeliveryRunID: report.RunID, Source: "tick"}, items, nil)
 }
 
 func RenderTickText(report TickReport) string {

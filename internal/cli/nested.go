@@ -592,7 +592,7 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 
 func renderNestedRun(w io.Writer, format string, report orchestration.NestedScheduleReport) error {
 	if format == "json" {
-		data, err := json.MarshalIndent(report, "", "  ")
+		data, err := json.MarshalIndent(nestedJSONPayload(report), "", "  ")
 		if err != nil {
 			return err
 		}

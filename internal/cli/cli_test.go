@@ -794,6 +794,18 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Correlation   struct {
+				DeliveryRunID string `json:"delivery_run_id"`
+			} `json:"correlation"`
+			Items []struct {
+				Kind   string `json:"kind"`
+				Status string `json:"status"`
+			} `json:"items"`
+		} `json:"observability"`
 		RunID   string `json:"run_id"`
 		Project struct {
 			ProjectID string `json:"project_id"`
@@ -814,14 +826,26 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 	if payload.RunID != child || payload.Project.ProjectID == "" || payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("status JSON = %#v", payload)
 	}
+	if payload.SchemaVersion != "loopcoder.run_status.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "status" || payload.Observability.Correlation.DeliveryRunID != child {
+		t.Fatalf("status observability = %#v", payload.Observability)
+	}
 	var foundChild bool
+	var foundObservableChild bool
 	for _, node := range payload.RunTree.Nodes {
 		if node.RunID == child && node.ParentRunID == parent && node.Issue == 651 && node.Provider == "codex" {
 			foundChild = true
 		}
 	}
+	for _, item := range payload.Observability.Items {
+		if item.Kind == "run-tree-node" && item.Status == "planned" {
+			foundObservableChild = true
+		}
+	}
 	if !foundChild {
 		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+	if !foundObservableChild {
+		t.Fatalf("status observability missing run-tree node: %#v", payload.Observability.Items)
 	}
 }
 
@@ -872,6 +896,16 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+			} `json:"items"`
+		} `json:"observability"`
 		Reports []reporter.Report `json:"reports"`
 		Records []struct {
 			RunID string `json:"run_id"`
@@ -888,6 +922,12 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 	}
 	if len(payload.Reports) != 1 || len(payload.Records) != 1 || payload.Records[0].RunID != child {
 		t.Fatalf("report records = %#v %#v", payload.Reports, payload.Records)
+	}
+	if payload.SchemaVersion != "loopcoder.report_query.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "report" {
+		t.Fatalf("report observability schema = %#v", payload.Observability)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("report observability item = %#v", payload.Observability.Items)
 	}
 	if payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("run tree = %#v", payload.RunTree)
@@ -7004,6 +7044,34 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 	assertSingleJSONValue(t, stdout.String(), &got)
 	if !got.OK || got.Status != "succeeded" || got.Report == nil {
 		t.Fatalf("dispatch JSON = %#v", got)
+	}
+	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Status   string `json:"status"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+				Usage    struct {
+					TotalTokens *int64 `json:"total_tokens"`
+				} `json:"usage"`
+				SourceRefs []struct {
+					Table string `json:"table"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("dispatch observability JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != "loopcoder.dispatch_result.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "dispatch" {
+		t.Fatalf("dispatch observability schema = %#v", payload)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Status != "succeeded" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("dispatch observability item = %#v", payload.Observability.Items)
 	}
 	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
 		if strings.Contains(stdout.String(), disallowed) {

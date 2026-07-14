@@ -475,7 +475,7 @@ func runDetachedRecover(repoPath, runID, format string, fence detachedrun.Fence,
 		}
 	}
 	if format == "json" {
-		if err := writeJSONLine(stdout, result); err != nil {
+		if err := renderCanonicalJSONLine(stdout, detachedRecoverJSONPayload(result)); err != nil {
 			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
 			return 1
 		}

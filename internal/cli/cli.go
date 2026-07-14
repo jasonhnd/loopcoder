@@ -4601,12 +4601,7 @@ func renderDispatchJSON(w io.Writer, result worker.Result) error {
 	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch report: %w", err)
 	}
-	data, err := worker.MarshalResult(result)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(data, '\n'))
-	return err
+	return renderCanonicalJSONLine(w, dispatchJSONPayload(result))
 }
 
 func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
