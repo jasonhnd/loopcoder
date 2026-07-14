@@ -127,6 +127,7 @@ loopcoder promote      --repo .               # may change production branch whe
 loopcoder upgrade --version 0.7.0             # signed self-upgrade from GitHub Releases
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
+loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --foreground
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --detach
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
@@ -143,7 +144,7 @@ loopcoder lease release --repo . --run-id <id> # release conductor lease
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>
 loopcoder loopreview    --repo . --pr-number 43 --provider claude --strict
 loopcoder verify-local  --repo . --pr-number 43
-loopcoder dispatch-wave --repo . --issue-numbers 41,42
+loopcoder dispatch-wave --repo . --issue-numbers 41,42 --foreground
 loopcoder hook conductor-reporter             # internal: host hook integration
 loopcoder ps --repo .                         # list loopcoder-managed worker processes
 loopcoder kill --repo . --run <run-id>        # terminate loopcoder-managed processes for one run
@@ -165,7 +166,7 @@ loopcoder status --repo . --format json       # inspect latest run tree as stabl
 loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 ```
 
-`dispatch` and `loopreview` emit local-only human-readable report receipts to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. Receipts are conclusion-first and use the stable section order `Target`, `Verdict`, `Review summary`, `Run`, and `Next`; verifier receipts include verdict, finding counts, and needs-human reasons. The durable local machine surfaces are the `[reporter]` header, canonical report JSON, the `dispatch` / `loopreview` result JSON, and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
+Host-profiled non-interactive `dispatch`, `dispatch-wave`, and `tick` launches default to detached supervision and immediately return the run id plus `status`, `attach`, and `cancel` commands; pass `--foreground` for synchronous local execution. Foreground `dispatch` and `loopreview` emit local-only human-readable report receipts to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. Receipts are conclusion-first and use the stable section order `Target`, `Verdict`, `Review summary`, `Run`, and `Next`; verifier receipts include verdict, finding counts, and needs-human reasons. The durable local machine surfaces are the `[reporter]` header, canonical report JSON, the `dispatch` / `loopreview` result JSON, and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
 
 ### Model And Depth
 

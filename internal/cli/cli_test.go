@@ -2740,6 +2740,7 @@ func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t 
 	dispatchCalled := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "899",
 		"--issue-title", "Codex replay",
@@ -2855,6 +2856,7 @@ func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
 	dispatchCalled := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Next invocation replay",
@@ -3159,6 +3161,7 @@ func TestDispatchWithoutRunIDBoundedReplayProgressesPastExhaustedAndUnrelatedCan
 	result.RunID = "run-after-over-limit-replay"
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "903",
 		"--issue-title", "Over limit replay",
@@ -3224,6 +3227,7 @@ func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
 	result.RunID = "run-origin-mismatch-new"
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Origin mismatch",
@@ -3284,6 +3288,7 @@ func TestDispatchReplaysClaudeOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t
 	dispatchCalled := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude replay",
@@ -3333,6 +3338,7 @@ func TestDispatchWithoutRunIDReplaysPriorClaudeOriginExactlyOnce(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude next invocation replay",
@@ -3401,6 +3407,7 @@ func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *te
 	dispatchB := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude session B",
@@ -3432,6 +3439,7 @@ func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *te
 	dispatchA := false
 	exitCode = RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude session A return",
@@ -3519,6 +3527,7 @@ func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testi
 	dispatchB := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Paseo agent B",
@@ -3553,6 +3562,7 @@ func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testi
 	dispatchA := false
 	exitCode = RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Paseo agent A return",
@@ -4277,6 +4287,7 @@ func TestDispatchPaseoHostReplayProviderModelMatrix(t *testing.T) {
 			result.RunID = "run-paseo-provider-independence-" + tt.name
 			exitCode := RunWithDeps([]string{
 				"dispatch",
+				"--foreground",
 				"--repo", repo,
 				"--issue-number", "901",
 				"--issue-title", "Paseo host provider independence",
@@ -4565,6 +4576,7 @@ func TestDispatchClaudeHostReplayIsIndependentOfWorkerProvider(t *testing.T) {
 			result.RunID = "run-provider-independence-" + tt.name
 			exitCode := RunWithDeps([]string{
 				"dispatch",
+				"--foreground",
 				"--repo", repo,
 				"--issue-number", "900",
 				"--issue-title", "Claude host provider independence",
@@ -6820,6 +6832,48 @@ evidence:
 	}
 }
 
+func TestTickHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "generic-local")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 7, 0, 0, time.UTC)
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"tick",
+		"--format", "json",
+		"--repo", repo,
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			t.Fatal("foreground tick should not run")
+			return orchestration.TickReport{}, nil
+		},
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 4245, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("tick exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var launch detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040700Z-wave" || launch.CancelCommand == "" {
+		t.Fatalf("launch = %#v, want detached tick launch with cancel command", launch)
+	}
+	for _, want := range []string{"supervise", "tick", "--foreground", "--run-id", launch.RunID} {
+		if !containsString(launchedArgs, want) {
+			t.Fatalf("launched args missing %q: %#v", want, launchedArgs)
+		}
+	}
+}
+
 func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 	cfg := config.Default()
 	cfg.Domain.RedLines = []config.DomainRedLine{{
@@ -7492,6 +7546,88 @@ func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
 	}
 	if strings.Contains(launchRecord.StatusCommand, "--supervisor-lease") || strings.Contains(launchRecord.AttachCommand, "--supervisor-lease") {
 		t.Fatalf("launch commands contain mutable supervisor lease: %#v", launchRecord)
+	}
+	if launchRecord.CancelCommand == "" || strings.Contains(launchRecord.CancelCommand, "--supervisor-lease") || strings.Contains(launchRecord.CancelCommand, repo) {
+		t.Fatalf("launch cancel command is missing, mutable, or leaks repo path: %#v", launchRecord)
+	}
+}
+
+func TestDispatchHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	profiles := []string{"paseo", "codex-cli", "claude-code", "generic-local"}
+	for _, profile := range profiles {
+		t.Run(profile, func(t *testing.T) {
+			t.Setenv("LOOPCODER_HOME", t.TempDir())
+			t.Setenv(hostprofile.EnvName, profile)
+			repo := t.TempDir()
+			now := time.Date(2026, 7, 14, 4, 5, 0, 0, time.UTC)
+			if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			var launchedArgs []string
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--format", "json",
+				"--repo", repo,
+				"--issue-number", "964",
+				"--issue-title", "Default detached",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return now },
+				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+					t.Fatal("foreground dispatch should not run for host-profiled non-interactive default")
+					return worker.Result{}, nil
+				},
+				StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+					launchedArgs = append([]string(nil), args...)
+					return 4242, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var launch detachedLaunchRecord
+			assertSingleJSONValue(t, stdout.String(), &launch)
+			if !launch.Detached || launch.RunID != "run-20260714T040500Z-issue-964" || launch.CancelCommand == "" {
+				t.Fatalf("launch = %#v, want detached issue run with cancel command", launch)
+			}
+			if !containsString(launchedArgs, "--supervisor-run") {
+				t.Fatalf("launched args missing dispatch supervisor mode: %#v", launchedArgs)
+			}
+		})
+	}
+}
+
+func TestDispatchForegroundOverridesHostProfiledNonInteractiveDefault(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv(hostprofile.EnvName, "codex-cli")
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	called := false
+	record := validDispatchReport()
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "964",
+		"--issue-title", "Foreground dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return validDispatchResult(record), nil
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			t.Fatal("detached launcher should not run with --foreground")
+			return 0, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !called {
+		t.Fatal("foreground dispatch was not called")
 	}
 }
 
@@ -10035,6 +10171,49 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	for _, want := range []string{"DISPATCH WAVE", "RunId: run-test-wave", "- #201 succeeded", "Verify successful PRs"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestDispatchWaveHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 6, 0, 0, time.UTC)
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-numbers", "964,965",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			t.Fatal("foreground dispatch-wave should not dispatch workers")
+			return worker.Result{}, nil
+		},
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 4244, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch-wave exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var launch detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040600Z-wave" || launch.CancelCommand == "" {
+		t.Fatalf("launch = %#v, want detached wave launch with cancel command", launch)
+	}
+	for _, want := range []string{"supervise", "dispatch-wave", "--foreground", "--run-id", launch.RunID} {
+		if !containsString(launchedArgs, want) {
+			t.Fatalf("launched args missing %q: %#v", want, launchedArgs)
 		}
 	}
 }

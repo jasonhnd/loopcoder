@@ -114,10 +114,13 @@ diagnostics are written to stderr, while `status --receipts --format jsonl` and
 `attach --format jsonl` write one receipt view per stdout line. Text status and
 attach render the same durable receipt views for humans.
 
-Detached `dispatch --detach` returns a run ID plus explicit `status` and
-`attach` commands. Detached supervisor receipts are persisted to the progress
-receipt store and the delivery outbox. If the host goes offline, the run remains
-observable through `loopcoder status --repo . --run <run-id> --receipts` and
+Host-profiled non-interactive `dispatch`, `dispatch-wave`, and `tick` default
+to detached supervision. Explicit `--detach` uses the same contract, and
+`--foreground` is the deterministic opt-out. A detached launch returns a run ID
+plus explicit `status`, `attach`, and `cancel` commands. Detached supervisor
+receipts are persisted to the progress receipt store and the delivery outbox.
+If the host goes offline, the run remains observable through
+`loopcoder status --repo . --run <run-id> --receipts` and
 `loopcoder attach --repo . --run <run-id>`; no notification is claimed.
 
 On a later invocation with the same project and host origin reference,
