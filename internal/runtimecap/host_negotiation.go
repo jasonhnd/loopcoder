@@ -302,6 +302,20 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 				declarations[i].Source = "claude-code-documented-local-subprocess-hooks"
 			}
 		}
+	case "paseo-style":
+		for i := range declarations {
+			switch declarations[i].Capability {
+			case HostDurablePolling, HostResumableFollow:
+				declarations[i].Support = HostCapabilitySupported
+				declarations[i].Source = "paseo-documented-cli-poll-follow"
+			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:
+				declarations[i].Support = HostCapabilityUnsupported
+				declarations[i].Source = "paseo-documented-cli-poll-follow"
+			case HostDetachedCancellation:
+				declarations[i].Support = HostCapabilityUnknown
+				declarations[i].Source = "paseo-documented-cli-poll-follow"
+			}
+		}
 	}
 	sortHostCapabilityDeclarations(declarations)
 	return declarations

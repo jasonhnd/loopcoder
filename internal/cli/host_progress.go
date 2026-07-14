@@ -43,12 +43,25 @@ var claudeProgressAdapter = hostProgressAdapter{
 	BindingRequest:    hostprofile.ClaudeOriginBindingRequest,
 }
 
+var paseoProgressAdapter = hostProgressAdapter{
+	Profile:           "paseo-style",
+	Display:           "Paseo",
+	ClaimOwner:        "paseo-host-replay",
+	ReplayRunID:       "paseo-host-replay-origin",
+	ReplayCorrelation: "paseo-host-replay-origin",
+	BindingRequest:    hostprofile.PaseoOriginBindingRequest,
+}
+
 func codexHostOriginBinding(projectID, deliveryRunID, correlationID string) runtimecap.HostRunOriginBinding {
 	return hostOriginBinding(codexProgressAdapter, projectID, deliveryRunID, correlationID)
 }
 
 func claudeHostOriginBinding(projectID, deliveryRunID, correlationID string) runtimecap.HostRunOriginBinding {
 	return hostOriginBinding(claudeProgressAdapter, projectID, deliveryRunID, correlationID)
+}
+
+func paseoHostOriginBinding(projectID, deliveryRunID, correlationID string) runtimecap.HostRunOriginBinding {
+	return hostOriginBinding(paseoProgressAdapter, projectID, deliveryRunID, correlationID)
 }
 
 func hostOriginBinding(adapter hostProgressAdapter, projectID, deliveryRunID, correlationID string) runtimecap.HostRunOriginBinding {
@@ -282,6 +295,8 @@ func currentHostProgressAdapter() (hostProgressAdapter, bool) {
 			return codexProgressAdapter, true
 		case claudeProgressAdapter.Profile:
 			return claudeProgressAdapter, true
+		case paseoProgressAdapter.Profile:
+			return paseoProgressAdapter, true
 		default:
 			return hostProgressAdapter{}, false
 		}
@@ -291,6 +306,9 @@ func currentHostProgressAdapter() (hostProgressAdapter, bool) {
 	}
 	if _, ok := hostprofile.ClaudeOriginBindingRequest(hostprofile.OriginOptions{Getenv: os.Getenv}); ok {
 		return claudeProgressAdapter, true
+	}
+	if _, ok := hostprofile.PaseoOriginBindingRequest(hostprofile.OriginOptions{Getenv: os.Getenv}); ok {
+		return paseoProgressAdapter, true
 	}
 	return hostProgressAdapter{}, false
 }

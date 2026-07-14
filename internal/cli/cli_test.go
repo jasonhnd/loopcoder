@@ -3159,6 +3159,133 @@ func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *te
 	}
 }
 
+func TestPaseoHostMarkerWithoutAgentIDUsesFallbackSinkOnly(t *testing.T) {
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	if binding := paseoHostOriginBinding("proj_paseo", "run_paseo", "corr_paseo"); binding.Bound || binding.Code != runtimecap.HostOriginAbsent {
+		t.Fatalf("Paseo marker-only binding = %#v, want absent", binding)
+	}
+	adapter, ok := currentHostProgressAdapter()
+	if !ok || adapter.Profile != paseoProgressAdapter.Profile {
+		t.Fatalf("currentHostProgressAdapter = %#v/%v, want explicit Paseo adapter", adapter, ok)
+	}
+	sinkID, originID, transport := hostSink(adapter, "proj_paseo", "run_paseo", "corr_paseo", "fallback-sink")
+	if sinkID != "fallback-sink" || originID != "corr_paseo" || transport != "host-jsonl-v1" {
+		t.Fatalf("Paseo marker-only hostSink = sink:%q origin:%q transport:%q, want fallback without known-origin replay", sinkID, originID, transport)
+	}
+}
+
+func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-a-replacement")
+	created, bindingA := persistPaseoReplayFixture(t, store, projectID, priorRunID, "", "Paseo agent A terminal result", 48)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-b-replacement")
+	var stdoutB, stderrB bytes.Buffer
+	resultB := validDispatchResult(record)
+	resultB.RunID = "run-paseo-agent-b"
+	dispatchB := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Paseo agent B",
+		"--format", "json",
+	}, &stdoutB, &stderrB, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchB = true
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; Paseo must remain host transport only", opts.Provider)
+			}
+			if strings.Contains(stderrB.String(), "Paseo agent A terminal result") || strings.Contains(stderrB.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("Paseo agent B replayed agent A receipt: %q", stderrB.String())
+			}
+			return resultB, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("Paseo agent B dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutB.String(), stderrB.String())
+	}
+	if !dispatchB {
+		t.Fatal("Paseo agent B dispatch was not called")
+	}
+	if err := relaygate.Flush(repo, io.Discard); err != nil {
+		t.Fatalf("flush Paseo agent B relay gate: %v", err)
+	}
+
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-a-replacement")
+	var stdoutA, stderrA bytes.Buffer
+	resultA := validDispatchResult(record)
+	resultA.RunID = "run-paseo-agent-a-return"
+	dispatchA := false
+	exitCode = RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Paseo agent A return",
+		"--format", "json",
+	}, &stdoutA, &stderrA, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchA = true
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; Paseo must remain host transport only", opts.Provider)
+			}
+			if !strings.Contains(stderrA.String(), "Paseo agent A terminal result") {
+				return worker.Result{}, fmt.Errorf("Paseo agent A receipt was not replayed before dispatch: %q", stderrA.String())
+			}
+			if !strings.Contains(stderrA.String(), "for Paseo origin") {
+				return worker.Result{}, fmt.Errorf("Paseo replay did not identify host transport: %q", stderrA.String())
+			}
+			return resultA, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("Paseo agent A dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutA.String(), stderrA.String())
+	}
+	if !dispatchA {
+		t.Fatal("Paseo agent A dispatch was not called")
+	}
+
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after Paseo agent A replay: %v", err)
+	}
+	defer store.Close()
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      bindingA.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want one cursor for Paseo agent A receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, bindingA.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 5, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate Paseo replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate Paseo replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+}
+
 func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
 	_, runID, store := setupStatusProgressFixture(t)
 	defer store.Close()
@@ -3333,6 +3460,40 @@ func persistClaudeReplayFixture(t *testing.T, store storage.Store, projectID, ru
 	})
 	if err != nil {
 		t.Fatalf("PersistReceiptWithObligation Claude %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func persistPaseoReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := paseoHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Paseo host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-paseo-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation Paseo %s: %v", runID, err)
 	}
 	return created, binding
 }

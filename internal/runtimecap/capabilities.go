@@ -711,6 +711,8 @@ var staticContract = Contract{
 			SupportsCancel:     true,
 			KnownLimitations: []string{
 				"the host owns session lifetime and must keep stderr visible for local relay obligations",
+				"LoopCoder has no documented Paseo callback, targeted wake, or acknowledgment proof in this release; progress delivery is durable poll/follow plus matching-origin next-invocation replay",
+				"upstream Paseo issue #2034 can delay an already-closed Claude ProcessTransport refresh by the rescue timeout; LoopCoder treats this as an isolated host limitation",
 			},
 		},
 		{

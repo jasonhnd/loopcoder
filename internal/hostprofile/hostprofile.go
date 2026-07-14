@@ -155,6 +155,14 @@ func ClaudeOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBin
 	})
 }
 
+func PaseoOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "paseo-style", "paseo-agent", []string{
+		"PASEO_AGENT_ID",
+	}, []string{
+		"PASEO_HOST",
+	})
+}
+
 func originBindingRequest(opts OriginOptions, host, kind string, opaqueEnvNames, markerEnvNames []string) (runtimecap.HostRunOriginBindingRequest, bool) {
 	getenv := opts.Getenv
 	if getenv == nil {

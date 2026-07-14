@@ -178,6 +178,53 @@ func TestClaudeOriginBindingRequestAbsentMetadataIsNotCapabilityProof(t *testing
 	}
 }
 
+func TestPaseoOriginBindingRequestRedactsAgentIDAndMarkers(t *testing.T) {
+	secret := "AKIA" + strings.Repeat("C", 16)
+	req, ok := hostprofile.PaseoOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_paseo",
+		DeliveryRunID: "run_paseo",
+		CorrelationID: "corr_paseo",
+		Getenv: mapGetenv(map[string]string{
+			"PASEO_AGENT_ID": "agent-" + secret,
+			"PASEO_HOST":     "127.0.0.1:6767",
+			"PWD":            "/Users/alice/private/repo",
+		}),
+	})
+	if !ok {
+		t.Fatal("PaseoOriginBindingRequest returned ok=false")
+	}
+	binding := runtimecap.BindHostRunOrigin(req)
+	if !binding.Bound || binding.Code != runtimecap.HostOriginBound || binding.BindingID == "" {
+		t.Fatalf("binding = %#v, want bound Paseo origin", binding)
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatalf("marshal binding: %v", err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{secret, "agent-", "127.0.0.1", "/Users/alice", "PASEO_AGENT_ID\":\"agent"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("binding leaked %q: %s", forbidden, text)
+		}
+	}
+	for _, want := range []string{"env.PASEO_AGENT_ID", "env.PASEO_HOST"} {
+		if !containsHostProfileString(binding.MetadataKeys, want) {
+			t.Fatalf("metadata keys = %#v, want marker %s", binding.MetadataKeys, want)
+		}
+	}
+}
+
+func TestPaseoHostMarkerWithoutAgentIDIsNotOriginOrWakeProof(t *testing.T) {
+	if _, ok := hostprofile.PaseoOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_paseo",
+		DeliveryRunID: "run_paseo",
+		CorrelationID: "corr_paseo",
+		Getenv:        mapGetenv(map[string]string{"PASEO_HOST": "127.0.0.1:6767"}),
+	}); ok {
+		t.Fatal("PaseoOriginBindingRequest ok=true without PASEO_AGENT_ID")
+	}
+}
+
 func mapGetenv(values map[string]string) func(string) string {
 	return func(key string) string {
 		return values[key]
