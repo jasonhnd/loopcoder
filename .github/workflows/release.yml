@@ -87,6 +87,8 @@ jobs:
           cp LICENSE dist/package/LICENSE
 
           tar -C dist/package -czf "dist/${archive}" "${binary}" LICENSE
+          # Build stages files under dist/package before tarring; remove so only the archive remains.
+          rm -rf dist/package
           bash scripts/stage-draft-release.sh validate-archives
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
