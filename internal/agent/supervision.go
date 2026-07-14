@@ -30,6 +30,19 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		LivenessMode:    supervisedexec.LivenessMode(inv.LivenessMode),
 		LivenessCommand: inv.LivenessCommand,
 	}
+	if inv.OnProviderStart != nil {
+		opts.OnStart = func(started supervisedexec.StartedProcess) error {
+			return inv.OnProviderStart(ProviderProcess{
+				PID:                   started.PID,
+				PGID:                  started.PGID,
+				ProcessBirthIdentity:  started.ProcessBirthIdentity,
+				ExecutableIdentity:    started.ExecutableIdentity,
+				ObservedAt:            started.ObservedAt,
+				IdentityAmbiguous:     started.IdentityAmbiguous,
+				IdentityAmbiguityNote: started.IdentityAmbiguityNote,
+			})
+		}
+	}
 	if inv.StallTimeout > 0 {
 		opts.OnStall = appendStallLine(inv.LogPath, provider)
 	}

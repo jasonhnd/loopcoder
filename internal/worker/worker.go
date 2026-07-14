@@ -155,17 +155,18 @@ type dispatchContext struct {
 	github   GitHubClient
 	agentRun agent.Runner
 
-	scratch        string
-	worktreePath   string
-	promptPath     string
-	summaryPath    string
-	logPath        string
-	runtimeRoots   runtimepath.Roots
-	ownershipStore storage.Store
-	ownershipLease *storage.AgentOwnershipLease
-	jobID          string
-	attemptPath    string
-	tracker        *attemptTracker
+	scratch                string
+	worktreePath           string
+	promptPath             string
+	summaryPath            string
+	logPath                string
+	runtimeRoots           runtimepath.Roots
+	ownershipStore         storage.Store
+	ownershipLease         *storage.AgentOwnershipLease
+	providerAuthorityFence *storage.ProviderExecutionAuthorityFence
+	jobID                  string
+	attemptPath            string
+	tracker                *attemptTracker
 
 	domainPolicy      domainWorkerPolicy
 	progressRecorder  *progressRecorder
@@ -385,8 +386,8 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
 
-	dispatch.activePhase = "codex_started"
-	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	dispatch.activePhase = "codex_launching"
+	dispatch.tracker.snapshot(dispatch.activePhase, state.StatusLaunching)
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
 	if err != nil {
 		return agent.Invocation{}, err
@@ -416,6 +417,15 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
 		MCPServers:      mcpServers,
+		OnProviderStart: func(started agent.ProviderProcess) error {
+			if err := persistProviderExecutionAuthority(ctx, dispatch, started); err != nil {
+				return err
+			}
+			dispatch.tracker.setPID(started.PID)
+			dispatch.activePhase = "codex_started"
+			dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
+			return nil
+		},
 	}, nil
 }
 
@@ -426,6 +436,10 @@ func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.I
 	agentResult, agentErr := dispatch.agentRun.Run(ctx, invocation)
 	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
 		return agentResult, err
+	}
+	if dispatch.activePhase == "codex_launching" {
+		dispatch.activePhase = "codex_started"
+		dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
 	}
 	dispatch.activePhase = "codex_exited"
 	var exitCodePtr *int
@@ -665,6 +679,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 				reason = "keep-worktree requested"
 			}
 			preserveAttemptArtifacts(dispatch, reason, nil)
+			completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 			releaseWorkerOwnership(dispatch)
 			return
 		}
@@ -672,6 +687,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: refused cleanup without active ownership fence for %s: %v\n", dispatch.worktreePath, err)
 			selectArtifactPreservation(dispatch, "cleanup ownership refused", []string{err.Error()})
 			preserveAttemptArtifacts(dispatch, "cleanup ownership refused", []string{err.Error()})
+			completeProviderExecutionAuthority(dispatch, state.StatusNeedsHuman)
 			return
 		}
 		selectArtifactCleanup(dispatch, "successful attempt cleanup")
@@ -690,10 +706,12 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove scratch %s: %v", dispatch.scratch, cleanupErr))
 		}
 		completeArtifactCleanup(dispatch, cleanupErrors)
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if failure == nil {
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
 		releaseWorkerOwnership(dispatch)
 		return
 	}
@@ -701,6 +719,7 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		dispatch.failureStatus = state.FailureStatus(failure)
 	}
 	writeRecovery(ctx, dispatch, failure)
+	completeProviderExecutionAuthority(dispatch, dispatch.failureStatus)
 	releaseWorkerOwnership(dispatch)
 }
 
@@ -1741,6 +1760,62 @@ func validateWorkerOwnership(ctx context.Context, dispatch *dispatchContext) err
 	return nil
 }
 
+func persistProviderExecutionAuthority(ctx context.Context, dispatch *dispatchContext, started agent.ProviderProcess) error {
+	if dispatch == nil || dispatch.tracker == nil {
+		return errors.New("provider execution authority dispatch context is missing")
+	}
+	if started.PID <= 0 {
+		return errors.New("provider execution authority provider pid is missing")
+	}
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return err
+	}
+	if dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return nil
+	}
+	startedAt := started.ObservedAt
+	if startedAt.IsZero() {
+		startedAt = dispatch.deps.Now()
+	}
+	authority := storage.ProviderExecutionAuthority{
+		ProjectID:            dispatch.runtimeRoots.ProjectID,
+		RunID:                dispatch.opts.RunID,
+		AttemptID:            dispatch.jobID,
+		ProviderPID:          started.PID,
+		ProviderPGID:         started.PGID,
+		ProcessBirthIdentity: started.ProcessBirthIdentity,
+		ExecutableIdentity:   started.ExecutableIdentity,
+		OwnerID:              dispatch.ownershipLease.OwnerID,
+		ClaimGeneration:      dispatch.ownershipLease.ClaimGeneration,
+		StartedAt:            state.FormatTimestamp(startedAt),
+		HeartbeatAt:          state.FormatTimestamp(startedAt),
+		WorktreePath:         dispatch.worktreePath,
+		LogPath:              dispatch.logPath,
+		IdentityAmbiguous:    started.IdentityAmbiguous,
+		AmbiguityReason:      started.IdentityAmbiguityNote,
+	}
+	if _, err := storage.PersistProviderExecutionAuthority(ctx, dispatch.ownershipStore, authority, startedAt); err != nil {
+		return fmt.Errorf("persist provider execution authority: %w", err)
+	}
+	dispatch.providerAuthorityFence = &storage.ProviderExecutionAuthorityFence{
+		ProjectID:       authority.ProjectID,
+		RunID:           authority.RunID,
+		AttemptID:       authority.AttemptID,
+		OwnerID:         authority.OwnerID,
+		ClaimGeneration: authority.ClaimGeneration,
+	}
+	return nil
+}
+
+func completeProviderExecutionAuthority(dispatch *dispatchContext, terminalState string) {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.providerAuthorityFence == nil {
+		return
+	}
+	if err := storage.CompleteProviderExecutionAuthority(context.Background(), dispatch.ownershipStore, *dispatch.providerAuthorityFence, dispatch.deps.Now(), terminalState); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to complete provider execution authority for %s/%s: %v\n", dispatch.opts.RunID, dispatch.jobID, err)
+	}
+}
+
 func releaseWorkerOwnership(dispatch *dispatchContext) {
 	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
 		return
@@ -1854,8 +1929,26 @@ func (t *attemptTracker) setReport(record reporter.Report) {
 	t.reporter = cloneReport(&record)
 }
 
+func (t *attemptTracker) setPID(pid int) {
+	if pid > 0 {
+		t.pid = pid
+	}
+}
+
 func (t *attemptTracker) setArtifactDecision(decision state.ArtifactDecision) {
 	t.artifactDecision = cloneArtifactDecision(&decision)
+}
+
+func (t *attemptTracker) snapshot(phase, status string) {
+	now := state.FormatTimestamp(t.now())
+	if strings.TrimSpace(phase) != "" {
+		t.phase = phase
+	}
+	if strings.TrimSpace(status) != "" {
+		t.status = status
+	}
+	t.heartbeatAt = now
+	t.writeAttempt()
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {

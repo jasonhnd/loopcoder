@@ -32,7 +32,8 @@ type Invocation struct {
 	// ProviderKey is loopcoder's durable idempotency key for the logical child
 	// operation. Runners may pass it to providers with native support; providers
 	// without native support receive it only as loopcoder metadata.
-	ProviderKey string
+	ProviderKey     string
+	OnProviderStart func(ProviderProcess) error
 	// MCPServers carries provider-neutral MCP declarations. Provider-specific
 	// flags and config files are still owned by each runner.
 	MCPServers []MCPServer
@@ -55,6 +56,16 @@ type Result struct {
 	HungReason         string
 	AdapterVersion     string
 	ExternalSessionRef string
+}
+
+type ProviderProcess struct {
+	PID                   int
+	PGID                  int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ObservedAt            time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
 }
 
 type Runner interface {
