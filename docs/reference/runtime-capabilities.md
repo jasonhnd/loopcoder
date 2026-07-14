@@ -10,6 +10,23 @@ model, and depth still resolve from command flags, `.delivery.yml`, and the
 static model registry. Runtime capabilities describe whether the selected
 provider or host can safely satisfy a requested invocation mode.
 
+Host negotiation has two independent axes:
+
+1. **Host invocation capability**: whether the current host can run the
+   foreground `loopcoder` subprocess, preserve stdout/stderr, pass JSON through
+   unchanged, and allow loopcoder's own timeout/cancellation supervision to
+   work.
+2. **Progress transport capability**: whether the host declares durable
+   polling, resumable follow, callbacks, wake-up, acknowledgment, host-managed
+   background work, detached steering/cancellation, and explicit payload/rate
+   limits for progress delivery.
+
+A host profile name or environment marker can only propose a profile. Active
+callback, wake-up, acknowledgment, and detached control support require
+declared handshake evidence in the versioned host negotiation request. LoopCoder
+must not infer those capabilities from `codex-cli`, `claude-code`, a process
+environment variable, or the Worker/Verifier provider choice.
+
 Future provider declarations use the same contract and must follow
 [`future-provider-adapters.md`](future-provider-adapters.md) before they can
 participate in provider inventory or later routing.
@@ -189,6 +206,40 @@ Required host behavior:
 | Cancellation | The host can interrupt the foreground `loopcoder` process, or leave loopcoder's own timeout and kill-group supervision in control. |
 | Timeouts | The host can keep the session open long enough for configured hard caps, or terminate cleanly and let recovery re-derive state. |
 | No private API dependency | Host integration may use documented hooks or local subprocess behavior, but core delivery cannot require private host APIs. |
+
+The host negotiation record is `loopcoder.host_negotiation.v1`. It is pure
+data: evaluating it must not launch providers, collect provider inventory,
+write delivery records, open callbacks, wake hosts, perform network I/O, or
+start background supervisors.
+
+Progress delivery records stay provider-neutral. Receipt generation, transport
+write, host acceptance, user visibility, and acknowledgment are distinct states
+with distinct evidence requirements. Negotiation may say that a stage requires
+evidence, is local-only, is replay-only, or is unsupported, but it must not
+claim acceptance, visibility, or acknowledgment until the progress outbox has
+the exact matching transport evidence.
+
+Progress transport fallback order is deterministic:
+
+1. `acknowledged-streaming` when callbacks, wake-up, and acknowledgment are all
+   declared supported.
+2. `unacknowledged-streaming` when callbacks and wake-up are declared supported
+   but acknowledgment is not.
+3. `durable-follow-poll` when durable polling or resumable follow is declared
+   supported.
+4. `known-origin-next-invocation-replay` when an opaque run origin is bound but
+   no active wake path is declared.
+5. `next-invocation-replay` for generic, unknown, partial, or unsupported
+   active transport declarations.
+
+The optional run origin is bound with
+`loopcoder.host_run_origin.v1`. The binding is scoped to exactly one
+`project_id`, `delivery_run_id`, and `correlation_id`, and it persists only
+redacted identifiers, metadata keys, and digests. Raw opaque host tokens,
+credentials, local paths, and secret-like values are not authority and must not
+be persisted or rendered. Replaying the same origin in the same scope produces
+the same binding; replaying it for another project, run, or correlation produces
+a different binding and cannot authorize delivery for the original scope.
 
 Current host profiles:
 

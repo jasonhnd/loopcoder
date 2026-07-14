@@ -1,22 +1,42 @@
 package runtimecap
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strings"
 )
 
 const HostNegotiationSchemaVersion = "loopcoder.host_negotiation.v1"
+const HostRunOriginSchemaVersion = "loopcoder.host_run_origin.v1"
+
+const (
+	maxHostOriginMetadataKeys  = 16
+	maxHostOriginMetadataRunes = 2048
+	maxHostOriginValueRunes    = 120
+)
 
 type HostCapability string
 
 const (
-	HostLocalSubprocess HostCapability = "local-subprocess"
-	HostStdout          HostCapability = "stdout"
-	HostStderr          HostCapability = "stderr"
-	HostJSONOutput      HostCapability = "json-output"
-	HostTimeouts        HostCapability = "timeouts"
-	HostCancellation    HostCapability = "cancellation"
-	HostHooks           HostCapability = "hooks"
+	HostLocalSubprocess       HostCapability = "local-subprocess"
+	HostStdout                HostCapability = "stdout"
+	HostStderr                HostCapability = "stderr"
+	HostJSONOutput            HostCapability = "json-output"
+	HostTimeouts              HostCapability = "timeouts"
+	HostCancellation          HostCapability = "cancellation"
+	HostHooks                 HostCapability = "hooks"
+	HostDurablePolling        HostCapability = "durable-polling"
+	HostResumableFollow       HostCapability = "resumable-follow"
+	HostManagedBackgroundWork HostCapability = "host-managed-background-work"
+	HostCallbacks             HostCapability = "callbacks"
+	HostWakeUp                HostCapability = "wake-up"
+	HostAcknowledgment        HostCapability = "acknowledgment"
+	HostDetachedSteering      HostCapability = "detached-steering"
+	HostDetachedCancellation  HostCapability = "detached-cancellation"
+	HostPayloadLimits         HostCapability = "payload-limits"
+	HostRateLimits            HostCapability = "rate-limits"
 )
 
 type HostFeature string
@@ -30,6 +50,8 @@ const (
 	HostFeatureCancellation       HostFeature = "cancellation"
 	HostFeatureCompatibility      HostFeature = "compatibility"
 	HostFeatureInvocationMetadata HostFeature = "invocation-metadata"
+	HostFeatureProgressTransport  HostFeature = "progress-transport"
+	HostFeatureRunOrigin          HostFeature = "run-origin"
 )
 
 type HostCapabilitySupport string
@@ -49,11 +71,49 @@ const (
 )
 
 const (
-	ErrUnsupportedHostSchemaVersion = "ErrUnsupportedHostSchemaVersion"
-	ErrUnsupportedHostFeature       = "ErrUnsupportedHostFeature"
-	ErrMissingHostMetadata          = "ErrMissingHostMetadata"
-	ErrPartialHostMetadata          = "ErrPartialHostMetadata"
-	ErrUnsupportedHostCapability    = "ErrUnsupportedHostCapability"
+	ErrUnsupportedHostSchemaVersion       = "ErrUnsupportedHostSchemaVersion"
+	ErrUnsupportedHostFeature             = "ErrUnsupportedHostFeature"
+	ErrMissingHostMetadata                = "ErrMissingHostMetadata"
+	ErrPartialHostMetadata                = "ErrPartialHostMetadata"
+	ErrUnsupportedHostCapability          = "ErrUnsupportedHostCapability"
+	ErrUnsupportedHostOriginSchemaVersion = "ErrUnsupportedHostOriginSchemaVersion"
+	ErrInvalidHostOriginScope             = "ErrInvalidHostOriginScope"
+	ErrHostOriginMetadataTooLarge         = "ErrHostOriginMetadataTooLarge"
+	ErrInvalidHostOriginMetadata          = "ErrInvalidHostOriginMetadata"
+)
+
+const (
+	HostProgressAcknowledgedStreaming   = "acknowledged-streaming"
+	HostProgressUnacknowledgedStreaming = "unacknowledged-streaming"
+	HostProgressDurableFollowPoll       = "durable-follow-poll"
+	HostProgressKnownOriginReplay       = "known-origin-next-invocation-replay"
+	HostProgressNextInvocationReplay    = "next-invocation-replay"
+
+	HostProgressAckRequired = "required-ack"
+	HostProgressAckNone     = "no-ack"
+)
+
+type HostProgressStage string
+
+const (
+	HostProgressStageReceiptGeneration HostProgressStage = "receipt-generation"
+	HostProgressStageTransportWrite    HostProgressStage = "transport-write"
+	HostProgressStageHostAcceptance    HostProgressStage = "host-acceptance"
+	HostProgressStageUserVisibility    HostProgressStage = "user-visibility"
+	HostProgressStageAcknowledgment    HostProgressStage = "acknowledgment"
+	HostProgressStageWakeUp            HostProgressStage = "wake-up"
+)
+
+const (
+	HostStageLocalOnly        = "local-only"
+	HostStageEvidenceRequired = "evidence-required"
+	HostStageUnsupported      = "unsupported"
+	HostStageReplayOnly       = "replay-only"
+)
+
+const (
+	HostOriginAbsent = "origin-absent"
+	HostOriginBound  = "origin-bound"
 )
 
 type HostNegotiationRequest struct {
@@ -62,6 +122,8 @@ type HostNegotiationRequest struct {
 	RequestedFeatures       []HostFeature
 	Host                    HostProfileRecord
 	Capabilities            []HostCapabilityDeclaration
+	ProgressLimits          HostProgressLimitDeclaration
+	Origin                  HostRunOriginBindingRequest
 }
 
 type HostProfileRecord struct {
@@ -99,6 +161,67 @@ type HostCancellationRecord struct {
 	Cancellation HostCapabilitySupport `json:"cancellation"`
 }
 
+type HostProgressLimitDeclaration struct {
+	MaxPayloadBytes      int `json:"max_payload_bytes,omitempty"`
+	MaxEnvelopeBytes     int `json:"max_envelope_bytes,omitempty"`
+	MaxReceiptsPerMinute int `json:"max_receipts_per_minute,omitempty"`
+	MaxOutstanding       int `json:"max_outstanding,omitempty"`
+}
+
+type HostProgressTransportRecord struct {
+	TransportContract string                    `json:"transport_contract"`
+	AckPolicy         string                    `json:"ack_policy"`
+	FallbackOrder     []string                  `json:"fallback_order"`
+	Limits            HostProgressLimitRecord   `json:"limits"`
+	Stages            []HostProgressStageRecord `json:"stages"`
+}
+
+type HostProgressLimitRecord struct {
+	MaxPayloadBytes      int  `json:"max_payload_bytes"`
+	MaxEnvelopeBytes     int  `json:"max_envelope_bytes"`
+	MaxReceiptsPerMinute int  `json:"max_receipts_per_minute"`
+	MaxOutstanding       int  `json:"max_outstanding"`
+	Declared             bool `json:"declared"`
+}
+
+type HostProgressStageRecord struct {
+	Stage            HostProgressStage `json:"stage"`
+	Code             string            `json:"code"`
+	EvidenceRequired bool              `json:"evidence_required"`
+	EvidenceKind     string            `json:"evidence_kind"`
+}
+
+type HostRunOriginDeclaration struct {
+	SchemaVersion           string            `json:"schema_version,omitempty"`
+	SupportedSchemaVersions []string          `json:"supported_schema_versions,omitempty"`
+	Kind                    string            `json:"kind,omitempty"`
+	OpaqueID                string            `json:"opaque_id,omitempty"`
+	Metadata                map[string]string `json:"metadata,omitempty"`
+}
+
+type HostRunOriginBindingRequest struct {
+	ProjectID     string                   `json:"project_id,omitempty"`
+	DeliveryRunID string                   `json:"delivery_run_id,omitempty"`
+	CorrelationID string                   `json:"correlation_id,omitempty"`
+	Origin        HostRunOriginDeclaration `json:"origin,omitempty"`
+}
+
+type HostRunOriginBinding struct {
+	Bound          bool           `json:"bound"`
+	Code           string         `json:"code"`
+	SchemaVersion  string         `json:"schema_version,omitempty"`
+	BindingID      string         `json:"binding_id,omitempty"`
+	OriginKind     string         `json:"origin_kind,omitempty"`
+	OriginRef      string         `json:"origin_ref,omitempty"`
+	ProjectID      string         `json:"project_id,omitempty"`
+	DeliveryRunID  string         `json:"delivery_run_id,omitempty"`
+	CorrelationID  string         `json:"correlation_id,omitempty"`
+	MetadataDigest string         `json:"metadata_digest,omitempty"`
+	MetadataKeys   []string       `json:"metadata_keys,omitempty"`
+	Redacted       bool           `json:"redacted"`
+	Limits         map[string]int `json:"limits,omitempty"`
+}
+
 type HostCompatibilityRecord struct {
 	Outcome             HostNegotiationOutcome `json:"outcome"`
 	Code                string                 `json:"code"`
@@ -127,6 +250,8 @@ type HostNegotiation struct {
 	Outputs       HostOutputRecord            `json:"outputs"`
 	Streaming     HostStreamingRecord         `json:"streaming"`
 	Cancellation  HostCancellationRecord      `json:"cancellation"`
+	Progress      HostProgressTransportRecord `json:"progress"`
+	Origin        HostRunOriginBinding        `json:"origin"`
 	Compatibility HostCompatibilityRecord     `json:"compatibility"`
 	Invocation    HostInvocationMetadata      `json:"invocation"`
 }
@@ -140,6 +265,16 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 		{Capability: HostTimeouts, Support: supportFromBool(host.SupportsTimeouts), Source: "runtime-contract"},
 		{Capability: HostCancellation, Support: supportFromBool(host.SupportsCancel), Source: "runtime-contract"},
 		{Capability: HostHooks, Support: supportFromBool(host.SupportsHooks), Source: "runtime-contract"},
+		{Capability: HostDurablePolling, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostResumableFollow, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostManagedBackgroundWork, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostCallbacks, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostWakeUp, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostAcknowledgment, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostDetachedSteering, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostDetachedCancellation, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostPayloadLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
+		{Capability: HostRateLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
 	}
 	sortHostCapabilityDeclarations(declarations)
 	return declarations
@@ -180,6 +315,7 @@ func NegotiateHost(request HostNegotiationRequest) HostNegotiation {
 		code = ErrUnsupportedHostCapability
 		reasons = append(reasons, "host does not satisfy one or more required capabilities")
 	}
+	origin := BindHostRunOrigin(request.Origin)
 
 	return HostNegotiation{
 		SchemaVersion: HostNegotiationSchemaVersion,
@@ -207,6 +343,8 @@ func NegotiateHost(request HostNegotiationRequest) HostNegotiation {
 			Timeouts:     hostCapabilitySupport(capabilities, HostTimeouts),
 			Cancellation: hostCapabilitySupport(capabilities, HostCancellation),
 		},
+		Progress: negotiateProgressTransport(capabilities, request.ProgressLimits, origin),
+		Origin:   origin,
 		Compatibility: HostCompatibilityRecord{
 			Outcome:             outcome,
 			Code:                code,
@@ -253,6 +391,8 @@ func supportedHostFeatures() []HostFeature {
 		HostFeatureInvocationMetadata,
 		HostFeatureOutputs,
 		HostFeatureProfile,
+		HostFeatureProgressTransport,
+		HostFeatureRunOrigin,
 		HostFeatureStreaming,
 	}
 }
@@ -303,6 +443,281 @@ func normalizeHostCapabilities(capabilities []HostCapabilityDeclaration) []HostC
 	return out
 }
 
+func negotiateProgressTransport(capabilities []HostCapabilityDeclaration, limits HostProgressLimitDeclaration, origin HostRunOriginBinding) HostProgressTransportRecord {
+	ack := capabilityIsSupported(capabilities, HostAcknowledgment)
+	callbacks := capabilityIsSupported(capabilities, HostCallbacks)
+	wake := capabilityIsSupported(capabilities, HostWakeUp)
+	durable := capabilityIsSupported(capabilities, HostDurablePolling)
+	follow := capabilityIsSupported(capabilities, HostResumableFollow)
+
+	contract := HostProgressNextInvocationReplay
+	ackPolicy := HostProgressAckNone
+	switch {
+	case callbacks && wake && ack:
+		contract = HostProgressAcknowledgedStreaming
+		ackPolicy = HostProgressAckRequired
+	case callbacks && wake:
+		contract = HostProgressUnacknowledgedStreaming
+	case durable || follow:
+		contract = HostProgressDurableFollowPoll
+	case origin.Bound:
+		contract = HostProgressKnownOriginReplay
+	}
+
+	return HostProgressTransportRecord{
+		TransportContract: contract,
+		AckPolicy:         ackPolicy,
+		FallbackOrder: []string{
+			HostProgressAcknowledgedStreaming,
+			HostProgressUnacknowledgedStreaming,
+			HostProgressDurableFollowPoll,
+			HostProgressKnownOriginReplay,
+			HostProgressNextInvocationReplay,
+		},
+		Limits: normalizeProgressLimits(limits),
+		Stages: progressStages(contract, ack, callbacks, wake),
+	}
+}
+
+func normalizeProgressLimits(limits HostProgressLimitDeclaration) HostProgressLimitRecord {
+	record := HostProgressLimitRecord{
+		MaxPayloadBytes:      boundedPositive(limits.MaxPayloadBytes, 0, 1<<20),
+		MaxEnvelopeBytes:     boundedPositive(limits.MaxEnvelopeBytes, 0, 4<<20),
+		MaxReceiptsPerMinute: boundedPositive(limits.MaxReceiptsPerMinute, 0, 6000),
+		MaxOutstanding:       boundedPositive(limits.MaxOutstanding, 0, 10000),
+	}
+	record.Declared = record.MaxPayloadBytes > 0 || record.MaxEnvelopeBytes > 0 || record.MaxReceiptsPerMinute > 0 || record.MaxOutstanding > 0
+	return record
+}
+
+func boundedPositive(value, fallback, max int) int {
+	if value <= 0 {
+		return fallback
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func progressStages(contract string, ack, callbacks, wake bool) []HostProgressStageRecord {
+	stages := []HostProgressStageRecord{
+		{Stage: HostProgressStageReceiptGeneration, Code: HostStageLocalOnly, EvidenceRequired: false, EvidenceKind: "progress-receipt"},
+	}
+	writeCode := HostStageReplayOnly
+	if callbacks || contract == HostProgressDurableFollowPoll {
+		writeCode = HostStageEvidenceRequired
+	}
+	stages = append(stages, HostProgressStageRecord{
+		Stage:            HostProgressStageTransportWrite,
+		Code:             writeCode,
+		EvidenceRequired: writeCode == HostStageEvidenceRequired,
+		EvidenceKind:     "transport-write",
+	})
+	acceptCode := HostStageUnsupported
+	if callbacks {
+		acceptCode = HostStageEvidenceRequired
+	}
+	stages = append(stages, HostProgressStageRecord{
+		Stage:            HostProgressStageHostAcceptance,
+		Code:             acceptCode,
+		EvidenceRequired: acceptCode == HostStageEvidenceRequired,
+		EvidenceKind:     "host-accepted",
+	})
+	visibleCode := HostStageUnsupported
+	if ack {
+		visibleCode = HostStageEvidenceRequired
+	}
+	stages = append(stages, HostProgressStageRecord{
+		Stage:            HostProgressStageUserVisibility,
+		Code:             visibleCode,
+		EvidenceRequired: visibleCode == HostStageEvidenceRequired,
+		EvidenceKind:     "host-visible",
+	})
+	ackCode := HostStageUnsupported
+	if ack {
+		ackCode = HostStageEvidenceRequired
+	}
+	stages = append(stages, HostProgressStageRecord{
+		Stage:            HostProgressStageAcknowledgment,
+		Code:             ackCode,
+		EvidenceRequired: ackCode == HostStageEvidenceRequired,
+		EvidenceKind:     "host-acknowledged",
+	})
+	wakeCode := HostStageUnsupported
+	if wake {
+		wakeCode = HostStageEvidenceRequired
+	}
+	stages = append(stages, HostProgressStageRecord{
+		Stage:            HostProgressStageWakeUp,
+		Code:             wakeCode,
+		EvidenceRequired: wakeCode == HostStageEvidenceRequired,
+		EvidenceKind:     "host-wake-up",
+	})
+	return stages
+}
+
+func BindHostRunOrigin(request HostRunOriginBindingRequest) HostRunOriginBinding {
+	origin := request.Origin
+	if strings.TrimSpace(origin.OpaqueID) == "" && strings.TrimSpace(origin.Kind) == "" && len(origin.Metadata) == 0 &&
+		strings.TrimSpace(origin.SchemaVersion) == "" && len(origin.SupportedSchemaVersions) == 0 {
+		return HostRunOriginBinding{Bound: false, Code: HostOriginAbsent, Redacted: true}
+	}
+	scope := normalizeOriginScope(request)
+	if scope.ProjectID == "" || scope.DeliveryRunID == "" || scope.CorrelationID == "" {
+		return HostRunOriginBinding{Bound: false, Code: ErrInvalidHostOriginScope, Redacted: true}
+	}
+	selectedSchema := selectOriginSchema(origin)
+	if selectedSchema == "" {
+		return HostRunOriginBinding{Bound: false, Code: ErrUnsupportedHostOriginSchemaVersion, Redacted: true}
+	}
+	kind := stableDiagnosticValue(origin.Kind, "opaque-origin")
+	opaqueDigest := digestString(strings.TrimSpace(origin.OpaqueID))
+	if opaqueDigest == "" {
+		return HostRunOriginBinding{Bound: false, Code: ErrInvalidHostOriginMetadata, Redacted: true}
+	}
+	metadataDigest, metadataKeys, ok := normalizeOriginMetadata(origin.Metadata)
+	if !ok {
+		return HostRunOriginBinding{Bound: false, Code: ErrHostOriginMetadataTooLarge, Redacted: true}
+	}
+	bindingID := prefixedHostDigest("horigin", map[string]any{
+		"schema_version":  HostRunOriginSchemaVersion,
+		"project_id":      scope.ProjectID,
+		"delivery_run_id": scope.DeliveryRunID,
+		"correlation_id":  scope.CorrelationID,
+		"origin_kind":     kind,
+		"opaque_digest":   opaqueDigest,
+		"metadata_digest": metadataDigest,
+	})
+	return HostRunOriginBinding{
+		Bound:          true,
+		Code:           HostOriginBound,
+		SchemaVersion:  selectedSchema,
+		BindingID:      bindingID,
+		OriginKind:     kind,
+		OriginRef:      opaqueDigest,
+		ProjectID:      scope.ProjectID,
+		DeliveryRunID:  scope.DeliveryRunID,
+		CorrelationID:  scope.CorrelationID,
+		MetadataDigest: metadataDigest,
+		MetadataKeys:   metadataKeys,
+		Redacted:       true,
+		Limits: map[string]int{
+			"max_metadata_keys":  maxHostOriginMetadataKeys,
+			"max_metadata_runes": maxHostOriginMetadataRunes,
+			"max_value_runes":    maxHostOriginValueRunes,
+		},
+	}
+}
+
+func selectOriginSchema(origin HostRunOriginDeclaration) string {
+	supported := uniqueStrings(origin.SupportedSchemaVersions)
+	if len(supported) == 0 && strings.TrimSpace(origin.SchemaVersion) != "" {
+		supported = []string{strings.TrimSpace(origin.SchemaVersion)}
+	}
+	if len(supported) == 0 {
+		return HostRunOriginSchemaVersion
+	}
+	for _, version := range supported {
+		if version == HostRunOriginSchemaVersion {
+			return HostRunOriginSchemaVersion
+		}
+	}
+	return ""
+}
+
+type originScope struct {
+	ProjectID     string
+	DeliveryRunID string
+	CorrelationID string
+}
+
+func normalizeOriginScope(request HostRunOriginBindingRequest) originScope {
+	return originScope{
+		ProjectID:     stableOriginID(request.ProjectID),
+		DeliveryRunID: stableOriginID(request.DeliveryRunID),
+		CorrelationID: stableOriginID(request.CorrelationID),
+	}
+}
+
+func stableOriginID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, `/\`) || likelySecret(value) {
+		return ""
+	}
+	if len([]rune(value)) > maxHostOriginValueRunes {
+		return ""
+	}
+	return value
+}
+
+func normalizeOriginMetadata(metadata map[string]string) (string, []string, bool) {
+	if len(metadata) > maxHostOriginMetadataKeys {
+		return "", nil, false
+	}
+	redacted := map[string]string{}
+	keys := make([]string, 0, len(metadata))
+	totalRunes := 0
+	for key, value := range metadata {
+		key = stableDiagnosticValue(key, "redacted-key")
+		if key == "redacted-key" {
+			key = key + "-" + digestString(value)[:12]
+		}
+		if len([]rune(value)) > maxHostOriginMetadataRunes {
+			return "", nil, false
+		}
+		value = stableOriginMetadataValue(value)
+		totalRunes += len([]rune(key)) + len([]rune(value))
+		if totalRunes > maxHostOriginMetadataRunes {
+			return "", nil, false
+		}
+		redacted[key] = value
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(redacted) == 0 {
+		return "", nil, true
+	}
+	return prefixedHostDigest("sha256", redacted), keys, true
+}
+
+func stableOriginMetadataValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.ContainsAny(value, `/\`) || likelySecret(value) {
+		return "[redacted]"
+	}
+	runes := []rune(value)
+	if len(runes) > maxHostOriginValueRunes {
+		return string(runes[:maxHostOriginValueRunes])
+	}
+	return value
+}
+
+func digestString(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func prefixedHostDigest(prefix string, value any) string {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return prefix + "_invalid"
+	}
+	sum := sha256.Sum256(payload)
+	hexDigest := hex.EncodeToString(sum[:])
+	if prefix == "sha256" {
+		return "sha256:" + hexDigest
+	}
+	return prefix + "_" + hexDigest[:40]
+}
+
 func evaluateRequiredHostCapabilities(capabilities []HostCapabilityDeclaration) ([]HostCapability, []HostCapability) {
 	byName := map[HostCapability]HostCapabilitySupport{}
 	for _, capability := range capabilities {
@@ -335,7 +750,9 @@ func requiredHostCapabilities() map[HostCapability]bool {
 
 func knownHostCapability(capability HostCapability) bool {
 	switch capability {
-	case HostLocalSubprocess, HostStdout, HostStderr, HostJSONOutput, HostTimeouts, HostCancellation, HostHooks:
+	case HostLocalSubprocess, HostStdout, HostStderr, HostJSONOutput, HostTimeouts, HostCancellation, HostHooks,
+		HostDurablePolling, HostResumableFollow, HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment,
+		HostDetachedSteering, HostDetachedCancellation, HostPayloadLimits, HostRateLimits:
 		return true
 	default:
 		return false
@@ -349,6 +766,10 @@ func hostCapabilitySupport(capabilities []HostCapabilityDeclaration, target Host
 		}
 	}
 	return HostCapabilityUnknown
+}
+
+func capabilityIsSupported(capabilities []HostCapabilityDeclaration, target HostCapability) bool {
+	return hostCapabilitySupport(capabilities, target) == HostCapabilitySupported
 }
 
 func supportFromBool(value bool) HostCapabilitySupport {
