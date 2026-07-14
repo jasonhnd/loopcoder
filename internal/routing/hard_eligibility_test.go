@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
 
@@ -110,6 +112,269 @@ func TestUnknownAndStaleEvidencePolicyIsVisibleAndControlled(t *testing.T) {
 	})
 	if len(allowed.Eligible) != 1 {
 		t.Fatalf("eligible estimated candidate = %#v rejected=%#v, want policy-controlled pass", allowed.Eligible, allowed.Rejected)
+	}
+}
+
+func TestInputsWithCachedInventoryLoadsDurableQuotaWithoutCollectors(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	seedCachedRoutingInventoryPayloads(t, ctx, store, fixture)
+	inputs, err := InputsWithCachedInventory(ctx, store, Inputs{
+		Requirement:     workerRequirement("task-cache"),
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy: Policy{
+			RequireExactQuota: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("InputsWithCachedInventory: %v", err)
+	}
+	if len(inputs.Inventory.QuotaSnapshots) == 0 {
+		t.Fatalf("cached inventory has no quota snapshots: %#v", inputs.Inventory)
+	}
+	result := FilterHardEligibility(inputs)
+	if len(result.Eligible) == 0 {
+		t.Fatalf("eligible candidates = %#v rejected=%#v, want cached quota to drive routing", result.Eligible, result.Rejected)
+	}
+	for _, candidate := range result.Eligible {
+		if candidate.AdapterID == "codex" && len(candidate.QuotaSnapshotIDs) == 0 {
+			t.Fatalf("codex candidate missing cached quota ids: %#v", candidate)
+		}
+	}
+}
+
+func seedCachedRoutingInventoryPayloads(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture) {
+	t.Helper()
+	at := fixture.now.Format(time.RFC3339Nano)
+	mustJSON := func(value any) string {
+		t.Helper()
+		payload, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal inventory payload: %v", err)
+		}
+		return string(payload)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		for _, installation := range fixture.inventory.Installations {
+			installation.Scope = "machine"
+			installation.ProjectID = nil
+			installation.AdapterDeclarationID = "adecl-" + installation.AdapterID
+			installation.ProviderDisplayName = installation.AdapterID
+			installation.ExecutableName = installation.AdapterID
+			installation.ExecutableIdentity = providerinventory.ExecutableIdentity{
+				Basename:          installation.AdapterID,
+				Platform:          "test",
+				PathHash:          "sha256:test",
+				SymlinkResolution: "not-symlink",
+				ExecutableMode:    "executable",
+			}
+			installation.CanonicalPathRedacted = installation.AdapterID
+			installation.DiscoverySource = providerinventory.DiscoveryFixture
+			installation.DiscoveryOrder = 1
+			installation.Platform = "test"
+			installation.VersionConfidence = providerinventory.ConfidenceExact
+			if installation.InstallationState == "" {
+				installation.InstallationState = providerinventory.InstallationInstalled
+			}
+			if installation.UsableForInvocation == "" {
+				installation.UsableForInvocation = "yes"
+			}
+			installation.KnownLimitations = []string{}
+			installation.CreatedAt = firstNonEmpty(installation.CreatedAt, at)
+			installation.UpdatedAt = firstNonEmpty(installation.UpdatedAt, at)
+			installation.CreatedBy = providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"}
+			installation.UpdatedBy = installation.CreatedBy
+			installation.Host = providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"}
+			installation.PolicyVersion = providerinventory.PolicyVersion
+			installation.SideEffectClass = "local-read"
+			installation.Classification = "provider-output-untrusted"
+			installation.Source = providerinventory.SourceDescriptor{Kind: "fixture", AdapterID: installation.AdapterID}
+			installation.Evidence = providerinventory.EvidenceSummary{Kind: string(providerinventory.EvidenceFileExistence), CommandBounded: true, NoShell: true}
+			installation.GapReasons = []string{}
+			payload := mustJSON(installation)
+			if _, err := tx.Exec(ctx, `INSERT INTO adapter_declarations(
+				adapter_declaration_id, schema_version, record_version, adapter_id, adapter_version, display_name,
+				executable_names_json, created_at, updated_at, payload_json)
+				VALUES (?, 'loopcoder.adapter_declaration.v1', 1, ?, 'test', ?, '[]', ?, ?, '{}')
+				ON CONFLICT(adapter_declaration_id) DO NOTHING`,
+				"adecl-"+installation.AdapterID, installation.AdapterID, installation.AdapterID, at, at); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO provider_installations(
+				provider_installation_id, schema_version, record_version, scope, project_id, adapter_id, adapter_declaration_id,
+				provider_display_name, executable_name, executable_identity_json, canonical_path_redacted, discovery_source,
+				discovery_order, platform, version_confidence, installation_state, usable_for_invocation, created_at,
+				updated_at, captured_at, stale_after, freshness_state, confidence, side_effect_class, classification, payload_json)
+				VALUES (?, ?, ?, 'machine', NULL, ?, ?, ?, ?, '{}', ?, 'test',
+				1, 'test', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local-read', 'local-diagnostic', ?)
+				ON CONFLICT(provider_installation_id) DO UPDATE SET payload_json = excluded.payload_json`,
+				installation.ProviderInstallationID, installation.SchemaVersion, installation.RecordVersion, installation.AdapterID,
+				"adecl-"+installation.AdapterID, installation.AdapterID, installation.AdapterID, installation.AdapterID,
+				installation.Confidence, installation.InstallationState, installation.UsableForInvocation, at, at, installation.CapturedAt,
+				installation.StaleAfter, installation.FreshnessState, installation.Confidence, payload); err != nil {
+				return err
+			}
+		}
+		for _, account := range fixture.inventory.AccountProfiles {
+			account.Scope = "machine"
+			account.ProjectID = nil
+			if account.ProfileSource == "" {
+				account.ProfileSource = providerinventory.ProfileSourceFixture
+			}
+			if account.SelectionState == "" {
+				account.SelectionState = providerinventory.SelectionDefault
+			}
+			account.CreatedAt = firstNonEmpty(account.CreatedAt, at)
+			account.UpdatedAt = firstNonEmpty(account.UpdatedAt, at)
+			account.CreatedBy = providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"}
+			account.UpdatedBy = account.CreatedBy
+			account.Host = providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"}
+			account.PolicyVersion = providerinventory.PolicyVersion
+			account.SideEffectClass = "local-read"
+			account.Classification = "provider-output-untrusted"
+			account.Source = providerinventory.SourceDescriptor{Kind: "fixture", AdapterID: account.AdapterID}
+			account.Evidence = providerinventory.EvidenceSummary{Kind: string(providerinventory.EvidenceStatusCommand), CommandBounded: true, NoShell: true}
+			account.GapReasons = []string{}
+			if _, err := tx.Exec(ctx, `INSERT INTO account_profiles(account_profile_id, adapter_id, provider_installation_id, payload_json)
+				VALUES (?, ?, ?, ?) ON CONFLICT(account_profile_id) DO UPDATE SET payload_json = excluded.payload_json`,
+				account.AccountProfileID, account.AdapterID, ptrValue(account.ProviderInstallationID), mustJSON(account)); err != nil {
+				return err
+			}
+		}
+		for _, auth := range fixture.inventory.AuthReadiness {
+			auth.Scope = "machine"
+			auth.ProjectID = nil
+			if auth.ReadinessState == "" {
+				auth.ReadinessState = providerinventory.ReadinessReady
+			}
+			if auth.ReadinessConfidence == "" {
+				auth.ReadinessConfidence = providerinventory.ConfidenceExact
+			}
+			if auth.EvidenceKind == "" {
+				auth.EvidenceKind = providerinventory.EvidenceStatusCommand
+			}
+			if auth.AuthorizationScopeState == "" {
+				auth.AuthorizationScopeState = providerinventory.AuthorizationAllKnown
+			}
+			auth.CreatedAt = firstNonEmpty(auth.CreatedAt, at)
+			auth.UpdatedAt = firstNonEmpty(auth.UpdatedAt, at)
+			auth.CreatedBy = providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"}
+			auth.UpdatedBy = auth.CreatedBy
+			auth.Host = providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"}
+			auth.PolicyVersion = providerinventory.PolicyVersion
+			auth.SideEffectClass = "local-read"
+			auth.Classification = "provider-output-untrusted"
+			auth.Source = providerinventory.SourceDescriptor{Kind: "fixture", AdapterID: auth.AdapterID}
+			auth.Evidence = providerinventory.EvidenceSummary{Kind: string(providerinventory.EvidenceStatusCommand), CommandBounded: true, NoShell: true}
+			auth.GapReasons = []string{}
+			if _, err := tx.Exec(ctx, `INSERT INTO auth_readiness(auth_readiness_id, adapter_id, provider_installation_id, account_profile_id, payload_json)
+				VALUES (?, ?, ?, ?, ?) ON CONFLICT(auth_readiness_id) DO UPDATE SET payload_json = excluded.payload_json`,
+				auth.AuthReadinessID, auth.AdapterID, ptrValue(auth.ProviderInstallationID), ptrValue(auth.AccountProfileID), mustJSON(auth)); err != nil {
+				return err
+			}
+		}
+		for _, model := range fixture.inventory.ModelCapabilities {
+			if model.ReadOnly == "" {
+				model.ReadOnly = providerinventory.CapabilityFalse
+			}
+			if model.JSONOutput == "" {
+				model.JSONOutput = providerinventory.CapabilityFalse
+			}
+			if model.NestedSubagents == "" {
+				model.NestedSubagents = providerinventory.CapabilityFalse
+			}
+			if model.MCPConfig == "" {
+				model.MCPConfig = providerinventory.CapabilityFalse
+			}
+			if model.Cancellation == "" {
+				model.Cancellation = providerinventory.CapabilityFalse
+			}
+			if model.TokenUsageReporting == "" {
+				model.TokenUsageReporting = providerinventory.CapabilityFalse
+			}
+			if model.ImageInput == "" {
+				model.ImageInput = providerinventory.CapabilityFalse
+			}
+			if model.ImageOutput == "" {
+				model.ImageOutput = providerinventory.CapabilityFalse
+			}
+			model.Constraints = []string{}
+			model.EntrySources = []providerinventory.CatalogEntrySource{}
+			model.Conflicts = []providerinventory.CatalogConflict{}
+			model.CreatedAt = firstNonEmpty(model.CreatedAt, at)
+			model.UpdatedAt = firstNonEmpty(model.UpdatedAt, at)
+			model.CreatedBy = providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"}
+			model.UpdatedBy = model.CreatedBy
+			model.Host = providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"}
+			model.PolicyVersion = providerinventory.PolicyVersion
+			model.SideEffectClass = "local-read"
+			model.Classification = "provider-output-untrusted"
+			model.Source = providerinventory.SourceDescriptor{Kind: "fixture", AdapterID: model.AdapterID}
+			model.Evidence = providerinventory.EvidenceSummary{Kind: string(providerinventory.EvidenceStatusCommand), CommandBounded: true, NoShell: true}
+			model.GapReasons = []string{}
+			if _, err := tx.Exec(ctx, `INSERT INTO model_catalog_snapshots(model_catalog_snapshot_id, adapter_id, provider_installation_id, payload_json)
+				VALUES (?, ?, ?, '{}') ON CONFLICT(model_catalog_snapshot_id) DO NOTHING`,
+				model.ModelCatalogSnapshotID, model.AdapterID, "pinst-"+model.AdapterID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO model_capabilities(model_capability_id, model_catalog_snapshot_id, adapter_id, payload_json)
+				VALUES (?, ?, ?, ?) ON CONFLICT(model_capability_id) DO UPDATE SET payload_json = excluded.payload_json`,
+				model.ModelCapabilityID, model.ModelCatalogSnapshotID, model.AdapterID, mustJSON(model)); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO quota_telemetry_sources(
+			quota_source_id, schema_version, record_version, adapter_id, source_kind, source_key,
+			source_schema_version, network_declared, payload_json)
+			VALUES ('qsrc-fixture', ?, 1, 'fixture', ?, 'fixture', 'test', 0, '{}')
+			ON CONFLICT(quota_source_id) DO NOTHING`,
+			providerinventory.QuotaTelemetrySourceSchema, providerinventory.QuotaSourceFixture); err != nil {
+			return err
+		}
+		for _, snapshot := range fixture.inventory.QuotaSnapshots {
+			if _, err := tx.Exec(ctx, `INSERT INTO quota_snapshots(
+				quota_snapshot_id, quota_source_id, source_kind, adapter_id, scope_key, quantity_kind, unit,
+				window_kind, confidence, freshness_state, captured_at, stale_after, terminal_error_code, payload_json)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(quota_snapshot_id) DO UPDATE SET payload_json = excluded.payload_json`,
+				snapshot.QuotaSnapshotID, snapshot.QuotaSourceID, snapshot.SourceKind, snapshot.AdapterID, firstNonEmpty(snapshot.ScopeKey, "provider:"+snapshot.AdapterID),
+				snapshot.QuantityKind, snapshot.Unit, snapshot.WindowKind, snapshot.Confidence, snapshot.FreshnessState, snapshot.CapturedAt,
+				snapshot.StaleAfter, snapshot.TerminalErrorCode, mustJSON(snapshot)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cached inventory payloads: %v", err)
+	}
+}
+
+func TestInputsWithCachedInventoryMissingCacheLeavesQuotaUnknown(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+	inputs, err := InputsWithCachedInventory(ctx, store, Inputs{
+		Requirement:     workerRequirement("task-missing-cache"),
+		RuntimeContract: fixture.contract,
+		HostName:        "codex-cli",
+		Policy:          Policy{RequireExactQuota: true},
+	})
+	if err != nil {
+		t.Fatalf("InputsWithCachedInventory: %v", err)
+	}
+	result := FilterHardEligibility(inputs)
+	if len(result.Eligible) != 0 || len(inputs.Inventory.QuotaSnapshots) != 0 {
+		t.Fatalf("missing cache result eligible=%#v inventory=%#v, want no fabricated quota", result.Eligible, inputs.Inventory.QuotaSnapshots)
 	}
 }
 

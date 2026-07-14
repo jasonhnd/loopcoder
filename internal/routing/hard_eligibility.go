@@ -2,6 +2,7 @@
 package routing
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
 
@@ -137,6 +139,19 @@ type Inputs struct {
 	Pins            []Pin
 	Exclusions      []Exclusion
 	WorkerRoute     *Candidate
+}
+
+func InputsWithCachedInventory(ctx context.Context, store storage.Store, inputs Inputs) (Inputs, error) {
+	report, err := providerinventory.Load(ctx, store)
+	if err != nil {
+		return inputs, err
+	}
+	inputs.Inventory = report
+	if len(inputs.Candidates) == 0 {
+		role, hasRole := ResolveRoleDefinition(inputs.Requirement.RoleKey, inputs.RoleDefinitions)
+		inputs.Candidates = candidatesFromInventory(inputs.Requirement, report, role, hasRole)
+	}
+	return inputs, nil
 }
 
 type RejectionReason struct {

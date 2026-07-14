@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -110,9 +112,10 @@ type RefreshManager struct {
 }
 
 type refreshCall struct {
-	done   chan struct{}
-	result RefreshResult
-	err    error
+	waiters int
+	done    chan struct{}
+	result  RefreshResult
+	err     error
 }
 
 type providerCollectResult struct {
@@ -135,26 +138,31 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	m.ensureDefaults()
 	now := normalizeNow(req.Now)().UTC()
 	policy := normalizeRefreshPolicy(req.Policy)
-	providers := activeRefreshProviders(req.Config, req.Providers)
+	trigger := normalizeRefreshTrigger(req.Trigger)
+	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
 	cached, err := Load(ctx, m.Store)
 	if err != nil {
 		return RefreshResult{}, err
 	}
-	refreshProviders := providersForTrigger(cached, providers, req.Trigger, policy, now)
-	key := refreshRequestKey(req.Trigger, refreshProviders, policy)
+	inactiveResults := inactiveProviderRefreshResults(inactiveProviders, trigger, now)
+	refreshProviders := providersForTrigger(cached, providers, trigger, policy, now)
+	key := m.refreshRequestKey(req, trigger, refreshProviders, policy, now)
 	if len(refreshProviders) == 0 {
 		status := m.statusFromReport(cached, providers, policy, now)
-		return RefreshResult{Report: cached, Status: status, Providers: []ProviderRefreshResult{}}, nil
+		return RefreshResult{Report: cached, Status: status, Providers: inactiveResults}, nil
 	}
 
 	m.mu.Lock()
 	if existing := m.inFlight[key]; existing != nil {
+		existing.waiters++
 		m.mu.Unlock()
 		select {
 		case <-existing.done:
 			result := existing.result
 			for i := range result.Providers {
-				result.Providers[i].Coalesced = true
+				if result.Providers[i].ErrorCode == "" {
+					result.Providers[i].Coalesced = true
+				}
 			}
 			return result, existing.err
 		case <-ctx.Done():
@@ -167,7 +175,7 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	m.mu.Unlock()
 
 	go func() {
-		call.result, call.err = m.runSharedRefresh(req, cached, refreshProviders, policy, now)
+		call.result, call.err = m.runSharedRefresh(req, cached, refreshProviders, inactiveResults, policy, now)
 		m.mu.Lock()
 		m.markActiveLocked(refreshProviders, -1)
 		delete(m.inFlight, key)
@@ -196,10 +204,14 @@ func (m *RefreshManager) Status(ctx context.Context, req RefreshRequest) (QuotaR
 	if err != nil {
 		return QuotaRefreshStatus{}, err
 	}
-	return m.statusFromReport(report, activeRefreshProviders(req.Config, req.Providers), normalizeRefreshPolicy(req.Policy), now), nil
+	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
+	status := m.statusFromReport(report, providers, normalizeRefreshPolicy(req.Policy), now)
+	status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
+	sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
+	return status, nil
 }
 
-func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, providers []string, policy RefreshPolicy, now time.Time) (RefreshResult, error) {
+func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, providers []string, inactiveResults []ProviderRefreshResult, policy RefreshPolicy, now time.Time) (RefreshResult, error) {
 	globalCtx := context.Background()
 	var cancel context.CancelFunc
 	if policy.GlobalDeadline > 0 {
@@ -212,6 +224,18 @@ func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, pro
 	started := formatTime(now)
 	jobs := make(chan string)
 	results := make(chan ProviderRefreshResult, len(providers))
+	providerResults := make(map[string]ProviderRefreshResult, len(providers))
+	for _, provider := range providers {
+		providerResults[provider] = ProviderRefreshResult{
+			AdapterID:     provider,
+			Trigger:       normalizeRefreshTrigger(req.Trigger),
+			Refreshed:     false,
+			ErrorCode:     "",
+			StartedAt:     "",
+			CompletedAt:   "",
+			NextRefreshAt: nextRefreshForReport(cached, provider, policy, now),
+		}
+	}
 	parallelism := policy.MaxParallelism
 	if parallelism > len(providers) {
 		parallelism = len(providers)
@@ -260,6 +284,9 @@ func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, pro
 	go func() {
 		defer close(jobs)
 		for _, provider := range providers {
+			if globalCtx.Err() != nil {
+				return
+			}
 			select {
 			case jobs <- provider:
 			case <-globalCtx.Done():
@@ -270,19 +297,38 @@ func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, pro
 	wg.Wait()
 	close(results)
 
-	providerResults := make([]ProviderRefreshResult, 0, len(providers))
 	for result := range results {
-		providerResults = append(providerResults, result)
+		providerResults[result.AdapterID] = result
 	}
-	sort.Slice(providerResults, func(i, j int) bool {
-		return providerResults[i].AdapterID < providerResults[j].AdapterID
+	completedAt := formatTime(normalizeNow(req.Now)().UTC())
+	for _, provider := range providers {
+		result := providerResults[provider]
+		if result.ErrorCode == "" && !result.Refreshed {
+			result.CompletedAt = completedAt
+			result.ErrorCode = quotaErrorCode(globalCtx.Err())
+			if result.ErrorCode == "" {
+				result.ErrorCode = "ErrQuotaRefreshDeadlineExceeded"
+			}
+			providerResults[provider] = result
+		}
+	}
+	orderedResults := make([]ProviderRefreshResult, 0, len(providers)+len(inactiveResults))
+	for _, provider := range providers {
+		orderedResults = append(orderedResults, providerResults[provider])
+	}
+	orderedResults = append(orderedResults, inactiveResults...)
+	sort.Slice(orderedResults, func(i, j int) bool {
+		return orderedResults[i].AdapterID < orderedResults[j].AdapterID
 	})
 	report, err := Load(context.Background(), m.Store)
 	if err != nil {
 		return RefreshResult{}, err
 	}
-	status := m.statusFromReport(report, activeRefreshProviders(req.Config, req.Providers), policy, normalizeNow(req.Now)().UTC())
-	return RefreshResult{Report: report, Status: status, Providers: providerResults}, nil
+	activeProviders, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
+	status := m.statusFromReport(report, activeProviders, policy, normalizeNow(req.Now)().UTC())
+	status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
+	sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
+	return RefreshResult{Report: report, Status: status, Providers: orderedResults}, nil
 }
 
 func (m *RefreshManager) collectProvider(parent context.Context, req RefreshRequest, provider string, policy RefreshPolicy, now time.Time) providerCollectResult {
@@ -391,22 +437,68 @@ func (m *RefreshManager) isActive(provider string) bool {
 	return m.active[provider] > 0
 }
 
-func activeRefreshProviders(cfg config.Config, requested []string) []string {
+func selectActiveRefreshProviders(cfg config.Config, requested []string) ([]string, []string) {
+	configured := configuredProviderNames(cfg)
+	active := map[string]bool{}
+	for _, provider := range configured {
+		provider = strings.TrimSpace(provider)
+		if provider != "" {
+			active[provider] = true
+		}
+	}
 	if len(requested) == 0 {
-		return configuredProviderNames(cfg)
+		return configured, nil
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(requested))
+	inactive := make([]string, 0)
 	for _, provider := range requested {
 		provider = strings.TrimSpace(provider)
 		if provider == "" || seen[provider] {
 			continue
 		}
 		seen[provider] = true
-		out = append(out, provider)
+		if active[provider] {
+			out = append(out, provider)
+		} else {
+			inactive = append(inactive, provider)
+		}
 	}
 	sort.Strings(out)
-	return out
+	sort.Strings(inactive)
+	return out, inactive
+}
+
+func inactiveProviderRefreshResults(providers []string, trigger RefreshTrigger, now time.Time) []ProviderRefreshResult {
+	results := make([]ProviderRefreshResult, 0, len(providers))
+	for _, provider := range providers {
+		results = append(results, ProviderRefreshResult{
+			AdapterID:     provider,
+			Trigger:       trigger,
+			Refreshed:     false,
+			ErrorCode:     "ErrQuotaRefreshProviderInactive",
+			StartedAt:     "",
+			CompletedAt:   formatTime(now),
+			NextRefreshAt: formatTime(now),
+		})
+	}
+	return results
+}
+
+func inactiveProviderQuotaStatuses(providers []string, now time.Time) []ProviderQuotaStatus {
+	statuses := make([]ProviderQuotaStatus, 0, len(providers))
+	for _, provider := range providers {
+		statuses = append(statuses, ProviderQuotaStatus{
+			AdapterID:         provider,
+			Confidence:        ConfidenceUnavailable,
+			FreshnessState:    FreshnessNotApplicable,
+			TerminalErrorCode: "ErrQuotaRefreshProviderInactive",
+			InFlight:          false,
+			NextRefreshAt:     formatTime(now),
+			GapReasons:        []string{"provider-not-configured-active"},
+		})
+	}
+	return statuses
 }
 
 func providersForTrigger(report Report, providers []string, trigger RefreshTrigger, policy RefreshPolicy, now time.Time) []string {
@@ -467,7 +559,7 @@ func normalizeRefreshTrigger(trigger RefreshTrigger) RefreshTrigger {
 	case RefreshTriggerExplicit, RefreshTriggerStartup, RefreshTriggerStaleTTL, RefreshTriggerApproachingReset, RefreshTriggerProviderError, RefreshTriggerPeriodic:
 		return trigger
 	default:
-		return RefreshTriggerExplicit
+		return RefreshTrigger("")
 	}
 }
 
@@ -592,18 +684,10 @@ func staleQuotaErrorReport(cfg config.Config, cached Report, provider, code stri
 	}
 	var sources []QuotaTelemetrySource
 	var snapshots []QuotaSnapshot
-	includedSources := map[string]bool{}
-	for _, snapshot := range cached.QuotaSnapshots {
-		if snapshot.AdapterID != provider {
-			continue
-		}
+	if snapshot, ok := latestTrustworthyQuotaSnapshot(cached, provider); ok {
 		source, ok := sourceByID[snapshot.QuotaSourceID]
-		if !ok {
-			continue
-		}
-		if !includedSources[source.QuotaSourceID] {
+		if ok {
 			sources = append(sources, source)
-			includedSources[source.QuotaSourceID] = true
 		}
 		next := snapshot
 		next.QuotaSnapshotID = quotaSnapshotID(provider, snapshot.QuotaSnapshotID, code, formatTime(now))
@@ -647,6 +731,54 @@ func staleQuotaErrorReport(cfg config.Config, cached Report, provider, code stri
 	return report
 }
 
+func latestTrustworthyQuotaSnapshot(report Report, provider string) (QuotaSnapshot, bool) {
+	var best QuotaSnapshot
+	var bestAt time.Time
+	found := false
+	for _, snapshot := range report.QuotaSnapshots {
+		if snapshot.AdapterID != provider || snapshot.FreshnessState == FreshnessExpired || snapshot.Confidence == ConfidenceUnavailable || snapshot.Confidence == ConfidenceUnknown {
+			continue
+		}
+		if strings.TrimSpace(snapshot.TerminalErrorCode) != "" {
+			continue
+		}
+		captured, err := time.Parse(time.RFC3339Nano, snapshot.CapturedAt)
+		if err != nil {
+			continue
+		}
+		if !found || captured.After(bestAt) || (captured.Equal(bestAt) && quotaWindowScopeKey(snapshot) > quotaWindowScopeKey(best)) {
+			best = snapshot
+			bestAt = captured.UTC()
+			found = true
+		}
+	}
+	return best, found
+}
+
+func quotaWindowScopeKey(snapshot QuotaSnapshot) string {
+	parts := []string{
+		snapshot.ScopeKey,
+		string(snapshot.QuantityKind),
+		snapshot.ProviderQuantityName,
+		snapshot.Unit,
+		string(snapshot.WindowKind),
+		snapshot.WindowStart,
+		snapshot.WindowEnd,
+		strconvFormatInt(snapshot.RollingDurationMS),
+		snapshot.ResetAt,
+		string(snapshot.ResetSemantics),
+		ptrValue(snapshot.ProviderInstallationID),
+		ptrValue(snapshot.AccountProfileID),
+		ptrValue(snapshot.ModelCapabilityID),
+		snapshot.QuotaSnapshotID,
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func strconvFormatInt(value int64) string {
+	return fmt.Sprintf("%d", value)
+}
+
 func quotaSnapshotIDs(snapshots []QuotaSnapshot) []string {
 	out := make([]string, 0, len(snapshots))
 	for _, snapshot := range snapshots {
@@ -656,9 +788,96 @@ func quotaSnapshotIDs(snapshots []QuotaSnapshot) []string {
 	return out
 }
 
-func refreshRequestKey(trigger RefreshTrigger, providers []string, policy RefreshPolicy) string {
-	parts := append([]string{string(normalizeRefreshTrigger(trigger)), policy.PeriodicCadence.String(), policy.ProviderTimeout.String(), policy.GlobalDeadline.String()}, providers...)
-	return strings.Join(parts, "\x00")
+func (m *RefreshManager) refreshRequestKey(req RefreshRequest, trigger RefreshTrigger, providers []string, policy RefreshPolicy, now time.Time) string {
+	type key struct {
+		RepoPath        string              `json:"repo_path"`
+		Config          config.Config       `json:"config"`
+		RuntimeContract runtimecap.Contract `json:"runtime_contract"`
+		NetworkGrants   []NetworkGrant      `json:"network_grants"`
+		Requested       []string            `json:"requested"`
+		Providers       []string            `json:"providers"`
+		Trigger         RefreshTrigger      `json:"trigger"`
+		Policy          refreshPolicyKey    `json:"policy"`
+		Now             string              `json:"now"`
+		Collector       string              `json:"collector"`
+	}
+	payload, err := json.Marshal(key{
+		RepoPath:        strings.TrimSpace(req.RepoPath),
+		Config:          req.Config,
+		RuntimeContract: req.RuntimeContract,
+		NetworkGrants:   canonicalNetworkGrants(req.NetworkGrants),
+		Requested:       canonicalProviderList(req.Providers),
+		Providers:       append([]string(nil), providers...),
+		Trigger:         trigger,
+		Policy:          refreshPolicyKeyFromPolicy(policy),
+		Now:             formatTime(now),
+		Collector:       m.collectorKey(),
+	})
+	if err != nil {
+		return strings.Join(append([]string{string(trigger), formatTime(now)}, providers...), "\x00")
+	}
+	sum := sha256.Sum256(payload)
+	return "sha256:" + fmt.Sprintf("%x", sum[:])
+}
+
+func canonicalProviderList(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+type refreshPolicyKey struct {
+	PeriodicCadenceMS        int64  `json:"periodic_cadence_ms"`
+	MinPeriodicCadenceMS     int64  `json:"min_periodic_cadence_ms"`
+	MaxPeriodicCadenceMS     int64  `json:"max_periodic_cadence_ms"`
+	MaxJitterMS              int64  `json:"max_jitter_ms"`
+	StaleTTLMS               int64  `json:"stale_ttl_ms"`
+	ApproachingResetWithinMS int64  `json:"approaching_reset_within_ms"`
+	ProviderTimeoutMS        int64  `json:"provider_timeout_ms"`
+	GlobalDeadlineMS         int64  `json:"global_deadline_ms"`
+	MaxParallelism           int    `json:"max_parallelism"`
+	JitterSeed               string `json:"jitter_seed"`
+}
+
+func refreshPolicyKeyFromPolicy(policy RefreshPolicy) refreshPolicyKey {
+	return refreshPolicyKey{
+		PeriodicCadenceMS:        policy.PeriodicCadence.Milliseconds(),
+		MinPeriodicCadenceMS:     policy.MinPeriodicCadence.Milliseconds(),
+		MaxPeriodicCadenceMS:     policy.MaxPeriodicCadence.Milliseconds(),
+		MaxJitterMS:              policy.MaxJitter.Milliseconds(),
+		StaleTTLMS:               policy.StaleTTL.Milliseconds(),
+		ApproachingResetWithinMS: policy.ApproachingResetWithin.Milliseconds(),
+		ProviderTimeoutMS:        policy.ProviderTimeout.Milliseconds(),
+		GlobalDeadlineMS:         policy.GlobalDeadline.Milliseconds(),
+		MaxParallelism:           policy.MaxParallelism,
+		JitterSeed:               strings.TrimSpace(policy.JitterSeed),
+	}
+}
+
+func canonicalNetworkGrants(grants []NetworkGrant) []NetworkGrant {
+	out := append([]NetworkGrant(nil), grants...)
+	sort.Slice(out, func(i, j int) bool {
+		left := out[i].ProviderID + "\x00" + string(out[i].Purpose) + "\x00" + string(out[i].Scope)
+		right := out[j].ProviderID + "\x00" + string(out[j].Purpose) + "\x00" + string(out[j].Scope)
+		return left < right
+	})
+	return out
+}
+
+func (m *RefreshManager) collectorKey() string {
+	if m == nil || m.Collector == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%#x", reflect.ValueOf(m.Collector).Pointer())
 }
 
 func quotaErrorCode(err error) string {

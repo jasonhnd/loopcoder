@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/audit"
@@ -167,6 +168,7 @@ func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) 
 }
 
 func DefaultDeps() Deps {
+	quotaLifecycle := newDefaultProviderQuotaLifecycle()
 	return Deps{
 		NewGitHubReader: func(repoPath string) orchestration.GitHubReader {
 			return gh.New(repoPath)
@@ -226,26 +228,10 @@ func DefaultDeps() Deps {
 			return providerinventory.Refresh(ctx, store, report, now)
 		},
 		ProviderQuotaRefresh: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
-			now := normalizeCLINow(req.Now)
-			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
-			if err != nil {
-				return providerinventory.RefreshResult{}, err
-			}
-			defer store.Close()
-			manager := providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
-			req.Now = now
-			return manager.Refresh(ctx, req)
+			return quotaLifecycle.Refresh(ctx, req)
 		},
 		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
-			now := normalizeCLINow(req.Now)
-			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
-			if err != nil {
-				return providerinventory.QuotaRefreshStatus{}, err
-			}
-			defer store.Close()
-			manager := providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
-			req.Now = now
-			return manager.Status(ctx, req)
+			return quotaLifecycle.Status(ctx, req)
 		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
@@ -272,6 +258,51 @@ func DefaultDeps() Deps {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
 	}
+}
+
+type defaultProviderQuotaLifecycle struct {
+	mu      sync.Mutex
+	store   storage.Store
+	manager *providerinventory.RefreshManager
+}
+
+func newDefaultProviderQuotaLifecycle() *defaultProviderQuotaLifecycle {
+	return &defaultProviderQuotaLifecycle{}
+}
+
+func (l *defaultProviderQuotaLifecycle) managerFor(ctx context.Context, now func() time.Time) (*providerinventory.RefreshManager, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.manager != nil {
+		return l.manager, nil
+	}
+	store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
+	if err != nil {
+		return nil, err
+	}
+	l.store = store
+	l.manager = providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
+	return l.manager, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Refresh(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	req.Now = now
+	return manager.Refresh(ctx, req)
+}
+
+func (l *defaultProviderQuotaLifecycle) Status(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	req.Now = now
+	return manager.Status(ctx, req)
 }
 
 func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
