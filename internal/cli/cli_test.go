@@ -26,6 +26,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
@@ -2908,6 +2909,206 @@ func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
 	assertSingleJSONValue(t, stdout.String(), &parsed)
 }
 
+func TestDispatchReplaysClaudeOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-dispatch-replay")
+	t.Setenv("CLAUDECODE", "1")
+	binding := claudeHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Claude host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-claude-dispatch-replay"
+		r.CorrelationSequence = 44
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "Claude detached run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation Claude replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = runID
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude replay",
+		"--run-id", runID,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Claude Code origin") ||
+				!strings.Contains(stderr.String(), "Claude detached run completed while host was offline") {
+				return worker.Result{}, fmt.Errorf("worker started before Claude progress replay was emitted: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != runID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, runID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+}
+
+func TestDispatchWithoutRunIDReplaysPriorClaudeOriginExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-next-invocation")
+	t.Setenv("CLAUDECODE", "1")
+	created, binding := persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude terminal result between turns", 45)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	firstResult := validDispatchResult(record)
+	firstResult.RunID = "run-after-claude-replay"
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude next invocation replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; host replay must not route providers", opts.Provider)
+			}
+			if !strings.Contains(stderr.String(), "Claude terminal result between turns") {
+				return worker.Result{}, fmt.Errorf("Claude receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return firstResult, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("first dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after first replay: %v", err)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want exactly one cursor for replayed Claude receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, binding.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate Claude replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+	store.Close()
+}
+
+func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-render-failure")
+	t.Setenv("CLAUDECODE", "1")
+	created, binding := persistClaudeReplayFixture(t, store, projectID, runID, "", "Claude receipt survives failed stderr render", 46)
+
+	renderErr := errors.New("claude stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 || !strings.Contains(stderr.String(), "Claude receipt survives failed stderr render") {
+		t.Fatalf("retry replay count=%d stderr=%q, want Claude receipt", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+}
+
 func persistCodexReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
 	t.Helper()
 	binding := codexHostOriginBinding(projectID, runID, runID)
@@ -2938,6 +3139,40 @@ func persistCodexReplayFixture(t *testing.T, store storage.Store, projectID, run
 	})
 	if err != nil {
 		t.Fatalf("PersistReceiptWithObligation %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func persistClaudeReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := claudeHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Claude host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-claude-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation Claude %s: %v", runID, err)
 	}
 	return created, binding
 }

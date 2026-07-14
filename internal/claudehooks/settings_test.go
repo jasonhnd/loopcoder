@@ -107,6 +107,86 @@ func TestMergeSettingsUpgradesBashOnlyConductorPostToolUseHooks(t *testing.T) {
 	}
 }
 
+func TestMergeSettingsIsIdempotentAndPreservesUnrelatedSettings(t *testing.T) {
+	input := []byte(`{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|PowerShell|pwsh",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/user-post-tool-use.js",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/user-stop.js",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hooks/user-prompt.js",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}`)
+	first, changed, err := MergeSettings(input)
+	if err != nil {
+		t.Fatalf("MergeSettings first returned error: %v", err)
+	}
+	if !changed {
+		t.Fatal("MergeSettings first changed = false, want install change")
+	}
+	second, changed, err := MergeSettings(first)
+	if err != nil {
+		t.Fatalf("MergeSettings second returned error: %v", err)
+	}
+	if changed {
+		t.Fatalf("MergeSettings second changed = true, want idempotent false:\n%s", second)
+	}
+	text := string(second)
+	for _, want := range []string{
+		`"Bash(git status:*)"`,
+		"node hooks/user-post-tool-use.js",
+		"node hooks/user-stop.js",
+		"node hooks/user-prompt.js",
+		"loopcoder hook conductor-reporter",
+		"loopcoder hook conductor-relay-guard",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("merged settings missing %q:\n%s", want, text)
+		}
+	}
+	missing, err := MissingHooks(second)
+	if err != nil {
+		t.Fatalf("MissingHooks returned error: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("MissingHooks = %#v, want none", missing)
+	}
+}
+
 type postToolUseEntry struct {
 	Matcher string `json:"matcher"`
 	Hooks   []struct {

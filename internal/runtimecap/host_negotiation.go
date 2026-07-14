@@ -276,7 +276,8 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 		{Capability: HostPayloadLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
 		{Capability: HostRateLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
 	}
-	if host.Name == "codex-cli" {
+	switch host.Name {
+	case "codex-cli":
 		for i := range declarations {
 			switch declarations[i].Capability {
 			case HostDurablePolling, HostResumableFollow, HostDetachedCancellation:
@@ -285,6 +286,20 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:
 				declarations[i].Support = HostCapabilityUnsupported
 				declarations[i].Source = "codex-cli-documented-local-surface"
+			}
+		}
+	case "claude-code":
+		for i := range declarations {
+			switch declarations[i].Capability {
+			case HostDurablePolling, HostResumableFollow:
+				declarations[i].Support = HostCapabilitySupported
+				declarations[i].Source = "claude-code-documented-local-subprocess-hooks"
+			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:
+				declarations[i].Support = HostCapabilityUnsupported
+				declarations[i].Source = "claude-code-documented-local-subprocess-hooks"
+			case HostDetachedCancellation:
+				declarations[i].Support = HostCapabilityUnknown
+				declarations[i].Source = "claude-code-documented-local-subprocess-hooks"
 			}
 		}
 	}

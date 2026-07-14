@@ -55,13 +55,13 @@ claimable immediately; retryable failures are claimable only at or after
 `next_attempt_at`; delivered, terminal, acknowledged, unsupported, expired, and
 superseded obligations are not claimable retry work.
 
-Codex host replay is bounded and cursor ordered. Before dispatch starts worker
-mechanics, an explicit `--run-id` replays only that run's exact Codex origin
-binding; an ordinary later dispatch without `--run-id` scans at most the host
-replay limit of prior project delivery-run candidates with pending or due
-retryable host obligations for the current redacted stable Codex origin
-reference, ordered by first eligible obligation `created_at`, run ID, origin
-reference, and sink ID. Candidate discovery is cursor-aware: groups whose
+Codex and Claude Code host replay is bounded and cursor ordered. Before
+dispatch starts worker mechanics, an explicit `--run-id` replays only that
+run's exact host origin binding; an ordinary later dispatch without `--run-id`
+scans at most the host replay limit of prior project delivery-run candidates
+with pending or due retryable host obligations for the current redacted stable
+host origin reference, ordered by first eligible obligation `created_at`, run
+ID, origin reference, and sink ID. Candidate discovery is cursor-aware: groups whose
 per-run replay cursor has already passed all eligible obligations do not consume
 the bounded candidate window, while a non-empty cursor whose anchor cannot be
 read remains discoverable for the fail-closed diagnostic instead of "start from
@@ -83,25 +83,30 @@ become terminal when delivery is durably recorded and do not create an
 acknowledgment row; the legacy `required_ack` column is a derived compatibility
 view of that typed policy.
 
-## Codex CLI Host Delivery
+## Codex CLI And Claude Code Host Delivery
 
-The Codex CLI host adapter uses only local documented host surfaces:
-foreground stdout/stderr, machine JSON stdout, durable local polling through
-`loopcoder status --receipts`, resumable following through `loopcoder attach`,
-and detached-run cancellation through `loopcoder cancel`. It declares callback,
-wake-up, host-managed background ownership, and acknowledgment unsupported, and
-leaves detached steering unknown unless a future documented Codex host API
-provides exact evidence. A Codex environment marker can identify an origin
+The Codex CLI and Claude Code host adapters use only documented local host
+surfaces: foreground stdout/stderr, machine JSON stdout, durable local polling
+through `loopcoder status --receipts`, and resumable following through
+`loopcoder attach`. Codex additionally advertises detached-run cancellation
+through `loopcoder cancel`; Claude Code leaves detached cancellation unknown
+because LoopCoder has no documented host-owned cancellation proof for the
+original conductor session. Both adapters declare callback, wake-up,
+host-managed background ownership, and acknowledgment unsupported unless an
+opt-in future integration fixture proves targeted terminal delivery to the
+original host session. A host environment marker can identify an origin
 candidate, but it is not capability proof and does not create callback, wake-up,
 visibility, steering, or acknowledgment evidence.
 
-When `CODEX_THREAD_ID` or `CODEX_SESSION_ID` is present, LoopCoder binds the
-active Codex origin by hashing the opaque thread/session value and storing only
-the redacted binding, marker key names, and bounded metadata digest. It does
-not persist Codex credentials, bearer material, prompts, raw provider output, or
-raw local paths. If Codex origin metadata is absent, automatic origin-bound
-replay is unavailable; use explicit `status --receipts`, `status --follow`, or
-`attach --run` to inspect the durable receipts.
+When `CODEX_THREAD_ID` / `CODEX_SESSION_ID` or
+`CLAUDE_CODE_SESSION_ID` / `CLAUDECODE_SESSION_ID` is present, LoopCoder binds
+the active host origin by hashing the opaque thread/session value and storing
+only the redacted binding, marker key names, and bounded metadata digest. It
+does not persist host credentials, bearer material, prompts, raw provider
+output, transcript contents, or raw local paths. If host origin metadata is
+absent, automatic origin-bound replay is unavailable; use explicit
+`status --receipts`, `status --follow`, or `attach --run` to inspect the
+durable receipts.
 
 Foreground `dispatch` keeps machine JSON stdout pure. Human progress replay and
 diagnostics are written to stderr, while `status --receipts --format jsonl` and
@@ -114,7 +119,7 @@ receipt store and the delivery outbox. If the host goes offline, the run remains
 observable through `loopcoder status --repo . --run <run-id> --receipts` and
 `loopcoder attach --repo . --run <run-id>`; no notification is claimed.
 
-On a later invocation with the same project and Codex origin reference,
+On a later invocation with the same project and host origin reference,
 `dispatch` replays pending terminal and consequential receipts for matching
 run-scoped bindings before launching new worker mechanics. Replay advances a
 bounded per-origin cursor and leaves the delivery obligation pending and

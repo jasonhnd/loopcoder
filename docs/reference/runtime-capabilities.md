@@ -250,6 +250,17 @@ Current host profiles:
 | `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | The host owns session lifetime and must keep stderr visible for relay obligations. |
 | `generic-local` | Unknown local agent host calls `loopcoder` as a subprocess. | unknown | Fallback when no explicit profile or known host signal is available. |
 
+Progress delivery capabilities are declared per host surface, not inferred from
+provider/model selection. Codex CLI and Claude Code both support foreground
+stdout/stderr, JSON pass-through, durable `status --receipts`, and resumable
+`attach` follow. Claude Code also supports documented project hooks for
+observing local tool events, but hook invocation is only hook evidence; it is
+not evidence that the original user saw a message, that a session woke up, or
+that a progress receipt was acknowledged. Until a documented targeted wake or
+callback path is proven by an opt-in integration fixture, both hosts fall back
+to durable follow/poll and matching-origin next-invocation replay for terminal
+or consequential detached progress.
+
 ## Host Profile Resolution
 
 Host profile selection is separate from provider and model selection. The
