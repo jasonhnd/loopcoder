@@ -107,6 +107,7 @@ func Execute(ctx context.Context, scenario Scenario, opts Options) (Result, erro
 		return Result{}, typedError(ErrInvalidFixture, "digest starting state: %v", err)
 	}
 	state := normalizeDurableState(scenario.StartingState)
+	decisionsByTask := durableReplayDecisionsByTask(state, opts.ReplayJournal, ordered)
 	budgetRemaining, err := budgetRemaining(scenario, state.BudgetCommitments)
 	if err != nil {
 		return Result{}, err
@@ -126,7 +127,7 @@ func Execute(ctx context.Context, scenario Scenario, opts Options) (Result, erro
 		eventReplay:       eventMapByID(opts.ReplayJournal),
 		budgetRemaining:   budgetRemaining,
 		providerCallCount: providerCallCount(state.ProviderReceipts),
-		decisionsByTask:   map[string]DecisionRecord{},
+		decisionsByTask:   decisionsByTask,
 	}
 	result := Result{
 		SchemaVersion:    ResultSchemaV1,
@@ -1712,6 +1713,43 @@ func mapByEvent(journal *ReplayJournal) map[string]DecisionRecord {
 	}
 	for _, decision := range journal.Decisions {
 		out[decision.EventID] = decision
+	}
+	return out
+}
+
+func durableReplayDecisionsByTask(state DurableState, journal *ReplayJournal, ordered []InjectedEvent) map[string]DecisionRecord {
+	out := map[string]DecisionRecord{}
+	if journal == nil {
+		return out
+	}
+	decisions := mapByEvent(journal)
+	durableEvents := durableReplayEventSet(state)
+	for _, event := range ordered {
+		if !durableEvents[event.EventID] {
+			continue
+		}
+		decision, ok := decisions[event.EventID]
+		if !ok {
+			continue
+		}
+		out[decision.TaskID] = decision
+	}
+	return out
+}
+
+func durableReplayEventSet(state DurableState) map[string]bool {
+	out := stringSet(state.AppliedEventIDs)
+	for _, receipt := range state.ProviderReceipts {
+		out[receipt.EventID] = true
+	}
+	for _, commitment := range state.BudgetCommitments {
+		out[commitment.EventID] = true
+	}
+	for _, handoff := range state.Handoffs {
+		out[handoff.EventID] = true
+	}
+	for _, owner := range state.AgentOwners {
+		out[owner.EventID] = true
 	}
 	return out
 }

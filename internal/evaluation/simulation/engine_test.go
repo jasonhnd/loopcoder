@@ -307,6 +307,109 @@ func TestExecuteCrashRestartReconstructsBudgetAndProviderOrdinals(t *testing.T) 
 	}
 }
 
+func TestExecuteCrashRestartEvaluatesRouteInvariantFromDurableHistory(t *testing.T) {
+	scenario := routeOnlyScenario()
+	scenario.Invariants = []Invariant{{InvariantID: "inv-route", Kind: "route_accepted", TaskID: "task-a"}}
+	uninterrupted, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute uninterrupted: %v", err)
+	}
+	assertRouteInvariantPassed(t, uninterrupted)
+
+	restart := scenario
+	restart.StartingState = cloneDurableState(uninterrupted.DurableState)
+	restarted, err := Execute(context.Background(), restart, Options{ReplayJournal: &uninterrupted.ReplayJournal})
+	if err != nil {
+		t.Fatalf("Execute restart: %v", err)
+	}
+	assertRouteInvariantPassed(t, restarted)
+	assertNoInvariantDiagnostic(t, restarted)
+	if got := len(restarted.Decisions); got != 0 {
+		t.Fatalf("restart decisions = %d, want no newly added decisions: %#v", got, restarted.Decisions)
+	}
+	if got := restarted.Diff.AddedDecisionIDs; len(got) != 0 {
+		t.Fatalf("restart diff added decisions = %#v, want none", got)
+	}
+	if got, want := mustCanonicalInvariants(t, restarted), mustCanonicalInvariants(t, uninterrupted); !bytes.Equal(got, want) {
+		t.Fatalf("restart invariant bytes mismatch\nrestart=%s\nuninterrupted=%s", got, want)
+	}
+}
+
+func TestExecuteCrashRestartEvaluatesSideEffectRouteInvariantsFromDurableHistory(t *testing.T) {
+	tests := []struct {
+		name  string
+		event InjectedEvent
+	}{
+		{name: "provider", event: InjectedEvent{EventID: "event-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "budget", event: InjectedEvent{EventID: "event-budget", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "handoff", event: InjectedEvent{EventID: "event-handoff", Kind: "handoff", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "ownership", event: InjectedEvent{EventID: "event-owner", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := baseScenario()
+			scenario.InjectedEvents = []InjectedEvent{tt.event}
+			scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{tt.event.EventID}}}
+			scenario.Invariants = []Invariant{{InvariantID: "inv-route", Kind: "route_accepted", TaskID: "task-a"}}
+			uninterrupted, err := Execute(context.Background(), scenario, Options{})
+			if err != nil {
+				t.Fatalf("Execute uninterrupted: %v", err)
+			}
+			assertRouteInvariantPassed(t, uninterrupted)
+
+			restart := scenario
+			restart.StartingState = cloneDurableState(uninterrupted.DurableState)
+			restarted, err := Execute(context.Background(), restart, Options{ReplayJournal: &uninterrupted.ReplayJournal})
+			if err != nil {
+				t.Fatalf("Execute restart: %v", err)
+			}
+			assertRouteInvariantPassed(t, restarted)
+			assertNoInvariantDiagnostic(t, restarted)
+			if got := len(restarted.Decisions); got != 0 {
+				t.Fatalf("restart decisions = %d, want no newly added decisions: %#v", got, restarted.Decisions)
+			}
+			if got := restarted.Diff.AddedDecisionIDs; len(got) != 0 {
+				t.Fatalf("restart diff added decisions = %#v, want none", got)
+			}
+			if got, want := mustCanonicalInvariants(t, restarted), mustCanonicalInvariants(t, uninterrupted); !bytes.Equal(got, want) {
+				t.Fatalf("restart invariant bytes mismatch\nrestart=%s\nuninterrupted=%s", got, want)
+			}
+		})
+	}
+}
+
+func TestExecuteCrashRestartCurrentDecisionOverridesHistoricalRouteInvariant(t *testing.T) {
+	scenario := baseScenario()
+	scenario.BudgetAuthorities[0].RemainingValue = 1
+	scenario.Tasks[0].CandidateModelIDs = []string{"model-a"}
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-budget-1", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget-2", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-budget-1", "event-budget-2"}}}
+	scenario.Invariants = []Invariant{{InvariantID: "inv-route", Kind: "route_accepted", TaskID: "task-a"}}
+	uninterrupted, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute uninterrupted: %v", err)
+	}
+	assertRouteInvariantFailed(t, uninterrupted)
+
+	crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 1})
+	if err != nil {
+		t.Fatalf("Execute crash: %v", err)
+	}
+	restart := scenario
+	restart.StartingState = cloneDurableState(crashed.DurableState)
+	restarted, err := Execute(context.Background(), restart, Options{ReplayJournal: &crashed.ReplayJournal})
+	if err != nil {
+		t.Fatalf("Execute restart: %v", err)
+	}
+	assertRouteInvariantFailed(t, restarted)
+	if got, want := mustCanonicalInvariants(t, restarted), mustCanonicalInvariants(t, uninterrupted); !bytes.Equal(got, want) {
+		t.Fatalf("restart invariant bytes mismatch\nrestart=%s\nuninterrupted=%s", got, want)
+	}
+}
+
 func TestExecuteRejectsMalformedStartingState(t *testing.T) {
 	validCommitment := func() BudgetCommitment {
 		return BudgetCommitment{
@@ -868,6 +971,48 @@ func mustCanonicalDurableState(t *testing.T, state DurableState) []byte {
 		t.Fatalf("CanonicalJSON durable state: %v", err)
 	}
 	return data
+}
+
+func mustCanonicalInvariants(t *testing.T, results Result) []byte {
+	t.Helper()
+	data, err := delivery.CanonicalJSON(results.InvariantResults)
+	if err != nil {
+		t.Fatalf("CanonicalJSON invariants: %v", err)
+	}
+	return data
+}
+
+func assertRouteInvariantPassed(t *testing.T, result Result) {
+	t.Helper()
+	if len(result.InvariantResults) != 1 || !result.InvariantResults[0].Passed {
+		t.Fatalf("invariant results = %#v, want one passed route invariant; diagnostics=%#v", result.InvariantResults, result.Diagnostics)
+	}
+}
+
+func assertRouteInvariantFailed(t *testing.T, result Result) {
+	t.Helper()
+	if len(result.InvariantResults) != 1 || result.InvariantResults[0].Passed {
+		t.Fatalf("invariant results = %#v, want one failed route invariant", result.InvariantResults)
+	}
+	found := false
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code == ErrInvariantFailed {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("diagnostics = %#v, want %s", result.Diagnostics, ErrInvariantFailed)
+	}
+}
+
+func assertNoInvariantDiagnostic(t *testing.T, result Result) {
+	t.Helper()
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.Code == ErrInvariantFailed {
+			t.Fatalf("diagnostics = %#v, want no %s", result.Diagnostics, ErrInvariantFailed)
+		}
+	}
 }
 
 func receiptByEvent(receipts []ProviderReceipt, eventID string) (ProviderReceipt, bool) {
