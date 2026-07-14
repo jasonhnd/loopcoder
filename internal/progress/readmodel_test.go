@@ -98,6 +98,73 @@ func TestReadReceiptsBuildsViewsAndResumesFromCursor(t *testing.T) {
 	}
 }
 
+func TestRenderJSONLWriteFailuresDoNotCorruptEarlierCompleteRecords(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	for i, correlation := range []string{"corr-first", "corr-second"} {
+		receipt := mutate(baseReceipt(), func(r *ProgressReceipt) {
+			r.CorrelationID = correlation
+			r.CorrelationSequence = int64(i + 1)
+			r.OccurredAt = fixedTime.Add(time.Duration(i) * time.Second).UTC().Format(time.RFC3339Nano)
+		})
+		if _, err := PersistReceipt(ctx, store, receipt); err != nil {
+			t.Fatalf("PersistReceipt %s: %v", correlation, err)
+		}
+	}
+	batch, err := ReadReceipts(ctx, store, ReadFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", Limit: 2}, fixedTime.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ReadReceipts: %v", err)
+	}
+
+	firstFail := &jsonlFailWriter{failOnWrite: 1}
+	if err := RenderJSONL(firstFail, batch.Views); err == nil {
+		t.Fatal("RenderJSONL first write succeeded, want failure")
+	}
+	if firstFail.buf.Len() != 0 {
+		t.Fatalf("first failed write accepted bytes: %q", firstFail.buf.String())
+	}
+
+	laterFail := &jsonlFailWriter{failOnWrite: 2, partialBytes: 7}
+	if err := RenderJSONL(laterFail, batch.Views); err == nil {
+		t.Fatal("RenderJSONL later write succeeded, want failure")
+	}
+	lines := strings.Split(laterFail.buf.String(), "\n")
+	var first ReceiptView
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first complete JSONL record corrupted: %v\n%s", err, laterFail.buf.String())
+	}
+	if first.Receipt.CorrelationID != "corr-first" {
+		t.Fatalf("first record correlation = %q", first.Receipt.CorrelationID)
+	}
+	if len(lines) < 2 || len(lines[1]) != laterFail.partialBytes {
+		t.Fatalf("short-write boundary not documented by fixture: lines=%q", lines)
+	}
+}
+
+type jsonlFailWriter struct {
+	buf          bytes.Buffer
+	writes       int
+	failOnWrite  int
+	partialBytes int
+}
+
+func (w *jsonlFailWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failOnWrite {
+		n := w.partialBytes
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		return n, errors.New("short writer")
+	}
+	return w.buf.Write(p)
+}
+
 func TestReadReceiptsFiltersByCorrelationAndSkipsUnknownRecords(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, ctx)

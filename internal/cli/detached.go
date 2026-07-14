@@ -388,8 +388,8 @@ func runAttach(args []string, stdout, stderr io.Writer, deps Deps) int {
 }
 
 func runDetachedRecover(repoPath, runID, format string, fence detachedrun.Fence, expectedLease string, stdout, stderr io.Writer, deps Deps) int {
-	if format != "text" && format != "json" {
-		fmt.Fprintf(stderr, "recover: invalid --format %q; want text or json\n", format)
+	if format != "text" && format != "json" && format != "jsonl" {
+		fmt.Fprintf(stderr, "recover: invalid --format %q; want text, json, or jsonl\n", format)
 		return 2
 	}
 	fence, expectedLease, ok := detachedCommandFence("recover", runID, fence.Owner, fence.Generation, expectedLease, stderr)
@@ -475,7 +475,12 @@ func runDetachedRecover(repoPath, runID, format string, fence detachedrun.Fence,
 		}
 	}
 	if format == "json" {
-		if err := writeJSONLine(stdout, result); err != nil {
+		if err := renderCanonicalJSONLine(stdout, detachedRecoverJSONPayload(result)); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
+		}
+	} else if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, detachedRecoverObservability(result), "jsonl"); err != nil {
 			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
 			return 1
 		}
@@ -484,6 +489,10 @@ func runDetachedRecover(repoPath, runID, format string, fence detachedrun.Fence,
 		fmt.Fprintf(stdout, "state: %s phase=%s action=%s\n", result.Record.Status, result.Record.LaunchPhase, result.ReplayAction)
 		if result.Reason != "" {
 			fmt.Fprintf(stdout, "reason: %s\n", result.Reason)
+		}
+		if err := renderCanonicalHuman(stdout, detachedRecoverObservability(result), deps); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
 		}
 	}
 	if result.NeedsHuman {

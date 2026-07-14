@@ -705,6 +705,39 @@ func TestRenderingIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestRenderJSONObservabilityDoesNotUseRepoPathAsRecordID(t *testing.T) {
+	repo := t.TempDir()
+	result := Finalize(NewResult(repo, []string{LayerSAST}, SeverityMedium))
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, result); err != nil {
+		t.Fatalf("RenderJSON returned error: %v", err)
+	}
+	var payload struct {
+		Observability struct {
+			Items []struct {
+				ID         string `json:"id"`
+				SourceRefs []struct {
+					RecordID string `json:"record_id"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("audit JSON did not parse: %v\n%s", err, out.String())
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].ID == repo {
+		t.Fatalf("audit observability item used repo path as identity: %#v", payload.Observability.Items)
+	}
+	if len(payload.Observability.Items[0].SourceRefs) != 1 {
+		t.Fatalf("audit observability source refs = %#v", payload.Observability.Items[0].SourceRefs)
+	}
+	recordID := payload.Observability.Items[0].SourceRefs[0].RecordID
+	if recordID == repo || strings.Contains(recordID, string(filepath.Separator)) {
+		t.Fatalf("audit observability source ref used local path: %#v", payload.Observability.Items[0].SourceRefs)
+	}
+}
+
 func commandIDs(commands []SASTCommand) []string {
 	ids := make([]string, 0, len(commands))
 	for _, command := range commands {

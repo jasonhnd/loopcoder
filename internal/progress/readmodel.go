@@ -1,6 +1,7 @@
 package progress
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -264,15 +265,23 @@ func RenderHuman(w io.Writer, views []ReceiptView) error {
 
 func RenderJSON(w io.Writer, batch ReceiptBatch) error {
 	batch.Diagnostics = nil
-	encoder := json.NewEncoder(w)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(batch)
+	if err := encoder.Encode(batch); err != nil {
+		return err
+	}
+	_, err := w.Write(buf.Bytes())
+	return err
 }
 
 func RenderJSONL(w io.Writer, views []ReceiptView) error {
-	encoder := json.NewEncoder(w)
 	for _, view := range views {
-		if err := encoder.Encode(view); err != nil {
+		var line bytes.Buffer
+		if err := json.NewEncoder(&line).Encode(view); err != nil {
+			return err
+		}
+		if _, err := w.Write(line.Bytes()); err != nil {
 			return err
 		}
 	}

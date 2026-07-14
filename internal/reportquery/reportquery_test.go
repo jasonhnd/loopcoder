@@ -136,6 +136,9 @@ func TestListReadsAttemptsAndPendingRelayReports(t *testing.T) {
 	if payload.Records[1].Report.WorkID != "run-test" || payload.Records[1].Source != "attempt" || payload.Records[1].RunID != "run-test" || payload.Records[1].Path == "" {
 		t.Fatalf("JSON attempt record = %#v, want report plus source context", payload.Records[1])
 	}
+	if strings.Contains(string(data), repo) || strings.Contains(payload.Records[1].Path, string(filepath.Separator)) {
+		t.Fatalf("rendered JSON leaked local report path: path=%q data=%s", payload.Records[1].Path, string(data))
+	}
 	if _, err := filepath.Rel(repo, records[1].Path); err != nil {
 		t.Fatalf("worker source path is not under repo: %v", err)
 	}
@@ -246,6 +249,55 @@ func TestRenderTextAndJSONIncludesGrokAttributionWithoutSecrets(t *testing.T) {
 	}
 	if strings.Contains(string(data), secretCanary) {
 		t.Fatalf("Grok report JSON leaked secret canary: %s", string(data))
+	}
+}
+
+func TestReportObservabilityFallbackDoesNotUseRecordPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".loopcoder", "runs", "run-x", "worker.report.json")
+	record := Record{
+		Report: testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement fallback", "2026-07-13T00:00:00Z"),
+		Source: "run-json",
+		Path:   path,
+	}
+	record.Report.WorkID = ""
+	record.Report.Issue = 0
+
+	data, err := MarshalJSON([]Record{record})
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		Observability struct {
+			Items []struct {
+				ID         string `json:"id"`
+				SourceRefs []struct {
+					RecordID string `json:"record_id"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("JSON output invalid: %v\n%s", err, string(data))
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].ID == path || strings.Contains(payload.Observability.Items[0].ID, string(filepath.Separator)) {
+		t.Fatalf("report observability item used path fallback: %#v", payload.Observability.Items)
+	}
+	if len(payload.Observability.Items[0].SourceRefs) != 1 || payload.Observability.Items[0].SourceRefs[0].RecordID == path || strings.Contains(payload.Observability.Items[0].SourceRefs[0].RecordID, string(filepath.Separator)) {
+		t.Fatalf("report observability source ref used path fallback: %#v", payload.Observability.Items[0].SourceRefs)
+	}
+}
+
+func TestReportObservabilityPathFallbackIsCollisionResistant(t *testing.T) {
+	a := Record{
+		Report: testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement fallback", "2026-07-13T00:00:00Z"),
+		Path:   filepath.Join(string(os.PathSeparator), "tmp", "a", ".loopcoder", "runs", "run-a", "worker.report.json"),
+	}
+	b := Record{
+		Report: testReport(reporter.RoleWorker, "codex", "gpt-5.5", "high", "implement fallback", "2026-07-13T00:00:00Z"),
+		Path:   filepath.Join(string(os.PathSeparator), "tmp", "b", ".loopcoder", "runs", "run-b", "worker.report.json"),
+	}
+	if gotA, gotB := reportItemID(a), reportItemID(b); gotA == gotB || strings.Contains(gotA, "/") || strings.Contains(gotB, "/") {
+		t.Fatalf("path fallback ids collided or leaked paths: %q %q", gotA, gotB)
 	}
 }
 

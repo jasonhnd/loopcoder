@@ -84,7 +84,7 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --model string                optional worker model override for this run")
 	fmt.Fprintln(w, "  --effort string               optional worker reasoning effort override for this run")
 	fmt.Fprintln(w, "  --parent-permission string    parent permission ceiling: read-only, write, or orchestrate (default \"orchestrate\")")
-	fmt.Fprintln(w, "  --format string               output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --format string               output format: text, json, or jsonl (default \"text\")")
 	fmt.Fprintln(w, "  --timeout duration            optional timeout for the nested run, for example 30s or 5m")
 	fmt.Fprintln(w, "  --config-from-base            read .delivery.yml from base branch when absent from working tree")
 	fmt.Fprintln(w, "  --strict                      reject invalid model/depth selections instead of warning")
@@ -187,13 +187,13 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	switch opts.Format {
-	case "text", "json":
+	case "text", "json", "jsonl":
 	default:
-		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text or json\n", opts.Format)
+		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text, json, or jsonl\n", opts.Format)
 		return 2
 	}
 	warnings := stderr
-	if opts.Format == "json" {
+	if opts.Format == "json" || opts.Format == "jsonl" {
 		warnings = io.Discard
 	}
 	parentPermission := normalizeNestedPermission(opts.ParentPermission)
@@ -300,7 +300,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	})
 	if err != nil {
 		if nestedReportHasContent(report) {
-			if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
+			if renderErr := renderNestedRun(stdout, opts.Format, report, deps); renderErr != nil {
 				fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
 			}
 		}
@@ -309,7 +309,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		return 1
 	}
-	if err := renderNestedRun(stdout, opts.Format, report); err != nil {
+	if err := renderNestedRun(stdout, opts.Format, report, deps); err != nil {
 		fmt.Fprintf(stderr, "nested run: write output: %v\n", err)
 		return 1
 	}
@@ -590,17 +590,25 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 	return nil
 }
 
-func renderNestedRun(w io.Writer, format string, report orchestration.NestedScheduleReport) error {
+func renderNestedRun(w io.Writer, format string, report orchestration.NestedScheduleReport, deps Deps) error {
 	if format == "json" {
-		data, err := json.MarshalIndent(report, "", "  ")
+		data, err := json.MarshalIndent(nestedJSONPayload(report), "", "  ")
 		if err != nil {
 			return err
 		}
 		_, err = w.Write(append(data, '\n'))
 		return err
 	}
-	_, err := fmt.Fprint(w, renderNestedText(report))
-	return err
+	if format == "jsonl" {
+		return renderCanonicalMachine(w, nestedObservability(report), "jsonl")
+	}
+	if _, err := fmt.Fprint(w, renderNestedText(report)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
+	return renderCanonicalHuman(w, nestedObservability(report), deps)
 }
 
 func renderNestedText(report orchestration.NestedScheduleReport) string {

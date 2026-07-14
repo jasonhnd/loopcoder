@@ -1,0 +1,31 @@
+RUN STATUS
+RunId: run-golden (requested run)
+Source: $REPO/.loopcoder/runs/run-golden
+Project: proj_TEST (repo)
+Events: 2
+Verifier records: 0
+Lifecycle: planned (source=lifecycle entries=1)
+
+Run tree
+- run-golden (state=planned issue=#865 role=worker provider=codex model=gpt-5.5 (high) permission=write)
+  summary: implement issue #codex-golden
+
+Agent tree
+- none
+
+| Issue | Worker job | PR | Worker provider | Worker model | Worker model source | Worker effort | Worker permission | Worker duration | Worker tokens in | Worker tokens out | Worker tokens total | Worker verified | Phase | Status | Verifier verdict | Verifier provider | Verifier model | Verifier model source | Verifier effort | Verifier permission | Verifier duration | Verifier tokens in | Verifier tokens out | Verifier tokens total | Verifier verified |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| #864 | job-864 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | codex_exited | succeeded | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported |
+| #865 | job-865 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 220 | 44 | 264 | true | codex_exited | succeeded | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported |
+
+Safety
+- status is read-only and local-only: read $REPO/.loopcoder/runs/run-golden and wrote no repo, GitHub, PR, issue, commit, merge, doc, or tracked-file surface.
+
+OBSERVABILITY status
+scope: project=proj_TEST [TRUNCATED]
+OK run-golden planned
+codex/gpt-5.5 duration=not-rep [TRUNCATED]
+OK job-864 succeeded
+codex/gpt-5.5 duration=42s usa [TRUNCATED]
+OK job-865 succeeded
+codex/gpt-5.5 duration=42s usa [TRUNCATED]

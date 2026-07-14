@@ -1,10 +1,12 @@
 package orchestration
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -203,8 +205,8 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 		"  branch: loop/issue-7\n" +
 		"  pr: https://github.com/owner/repo/pull/7\n" +
 		"  report: provider=codex model=gpt-5 (high) source=parsed permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
-		"  attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
-		"  recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
+		"  attempt_id: job-7\n" +
+		"  recovery_id: job-7-context\n" +
 		"- #8 needs-human\n" +
 		"  error: guardrail frozen\n" +
 		"\n" +
@@ -224,13 +226,46 @@ func TestRenderDispatchWaveIssueCompletionGoldenBytes(t *testing.T) {
 	const want = "DISPATCH WAVE WORKER #7 succeeded\n" +
 		"branch: loop/issue-7\n" +
 		"pr: https://github.com/owner/repo/pull/7\n" +
-		"attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
-		"recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
+		"attempt_id: job-7\n" +
+		"recovery_id: job-7-context\n" +
 		"worker report\n" +
 		"  provider codex\n" +
 		"\n"
 	if got := RenderDispatchWaveIssueCompletion(result, pretty); got != want {
 		t.Fatalf("RenderDispatchWaveIssueCompletion drifted:\n--- got ---\n%s--- want ---\n%s", got, want)
+	}
+}
+
+func TestMarshalTickJSONSanitizesDispatchAttemptPaths(t *testing.T) {
+	repo := t.TempDir()
+	report := TickReport{
+		Version: TickReportVersion,
+		RunID:   "run-render-paths",
+		Status:  TickStatusSucceeded,
+		DispatchWave: &DispatchWaveReport{
+			RunID: "run-render-paths",
+			Results: []DispatchWaveIssueResult{{
+				Issue:               7,
+				Status:              DispatchWaveStatusSucceeded,
+				AttemptPath:         filepath.Join(repo, ".loopcoder", "runs", "run-render-paths", "workers", "job-7.attempt.json"),
+				RecoveryContextPath: filepath.Join(repo, ".loopcoder", "runs", "run-render-paths", "recovery", "job-7-context.md"),
+			}},
+		},
+	}
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("tick JSON is invalid:\n%s", string(data))
+	}
+	if strings.Contains(string(data), repo) || strings.Contains(string(data), ".attempt.json") || strings.Contains(string(data), "job-7-context.md") {
+		t.Fatalf("tick JSON leaked local path:\n%s", string(data))
+	}
+	for _, want := range []string{`"AttemptPath": "job-7"`, `"RecoveryContextPath": "job-7-context"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing stable %q:\n%s", want, string(data))
+		}
 	}
 }
 

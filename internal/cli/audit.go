@@ -132,7 +132,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "audit: unexpected argument %q\n", fs.Arg(0))
 		return auditCommandFailureExitCode
 	}
-	outputMode, ok := normalizeCommandOutputMode("audit", outputFormat, verbose, stderr)
+	outputMode, ok := normalizeCommandOutputModeWithFormats("audit", outputFormat, verbose, stderr, "text", "json", "jsonl")
 	if !ok {
 		return auditCommandFailureExitCode
 	}
@@ -225,7 +225,7 @@ func runAudit(args []string, stdout, stderr io.Writer, deps Deps) int {
 			}
 		}
 	}
-	if err := renderAudit(stdout, result, outputMode.Format); err != nil {
+	if err := renderAudit(stdout, result, outputMode.Format, deps); err != nil {
 		fmt.Fprintf(stderr, "audit: write output: %v\n", err)
 		return auditCommandFailureExitCode
 	}
@@ -285,9 +285,15 @@ func writeAuditRelayLedger(repoPath string, result audit.Result, record reporter
 	return err
 }
 
-func renderAudit(w io.Writer, result audit.Result, outputFormat string) error {
+func renderAudit(w io.Writer, result audit.Result, outputFormat string, deps Deps) error {
 	if outputFormat == "text" || outputFormat == "both" {
 		if err := audit.RenderText(w, result); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		if err := renderCanonicalHuman(w, audit.ObservabilityDocument(result), deps); err != nil {
 			return err
 		}
 	}
@@ -303,6 +309,9 @@ func renderAudit(w io.Writer, result audit.Result, outputFormat string) error {
 		if err := audit.RenderJSON(w, result); err != nil {
 			return err
 		}
+	}
+	if outputFormat == "jsonl" {
+		return renderCanonicalMachine(w, audit.ObservabilityDocument(result), "jsonl")
 	}
 	return nil
 }

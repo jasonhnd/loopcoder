@@ -709,6 +709,9 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if payload.Records[0].Report.WorkID != "run-report-test" || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != "run-report-test" || payload.Records[0].Path == "" {
 		t.Fatalf("records = %#v, want one filtered local record with source context", payload.Records)
 	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(payload.Records[0].Path, string(filepath.Separator)) {
+		t.Fatalf("report JSON leaked local report path: path=%q output=%s", payload.Records[0].Path, stdout.String())
+	}
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
@@ -794,6 +797,18 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Correlation   struct {
+				DeliveryRunID string `json:"delivery_run_id"`
+			} `json:"correlation"`
+			Items []struct {
+				Kind   string `json:"kind"`
+				Status string `json:"status"`
+			} `json:"items"`
+		} `json:"observability"`
 		RunID   string `json:"run_id"`
 		Project struct {
 			ProjectID string `json:"project_id"`
@@ -814,14 +829,26 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 	if payload.RunID != child || payload.Project.ProjectID == "" || payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("status JSON = %#v", payload)
 	}
+	if payload.SchemaVersion != "loopcoder.run_status.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "status" || payload.Observability.Correlation.DeliveryRunID != child {
+		t.Fatalf("status observability = %#v", payload.Observability)
+	}
 	var foundChild bool
+	var foundObservableChild bool
 	for _, node := range payload.RunTree.Nodes {
 		if node.RunID == child && node.ParentRunID == parent && node.Issue == 651 && node.Provider == "codex" {
 			foundChild = true
 		}
 	}
+	for _, item := range payload.Observability.Items {
+		if item.Kind == "run-tree-node" && item.Status == "planned" {
+			foundObservableChild = true
+		}
+	}
 	if !foundChild {
 		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+	if !foundObservableChild {
+		t.Fatalf("status observability missing run-tree node: %#v", payload.Observability.Items)
 	}
 }
 
@@ -872,6 +899,16 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+			} `json:"items"`
+		} `json:"observability"`
 		Reports []reporter.Report `json:"reports"`
 		Records []struct {
 			RunID string `json:"run_id"`
@@ -888,6 +925,12 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 	}
 	if len(payload.Reports) != 1 || len(payload.Records) != 1 || payload.Records[0].RunID != child {
 		t.Fatalf("report records = %#v %#v", payload.Reports, payload.Records)
+	}
+	if payload.SchemaVersion != "loopcoder.report_query.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "report" {
+		t.Fatalf("report observability schema = %#v", payload.Observability)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("report observability item = %#v", payload.Observability.Items)
 	}
 	if payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("run tree = %#v", payload.RunTree)
@@ -7005,10 +7048,87 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 	if !got.OK || got.Status != "succeeded" || got.Report == nil {
 		t.Fatalf("dispatch JSON = %#v", got)
 	}
+	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Status   string `json:"status"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+				Usage    struct {
+					TotalTokens *int64 `json:"total_tokens"`
+				} `json:"usage"`
+				SourceRefs []struct {
+					Table string `json:"table"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("dispatch observability JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != "loopcoder.dispatch_result.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "dispatch" {
+		t.Fatalf("dispatch observability schema = %#v", payload)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Status != "succeeded" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("dispatch observability item = %#v", payload.Observability.Items)
+	}
+	for _, forbidden := range []string{"/repo/.loopcoder", repo, ".attempt.json"} {
+		if strings.Contains(stdout.String(), forbidden) {
+			t.Fatalf("dispatch JSON leaked local path artifact %q:\n%s", forbidden, stdout.String())
+		}
+	}
 	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
 		if strings.Contains(stdout.String(), disallowed) {
 			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
 		}
+	}
+}
+
+func TestDispatchJSONObservabilityUsesStableAttemptID(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.AttemptPath = filepath.Join(repo, ".loopcoder", "runs", result.RunID, "workers", "job-101-1.attempt.json")
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var payload struct {
+		AttemptPath   string `json:"attempt_path"`
+		Observability struct {
+			Items []struct {
+				SourceRefs []struct {
+					RecordID string `json:"record_id"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &payload)
+	if payload.AttemptPath != "job-101-1" {
+		t.Fatalf("attempt_path = %q, want stable attempt id", payload.AttemptPath)
+	}
+	if len(payload.Observability.Items) != 1 || len(payload.Observability.Items[0].SourceRefs) != 1 || payload.Observability.Items[0].SourceRefs[0].RecordID != "job-101-1" {
+		t.Fatalf("source refs = %#v, want stable attempt id", payload.Observability.Items)
+	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(stdout.String(), ".attempt.json") {
+		t.Fatalf("dispatch JSON leaked local attempt path:\n%s", stdout.String())
 	}
 }
 

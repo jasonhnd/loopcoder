@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/observability"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -32,6 +33,7 @@ import (
 const NotReported = "not reported"
 
 const (
+	SchemaVersion                      = "loopcoder.run_status.v1"
 	maxRunStatusEventBytes       int64 = lcdefaults.RunStatusMaxEventBytes
 	maxRunStatusEventLineBytes   int   = lcdefaults.RunStatusMaxEventLineBytes
 	maxRunStatusRecordBytes      int64 = lcdefaults.RunStatusMaxRecordBytes
@@ -46,6 +48,8 @@ type Options struct {
 }
 
 type Report struct {
+	SchemaVersion       string                           `json:"schema_version"`
+	Observability       observability.Document           `json:"observability"`
 	RunID               string                           `json:"run_id"`
 	RunNote             string                           `json:"run_note"`
 	RunPath             string                           `json:"run_path"`
@@ -455,6 +459,7 @@ func Render(report Report) string {
 }
 
 func normalizeReport(report Report) Report {
+	report.SchemaVersion = SchemaVersion
 	report.RunPath = filepath.ToSlash(report.RunPath)
 	if report.ChildRunIDs == nil {
 		report.ChildRunIDs = []string{}
@@ -486,6 +491,7 @@ func normalizeReport(report Report) Report {
 		}
 	}
 	report.RunTree.Summary = summarizeRunTree(report.RunTree.Nodes)
+	report.Observability = runStatusObservability(report)
 	return report
 }
 
