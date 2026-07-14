@@ -621,6 +621,9 @@ func RenewChildRunClaim(ctx context.Context, store Store, childRunID, executorID
 			if err := renewClaimFencedOwnershipLocksTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
 				return err
 			}
+			if err := refreshHandoffSuccessorLaunchOwnershipSnapshotTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now)); err != nil {
+				return err
+			}
 			if err := renewNestedSchedulerReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, formatTimestamp(now), formatTimestamp(leaseUntil)); err != nil {
 				return err
 			}
