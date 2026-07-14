@@ -818,6 +818,143 @@ func TestGrokRunnerCancellationKillsNativeProcessTree(t *testing.T) {
 	}
 }
 
+func TestGrokOrdinaryWorkerConformanceSuite(t *testing.T) {
+	secretCanaries := append(runtimeGrokSecretCanaries(), "AKIA"+strings.Repeat("A", 16), "xai-"+strings.Repeat("Z", 24))
+	hostileHome := t.TempDir()
+	t.Setenv("HOME", hostileHome)
+	t.Setenv("USERPROFILE", hostileHome)
+	t.Setenv("AWS_ACCESS_KEY_ID", secretCanaries[2])
+	t.Setenv("XAI_API_KEY", secretCanaries[3])
+
+	var launchCount atomic.Int32
+	var launchDirs []string
+	var launchHomes []string
+	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		launchCount.Add(1)
+		launchDirs = append(launchDirs, cmd.Dir)
+		launchHomes = append(launchHomes, envValue(cmd.Env, "HOME"))
+		if strings.Contains(strings.Join(cmd.Env, "\n"), secretCanaries[2]) {
+			t.Fatalf("non-Grok credential reached worker env: %s", strings.Join(cmd.Env, "\n"))
+		}
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"system","session_id":"sess-conformance","model":"grok-4.5"}`+"\n")
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"assistant","model":"grok-4.5","text":"Authorization: Bearer `+secretCanaries[0]+`"}`+"\n")
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"done `+secretCanaries[2]+`","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restoreRun()
+
+	logRoot := t.TempDir()
+	for _, project := range []string{"project-a", "project-b"} {
+		t.Run(project, func(t *testing.T) {
+			worktree := filepath.Join(t.TempDir(), project)
+			if err := os.MkdirAll(worktree, 0o755); err != nil {
+				t.Fatalf("mkdir worktree: %v", err)
+			}
+			promptCanary := "prompt-secret-" + project + "-" + strings.Repeat("p", 16)
+			logPath := filepath.Join(logRoot, project+".log")
+			result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+				WorktreePath: worktree,
+				Prompt:       "ordinary worker prompt " + promptCanary,
+				LogPath:      logPath,
+				RunID:        "run-" + project,
+				ProviderKey:  "provider-key-" + project,
+				Role:         "worker",
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			if !strings.Contains(result.Summary, "done [REDACTED]") || strings.Contains(result.Summary, secretCanaries[0]) || strings.Contains(result.Summary, secretCanaries[2]) || result.Model != "grok-4.5" {
+				t.Fatalf("result = %#v, want redacted summary and parsed model", result)
+			}
+			logText := readFileString(t, logPath)
+			for _, forbidden := range append(secretCanaries, promptCanary, hostileHome) {
+				if strings.Contains(logText, forbidden) {
+					t.Fatalf("log retained forbidden value %q:\n%s", forbidden, logText)
+				}
+			}
+			if !strings.Contains(logText, `"kind":"progress"`) || !strings.Contains(logText, `"kind":"terminal"`) || !strings.Contains(logText, "[REDACTED]") {
+				t.Fatalf("log missing normalized stream/redaction evidence:\n%s", logText)
+			}
+			assertPrivateDirMode(t, grokRuntimeRootPath(logPath))
+		})
+	}
+	if launchCount.Load() != 2 {
+		t.Fatalf("launch count = %d, want two isolated launches", launchCount.Load())
+	}
+	if len(launchDirs) != 2 || launchDirs[0] == launchDirs[1] {
+		t.Fatalf("launch dirs = %#v, want distinct project workspaces", launchDirs)
+	}
+	if len(launchHomes) != 2 || launchHomes[0] == "" || launchHomes[1] == "" || launchHomes[0] == launchHomes[1] || strings.Contains(strings.Join(launchHomes, "\n"), hostileHome) {
+		t.Fatalf("launch homes = %#v, want distinct isolated homes not inherited", launchHomes)
+	}
+}
+
+func TestGrokOrdinaryWorkerRestartRecoveryConformance(t *testing.T) {
+	var attempt atomic.Int32
+	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		if attempt.Add(1) == 1 {
+			_, _ = io.WriteString(cmd.Stdout, `{"type":"assistant","model":"grok-4.5","text":"partial"}`+"\n")
+			return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+		}
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","model":"grok-4.5","result":"recovered"}`+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restoreRun()
+
+	worktree := t.TempDir()
+	firstLog := filepath.Join(t.TempDir(), "first.log")
+	_, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: worktree,
+		Prompt:       "recover",
+		LogPath:      firstLog,
+		RunID:        "restart-recovery",
+		ProviderKey:  "same-logical-operation",
+		Role:         "worker",
+	})
+	assertGrokError(t, err, GrokErrTransportLoss, "terminal result")
+
+	secondLog := filepath.Join(t.TempDir(), "second.log")
+	result, err := (GrokRunner{probe: supportedGrokProbe}).Run(context.Background(), Invocation{
+		WorktreePath: worktree,
+		Prompt:       "recover",
+		LogPath:      secondLog,
+		RunID:        "restart-recovery",
+		ProviderKey:  "same-logical-operation",
+		Role:         "worker",
+	})
+	if err != nil {
+		t.Fatalf("recovery Run returned error: %v", err)
+	}
+	if result.Summary != "recovered" || strings.Contains(readFileString(t, secondLog), "partial") {
+		t.Fatalf("recovery result/log = %#v\n%s", result, readFileString(t, secondLog))
+	}
+}
+
+func TestGrokLiveSmokeRequiresExplicitOptIn(t *testing.T) {
+	if os.Getenv("LOOPCODER_GROK_LIVE_SMOKE") != "1" || os.Getenv("LOOPCODER_ALLOW_LIVE_PROVIDER") != "1" {
+		t.Skip("live Grok smoke is disabled by default; set LOOPCODER_GROK_LIVE_SMOKE=1 and LOOPCODER_ALLOW_LIVE_PROVIDER=1 to opt in")
+	}
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skipf("v0.8 native live Grok smoke is scoped to darwin/arm64, got %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	logPath := filepath.Join(t.TempDir(), "grok-live.log")
+	result, err := (GrokRunner{}).Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "Return exactly: loopcoder grok live smoke",
+		LogPath:      logPath,
+		ReadOnly:     true,
+		HardCap:      30 * time.Second,
+		RunID:        "live-smoke",
+		Role:         "verifier",
+	})
+	if err != nil {
+		t.Fatalf("live Grok smoke failed: %v", err)
+	}
+	if result.ExitCode != 0 || strings.TrimSpace(result.Model) == "" {
+		t.Fatalf("live Grok smoke result = %#v, want successful parsed model", result)
+	}
+}
+
 func supportedGrokProbe(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
 	if reflect.DeepEqual(argv, []string{"grok", "version"}) {
 		return grokProbeResult{Stdout: "grok 0.1.211\n"}, nil
@@ -884,6 +1021,16 @@ func argValue(args []string, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
 }
 
 func assertGrokCommandWorkspace(t *testing.T, cmd *exec.Cmd, want string) {

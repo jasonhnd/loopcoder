@@ -23,16 +23,23 @@ registry. The registered worker providers are:
 - `codex` (default; verified)
 - `claude` (verified)
 - `antigravity` (Google Antigravity CLI path through executable `agy`)
+- `grok` (Grok Build CLI ordinary Worker/Verifier path)
 - `gemini` (experimental/unverified)
 
 `loopcoder models` exposes the static model registry for `codex`, `claude`,
-and `antigravity`. The older direct `gemini` worker adapter code is still
-present and registered, but it is experimental and is not part of the static
-model registry because the Antigravity provider is the current Gemini-family
-target path.
+`antigravity`, and Grok's built-in default model entry. Grok inventory can also
+discover the operator's currently available models through the official
+`grok models` surface when an explicit network inventory grant is provided.
+The older direct `gemini` worker adapter code is still present and registered,
+but it is experimental and is not part of the static model registry because
+the Antigravity provider is the current Gemini-family target path.
 
-The provider is selected per dispatch with the `--provider` flag and defaults to
-`codex`. The registry rejects any unknown provider with an actionable error.
+The provider is selected per dispatch with the `--provider` flag and defaults
+to `codex`. The registry rejects any unknown provider with an actionable error.
+LoopCoder does not install, update, log in to, or provision subscription access
+for provider CLIs. Operators own Grok Build installation and authentication
+outside loopcoder; loopcoder only probes declared, bounded status/catalog
+commands and launches the selected local executable.
 
 `--model` and `--effort` are provider-specific overrides. When either value is
 absent, loopcoder resolves it from `.delivery.yml` and then from the static
@@ -191,6 +198,14 @@ documented flag that proves they are ignored. See
 [`../security/grok-isolation.md`](../security/grok-isolation.md) for the full
 inventory and residual provider-controlled state.
 
+Grok execution is ordinary Worker/Verifier execution only. LoopCoder does not
+call a direct xAI API, does not estimate exact account quota, does not
+auto-install or auto-update Grok Build, and does not treat provider-native
+subagents or native federation as supported evidence for Grok. Token usage,
+cost, and quota-like telemetry are recorded only when the official CLI returns
+machine-readable values through the bounded surfaces, and unknown provider
+quota remains explicitly unknown.
+
 ## Why VCS Stays In The Adapter
 
 The adapter, not Codex, commits, pushes, and opens the PR. This keeps VCS state
@@ -214,7 +229,7 @@ deterministic and in the conductor's hands:
 | `--run-id` | No | generated | Run id used for attempt state and recovery context. |
 | `--attempt` | No | `1` | Attempt number recorded in state and recovery output. |
 | `--recovery-context` | No | unset | Prior recovery context to append to the worker prompt. |
-| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, `antigravity`, or experimental/unverified `gemini`. |
+| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, `grok`, `antigravity`, or experimental/unverified `gemini`. |
 | `--model` | No | resolved registry default | Optional provider-specific model override. When absent, role config and then the provider registry default are used. |
 | `--effort` | No | resolved model default | Optional provider-specific reasoning effort/depth override. When absent, role config and then the resolved model's default depth are used. |
 | `--strict` | No | false | Reject invalid model/depth selections instead of warning and preserving the pass-through value. |

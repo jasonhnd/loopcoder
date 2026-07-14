@@ -84,6 +84,64 @@ func TestRouteDecisionScoresOnlyEligibleCandidatesAndExplainsCandidates(t *testi
 	}
 }
 
+func TestRouteDecisionGrokUsesOrdinaryEligibilityContracts(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.contract.Providers = append(fixture.contract.Providers, providerRuntime("grok", true, false, true))
+	planFingerprint := testFingerprint("plan-grok-ordinary-route")
+	req := decisionRequirement(t, fixture, workerRequirement("task-grok-route"), "treq-grok-route", planFingerprint)
+	grok := fixture.candidate("grok", "acct-grok", "grok-missing")
+	input := DecisionInput{
+		ProjectID:         "proj-routing",
+		DeliveryRunID:     "drun-routing",
+		DecisionKey:       "route-worker-grok-ordinary",
+		TaskRequirementID: req.TaskRequirementID,
+		RoleDefinitionID:  "role-worker",
+		PlanFingerprint:   planFingerprint,
+		DecidedBy:         routerActor(),
+		Host:              routingHost(),
+		Now:               fixture.now,
+		Inputs: Inputs{
+			Requirement: req,
+			Candidates: []Candidate{
+				grok,
+				fixture.candidate("codex", "acct-a", "codex-good"),
+			},
+			Inventory:       fixture.inventory,
+			Availability:    fixture.availabilityScores(),
+			Budgets:         fixture.budgets,
+			RuntimeContract: fixture.contract,
+			HostName:        "codex-cli",
+			Policy: Policy{
+				EvidencePolicy:              EvidenceAllowEstimated,
+				RequireAvailabilityEvidence: true,
+				RequireBudgetEvidence:       true,
+			},
+		},
+	}
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if decision.DecisionStatus != DecisionStatusSelected || !strings.Contains(decision.ChosenReason, "selected") {
+		t.Fatalf("decision = %#v, want ordinary selected route", decision)
+	}
+	if len(decision.ScoredCandidates) != 1 || decision.ScoredCandidates[0].Candidate.AdapterID != "codex" {
+		t.Fatalf("scored candidates = %#v, want only codex scored", decision.ScoredCandidates)
+	}
+	foundGrokRejection := false
+	for _, rejected := range decision.RejectedCandidates {
+		if rejected.Candidate.AdapterID == "grok" {
+			foundGrokRejection = true
+			if len(rejected.Reasons) == 0 || rejected.Reasons[0].Code == "" || rejected.Reasons[0].Message == "" {
+				t.Fatalf("grok rejection lacks common-contract reason: %#v", rejected)
+			}
+		}
+	}
+	if !foundGrokRejection {
+		t.Fatalf("missing grok rejection in %#v", decision.RejectedCandidates)
+	}
+}
+
 func TestRouteDecisionQuotaAndCostEvidenceStayWithScoreProducingRecord(t *testing.T) {
 	fixture := newFixture(t)
 	input := replayDecisionInput(fixture)

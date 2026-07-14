@@ -32,19 +32,23 @@ Before tagging a release:
 
 The release workflow builds each advertised archive exactly once, generates and
 signs one `SHA256SUMS` manifest, uploads those artifacts to a draft GitHub
-Release, and runs native smoke jobs on Ubuntu, macOS, and Windows before the
-release is public. The final publication job does not rebuild or re-upload
-archives; it only promotes the already-smoked draft release after the protected
-`release-publication` environment grants approval.
+Release, and runs the release's native smoke jobs before the release is public.
+For v0.8, [`../specs/0884-macos-arm64-only.md`](../specs/0884-macos-arm64-only.md)
+is binding: native implementation and release proof target `darwin/arm64`
+only. Unsupported OS/arch diagnostics may use credential-free fixtures, but
+they are not advertised as native support or required native smoke. The final
+publication job does not rebuild or re-upload archives; it only promotes the
+already-smoked draft release after the protected `release-publication`
+environment grants approval.
 
 A failing smoke job must leave the release as a draft. The workflow appends the
 failed run URL to the draft notes so the candidate assets and diagnostic
 evidence remain available without presenting the release as final.
 
-The native smoke jobs run:
+The v0.8 native smoke job runs on the supported `darwin/arm64` host:
 
 ```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.7.0
+pwsh scripts/release-smoke.ps1 -Version 0.8.0
 ```
 
 The smoke script targets the staged draft release. It downloads the current
@@ -58,6 +62,12 @@ nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
 `-PreviousVersion` is set. It is verification-only and must not create tags,
 publish releases, or upload assets.
+
+Provider live smoke, including Grok, is not part of required CI or default
+release smoke. It is an explicit operator diagnostic only, must be enabled by
+its environment/flag gate, and must not be used as evidence that provider
+credentials, subscription quota, browser/session state, or private
+configuration are required for release acceptance.
 
 ## Required GitHub Repository Settings
 

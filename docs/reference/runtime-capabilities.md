@@ -44,7 +44,7 @@ capability, supporting alternatives when known, and the local fix.
 | `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider; local machine-readable status fields only. |
 | `gemini` | `gemini` | yes | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
 | `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
-| `grok` | `grok` | yes | no | yes | no | yes | yes | `grok models` | Requires CLI help to advertise the bounded headless flags; MCP and schema-enforced output fail closed. |
+| `grok` | `grok` | yes | no | yes | no | yes | yes | `grok models` | Official Grok Build CLI only; auth/catalog probing is network-declared and skipped unless explicitly granted. |
 
 `antigravity` is the clearest partial provider today. If selected for a
 read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,
@@ -66,6 +66,12 @@ server-side conversation, and model state may still exist behind the official
 CLI; loopcoder records only redacted session references and normalized
 receipts. The detailed inherited-source inventory is in
 [`../security/grok-isolation.md`](../security/grok-isolation.md).
+Grok model discovery is dynamic when the operator grants
+`provider:grok/action:auth-catalog-inventory` style inventory access; otherwise
+the provider-machine catalog is recorded as unavailable rather than guessed.
+LoopCoder does not read Grok credential files or secret environment values,
+does not perform login, does not auto-install or auto-update Grok Build, and
+does not call a direct xAI API.
 
 ## Compatibility Smoke Matrix
 
@@ -78,9 +84,11 @@ try to automate provider authentication.
 Provider-native sub-agent eligibility is stricter than a static adapter claim:
 the live scheduler requires fresh durable provider inventory, task requirement,
 budget reservation, scope, ownership-lock, and plan/policy fingerprint authority
-before a native child can launch. `codex`, `gemini`, and `antigravity` remain
-unsupported for provider-native sub-agents in the live matrix until a future
-provider passes the same conformance suite with accepted capability evidence.
+before a native child can launch. `codex`, `gemini`, `antigravity`, and `grok`
+remain unsupported for provider-native sub-agents in the live matrix until a
+future provider passes the same conformance suite with accepted capability
+evidence. Grok's ordinary-worker conformance does not imply native federation
+or provider-native subagent support.
 
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation,
@@ -111,6 +119,9 @@ Built-in local declarations are part of `internal/runtimecap`: Codex uses
 Gemini reports only auth-reference existence, Antigravity declares
 `agy models` as network-capable so it is recorded but not run by default, and
 Grok declares `grok models` as the network-capable auth/catalog surface.
+Quota telemetry for Grok remains confidence-scoped to what the official CLI
+returns. Exact account quota, subscription limits, reset windows, or
+provider-wide allowance are not inferred when the CLI does not report them.
 
 ModelCapability records reuse this same capability vocabulary rather than
 creating a parallel model-tier scheme. `read_only`, `json_output`,

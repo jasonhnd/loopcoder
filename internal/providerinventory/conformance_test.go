@@ -2,6 +2,8 @@ package providerinventory
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -104,6 +106,151 @@ func TestAdapterConformanceFutureProviderFixturePipeline(t *testing.T) {
 	capability := capabilityForAdapterModel(t, report, "futurefixture", "future-model")
 	if !capability.SatisfiesHardRequirements(HardRequirement{ReadOnly: true, JSONOutput: true, Cancellation: true}) {
 		t.Fatalf("future fixture capability did not satisfy declared hard requirements: %#v", capability)
+	}
+}
+
+func TestGrokOrdinaryWorkerInventoryConformanceDoesNotAffectOtherProviders(t *testing.T) {
+	codexExe := writeFakeCodex(t)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(codexExe): "codex 0.9.0"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return filepath.Dir(codexExe)
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		if filepath.Base(req.Argv[0]) == executableName("grok") {
+			t.Fatalf("absent grok executable was probed: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{Stdout: "codex 0.9.0\n", ExitCode: 0}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex", Verifier: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if installationForAdapter(t, report, "codex").InstallationState != InstallationInstalled {
+		t.Fatalf("codex installation not installed: %#v", report.Installations)
+	}
+	if probe := findProbe(t, report, "grok", "install"); probe.Outcome != OutcomeNotInstalled || !contains(probe.GapReasons, "executable-not-found") {
+		t.Fatalf("grok absent probe = %#v", probe)
+	}
+	if len(capabilitiesForAdapter(report, "codex")) == 0 {
+		t.Fatalf("absent grok removed codex model capabilities: %#v", report.ModelCapabilities)
+	}
+}
+
+func TestGrokOrdinaryWorkerAuthNotReadyIsCredentialBlind(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	secretCanary := "AKIA" + strings.Repeat("A", 16)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return dir
+		case "XAI_API_KEY", "AWS_ACCESS_KEY_ID", "GIT_DIR", "GIT_WORK_TREE":
+			return secretCanary
+		default:
+			return ""
+		}
+	}
+	modelCalls := 0
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		for _, env := range req.Env {
+			if strings.Contains(env, secretCanary) || strings.HasPrefix(env, "XAI_API_KEY=") || strings.HasPrefix(env, "GIT_") {
+				t.Fatalf("credential or repository selector reached grok inventory probe: %q", env)
+			}
+		}
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			modelCalls++
+			return ProbeExecutionResult{Stdout: "not logged in. run grok auth login\n" + secretCanary, ExitCode: 1}, nil
+		case len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+			return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config:        config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:           fixedInventoryNow,
+		NetworkGrants: []NetworkGrant{{ProviderID: "grok", Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if modelCalls != 1 {
+		t.Fatalf("grok models calls = %d, want one shared auth/catalog probe", modelCalls)
+	}
+	readiness := latestAuthReadinessFor(t, report, "grok")
+	if readiness.ReadinessState != ReadinessNotAuthenticated || !contains(readiness.GapReasons, "provider-reports-not-authenticated") {
+		t.Fatalf("grok readiness = %#v, want credential-blind not-authenticated", readiness)
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal report: %v", err)
+	}
+	if strings.Contains(string(payload), secretCanary) {
+		t.Fatalf("inventory report retained secret canary: %s", payload)
+	}
+}
+
+func TestGrokOrdinaryWorkerDefaultTestsDoNotUseLiveSmokeGate(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	t.Setenv("LOOPCODER_GROK_LIVE_SMOKE", "1")
+	t.Setenv("LOOPCODER_ALLOW_LIVE_PROVIDER", "1")
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return dir
+		case "LOOPCODER_GROK_LIVE_SMOKE", "LOOPCODER_ALLOW_LIVE_PROVIDER":
+			return os.Getenv(key)
+		default:
+			return ""
+		}
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+			return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			t.Fatalf("live smoke env gate must not grant inventory network by itself: %#v", req.Argv)
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{ExitCode: 2}, nil
+	}
+	deps.RunGrokACP = func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error) {
+		t.Fatal("live smoke env gate must not grant quota or paid provider invocation")
+		return GrokACPBillingResult{}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if findProbe(t, report, "grok", "catalog").NetworkPermission != NetworkDenied {
+		t.Fatalf("catalog probe unexpectedly received network permission: %#v", report.ProbeResults)
+	}
+	if got := onlyQuotaSnapshot(t, report, "grok"); got.TerminalErrorCode != "ErrQuotaCollectionGrantRequired" {
+		t.Fatalf("quota snapshot = %#v, want grant required", got)
 	}
 }
 
@@ -253,4 +400,14 @@ func capabilityForAdapterModel(t *testing.T, report Report, adapterID, modelID s
 	}
 	t.Fatalf("model capability %s/%s missing in %#v", adapterID, modelID, report.ModelCapabilities)
 	return ModelCapability{}
+}
+
+func capabilitiesForAdapter(report Report, adapterID string) []ModelCapability {
+	var out []ModelCapability
+	for _, capability := range report.ModelCapabilities {
+		if capability.AdapterID == adapterID {
+			out = append(out, capability)
+		}
+	}
+	return out
 }
