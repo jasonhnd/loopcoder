@@ -1812,6 +1812,89 @@ func TestWithWriteTxRollbackFailureDiscardsConnection(t *testing.T) {
 	}
 }
 
+func TestWithWriteTxFirstAttemptDoesNotAddRetryDeadline(t *testing.T) {
+	ctx := context.Background()
+	shortRetry := WriteTxRetryOptions{
+		MaxAttempts: 2,
+		MaxElapsed:  time.Nanosecond,
+		Backoff:     func(int) time.Duration { return 0 },
+	}
+	policy := normalizeWriteTxRetryPolicy(shortRetry)
+	if !policy.useAttemptDeadline {
+		t.Fatal("normalized real-clock retry policy did not enable attempt deadlines")
+	}
+	var retryLoopSawDeadline bool
+	if err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		_, retryLoopSawDeadline = attemptCtx.Deadline()
+		return nil
+	}); err != nil {
+		t.Fatalf("retryWriteTx returned error: %v", err)
+	}
+	if retryLoopSawDeadline {
+		t.Fatal("first successful retryWriteTx attempt received an internal deadline")
+	}
+
+	var commitHookCalls int
+	store, err := Open(ctx, Options{
+		Path: filepath.Join(t.TempDir(), "loopcoder.db"),
+		Now:  fixedNow,
+		WriteTxCommitHookForTest: func(hookCtx context.Context, tx Tx, commit func(context.Context) error) error {
+			commitHookCalls++
+			if deadline, ok := hookCtx.Deadline(); ok {
+				return fmt.Errorf("commit hook context has internal deadline %s", deadline.Format(time.RFC3339Nano))
+			}
+			return commit(hookCtx)
+		},
+		WriteTxRetry: shortRetry,
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('first-attempt-no-deadline', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	}); err != nil {
+		t.Fatalf("WithWriteTx returned error: %v", err)
+	}
+	if commitHookCalls != 1 {
+		t.Fatalf("commit hook calls = %d, want 1", commitHookCalls)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'first-attempt-no-deadline'`, 1)
+}
+
+func TestRetryWriteTxNormalAttemptCanOutliveRetryMaxElapsed(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualWriteTxRetryClock(fixedNow())
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 2,
+		MaxElapsed:  time.Millisecond,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		if deadline, ok := attemptCtx.Deadline(); ok {
+			return fmt.Errorf("normal attempt has internal deadline %s", deadline.Format(time.RFC3339Nano))
+		}
+		clock.now = clock.now.Add(time.Hour)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryWriteTx returned error: %v", err)
+	}
+	if attempts != 1 || clock.sleeps != 0 {
+		t.Fatalf("attempts/sleeps = %d/%d, want 1/0", attempts, clock.sleeps)
+	}
+	if !clock.now.After(fixedNow().Add(policy.maxElapsed)) {
+		t.Fatalf("clock now = %s, want beyond retry max elapsed", clock.now.Format(time.RFC3339Nano))
+	}
+}
+
 func TestWithWriteTxRetriesBusyBeginAfterRollbackBoundary(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")

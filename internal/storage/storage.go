@@ -743,17 +743,17 @@ func defaultWriteTxRetryBackoff(attempt int) time.Duration {
 }
 
 func retryWriteTx(ctx context.Context, policy writeTxRetryPolicy, op func(context.Context) error) error {
-	start := policy.clock.Now()
-	deadline := start.Add(policy.maxElapsed)
 	var err error
 	var lastBusyErr error
+	var deadline time.Time
+	retryWindowStarted := false
 	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
-		if policy.maxElapsed > 0 && lastBusyErr != nil && !policy.clock.Now().Before(deadline) {
+		if retryWindowStarted && policy.maxElapsed > 0 && !policy.clock.Now().Before(deadline) {
 			return lastBusyErr
 		}
 		attemptCtx := ctx
 		cancel := func() {}
-		if policy.useAttemptDeadline && policy.maxElapsed > 0 {
+		if retryWindowStarted && policy.useAttemptDeadline && policy.maxElapsed > 0 {
 			attemptCtx, cancel = context.WithDeadline(ctx, deadline)
 		}
 		err = op(attemptCtx)
@@ -765,6 +765,12 @@ func retryWriteTx(ctx context.Context, policy writeTxRetryPolicy, op func(contex
 			return err
 		}
 		lastBusyErr = err
+		if !retryWindowStarted {
+			retryWindowStarted = true
+			if policy.maxElapsed > 0 {
+				deadline = policy.clock.Now().Add(policy.maxElapsed)
+			}
+		}
 		if attempt == policy.maxAttempts {
 			return err
 		}
