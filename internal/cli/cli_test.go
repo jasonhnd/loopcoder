@@ -2462,6 +2462,249 @@ func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t 
 	}
 }
 
+func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-next-invocation")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next"
+		r.CorrelationSequence = 5
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "prior run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          priorRunID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	heartbeat := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next-heartbeat"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-supervisor-heartbeat"
+		r.Status = "running"
+		r.NextAction = progress.ActionState{State: "continue", Summary: "heartbeat chatter"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, heartbeat, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          priorRunID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation heartbeat fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-new-dispatch"
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Next invocation replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if opts.RunID != "" {
+				return worker.Result{}, fmt.Errorf("ordinary dispatch opts.RunID = %q, want empty", opts.RunID)
+			}
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || !strings.Contains(stderr.String(), priorRunID) {
+				return worker.Result{}, fmt.Errorf("worker started before prior Codex progress replay was emitted: %q", stderr.String())
+			}
+			if strings.Contains(stderr.String(), "detached-supervisor-heartbeat") || strings.Contains(stderr.String(), "heartbeat chatter") {
+				return worker.Result{}, fmt.Errorf("non-consequential heartbeat was replayed: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != result.RunID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+}
+
+func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-a")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-origin-mismatch"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          priorRunID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-b")
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-origin-mismatch-new"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Origin mismatch",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now:      func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) { return result, nil },
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || strings.Contains(stderr.String(), "progress receipt") {
+		t.Fatalf("origin mismatch replayed prior receipt:\n%s", stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+}
+
+func TestDispatchReplaysCancelledDetachedRunAndLeavesUnacknowledged(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv("CODEX_THREAD_ID", "thread-cancelled-detached-replay")
+	t.Setenv("CODEX_CLI", "1")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-cancelled-detached-replay",
+		Owner:          "owner-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    899,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "902",
+		"--issue-title", "After cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := codexHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("cancelled obligation after replay = %#v, want pending and unacknowledged", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
 func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 

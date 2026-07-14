@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -606,7 +607,11 @@ func TestReplayPendingForHostIsOriginBoundCursorSafeAndDoesNotAcknowledge(t *tes
 
 	obligationA := baseObligation()
 	obligationA.SinkID = "horigin_a"
-	createdA, err := PersistReceiptWithObligation(ctx, store, baseReceipt(), obligationA)
+	receiptA := baseReceipt()
+	receiptA.Phase = "detached-terminal"
+	receiptA.Status = "succeeded"
+	receiptA.Progress.State = KnownTerminal
+	createdA, err := PersistReceiptWithObligation(ctx, store, receiptA, obligationA)
 	if err != nil {
 		t.Fatalf("PersistReceiptWithObligation A: %v", err)
 	}
@@ -697,6 +702,265 @@ func TestReplayPendingForHostIsOriginBoundCursorSafeAndDoesNotAcknowledge(t *tes
 	}
 }
 
+func TestReplayPendingForHostClaimsBeforeEmitAndFencesRelease(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	obligation := baseObligation()
+	obligation.SinkID = "horigin_race"
+	receipt := baseReceipt()
+	receipt.Phase = "detached-terminal"
+	receipt.Status = "succeeded"
+	receipt.Progress.State = KnownTerminal
+	created, err := PersistReceiptWithObligation(ctx, store, receipt, obligation)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation: %v", err)
+	}
+
+	firstEmitted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	duplicateEmit := make(chan struct{}, 1)
+	var emitCount int32
+	runReplay := func(owner string) (HostReplayResult, error) {
+		return ReplayPendingForHost(ctx, store, HostReplayOptions{
+			ProjectID:     "proj_progress",
+			DeliveryRunID: "run_progress",
+			OriginKind:    "host-run-origin",
+			OriginID:      "horigin_race",
+			ClaimOwner:    owner,
+			Now:           fixedTime.Add(time.Minute),
+		}, func(ReceiptView) error {
+			if atomic.AddInt32(&emitCount, 1) == 1 {
+				close(firstEmitted)
+				<-releaseFirst
+				return nil
+			}
+			duplicateEmit <- struct{}{}
+			return nil
+		})
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runReplay("codex-race-a")
+		firstDone <- err
+	}()
+	<-firstEmitted
+
+	claimed, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation claimed: %v", err)
+	}
+	if claimed.Status != DeliveryAttempting || claimed.ClaimOwner != "codex-race-a" || claimed.ClaimGeneration != 1 {
+		t.Fatalf("claimed obligation = %#v, want active replay claim before emit returns", claimed)
+	}
+	if err := advanceDeliveryReplayCursorAndRelease(ctx, store, CursorAdvanceRequest{
+		ObligationID: created.Obligation.ObligationID,
+		ClaimOwner:   "codex-race-stale",
+		Generation:   claimed.ClaimGeneration,
+		OriginKind:   "host-run-origin",
+		OriginID:     "horigin_race",
+		CursorValue:  "stale-cursor",
+		AdvancedAt:   fixedTime.Add(time.Minute).Format(time.RFC3339Nano),
+	}); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale cursor advance error = %v, want ErrStaleClaim", err)
+	}
+	if err := releaseHostReplayClaim(ctx, store, claimed.ClaimOwner, claimed.ClaimGeneration+1, created.Obligation.ObligationID); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale release error = %v, want ErrStaleClaim", err)
+	}
+
+	secondDone := make(chan HostReplayResult, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		result, err := runReplay("codex-race-b")
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		secondDone <- result
+	}()
+	select {
+	case <-duplicateEmit:
+		close(releaseFirst)
+		t.Fatal("concurrent replayer emitted a receipt without owning the obligation claim")
+	case err := <-secondErr:
+		close(releaseFirst)
+		t.Fatalf("second replay returned error: %v", err)
+	case result := <-secondDone:
+		if result.Replayed != 0 {
+			close(releaseFirst)
+			t.Fatalf("second replay = %#v, want claim loser to emit nothing", result)
+		}
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first replay returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&emitCount); got != 1 {
+		t.Fatalf("emit count = %d, want exactly one", got)
+	}
+	after, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation after replay: %v", err)
+	}
+	if after.Status != DeliveryPending || after.ClaimOwner != "" || after.AttemptCount != 0 {
+		t.Fatalf("after replay obligation = %#v, want pending unattempted obligation", after)
+	}
+}
+
+func TestReplayPendingForHostEmitFailureReleasesWithoutAdvancingCursor(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	receipt := baseReceipt()
+	receipt.Phase = "detached-terminal"
+	receipt.Status = "failed"
+	receipt.Progress.State = KnownTerminal
+	obligation := baseObligation()
+	obligation.SinkID = "horigin_emit_failure"
+	created, err := PersistReceiptWithObligation(ctx, store, receipt, obligation)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation: %v", err)
+	}
+	emitErr := errors.New("stderr closed")
+	first, err := ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_emit_failure",
+		ClaimOwner:    "codex-emit-failure",
+		Now:           fixedTime.Add(time.Minute),
+	}, func(ReceiptView) error {
+		return emitErr
+	})
+	if !errors.Is(err, emitErr) {
+		t.Fatalf("ReplayPendingForHost error = %v, want emit error", err)
+	}
+	if first.Replayed != 0 || first.NextCursor != "" {
+		t.Fatalf("failed replay = %#v, want no replay and no cursor", first)
+	}
+	afterFailure, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation after failure: %v", err)
+	}
+	if afterFailure.Status != DeliveryPending || afterFailure.ClaimOwner != "" || afterFailure.AttemptCount != 0 {
+		t.Fatalf("obligation after emit failure = %#v, want pending unattempted obligation", afterFailure)
+	}
+	cursors, err := ListDeliveryReplayCursors(ctx, store, DeliveryCursorFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", OriginKind: "host-run-origin", OriginID: "horigin_emit_failure"})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after emit failure = %#v, want none", cursors)
+	}
+
+	var replayed []ReceiptView
+	second, err := ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_emit_failure",
+		ClaimOwner:    "codex-emit-retry",
+		Now:           fixedTime.Add(2 * time.Minute),
+	}, func(view ReceiptView) error {
+		replayed = append(replayed, view)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost retry: %v", err)
+	}
+	if second.Replayed != 1 || len(replayed) != 1 || replayed[0].Receipt.ProgressReceiptID != created.Receipt.Receipt.ProgressReceiptID {
+		t.Fatalf("retry replay = %#v views=%#v, want same receipt after emit failure", second, replayed)
+	}
+}
+
+func TestReplayPendingForHostStaleCursorAnchorFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	obligationA := baseObligation()
+	obligationA.SinkID = "horigin_stale"
+	receiptA := baseReceipt()
+	receiptA.Phase = "detached-terminal"
+	receiptA.Status = "succeeded"
+	receiptA.Progress.State = KnownTerminal
+	createdA, err := PersistReceiptWithObligation(ctx, store, receiptA, obligationA)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation A: %v", err)
+	}
+	receiptB := baseReceipt()
+	receiptB.CorrelationID = "corr_progress_b"
+	receiptB.CorrelationSequence = 2
+	receiptB.OccurredAt = fixedTime.Add(time.Second).Format(time.RFC3339Nano)
+	receiptB.Phase = "detached-terminal"
+	receiptB.Status = "failed"
+	receiptB.Progress.State = KnownTerminal
+	obligationB := baseObligation()
+	obligationB.OriginID = "corr_progress_b"
+	obligationB.SinkID = "horigin_stale"
+	if _, err := PersistReceiptWithObligation(ctx, store, receiptB, obligationB); err != nil {
+		t.Fatalf("PersistReceiptWithObligation B: %v", err)
+	}
+	first, err := ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_stale",
+		ClaimOwner:    "codex-stale",
+		Now:           fixedTime.Add(time.Minute),
+	}, func(ReceiptView) error { return nil })
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost first: %v", err)
+	}
+	if first.Replayed != 2 {
+		t.Fatalf("first replay = %#v, want both receipts consumed to latest cursor", first)
+	}
+	cursors, err := ListDeliveryReplayCursors(ctx, store, DeliveryCursorFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", OriginKind: "host-run-origin", OriginID: "horigin_stale"})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 {
+		t.Fatalf("cursors = %#v, want one cursor", cursors)
+	}
+	corrupt := cursors[0]
+	corrupt.ObligationID = "pdelobl_missing_anchor"
+	payload, err := canonicalJSON(corrupt)
+	if err != nil {
+		t.Fatalf("canonical corrupt cursor: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE progress_delivery_replay_cursors SET payload_json = ? WHERE cursor_id = ?`, string(payload), corrupt.CursorID)
+		return err
+	}); err != nil {
+		t.Fatalf("corrupt cursor payload: %v", err)
+	}
+
+	var replayed []ReceiptView
+	_, err = ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_stale",
+		ClaimOwner:    "codex-stale",
+		Now:           fixedTime.Add(2 * time.Minute),
+	}, func(view ReceiptView) error {
+		replayed = append(replayed, view)
+		return nil
+	})
+	if !errors.Is(err, ErrMissingReference) {
+		t.Fatalf("stale cursor replay error = %v, want ErrMissingReference", err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("stale cursor replayed receipts = %#v, want fail-closed with no duplicate from start", replayed)
+	}
+	if createdA.Obligation.ObligationID == corrupt.ObligationID {
+		t.Fatalf("test corruption did not change cursor anchor")
+	}
+}
+
 func TestDeliveryOutboxStaleClaimCannotRecordAfterLeaseTakeover(t *testing.T) {
 	ctx := context.Background()
 	now := fixedTime
@@ -733,6 +997,27 @@ func TestDeliveryOutboxStaleClaimCannotRecordAfterLeaseTakeover(t *testing.T) {
 	}
 	if second.ClaimGeneration != first.ClaimGeneration+1 {
 		t.Fatalf("takeover generation = %d, want %d", second.ClaimGeneration, first.ClaimGeneration+1)
+	}
+	if err := releaseHostReplayClaim(ctx, store, first.ClaimOwner, first.ClaimGeneration, created.Obligation.ObligationID); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale replay release error = %v, want ErrStaleClaim", err)
+	}
+	if err := advanceDeliveryReplayCursorAndRelease(ctx, store, CursorAdvanceRequest{
+		ObligationID: created.Obligation.ObligationID,
+		ClaimOwner:   first.ClaimOwner,
+		Generation:   first.ClaimGeneration,
+		OriginKind:   "host-run-origin",
+		OriginID:     "attached-session",
+		CursorValue:  "stale-cursor",
+		AdvancedAt:   now.Format(time.RFC3339Nano),
+	}); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale replay advance/release error = %v, want ErrStaleClaim", err)
+	}
+	afterReplayStale, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation after stale replay helpers: %v", err)
+	}
+	if afterReplayStale.ClaimOwner != second.ClaimOwner || afterReplayStale.ClaimGeneration != second.ClaimGeneration || afterReplayStale.Status != DeliveryAttempting {
+		t.Fatalf("stale replay helper changed active generation: %#v, want owner %s generation %d", afterReplayStale, second.ClaimOwner, second.ClaimGeneration)
 	}
 	_, err = BeginDeliveryAttempt(ctx, store, BeginAttemptRequest{
 		ObligationID: created.Obligation.ObligationID,

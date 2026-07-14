@@ -74,26 +74,35 @@ func ReplayPendingForHost(ctx context.Context, store storage.Store, opts HostRep
 	}
 	result := HostReplayResult{OriginKind: originKind, OriginID: originID, DeliveryOpen: len(obligations) > 0}
 	for _, obligation := range obligations {
-		receipt, order, err := loadReceiptByID(ctx, store, obligation.ProgressReceiptID)
-		if err != nil {
-			return result, err
-		}
-		view := ViewReceipt(receipt, order, "", now)
-		state, err := deliveryStateForReceipt(ctx, store, receipt.ProgressReceiptID)
-		if err != nil {
-			return result, err
-		}
-		view.DeliveryState = state
-		if err := emit(view); err != nil {
-			return result, err
-		}
 		claim, err := ClaimDeliveryObligation(ctx, store, ClaimRequest{
 			ObligationID:   obligation.ObligationID,
 			ClaimOwner:     owner,
 			LeaseExpiresAt: canonicalTimestamp(now.Add(leaseDuration)),
 		})
 		if err != nil {
-			continue
+			if errors.Is(err, ErrClaimConflict) || errors.Is(err, ErrStaleClaim) {
+				continue
+			}
+			return result, err
+		}
+		receipt, order, err := loadReceiptByID(ctx, store, obligation.ProgressReceiptID)
+		if err != nil {
+			if releaseErr := releaseHostReplayClaim(ctx, store, claim.ClaimOwner, claim.ClaimGeneration, obligation.ObligationID); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
+			return result, err
+		}
+		view := ViewReceipt(receipt, order, "", now)
+		view.DeliveryState = DeliveryStateView{
+			State:     obligation.Status,
+			Authority: "progress_delivery_obligations.status",
+			Reason:    "transport_contract=" + displayValue(obligation.TransportContract),
+		}
+		if err := emit(view); err != nil {
+			if releaseErr := releaseHostReplayClaim(ctx, store, claim.ClaimOwner, claim.ClaimGeneration, obligation.ObligationID); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
+			return result, err
 		}
 		cursorValue := prefixedDigest("preplay", map[string]any{
 			"origin_kind":   originKind,
@@ -150,6 +159,16 @@ func pendingHostReplayObligations(ctx context.Context, store storage.Store, proj
 	query := `SELECT obligation_id FROM progress_delivery_obligations
 		WHERE project_id = ? AND delivery_run_id = ? AND sink_kind = 'host' AND sink_id = ?
 			AND (status = ? OR (status = ? AND (next_attempt_at = '' OR next_attempt_at <= ?)))
+			AND EXISTS (
+				SELECT 1 FROM progress_receipts
+				WHERE progress_receipts.progress_receipt_id = progress_delivery_obligations.progress_receipt_id
+					AND (
+						COALESCE(json_extract(progress_json, '$.state'), '') = 'terminal'
+						OR phase = 'detached-terminal'
+						OR status IN ('succeeded', 'failed', 'cancelled', 'needs-human', 'timed-out', 'abandoned')
+						OR COALESCE(json_extract(blocker_json, '$.state'), '') NOT IN ('', 'none', 'unknown')
+					)
+			)
 			AND (created_at > ? OR (created_at = ? AND obligation_id > ?))
 		ORDER BY created_at, obligation_id LIMIT ?`
 	args := []any{projectID, deliveryRunID, sinkID, DeliveryPending, DeliveryRetryableFailure, canonicalTimestamp(now), afterCreatedAt, afterCreatedAt, afterID, limit}
@@ -187,7 +206,7 @@ func hostReplayCursorPosition(ctx context.Context, store storage.Store, obligati
 	err := store.WithTx(ctx, func(tx storage.Tx) error {
 		if err := tx.QueryRow(ctx, `SELECT created_at FROM progress_delivery_obligations WHERE obligation_id = ?`, obligationID).Scan(&createdAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return nil
+				return typed(ErrMissingReferenceCode, "host replay cursor anchor %s not found", obligationID)
 			}
 			return fmt.Errorf("read host replay cursor position: %w", err)
 		}
@@ -197,6 +216,42 @@ func hostReplayCursorPosition(ctx context.Context, store storage.Store, obligati
 		return "", "", err
 	}
 	return createdAt, obligationID, nil
+}
+
+func releaseHostReplayClaim(ctx context.Context, store storage.Store, owner string, generation int64, obligationID string) error {
+	if store == nil {
+		return typed(ErrInvalidRecordCode, "store is required")
+	}
+	now := store.Now()
+	owner = sanitizeID(owner)
+	obligationID = sanitizeID(obligationID)
+	if owner == "" || generation <= 0 || obligationID == "" {
+		return typed(ErrInvalidRecordCode, "obligation and claim are required")
+	}
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		obligation, err := loadDeliveryObligationTx(ctx, tx, obligationID)
+		if err != nil {
+			return err
+		}
+		if err := requireCurrentClaim(obligation, owner, generation, now); err != nil {
+			return err
+		}
+		res, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
+			SET status = ?, claim_owner = '', claimed_at = '', claim_expires_at = '', updated_at = ?
+			WHERE obligation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ?`,
+			DeliveryPending, canonicalTimestamp(now), obligation.ObligationID, DeliveryAttempting, owner, generation)
+		if err != nil {
+			return fmt.Errorf("release host replay claim: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("release host replay claim rows affected: %w", err)
+		}
+		if rows != 1 {
+			return typed(ErrStaleClaimCode, "obligation %s replay release lost active claim fence", obligation.ObligationID)
+		}
+		return nil
+	})
 }
 
 func loadReceiptByID(ctx context.Context, store storage.Store, progressReceiptID string) (ProgressReceipt, int64, error) {

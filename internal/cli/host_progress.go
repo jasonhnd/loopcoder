@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,15 +38,11 @@ func codexHostSink(projectID, deliveryRunID, correlationID, fallbackSinkID strin
 }
 
 func replayCodexHostProgressBeforeDispatch(ctx context.Context, repoPath, runID string, stderr io.Writer, deps Deps) error {
-	if stderr == nil || strings.TrimSpace(runID) == "" {
+	if stderr == nil {
 		return nil
 	}
 	roots, err := runtimepath.Resolve(ctx, repoPath)
 	if err != nil || !roots.Registered || roots.ProjectID == "" || roots.DatabasePath == "" {
-		return nil
-	}
-	binding := codexHostOriginBinding(roots.ProjectID, runID, runID)
-	if !binding.Bound {
 		return nil
 	}
 	now := deps.Now
@@ -62,25 +59,135 @@ func replayCodexHostProgressBeforeDispatch(ctx context.Context, repoPath, runID 
 		return fmt.Errorf("open Codex host progress replay store: %w", err)
 	}
 	defer store.Close()
+	if strings.TrimSpace(runID) != "" {
+		_, err := replayCodexHostProgressForRun(ctx, store, roots.ProjectID, runID, runID, stderr, now, progress.DefaultHostReplayLimit)
+		return err
+	}
+	candidates, err := codexHostReplayCandidates(ctx, store, roots.ProjectID, now().UTC(), progress.DefaultHostReplayLimit)
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	replayed := 0
+	for _, candidate := range candidates {
+		for _, correlationID := range candidate.correlationIDs() {
+			if replayed >= progress.DefaultHostReplayLimit {
+				return nil
+			}
+			binding := codexHostOriginBinding(roots.ProjectID, candidate.deliveryRunID, correlationID)
+			if !binding.Bound {
+				continue
+			}
+			key := candidate.deliveryRunID + "\x00" + binding.BindingID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			count, err := replayCodexHostProgressForRun(ctx, store, roots.ProjectID, candidate.deliveryRunID, correlationID, stderr, now, progress.DefaultHostReplayLimit-replayed)
+			if err != nil {
+				if errors.Is(err, progress.ErrMissingReference) {
+					fmt.Fprintf(stderr, "[loopcoder] skipped Codex progress replay for run %s: %v. Use `loopcoder status --repo %s --run %s --receipts` or `loopcoder attach --repo %s --run %s` to inspect durable receipts.\n", candidate.deliveryRunID, err, repoPath, candidate.deliveryRunID, repoPath, candidate.deliveryRunID)
+					continue
+				}
+				return err
+			}
+			replayed += count
+		}
+	}
+	return nil
+}
+
+type codexHostReplayCandidate struct {
+	deliveryRunID string
+	originID      string
+}
+
+func (c codexHostReplayCandidate) correlationIDs() []string {
+	runID := strings.TrimSpace(c.deliveryRunID)
+	originID := strings.TrimSpace(c.originID)
+	if originID == "" || originID == runID {
+		return []string{runID}
+	}
+	return []string{runID, originID}
+}
+
+func replayCodexHostProgressForRun(ctx context.Context, store storage.Store, projectID, runID, correlationID string, stderr io.Writer, now func() time.Time, limit int) (int, error) {
+	binding := codexHostOriginBinding(projectID, runID, correlationID)
+	if !binding.Bound {
+		return 0, nil
+	}
+	if limit <= 0 {
+		return 0, nil
+	}
 	var views []progress.ReceiptView
-	_, err = progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
-		ProjectID:     roots.ProjectID,
+	_, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+		ProjectID:     projectID,
 		DeliveryRunID: runID,
 		OriginKind:    "host-run-origin",
 		OriginID:      binding.BindingID,
 		ClaimOwner:    "codex-host-replay",
-		Limit:         progress.DefaultHostReplayLimit,
+		Limit:         limit,
 		Now:           now().UTC(),
 	}, func(view progress.ReceiptView) error {
 		views = append(views, view)
 		return nil
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(views) == 0 {
-		return nil
+		return 0, nil
 	}
 	fmt.Fprintf(stderr, "[loopcoder] replaying %d pending progress receipt(s) for Codex origin %s\n", len(views), binding.BindingID)
-	return progress.RenderHuman(stderr, views)
+	return len(views), progress.RenderHuman(stderr, views)
+}
+
+func codexHostReplayCandidates(ctx context.Context, store storage.Store, projectID string, now time.Time, limit int) ([]codexHostReplayCandidate, error) {
+	limit = codexHostReplayCandidateLimit(limit)
+	query := `SELECT o.delivery_run_id, o.origin_id, MIN(o.created_at) AS first_created_at
+		FROM progress_delivery_obligations o
+		JOIN progress_receipts r ON r.progress_receipt_id = o.progress_receipt_id
+		WHERE o.project_id = ? AND o.sink_kind = 'host' AND o.transport_contract = ?
+			AND (o.status = ? OR (o.status = ? AND (o.next_attempt_at = '' OR o.next_attempt_at <= ?)))
+			AND (
+				COALESCE(json_extract(r.progress_json, '$.state'), '') = 'terminal'
+				OR r.phase = 'detached-terminal'
+				OR r.status IN ('succeeded', 'failed', 'cancelled', 'needs-human', 'timed-out', 'abandoned')
+				OR COALESCE(json_extract(r.blocker_json, '$.state'), '') NOT IN ('', 'none', 'unknown')
+			)
+		GROUP BY o.delivery_run_id, o.origin_id
+		ORDER BY first_created_at, o.delivery_run_id, o.origin_id
+		LIMIT ?`
+	args := []any{strings.TrimSpace(projectID), runtimecap.HostProgressKnownOriginReplay, progress.DeliveryPending, progress.DeliveryRetryableFailure, now.UTC().Format(time.RFC3339Nano), limit}
+	var out []codexHostReplayCandidate
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("list Codex host replay candidates: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var candidate codexHostReplayCandidate
+			var firstCreatedAt string
+			if err := rows.Scan(&candidate.deliveryRunID, &candidate.originID, &firstCreatedAt); err != nil {
+				return fmt.Errorf("list Codex host replay candidates scan: %w", err)
+			}
+			out = append(out, candidate)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list Codex host replay candidates rows: %w", err)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func codexHostReplayCandidateLimit(limit int) int {
+	if limit <= 0 {
+		return progress.DefaultHostReplayLimit
+	}
+	if limit > progress.MaxHostReplayLimit {
+		return progress.MaxHostReplayLimit
+	}
+	return limit
 }

@@ -55,6 +55,19 @@ claimable immediately; retryable failures are claimable only at or after
 `next_attempt_at`; delivered, terminal, acknowledged, unsupported, expired, and
 superseded obligations are not claimable retry work.
 
+Codex host replay is bounded and cursor ordered. Before dispatch starts worker
+mechanics, an explicit `--run-id` replays only that run's exact Codex origin
+binding; an ordinary later dispatch without `--run-id` scans at most the host
+replay limit of prior project delivery-run candidates with pending or due
+retryable host obligations, ordered by first obligation `created_at`, run ID,
+and correlation/origin ID. Each candidate recomputes the run-scoped Codex
+origin binding from the current opaque host origin and replays only exact
+`sink_id` matches, so other hosts, projects, runs, and non-matching chatter are
+ignored. Within a run, receipts replay in obligation `created_at, obligation_id`
+order and advance a per-origin cursor only after a claim-fenced human emit
+succeeds; a non-empty cursor whose anchor cannot be read is a fail-closed
+diagnostic instead of "start from zero."
+
 Adapters and recovery readers must use project/delivery-run scoped read APIs:
 `ReadDeliveryObligation`, `ListDeliveryObligations`,
 `ListDeliveryAttempts`, `ListDeliveryAcknowledgments`, and
