@@ -127,10 +127,13 @@ loopcoder promote      --repo .               # may change production branch whe
 loopcoder upgrade --version 0.7.0             # signed self-upgrade from GitHub Releases
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
+loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --detach
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder attach        --repo . --run <run-id> # follow durable detached run progress
+loopcoder cancel        --repo . --run <run-id> # request detached run cancellation
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch

@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
@@ -2222,6 +2223,15 @@ func clearGitSelectionEnvForFixture(t *testing.T) {
 	} {
 		t.Setenv(key, "")
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func statusProgressProjectID(t *testing.T, store storage.Store) string {
@@ -5073,6 +5083,76 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 		if strings.Contains(stdout.String(), disallowed) {
 			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
 		}
+	}
+}
+
+func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	var launchedArgs []string
+	var launchedLog string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Detached supervision",
+		"--run-id", "run-20260714T040000Z-issue-898",
+		"--detach",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		StartDetachedDispatch: func(_ context.Context, args []string, logPath string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			launchedLog = logPath
+			store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatalf("open store in launcher: %v", err)
+			}
+			defer store.Close()
+			record, err := detachedrun.Get(ctx, store, "run-20260714T040000Z-issue-898")
+			if err != nil {
+				t.Fatalf("launcher did not observe durable claim: %v", err)
+			}
+			if record.ProjectID != registered.Project.ProjectID || record.Status != detachedrun.StatusNotStarted {
+				t.Fatalf("claim before launcher = %#v", record)
+			}
+			return 4242, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var launch struct {
+		Detached   bool   `json:"detached"`
+		RunID      string `json:"run_id"`
+		ProjectID  string `json:"project_id"`
+		Status     string `json:"status"`
+		PID        int    `json:"pid"`
+		Owner      string `json:"supervisor_owner"`
+		Generation int64  `json:"supervisor_generation"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040000Z-issue-898" || launch.ProjectID != registered.Project.ProjectID || launch.Status != detachedrun.StatusRunning || launch.PID != 4242 || launch.Owner == "" || launch.Generation != 1 {
+		t.Fatalf("launch = %#v", launch)
+	}
+	if !containsString(launchedArgs, "--supervisor-run") || !containsString(launchedArgs, "--supervisor-owner") || !containsString(launchedArgs, launch.Owner) {
+		t.Fatalf("launched args missing supervisor fence: %#v", launchedArgs)
+	}
+	if !strings.Contains(launchedLog, launch.RunID) || strings.Contains(launchedLog, repo) {
+		t.Fatalf("launched log path = %q, want machine-local redacted path containing run id only", launchedLog)
 	}
 }
 

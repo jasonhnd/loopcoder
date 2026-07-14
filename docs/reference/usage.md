@@ -103,6 +103,8 @@ Command side effects in the first-run path:
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
+| `loopcoder attach --repo . --run <run-id>` | Read-only durable detached run progress follow. |
+| `loopcoder cancel --repo . --run <run-id>` | Requests cancellation for a LoopCoder-owned detached run. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
 | `loopcoder promote --repo .` | May change the configured production branch, subject to `adapters.gate` and the human command that invokes promotion. |
 
@@ -1004,6 +1006,12 @@ loopcoder dispatch \
   --strict \
   --pretty
 
+loopcoder dispatch \
+  --repo . \
+  --issue-number <number> \
+  --issue-title "<title>" \
+  --detach
+
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
 
 loopcoder tick --repo . --strict
@@ -1013,6 +1021,8 @@ loopcoder promote --repo .
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
 loopcoder status --repo . --format json
+loopcoder attach --repo . --run <run-id>
+loopcoder cancel --repo . --run <run-id>
 loopcoder report --repo .
 loopcoder report --repo . --verbose
 loopcoder report --repo . --format json

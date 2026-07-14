@@ -23,6 +23,7 @@ import (
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
@@ -97,6 +98,8 @@ type Deps struct {
 	StatePull                func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
 	LeaseAcquire             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 	LeaseRelease             func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch    func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree          func(pid int) error
 }
 
 var commands = []Command{
@@ -124,10 +127,12 @@ var commands = []Command{
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
+	{Name: "attach", Summary: "attach to durable detached run progress"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
+	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
@@ -257,6 +262,8 @@ func DefaultDeps() Deps {
 		LeaseRelease: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
+		StartDetachedDispatch: startDetachedDispatchProcess,
+		KillProcessTree:       process.KillTree,
 	}
 }
 
@@ -391,6 +398,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "status" {
 		return runStatus(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "attach" {
+		return runAttach(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "report" {
 		return runReport(args[1:], stdout, stderr)
 	}
@@ -468,6 +478,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "cancel" {
+		return runCancel(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "loopreview" {
 		return runLoopreview(args[1:], stdout, stderr, deps)
@@ -573,6 +586,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
+		fmt.Fprintln(w, "  --detach                    launch a bounded detached supervisor and return a run record")
 		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -618,6 +632,15 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
 		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
 		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
+	}
+	if command.Name == "attach" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to attach")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --cursor string        opaque receipt cursor to resume after")
+		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
+		fmt.Fprintln(w, "  --format string        output format: text or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -760,6 +783,14 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
 		fmt.Fprintln(w, "  --strict                        reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --detached                      reconcile detached supervisor state by --run-id without retrying worker dispatch")
+		fmt.Fprintln(w, "  --format string                 output format for --detached: text or json (default \"text\")")
+	}
+	if command.Name == "cancel" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to cancel")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -4170,6 +4201,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var supervisorRun bool
+	var supervisorOwner string
+	var supervisorGeneration int64
 	format := "text"
 	var formatAlias string
 	var verbose bool
@@ -4207,6 +4243,11 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&supervisorRun, "supervisor-run", false, "run as detached supervisor child")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "detached supervisor generation")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
@@ -4260,6 +4301,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	detach = detach || detachAlias
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -4290,6 +4332,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if opts.Timeout < 0 {
 		fmt.Fprintln(stderr, "dispatch: --timeout must not be negative")
+		return 2
+	}
+	if detach && supervisorRun {
+		fmt.Fprintln(stderr, "dispatch: --detach cannot be combined with --supervisor-run")
 		return 2
 	}
 
@@ -4329,6 +4375,13 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.Provider = selection.Provider
 	opts.Model = selection.Model
 	opts.Effort = selection.Effort
+
+	if detach {
+		return runDetachedDispatch(opts, outputMode.Format, stdout, stderr, deps)
+	}
+	if supervisorRun {
+		return runDispatchSupervisor(opts, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, deps)
+	}
 
 	result, err := deps.Dispatch(context.Background(), opts)
 	if err != nil {
@@ -5271,6 +5324,10 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var verifierTimeoutAlias time.Duration
 	var strict bool
 	var strictAlias bool
+	var detached bool
+	var detachedAlias bool
+	format := "text"
+	var formatAlias string
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -5296,6 +5353,10 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&detached, "detached", false, "reconcile a detached run supervisor by run id")
+	fs.BoolVar(&detachedAlias, "Detached", false, "reconcile a detached run supervisor by run id")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
@@ -5367,6 +5428,10 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.VerifierTimeout = verifierTimeoutAlias
 	}
 	strict = strict || strictAlias
+	detached = detached || detachedAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
 	opts.Stderr = stderr
 
 	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
@@ -5379,6 +5444,18 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "recover: --repo is required")
 		return 2
+	}
+	if detached {
+		if strings.TrimSpace(opts.RunID) == "" {
+			fmt.Fprintln(stderr, "recover: --run-id is required")
+			return 2
+		}
+		resolvedRepo, err := resolveRepo(opts.RepoPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "recover: %v\n", err)
+			return 2
+		}
+		return runDetachedRecover(resolvedRepo, opts.RunID, format, stdout, stderr, deps)
 	}
 	if opts.IssueNumber <= 0 {
 		fmt.Fprintln(stderr, "recover: --issue-number is required")

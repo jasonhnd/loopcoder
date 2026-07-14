@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 28
+	CurrentSchemaVersion = 29
 
 	driverName = "sqlite"
 
@@ -436,6 +436,11 @@ var migrations = []migration{
 		name:       "progress delivery outbox",
 		statements: progressDeliveryOutboxSchemaStatements,
 	},
+	{
+		version:    29,
+		name:       "detached run supervisors",
+		statements: detachedRunSupervisorSchemaStatements,
+	},
 }
 
 var requiredTables = []string{
@@ -495,6 +500,7 @@ var requiredTables = []string{
 	"progress_delivery_attempt_results",
 	"progress_delivery_acknowledgments",
 	"progress_delivery_replay_cursors",
+	"detached_run_supervisors",
 	"handoff_transactions",
 	"nested_scheduler_resource_reservations",
 	"agent_scope_grants",
