@@ -21,6 +21,21 @@ function Require-Command([string]$Name) {
     }
 }
 
+function Assert-DarwinArm64GoHost {
+    $goos = (& go env GOOS).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to resolve Go host GOOS"
+    }
+    $goarch = (& go env GOARCH).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to resolve Go host GOARCH"
+    }
+    Write-Host "Go host tuple: $goos/$goarch"
+    if ($goos -ne "darwin" -or $goarch -ne "arm64") {
+        Fail "release smoke must run on darwin/arm64; got $goos/$goarch"
+    }
+}
+
 function Invoke-Checked([string]$Label, [scriptblock]$Block) {
     Write-Host "==> $Label"
     & $Block
@@ -79,29 +94,12 @@ function Assert-DoctorCheckIsReady([object]$Entry, [string]$Label) {
 }
 
 function Get-PlatformAssetName([string]$SelectedVersion) {
-    $goos = switch ($PSVersionTable.Platform) {
-        "Unix" {
-            if ($IsMacOS) { "darwin" } else { "linux" }
-        }
-        default { "windows" }
-    }
-    if ($IsWindows) {
-        $goos = "windows"
-    }
-
-    $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-        "X64" { "amd64" }
-        "Arm64" { "arm64" }
-        default { Fail "unsupported architecture: $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)" }
-    }
-    $ext = if ($goos -eq "windows") { "zip" } else { "tar.gz" }
-    return "loopcoder_${SelectedVersion}_${goos}_${arch}.${ext}"
+    return "loopcoder_${SelectedVersion}_darwin_arm64.tar.gz"
 }
 
 function Expand-LoopcoderArchive([string]$Archive, [string]$Destination) {
-    if ($Archive.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
-        Expand-Archive -LiteralPath $Archive -DestinationPath $Destination -Force
-        return
+    if (-not $Archive.EndsWith("_darwin_arm64.tar.gz", [System.StringComparison]::Ordinal)) {
+        Fail "unsupported release archive format: $(Split-Path -Leaf $Archive)"
     }
     tar -xzf $Archive -C $Destination
     if ($LASTEXITCODE -ne 0) {
@@ -109,7 +107,35 @@ function Expand-LoopcoderArchive([string]$Archive, [string]$Destination) {
     }
 }
 
-function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
+function Assert-AssetNameSet([string[]]$Names, [string[]]$Expected, [string]$Label) {
+    $actual = @($Names | Sort-Object)
+    $want = @($Expected | Sort-Object)
+    if ($actual.Count -ne $want.Count) {
+        Fail "$Label asset inventory contains $($actual.Count) files; want $($want.Count): $($actual -join ', ')"
+    }
+    for ($i = 0; $i -lt $want.Count; $i++) {
+        if ($actual[$i] -ne $want[$i]) {
+            Fail "$Label asset inventory mismatch; got $($actual -join ', '), want $($want -join ', ')"
+        }
+    }
+}
+
+function Assert-RemoteReleaseAssetInventory([string]$SelectedTag, [string]$SelectedAsset, [string]$Label) {
+    $inventoryOutput = @(& gh release view $SelectedTag --repo $Repo --json assets)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to inspect $Label release asset inventory"
+    }
+    $inventory = ConvertFrom-JsonOutput $inventoryOutput "$Label release asset inventory"
+    $assetNames = @($inventory.assets | ForEach-Object { [string]$_.name })
+    Assert-AssetNameSet $assetNames @($SelectedAsset, "SHA256SUMS", "SHA256SUMS.sigstore") "$Label remote release"
+}
+
+function Assert-LocalReleaseAssetInventory([string]$ReleaseDir, [string]$SelectedAsset, [string]$Label) {
+    $assetNames = @(Get-ChildItem -LiteralPath $ReleaseDir -File | ForEach-Object { $_.Name })
+    Assert-AssetNameSet $assetNames @($SelectedAsset, "SHA256SUMS", "SHA256SUMS.sigstore") "$Label downloaded release"
+}
+
+function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label, [bool]$RequireExactRemoteInventory = $false) {
     $selectedTag = if ($SelectedVersion.StartsWith("v")) { $SelectedVersion } else { "v$SelectedVersion" }
     $selectedPlainVersion = $selectedTag.TrimStart("v")
     $selectedAsset = Get-PlatformAssetName $selectedPlainVersion
@@ -120,6 +146,9 @@ function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
 
     Invoke-Checked "check $Label release exists" {
         gh release view $selectedTag --repo $Repo | Out-Host
+    }
+    if ($RequireExactRemoteInventory) {
+        Assert-RemoteReleaseAssetInventory -SelectedTag $selectedTag -SelectedAsset $selectedAsset -Label $Label
     }
 
     $archivePath = Join-Path $releaseDir $selectedAsset
@@ -134,6 +163,7 @@ function Get-ReleaseArchive([string]$SelectedVersion, [string]$Label) {
             Fail "downloaded $Label release did not include $(Split-Path -Leaf $requiredPath)"
         }
     }
+    Assert-LocalReleaseAssetInventory -ReleaseDir $releaseDir -SelectedAsset $selectedAsset -Label $Label
 
     Invoke-Checked "verify $Label SHA256SUMS signature" {
         cosign verify-blob $sumsPath --bundle $signaturePath --certificate-identity $identity --certificate-oidc-issuer $issuer | Out-Host
@@ -348,6 +378,8 @@ function Invoke-WithMockReleaseApi([object]$Server, [scriptblock]$Block) {
     }
 }
 
+Require-Command "go"
+Assert-DarwinArm64GoHost
 Require-Command "gh"
 Require-Command "git"
 Require-Command "cosign"
@@ -372,13 +404,13 @@ $sourceRepo = (Resolve-Path -LiteralPath (Join-Path $scriptRoot "..")).Path
 $mockReleaseApi = $null
 
 try {
-    $release = Get-ReleaseArchive $plainVersion "candidate"
+    $release = Get-ReleaseArchive $plainVersion "candidate" $true
     $mockReleaseApi = Start-LocalReleaseApi $release
 
     $extractDir = Join-Path $tmp "extract"
     New-Item -ItemType Directory -Path $extractDir | Out-Null
     Expand-LoopcoderArchive -Archive $release.ArchivePath -Destination $extractDir
-    $binary = Join-Path $extractDir ($(if ($IsWindows) { "loopcoder.exe" } else { "loopcoder" }))
+    $binary = Join-Path $extractDir "loopcoder"
     if (-not (Test-Path -LiteralPath $binary)) {
         Fail "archive did not contain loopcoder binary"
     }
@@ -581,7 +613,7 @@ try {
         $previousExtractDir = Join-Path $tmp "previous-extract"
         New-Item -ItemType Directory -Path $previousExtractDir | Out-Null
         Expand-LoopcoderArchive -Archive $previous.ArchivePath -Destination $previousExtractDir
-        $previousBinary = Join-Path $previousExtractDir ($(if ($IsWindows) { "loopcoder.exe" } else { "loopcoder" }))
+        $previousBinary = Join-Path $previousExtractDir "loopcoder"
         if (-not (Test-Path -LiteralPath $previousBinary)) {
             Fail "previous archive did not contain loopcoder binary"
         }
