@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,7 +37,25 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 			t.Fatalf("seed source receipt: %v", err)
 		}
 	})
-	defer store.Close()
+	activeStore := store
+	closeActiveStore := func(label string) {
+		t.Helper()
+		if activeStore == nil {
+			return
+		}
+		if err := activeStore.Close(); err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		activeStore = nil
+	}
+	t.Cleanup(func() {
+		if activeStore != nil {
+			if err := activeStore.Close(); err != nil {
+				t.Errorf("cleanup active canonical store: %v", err)
+			}
+			activeStore = nil
+		}
+	})
 	makeClaudeEligibleOnly(input)
 
 	var sourceEffect, receiptReuse, destinationLaunch, continuedEffect, verifierEmission, reportEmission atomic.Int64
@@ -135,13 +155,12 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 	}
 	assertCanonicalReplay(t, ctx, store, result, sameProcessReplay, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect)
 
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
+	closeActiveStore("close store")
 	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
+	activeStore = reopened
 	store = reopened
 	reopenedReplay, err := ResumeApprovedHandoff(ctx, store, replayInput)
 	if err != nil {
@@ -157,24 +176,36 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			var goroutineErr error
+			defer func() {
+				if goroutineErr != nil {
+					errs <- goroutineErr
+				}
+			}()
 			target := store
+			var other storage.Store
 			if i%2 == 1 {
-				other, openErr := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
+				var openErr error
+				other, openErr = storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return fixture.now }})
 				if openErr != nil {
-					errs <- openErr
+					goroutineErr = openErr
 					return
 				}
-				defer other.Close()
+				defer func() {
+					if closeErr := other.Close(); closeErr != nil && goroutineErr == nil {
+						goroutineErr = closeErr
+					}
+				}()
 				target = other
 			}
 			<-start
 			concurrent, resumeErr := ResumeApprovedHandoff(ctx, target, replayInput)
 			if resumeErr != nil {
-				errs <- resumeErr
+				goroutineErr = resumeErr
 				return
 			}
 			if concurrent.Successor.AttemptID != result.Successor.AttemptID || concurrent.Successor.LaunchExposed {
-				errs <- errors.New("concurrent replay exposed duplicate canonical launch")
+				goroutineErr = errors.New("concurrent replay exposed duplicate canonical launch")
 			}
 		}(i)
 	}
@@ -211,6 +242,11 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 		t.Fatalf("stale source authoritative completion error = %v, want ErrHandoffReplayMismatch", err)
 	}
 	assertCanonicalCounters(t, &sourceEffect, &receiptReuse, &destinationLaunch, &continuedEffect, &verifierEmission, &reportEmission, 1, 1, 1, 1, 1, 1)
+
+	closeActiveStore("close reopened canonical store")
+	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+		t.Fatalf("remove canonical db directory after closing all stores: %v", err)
+	}
 }
 
 func TestResumeApprovedHandoffRoutesProviderAToProviderBOnce(t *testing.T) {
