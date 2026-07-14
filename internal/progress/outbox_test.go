@@ -259,6 +259,58 @@ func TestDeliveryOutboxClaimAttemptAckAndCursorFencing(t *testing.T) {
 	}
 }
 
+func TestDeliveryLifecycleStatesRequireExactEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	created, err := PersistReceiptWithObligation(ctx, store, baseReceipt(), baseObligation())
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation: %v", err)
+	}
+	claim, err := ClaimDeliveryObligation(ctx, store, ClaimRequest{
+		ObligationID:   created.Obligation.ObligationID,
+		ClaimOwner:     "supervisor-lifecycle",
+		LeaseExpiresAt: fixedTime.Add(time.Minute).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("ClaimDeliveryObligation: %v", err)
+	}
+	attempt := beginDeliveryAttemptForClaim(t, ctx, store, created.Obligation.ObligationID, claim)
+
+	if _, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
+		ResultStatus: DeliveryDeliveredUnacknowledged,
+		Evidence:     DeliveryEvidence{EvidenceKind: "unknown", EvidenceRef: "", TransportContract: "host-jsonl-v1"},
+	})); !errors.Is(err, ErrEvidenceRejected) {
+		t.Fatalf("delivery without exact transport evidence error = %v, want ErrEvidenceRejected", err)
+	}
+	pending, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", created.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation: %v", err)
+	}
+	if pending.Status != DeliveryAttempting {
+		t.Fatalf("status after rejected evidence = %q, want attempting", pending.Status)
+	}
+
+	unsupported, err := RecordDeliveryAttemptResult(ctx, store, bindAttemptResult(attempt, AttemptResultRequest{
+		ResultStatus: DeliveryUnsupported,
+		Evidence:     DeliveryEvidence{EvidenceKind: "transport-unsupported", EvidenceRef: "negotiation-downgrade", TransportContract: "host-jsonl-v1"},
+		ErrorCode:    "unsupported-push-transport",
+	}))
+	if err != nil {
+		t.Fatalf("RecordDeliveryAttemptResult unsupported: %v", err)
+	}
+	if unsupported.Status != DeliveryUnsupported {
+		t.Fatalf("unsupported status = %q, want unsupported", unsupported.Status)
+	}
+	if _, err := AcknowledgeDelivery(ctx, store, bindAcknowledgment(attempt, AcknowledgmentRequest{
+		Evidence: DeliveryEvidence{EvidenceKind: "host-visible", EvidenceRef: "late-visibility", TransportContract: "host-jsonl-v1"},
+	})); !errors.Is(err, ErrEvidenceRejected) {
+		t.Fatalf("ack after unsupported error = %v, want ErrEvidenceRejected", err)
+	}
+	assertProgressCount(t, ctx, store, `SELECT COUNT(*) FROM progress_delivery_acknowledgments`, 0)
+}
+
 func TestDeliveryOutboxAttemptResultReplayDoesNotDoubleCount(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t, ctx)

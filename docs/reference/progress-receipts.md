@@ -38,6 +38,15 @@ advance delivery state. Acknowledgment requires typed host/transport evidence
 matching the obligation contract, and stdout bytes alone are not acknowledgment
 unless the explicit transport contract says so.
 
+Host progress transport is negotiated by the provider-neutral runtime
+capability contract in [`runtime-capabilities.md`](runtime-capabilities.md).
+Negotiation distinguishes receipt generation, transport write, host acceptance,
+user visibility, and acknowledgment, but it is only a capability/evidence
+policy. It never mutates the outbox and never proves that a push, visibility
+event, or acknowledgment happened. Unsupported active push paths must downgrade
+to durable follow/poll and then next-invocation replay without promoting a
+delivery obligation beyond the exact evidence recorded in the outbox.
+
 Retryable delivery failures persist `next_attempt_at` on both the obligation
 and attempt history. When a caller does not provide an explicit future time,
 the outbox schedules deterministic bounded backoff from the injected store clock

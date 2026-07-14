@@ -2,7 +2,10 @@ package runtimecap_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
@@ -53,6 +56,305 @@ func TestNegotiateHostFixturesAreDeterministic(t *testing.T) {
 				t.Fatalf("streaming = %#v, want supported stdout/stderr", first.Streaming)
 			}
 		})
+	}
+}
+
+func TestNegotiateHostProgressTransportModes(t *testing.T) {
+	tests := []struct {
+		name         string
+		capabilities []runtimecap.HostCapabilityDeclaration
+		origin       runtimecap.HostRunOriginDeclaration
+		contract     string
+		ackPolicy    string
+		wakeCode     string
+		ackCode      string
+	}{
+		{
+			name:         "acknowledged streaming",
+			capabilities: progressCapabilities(runtimecap.HostCallbacks, runtimecap.HostWakeUp, runtimecap.HostAcknowledgment),
+			origin:       originDeclaration("host-session-ack", nil),
+			contract:     runtimecap.HostProgressAcknowledgedStreaming,
+			ackPolicy:    runtimecap.HostProgressAckRequired,
+			wakeCode:     runtimecap.HostStageEvidenceRequired,
+			ackCode:      runtimecap.HostStageEvidenceRequired,
+		},
+		{
+			name:         "unacknowledged streaming",
+			capabilities: progressCapabilities(runtimecap.HostCallbacks, runtimecap.HostWakeUp),
+			origin:       originDeclaration("host-session-unack", nil),
+			contract:     runtimecap.HostProgressUnacknowledgedStreaming,
+			ackPolicy:    runtimecap.HostProgressAckNone,
+			wakeCode:     runtimecap.HostStageEvidenceRequired,
+			ackCode:      runtimecap.HostStageUnsupported,
+		},
+		{
+			name:         "poll follow only",
+			capabilities: progressCapabilities(runtimecap.HostDurablePolling, runtimecap.HostResumableFollow),
+			contract:     runtimecap.HostProgressDurableFollowPoll,
+			ackPolicy:    runtimecap.HostProgressAckNone,
+			wakeCode:     runtimecap.HostStageUnsupported,
+			ackCode:      runtimecap.HostStageUnsupported,
+		},
+		{
+			name:         "known origin without wake",
+			capabilities: progressCapabilities(),
+			origin:       originDeclaration("known-origin-no-wake", nil),
+			contract:     runtimecap.HostProgressKnownOriginReplay,
+			ackPolicy:    runtimecap.HostProgressAckNone,
+			wakeCode:     runtimecap.HostStageUnsupported,
+			ackCode:      runtimecap.HostStageUnsupported,
+		},
+		{
+			name:         "generic unknown host",
+			capabilities: progressCapabilities(),
+			contract:     runtimecap.HostProgressNextInvocationReplay,
+			ackPolicy:    runtimecap.HostProgressAckNone,
+			wakeCode:     runtimecap.HostStageUnsupported,
+			ackCode:      runtimecap.HostStageUnsupported,
+		},
+		{
+			name:         "synthetic future host declaration",
+			capabilities: progressCapabilities(runtimecap.HostCallbacks, runtimecap.HostWakeUp, runtimecap.HostAcknowledgment, runtimecap.HostDetachedSteering, runtimecap.HostDetachedCancellation),
+			origin:       originDeclaration("future-host-origin", map[string]string{"schema": "future"}),
+			contract:     runtimecap.HostProgressAcknowledgedStreaming,
+			ackPolicy:    runtimecap.HostProgressAckRequired,
+			wakeCode:     runtimecap.HostStageEvidenceRequired,
+			ackCode:      runtimecap.HostStageEvidenceRequired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+				SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+				Host:          runtimecap.HostProfileRecord{Name: tt.name, Source: "fixture-declaration"},
+				Capabilities:  tt.capabilities,
+				ProgressLimits: runtimecap.HostProgressLimitDeclaration{
+					MaxPayloadBytes:      32768,
+					MaxEnvelopeBytes:     65536,
+					MaxReceiptsPerMinute: 120,
+					MaxOutstanding:       8,
+				},
+				Origin: runtimecap.HostRunOriginBindingRequest{
+					ProjectID:     "proj_transport",
+					DeliveryRunID: "run_transport",
+					CorrelationID: "corr_transport",
+					Origin:        tt.origin,
+				},
+			})
+			if contract.Progress.TransportContract != tt.contract || contract.Progress.AckPolicy != tt.ackPolicy {
+				t.Fatalf("progress = %#v", contract.Progress)
+			}
+			if got := stageCode(contract.Progress.Stages, runtimecap.HostProgressStageWakeUp); got != tt.wakeCode {
+				t.Fatalf("wake stage code = %q, want %q; stages=%#v", got, tt.wakeCode, contract.Progress.Stages)
+			}
+			if got := stageCode(contract.Progress.Stages, runtimecap.HostProgressStageAcknowledgment); got != tt.ackCode {
+				t.Fatalf("ack stage code = %q, want %q; stages=%#v", got, tt.ackCode, contract.Progress.Stages)
+			}
+			for _, stage := range contract.Progress.Stages {
+				if stage.Code == "accepted" || stage.Code == "visible" || stage.Code == "acknowledged" {
+					t.Fatalf("negotiation claimed delivery success without evidence: %#v", stage)
+				}
+			}
+		})
+	}
+}
+
+func TestNegotiateHostProgressDoesNotInferActiveSupportFromProfile(t *testing.T) {
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: "claude-code", Source: "detection"},
+		Capabilities:  progressCapabilities(),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressNextInvocationReplay {
+		t.Fatalf("contract = %q, want profile-only fallback replay", contract.Progress.TransportContract)
+	}
+	for _, capability := range []runtimecap.HostCapability{runtimecap.HostCallbacks, runtimecap.HostWakeUp, runtimecap.HostAcknowledgment} {
+		if got := capabilitySupport(contract.Capabilities, capability); got != runtimecap.HostCapabilityUnknown {
+			t.Fatalf("%s support = %q, want unknown without declaration evidence", capability, got)
+		}
+	}
+}
+
+func TestNegotiateHostProviderModelIndependence(t *testing.T) {
+	hostRequest := runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: "synthetic-host", Source: "fixture"},
+		Capabilities:  progressCapabilities(runtimecap.HostCallbacks, runtimecap.HostWakeUp, runtimecap.HostAcknowledgment),
+	}
+	baseline := marshalNegotiation(t, runtimecap.NegotiateHost(hostRequest))
+
+	type providerCase struct {
+		provider string
+		model    string
+		invoked  *int
+	}
+	providers := []providerCase{
+		{provider: "codex", model: "gpt-5.5", invoked: new(int)},
+		{provider: "claude", model: "claude-opus-4.5", invoked: new(int)},
+		{provider: "grok", model: "grok-build", invoked: new(int)},
+		{provider: "synthetic", model: "future-model", invoked: new(int)},
+	}
+	for _, provider := range providers {
+		t.Run(provider.provider+"/"+provider.model, func(t *testing.T) {
+			got := marshalNegotiation(t, runtimecap.NegotiateHost(hostRequest))
+			if got != baseline {
+				t.Fatalf("host negotiation changed for provider %s model %s", provider.provider, provider.model)
+			}
+			if *provider.invoked != 0 {
+				t.Fatalf("provider invocation count = %d, want zero", *provider.invoked)
+			}
+		})
+	}
+}
+
+func TestBindHostRunOriginScopeAndRedaction(t *testing.T) {
+	secret := "sk-" + "origin-secret-canary"
+	base := runtimecap.HostRunOriginBindingRequest{
+		ProjectID:     "proj_origin",
+		DeliveryRunID: "run_origin",
+		CorrelationID: "corr_origin",
+		Origin: runtimecap.HostRunOriginDeclaration{
+			SchemaVersion: runtimecap.HostRunOriginSchemaVersion,
+			Kind:          "callback-session",
+			OpaqueID:      "opaque-" + secret,
+			Metadata: map[string]string{
+				"cwd":   "/Users/alice/private/repo",
+				"token": secret,
+				"label": "primary",
+			},
+		},
+	}
+	first := runtimecap.BindHostRunOrigin(base)
+	second := runtimecap.BindHostRunOrigin(base)
+	if !first.Bound || first.Code != runtimecap.HostOriginBound || first.BindingID == "" {
+		t.Fatalf("first binding = %#v", first)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("origin binding is not restart-stable:\nfirst=%#v\nsecond=%#v", first, second)
+	}
+	if strings.Contains(mustJSON(t, first), secret) || strings.Contains(mustJSON(t, first), "/Users") {
+		t.Fatalf("origin binding leaked secret/path: %s", mustJSON(t, first))
+	}
+
+	otherProject := base
+	otherProject.ProjectID = "proj_other"
+	otherRun := base
+	otherRun.DeliveryRunID = "run_other"
+	otherCorrelation := base
+	otherCorrelation.CorrelationID = "corr_other"
+	for name, req := range map[string]runtimecap.HostRunOriginBindingRequest{
+		"project":     otherProject,
+		"run":         otherRun,
+		"correlation": otherCorrelation,
+	} {
+		t.Run("scope "+name, func(t *testing.T) {
+			got := runtimecap.BindHostRunOrigin(req)
+			if got.BindingID == first.BindingID {
+				t.Fatalf("binding replayed across %s scope: %s", name, got.BindingID)
+			}
+		})
+	}
+}
+
+func TestBindHostRunOriginRejectsInvalidMissingOversizedAndFutureSchemas(t *testing.T) {
+	tests := []struct {
+		name string
+		req  runtimecap.HostRunOriginBindingRequest
+		code string
+	}{
+		{
+			name: "missing optional origin",
+			req: runtimecap.HostRunOriginBindingRequest{
+				ProjectID:     "proj_origin",
+				DeliveryRunID: "run_origin",
+				CorrelationID: "corr_origin",
+			},
+			code: runtimecap.HostOriginAbsent,
+		},
+		{
+			name: "missing scope",
+			req: runtimecap.HostRunOriginBindingRequest{
+				ProjectID: "proj_origin",
+				Origin:    originDeclaration("opaque", nil),
+			},
+			code: runtimecap.ErrInvalidHostOriginScope,
+		},
+		{
+			name: "future schema without fallback",
+			req: runtimecap.HostRunOriginBindingRequest{
+				ProjectID:     "proj_origin",
+				DeliveryRunID: "run_origin",
+				CorrelationID: "corr_origin",
+				Origin: runtimecap.HostRunOriginDeclaration{
+					SchemaVersion:           "loopcoder.host_run_origin.v2",
+					SupportedSchemaVersions: []string{"loopcoder.host_run_origin.v2"},
+					Kind:                    "callback-session",
+					OpaqueID:                "opaque",
+				},
+			},
+			code: runtimecap.ErrUnsupportedHostOriginSchemaVersion,
+		},
+		{
+			name: "oversized metadata",
+			req: runtimecap.HostRunOriginBindingRequest{
+				ProjectID:     "proj_origin",
+				DeliveryRunID: "run_origin",
+				CorrelationID: "corr_origin",
+				Origin:        originDeclaration("opaque", map[string]string{"huge": strings.Repeat("x", 5000)}),
+			},
+			code: runtimecap.ErrHostOriginMetadataTooLarge,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runtimecap.BindHostRunOrigin(tt.req)
+			if got.Code != tt.code {
+				t.Fatalf("binding code = %q, want %q; binding=%#v", got.Code, tt.code, got)
+			}
+			if tt.code != runtimecap.HostOriginAbsent && got.Bound {
+				t.Fatalf("binding unexpectedly bound: %#v", got)
+			}
+		})
+	}
+}
+
+func TestNegotiateHostConcurrentCanonicalizationIsStable(t *testing.T) {
+	requests := make([]runtimecap.HostNegotiationRequest, 256)
+	for i := range requests {
+		requests[i] = runtimecap.HostNegotiationRequest{
+			SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+			Host:          runtimecap.HostProfileRecord{Name: fmt.Sprintf("host-%03d", 255-i), Source: "race-fixture"},
+			Capabilities: append(progressCapabilities(runtimecap.HostDurablePolling, runtimecap.HostResumableFollow),
+				runtimecap.HostCapabilityDeclaration{Capability: runtimecap.HostCallbacks, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"}),
+			Origin: runtimecap.HostRunOriginBindingRequest{
+				ProjectID:     "proj_race",
+				DeliveryRunID: "run_race",
+				CorrelationID: fmt.Sprintf("corr_%03d", i%8),
+				Origin:        originDeclaration(fmt.Sprintf("opaque-%03d", i%8), map[string]string{"k": fmt.Sprintf("%03d", i%8)}),
+			},
+		}
+	}
+	baseline := make([]string, len(requests))
+	for i, req := range requests {
+		baseline[i] = marshalNegotiation(t, runtimecap.NegotiateHost(req))
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan string, len(requests))
+	for i, req := range requests {
+		wg.Add(1)
+		go func(i int, req runtimecap.HostNegotiationRequest) {
+			defer wg.Done()
+			if got := marshalNegotiation(t, runtimecap.NegotiateHost(req)); got != baseline[i] {
+				errs <- fmt.Sprintf("request %d changed", i)
+			}
+		}(i, req)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 
@@ -211,6 +513,15 @@ func marshalNegotiation(t *testing.T, contract runtimecap.HostNegotiation) strin
 	return string(data)
 }
 
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	return string(data)
+}
+
 func containsHostCapability(capabilities []runtimecap.HostCapability, want runtimecap.HostCapability) bool {
 	for _, capability := range capabilities {
 		if capability == want {
@@ -218,4 +529,56 @@ func containsHostCapability(capabilities []runtimecap.HostCapability, want runti
 		}
 	}
 	return false
+}
+
+func progressCapabilities(extra ...runtimecap.HostCapability) []runtimecap.HostCapabilityDeclaration {
+	base := []runtimecap.HostCapabilityDeclaration{
+		{Capability: runtimecap.HostLocalSubprocess, Support: runtimecap.HostCapabilitySupported, Source: "fixture"},
+		{Capability: runtimecap.HostStdout, Support: runtimecap.HostCapabilitySupported, Source: "fixture"},
+		{Capability: runtimecap.HostStderr, Support: runtimecap.HostCapabilitySupported, Source: "fixture"},
+		{Capability: runtimecap.HostJSONOutput, Support: runtimecap.HostCapabilitySupported, Source: "fixture"},
+		{Capability: runtimecap.HostDurablePolling, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostResumableFollow, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostManagedBackgroundWork, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostCallbacks, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostWakeUp, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostAcknowledgment, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostDetachedSteering, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+		{Capability: runtimecap.HostDetachedCancellation, Support: runtimecap.HostCapabilityUnknown, Source: "fixture"},
+	}
+	for _, capability := range extra {
+		for i := range base {
+			if base[i].Capability == capability {
+				base[i].Support = runtimecap.HostCapabilitySupported
+			}
+		}
+	}
+	return base
+}
+
+func originDeclaration(opaque string, metadata map[string]string) runtimecap.HostRunOriginDeclaration {
+	return runtimecap.HostRunOriginDeclaration{
+		SchemaVersion: runtimecap.HostRunOriginSchemaVersion,
+		Kind:          "callback-session",
+		OpaqueID:      opaque,
+		Metadata:      metadata,
+	}
+}
+
+func stageCode(stages []runtimecap.HostProgressStageRecord, stage runtimecap.HostProgressStage) string {
+	for _, record := range stages {
+		if record.Stage == stage {
+			return record.Code
+		}
+	}
+	return ""
+}
+
+func capabilitySupport(capabilities []runtimecap.HostCapabilityDeclaration, capability runtimecap.HostCapability) runtimecap.HostCapabilitySupport {
+	for _, declaration := range capabilities {
+		if declaration.Capability == capability {
+			return declaration.Support
+		}
+	}
+	return runtimecap.HostCapabilityUnknown
 }
