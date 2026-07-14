@@ -24,9 +24,26 @@ const (
 	SideEffectStateNone          = "none"
 	SideEffectStateNotStarted    = "not-started"
 	SideEffectStateReadOnly      = "read-only"
+	SideEffectStateIdempotent    = "idempotent"
+	SideEffectStateReceiptBacked = "receipt-backed"
 	SideEffectStateUnknown       = "unknown"
 	SideEffectStateAmbiguous     = "ambiguous"
+	SideEffectStateIrreversible  = "irreversible"
 	SideEffectStateProviderStart = "provider-started"
+)
+
+const (
+	HandoffSideEffectReconciliationSchema = "loopcoder.handoff_side_effect_reconciliation.v1"
+	HandoffContinuationProofSchema        = "loopcoder.handoff_continuation_proof.v1"
+
+	HandoffSideEffectCodeNotStarted        = "handoff.side_effect.not_started"
+	HandoffSideEffectCodeReadOnly          = "handoff.side_effect.read_only"
+	HandoffSideEffectCodeIdempotentExact   = "handoff.side_effect.idempotent_exact_key"
+	HandoffSideEffectCodeReceiptBacked     = "handoff.side_effect.receipt_backed_exact"
+	HandoffSideEffectCodeAmbiguous         = "handoff.side_effect.ambiguous"
+	HandoffSideEffectCodeIrreversible      = "handoff.side_effect.irreversible"
+	HandoffSideEffectCodeFingerprintDrift  = "handoff.side_effect.fingerprint_drift"
+	HandoffSideEffectCodeMissingDurability = "handoff.side_effect.missing_durable_row"
 )
 
 const (
@@ -98,6 +115,47 @@ type HandoffTransaction struct {
 	UpdatedAt                   string   `json:"updated_at"`
 }
 
+type HandoffSideEffectReconciliation struct {
+	SchemaVersion              string   `json:"schema_version"`
+	Code                       string   `json:"code"`
+	State                      string   `json:"state"`
+	SourceAttemptID            string   `json:"source_attempt_id"`
+	SourceExecutorID           string   `json:"source_executor_id"`
+	SourceClaimGeneration      int64    `json:"source_claim_generation"`
+	HandoffID                  string   `json:"handoff_id,omitempty"`
+	HandoffGeneration          int64    `json:"handoff_generation,omitempty"`
+	OwnershipFence             string   `json:"ownership_fence"`
+	ExecutionOutcome           string   `json:"execution_outcome"`
+	ProviderIdempotencyKeyHash string   `json:"provider_idempotency_key_hash,omitempty"`
+	ProviderReceiptHash        string   `json:"provider_receipt_hash,omitempty"`
+	BudgetReservationIDs       []string `json:"budget_reservation_ids,omitempty"`
+	EvidenceRecordIDs          []string `json:"evidence_record_ids,omitempty"`
+	AutomaticContinuation      bool     `json:"automatic_continuation"`
+	NeedsHuman                 bool     `json:"needs_human"`
+	Reason                     string   `json:"reason"`
+}
+
+type HandoffContinuationProof struct {
+	SchemaVersion              string   `json:"schema_version"`
+	Code                       string   `json:"code"`
+	State                      string   `json:"state"`
+	SourceAttemptID            string   `json:"source_attempt_id"`
+	SourceExecutorID           string   `json:"source_executor_id"`
+	SourceClaimGeneration      int64    `json:"source_claim_generation"`
+	HandoffID                  string   `json:"handoff_id"`
+	HandoffGeneration          int64    `json:"handoff_generation"`
+	OwnershipFence             string   `json:"ownership_fence"`
+	ExecutionOutcome           string   `json:"execution_outcome"`
+	ProviderIdempotencyKeyHash string   `json:"provider_idempotency_key_hash,omitempty"`
+	ProviderReceiptHash        string   `json:"provider_receipt_hash,omitempty"`
+	EvidenceRecordIDs          []string `json:"evidence_record_ids,omitempty"`
+	DecisionRef                string   `json:"decision_ref"`
+	CompletedBoundary          string   `json:"completed_boundary"`
+	CheckpointID               string   `json:"checkpoint_id"`
+	ProofFingerprint           string   `json:"proof_fingerprint"`
+	AutomaticContinuation      bool     `json:"automatic_continuation"`
+}
+
 type HandoffSuccessorCandidate struct {
 	RoutingDecisionID      string
 	RoutingCandidateID     string
@@ -116,6 +174,7 @@ type HandoffSuccessorRequest struct {
 	BudgetReservationID string
 	BudgetPolicyIDs     []string
 	ReusableEvidenceIDs []string
+	ContinuationProof   HandoffContinuationProof
 	Candidate           HandoffSuccessorCandidate
 	Cancelled           bool
 	CreatedAt           string
@@ -143,6 +202,7 @@ type HandoffSuccessorLaunch struct {
 	RoutingCandidateID     string                         `json:"routing_candidate_id"`
 	BudgetReservationID    string                         `json:"budget_reservation_id"`
 	ReusableEvidenceIDs    []string                       `json:"reusable_evidence_ids"`
+	ContinuationProof      HandoffContinuationProof       `json:"continuation_proof"`
 	OwnershipLocks         []HandoffOwnershipLockSnapshot `json:"ownership_locks,omitempty"`
 	LaunchExposed          bool                           `json:"launch_exposed"`
 	LaunchPhase            string                         `json:"launch_phase,omitempty"`
@@ -224,6 +284,122 @@ func LoadHandoffTransaction(ctx context.Context, store Store, handoffID string) 
 	return out, err
 }
 
+func ReconcileHandoffSideEffect(ctx context.Context, store Store, handoff HandoffTransaction) (HandoffSideEffectReconciliation, error) {
+	if store == nil {
+		return HandoffSideEffectReconciliation{}, federationError(ErrHandoffRequiredCode, "store is required")
+	}
+	var out HandoffSideEffectReconciliation
+	err := withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			current, ok, err := loadHandoffTx(ctx, tx, `WHERE handoff_id = ?`, handoff.HandoffID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return federationError(ErrHandoffRequiredCode, "handoff %s is missing", handoff.HandoffID)
+			}
+			if handoff.RequestFingerprint != "" && current.RequestFingerprint != handoff.RequestFingerprint {
+				return federationError(ErrHandoffReplayMismatchCode, "handoff request fingerprint changed before reconciliation")
+			}
+			rec, err := reconcileHandoffSideEffectTx(ctx, tx, current)
+			if err != nil {
+				return err
+			}
+			if err := insertHandoffSideEffectDecisionTx(ctx, tx, current, rec, store.Now()); err != nil {
+				return err
+			}
+			out = rec
+			return nil
+		})
+	})
+	return out, err
+}
+
+func MarkHandoffSideEffectNeedsHuman(ctx context.Context, store Store, handoff HandoffTransaction, rec HandoffSideEffectReconciliation) error {
+	if store == nil {
+		return federationError(ErrHandoffRequiredCode, "store is required")
+	}
+	return withRetry(ctx, func() error {
+		return store.WithWriteTx(ctx, func(tx Tx) error {
+			current, ok, err := loadHandoffTx(ctx, tx, `WHERE handoff_id = ?`, handoff.HandoffID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return federationError(ErrHandoffRequiredCode, "handoff %s is missing", handoff.HandoffID)
+			}
+			if current.RequestFingerprint != handoff.RequestFingerprint {
+				return federationError(ErrHandoffReplayMismatchCode, "handoff request fingerprint changed before needs-human reconciliation")
+			}
+			at := formatTimestamp(store.Now().UTC())
+			rec.AutomaticContinuation = false
+			rec.NeedsHuman = true
+			if strings.TrimSpace(rec.Reason) == "" {
+				rec.Reason = "handoff side-effect reconciliation requires human review"
+			}
+			if err := insertHandoffSideEffectDecisionTx(ctx, tx, current, rec, store.Now()); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE handoff_transactions
+				SET handoff_status = ?, next_action = ?, updated_at = ?
+				WHERE handoff_id = ? AND request_fingerprint = ?`,
+				HandoffStatusNeedsHuman, "human-review-side-effect-reconciliation", at, current.HandoffID, current.RequestFingerprint); err != nil {
+				return fmt.Errorf("mark handoff side-effect needs-human: %w", err)
+			}
+			if err := transitionRunStatusTx(ctx, tx, RunStatusTransition{
+				RunID:       current.ChildRunID,
+				ParentRunID: current.ParentRunID,
+				ChildRunID:  current.ChildRunID,
+				Status:      HandoffStatusNeedsHuman,
+				UpdatedAt:   at,
+				Reason:      rec.Code,
+				Source:      "handoff-side-effect-reconciliation",
+			}); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE delivery_tasks
+				SET state = ?, ended_at = COALESCE(NULLIF(ended_at, ''), ?), updated_at = ?,
+					terminal_error_code = ?, error_message = ?
+				WHERE project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+				HandoffStatusNeedsHuman, at, at, ErrHandoffSideEffectUnknownCode, rec.Code, current.ProjectID, current.DeliveryRunID, current.TaskID); err != nil {
+				return fmt.Errorf("mark handoff task needs-human: %w", err)
+			}
+			return nil
+		})
+	})
+}
+
+func BuildHandoffContinuationProof(handoff HandoffTransaction, rec HandoffSideEffectReconciliation) (HandoffContinuationProof, error) {
+	rec.State = normalizeHandoffSideEffectState(rec.State)
+	if strings.TrimSpace(rec.Code) == "" {
+		rec.Code = handoffSideEffectCode(rec.State)
+	}
+	proof := HandoffContinuationProof{
+		SchemaVersion:              HandoffContinuationProofSchema,
+		Code:                       strings.TrimSpace(rec.Code),
+		State:                      rec.State,
+		SourceAttemptID:            strings.TrimSpace(firstNonEmptyAgent(rec.SourceAttemptID, handoff.SourceAttemptID)),
+		SourceExecutorID:           strings.TrimSpace(firstNonEmptyAgent(rec.SourceExecutorID, handoff.SourceExecutorID)),
+		SourceClaimGeneration:      firstPositiveAgent(rec.SourceClaimGeneration, handoff.SourceClaimGeneration),
+		HandoffID:                  handoff.HandoffID,
+		HandoffGeneration:          handoff.HandoffGeneration,
+		OwnershipFence:             strings.TrimSpace(rec.OwnershipFence),
+		ExecutionOutcome:           strings.TrimSpace(rec.ExecutionOutcome),
+		ProviderIdempotencyKeyHash: strings.TrimSpace(rec.ProviderIdempotencyKeyHash),
+		ProviderReceiptHash:        strings.TrimSpace(rec.ProviderReceiptHash),
+		EvidenceRecordIDs:          sortedCopyAgent(firstNonEmptySlice(rec.EvidenceRecordIDs, handoff.EvidenceRecordIDs)),
+		DecisionRef:                "handoff-side-effect:" + handoff.HandoffID,
+		CompletedBoundary:          handoffContinuationBoundary(rec),
+		AutomaticContinuation:      rec.AutomaticContinuation && !rec.NeedsHuman,
+	}
+	proof.CheckpointID = handoffContinuationCheckpointID(proof)
+	proof.ProofFingerprint = handoffContinuationProofFingerprint(proof)
+	if err := validateHandoffContinuationProof(handoff, rec, proof); err != nil {
+		return HandoffContinuationProof{}, err
+	}
+	return proof, nil
+}
+
 func PrepareHandoffSuccessorLaunch(ctx context.Context, store Store, req HandoffSuccessorRequest) (HandoffSuccessorLaunch, error) {
 	if store == nil {
 		return HandoffSuccessorLaunch{}, federationError(ErrHandoffRequiredCode, "store is required")
@@ -287,10 +463,11 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 		}
 	}
 
-	effectiveSideEffectState, err := deriveHandoffSideEffectStateTx(ctx, tx, req, task, claim)
+	sideEffectRecord, err := deriveHandoffSideEffectRecordTx(ctx, tx, req, task, claim)
 	if err != nil {
 		return HandoffTransaction{}, err
 	}
+	effectiveSideEffectState := sideEffectRecord.State
 	status, nextAction, terminalCode := classifyHandoff(req, effectiveSideEffectState)
 	requestedAt, err := time.Parse(time.RFC3339Nano, req.RequestedAt)
 	if err != nil {
@@ -324,17 +501,18 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 	}
 
 	sourceClaimSnapshot, err := compactJSON(map[string]any{
-		"run_id":                   claim.RunID,
-		"executor_id":              claim.ExecutorID,
-		"claim_generation":         claim.ClaimGeneration,
-		"claimed_at":               claim.ClaimedAt,
-		"lease_expires_at":         claim.LeaseExpiresAt,
-		"heartbeat_at":             claim.HeartbeatAt,
-		"claim_phase":              claim.ClaimPhase,
-		"provider_idempotency_key": claim.ProviderKey,
-		"provider_receipt":         claim.ProviderReceipt,
-		"effective_side_effect":    effectiveSideEffectState,
-		"requested_side_effect":    req.SideEffectState,
+		"run_id":                     claim.RunID,
+		"executor_id":                claim.ExecutorID,
+		"claim_generation":           claim.ClaimGeneration,
+		"claimed_at":                 claim.ClaimedAt,
+		"lease_expires_at":           claim.LeaseExpiresAt,
+		"heartbeat_at":               claim.HeartbeatAt,
+		"claim_phase":                claim.ClaimPhase,
+		"provider_idempotency_key":   claim.ProviderKey,
+		"provider_receipt":           claim.ProviderReceipt,
+		"effective_side_effect":      effectiveSideEffectState,
+		"requested_side_effect":      req.SideEffectState,
+		"side_effect_reconciliation": sideEffectRecord,
 	})
 	if err != nil {
 		return HandoffTransaction{}, err
@@ -422,7 +600,7 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 			return HandoffTransaction{}, err
 		}
 	}
-	if err := updateDeliveryAfterHandoffTx(ctx, tx, req, status, terminalCode); err != nil {
+	if err := updateDeliveryAfterHandoffTx(ctx, tx, req, status, terminalCode, claim.ProviderReceipt); err != nil {
 		return HandoffTransaction{}, err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO handoff_transactions(
@@ -460,6 +638,7 @@ type handoffTaskSnapshot struct {
 	taskPermission           string
 	taskSideEffect           string
 	attemptState             string
+	attemptProviderKey       string
 	attemptProviderReceipt   string
 	attemptSideEffect        string
 }
@@ -478,10 +657,10 @@ func loadHandoffTaskSnapshotTx(ctx context.Context, tx Tx, req HandoffRequest) (
 	if runProject != req.ProjectID || taskProject != req.ProjectID || taskRun != req.DeliveryRunID || taskPlan != runPlan || taskAuth != runAuth {
 		return handoffTaskSnapshot{}, federationError(ErrHandoffAcceptedTaskStaleCode, "delivery task authority no longer matches accepted run authority")
 	}
-	var attemptTask, attemptRun, attemptProject, attemptExecutor, attemptState, attemptProviderReceipt, attemptSideEffect string
+	var attemptTask, attemptRun, attemptProject, attemptExecutor, attemptState, attemptProviderKey, attemptProviderReceipt, attemptSideEffect string
 	var attemptGeneration int64
-	if err := tx.QueryRow(ctx, `SELECT task_id, delivery_run_id, project_id, executor_id, claim_generation, state, provider_receipt, side_effect_class
-		FROM delivery_attempts WHERE attempt_id = ?`, req.SourceAttemptID).Scan(&attemptTask, &attemptRun, &attemptProject, &attemptExecutor, &attemptGeneration, &attemptState, &attemptProviderReceipt, &attemptSideEffect); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT task_id, delivery_run_id, project_id, executor_id, claim_generation, state, provider_idempotency_key, provider_receipt, side_effect_class
+		FROM delivery_attempts WHERE attempt_id = ?`, req.SourceAttemptID).Scan(&attemptTask, &attemptRun, &attemptProject, &attemptExecutor, &attemptGeneration, &attemptState, &attemptProviderKey, &attemptProviderReceipt, &attemptSideEffect); err != nil {
 		return handoffTaskSnapshot{}, federationError(ErrHandoffAcceptedTaskStaleCode, "source attempt %s is missing", req.SourceAttemptID)
 	}
 	if attemptTask != req.TaskID || attemptRun != req.DeliveryRunID || attemptProject != req.ProjectID || attemptExecutor != req.SourceExecutorID || attemptGeneration != req.SourceClaimGeneration {
@@ -536,51 +715,110 @@ func loadHandoffTaskSnapshotTx(ctx context.Context, tx Tx, req HandoffRequest) (
 		taskPermission:           normalizePermission(taskPermission),
 		taskSideEffect:           normalizeSideEffectClass(taskSideEffect),
 		attemptState:             strings.ToLower(strings.TrimSpace(attemptState)),
+		attemptProviderKey:       strings.TrimSpace(attemptProviderKey),
 		attemptProviderReceipt:   strings.TrimSpace(attemptProviderReceipt),
 		attemptSideEffect:        normalizeSideEffectClass(attemptSideEffect),
 	}, nil
 }
 
-func deriveHandoffSideEffectStateTx(ctx context.Context, tx Tx, req HandoffRequest, task handoffTaskSnapshot, claim ClaimResult) (string, error) {
+func deriveHandoffSideEffectRecordTx(ctx context.Context, tx Tx, req HandoffRequest, task handoffTaskSnapshot, claim ClaimResult) (HandoffSideEffectReconciliation, error) {
+	base := HandoffSideEffectReconciliation{
+		SchemaVersion:              HandoffSideEffectReconciliationSchema,
+		SourceAttemptID:            req.SourceAttemptID,
+		SourceExecutorID:           req.SourceExecutorID,
+		SourceClaimGeneration:      req.SourceClaimGeneration,
+		OwnershipFence:             "source-owner",
+		ExecutionOutcome:           normalizeClaimPhase(claim.ClaimPhase),
+		ProviderIdempotencyKeyHash: hashSecretEvidence(firstNonEmptyAgent(task.attemptProviderKey, claim.ProviderKey)),
+		ProviderReceiptHash:        hashSecretEvidence(firstNonEmptyAgent(task.attemptProviderReceipt, claim.ProviderReceipt)),
+		BudgetReservationIDs:       nil,
+		EvidenceRecordIDs:          sortedCopyAgent(req.EvidenceRecordIDs),
+	}
+	record := func(state, code, reason string, automatic bool) HandoffSideEffectReconciliation {
+		next := base
+		next.State = state
+		next.Code = code
+		next.Reason = reason
+		next.AutomaticContinuation = automatic
+		next.NeedsHuman = !automatic
+		return next
+	}
 	requested := normalizeHandoffSideEffectState(req.SideEffectState)
 	if !handoffSideEffectSafe(requested) {
-		return requested, nil
+		return record(requested, handoffSideEffectCode(requested), "caller reported unsafe side-effect state", false), nil
 	}
 	if strings.TrimSpace(claim.ProviderReceipt) != "" || strings.TrimSpace(task.attemptProviderReceipt) != "" {
-		return SideEffectStateProviderStart, nil
+		return record(SideEffectStateReceiptBacked, HandoffSideEffectCodeReceiptBacked, "source effect has an exact durable provider receipt", true), nil
 	}
 	if registration, ok, err := loadAgentRegistrationByRunTx(ctx, tx, req.ChildRunID); err != nil {
-		return "", err
+		return HandoffSideEffectReconciliation{}, err
 	} else if ok {
 		if strings.TrimSpace(registration.ProviderReceipt) != "" {
-			return SideEffectStateProviderStart, nil
+			return record(SideEffectStateAmbiguous, HandoffSideEffectCodeAmbiguous, "agent registration already contains provider receipt state", false), nil
 		}
 		switch normalizeAgentRegistrationState(registration.RegistrationState) {
 		case AgentStateRegistered, AgentStatePlanned:
 		case AgentStateLaunching, AgentStateRunning, AgentStateCancelling:
-			return SideEffectStateProviderStart, nil
+			if handoffSourceAttemptHasExactKey(task, claim) && !handoffSourceEffectIrreversible(task) {
+				return record(SideEffectStateIdempotent, HandoffSideEffectCodeIdempotentExact, "source effect can be reconciled under the exact durable idempotency key", true), nil
+			}
+			return record(handoffCrashWindowState(task), handoffCrashWindowCode(task), "source effect entered a provider crash window without exact reusable proof", false), nil
 		case AgentStateSucceeded, AgentStateFailed, AgentStateCancelled:
-			return SideEffectStateProviderStart, nil
+			if handoffSourceAttemptHasExactKey(task, claim) && !handoffSourceEffectIrreversible(task) {
+				return record(SideEffectStateIdempotent, HandoffSideEffectCodeIdempotentExact, "source terminal effect can be reconciled under the exact durable idempotency key", true), nil
+			}
+			return record(handoffCrashWindowState(task), handoffCrashWindowCode(task), "source terminal effect has no exact reusable receipt or key", false), nil
 		case AgentStateNeedsHuman, AgentStateSuperseded:
-			return SideEffectStateAmbiguous, nil
+			return record(SideEffectStateAmbiguous, HandoffSideEffectCodeAmbiguous, "source registration requires human reconciliation", false), nil
 		default:
-			return SideEffectStateAmbiguous, nil
+			return record(SideEffectStateAmbiguous, HandoffSideEffectCodeAmbiguous, "source registration state is unknown", false), nil
 		}
 	}
 	switch normalizeClaimPhase(claim.ClaimPhase) {
 	case ClaimPhaseClaimed:
 	case ClaimPhaseLaunching, ClaimPhaseExecuting, ClaimPhaseCompleted:
-		return SideEffectStateProviderStart, nil
+		if handoffSourceAttemptHasExactKey(task, claim) && !handoffSourceEffectIrreversible(task) {
+			return record(SideEffectStateIdempotent, HandoffSideEffectCodeIdempotentExact, "source claim can be reconciled under the exact durable idempotency key", true), nil
+		}
+		return record(handoffCrashWindowState(task), handoffCrashWindowCode(task), "source claim entered a provider crash window without exact reusable proof", false), nil
 	default:
-		return SideEffectStateAmbiguous, nil
+		return record(SideEffectStateAmbiguous, HandoffSideEffectCodeAmbiguous, "source claim phase is unknown", false), nil
 	}
 	if handoffDeliveryStateImpliesSideEffect(task.attemptState) || handoffDeliveryStateImpliesSideEffect(task.taskState) {
-		return SideEffectStateProviderStart, nil
+		if handoffSourceAttemptHasExactKey(task, claim) && !handoffSourceEffectIrreversible(task) {
+			return record(SideEffectStateIdempotent, HandoffSideEffectCodeIdempotentExact, "source delivery state can be reconciled under the exact durable idempotency key", true), nil
+		}
+		return record(handoffCrashWindowState(task), handoffCrashWindowCode(task), "source delivery state implies execution without exact reusable proof", false), nil
 	}
 	if task.taskPermission == PermissionReadOnly && sideEffectRank(task.taskSideEffect) <= sideEffectRank(SideEffectLocalRead) && sideEffectRank(task.attemptSideEffect) <= sideEffectRank(SideEffectLocalRead) {
-		return SideEffectStateReadOnly, nil
+		return record(SideEffectStateReadOnly, HandoffSideEffectCodeReadOnly, "accepted task is read-only", true), nil
 	}
-	return SideEffectStateNotStarted, nil
+	return record(SideEffectStateNotStarted, HandoffSideEffectCodeNotStarted, "source attempt has not reached a side-effect boundary", true), nil
+}
+
+func handoffSourceAttemptHasExactKey(task handoffTaskSnapshot, claim ClaimResult) bool {
+	attemptKey := strings.TrimSpace(task.attemptProviderKey)
+	claimKey := strings.TrimSpace(claim.ProviderKey)
+	return attemptKey != "" && claimKey != "" && attemptKey == claimKey
+}
+
+func handoffSourceEffectIrreversible(task handoffTaskSnapshot) bool {
+	return sideEffectRank(task.taskSideEffect) >= sideEffectRank(SideEffectExternalWrite) ||
+		sideEffectRank(task.attemptSideEffect) >= sideEffectRank(SideEffectExternalWrite)
+}
+
+func handoffCrashWindowState(task handoffTaskSnapshot) string {
+	if handoffSourceEffectIrreversible(task) {
+		return SideEffectStateIrreversible
+	}
+	return SideEffectStateAmbiguous
+}
+
+func handoffCrashWindowCode(task handoffTaskSnapshot) string {
+	if handoffSourceEffectIrreversible(task) {
+		return HandoffSideEffectCodeIrreversible
+	}
+	return HandoffSideEffectCodeAmbiguous
 }
 
 func handoffDeliveryStateImpliesSideEffect(state string) bool {
@@ -590,6 +828,292 @@ func handoffDeliveryStateImpliesSideEffect(state string) bool {
 	default:
 		return false
 	}
+}
+
+func reconcileHandoffSideEffectTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (HandoffSideEffectReconciliation, error) {
+	snapshot, err := decodeHandoffSideEffectSnapshot(handoff)
+	if err != nil {
+		return HandoffSideEffectReconciliation{}, err
+	}
+	if snapshot.SourceAttemptID != "" && snapshot.SourceAttemptID != handoff.SourceAttemptID {
+		return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "handoff source attempt snapshot changed")
+	}
+	if snapshot.SourceExecutorID != "" && snapshot.SourceExecutorID != handoff.SourceExecutorID {
+		return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "handoff source executor snapshot changed")
+	}
+	if snapshot.SourceClaimGeneration > 0 && snapshot.SourceClaimGeneration != handoff.SourceClaimGeneration {
+		return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "handoff source generation snapshot changed")
+	}
+	var attemptState, attemptProviderKey, attemptReceipt, attemptSideEffect string
+	err = tx.QueryRow(ctx, `SELECT state, provider_idempotency_key, provider_receipt, side_effect_class
+		FROM delivery_attempts WHERE attempt_id = ? AND project_id = ? AND delivery_run_id = ? AND task_id = ?`,
+		handoff.SourceAttemptID, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID).Scan(&attemptState, &attemptProviderKey, &attemptReceipt, &attemptSideEffect)
+	if errors.Is(err, sql.ErrNoRows) {
+		rec := snapshot
+		rec.Code = HandoffSideEffectCodeMissingDurability
+		rec.State = SideEffectStateAmbiguous
+		rec.AutomaticContinuation = false
+		rec.NeedsHuman = true
+		rec.Reason = "source attempt row is missing; safety cannot be inferred from absence"
+		rec.HandoffID = handoff.HandoffID
+		rec.HandoffGeneration = handoff.HandoffGeneration
+		return rec, nil
+	}
+	if err != nil {
+		return HandoffSideEffectReconciliation{}, fmt.Errorf("reconcile handoff source attempt: %w", err)
+	}
+	var claimExecutor, claimPhase, claimProviderKey, claimReceipt string
+	var claimGeneration int64
+	err = tx.QueryRow(ctx, `SELECT executor_id, claim_generation, phase, provider_idempotency_key, provider_receipt
+		FROM run_claims WHERE run_id = ?`, handoff.ChildRunID).Scan(&claimExecutor, &claimGeneration, &claimPhase, &claimProviderKey, &claimReceipt)
+	if errors.Is(err, sql.ErrNoRows) {
+		rec := snapshot
+		rec.Code = HandoffSideEffectCodeMissingDurability
+		rec.State = SideEffectStateAmbiguous
+		rec.AutomaticContinuation = false
+		rec.NeedsHuman = true
+		rec.Reason = "handoff ownership fence row is missing"
+		rec.HandoffID = handoff.HandoffID
+		rec.HandoffGeneration = handoff.HandoffGeneration
+		return rec, nil
+	}
+	if err != nil {
+		return HandoffSideEffectReconciliation{}, fmt.Errorf("reconcile handoff claim: %w", err)
+	}
+	if claimExecutor != handoff.DestinationExecutorID || claimGeneration != handoff.HandoffGeneration {
+		return HandoffSideEffectReconciliation{}, federationError(ErrStaleClaimCode, "handoff ownership fence changed before side-effect reconciliation")
+	}
+	rec := snapshot
+	rec.HandoffID = handoff.HandoffID
+	rec.HandoffGeneration = handoff.HandoffGeneration
+	rec.OwnershipFence = "destination-owner"
+	rec.ExecutionOutcome = strings.ToLower(strings.TrimSpace(firstNonEmptyAgent(attemptState, claimPhase)))
+	rec.BudgetReservationIDs = handoffSourceBudgetReservationIDsTx(ctx, tx, handoff.ChildRunID)
+	if rec.State == "" {
+		rec.State = normalizeHandoffSideEffectState(handoff.SideEffectState)
+		rec.Code = handoffSideEffectCode(rec.State)
+		rec.AutomaticContinuation = handoffSideEffectSafe(rec.State)
+		rec.NeedsHuman = !rec.AutomaticContinuation
+	}
+	if normalizeHandoffSideEffectState(handoff.SideEffectState) != normalizeHandoffSideEffectState(rec.State) {
+		return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "handoff side-effect state differs from reconciliation snapshot")
+	}
+	if !handoffSideEffectSafe(rec.State) {
+		rec.AutomaticContinuation = false
+		rec.NeedsHuman = true
+		if rec.Reason == "" {
+			rec.Reason = "source side-effect state requires human reconciliation"
+		}
+		return rec, nil
+	}
+	switch normalizeHandoffSideEffectState(rec.State) {
+	case SideEffectStateReceiptBacked:
+		if rec.ProviderReceiptHash == "" {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "receipt-backed handoff has no durable receipt hash")
+		}
+		if hashSecretEvidence(attemptReceipt) != rec.ProviderReceiptHash {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "receipt-backed handoff provider receipt no longer matches durable proof")
+		}
+	case SideEffectStateIdempotent:
+		if rec.ProviderIdempotencyKeyHash == "" {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "idempotent handoff has no durable idempotency key hash")
+		}
+		if hashSecretEvidence(attemptProviderKey) != rec.ProviderIdempotencyKeyHash {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "idempotent handoff key no longer matches durable proof")
+		}
+	case SideEffectStateNone, SideEffectStateNotStarted, SideEffectStateReadOnly:
+		if strings.TrimSpace(attemptReceipt) != "" {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "non-executed handoff gained a provider receipt before successor launch")
+		}
+		if normalizeSideEffectClass(attemptSideEffect) == SideEffectExternalWrite && normalizeHandoffSideEffectState(rec.State) == SideEffectStateNotStarted {
+			return HandoffSideEffectReconciliation{}, federationError(ErrHandoffReplayMismatchCode, "not-started handoff source attempt became irreversible")
+		}
+	}
+	rec.AutomaticContinuation = true
+	rec.NeedsHuman = false
+	if rec.Reason == "" {
+		rec.Reason = "source side-effect reconciliation permits automatic continuation"
+	}
+	return rec, nil
+}
+
+func decodeHandoffSideEffectSnapshot(handoff HandoffTransaction) (HandoffSideEffectReconciliation, error) {
+	var payload struct {
+		ProviderIDempotencyKey   string                          `json:"provider_idempotency_key"`
+		ProviderReceipt          string                          `json:"provider_receipt"`
+		EffectiveSideEffect      string                          `json:"effective_side_effect"`
+		SideEffectReconciliation HandoffSideEffectReconciliation `json:"side_effect_reconciliation"`
+	}
+	if err := json.Unmarshal([]byte(handoff.SourceClaimSnapshotJSON), &payload); err != nil {
+		return HandoffSideEffectReconciliation{}, federationError(ErrInvalidRecordCode, "handoff source claim snapshot is invalid")
+	}
+	rec := payload.SideEffectReconciliation
+	if rec.SchemaVersion == "" {
+		rec.SchemaVersion = HandoffSideEffectReconciliationSchema
+		rec.SourceAttemptID = handoff.SourceAttemptID
+		rec.SourceExecutorID = handoff.SourceExecutorID
+		rec.SourceClaimGeneration = handoff.SourceClaimGeneration
+		rec.State = normalizeHandoffSideEffectState(firstNonEmptyAgent(payload.EffectiveSideEffect, handoff.SideEffectState))
+		rec.Code = handoffSideEffectCode(rec.State)
+		rec.ProviderIdempotencyKeyHash = hashSecretEvidence(payload.ProviderIDempotencyKey)
+		rec.ProviderReceiptHash = hashSecretEvidence(payload.ProviderReceipt)
+		rec.EvidenceRecordIDs = sortedCopyAgent(handoff.EvidenceRecordIDs)
+		rec.AutomaticContinuation = handoffSideEffectSafe(rec.State)
+		rec.NeedsHuman = !rec.AutomaticContinuation
+	}
+	rec.State = normalizeHandoffSideEffectState(rec.State)
+	rec.Code = firstNonEmptyAgent(rec.Code, handoffSideEffectCode(rec.State))
+	rec.EvidenceRecordIDs = sortedCopyAgent(firstNonEmptySlice(rec.EvidenceRecordIDs, handoff.EvidenceRecordIDs))
+	return rec, nil
+}
+
+func handoffSourceBudgetReservationIDsTx(ctx context.Context, tx Tx, childRunID string) []string {
+	rows, err := tx.Query(ctx, `SELECT abb.budget_reservation_id
+		FROM agent_registrations ar
+		JOIN agent_budget_bindings abb ON abb.child_agent_id = ar.id
+		WHERE ar.child_run_id = ?
+		ORDER BY abb.budget_reservation_id`, childRunID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil && strings.TrimSpace(id) != "" {
+			ids = append(ids, id)
+		}
+	}
+	return sortedCopyAgent(ids)
+}
+
+func insertHandoffSideEffectDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction, rec HandoffSideEffectReconciliation, now time.Time) error {
+	output, err := compactJSON(rec)
+	if err != nil {
+		return err
+	}
+	at := formatTimestamp(now.UTC())
+	decisionID := stableID("ddec_hse_", handoff.HandoffID, rec.Code, rec.State)
+	_, err = tx.Exec(ctx, `INSERT INTO delivery_decisions(
+			decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, decision_key, decision_kind,
+			decided_by_json, inputs_fingerprint, output_json, alternatives_json, heuristic, heuristic_reason, policy_version,
+			side_effect_class, created_at, created_by_json, host_json)
+		VALUES (?, 'loopcoder.delivery_decision.v1', 1, ?, ?, ?, ?, 'handoff-side-effect-reconciliation', '{}', ?, ?, 'null', 0, ?, ?, ?, ?, '{}', '{}')
+		ON CONFLICT(project_id, delivery_run_id, decision_key) DO NOTHING`,
+		decisionID, handoff.ProjectID, handoff.DeliveryRunID, handoff.TaskID, "handoff-side-effect:"+handoff.HandoffID,
+		digestJSON(map[string]any{"handoff_id": handoff.HandoffID, "request_fingerprint": handoff.RequestFingerprint, "code": rec.Code}),
+		output, rec.Reason, HandoffPolicyVersion, rec.State, at)
+	return err
+}
+
+func loadHandoffSideEffectDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (HandoffSideEffectReconciliation, bool, error) {
+	var raw string
+	err := tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions
+		WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ? AND decision_kind = 'handoff-side-effect-reconciliation'`,
+		handoff.ProjectID, handoff.DeliveryRunID, "handoff-side-effect:"+handoff.HandoffID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return HandoffSideEffectReconciliation{}, false, nil
+	}
+	if err != nil {
+		return HandoffSideEffectReconciliation{}, false, err
+	}
+	var rec HandoffSideEffectReconciliation
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		return HandoffSideEffectReconciliation{}, false, federationError(ErrInvalidRecordCode, "handoff side-effect decision payload is invalid")
+	}
+	rec.State = normalizeHandoffSideEffectState(rec.State)
+	rec.Code = firstNonEmptyAgent(rec.Code, handoffSideEffectCode(rec.State))
+	rec.EvidenceRecordIDs = sortedCopyAgent(rec.EvidenceRecordIDs)
+	return rec, true, nil
+}
+
+func handoffContinuationBoundary(rec HandoffSideEffectReconciliation) string {
+	switch normalizeHandoffSideEffectState(rec.State) {
+	case SideEffectStateReceiptBacked:
+		return "source-boundary:provider-receipt"
+	case SideEffectStateIdempotent:
+		return "source-boundary:idempotency-key"
+	case SideEffectStateReadOnly:
+		return "source-boundary:read-only"
+	case SideEffectStateNotStarted, SideEffectStateNone:
+		return "source-boundary:not-started"
+	default:
+		return "source-boundary:" + normalizeHandoffSideEffectState(rec.State)
+	}
+}
+
+func handoffContinuationCheckpointID(proof HandoffContinuationProof) string {
+	return stableID("hcp_",
+		proof.HandoffID,
+		fmt.Sprint(proof.HandoffGeneration),
+		proof.SourceAttemptID,
+		fmt.Sprint(proof.SourceClaimGeneration),
+		proof.Code,
+		proof.State,
+		proof.ProviderReceiptHash,
+		proof.ProviderIdempotencyKeyHash,
+		proof.CompletedBoundary,
+		proof.DecisionRef,
+	)
+}
+
+func handoffContinuationProofFingerprint(proof HandoffContinuationProof) string {
+	proof.CheckpointID = ""
+	proof.ProofFingerprint = ""
+	return digestJSON(proof)
+}
+
+func validateHandoffContinuationProof(handoff HandoffTransaction, rec HandoffSideEffectReconciliation, proof HandoffContinuationProof) error {
+	if proof.SchemaVersion != HandoffContinuationProofSchema {
+		return federationError(ErrInvalidRecordCode, "handoff continuation proof schema is invalid")
+	}
+	if !proof.AutomaticContinuation || rec.NeedsHuman || !rec.AutomaticContinuation {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof is not approved for automatic continuation")
+	}
+	if proof.HandoffID != handoff.HandoffID || proof.HandoffGeneration != handoff.HandoffGeneration ||
+		proof.SourceAttemptID != handoff.SourceAttemptID || proof.SourceExecutorID != handoff.SourceExecutorID ||
+		proof.SourceClaimGeneration != handoff.SourceClaimGeneration {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof does not match source authority")
+	}
+	if proof.State != normalizeHandoffSideEffectState(rec.State) || proof.Code != firstNonEmptyAgent(rec.Code, handoffSideEffectCode(rec.State)) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed reconciliation state")
+	}
+	if proof.DecisionRef != "handoff-side-effect:"+handoff.HandoffID || proof.CompletedBoundary != handoffContinuationBoundary(rec) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed boundary reference")
+	}
+	if proof.OwnershipFence != rec.OwnershipFence || proof.ExecutionOutcome != rec.ExecutionOutcome {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed source fence")
+	}
+	if proof.ProviderReceiptHash != strings.TrimSpace(rec.ProviderReceiptHash) || proof.ProviderIdempotencyKeyHash != strings.TrimSpace(rec.ProviderIdempotencyKeyHash) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed reusable hash")
+	}
+	switch normalizeHandoffSideEffectState(rec.State) {
+	case SideEffectStateReceiptBacked:
+		if proof.ProviderReceiptHash == "" {
+			return federationError(ErrHandoffReplayMismatchCode, "receipt-backed continuation proof is missing receipt hash")
+		}
+	case SideEffectStateIdempotent:
+		if proof.ProviderIdempotencyKeyHash == "" {
+			return federationError(ErrHandoffReplayMismatchCode, "idempotent continuation proof is missing idempotency key hash")
+		}
+	case SideEffectStateReadOnly, SideEffectStateNotStarted, SideEffectStateNone:
+	default:
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof state %s is not automatically reusable", rec.State)
+	}
+	if strings.Join(proof.EvidenceRecordIDs, "\x00") != strings.Join(sortedCopyAgent(firstNonEmptySlice(rec.EvidenceRecordIDs, handoff.EvidenceRecordIDs)), "\x00") {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed evidence refs")
+	}
+	if proof.CheckpointID != handoffContinuationCheckpointID(proof) || proof.ProofFingerprint != handoffContinuationProofFingerprint(proof) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof checkpoint changed")
+	}
+	return nil
+}
+
+func firstNonEmptySlice(primary, fallback []string) []string {
+	if len(primary) > 0 {
+		return primary
+	}
+	return fallback
 }
 
 func validateHandoffTransferAuthorityTx(ctx context.Context, tx Tx, req HandoffRequest, requestedAt time.Time) (string, string, FederationErrorCode, error) {
@@ -802,7 +1326,7 @@ func federationCodeFromError(err error, fallback FederationErrorCode) Federation
 	return fallback
 }
 
-func updateDeliveryAfterHandoffTx(ctx context.Context, tx Tx, req HandoffRequest, status string, terminalCode FederationErrorCode) error {
+func updateDeliveryAfterHandoffTx(ctx context.Context, tx Tx, req HandoffRequest, status string, terminalCode FederationErrorCode, claimProviderReceipt string) error {
 	attemptState := "stale"
 	taskState := "claimed"
 	if status != HandoffStatusTransferred {
@@ -811,9 +1335,10 @@ func updateDeliveryAfterHandoffTx(ctx context.Context, tx Tx, req HandoffRequest
 	}
 	if _, err := tx.Exec(ctx, `UPDATE delivery_attempts
 		SET state = ?, record_version = record_version + 1, updated_at = ?, ended_at = COALESCE(NULLIF(ended_at, ''), ?),
-			terminal_error_code = CASE WHEN ? <> '' THEN ? ELSE terminal_error_code END
+			terminal_error_code = CASE WHEN ? <> '' THEN ? ELSE terminal_error_code END,
+			provider_receipt = CASE WHEN provider_receipt = '' AND ? <> '' THEN ? ELSE provider_receipt END
 		WHERE attempt_id = ? AND executor_id = ? AND claim_generation = ?`,
-		attemptState, req.RequestedAt, req.RequestedAt, string(terminalCode), string(terminalCode), req.SourceAttemptID, req.SourceExecutorID, req.SourceClaimGeneration); err != nil {
+		attemptState, req.RequestedAt, req.RequestedAt, string(terminalCode), string(terminalCode), strings.TrimSpace(claimProviderReceipt), strings.TrimSpace(claimProviderReceipt), req.SourceAttemptID, req.SourceExecutorID, req.SourceClaimGeneration); err != nil {
 		return fmt.Errorf("record handoff: update source attempt: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE delivery_tasks
@@ -855,10 +1380,27 @@ func handoffReasonAllowsTransfer(reason string) bool {
 
 func handoffSideEffectSafe(state string) bool {
 	switch normalizeHandoffSideEffectState(state) {
-	case SideEffectStateNone, SideEffectStateNotStarted, SideEffectStateReadOnly:
+	case SideEffectStateNone, SideEffectStateNotStarted, SideEffectStateReadOnly, SideEffectStateIdempotent, SideEffectStateReceiptBacked:
 		return true
 	default:
 		return false
+	}
+}
+
+func handoffSideEffectCode(state string) string {
+	switch normalizeHandoffSideEffectState(state) {
+	case SideEffectStateNone, SideEffectStateNotStarted:
+		return HandoffSideEffectCodeNotStarted
+	case SideEffectStateReadOnly:
+		return HandoffSideEffectCodeReadOnly
+	case SideEffectStateIdempotent:
+		return HandoffSideEffectCodeIdempotentExact
+	case SideEffectStateReceiptBacked:
+		return HandoffSideEffectCodeReceiptBacked
+	case SideEffectStateIrreversible:
+		return HandoffSideEffectCodeIrreversible
+	default:
+		return HandoffSideEffectCodeAmbiguous
 	}
 }
 
@@ -901,6 +1443,7 @@ func normalizeHandoffSuccessorRequest(req HandoffSuccessorRequest, now time.Time
 	req.BudgetReservationID = strings.TrimSpace(req.BudgetReservationID)
 	req.BudgetPolicyIDs = sortedCopyAgent(req.BudgetPolicyIDs)
 	req.ReusableEvidenceIDs = sortedCopyAgent(req.ReusableEvidenceIDs)
+	req.ContinuationProof = normalizeHandoffContinuationProof(req.ContinuationProof)
 	req.Candidate.RoutingDecisionID = strings.TrimSpace(firstNonEmptyAgent(req.Candidate.RoutingDecisionID, req.RoutingDecisionID))
 	req.Candidate.RoutingCandidateID = strings.TrimSpace(req.Candidate.RoutingCandidateID)
 	req.Candidate.AdapterID = strings.TrimSpace(req.Candidate.AdapterID)
@@ -920,6 +1463,25 @@ func normalizeHandoffSuccessorRequest(req HandoffSuccessorRequest, now time.Time
 		req.HostJSON = "{}"
 	}
 	return req
+}
+
+func normalizeHandoffContinuationProof(proof HandoffContinuationProof) HandoffContinuationProof {
+	proof.SchemaVersion = strings.TrimSpace(proof.SchemaVersion)
+	proof.Code = strings.TrimSpace(proof.Code)
+	proof.State = normalizeHandoffSideEffectState(proof.State)
+	proof.SourceAttemptID = strings.TrimSpace(proof.SourceAttemptID)
+	proof.SourceExecutorID = strings.TrimSpace(proof.SourceExecutorID)
+	proof.HandoffID = strings.TrimSpace(proof.HandoffID)
+	proof.OwnershipFence = strings.TrimSpace(proof.OwnershipFence)
+	proof.ExecutionOutcome = strings.TrimSpace(proof.ExecutionOutcome)
+	proof.ProviderIdempotencyKeyHash = strings.TrimSpace(proof.ProviderIdempotencyKeyHash)
+	proof.ProviderReceiptHash = strings.TrimSpace(proof.ProviderReceiptHash)
+	proof.EvidenceRecordIDs = sortedCopyAgent(proof.EvidenceRecordIDs)
+	proof.DecisionRef = strings.TrimSpace(proof.DecisionRef)
+	proof.CompletedBoundary = strings.TrimSpace(proof.CompletedBoundary)
+	proof.CheckpointID = strings.TrimSpace(proof.CheckpointID)
+	proof.ProofFingerprint = strings.TrimSpace(proof.ProofFingerprint)
+	return proof
 }
 
 func validateHandoffSuccessorRequest(req HandoffSuccessorRequest) error {
@@ -948,6 +1510,10 @@ func validateHandoffSuccessorRequest(req HandoffSuccessorRequest) error {
 	}
 	if !json.Valid([]byte(req.ActorJSON)) || !json.Valid([]byte(req.HostJSON)) {
 		return federationError(ErrInvalidRecordCode, "actor_json and host_json must be valid JSON")
+	}
+	if req.ContinuationProof.SchemaVersion != HandoffContinuationProofSchema || strings.TrimSpace(req.ContinuationProof.CheckpointID) == "" ||
+		strings.TrimSpace(req.ContinuationProof.ProofFingerprint) == "" {
+		return federationError(ErrHandoffRequiredCode, "durable handoff continuation proof is required")
 	}
 	if len(req.BudgetPolicyIDs) == 0 {
 		return federationError(ErrChildBudgetRequiredCode, "at least one budget policy id is required")
@@ -1064,6 +1630,13 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		if existing.BudgetReservationID != req.BudgetReservationID && !(existing.LaunchPhase == ClaimPhaseCompleted && strings.TrimSpace(existing.ProviderReceipt) == "") {
 			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed handoff reservation")
 		}
+		if err := validateHandoffContinuationProofTx(ctx, tx, handoff, req.ContinuationProof); err != nil {
+			return HandoffSuccessorLaunch{}, err
+		}
+		if existing.ContinuationProof.CheckpointID == "" || existing.ContinuationProof.CheckpointID != req.ContinuationProof.CheckpointID ||
+			existing.ContinuationProof.ProofFingerprint != req.ContinuationProof.ProofFingerprint {
+			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed continuation proof")
+		}
 		existing.Replay = true
 		return existing, nil
 	}
@@ -1122,6 +1695,7 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		RoutingCandidateID:     req.Candidate.RoutingCandidateID,
 		BudgetReservationID:    req.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(req.ReusableEvidenceIDs),
+		ContinuationProof:      req.ContinuationProof,
 		OwnershipLocks:         ownershipSnapshot,
 		LaunchExposed:          true,
 		LaunchPhase:            ClaimPhaseLaunching,
@@ -1197,7 +1771,21 @@ func validateHandoffLaunchFenceTx(ctx context.Context, tx Tx, handoff HandoffTra
 			return federationError(ErrHandoffAuthorityMismatchCode, "routing decision does not match approved handoff authority")
 		}
 	}
+	if err := validateHandoffContinuationProofTx(ctx, tx, handoff, req.ContinuationProof); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateHandoffContinuationProofTx(ctx context.Context, tx Tx, handoff HandoffTransaction, proof HandoffContinuationProof) error {
+	rec, ok, err := loadHandoffSideEffectDecisionTx(ctx, tx, handoff)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof is missing durable reconciliation decision")
+	}
+	return validateHandoffContinuationProof(handoff, rec, proof)
 }
 
 func sourceAttemptForSuccessorTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (int, string, error) {
@@ -1336,6 +1924,7 @@ func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff Handof
 		"routing_candidate_id":     req.Candidate.RoutingCandidateID,
 		"budget_reservation_id":    req.BudgetReservationID,
 		"reusable_evidence_ids":    sortedCopyAgent(req.ReusableEvidenceIDs),
+		"continuation_proof":       req.ContinuationProof,
 		"ownership_locks":          normalizeHandoffOwnershipLockSnapshot(ownershipSnapshot),
 		"provider_idempotency_key": providerKey,
 		"provider_session_ref":     "",
@@ -1508,6 +2097,7 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID  string                         `json:"routing_candidate_id"`
 		BudgetReservationID string                         `json:"budget_reservation_id"`
 		ReusableEvidenceIDs []string                       `json:"reusable_evidence_ids"`
+		ContinuationProof   HandoffContinuationProof       `json:"continuation_proof"`
 		OwnershipLocks      []HandoffOwnershipLockSnapshot `json:"ownership_locks"`
 		LaunchPhase         string                         `json:"launch_phase"`
 	}
@@ -1531,6 +2121,7 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID:     payload.RoutingCandidateID,
 		BudgetReservationID:    payload.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(payload.ReusableEvidenceIDs),
+		ContinuationProof:      normalizeHandoffContinuationProof(payload.ContinuationProof),
 		OwnershipLocks:         normalizeHandoffOwnershipLockSnapshot(payload.OwnershipLocks),
 		LaunchExposed:          false,
 		LaunchPhase:            firstNonEmptyAgent(claimPhase, payload.LaunchPhase),
@@ -1658,13 +2249,27 @@ func normalizeHandoffSideEffectState(value string) string {
 		return SideEffectStateNotStarted
 	case "read-only", "readonly":
 		return SideEffectStateReadOnly
+	case "idempotent", "idempotent-exact-key", "exact-idempotency-key":
+		return SideEffectStateIdempotent
+	case "receipt-backed", "receipt_backed", "provider-receipt", "receipt":
+		return SideEffectStateReceiptBacked
 	case "provider-started", "launched", "started":
 		return SideEffectStateProviderStart
+	case "irreversible":
+		return SideEffectStateIrreversible
 	case "ambiguous":
 		return SideEffectStateAmbiguous
 	default:
 		return firstNonEmptyAgent(value, SideEffectStateUnknown)
 	}
+}
+
+func hashSecretEvidence(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return hashString(value)
 }
 
 func compactJSONString(raw string) string {

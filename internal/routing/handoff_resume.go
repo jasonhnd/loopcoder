@@ -28,6 +28,7 @@ type HandoffResumeInput struct {
 	BeforeLaunch        func() error
 	AfterPrepare        func() error
 	AfterRegistration   func() error
+	ContinuationSupport HandoffSuccessorContinuationSupport
 	ExecuteSuccessor    HandoffSuccessorExecutor
 	DecidedBy           delivery.Actor
 	Host                delivery.Host
@@ -35,14 +36,23 @@ type HandoffResumeInput struct {
 
 type HandoffSuccessorExecutor func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error)
 
+type HandoffSuccessorContinuationSupport struct {
+	ReceiptBacked bool
+	Idempotent    bool
+	CheckpointID  string
+}
+
 type HandoffSuccessorExecution struct {
-	Launch    storage.HandoffSuccessorLaunch
-	Candidate Candidate
+	Launch            storage.HandoffSuccessorLaunch
+	Candidate         Candidate
+	ContinuationProof storage.HandoffContinuationProof
 }
 
 type HandoffSuccessorExecutionResult struct {
-	ProviderReceipt string
-	Outcome         HandoffSuccessorExecutionOutcome
+	ProviderReceipt          string
+	Outcome                  HandoffSuccessorExecutionOutcome
+	ContinuationCheckpointID string
+	ReusedSourceBoundary     bool
 }
 
 type HandoffSuccessorExecutionOutcome string
@@ -62,6 +72,7 @@ const (
 
 type HandoffResumeResult struct {
 	Handoff         storage.HandoffTransaction
+	Reconciliation  storage.HandoffSideEffectReconciliation
 	RoutingDecision RoutingDecision
 	Reservation     budget.Reservation
 	Successor       storage.HandoffSuccessorLaunch
@@ -81,6 +92,22 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 	if handoff.HandoffStatus != storage.HandoffStatusTransferred {
 		return HandoffResumeResult{Handoff: handoff, Blocked: true}, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff is not approved for automatic successor launch"}
 	}
+	reconciliation, err := storage.ReconcileHandoffSideEffect(ctx, store, handoff)
+	if err != nil {
+		return HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}, err
+	}
+	if !reconciliation.AutomaticContinuation || reconciliation.NeedsHuman {
+		result := HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}
+		markErr := storage.MarkHandoffSideEffectNeedsHuman(ctx, store, handoff, reconciliation)
+		return result, errors.Join(markErr, &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff side-effect reconciliation requires human review before successor launch"})
+	}
+	continuationProof, err := storage.BuildHandoffContinuationProof(handoff, reconciliation)
+	if err != nil {
+		return HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}, err
+	}
+	if err := validateHandoffContinuationSupport(continuationProof, input.ContinuationSupport); err != nil {
+		return HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, Blocked: true}, err
+	}
 	routeInput := input.DecisionInput
 	routeInput.ProjectID = handoff.ProjectID
 	routeInput.DeliveryRunID = handoff.DeliveryRunID
@@ -95,7 +122,7 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		return HandoffResumeResult{Handoff: handoff}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "handoff successor requirement does not match approved task authority"}
 	}
 	decision, routeErr := DecideAndPersistRoute(ctx, store, routeInput)
-	result := HandoffResumeResult{Handoff: handoff, RoutingDecision: decision}
+	result := HandoffResumeResult{Handoff: handoff, Reconciliation: reconciliation, RoutingDecision: decision}
 	if routeErr != nil {
 		if errors.Is(routeErr, taskrequirements.ErrNoEligibleCandidate) {
 			result.Blocked = true
@@ -156,6 +183,7 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		BudgetReservationID: result.Reservation.BudgetReservationID,
 		BudgetPolicyIDs:     result.Reservation.PolicyIDs,
 		ReusableEvidenceIDs: boundedEvidenceRefs(input.ReusableEvidenceIDs, handoff.EvidenceRecordIDs),
+		ContinuationProof:   continuationProof,
 		Candidate: storage.HandoffSuccessorCandidate{
 			RoutingDecisionID:      decision.RoutingDecisionID,
 			RoutingCandidateID:     selected.RoutingCandidateID,
@@ -216,8 +244,12 @@ func ResumeApprovedHandoff(ctx context.Context, store storage.Store, input Hando
 		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "cancelled-before-provider-invocation", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
 		return result, errors.Join(&taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff resume cancelled before provider invocation"}, cleanupErr)
 	}
-	executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected})
+	executed, execErr := input.ExecuteSuccessor(ctx, HandoffSuccessorExecution{Launch: launch, Candidate: selected, ContinuationProof: launch.ContinuationProof})
 	result.Successor.ProviderReceipt = strings.TrimSpace(executed.ProviderReceipt)
+	if err := validateHandoffExecutionContinuationResult(launch.ContinuationProof, executed); err != nil {
+		cleanupErr := cleanupHandoffLaunchTerminal(store, handoff, launch, result.Reservation, "needs-human", taskrequirements.ErrReplanRequiredCode, "destination-launch-continuation-unconfirmed", handoffTerminalOwnershipRelease, input.DecidedBy, input.Host)
+		return result, errors.Join(execErr, err, cleanupErr)
+	}
 	switch handoffExecutionOutcome(executed) {
 	case HandoffSuccessorExecutionStarted:
 		startedErr := handoffStartedExecutionError(execErr)
@@ -307,6 +339,37 @@ func handoffResumeCancelled(ctx context.Context, input HandoffResumeInput) bool 
 		return true
 	}
 	return false
+}
+
+func validateHandoffContinuationSupport(proof storage.HandoffContinuationProof, support HandoffSuccessorContinuationSupport) error {
+	switch proof.State {
+	case storage.SideEffectStateReceiptBacked:
+		if !support.ReceiptBacked {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor executor has not declared receipt-backed continuation support"}
+		}
+	case storage.SideEffectStateIdempotent:
+		if !support.Idempotent {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor executor has not declared idempotent continuation support"}
+		}
+	default:
+		return nil
+	}
+	if strings.TrimSpace(support.CheckpointID) != proof.CheckpointID {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor executor checkpoint does not match durable continuation proof"}
+	}
+	return nil
+}
+
+func validateHandoffExecutionContinuationResult(proof storage.HandoffContinuationProof, result HandoffSuccessorExecutionResult) error {
+	switch proof.State {
+	case storage.SideEffectStateReceiptBacked, storage.SideEffectStateIdempotent:
+	default:
+		return nil
+	}
+	if strings.TrimSpace(result.ContinuationCheckpointID) != proof.CheckpointID || !result.ReusedSourceBoundary {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrReplanRequiredCode, Message: "handoff successor executor did not confirm reuse of the bound source continuation checkpoint"}
+	}
+	return nil
 }
 
 func handoffLaunchNeedsHuman(launch storage.HandoffSuccessorLaunch, now time.Time) bool {

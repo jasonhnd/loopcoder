@@ -95,11 +95,15 @@ func TestRecordHandoffTransactionStaleOwnershipLockFailsClosed(t *testing.T) {
 func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
-		name   string
-		mutate func(Store, federationClaim)
+		name       string
+		mutate     func(Store, federationClaim)
+		wantState  string
+		wantStatus string
+		wantAction string
 	}{
 		{
-			name: "executing phase",
+			name:      "executing phase with exact idempotency key",
+			wantState: SideEffectStateIdempotent, wantStatus: HandoffStatusTransferred, wantAction: "await-successor-route",
 			mutate: func(store Store, claim federationClaim) {
 				if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseExecuting, "2026-01-01T00:01:00Z", ""); err != nil {
 					t.Fatalf("set executing phase: %v", err)
@@ -107,7 +111,8 @@ func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *te
 			},
 		},
 		{
-			name: "claim provider receipt",
+			name:      "claim provider receipt",
+			wantState: SideEffectStateReceiptBacked, wantStatus: HandoffStatusTransferred, wantAction: "await-successor-route",
 			mutate: func(store Store, claim federationClaim) {
 				if err := UpdateChildRunClaimPhase(ctx, store, claim.ParentRunID, claim.RunID, claim.ExecutorID, claim.ClaimGeneration, ClaimPhaseClaimed, "2026-01-01T00:01:00Z", "provider-receipt-runtime"); err != nil {
 					t.Fatalf("set claim receipt: %v", err)
@@ -115,7 +120,8 @@ func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *te
 			},
 		},
 		{
-			name: "attempt provider receipt",
+			name:      "attempt provider receipt",
+			wantState: SideEffectStateReceiptBacked, wantStatus: HandoffStatusTransferred, wantAction: "await-successor-route",
 			mutate: func(store Store, claim federationClaim) {
 				if err := store.WithWriteTx(ctx, func(tx Tx) error {
 					_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = ?`, "attempt-runtime-receipt", "attempt-handoff-a")
@@ -126,7 +132,8 @@ func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *te
 			},
 		},
 		{
-			name: "ambiguous claim phase",
+			name:      "ambiguous claim phase",
+			wantState: SideEffectStateAmbiguous, wantStatus: HandoffStatusNeedsHuman, wantAction: "human-review-side-effect-state",
 			mutate: func(store Store, claim federationClaim) {
 				if err := store.WithWriteTx(ctx, func(tx Tx) error {
 					_, err := tx.Exec(ctx, `UPDATE run_claims SET phase = ? WHERE run_id = ?`, "provider-unknown", claim.RunID)
@@ -148,14 +155,18 @@ func TestRecordHandoffTransactionDerivesSideEffectStateFromDurableEvidence(t *te
 			if err != nil {
 				t.Fatalf("RecordHandoffTransaction: %v", err)
 			}
-			if record.HandoffStatus != HandoffStatusNeedsHuman || record.NextAction != "human-review-side-effect-state" {
-				t.Fatalf("handoff = %#v, want needs-human side-effect review", record)
+			if record.HandoffStatus != tc.wantStatus || record.NextAction != tc.wantAction || record.SideEffectState != tc.wantState {
+				t.Fatalf("handoff = %#v, want %s/%s/%s", record, tc.wantStatus, tc.wantAction, tc.wantState)
 			}
 			if record.SideEffectState == SideEffectStateNotStarted {
 				t.Fatalf("side effect state trusted caller input; got %q", record.SideEffectState)
 			}
-			if _, err := ValidateNativeChildLaunch(ctx, store, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration); err == nil {
+			_, launchErr := ValidateNativeChildLaunch(ctx, store, claim.RunID, record.DestinationExecutorID, record.HandoffGeneration)
+			if tc.wantStatus == HandoffStatusNeedsHuman && launchErr == nil {
 				t.Fatalf("needs-human handoff launch unexpectedly succeeded")
+			}
+			if tc.wantStatus == HandoffStatusTransferred && launchErr != nil {
+				t.Fatalf("transferred handoff launch validation: %v", launchErr)
 			}
 		})
 	}
@@ -174,8 +185,8 @@ func TestRecordHandoffTransactionDurableSideEffectReplayAfterRestart(t *testing.
 	if err != nil {
 		t.Fatalf("first handoff: %v", err)
 	}
-	if first.HandoffStatus != HandoffStatusNeedsHuman {
-		t.Fatalf("first handoff status = %q, want needs-human", first.HandoffStatus)
+	if first.HandoffStatus != HandoffStatusTransferred || first.SideEffectState != SideEffectStateIdempotent {
+		t.Fatalf("first handoff = %s/%s, want transferred/idempotent", first.HandoffStatus, first.SideEffectState)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
@@ -189,7 +200,7 @@ func TestRecordHandoffTransactionDurableSideEffectReplayAfterRestart(t *testing.
 	if err != nil {
 		t.Fatalf("replay after reopen: %v", err)
 	}
-	if replayed.HandoffID != first.HandoffID || replayed.SideEffectState != first.SideEffectState || replayed.HandoffStatus != HandoffStatusNeedsHuman {
+	if replayed.HandoffID != first.HandoffID || replayed.SideEffectState != first.SideEffectState || replayed.HandoffStatus != first.HandoffStatus {
 		t.Fatalf("replayed handoff = %#v, want %#v", replayed, first)
 	}
 }
