@@ -260,8 +260,30 @@ func readCodexSummary(logPath string) string {
 	return strings.TrimSpace(string(summaryBytes))
 }
 
+func stripANSI(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		if text[i] == 0x1b && i+1 < len(text) && text[i+1] == '[' {
+			j := i + 2
+			for j < len(text) {
+				c := text[j]
+				j++
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+					break
+				}
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
+}
+
 func parseCodexInvocation(output []byte) invocationMetadata {
-	text := string(output)
+	text := stripANSI(string(output))
 	metadata := invocationMetadata{
 		Model:  parseCodexHeaderValue(text, "model"),
 		Effort: parseCodexHeaderValue(text, "reasoning effort"),
