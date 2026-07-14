@@ -109,6 +109,8 @@ type RefreshManager struct {
 	mu       sync.Mutex
 	inFlight map[string]*refreshCall
 	active   map[string]int
+
+	afterPublish func()
 }
 
 type refreshCall struct {
@@ -144,6 +146,14 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{}, err
 	}
+	if trigger == "" {
+		results := invalidTriggerRefreshResults(append(append([]string(nil), providers...), inactiveProviders...), req.Trigger, now)
+		status := m.statusFromReport(cached, providers, policy, now)
+		status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
+		sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
+		status.GapReasons = dedupeStrings(append(status.GapReasons, "invalid-trigger"))
+		return RefreshResult{Report: cached, Status: status, Providers: results}, nil
+	}
 	inactiveResults := inactiveProviderRefreshResults(inactiveProviders, trigger, now)
 	refreshProviders := providersForTrigger(cached, providers, trigger, policy, now)
 	key := m.refreshRequestKey(req, trigger, refreshProviders, policy, now)
@@ -175,12 +185,20 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	m.mu.Unlock()
 
 	go func() {
-		call.result, call.err = m.runSharedRefresh(req, cached, refreshProviders, inactiveResults, policy, now)
+		result, err := m.runSharedRefresh(req, cached, refreshProviders, inactiveResults, policy, now)
 		m.mu.Lock()
+		call.result = result
+		call.err = err
 		m.markActiveLocked(refreshProviders, -1)
+		close(call.done)
+		afterPublish := m.afterPublish
+		m.mu.Unlock()
+		if afterPublish != nil {
+			afterPublish()
+		}
+		m.mu.Lock()
 		delete(m.inFlight, key)
 		m.mu.Unlock()
-		close(call.done)
 	}()
 
 	select {
@@ -485,6 +503,22 @@ func inactiveProviderRefreshResults(providers []string, trigger RefreshTrigger, 
 	return results
 }
 
+func invalidTriggerRefreshResults(providers []string, trigger RefreshTrigger, now time.Time) []ProviderRefreshResult {
+	providers = canonicalProviderList(providers)
+	results := make([]ProviderRefreshResult, 0, len(providers))
+	for _, provider := range providers {
+		results = append(results, ProviderRefreshResult{
+			AdapterID:     provider,
+			Trigger:       trigger,
+			Refreshed:     false,
+			ErrorCode:     "ErrQuotaRefreshInvalidTrigger",
+			CompletedAt:   formatTime(now),
+			NextRefreshAt: formatTime(now),
+		})
+	}
+	return results
+}
+
 func inactiveProviderQuotaStatuses(providers []string, now time.Time) []ProviderQuotaStatus {
 	statuses := make([]ProviderQuotaStatus, 0, len(providers))
 	for _, provider := range providers {
@@ -684,9 +718,11 @@ func staleQuotaErrorReport(cfg config.Config, cached Report, provider, code stri
 	}
 	var sources []QuotaTelemetrySource
 	var snapshots []QuotaSnapshot
-	if snapshot, ok := latestTrustworthyQuotaSnapshot(cached, provider); ok {
+	sourceSeen := map[string]bool{}
+	for _, snapshot := range latestTrustworthyQuotaSnapshotsByScope(cached, provider) {
 		source, ok := sourceByID[snapshot.QuotaSourceID]
-		if ok {
+		if ok && !sourceSeen[source.QuotaSourceID] {
+			sourceSeen[source.QuotaSourceID] = true
 			sources = append(sources, source)
 		}
 		next := snapshot
@@ -731,10 +767,12 @@ func staleQuotaErrorReport(cfg config.Config, cached Report, provider, code stri
 	return report
 }
 
-func latestTrustworthyQuotaSnapshot(report Report, provider string) (QuotaSnapshot, bool) {
-	var best QuotaSnapshot
-	var bestAt time.Time
-	found := false
+func latestTrustworthyQuotaSnapshotsByScope(report Report, provider string) []QuotaSnapshot {
+	type selected struct {
+		snapshot   QuotaSnapshot
+		capturedAt time.Time
+	}
+	bestByKey := map[string]selected{}
 	for _, snapshot := range report.QuotaSnapshots {
 		if snapshot.AdapterID != provider || snapshot.FreshnessState == FreshnessExpired || snapshot.Confidence == ConfidenceUnavailable || snapshot.Confidence == ConfidenceUnknown {
 			continue
@@ -746,13 +784,23 @@ func latestTrustworthyQuotaSnapshot(report Report, provider string) (QuotaSnapsh
 		if err != nil {
 			continue
 		}
-		if !found || captured.After(bestAt) || (captured.Equal(bestAt) && quotaWindowScopeKey(snapshot) > quotaWindowScopeKey(best)) {
-			best = snapshot
-			bestAt = captured.UTC()
-			found = true
+		key := quotaWindowScopeKey(snapshot)
+		current, ok := bestByKey[key]
+		captured = captured.UTC()
+		if !ok || captured.After(current.capturedAt) || (captured.Equal(current.capturedAt) && snapshot.QuotaSnapshotID > current.snapshot.QuotaSnapshotID) {
+			bestByKey[key] = selected{snapshot: snapshot, capturedAt: captured}
 		}
 	}
-	return best, found
+	keys := make([]string, 0, len(bestByKey))
+	for key := range bestByKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]QuotaSnapshot, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, bestByKey[key].snapshot)
+	}
+	return out
 }
 
 func quotaWindowScopeKey(snapshot QuotaSnapshot) string {
@@ -770,7 +818,6 @@ func quotaWindowScopeKey(snapshot QuotaSnapshot) string {
 		ptrValue(snapshot.ProviderInstallationID),
 		ptrValue(snapshot.AccountProfileID),
 		ptrValue(snapshot.ModelCapabilityID),
-		snapshot.QuotaSnapshotID,
 	}
 	return strings.Join(parts, "\x00")
 }

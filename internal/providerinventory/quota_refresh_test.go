@@ -99,6 +99,71 @@ func TestQuotaRefreshCoalescesEquivalentRequestsAndWaiterCancelDoesNotCancelWork
 	}
 }
 
+func TestQuotaRefreshPublicationBoundarySharesCompletedResult(t *testing.T) {
+	ctx := context.Background()
+	store := quotaRefreshStore(t, fixedInventoryNow)
+	defer store.Close()
+
+	now := fixedInventoryNow()
+	published := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	var publishOnce sync.Once
+	var mu sync.Mutex
+	calls := 0
+	manager := NewRefreshManager(store, fakeDeps(t, nil))
+	manager.afterPublish = func() {
+		publishOnce.Do(func() { close(published) })
+		<-releaseCleanup
+	}
+	manager.Collector = func(context.Context, Options, Deps) (Report, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return quotaRefreshReport("codex", now, 42, ""), nil
+	}
+	req := RefreshRequest{
+		Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Trigger: RefreshTriggerExplicit,
+		Now:     func() time.Time { return now },
+	}
+	firstDone := make(chan RefreshResult, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		result, err := manager.Refresh(ctx, req)
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		firstDone <- result
+	}()
+	<-published
+
+	second, err := manager.Refresh(ctx, req)
+	if err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+	close(releaseCleanup)
+	select {
+	case err := <-firstErr:
+		t.Fatalf("first Refresh: %v", err)
+	case first := <-firstDone:
+		if !reflect.DeepEqual(first.Report.InventoryFingerprint, second.Report.InventoryFingerprint) {
+			t.Fatalf("shared result fingerprints differ: first=%s second=%s", first.Report.InventoryFingerprint, second.Report.InventoryFingerprint)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first refresh did not finish")
+	}
+	if len(second.Providers) != 1 || !second.Providers[0].Coalesced || !second.Providers[0].Refreshed {
+		t.Fatalf("second providers = %#v, want completed coalesced result", second.Providers)
+	}
+	mu.Lock()
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("collector calls = %d, want 1", gotCalls)
+	}
+}
+
 func TestQuotaRefreshRejectsUnconfiguredRequestedProviderWithoutInvokingIt(t *testing.T) {
 	store := quotaRefreshStore(t, fixedInventoryNow)
 	defer store.Close()
@@ -350,20 +415,48 @@ func TestQuotaRefreshProviderErrorPersistsLastKnownGoodAsStaleWithoutFabricating
 	}
 }
 
-func TestQuotaRefreshProviderErrorCarriesOnlyLatestTrustworthySnapshot(t *testing.T) {
+func TestQuotaRefreshProviderErrorCarriesLatestTrustworthySnapshotPerScopeWindow(t *testing.T) {
 	now := fixedInventoryNow()
 	current := now
 	store := quotaRefreshStore(t, func() time.Time { return current })
 	defer store.Close()
-	older := quotaRefreshReport("codex", now.Add(-3*time.Minute), 99, "")
-	newer := quotaRefreshReport("codex", now.Add(-time.Minute), 7, "")
-	newer.QuotaSnapshots[0].QuotaSnapshotID = "qsnap_a_newer_lower"
-	older.QuotaSnapshots[0].QuotaSnapshotID = "qsnap_z_older_higher"
-	if err := Refresh(context.Background(), store, older, now); err != nil {
-		t.Fatalf("seed older: %v", err)
+
+	source := fixtureQuotaSource("codex", QuotaSourceFixture, false)
+	windowAOlder := quotaRefreshSnapshot("codex", now.Add(-6*time.Minute), 99, "")
+	windowAOlder.QuotaSourceID = source.QuotaSourceID
+	windowAOlder.QuotaSnapshotID = "qsnap_codex_window_a_older"
+	windowAOlder.ScopeKey = "provider:codex/window:a"
+	windowAOlder.ResetAt = formatTime(now.Add(time.Hour))
+	windowANewer := windowAOlder
+	remainingA := int64(7)
+	windowANewer.QuotaSnapshotID = "qsnap_codex_window_a_newer"
+	windowANewer.CapturedAt = formatTime(now.Add(-2 * time.Minute))
+	windowANewer.CreatedAt = windowANewer.CapturedAt
+	windowANewer.UpdatedAt = windowANewer.CapturedAt
+	windowANewer.RemainingValue = &remainingA
+	windowBOlder := quotaRefreshSnapshot("codex", now.Add(-5*time.Minute), 88, "")
+	windowBOlder.QuotaSourceID = source.QuotaSourceID
+	windowBOlder.QuotaSnapshotID = "qsnap_codex_window_b_older"
+	windowBOlder.ScopeKey = "provider:codex/window:b"
+	windowBOlder.ResetAt = formatTime(now.Add(2 * time.Hour))
+	windowBNewer := windowBOlder
+	remainingB := int64(3)
+	windowBNewer.QuotaSnapshotID = "qsnap_codex_window_b_newer"
+	windowBNewer.CapturedAt = formatTime(now.Add(-time.Minute))
+	windowBNewer.CreatedAt = windowBNewer.CapturedAt
+	windowBNewer.UpdatedAt = windowBNewer.CapturedAt
+	windowBNewer.RemainingValue = &remainingB
+
+	seed := quotaRefreshReport("codex", now.Add(-6*time.Minute), 0, "")
+	seed.QuotaTelemetrySources = []QuotaTelemetrySource{source}
+	seed.QuotaSnapshots = []QuotaSnapshot{
+		normalizeQuotaSnapshot(windowAOlder),
+		normalizeQuotaSnapshot(windowANewer),
+		normalizeQuotaSnapshot(windowBOlder),
+		normalizeQuotaSnapshot(windowBNewer),
 	}
-	if err := Refresh(context.Background(), store, newer, now); err != nil {
-		t.Fatalf("seed newer: %v", err)
+	if err := Refresh(context.Background(), store, seed, now); err != nil {
+		t.Fatalf("seed windows: %v", err)
 	}
 	manager := NewRefreshManager(store, fakeDeps(t, nil))
 	manager.Collector = func(context.Context, Options, Deps) (Report, error) {
@@ -378,8 +471,8 @@ func TestQuotaRefreshProviderErrorCarriesOnlyLatestTrustworthySnapshot(t *testin
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	if got := result.Providers[0].QuotaSnapshotIDs; len(got) != 1 {
-		t.Fatalf("stale result snapshot ids = %#v, want one", got)
+	if got := result.Providers[0].QuotaSnapshotIDs; len(got) != 2 {
+		t.Fatalf("stale result snapshot ids = %#v, want two scope/window carry-forwards", got)
 	}
 	loaded, err := Load(context.Background(), store)
 	if err != nil {
@@ -391,11 +484,18 @@ func TestQuotaRefreshProviderErrorCarriesOnlyLatestTrustworthySnapshot(t *testin
 			stale = append(stale, snapshot)
 		}
 	}
-	if len(stale) != 1 {
-		t.Fatalf("stale snapshots = %#v, want exactly one", stale)
+	if len(stale) != 2 {
+		t.Fatalf("stale snapshots = %#v, want exactly two", stale)
 	}
-	if stale[0].RemainingValue == nil || *stale[0].RemainingValue != 7 {
-		t.Fatalf("stale remaining = %#v, want latest trustworthy value 7", stale[0].RemainingValue)
+	byScope := map[string]QuotaSnapshot{}
+	for _, snapshot := range stale {
+		byScope[snapshot.ScopeKey] = snapshot
+	}
+	if byScope["provider:codex/window:a"].RemainingValue == nil || *byScope["provider:codex/window:a"].RemainingValue != 7 {
+		t.Fatalf("window a stale snapshot = %#v, want latest trustworthy value 7", byScope["provider:codex/window:a"])
+	}
+	if byScope["provider:codex/window:b"].RemainingValue == nil || *byScope["provider:codex/window:b"].RemainingValue != 3 {
+		t.Fatalf("window b stale snapshot = %#v, want latest trustworthy value 3", byScope["provider:codex/window:b"])
 	}
 }
 
@@ -557,15 +657,24 @@ func TestQuotaRefreshInvalidTriggerFailsClosed(t *testing.T) {
 		return Report{}, nil
 	}
 	result, err := manager.Refresh(context.Background(), RefreshRequest{
-		Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
-		Trigger: RefreshTrigger("surprise"),
-		Now:     func() time.Time { return now },
+		Config:    config.Config{Adapters: config.Adapters{Worker: "codex", Verifier: "claude"}},
+		Providers: []string{"claude", "codex"},
+		Trigger:   RefreshTrigger("surprise"),
+		Now:       func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	if len(result.Providers) != 0 {
-		t.Fatalf("providers = %#v, want no probe results for invalid trigger", result.Providers)
+	if len(result.Providers) != 2 {
+		t.Fatalf("providers = %#v, want deterministic provider evidence for invalid trigger", result.Providers)
+	}
+	if got := []string{result.Providers[0].AdapterID, result.Providers[1].AdapterID}; !reflect.DeepEqual(got, []string{"claude", "codex"}) {
+		t.Fatalf("provider order = %#v", got)
+	}
+	for _, provider := range result.Providers {
+		if provider.Refreshed || provider.ErrorCode != "ErrQuotaRefreshInvalidTrigger" || provider.Trigger != RefreshTrigger("surprise") {
+			t.Fatalf("provider result = %#v, want invalid-trigger typed gap", provider)
+		}
 	}
 }
 

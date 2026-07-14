@@ -455,7 +455,7 @@ func TestRouteDecisionReplayPersistsOneReproducibleSelection(t *testing.T) {
 		t.Fatalf("Close first store: %v", err)
 	}
 
-	later := fixture.now.Add(2 * time.Hour)
+	later := fixture.now.Add(30 * time.Minute)
 	reopened, err := storage.Open(ctx, storage.Options{Path: path, Now: func() time.Time { return later }})
 	if err != nil {
 		t.Fatalf("reopen storage: %v", err)
@@ -540,7 +540,11 @@ func TestRouteDecisionNoEligibleCandidatePersistsTypedBlockedDecision(t *testing
 
 	input := replayDecisionInput(fixture)
 	input.DecisionKey = "route-blocked"
-	input.Inputs.Candidates = []Candidate{fixture.candidate("codex", "acct-a", "codex-broken")}
+	req := workerRequirement("task-blocked-permission")
+	req.PermissionRequired = taskrequirements.PermissionOrchestrate
+	req = decisionRequirement(t, fixture, req, "treq-blocked-permission", input.PlanFingerprint)
+	input.TaskRequirementID = req.TaskRequirementID
+	input.Inputs.Requirement = req
 	decision, err := DecideAndPersistRoute(ctx, store, input)
 	if !errors.Is(err, taskrequirements.ErrNoEligibleCandidate) {
 		t.Fatalf("DecideAndPersistRoute error = %v, want ErrNoEligibleCandidate", err)
@@ -552,7 +556,7 @@ func TestRouteDecisionNoEligibleCandidatePersistsTypedBlockedDecision(t *testing
 	if err != nil {
 		t.Fatalf("LoadRoutingDecision: %v", err)
 	}
-	if loaded.DecisionStatus != DecisionStatusNoEligible || len(loaded.RejectedCandidates) != 1 || len(loaded.RejectedSummary) == 0 {
+	if loaded.DecisionStatus != DecisionStatusNoEligible || len(loaded.RejectedCandidates) == 0 || len(loaded.RejectedSummary) == 0 {
 		t.Fatalf("loaded blocked decision missing rejection evidence: %#v", loaded)
 	}
 	replayed, err := DecideAndPersistRoute(ctx, store, input)
@@ -561,6 +565,57 @@ func TestRouteDecisionNoEligibleCandidatePersistsTypedBlockedDecision(t *testing
 	}
 	if replayed.RoutingDecisionID != decision.RoutingDecisionID || replayed.CreatedAt != decision.CreatedAt || replayed.TerminalErrorCode != taskrequirements.ErrNoEligibleCandidateCode {
 		t.Fatalf("blocked replay changed immutable decision:\nfirst=%#v\nreplay=%#v", decision, replayed)
+	}
+}
+
+func TestDecideAndPersistRouteUsesDurableCachedInventoryOverCallerCandidates(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+
+	input := replayDecisionInput(fixture)
+	input.DecisionKey = "route-cache-authoritative"
+	grokFixture := withGrokOrdinaryWorkerFixture(fixture)
+	fabricated := grokFixture.candidate("grok", "acct-grok", "grok-good")
+	input.Inputs.Candidates = []Candidate{fabricated}
+	input.Inputs.Inventory = grokFixture.inventory
+	decision, err := DecideAndPersistRoute(ctx, store, input)
+	if err != nil {
+		t.Fatalf("DecideAndPersistRoute: %v", err)
+	}
+	for _, candidate := range append(decision.EligibleCandidates, rejectedDecisionCandidates(decision.RejectedCandidates)...) {
+		if candidate.AdapterID == "grok" {
+			t.Fatalf("caller-supplied grok candidate bypassed cached inventory: %#v", decision)
+		}
+	}
+	if len(decision.InputRecordRefs) == 0 || !hasInputRecordRef(decision.InputRecordRefs, "quota_snapshot", "qsnap-codex-a-good") {
+		t.Fatalf("decision did not bind cached quota evidence: %#v", decision.InputRecordRefs)
+	}
+}
+
+func TestDecideAndPersistRouteMissingDurableInventoryFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStoreMetadataOnly(t, ctx, store, fixture.now)
+
+	input := replayDecisionInput(fixture)
+	input.DecisionKey = "route-cache-missing"
+	decision, err := DecideAndPersistRoute(ctx, store, input)
+	if !errors.Is(err, taskrequirements.ErrNoEligibleCandidate) {
+		t.Fatalf("DecideAndPersistRoute error = %v, want ErrNoEligibleCandidate", err)
+	}
+	if decision.DecisionStatus != DecisionStatusNoEligible || len(decision.EligibleCandidates) != 0 || len(decision.ScoredCandidates) != 0 {
+		t.Fatalf("missing cached inventory decision = %#v", decision)
 	}
 }
 
@@ -609,6 +664,12 @@ func tempDB(t *testing.T) string {
 }
 
 func seedRoutingDecisionStore(t *testing.T, ctx context.Context, store storage.Store, now time.Time) {
+	t.Helper()
+	seedRoutingDecisionStoreMetadataOnly(t, ctx, store, now)
+	seedCachedRoutingInventoryPayloads(t, ctx, store, newFixture(t))
+}
+
+func seedRoutingDecisionStoreMetadataOnly(t *testing.T, ctx context.Context, store storage.Store, now time.Time) {
 	t.Helper()
 	at := delivery.CanonicalTimestamp(now)
 	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
@@ -723,6 +784,14 @@ func assertRoutingDecisionCount(t *testing.T, ctx context.Context, store storage
 	if count != want {
 		t.Fatalf("routing decision count = %d, want %d", count, want)
 	}
+}
+
+func rejectedDecisionCandidates(rejected []RejectedCandidate) []Candidate {
+	out := make([]Candidate, 0, len(rejected))
+	for _, candidate := range rejected {
+		out = append(out, candidate.Candidate)
+	}
+	return out
 }
 
 func containsScoredCandidate(candidates []ScoredCandidate, id string) bool {
