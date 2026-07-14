@@ -32,6 +32,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/platform"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
@@ -72,6 +73,8 @@ type Deps struct {
 	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
 	ProcessAlive                func(pid int) bool
 	Now                         func() time.Time
+	RuntimeGOOS                 string
+	RuntimeGOARCH               string
 	IsTerminal                  func(w io.Writer) bool
 	TerminalWidth               func(w io.Writer) int
 	Stdin                       io.Reader
@@ -193,10 +196,12 @@ func DefaultDeps() Deps {
 		NewPromoteWriter: func(repoPath string) orchestration.PromotionWriter {
 			return gh.New(repoPath)
 		},
-		ProcessAlive: process.Alive,
-		Now:          time.Now,
-		IsTerminal:   isTerminalWriter,
-		Stdin:        os.Stdin,
+		ProcessAlive:  process.Alive,
+		Now:           time.Now,
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+		IsTerminal:    isTerminalWriter,
+		Stdin:         os.Stdin,
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
 		},
@@ -386,18 +391,27 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 0
 	}
 
+	for _, arg := range args[1:] {
+		if isHelp(arg) {
+			if command, ok := findCommand(args[0]); ok {
+				PrintCommandHelp(stdout, command)
+				return 0
+			}
+		}
+	}
+	if args[0] == "version" {
+		return runVersion(args[1:], stdout, stderr, deps)
+	}
+
+	if err := platform.Check(cliPlatformTuple(deps), platform.StartupPhase); err != nil {
+		return renderUnsupportedPlatform(err, args, stdout, stderr)
+	}
+
 	command, ok := findCommand(args[0])
 	if !ok {
 		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
 		PrintRootHelp(stderr)
 		return 2
-	}
-
-	for _, arg := range args[1:] {
-		if isHelp(arg) {
-			PrintCommandHelp(stdout, command)
-			return 0
-		}
 	}
 
 	if command.Name == "ready-set" {
@@ -414,9 +428,6 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
-	}
-	if command.Name == "version" {
-		return runVersion(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "models" {
 		return runModels(args[1:], stdout, stderr)
@@ -511,6 +522,86 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)
 	return 1
+}
+
+func cliPlatformTuple(deps Deps) platform.Tuple {
+	goos := strings.TrimSpace(deps.RuntimeGOOS)
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	goarch := strings.TrimSpace(deps.RuntimeGOARCH)
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+	return platform.Tuple{GOOS: goos, GOARCH: goarch}
+}
+
+func renderUnsupportedPlatform(err error, args []string, stdout, stderr io.Writer) int {
+	var unsupported *platform.UnsupportedPlatformError
+	if !errors.As(err, &unsupported) {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	if requestedMachineDiagnostic(args) {
+		data, marshalErr := json.Marshal(unsupported.Diagnostic())
+		if marshalErr != nil {
+			fmt.Fprintf(stderr, "unsupported platform: marshal diagnostic: %v\n", marshalErr)
+			return 1
+		}
+		if _, writeErr := stdout.Write(append(data, '\n')); writeErr != nil {
+			fmt.Fprintf(stderr, "unsupported platform: write diagnostic: %v\n", writeErr)
+			return 1
+		}
+		return unsupported.ExitCode()
+	}
+	fmt.Fprintln(stderr, platform.HumanFirstLine)
+	fmt.Fprintf(stderr, "Actual platform: %s/%s.\n", unsupported.Actual.GOOS, unsupported.Actual.GOARCH)
+	fmt.Fprintln(stderr, platform.CompatibilityGuidance)
+	return unsupported.ExitCode()
+}
+
+func requestedMachineDiagnostic(args []string) bool {
+	for i := 1; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		name, value, hasValue := splitFlagAssignment(arg)
+		if isFormatFlagName(name) {
+			if !hasValue {
+				if i+1 >= len(args) {
+					return false
+				}
+				value = args[i+1]
+			}
+			return isMachineFormat(value)
+		}
+	}
+	return false
+}
+
+func splitFlagAssignment(arg string) (name, value string, hasValue bool) {
+	if !strings.HasPrefix(arg, "-") {
+		return arg, "", false
+	}
+	trimmed := strings.TrimLeft(arg, "-")
+	if before, after, ok := strings.Cut(trimmed, "="); ok {
+		return before, after, true
+	}
+	return trimmed, "", false
+}
+
+func isFormatFlagName(name string) bool {
+	return name == "format" || name == "Format"
+}
+
+func isMachineFormat(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "json", "jsonl", "both":
+		return true
+	default:
+		return false
+	}
 }
 
 // PrintRootHelp writes root command help.
