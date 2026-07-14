@@ -17,6 +17,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/sanitize"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
@@ -369,6 +370,9 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if diagnostics := ValidateOverrideProvenance(input.OverrideProvenance, input.Now, expectedPolicyFingerprint, input.AuthorizationFingerprint); len(diagnostics) > 0 {
 		return RoutingDecision{}, &taskrequirements.TypedError{Code: diagnostics[0].Code, Message: diagnostics[0].Message}
 	}
+	if err := validateOverrideDecisionScope(input.OverrideProvenance, input.DeliveryRunID, input.Inputs.Requirement.TaskID); err != nil {
+		return RoutingDecision{}, err
+	}
 	if err := validateDecisionInput(input, policy); err != nil {
 		return RoutingDecision{}, err
 	}
@@ -587,6 +591,7 @@ func applyManualRoutingOverrides(inputs Inputs, overrides []OverrideProvenance, 
 		return inputs
 	}
 	out := inputs
+	out.Candidates = append([]Candidate(nil), inputs.Candidates...)
 	out.Inventory.QuotaSnapshots = append([]providerinventory.QuotaSnapshot(nil), inputs.Inventory.QuotaSnapshots...)
 	out.ManualUnavailable = append([]ManualUnavailableOverride(nil), inputs.ManualUnavailable...)
 	for _, override := range overrides {
@@ -605,45 +610,104 @@ func applyManualRoutingOverrides(inputs Inputs, overrides []OverrideProvenance, 
 				Until:      delivery.CanonicalTimestamp(until),
 			})
 		case "manual-reset":
-			for i := range out.Inventory.QuotaSnapshots {
-				if !constraintMatchesQuotaSnapshot(override.CandidateConstraint, out.Inventory.QuotaSnapshots[i]) {
+			for candidateIndex := range out.Candidates {
+				candidate := out.Candidates[candidateIndex]
+				if !constraintMatchesCandidate(override.CandidateConstraint, candidate) {
 					continue
 				}
-				if override.ClearManualReset {
-					out.Inventory.QuotaSnapshots[i].ResetAt = ""
-					out.Inventory.QuotaSnapshots[i].WindowEnd = ""
-					out.Inventory.QuotaSnapshots[i].ValidUntil = ""
-					continue
-				}
-				resetAt, ok := parseTime(override.ManualResetAt)
-				if !ok || !resetAt.After(now.UTC()) {
-					continue
-				}
-				canonical := delivery.CanonicalTimestamp(resetAt)
-				out.Inventory.QuotaSnapshots[i].ResetAt = canonical
-				out.Inventory.QuotaSnapshots[i].WindowEnd = canonical
-				out.Inventory.QuotaSnapshots[i].ValidUntil = canonical
+				out.Candidates[candidateIndex].QuotaSnapshotIDs = manualResetQuotaSnapshotIDs(out.Candidates[candidateIndex], override, &out.Inventory.QuotaSnapshots, now)
+				out.Candidates[candidateIndex].CandidateFingerprint = candidateFingerprint(out.Candidates[candidateIndex])
 			}
 		}
 	}
 	return out
 }
 
+func manualResetQuotaSnapshotIDs(candidate Candidate, override OverrideProvenance, snapshots *[]providerinventory.QuotaSnapshot, now time.Time) []string {
+	if len(candidate.QuotaSnapshotIDs) == 0 {
+		return candidate.QuotaSnapshotIDs
+	}
+	out := append([]string(nil), candidate.QuotaSnapshotIDs...)
+	for i, id := range candidate.QuotaSnapshotIDs {
+		snapshotIndex := quotaSnapshotIndex(*snapshots, id)
+		if snapshotIndex < 0 {
+			continue
+		}
+		snapshot := (*snapshots)[snapshotIndex]
+		if override.ClearManualReset {
+			snapshot.ResetAt = ""
+			snapshot.WindowEnd = ""
+			snapshot.ValidUntil = ""
+		} else {
+			resetAt, ok := parseTime(override.ManualResetAt)
+			if !ok || !resetAt.After(now.UTC()) {
+				continue
+			}
+			canonical := delivery.CanonicalTimestamp(resetAt)
+			snapshot.ResetAt = canonical
+			snapshot.WindowEnd = canonical
+			snapshot.ValidUntil = canonical
+		}
+		snapshot.QuotaSnapshotID = manualResetQuotaSnapshotID(snapshot.QuotaSnapshotID, override.OverrideID, candidate.RoutingCandidateID)
+		*snapshots = append(*snapshots, snapshot)
+		out[i] = snapshot.QuotaSnapshotID
+	}
+	return dedupeStrings(out)
+}
+
+func quotaSnapshotIndex(snapshots []providerinventory.QuotaSnapshot, id string) int {
+	for i, snapshot := range snapshots {
+		if snapshot.QuotaSnapshotID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func manualResetQuotaSnapshotID(snapshotID, overrideID, candidateID string) string {
+	return "manual-reset:" + shortDigest(hashHex("manual_reset_quota", snapshotID, overrideID, candidateID))
+}
+
 func manualOverrideScopeMatches(override OverrideProvenance, deliveryRunID, taskID string) bool {
-	if strings.TrimSpace(override.DeliveryRunID) != "" && strings.TrimSpace(override.DeliveryRunID) != strings.TrimSpace(deliveryRunID) {
+	run := strings.TrimSpace(override.DeliveryRunID)
+	task := strings.TrimSpace(override.TaskID)
+	if run == "" && task == "" {
 		return false
 	}
-	if strings.TrimSpace(override.TaskID) != "" && strings.TrimSpace(override.TaskID) != strings.TrimSpace(taskID) {
+	if strings.TrimSpace(override.Scope) != canonicalManualOverrideScope(override) {
+		return false
+	}
+	if run != "" && run != strings.TrimSpace(deliveryRunID) {
+		return false
+	}
+	if task != "" && task != strings.TrimSpace(taskID) {
 		return false
 	}
 	return true
 }
 
-func constraintMatchesQuotaSnapshot(constraint CandidateConstraint, snapshot providerinventory.QuotaSnapshot) bool {
-	return scopeMatchesCandidate(constraint.AdapterID, snapshot.AdapterID) &&
-		scopeMatchesCandidate(constraint.ProviderInstallationID, ptrValue(snapshot.ProviderInstallationID)) &&
-		scopeMatchesCandidate(constraint.AccountProfileID, ptrValue(snapshot.AccountProfileID)) &&
-		scopeMatchesCandidate(constraint.ModelCapabilityID, ptrValue(snapshot.ModelCapabilityID))
+func validateOverrideDecisionScope(overrides []OverrideProvenance, deliveryRunID, taskID string) error {
+	for _, override := range overrides {
+		if !manualOverrideScopeMatches(override, deliveryRunID, taskID) {
+			return &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "manual override task/run scope does not match routing decision authority"}
+		}
+	}
+	return nil
+}
+
+func canonicalManualOverrideScope(override OverrideProvenance) string {
+	kind := strings.ToLower(strings.TrimSpace(override.OverrideKind))
+	var parts []string
+	if run := strings.TrimSpace(override.DeliveryRunID); run != "" {
+		parts = append(parts, "run:"+run)
+	}
+	if task := strings.TrimSpace(override.TaskID); task != "" {
+		parts = append(parts, "task:"+task)
+	}
+	if kind == "" || len(parts) == 0 {
+		return strings.Join(parts, " ")
+	}
+	return kind + " " + strings.Join(parts, " ")
 }
 
 func redactOverrideProvenance(overrides []OverrideProvenance) []OverrideProvenance {
@@ -654,18 +718,13 @@ func redactOverrideProvenance(overrides []OverrideProvenance) []OverrideProvenan
 	for i := range out {
 		out[i].Reason = redactSensitiveText(out[i].Reason)
 		out[i].Source = redactSensitiveText(out[i].Source)
+		out[i].Scope = canonicalManualOverrideScope(out[i])
 	}
 	return out
 }
 
 func redactSensitiveText(value string) string {
-	lower := strings.ToLower(value)
-	for _, marker := range []string{"sk-", "ghp_", "github_pat_", "api_key", "token=", "authorization:", "bearer "} {
-		if strings.Contains(lower, marker) {
-			return "[redacted]"
-		}
-	}
-	return value
+	return sanitize.Text(value)
 }
 
 func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {

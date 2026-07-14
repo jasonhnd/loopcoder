@@ -49,14 +49,15 @@ type RefreshPolicy struct {
 }
 
 type RefreshRequest struct {
-	RepoPath        string
-	Config          config.Config
-	RuntimeContract runtimecap.Contract
-	NetworkGrants   []NetworkGrant
-	Providers       []string
-	Trigger         RefreshTrigger
-	Policy          RefreshPolicy
-	Now             func() time.Time
+	RepoPath                string
+	Config                  config.Config
+	RuntimeContract         runtimecap.Contract
+	NetworkGrants           []NetworkGrant
+	Providers               []string
+	Trigger                 RefreshTrigger
+	Policy                  RefreshPolicy
+	Now                     func() time.Time
+	AfterFreshCapacityEvent func(context.Context, RefreshResult) error
 }
 
 type RefreshResult struct {
@@ -189,8 +190,11 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	m.refreshGoroutines++
 	m.mu.Unlock()
 
-	go func() {
+	go func(ctx context.Context) {
 		result, err := m.runSharedRefresh(req, cached, refreshProviders, inactiveResults, policy, now)
+		if err == nil && req.AfterFreshCapacityEvent != nil && refreshResultPublishedFreshCapacity(result) {
+			err = req.AfterFreshCapacityEvent(ctx, result)
+		}
 		m.mu.Lock()
 		call.result = result
 		call.err = err
@@ -208,7 +212,7 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 			m.idle.Broadcast()
 		}
 		m.mu.Unlock()
-	}()
+	}(ctx)
 
 	select {
 	case <-call.done:
@@ -216,6 +220,15 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	case <-ctx.Done():
 		return RefreshResult{}, ctx.Err()
 	}
+}
+
+func refreshResultPublishedFreshCapacity(result RefreshResult) bool {
+	for _, provider := range result.Providers {
+		if provider.Refreshed && len(provider.QuotaSnapshotIDs) > 0 && provider.ErrorCode == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *RefreshManager) Status(ctx context.Context, req RefreshRequest) (QuotaRefreshStatus, error) {

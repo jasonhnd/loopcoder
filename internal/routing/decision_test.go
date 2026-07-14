@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/budget"
+	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
@@ -687,16 +689,13 @@ func TestManualUnavailableOverrideScopeMismatchDoesNotSuppress(t *testing.T) {
 	candidate := fixture.candidate("codex", "acct-a", "codex-good")
 	override := manualUnavailableOverride(fixture, candidate, fixture.now.Add(10*time.Minute))
 	override.TaskID = "different-task"
+	override.Scope = canonicalManualOverrideScope(override)
 	input := replayDecisionInput(fixture)
 	input.Inputs.Candidates = []Candidate{candidate}
 	input.AuthorizationFingerprint = testFingerprint("auth")
 	input.OverrideProvenance = []OverrideProvenance{override}
-	decision, err := BuildRoutingDecision(input)
-	if err != nil {
-		t.Fatalf("BuildRoutingDecision: %v", err)
-	}
-	if selected := selectedCandidate(decision); selected.RoutingCandidateID != candidate.RoutingCandidateID {
-		t.Fatalf("selected = %#v, want scope mismatch to leave candidate eligible", selected)
+	if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("BuildRoutingDecision error = %v, want scope mismatch to fail closed", err)
 	}
 }
 
@@ -751,6 +750,127 @@ func TestManualResetOverrideReplacesOnlyResetEvidenceAndCannotBypassHardGates(t 
 	}
 }
 
+func TestManualResetOverrideIsBoundToCandidateInvocationProfile(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.AuthorizationFingerprint = testFingerprint("auth")
+	shared := quotaWithReset("qsnap-shared-invocation", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 100, fixture.now, fixture.now.Add(10*time.Minute))
+	base := fixture.candidate("codex", "acct-a", "codex-good")
+	fast := base
+	fast.InvocationProfileKey = "fast"
+	fast.QuotaSnapshotIDs = []string{shared.QuotaSnapshotID}
+	fast.RoutingCandidateID = candidateID(fast)
+	fast.CandidateFingerprint = candidateFingerprint(fast)
+	deep := base
+	deep.InvocationProfileKey = "deep"
+	deep.QuotaSnapshotIDs = []string{shared.QuotaSnapshotID}
+	deep.RoutingCandidateID = candidateID(deep)
+	deep.CandidateFingerprint = candidateFingerprint(deep)
+	input.Inputs.Candidates = []Candidate{fast, deep}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, shared)
+	req := input.Inputs.Requirement
+	req.RiskTier = taskrequirements.RiskHigh
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+	input.Inputs.Requirement = req
+	override := manualResetOverride(fixture, fast, fixture.now.Add(2*time.Hour))
+	override.CandidateConstraint = CandidateConstraint{InvocationProfileKey: "fast"}
+	override.Scope = canonicalManualOverrideScope(override)
+	input.OverrideProvenance = []OverrideProvenance{override}
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if selected := selectedCandidate(decision); selected.RoutingCandidateID != fast.RoutingCandidateID {
+		t.Fatalf("selected = %#v, want only fast invocation candidate reset-bound eligible", selected)
+	}
+	if containsScoredCandidate(decision.ScoredCandidates, deep.RoutingCandidateID) {
+		t.Fatalf("deep invocation candidate shared reset mutation: %#v", decision.ScoredCandidates)
+	}
+	if !rejectedHas(Result{Rejected: decision.RejectedCandidates}, deep.RoutingCandidateID, RejectQuotaResetIncompatible) {
+		t.Fatalf("deep invocation rejections = %#v, want original near reset to remain incompatible", decision.RejectedCandidates)
+	}
+	fastExpiry := componentByName(t, decision.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+	if len(fastExpiry.SnapshotIDs) != 1 || fastExpiry.SnapshotIDs[0] == shared.QuotaSnapshotID || !strings.HasPrefix(fastExpiry.SnapshotIDs[0], "manual-reset:") || fastExpiry.ResetWindow != "over-1h" {
+		t.Fatalf("fast expiry component = %#v, want candidate-specific manual reset snapshot", fastExpiry)
+	}
+}
+
+func TestManualResetInvocationOnlyConstraintDoesNotExpandToWildcard(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.AuthorizationFingerprint = testFingerprint("auth")
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	candidate.InvocationProfileKey = "default"
+	candidate.RoutingCandidateID = candidateID(candidate)
+	near := quotaWithReset("qsnap-invocation-only-no-match", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 100, fixture.now, fixture.now.Add(10*time.Minute))
+	candidate.QuotaSnapshotIDs = []string{near.QuotaSnapshotID}
+	input.Inputs.Candidates = []Candidate{candidate}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, near)
+	req := input.Inputs.Requirement
+	req.RiskTier = taskrequirements.RiskHigh
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+	input.Inputs.Requirement = req
+	override := manualResetOverride(fixture, candidate, fixture.now.Add(2*time.Hour))
+	override.CandidateConstraint = CandidateConstraint{InvocationProfileKey: "different"}
+	override.Scope = canonicalManualOverrideScope(override)
+	input.OverrideProvenance = []OverrideProvenance{override}
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if decision.DecisionStatus != DecisionStatusNoEligible || containsScoredCandidate(decision.ScoredCandidates, candidate.RoutingCandidateID) {
+		t.Fatalf("decision = %#v, want invocation-only non-match to leave candidate rejected", decision)
+	}
+	if !rejectedHas(Result{Rejected: decision.RejectedCandidates}, candidate.RoutingCandidateID, RejectQuotaResetIncompatible) {
+		t.Fatalf("rejections = %#v, want original reset incompatibility", decision.RejectedCandidates)
+	}
+}
+
+func TestManualOverrideScopeMustMatchStructuredTaskRunBindings(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	for _, tc := range []struct {
+		name   string
+		mutate func(*OverrideProvenance)
+	}{
+		{name: "empty structured bindings", mutate: func(override *OverrideProvenance) {
+			override.TaskID = ""
+			override.DeliveryRunID = ""
+			override.Scope = "manual-reset task:task-a"
+		}},
+		{name: "misleading prose scope", mutate: func(override *OverrideProvenance) {
+			override.Scope = "manual-reset please only task:task-a"
+		}},
+		{name: "task mismatch", mutate: func(override *OverrideProvenance) {
+			override.TaskID = "task-other"
+			override.Scope = canonicalManualOverrideScope(*override)
+		}},
+		{name: "run mismatch", mutate: func(override *OverrideProvenance) {
+			override.DeliveryRunID = "drun-other"
+			override.Scope = canonicalManualOverrideScope(*override)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := replayDecisionInput(fixture)
+			input.AuthorizationFingerprint = testFingerprint("auth")
+			input.Inputs.Candidates = []Candidate{candidate}
+			override := manualResetOverride(fixture, candidate, fixture.now.Add(time.Hour))
+			tc.mutate(&override)
+			input.OverrideProvenance = []OverrideProvenance{override}
+			if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrInvalidRecord) && !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+				t.Fatalf("BuildRoutingDecision error = %v, want fail-closed invalid or mismatch", err)
+			}
+		})
+	}
+
+	exact := manualResetOverride(fixture, candidate, fixture.now.Add(time.Hour))
+	if diagnostics := ValidateOverrideProvenance([]OverrideProvenance{exact}, fixture.now, exact.PolicyFingerprint, exact.AuthorizationFingerprint); len(diagnostics) != 0 {
+		t.Fatalf("exact combined scope diagnostics = %#v, want valid", diagnostics)
+	}
+}
+
 func TestManualOverrideProvenanceIsRedactedInExplain(t *testing.T) {
 	fixture := newFixture(t)
 	candidate := fixture.candidate("codex", "acct-a", "codex-good")
@@ -772,10 +892,79 @@ func TestManualOverrideProvenanceIsRedactedInExplain(t *testing.T) {
 		t.Fatalf("ExplainJSON: %v", err)
 	}
 	for _, output := range []string{human, string(stable)} {
-		if strings.Contains(output, secret) || !strings.Contains(output, "[redacted]") {
+		if strings.Contains(output, secret) || !strings.Contains(output, "[REDACTED_") {
 			t.Fatalf("override provenance not redacted:\n%s", output)
 		}
 	}
+}
+
+func TestManualOverrideProvenanceRedactsSecretPathAndControlCanaries(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	cases := map[string]string{
+		"github token":      "ghp_" + strings.Repeat("A", 24),
+		"github pat":        "github_pat_" + strings.Repeat("B", 24),
+		"aws access key":    "AKIA" + strings.Repeat("C", 16),
+		"openai key":        "sk-" + strings.Repeat("D", 24),
+		"bearer":            "Bearer " + strings.Repeat("E", 24),
+		"token assignment":  credentialAssignmentCanary([]string{"tok", "en"}, []string{"="}, strings.Repeat("F", 24)),
+		"password assign":   credentialAssignmentCanary([]string{"pass", "word"}, []string{":"}, strings.Repeat("G", 24)),
+		"secret assignment": credentialAssignmentCanary([]string{"sec", "ret"}, []string{"="}, strings.Repeat("H", 24)),
+		"api key assign":    credentialAssignmentCanary([]string{"api", "-key"}, []string{"="}, strings.Repeat("I", 24)),
+		"local path":        "/Users/tester/projects/loopcoder/private.json",
+		"control chars":     "safe\x00\x1bsecret",
+		"split long secret": strings.Repeat("x", 230) + " sk-" + strings.Repeat("J", 48),
+	}
+	for name, canary := range cases {
+		t.Run(name, func(t *testing.T) {
+			input := replayDecisionInput(fixture)
+			input.Inputs.Candidates = []Candidate{candidate}
+			input.AuthorizationFingerprint = testFingerprint("auth")
+			override := manualUnavailableOverride(fixture, candidate, fixture.now.Add(10*time.Minute))
+			override.Reason = "reason " + canary
+			override.Source = "source " + canary
+			input.OverrideProvenance = []OverrideProvenance{override}
+			decision, err := BuildRoutingDecision(input)
+			if err != nil {
+				t.Fatalf("BuildRoutingDecision: %v", err)
+			}
+			human := ExplainHuman(decision)
+			stable, err := ExplainJSON(decision)
+			if err != nil {
+				t.Fatalf("ExplainJSON: %v", err)
+			}
+			ctx := context.Background()
+			store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+			if err != nil {
+				t.Fatalf("Open storage: %v", err)
+			}
+			defer store.Close()
+			seedRoutingDecisionStore(t, ctx, store, fixture.now)
+			if err := PersistRoutingDecision(ctx, store, decision); err != nil {
+				t.Fatalf("PersistRoutingDecision: %v", err)
+			}
+			loaded, err := LoadRoutingDecision(ctx, store, decision.RoutingDecisionID)
+			if err != nil {
+				t.Fatalf("LoadRoutingDecision: %v", err)
+			}
+			persisted, err := ExplainJSON(loaded)
+			if err != nil {
+				t.Fatalf("ExplainJSON persisted: %v", err)
+			}
+			for _, output := range []string{human, string(stable), string(persisted)} {
+				if strings.Contains(output, canary) || strings.ContainsAny(output, "\x00\x1b") {
+					t.Fatalf("output leaked canary/control characters:\n%s", output)
+				}
+				if name != "control chars" && !strings.Contains(output, "[REDACTED_") {
+					t.Fatalf("output missing redaction marker:\n%s", output)
+				}
+			}
+		})
+	}
+}
+
+func credentialAssignmentCanary(keyParts, separatorParts []string, value string) string {
+	return strings.Join(keyParts, "") + strings.Join(separatorParts, "") + value
 }
 
 func TestReevaluateRoutePersistsOnTaskBoundaryOrFreshCapacityAndDryRunDoesNotMutate(t *testing.T) {
@@ -816,6 +1005,142 @@ func TestReevaluateRoutePersistsOnTaskBoundaryOrFreshCapacityAndDryRunDoesNotMut
 	}
 	if !persisted.Changed || persisted.Decision.RoutingDecisionID == first.Decision.RoutingDecisionID {
 		t.Fatalf("persisted re-evaluation = %#v, want new fingerprint", persisted)
+	}
+	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
+}
+
+func TestFreshCapacityRefreshHandlerReevaluatesRouteThroughProductionEvent(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	input := replayDecisionInput(fixture)
+	first, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary})
+	if err != nil {
+		t.Fatalf("ReevaluateRoute seed: %v", err)
+	}
+	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 1)
+
+	manager := providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
+	refreshedSnapshot := quotaWithReset("qsnap_fresh_event_codex_a_good", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, 500, fixture.now.Add(time.Minute), fixture.now.Add(30*time.Minute))
+	refreshedSnapshot.QuotaSourceID = "qsrc-fixture-codex"
+	refreshedSnapshot.ScopeKey = "provider:codex/account:acct-a/model:codex-good"
+	refreshedSnapshot.PolicyVersion = providerinventory.PolicyVersion
+	refreshedSnapshot.CreatedAt = refreshedSnapshot.CapturedAt
+	refreshedSnapshot.UpdatedAt = refreshedSnapshot.CapturedAt
+	refreshedSnapshot.WindowStart = delivery.CanonicalTimestamp(fixture.now.Add(-30 * time.Minute))
+	refreshed := providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           delivery.CanonicalTimestamp(fixture.now.Add(time.Minute)),
+		Confidence:            providerinventory.ConfidenceExact,
+		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{routingFixtureQuotaSource("codex", fixture.now)},
+		QuotaSnapshots:        []providerinventory.QuotaSnapshot{refreshedSnapshot},
+	}
+	manager.Collector = func(context.Context, providerinventory.Options, providerinventory.Deps) (providerinventory.Report, error) {
+		return refreshed, nil
+	}
+	var callbackCount int
+	var callbackDecision RoutingDecision
+	result, err := manager.Refresh(ctx, providerinventory.RefreshRequest{
+		Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Trigger: providerinventory.RefreshTriggerExplicit,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		AfterFreshCapacityEvent: func(ctx context.Context, result providerinventory.RefreshResult) error {
+			callbackCount++
+			reeval, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtFreshCapacityEvent})
+			callbackDecision = reeval.Decision
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if callbackCount != 1 || !refreshResultHasRefreshedProvider(result, "codex") {
+		t.Fatalf("callbackCount/result = %d/%#v, want one fresh capacity callback", callbackCount, result.Providers)
+	}
+	if callbackDecision.RoutingFingerprint == first.Decision.RoutingFingerprint {
+		t.Fatalf("fresh capacity callback did not produce new routing fingerprint")
+	}
+	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
+
+	dry, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtFreshCapacityEvent, DryRun: true})
+	if err != nil {
+		t.Fatalf("ReevaluateRoute dry replay: %v", err)
+	}
+	if dry.Changed {
+		t.Fatalf("dry replay changed = true, want no changed fingerprint after persisted fresh capacity decision")
+	}
+	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
+}
+
+func TestTaskBoundaryHandlerReevaluatesRouteThroughNestedSchedulerEvent(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	input := replayDecisionInput(fixture)
+	first, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary})
+	if err != nil {
+		t.Fatalf("ReevaluateRoute seed: %v", err)
+	}
+	var callbackCount int
+	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
+		RepoPath:         t.TempDir(),
+		ParentRunID:      "run-20260713T120000Z-wave",
+		BaseBranch:       "main",
+		ConcurrencyLimit: 1,
+		MaxChildren:      1,
+		Now:              fixture.now,
+		Clock:            func() time.Time { return fixture.now.Add(time.Minute) },
+		Children: []orchestration.ChildRunPlan{{
+			ID:         "route-boundary",
+			Issue:      844,
+			Permission: "write",
+			Required:   true,
+		}},
+		Execute: func(context.Context, orchestration.ChildRunPlan) (orchestration.ChildRunResult, error) {
+			if err := replaceStoredQuotaReset(t, ctx, store, "qsnap-codex-a-good", fixture.now.Add(30*time.Minute)); err != nil {
+				return orchestration.ChildRunResult{}, err
+			}
+			return orchestration.ChildRunResult{Status: orchestration.NestedStatusSucceeded}, nil
+		},
+		TaskBoundaryRouteReevaluation: func(ctx context.Context, event orchestration.TaskBoundaryRouteReevaluationEvent) error {
+			callbackCount++
+			if event.Status != orchestration.NestedStatusSucceeded || event.ChildKey == "" {
+				t.Fatalf("task boundary event = %#v", event)
+			}
+			_, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary})
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if report.Status != orchestration.NestedStatusSucceeded || callbackCount != 1 {
+		t.Fatalf("report/callback = %#v/%d, want succeeded with one task-boundary callback", report, callbackCount)
+	}
+	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
+	latest, err := latestRoutingDecision(ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey)
+	if err != nil {
+		t.Fatalf("latestRoutingDecision: %v", err)
+	}
+	if latest.RoutingFingerprint == first.Decision.RoutingFingerprint {
+		t.Fatalf("task boundary callback did not persist a new routing fingerprint")
+	}
+	dry, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary, DryRun: true})
+	if err != nil {
+		t.Fatalf("ReevaluateRoute dry no-change: %v", err)
+	}
+	if dry.Changed {
+		t.Fatalf("dry no-change changed = true, want false")
 	}
 	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
 }
@@ -1252,11 +1577,10 @@ func manualUnavailableOverride(fixture hardFixture, candidate Candidate, until t
 		panic(err)
 	}
 	taskID := "task-a"
-	return OverrideProvenance{
+	override := OverrideProvenance{
 		OverrideID:               "ovr-unavailable-" + candidate.ModelCapabilityID,
 		OverrideKind:             "manual-unavailable-until",
 		Reason:                   "operator marked candidate unavailable",
-		Scope:                    "manual-unavailable-until task:" + taskID,
 		TaskID:                   taskID,
 		DeliveryRunID:            "drun-routing",
 		CandidateConstraint:      CandidateConstraint{AdapterID: candidate.AdapterID, ProviderInstallationID: candidate.ProviderInstallationID, AccountProfileID: candidate.AccountProfileID, ModelCapabilityID: candidate.ModelCapabilityID},
@@ -1268,6 +1592,8 @@ func manualUnavailableOverride(fixture hardFixture, candidate Candidate, until t
 		Host:                     routingHost(),
 		Source:                   "test",
 	}
+	override.Scope = canonicalManualOverrideScope(override)
+	return override
 }
 
 func manualResetOverride(fixture hardFixture, candidate Candidate, resetAt time.Time) OverrideProvenance {
@@ -1276,11 +1602,10 @@ func manualResetOverride(fixture hardFixture, candidate Candidate, resetAt time.
 		panic(err)
 	}
 	taskID := "task-a"
-	return OverrideProvenance{
+	override := OverrideProvenance{
 		OverrideID:               "ovr-reset-" + candidate.ModelCapabilityID,
 		OverrideKind:             "manual-reset",
 		Reason:                   "operator provided bounded reset evidence",
-		Scope:                    "manual-reset task:" + taskID,
 		TaskID:                   taskID,
 		DeliveryRunID:            "drun-routing",
 		CandidateConstraint:      CandidateConstraint{AdapterID: candidate.AdapterID, ProviderInstallationID: candidate.ProviderInstallationID, AccountProfileID: candidate.AccountProfileID, ModelCapabilityID: candidate.ModelCapabilityID},
@@ -1292,6 +1617,8 @@ func manualResetOverride(fixture hardFixture, candidate Candidate, resetAt time.
 		Host:                     routingHost(),
 		Source:                   "test",
 	}
+	override.Scope = canonicalManualOverrideScope(override)
+	return override
 }
 
 func replaceStoredQuotaReset(t *testing.T, ctx context.Context, store storage.Store, quotaSnapshotID string, resetAt time.Time) error {
@@ -1350,6 +1677,55 @@ func assertRoutingDecisionCount(t *testing.T, ctx context.Context, store storage
 	}
 	if count != want {
 		t.Fatalf("routing decision count = %d, want %d", count, want)
+	}
+}
+
+func latestRoutingDecision(ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey string) (RoutingDecision, error) {
+	var payload string
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM routing_decisions
+			WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ?
+			ORDER BY created_at DESC, routing_decision_id DESC LIMIT 1`, projectID, deliveryRunID, decisionKey).Scan(&payload)
+	})
+	if err != nil {
+		return RoutingDecision{}, err
+	}
+	var decision RoutingDecision
+	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
+		return RoutingDecision{}, err
+	}
+	return decision, nil
+}
+
+func refreshResultHasRefreshedProvider(result providerinventory.RefreshResult, adapterID string) bool {
+	for _, provider := range result.Providers {
+		if provider.AdapterID == adapterID && provider.Refreshed && provider.ErrorCode == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func routingFixtureQuotaSource(adapterID string, now time.Time) providerinventory.QuotaTelemetrySource {
+	at := delivery.CanonicalTimestamp(now)
+	return providerinventory.QuotaTelemetrySource{
+		QuotaSourceID:       "qsrc-fixture-" + adapterID,
+		SchemaVersion:       providerinventory.QuotaTelemetrySourceSchema,
+		RecordVersion:       1,
+		AdapterID:           adapterID,
+		SourceKind:          providerinventory.QuotaSourceFixture,
+		SourceKey:           "fixture-quota-v1",
+		SourceSchemaVersion: "fixture.quota.v1",
+		SupportedQuantities: []providerinventory.QuantityKind{providerinventory.QuantityRequests},
+		SupportedWindows:    []providerinventory.WindowKind{providerinventory.WindowFixedHour},
+		ScopeDimensions:     []string{"provider", "account", "model"},
+		ConfidenceContract:  map[string]providerinventory.Confidence{"remaining_value": providerinventory.ConfidenceExact, "reset_at": providerinventory.ConfidenceExact},
+		NetworkDeclared:     false,
+		TimeoutMS:           1000,
+		ClassificationRules: []string{"fixture"},
+		CreatedAt:           at,
+		UpdatedAt:           at,
+		PolicyVersion:       providerinventory.PolicyVersion,
 	}
 }
 

@@ -575,6 +575,11 @@ func ValidateOverrideProvenance(overrides []OverrideProvenance, now time.Time, a
 		if strings.TrimSpace(override.ExpiresAt) == "" || err != nil || (!now.IsZero() && !expiresAt.After(now.UTC())) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrExpiredApprovalCode), "stale", "expires_at", id, "override requires a future expiry", nil, "record a fresh override with a future expiry"))
 		}
+		if strings.TrimSpace(override.TaskID) == "" && strings.TrimSpace(override.DeliveryRunID) == "" {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "scope", id, "override requires an explicit structured task_id or delivery_run_id binding", nil, "bind the override to an exact task or delivery run"))
+		} else if strings.TrimSpace(override.Scope) != canonicalManualOverrideScope(override) {
+			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrInvalidRecordCode, "invalid", "scope", id, "override scope must exactly match structured task/run binding", nil, "use the canonical structured scope representation"))
+		}
 		if isHardGateOverride(override.OverrideKind, override.Scope) {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrorCode(delivery.ErrPolicyDeniedCode), "invalid", "override_kind", id, "override cannot weaken hard eligibility, permission, side-effect, scope, approval, independence, budget, or release gates", nil, "change the plan or choose an eligible route instead"))
 		}
