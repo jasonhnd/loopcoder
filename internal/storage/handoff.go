@@ -34,6 +34,7 @@ const (
 
 const (
 	HandoffSideEffectReconciliationSchema = "loopcoder.handoff_side_effect_reconciliation.v1"
+	HandoffContinuationProofSchema        = "loopcoder.handoff_continuation_proof.v1"
 
 	HandoffSideEffectCodeNotStarted        = "handoff.side_effect.not_started"
 	HandoffSideEffectCodeReadOnly          = "handoff.side_effect.read_only"
@@ -134,6 +135,27 @@ type HandoffSideEffectReconciliation struct {
 	Reason                     string   `json:"reason"`
 }
 
+type HandoffContinuationProof struct {
+	SchemaVersion              string   `json:"schema_version"`
+	Code                       string   `json:"code"`
+	State                      string   `json:"state"`
+	SourceAttemptID            string   `json:"source_attempt_id"`
+	SourceExecutorID           string   `json:"source_executor_id"`
+	SourceClaimGeneration      int64    `json:"source_claim_generation"`
+	HandoffID                  string   `json:"handoff_id"`
+	HandoffGeneration          int64    `json:"handoff_generation"`
+	OwnershipFence             string   `json:"ownership_fence"`
+	ExecutionOutcome           string   `json:"execution_outcome"`
+	ProviderIdempotencyKeyHash string   `json:"provider_idempotency_key_hash,omitempty"`
+	ProviderReceiptHash        string   `json:"provider_receipt_hash,omitempty"`
+	EvidenceRecordIDs          []string `json:"evidence_record_ids,omitempty"`
+	DecisionRef                string   `json:"decision_ref"`
+	CompletedBoundary          string   `json:"completed_boundary"`
+	CheckpointID               string   `json:"checkpoint_id"`
+	ProofFingerprint           string   `json:"proof_fingerprint"`
+	AutomaticContinuation      bool     `json:"automatic_continuation"`
+}
+
 type HandoffSuccessorCandidate struct {
 	RoutingDecisionID      string
 	RoutingCandidateID     string
@@ -152,6 +174,7 @@ type HandoffSuccessorRequest struct {
 	BudgetReservationID string
 	BudgetPolicyIDs     []string
 	ReusableEvidenceIDs []string
+	ContinuationProof   HandoffContinuationProof
 	Candidate           HandoffSuccessorCandidate
 	Cancelled           bool
 	CreatedAt           string
@@ -179,6 +202,7 @@ type HandoffSuccessorLaunch struct {
 	RoutingCandidateID     string                         `json:"routing_candidate_id"`
 	BudgetReservationID    string                         `json:"budget_reservation_id"`
 	ReusableEvidenceIDs    []string                       `json:"reusable_evidence_ids"`
+	ContinuationProof      HandoffContinuationProof       `json:"continuation_proof"`
 	OwnershipLocks         []HandoffOwnershipLockSnapshot `json:"ownership_locks,omitempty"`
 	LaunchExposed          bool                           `json:"launch_exposed"`
 	LaunchPhase            string                         `json:"launch_phase,omitempty"`
@@ -343,6 +367,37 @@ func MarkHandoffSideEffectNeedsHuman(ctx context.Context, store Store, handoff H
 			return nil
 		})
 	})
+}
+
+func BuildHandoffContinuationProof(handoff HandoffTransaction, rec HandoffSideEffectReconciliation) (HandoffContinuationProof, error) {
+	rec.State = normalizeHandoffSideEffectState(rec.State)
+	if strings.TrimSpace(rec.Code) == "" {
+		rec.Code = handoffSideEffectCode(rec.State)
+	}
+	proof := HandoffContinuationProof{
+		SchemaVersion:              HandoffContinuationProofSchema,
+		Code:                       strings.TrimSpace(rec.Code),
+		State:                      rec.State,
+		SourceAttemptID:            strings.TrimSpace(firstNonEmptyAgent(rec.SourceAttemptID, handoff.SourceAttemptID)),
+		SourceExecutorID:           strings.TrimSpace(firstNonEmptyAgent(rec.SourceExecutorID, handoff.SourceExecutorID)),
+		SourceClaimGeneration:      firstPositiveAgent(rec.SourceClaimGeneration, handoff.SourceClaimGeneration),
+		HandoffID:                  handoff.HandoffID,
+		HandoffGeneration:          handoff.HandoffGeneration,
+		OwnershipFence:             strings.TrimSpace(rec.OwnershipFence),
+		ExecutionOutcome:           strings.TrimSpace(rec.ExecutionOutcome),
+		ProviderIdempotencyKeyHash: strings.TrimSpace(rec.ProviderIdempotencyKeyHash),
+		ProviderReceiptHash:        strings.TrimSpace(rec.ProviderReceiptHash),
+		EvidenceRecordIDs:          sortedCopyAgent(firstNonEmptySlice(rec.EvidenceRecordIDs, handoff.EvidenceRecordIDs)),
+		DecisionRef:                "handoff-side-effect:" + handoff.HandoffID,
+		CompletedBoundary:          handoffContinuationBoundary(rec),
+		AutomaticContinuation:      rec.AutomaticContinuation && !rec.NeedsHuman,
+	}
+	proof.CheckpointID = handoffContinuationCheckpointID(proof)
+	proof.ProofFingerprint = handoffContinuationProofFingerprint(proof)
+	if err := validateHandoffContinuationProof(handoff, rec, proof); err != nil {
+		return HandoffContinuationProof{}, err
+	}
+	return proof, nil
 }
 
 func PrepareHandoffSuccessorLaunch(ctx context.Context, store Store, req HandoffSuccessorRequest) (HandoffSuccessorLaunch, error) {
@@ -951,6 +1006,109 @@ func insertHandoffSideEffectDecisionTx(ctx context.Context, tx Tx, handoff Hando
 	return err
 }
 
+func loadHandoffSideEffectDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (HandoffSideEffectReconciliation, bool, error) {
+	var raw string
+	err := tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions
+		WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ? AND decision_kind = 'handoff-side-effect-reconciliation'`,
+		handoff.ProjectID, handoff.DeliveryRunID, "handoff-side-effect:"+handoff.HandoffID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return HandoffSideEffectReconciliation{}, false, nil
+	}
+	if err != nil {
+		return HandoffSideEffectReconciliation{}, false, err
+	}
+	var rec HandoffSideEffectReconciliation
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		return HandoffSideEffectReconciliation{}, false, federationError(ErrInvalidRecordCode, "handoff side-effect decision payload is invalid")
+	}
+	rec.State = normalizeHandoffSideEffectState(rec.State)
+	rec.Code = firstNonEmptyAgent(rec.Code, handoffSideEffectCode(rec.State))
+	rec.EvidenceRecordIDs = sortedCopyAgent(rec.EvidenceRecordIDs)
+	return rec, true, nil
+}
+
+func handoffContinuationBoundary(rec HandoffSideEffectReconciliation) string {
+	switch normalizeHandoffSideEffectState(rec.State) {
+	case SideEffectStateReceiptBacked:
+		return "source-boundary:provider-receipt"
+	case SideEffectStateIdempotent:
+		return "source-boundary:idempotency-key"
+	case SideEffectStateReadOnly:
+		return "source-boundary:read-only"
+	case SideEffectStateNotStarted, SideEffectStateNone:
+		return "source-boundary:not-started"
+	default:
+		return "source-boundary:" + normalizeHandoffSideEffectState(rec.State)
+	}
+}
+
+func handoffContinuationCheckpointID(proof HandoffContinuationProof) string {
+	return stableID("hcp_",
+		proof.HandoffID,
+		fmt.Sprint(proof.HandoffGeneration),
+		proof.SourceAttemptID,
+		fmt.Sprint(proof.SourceClaimGeneration),
+		proof.Code,
+		proof.State,
+		proof.ProviderReceiptHash,
+		proof.ProviderIdempotencyKeyHash,
+		proof.CompletedBoundary,
+		proof.DecisionRef,
+	)
+}
+
+func handoffContinuationProofFingerprint(proof HandoffContinuationProof) string {
+	proof.CheckpointID = ""
+	proof.ProofFingerprint = ""
+	return digestJSON(proof)
+}
+
+func validateHandoffContinuationProof(handoff HandoffTransaction, rec HandoffSideEffectReconciliation, proof HandoffContinuationProof) error {
+	if proof.SchemaVersion != HandoffContinuationProofSchema {
+		return federationError(ErrInvalidRecordCode, "handoff continuation proof schema is invalid")
+	}
+	if !proof.AutomaticContinuation || rec.NeedsHuman || !rec.AutomaticContinuation {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof is not approved for automatic continuation")
+	}
+	if proof.HandoffID != handoff.HandoffID || proof.HandoffGeneration != handoff.HandoffGeneration ||
+		proof.SourceAttemptID != handoff.SourceAttemptID || proof.SourceExecutorID != handoff.SourceExecutorID ||
+		proof.SourceClaimGeneration != handoff.SourceClaimGeneration {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof does not match source authority")
+	}
+	if proof.State != normalizeHandoffSideEffectState(rec.State) || proof.Code != firstNonEmptyAgent(rec.Code, handoffSideEffectCode(rec.State)) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed reconciliation state")
+	}
+	if proof.DecisionRef != "handoff-side-effect:"+handoff.HandoffID || proof.CompletedBoundary != handoffContinuationBoundary(rec) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed boundary reference")
+	}
+	if proof.OwnershipFence != rec.OwnershipFence || proof.ExecutionOutcome != rec.ExecutionOutcome {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed source fence")
+	}
+	if proof.ProviderReceiptHash != strings.TrimSpace(rec.ProviderReceiptHash) || proof.ProviderIdempotencyKeyHash != strings.TrimSpace(rec.ProviderIdempotencyKeyHash) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed reusable hash")
+	}
+	switch normalizeHandoffSideEffectState(rec.State) {
+	case SideEffectStateReceiptBacked:
+		if proof.ProviderReceiptHash == "" {
+			return federationError(ErrHandoffReplayMismatchCode, "receipt-backed continuation proof is missing receipt hash")
+		}
+	case SideEffectStateIdempotent:
+		if proof.ProviderIdempotencyKeyHash == "" {
+			return federationError(ErrHandoffReplayMismatchCode, "idempotent continuation proof is missing idempotency key hash")
+		}
+	case SideEffectStateReadOnly, SideEffectStateNotStarted, SideEffectStateNone:
+	default:
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof state %s is not automatically reusable", rec.State)
+	}
+	if strings.Join(proof.EvidenceRecordIDs, "\x00") != strings.Join(sortedCopyAgent(firstNonEmptySlice(rec.EvidenceRecordIDs, handoff.EvidenceRecordIDs)), "\x00") {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof changed evidence refs")
+	}
+	if proof.CheckpointID != handoffContinuationCheckpointID(proof) || proof.ProofFingerprint != handoffContinuationProofFingerprint(proof) {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof checkpoint changed")
+	}
+	return nil
+}
+
 func firstNonEmptySlice(primary, fallback []string) []string {
 	if len(primary) > 0 {
 		return primary
@@ -1285,6 +1443,7 @@ func normalizeHandoffSuccessorRequest(req HandoffSuccessorRequest, now time.Time
 	req.BudgetReservationID = strings.TrimSpace(req.BudgetReservationID)
 	req.BudgetPolicyIDs = sortedCopyAgent(req.BudgetPolicyIDs)
 	req.ReusableEvidenceIDs = sortedCopyAgent(req.ReusableEvidenceIDs)
+	req.ContinuationProof = normalizeHandoffContinuationProof(req.ContinuationProof)
 	req.Candidate.RoutingDecisionID = strings.TrimSpace(firstNonEmptyAgent(req.Candidate.RoutingDecisionID, req.RoutingDecisionID))
 	req.Candidate.RoutingCandidateID = strings.TrimSpace(req.Candidate.RoutingCandidateID)
 	req.Candidate.AdapterID = strings.TrimSpace(req.Candidate.AdapterID)
@@ -1304,6 +1463,25 @@ func normalizeHandoffSuccessorRequest(req HandoffSuccessorRequest, now time.Time
 		req.HostJSON = "{}"
 	}
 	return req
+}
+
+func normalizeHandoffContinuationProof(proof HandoffContinuationProof) HandoffContinuationProof {
+	proof.SchemaVersion = strings.TrimSpace(proof.SchemaVersion)
+	proof.Code = strings.TrimSpace(proof.Code)
+	proof.State = normalizeHandoffSideEffectState(proof.State)
+	proof.SourceAttemptID = strings.TrimSpace(proof.SourceAttemptID)
+	proof.SourceExecutorID = strings.TrimSpace(proof.SourceExecutorID)
+	proof.HandoffID = strings.TrimSpace(proof.HandoffID)
+	proof.OwnershipFence = strings.TrimSpace(proof.OwnershipFence)
+	proof.ExecutionOutcome = strings.TrimSpace(proof.ExecutionOutcome)
+	proof.ProviderIdempotencyKeyHash = strings.TrimSpace(proof.ProviderIdempotencyKeyHash)
+	proof.ProviderReceiptHash = strings.TrimSpace(proof.ProviderReceiptHash)
+	proof.EvidenceRecordIDs = sortedCopyAgent(proof.EvidenceRecordIDs)
+	proof.DecisionRef = strings.TrimSpace(proof.DecisionRef)
+	proof.CompletedBoundary = strings.TrimSpace(proof.CompletedBoundary)
+	proof.CheckpointID = strings.TrimSpace(proof.CheckpointID)
+	proof.ProofFingerprint = strings.TrimSpace(proof.ProofFingerprint)
+	return proof
 }
 
 func validateHandoffSuccessorRequest(req HandoffSuccessorRequest) error {
@@ -1332,6 +1510,10 @@ func validateHandoffSuccessorRequest(req HandoffSuccessorRequest) error {
 	}
 	if !json.Valid([]byte(req.ActorJSON)) || !json.Valid([]byte(req.HostJSON)) {
 		return federationError(ErrInvalidRecordCode, "actor_json and host_json must be valid JSON")
+	}
+	if req.ContinuationProof.SchemaVersion != HandoffContinuationProofSchema || strings.TrimSpace(req.ContinuationProof.CheckpointID) == "" ||
+		strings.TrimSpace(req.ContinuationProof.ProofFingerprint) == "" {
+		return federationError(ErrHandoffRequiredCode, "durable handoff continuation proof is required")
 	}
 	if len(req.BudgetPolicyIDs) == 0 {
 		return federationError(ErrChildBudgetRequiredCode, "at least one budget policy id is required")
@@ -1448,6 +1630,13 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		if existing.BudgetReservationID != req.BudgetReservationID && !(existing.LaunchPhase == ClaimPhaseCompleted && strings.TrimSpace(existing.ProviderReceipt) == "") {
 			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed handoff reservation")
 		}
+		if err := validateHandoffContinuationProofTx(ctx, tx, handoff, req.ContinuationProof); err != nil {
+			return HandoffSuccessorLaunch{}, err
+		}
+		if existing.ContinuationProof.CheckpointID == "" || existing.ContinuationProof.CheckpointID != req.ContinuationProof.CheckpointID ||
+			existing.ContinuationProof.ProofFingerprint != req.ContinuationProof.ProofFingerprint {
+			return HandoffSuccessorLaunch{}, federationError(ErrHandoffReplayMismatchCode, "successor attempt replay changed continuation proof")
+		}
 		existing.Replay = true
 		return existing, nil
 	}
@@ -1506,6 +1695,7 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		RoutingCandidateID:     req.Candidate.RoutingCandidateID,
 		BudgetReservationID:    req.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(req.ReusableEvidenceIDs),
+		ContinuationProof:      req.ContinuationProof,
 		OwnershipLocks:         ownershipSnapshot,
 		LaunchExposed:          true,
 		LaunchPhase:            ClaimPhaseLaunching,
@@ -1581,7 +1771,21 @@ func validateHandoffLaunchFenceTx(ctx context.Context, tx Tx, handoff HandoffTra
 			return federationError(ErrHandoffAuthorityMismatchCode, "routing decision does not match approved handoff authority")
 		}
 	}
+	if err := validateHandoffContinuationProofTx(ctx, tx, handoff, req.ContinuationProof); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateHandoffContinuationProofTx(ctx context.Context, tx Tx, handoff HandoffTransaction, proof HandoffContinuationProof) error {
+	rec, ok, err := loadHandoffSideEffectDecisionTx(ctx, tx, handoff)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return federationError(ErrHandoffReplayMismatchCode, "handoff continuation proof is missing durable reconciliation decision")
+	}
+	return validateHandoffContinuationProof(handoff, rec, proof)
 }
 
 func sourceAttemptForSuccessorTx(ctx context.Context, tx Tx, handoff HandoffTransaction) (int, string, error) {
@@ -1720,6 +1924,7 @@ func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff Handof
 		"routing_candidate_id":     req.Candidate.RoutingCandidateID,
 		"budget_reservation_id":    req.BudgetReservationID,
 		"reusable_evidence_ids":    sortedCopyAgent(req.ReusableEvidenceIDs),
+		"continuation_proof":       req.ContinuationProof,
 		"ownership_locks":          normalizeHandoffOwnershipLockSnapshot(ownershipSnapshot),
 		"provider_idempotency_key": providerKey,
 		"provider_session_ref":     "",
@@ -1892,6 +2097,7 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID  string                         `json:"routing_candidate_id"`
 		BudgetReservationID string                         `json:"budget_reservation_id"`
 		ReusableEvidenceIDs []string                       `json:"reusable_evidence_ids"`
+		ContinuationProof   HandoffContinuationProof       `json:"continuation_proof"`
 		OwnershipLocks      []HandoffOwnershipLockSnapshot `json:"ownership_locks"`
 		LaunchPhase         string                         `json:"launch_phase"`
 	}
@@ -1915,6 +2121,7 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID:     payload.RoutingCandidateID,
 		BudgetReservationID:    payload.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(payload.ReusableEvidenceIDs),
+		ContinuationProof:      normalizeHandoffContinuationProof(payload.ContinuationProof),
 		OwnershipLocks:         normalizeHandoffOwnershipLockSnapshot(payload.OwnershipLocks),
 		LaunchExposed:          false,
 		LaunchPhase:            firstNonEmptyAgent(claimPhase, payload.LaunchPhase),

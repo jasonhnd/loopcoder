@@ -106,13 +106,35 @@ func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) 
 	defer store.Close()
 	makeClaudeEligibleOnly(input)
 	var executions atomic.Int64
-	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+	var sourceExternalEffect atomic.Int64
+	sourceExternalEffect.Store(1)
+	_, bypassErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
-		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			sourceExternalEffect.Add(1)
 			executions.Add(1)
-			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination"}, nil
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-duplicate-source"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(bypassErr, taskrequirements.ErrReplanRequired) || sourceExternalEffect.Load() != 1 || executions.Load() != 0 {
+		t.Fatalf("receipt bypass err=%v source_effect=%d executions=%d, want fail closed before boundary-zero executor", bypassErr, sourceExternalEffect.Load(), executions.Load())
+	}
+	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			if execution.ContinuationProof.State != storage.SideEffectStateReceiptBacked || execution.ContinuationProof.ProviderReceiptHash == "" || execution.ContinuationProof.CheckpointID != support.CheckpointID {
+				t.Fatalf("receipt execution proof = %#v, want bound receipt proof", execution.ContinuationProof)
+			}
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination", ContinuationCheckpointID: execution.ContinuationProof.CheckpointID, ReusedSourceBoundary: true}, nil
 		},
 		DecidedBy: routerActor(),
 		Host:      routingHost(),
@@ -120,8 +142,8 @@ func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) 
 	if err != nil {
 		t.Fatalf("receipt-backed resume: %v", err)
 	}
-	if executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateReceiptBacked || !result.Reconciliation.AutomaticContinuation {
-		t.Fatalf("receipt-backed result=%#v executions=%d, want automatic receipt reconciliation and one successor execution", result.Reconciliation, executions.Load())
+	if sourceExternalEffect.Load() != 1 || executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateReceiptBacked || !result.Reconciliation.AutomaticContinuation {
+		t.Fatalf("receipt-backed result=%#v source_effect=%d executions=%d, want verified receipt reuse and one successor execution", result.Reconciliation, sourceExternalEffect.Load(), executions.Load())
 	}
 	evidence := handoffReconciliationEvidence(t, ctx, store, handoff.HandoffID)
 	if !strings.Contains(evidence, storage.HandoffSideEffectCodeReceiptBacked) || strings.Contains(evidence, receipt) || !strings.Contains(evidence, "provider_receipt_hash") {
@@ -129,10 +151,11 @@ func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) 
 	}
 
 	replayed, replayErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
-		HandoffID:        handoff.HandoffID,
-		DecisionInput:    input,
-		ReservationValue: 1,
-		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
 			executions.Add(1)
 			return HandoffSuccessorExecutionResult{ProviderReceipt: "duplicate"}, nil
 		},
@@ -164,13 +187,35 @@ func TestResumeApprovedHandoffReconcilesIdempotentSourceEffect(t *testing.T) {
 	defer store.Close()
 	makeClaudeEligibleOnly(input)
 	var executions atomic.Int64
-	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+	var sourceExternalEffect atomic.Int64
+	sourceExternalEffect.Store(1)
+	_, bypassErr := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
 		ReservationValue: 1,
 		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			sourceExternalEffect.Add(1)
 			executions.Add(1)
-			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination"}, nil
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-duplicate-source"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(bypassErr, taskrequirements.ErrReplanRequired) || sourceExternalEffect.Load() != 1 || executions.Load() != 0 {
+		t.Fatalf("idempotent bypass err=%v source_effect=%d executions=%d, want fail closed before boundary-zero executor", bypassErr, sourceExternalEffect.Load(), executions.Load())
+	}
+	support := handoffContinuationSupport(t, ctx, store, handoff, false, true)
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(_ context.Context, execution HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			if execution.ContinuationProof.State != storage.SideEffectStateIdempotent || execution.ContinuationProof.ProviderIdempotencyKeyHash == "" || execution.ContinuationProof.CheckpointID != support.CheckpointID {
+				t.Fatalf("idempotent execution proof = %#v, want bound exact-key proof", execution.ContinuationProof)
+			}
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination", ContinuationCheckpointID: execution.ContinuationProof.CheckpointID, ReusedSourceBoundary: true}, nil
 		},
 		DecidedBy: routerActor(),
 		Host:      routingHost(),
@@ -178,8 +223,77 @@ func TestResumeApprovedHandoffReconcilesIdempotentSourceEffect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("idempotent resume: %v", err)
 	}
-	if executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateIdempotent || !result.Reconciliation.AutomaticContinuation {
-		t.Fatalf("idempotent result=%#v executions=%d, want exact-key reconciliation and one successor execution", result.Reconciliation, executions.Load())
+	if sourceExternalEffect.Load() != 1 || executions.Load() != 1 || result.Reconciliation.State != storage.SideEffectStateIdempotent || !result.Reconciliation.AutomaticContinuation {
+		t.Fatalf("idempotent result=%#v source_effect=%d executions=%d, want exact-key reuse and one successor execution", result.Reconciliation, sourceExternalEffect.Load(), executions.Load())
+	}
+}
+
+func TestResumeApprovedHandoffReceiptContinuationCheckpointMismatchDoesNotLaunch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = 'attempt-source'`, "receipt-source-effect")
+			return err
+		}); err != nil {
+			t.Fatalf("seed source receipt: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
+	support.CheckpointID = support.CheckpointID + "-changed"
+	var executions atomic.Int64
+	_, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) || executions.Load() != 0 || countSuccessorAttempts(t, ctx, store, handoff.TaskID) != 0 {
+		t.Fatalf("checkpoint mismatch err=%v executions=%d attempts=%d, want fail closed before launch", err, executions.Load(), countSuccessorAttempts(t, ctx, store, handoff.TaskID))
+	}
+}
+
+func TestResumeApprovedHandoffReceiptContinuationResultMustConfirmReuse(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeFixtureWithSourceMutation(t, ctx, fixture, tempDB(t), false, func(store storage.Store, claim storage.ClaimResult) {
+		if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = ? WHERE attempt_id = 'attempt-source'`, "receipt-source-effect")
+			return err
+		}); err != nil {
+			t.Fatalf("seed source receipt: %v", err)
+		}
+	})
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
+	var executions atomic.Int64
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:           handoff.HandoffID,
+		DecisionInput:       input,
+		ReservationValue:    1,
+		ContinuationSupport: support,
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "receipt-destination"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, taskrequirements.ErrReplanRequired) || executions.Load() != 1 || result.Successor.LaunchPhase != storage.ClaimPhaseLaunching {
+		t.Fatalf("missing reuse ack err=%v result=%#v executions=%d, want fail closed after unconfirmed executor result", err, result.Successor, executions.Load())
+	}
+	state := handoffLaunchDurableState(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID)
+	if state.claimPhase != storage.ClaimPhaseCompleted || state.registrationState != storage.AgentStateNeedsHuman {
+		t.Fatalf("missing reuse ack durable state = %#v, want terminal needs-human", state)
 	}
 }
 
@@ -2261,6 +2375,23 @@ func handoffReconciliationEvidence(t *testing.T, ctx context.Context, store stor
 		t.Fatalf("handoff reconciliation evidence: %v", err)
 	}
 	return raw
+}
+
+func handoffContinuationSupport(t *testing.T, ctx context.Context, store storage.Store, handoff storage.HandoffTransaction, receiptBacked, idempotent bool) HandoffSuccessorContinuationSupport {
+	t.Helper()
+	rec, err := storage.ReconcileHandoffSideEffect(ctx, store, handoff)
+	if err != nil {
+		t.Fatalf("handoff continuation reconciliation: %v", err)
+	}
+	proof, err := storage.BuildHandoffContinuationProof(handoff, rec)
+	if err != nil {
+		t.Fatalf("handoff continuation proof: %v", err)
+	}
+	return HandoffSuccessorContinuationSupport{
+		ReceiptBacked: receiptBacked,
+		Idempotent:    idempotent,
+		CheckpointID:  proof.CheckpointID,
+	}
 }
 
 func handoffStatusAndAction(t *testing.T, ctx context.Context, store storage.Store, handoffID string) (string, string) {
