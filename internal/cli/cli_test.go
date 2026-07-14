@@ -97,6 +97,24 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, failure string) {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		<-signal
+		return
+	}
+	wait := time.Until(deadline) - 500*time.Millisecond
+	if wait <= 0 {
+		wait = time.Nanosecond
+	}
+	select {
+	case <-signal:
+	case <-time.After(wait):
+		t.Fatal(failure)
+	}
+}
+
 func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	repo := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -5482,22 +5500,14 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 	go run("recover-a", recoverArgs, recoverDeps, recoverStart, false)
 	go run("recover-b", recoverArgs, recoverDeps, recoverStart, false)
 	close(recoverStart)
-	select {
-	case <-launchedOnce:
-	case <-time.After(time.Second):
-		t.Fatal("recover attempts did not launch any detached supervisor")
-	}
+	waitForTestSignal(t, launchedOnce, "recover attempts did not launch any detached supervisor")
 	close(controlStart)
 	controlDone := make(chan struct{})
 	go func() {
 		controlWG.Wait()
 		close(controlDone)
 	}()
-	select {
-	case <-controlDone:
-	case <-time.After(time.Second):
-		t.Fatal("old-generation attach/cancel did not complete while recovered launch was blocked")
-	}
+	waitForTestSignal(t, controlDone, "old-generation attach/cancel did not complete while recovered launch was blocked")
 	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2*time.Minute + time.Second) }})
 	if err != nil {
 		t.Fatalf("reopen store during blocked launch: %v", err)
@@ -5515,7 +5525,12 @@ func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
 		t.Fatalf("old-generation controls terminalized recovered generation during blocked launch: %#v", inFlightRecord)
 	}
 	close(releaseLaunch)
-	wg.Wait()
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+	waitForTestSignal(t, allDone, "concurrent attach/cancel/recover commands did not complete")
 	close(results)
 
 	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
