@@ -4578,7 +4578,7 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 	if err != nil {
 		return fmt.Errorf("render dispatch report JSON: %w", err)
 	}
-	data, err := worker.MarshalResult(result)
+	data, err := worker.MarshalResult(dispatchResultForOutput(result))
 	if err != nil {
 		return err
 	}
@@ -5284,7 +5284,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if dispatchWaveReportHasContent(waveReport) {
 		var writeErr error
 		if outputMode.Format == "json" {
-			writeErr = writeJSONLine(stdout, waveReport)
+			writeErr = writeJSONLine(stdout, orchestration.SanitizeDispatchWaveReportForOutput(waveReport))
 		} else {
 			_, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport)))
 		}

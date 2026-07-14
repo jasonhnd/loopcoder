@@ -3,6 +3,7 @@ package cli
 import (
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
@@ -50,6 +51,7 @@ func detachedRecoverJSONPayload(result detachedrun.StatusResult) any {
 }
 
 func dispatchJSONPayload(result worker.Result) any {
+	result = dispatchResultForOutput(result)
 	return struct {
 		SchemaVersion string                 `json:"schema_version"`
 		Observability observability.Document `json:"observability"`
@@ -76,6 +78,13 @@ func dispatchObservabilityItems(result worker.Result) []observability.RenderItem
 			Provenance:    "durable-local-attempt",
 		}}),
 	}
+}
+
+func dispatchResultForOutput(result worker.Result) worker.Result {
+	if strings.TrimSpace(result.AttemptPath) != "" {
+		result.AttemptPath = observability.StableRecordID(result.AttemptPath)
+	}
+	return result
 }
 
 func nestedJSONPayload(report orchestration.NestedScheduleReport) any {

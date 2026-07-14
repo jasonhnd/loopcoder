@@ -35,5 +35,8 @@ func reportItemID(record Record) string {
 	if record.Report.Issue > 0 {
 		return "issue-" + strconv.Itoa(record.Report.Issue)
 	}
-	return record.Path
+	if record.Source != "" {
+		return "report-" + observability.StableRecordID(record.Source)
+	}
+	return "report-" + observability.StableRecordID(record.Path)
 }

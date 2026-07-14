@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,55 @@ func ItemFromReport(id, kind, status, reason, nextAction string, record reporter
 		Redaction:  projectionRedaction(),
 		Truncation: TruncationMetadata{Fields: []string{}},
 	}
+}
+
+func StableRecordID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	normalized := strings.ReplaceAll(value, "\\", "/")
+	if strings.Contains(normalized, "/") {
+		normalized = strings.TrimRight(normalized, "/")
+		base := path.Base(normalized)
+		if base != "." && base != "/" && strings.TrimSpace(base) != "" {
+			normalized = base
+		}
+	}
+	normalized = strings.TrimSpace(sanitize.Text(normalized))
+	if strings.Contains(normalized, sanitize.RedactedPath) {
+		return "redacted-path"
+	}
+	for _, suffix := range []string{".attempt.json", ".report.json", ".jsonl", ".json", ".attest", ".txt", ".md"} {
+		normalized = strings.TrimSuffix(normalized, suffix)
+	}
+	normalized = strings.TrimSpace(normalized)
+	if normalized == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range normalized {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.' || r == ':' || r == '#':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-.")
+	if out == "" {
+		return "unknown"
+	}
+	if len([]rune(out)) > 128 {
+		return string([]rune(out)[:128])
+	}
+	return out
 }
 
 func RenderJSON(w io.Writer, doc Document) error {
@@ -275,6 +325,9 @@ func normalizeSourceRefs(refs []SourceRef) []SourceRef {
 		return []SourceRef{}
 	}
 	out := append([]SourceRef(nil), refs...)
+	for i := range out {
+		out[i].RecordID = StableRecordID(out[i].RecordID)
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Table+"\x00"+out[i].RecordID+"\x00"+out[i].Field < out[j].Table+"\x00"+out[j].RecordID+"\x00"+out[j].Field
 	})

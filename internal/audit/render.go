@@ -29,20 +29,20 @@ func auditObservability(result Result) observability.Document {
 		receipt := DecisionReceipt(result)
 		items = append(items, observability.ItemFromReport("audit", "audit", result.Verdict, receipt.Reason, receipt.NextAction, *result.Report, []observability.SourceRef{{
 			Table:      "audit",
-			RecordID:   result.Repo,
+			RecordID:   "audit-result",
 			Provenance: "audit-result",
 		}}))
 	} else {
 		receipt := DecisionReceipt(result)
 		items = append(items, observability.RenderItem{
-			ID:         result.Repo,
+			ID:         "audit",
 			Kind:       "audit",
 			Status:     result.Verdict,
 			Reason:     receipt.Reason,
 			NextAction: receipt.NextAction,
 			Confidence: "exact",
 			Freshness:  "durable",
-			SourceRefs: []observability.SourceRef{{Table: "audit", RecordID: result.Repo, Provenance: "audit-result"}},
+			SourceRefs: []observability.SourceRef{{Table: "audit", RecordID: "audit-result", Provenance: "audit-result"}},
 		})
 	}
 	return observability.NewDocument("audit", observability.Correlation{Source: "audit"}, items, nil)

@@ -13,6 +13,7 @@ import (
 
 func MarshalTickJSON(report TickReport) ([]byte, error) {
 	report = normalizeTickReport(report)
+	report = sanitizeTickReportForOutput(report)
 	payload := struct {
 		SchemaVersion string                 `json:"schema_version"`
 		Observability observability.Document `json:"observability"`
@@ -27,6 +28,14 @@ func MarshalTickJSON(report TickReport) ([]byte, error) {
 		return nil, fmt.Errorf("marshal tick JSON: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+func sanitizeTickReportForOutput(report TickReport) TickReport {
+	if report.DispatchWave != nil {
+		wave := SanitizeDispatchWaveReportForOutput(*report.DispatchWave)
+		report.DispatchWave = &wave
+	}
+	return report
 }
 
 func tickObservability(report TickReport) observability.Document {

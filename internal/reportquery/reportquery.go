@@ -184,7 +184,7 @@ func RenderTextWithOptions(records []Record, opts RenderOptions) string {
 		fmt.Fprintf(&out, "Source\n")
 		fmt.Fprintf(&out, "- source: %s\n", display(record.Source))
 		fmt.Fprintf(&out, "- run ID: %s\n", display(record.RunID))
-		fmt.Fprintf(&out, "- path: %s\n", display(record.Path))
+		fmt.Fprintf(&out, "- source ID: %s\n", display(renderedRecordSourceID(record)))
 		if opts.Verbose {
 			fmt.Fprintf(&out, "\nRaw record\n")
 			fmt.Fprintf(&out, "- header: %s\n", r.Header())
@@ -209,7 +209,7 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 			Report: record.Report,
 			Source: record.Source,
 			RunID:  record.RunID,
-			Path:   record.Path,
+			Path:   renderedRecordSourceID(record),
 		})
 	}
 	payload := struct {
@@ -226,6 +226,10 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 		RunTree:       runTree,
 	}
 	return json.Marshal(payload)
+}
+
+func renderedRecordSourceID(record Record) string {
+	return reportItemID(record)
 }
 
 type jsonRecord struct {

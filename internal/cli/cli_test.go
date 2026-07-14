@@ -709,6 +709,9 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	if payload.Records[0].Report.WorkID != "run-report-test" || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != "run-report-test" || payload.Records[0].Path == "" {
 		t.Fatalf("records = %#v, want one filtered local record with source context", payload.Records)
 	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(payload.Records[0].Path, string(filepath.Separator)) {
+		t.Fatalf("report JSON leaked local report path: path=%q output=%s", payload.Records[0].Path, stdout.String())
+	}
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
 	}
@@ -7073,10 +7076,59 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Status != "succeeded" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
 		t.Fatalf("dispatch observability item = %#v", payload.Observability.Items)
 	}
+	for _, forbidden := range []string{"/repo/.loopcoder", repo, ".attempt.json"} {
+		if strings.Contains(stdout.String(), forbidden) {
+			t.Fatalf("dispatch JSON leaked local path artifact %q:\n%s", forbidden, stdout.String())
+		}
+	}
 	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
 		if strings.Contains(stdout.String(), disallowed) {
 			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
 		}
+	}
+}
+
+func TestDispatchJSONObservabilityUsesStableAttemptID(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.AttemptPath = filepath.Join(repo, ".loopcoder", "runs", result.RunID, "workers", "job-101-1.attempt.json")
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var payload struct {
+		AttemptPath   string `json:"attempt_path"`
+		Observability struct {
+			Items []struct {
+				SourceRefs []struct {
+					RecordID string `json:"record_id"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &payload)
+	if payload.AttemptPath != "job-101-1" {
+		t.Fatalf("attempt_path = %q, want stable attempt id", payload.AttemptPath)
+	}
+	if len(payload.Observability.Items) != 1 || len(payload.Observability.Items[0].SourceRefs) != 1 || payload.Observability.Items[0].SourceRefs[0].RecordID != "job-101-1" {
+		t.Fatalf("source refs = %#v, want stable attempt id", payload.Observability.Items)
+	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(stdout.String(), ".attempt.json") {
+		t.Fatalf("dispatch JSON leaked local attempt path:\n%s", stdout.String())
 	}
 }
 

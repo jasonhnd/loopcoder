@@ -539,7 +539,7 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerReports(t *testing.T) {
 		"  branch: loop/issue-21",
 		"  pr: https://github.com/owner/repo/pull/21",
 		"  report: provider=claude model=claude-sonnet-4-5 (high) source=parsed permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
-		"  attempt: .loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
+		"  attempt_id: job-21",
 		"- #22 succeeded",
 		"  report: provider=codex model=gpt-5.5 (xhigh) source=parsed permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
 		"- #23 skipped",
