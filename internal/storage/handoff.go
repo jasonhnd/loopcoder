@@ -123,26 +123,32 @@ type HandoffSuccessorRequest struct {
 	HostJSON            string
 }
 
+type HandoffOwnershipLockSnapshot struct {
+	LockID         string `json:"lock_id"`
+	LockGeneration int64  `json:"lock_generation"`
+}
+
 type HandoffSuccessorLaunch struct {
-	HandoffID              string   `json:"handoff_id"`
-	HandoffGeneration      int64    `json:"handoff_generation"`
-	AttemptID              string   `json:"attempt_id"`
-	SourceAttemptID        string   `json:"source_attempt_id"`
-	TaskID                 string   `json:"task_id"`
-	DeliveryRunID          string   `json:"delivery_run_id"`
-	ProjectID              string   `json:"project_id"`
-	ExecutorID             string   `json:"executor_id"`
-	ClaimGeneration        int64    `json:"claim_generation"`
-	ProviderIdempotencyKey string   `json:"provider_idempotency_key"`
-	RoutingDecisionID      string   `json:"routing_decision_id"`
-	RoutingCandidateID     string   `json:"routing_candidate_id"`
-	BudgetReservationID    string   `json:"budget_reservation_id"`
-	ReusableEvidenceIDs    []string `json:"reusable_evidence_ids"`
-	LaunchExposed          bool     `json:"launch_exposed"`
-	LaunchPhase            string   `json:"launch_phase,omitempty"`
-	ProviderReceipt        string   `json:"provider_receipt,omitempty"`
-	LeaseExpiresAt         string   `json:"lease_expires_at,omitempty"`
-	Replay                 bool     `json:"replay"`
+	HandoffID              string                         `json:"handoff_id"`
+	HandoffGeneration      int64                          `json:"handoff_generation"`
+	AttemptID              string                         `json:"attempt_id"`
+	SourceAttemptID        string                         `json:"source_attempt_id"`
+	TaskID                 string                         `json:"task_id"`
+	DeliveryRunID          string                         `json:"delivery_run_id"`
+	ProjectID              string                         `json:"project_id"`
+	ExecutorID             string                         `json:"executor_id"`
+	ClaimGeneration        int64                          `json:"claim_generation"`
+	ProviderIdempotencyKey string                         `json:"provider_idempotency_key"`
+	RoutingDecisionID      string                         `json:"routing_decision_id"`
+	RoutingCandidateID     string                         `json:"routing_candidate_id"`
+	BudgetReservationID    string                         `json:"budget_reservation_id"`
+	ReusableEvidenceIDs    []string                       `json:"reusable_evidence_ids"`
+	OwnershipLocks         []HandoffOwnershipLockSnapshot `json:"ownership_locks,omitempty"`
+	LaunchExposed          bool                           `json:"launch_exposed"`
+	LaunchPhase            string                         `json:"launch_phase,omitempty"`
+	ProviderReceipt        string                         `json:"provider_receipt,omitempty"`
+	LeaseExpiresAt         string                         `json:"lease_expires_at,omitempty"`
+	Replay                 bool                           `json:"replay"`
 }
 
 type handoffReplayConflict struct {
@@ -1084,7 +1090,11 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 	if err := insertHandoffSuccessorAttemptTx(ctx, tx, handoff, req, attemptID, providerKey, sourceOrdinal+1, sideEffectClass); err != nil {
 		return HandoffSuccessorLaunch{}, err
 	}
-	if err := insertHandoffSuccessorDecisionTx(ctx, tx, handoff, req, attemptID, providerKey); err != nil {
+	ownershipSnapshot, err := handoffOwnershipLockSnapshotTx(ctx, tx, handoff.ChildRunID, handoff.DestinationExecutorID, handoff.HandoffGeneration, req.CreatedAt)
+	if err != nil {
+		return HandoffSuccessorLaunch{}, err
+	}
+	if err := insertHandoffSuccessorDecisionTx(ctx, tx, handoff, req, attemptID, providerKey, ownershipSnapshot); err != nil {
 		return HandoffSuccessorLaunch{}, err
 	}
 	if err := claimHandoffSuccessorLaunchTx(ctx, tx, handoff, req.CreatedAt); err != nil {
@@ -1112,6 +1122,7 @@ func prepareHandoffSuccessorLaunchTx(ctx context.Context, tx Tx, req HandoffSucc
 		RoutingCandidateID:     req.Candidate.RoutingCandidateID,
 		BudgetReservationID:    req.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(req.ReusableEvidenceIDs),
+		OwnershipLocks:         ownershipSnapshot,
 		LaunchExposed:          true,
 		LaunchPhase:            ClaimPhaseLaunching,
 	}, nil
@@ -1314,7 +1325,7 @@ func insertHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff Handoff
 	return err
 }
 
-func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest, attemptID, providerKey string) error {
+func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff HandoffTransaction, req HandoffSuccessorRequest, attemptID, providerKey string, ownershipSnapshot []HandoffOwnershipLockSnapshot) error {
 	output, err := compactJSON(map[string]any{
 		"schema_version":           "loopcoder.handoff_successor_launch.v1",
 		"handoff_id":               handoff.HandoffID,
@@ -1325,6 +1336,7 @@ func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff Handof
 		"routing_candidate_id":     req.Candidate.RoutingCandidateID,
 		"budget_reservation_id":    req.BudgetReservationID,
 		"reusable_evidence_ids":    sortedCopyAgent(req.ReusableEvidenceIDs),
+		"ownership_locks":          normalizeHandoffOwnershipLockSnapshot(ownershipSnapshot),
 		"provider_idempotency_key": providerKey,
 		"provider_session_ref":     "",
 		"launch_exposed":           true,
@@ -1346,6 +1358,131 @@ func insertHandoffSuccessorDecisionTx(ctx context.Context, tx Tx, handoff Handof
 	return err
 }
 
+func handoffOwnershipLockSnapshotTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, at string) ([]HandoffOwnershipLockSnapshot, error) {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, childRunID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, federationError(ErrAgentRegistrationRequiredCode, "run %s has no registration", childRunID)
+	}
+	if record.ExecutorID != executorID || record.ClaimGeneration != claimGeneration {
+		return nil, federationError(ErrStaleClaimCode, "registration claim does not match handoff launch owner/generation")
+	}
+	return handoffOwnershipLockSnapshotForRegistrationTx(ctx, tx, record, at)
+}
+
+func handoffOwnershipLockSnapshotForRegistrationTx(ctx context.Context, tx Tx, record AgentRegistration, at string) ([]HandoffOwnershipLockSnapshot, error) {
+	lockIDs := sortedCopyAgent(record.OwnershipLockIDs)
+	if len(lockIDs) == 0 {
+		if strings.TrimSpace(record.Permission) == PermissionReadOnly {
+			return nil, nil
+		}
+		return nil, federationError(ErrOwnershipRequiredCode, "registration %s has no ownership locks", record.ChildAgentID)
+	}
+	atTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(at))
+	if err != nil {
+		return nil, federationError(ErrInvalidRecordCode, "handoff ownership snapshot time is invalid")
+	}
+	rows, err := tx.Query(ctx, `SELECT id, child_agent_id, run_id, claim_generation, lock_generation, state, lease_expires_at
+		FROM agent_ownership_locks
+		WHERE project_id = ? AND delivery_run_id = ? AND id IN (`+placeholders(len(lockIDs))+`)`,
+		append([]any{record.ProjectID, record.DeliveryRunID}, stringsToAny(lockIDs)...)...)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot handoff ownership locks: %w", err)
+	}
+	defer rows.Close()
+	expected := stringSetAgent(lockIDs)
+	seen := map[string]bool{}
+	out := make([]HandoffOwnershipLockSnapshot, 0, len(lockIDs))
+	for rows.Next() {
+		var id, ownerID, runID, state, leaseExpiresAt string
+		var claimGeneration, lockGeneration int64
+		if err := rows.Scan(&id, &ownerID, &runID, &claimGeneration, &lockGeneration, &state, &leaseExpiresAt); err != nil {
+			return nil, fmt.Errorf("scan handoff ownership snapshot: %w", err)
+		}
+		if !expected[id] {
+			continue
+		}
+		seen[id] = true
+		if ownerID != record.ChildAgentID || runID != record.RunID || claimGeneration != record.ClaimGeneration || lockGeneration <= 0 {
+			return nil, federationError(ErrOwnershipStaleCode, "ownership lock %s no longer matches handoff launch owner/generation", id)
+		}
+		if state != OwnershipStateHeld {
+			return nil, federationError(ErrOwnershipStaleCode, "ownership lock %s is %s", id, state)
+		}
+		leaseTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseExpiresAt))
+		if err != nil || !leaseTime.After(atTime.UTC()) {
+			return nil, federationError(ErrOwnershipStaleCode, "ownership lock %s lease expired at %s", id, leaseExpiresAt)
+		}
+		out = append(out, HandoffOwnershipLockSnapshot{LockID: id, LockGeneration: lockGeneration})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan handoff ownership snapshot rows: %w", err)
+	}
+	for _, id := range lockIDs {
+		if !seen[id] {
+			return nil, federationError(ErrOwnershipStaleCode, "ownership lock %s is missing", id)
+		}
+	}
+	return normalizeHandoffOwnershipLockSnapshot(out), nil
+}
+
+func refreshHandoffSuccessorLaunchOwnershipSnapshotTx(ctx context.Context, tx Tx, childRunID, executorID string, claimGeneration int64, at string) error {
+	record, ok, err := loadAgentRegistrationByRunTx(ctx, tx, childRunID)
+	if err != nil || !ok {
+		return err
+	}
+	if record.ExecutorID != executorID || record.ClaimGeneration != claimGeneration || strings.TrimSpace(record.AttemptID) == "" {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT decision_id, output_json
+		FROM delivery_decisions
+		WHERE project_id = ? AND delivery_run_id = ? AND task_id = ? AND decision_kind = 'handoff-successor-launch'`,
+		record.ProjectID, record.DeliveryRunID, record.TaskID)
+	if err != nil {
+		return fmt.Errorf("refresh handoff ownership snapshot: %w", err)
+	}
+	defer rows.Close()
+	matches := map[string]map[string]any{}
+	for rows.Next() {
+		var decisionID, outputJSON string
+		if err := rows.Scan(&decisionID, &outputJSON); err != nil {
+			return fmt.Errorf("scan handoff ownership snapshot decision: %w", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(outputJSON), &payload); err != nil {
+			return federationError(ErrInvalidRecordCode, "handoff successor launch decision payload is invalid")
+		}
+		if strings.TrimSpace(fmt.Sprint(payload["successor_attempt_id"])) != record.AttemptID {
+			continue
+		}
+		matches[decisionID] = payload
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("scan handoff ownership snapshot decisions: %w", err)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	snapshot, err := handoffOwnershipLockSnapshotForRegistrationTx(ctx, tx, record, at)
+	if err != nil {
+		return err
+	}
+	for decisionID, payload := range matches {
+		payload["ownership_locks"] = normalizeHandoffOwnershipLockSnapshot(snapshot)
+		updated, err := json.Marshal(payload)
+		if err != nil {
+			return federationError(ErrInvalidRecordCode, "marshal handoff ownership snapshot: %v", err)
+		}
+		outputJSON := string(updated)
+		if _, err := tx.Exec(ctx, `UPDATE delivery_decisions SET output_json = ? WHERE decision_id = ?`, outputJSON, decisionID); err != nil {
+			return fmt.Errorf("update handoff ownership snapshot: %w", err)
+		}
+	}
+	return nil
+}
+
 func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTransaction, attemptID string) (HandoffSuccessorLaunch, bool, error) {
 	var projectID, deliveryRunID, taskID, executorID, providerKey string
 	var generation int64
@@ -1364,14 +1501,15 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		return HandoffSuccessorLaunch{}, false, err
 	}
 	var payload struct {
-		HandoffID           string   `json:"handoff_id"`
-		HandoffGeneration   int64    `json:"handoff_generation"`
-		SourceAttemptID     string   `json:"source_attempt_id"`
-		RoutingDecisionID   string   `json:"routing_decision_id"`
-		RoutingCandidateID  string   `json:"routing_candidate_id"`
-		BudgetReservationID string   `json:"budget_reservation_id"`
-		ReusableEvidenceIDs []string `json:"reusable_evidence_ids"`
-		LaunchPhase         string   `json:"launch_phase"`
+		HandoffID           string                         `json:"handoff_id"`
+		HandoffGeneration   int64                          `json:"handoff_generation"`
+		SourceAttemptID     string                         `json:"source_attempt_id"`
+		RoutingDecisionID   string                         `json:"routing_decision_id"`
+		RoutingCandidateID  string                         `json:"routing_candidate_id"`
+		BudgetReservationID string                         `json:"budget_reservation_id"`
+		ReusableEvidenceIDs []string                       `json:"reusable_evidence_ids"`
+		OwnershipLocks      []HandoffOwnershipLockSnapshot `json:"ownership_locks"`
+		LaunchPhase         string                         `json:"launch_phase"`
 	}
 	if outputJSON != "" {
 		_ = json.Unmarshal([]byte(outputJSON), &payload)
@@ -1393,6 +1531,7 @@ func loadHandoffSuccessorAttemptTx(ctx context.Context, tx Tx, handoff HandoffTr
 		RoutingCandidateID:     payload.RoutingCandidateID,
 		BudgetReservationID:    payload.BudgetReservationID,
 		ReusableEvidenceIDs:    sortedCopyAgent(payload.ReusableEvidenceIDs),
+		OwnershipLocks:         normalizeHandoffOwnershipLockSnapshot(payload.OwnershipLocks),
 		LaunchExposed:          false,
 		LaunchPhase:            firstNonEmptyAgent(claimPhase, payload.LaunchPhase),
 		ProviderReceipt:        providerReceipt,
@@ -1487,6 +1626,27 @@ func normalizeHandoffReasonList(values []string) []string {
 
 func normalizeHandoffReason(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeHandoffOwnershipLockSnapshot(values []HandoffOwnershipLockSnapshot) []HandoffOwnershipLockSnapshot {
+	byID := map[string]HandoffOwnershipLockSnapshot{}
+	for _, value := range values {
+		id := strings.TrimSpace(value.LockID)
+		if id == "" || value.LockGeneration <= 0 {
+			continue
+		}
+		byID[id] = HandoffOwnershipLockSnapshot{LockID: id, LockGeneration: value.LockGeneration}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]HandoffOwnershipLockSnapshot, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out
 }
 
 func normalizeHandoffSideEffectState(value string) string {

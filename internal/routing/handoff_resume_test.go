@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -955,6 +956,198 @@ func TestResumeApprovedHandoffTerminalCleanupStaleOwnershipRollsBack(t *testing.
 	}
 }
 
+func TestResumeApprovedHandoffTerminalCleanupStaleSameClaimRenewalRollsBack(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var executions atomic.Int64
+	stopErr := errors.New("stop after stale renewal")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			return errors.Join(storage.RenewChildRunClaim(ctx, store, handoff.ChildRunID, handoff.DestinationExecutorID, handoff.HandoffGeneration, fixture.now.Add(2*time.Minute), fixture.now.Add(time.Hour)), stopErr)
+		},
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, storage.ErrOwnershipStale) || !errors.Is(err, stopErr) {
+		t.Fatalf("stale same-claim cleanup error = %v, want ErrOwnershipStale and stopErr", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("stale same-claim cleanup executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("stale same-claim cleanup reservation state = %q, want active rollback", state)
+	}
+	for id, generation := range destinationLockGenerations(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration) {
+		if generation != result.Successor.OwnershipLocks[0].LockGeneration+1 {
+			t.Fatalf("renewed lock %s generation = %d, want launch generation + 1", id, generation)
+		}
+	}
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration, storage.OwnershipStateHeld)
+	assertHandoffLaunchUnterminalized(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID, storage.AgentStateRegistered)
+}
+
+func TestResumeApprovedHandoffTerminalCleanupWithRenewedAuthoritySucceeds(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	stopErr := errors.New("stop after renewal")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			return errors.Join(storage.RenewChildRunClaim(ctx, store, handoff.ChildRunID, handoff.DestinationExecutorID, handoff.HandoffGeneration, fixture.now.Add(2*time.Minute), fixture.now.Add(time.Hour)), stopErr)
+		},
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, storage.ErrOwnershipStale) {
+		t.Fatalf("old cleanup error = %v, want stale authority", err)
+	}
+	refreshed := result.Successor
+	refreshed.OwnershipLocks = handoffLaunchDecisionOwnershipSnapshot(t, ctx, store, handoff)
+	if len(refreshed.OwnershipLocks) != len(result.Successor.OwnershipLocks) {
+		t.Fatalf("refreshed ownership snapshot = %#v, want same lock count as launch %#v", refreshed.OwnershipLocks, result.Successor.OwnershipLocks)
+	}
+	if err := terminalizeHandoffLaunch(ctx, store, handoff, refreshed, result.Reservation, "cancelled", taskrequirements.ErrReplanRequiredCode, "renewed-authority-cleanup", handoffTerminalOwnershipRelease, routerActor(), routingHost()); err != nil {
+		t.Fatalf("terminal cleanup with renewed authority: %v", err)
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateReleased) {
+		t.Fatalf("renewed authority cleanup reservation state = %q, want released", state)
+	}
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration, storage.OwnershipStateReleased)
+}
+
+func TestResumeApprovedHandoffTerminalCleanupMixedLockGenerationRollsBack(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	var changedID string
+	var executions atomic.Int64
+	stopErr := errors.New("stop after mixed generation")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			changedID = resultLockID(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration, 0)
+			mutateErr := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+				_, err := tx.Exec(ctx, `UPDATE agent_ownership_locks SET lock_generation = lock_generation + 1 WHERE id = ?`, changedID)
+				return err
+			})
+			return errors.Join(mutateErr, stopErr)
+		},
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, storage.ErrOwnershipStale) || !errors.Is(err, stopErr) {
+		t.Fatalf("mixed generation cleanup error = %v, want ErrOwnershipStale and stopErr", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("mixed generation cleanup executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("mixed generation cleanup reservation state = %q, want active rollback", state)
+	}
+	generations := destinationLockGenerations(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration)
+	for _, lock := range result.Successor.OwnershipLocks {
+		want := lock.LockGeneration
+		if lock.LockID == changedID {
+			want++
+		}
+		if generations[lock.LockID] != want {
+			t.Fatalf("lock %s generation = %d, want %d", lock.LockID, generations[lock.LockID], want)
+		}
+	}
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration, storage.OwnershipStateHeld)
+	assertHandoffLaunchUnterminalized(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID, storage.AgentStateRegistered)
+}
+
+func TestResumeApprovedHandoffTerminalCleanupExtraRegistrationLockRollsBack(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
+	defer store.Close()
+	makeClaudeEligibleOnly(input)
+	extraID := "lock-extra"
+	var executions atomic.Int64
+	stopErr := errors.New("stop after extra lock")
+	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
+		HandoffID:        handoff.HandoffID,
+		DecisionInput:    input,
+		ReservationValue: 1,
+		AfterPrepare: func() error {
+			mutateErr := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+				if _, err := tx.Exec(ctx, `INSERT INTO agent_ownership_locks(
+					id, project_id, delivery_run_id, child_agent_id, run_id, claim_generation, lock_generation,
+					resource_kind, resource_key, lock_mode, state, lease_expires_at, heartbeat_at, conflicts_with_json, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, 1, 'provider-receipt', 'extra-receipt', 'write', ?, ?, ?, '[]', ?, ?)`,
+					extraID, handoff.ProjectID, handoff.DeliveryRunID, "agent-source", handoff.ChildRunID, handoff.HandoffGeneration,
+					storage.OwnershipStateHeld, fixture.now.Add(time.Hour).Format(time.RFC3339Nano), fixture.now.Format(time.RFC3339Nano), fixture.now.Format(time.RFC3339Nano), fixture.now.Format(time.RFC3339Nano)); err != nil {
+					return err
+				}
+				var rawIDs string
+				if err := tx.QueryRow(ctx, `SELECT ownership_lock_ids_json FROM agent_registrations WHERE child_run_id = ?`, handoff.ChildRunID).Scan(&rawIDs); err != nil {
+					return err
+				}
+				var ids []string
+				if err := json.Unmarshal([]byte(rawIDs), &ids); err != nil {
+					return err
+				}
+				ids = append(ids, extraID)
+				raw, err := json.Marshal(ids)
+				if err != nil {
+					return err
+				}
+				_, err = tx.Exec(ctx, `UPDATE agent_registrations SET ownership_lock_ids_json = ? WHERE child_run_id = ?`, string(raw), handoff.ChildRunID)
+				return err
+			})
+			return errors.Join(mutateErr, stopErr)
+		},
+		ExecuteSuccessor: func(context.Context, HandoffSuccessorExecution) (HandoffSuccessorExecutionResult, error) {
+			executions.Add(1)
+			return HandoffSuccessorExecutionResult{ProviderReceipt: "unexpected"}, nil
+		},
+		DecidedBy: routerActor(),
+		Host:      routingHost(),
+	})
+	if !errors.Is(err, storage.ErrOwnershipStale) || !errors.Is(err, stopErr) {
+		t.Fatalf("extra lock cleanup error = %v, want ErrOwnershipStale and stopErr", err)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("extra lock cleanup executed provider %d times", executions.Load())
+	}
+	if state := reservationState(t, ctx, store, result.Reservation.BudgetReservationID); state != string(budget.StateActive) {
+		t.Fatalf("extra lock cleanup reservation state = %q, want active rollback", state)
+	}
+	assertDestinationLockState(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration, storage.OwnershipStateHeld)
+	assertHandoffLaunchUnterminalized(t, ctx, store, handoff.ChildRunID, result.Successor.AttemptID, storage.AgentStateRegistered)
+	if generations := destinationLockGenerations(t, ctx, store, handoff.ChildRunID, handoff.HandoffGeneration); generations[extraID] != 1 {
+		t.Fatalf("extra lock generation/state was not preserved: %#v", generations)
+	}
+}
+
 func TestResumeApprovedHandoffTerminalCleanupCommitFailureRollsBackReservationAndOwnership(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -1643,6 +1836,90 @@ func reservationState(t *testing.T, ctx context.Context, store storage.Store, re
 		t.Fatalf("reservation state: %v", err)
 	}
 	return state
+}
+
+func handoffLaunchDecisionOwnershipSnapshot(t *testing.T, ctx context.Context, store storage.Store, handoff storage.HandoffTransaction) []storage.HandoffOwnershipLockSnapshot {
+	t.Helper()
+	var raw string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT output_json FROM delivery_decisions
+			WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ?`,
+			handoff.ProjectID, handoff.DeliveryRunID, "handoff-successor:"+handoff.HandoffID).Scan(&raw)
+	}); err != nil {
+		t.Fatalf("handoff launch decision snapshot: %v", err)
+	}
+	var payload struct {
+		OwnershipLocks []storage.HandoffOwnershipLockSnapshot `json:"ownership_locks"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("handoff launch decision JSON: %v", err)
+	}
+	return payload.OwnershipLocks
+}
+
+func destinationLockGenerations(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64) map[string]int64 {
+	t.Helper()
+	out := map[string]int64{}
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id, lock_generation FROM agent_ownership_locks
+			WHERE run_id = ? AND claim_generation = ?
+			ORDER BY id`, childRunID, claimGeneration)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var generation int64
+			if err := rows.Scan(&id, &generation); err != nil {
+				return err
+			}
+			out[id] = generation
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("destination lock generations: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("destination lock generations empty for %s generation %d", childRunID, claimGeneration)
+	}
+	return out
+}
+
+func resultLockID(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64, index int) string {
+	t.Helper()
+	ids := []string{}
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id FROM agent_ownership_locks
+			WHERE run_id = ? AND claim_generation = ?
+			ORDER BY id`, childRunID, claimGeneration)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("destination lock id: %v", err)
+	}
+	if index < 0 || index >= len(ids) {
+		t.Fatalf("destination lock index %d out of range for %v", index, ids)
+	}
+	return ids[index]
+}
+
+func assertHandoffLaunchUnterminalized(t *testing.T, ctx context.Context, store storage.Store, childRunID, attemptID, wantRegistrationState string) {
+	t.Helper()
+	state := handoffLaunchDurableState(t, ctx, store, childRunID, attemptID)
+	if state.claimPhase != storage.ClaimPhaseLaunching || state.registrationState != wantRegistrationState || state.attemptState != "claimed" || state.taskState != "claimed" {
+		t.Fatalf("handoff launch durable state = %#v, want launching/%s/claimed", state, wantRegistrationState)
+	}
 }
 
 func assertNoDestinationHeldLocks(t *testing.T, ctx context.Context, store storage.Store, childRunID string, claimGeneration int64) {

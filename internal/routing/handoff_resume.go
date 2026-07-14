@@ -459,15 +459,28 @@ func terminalizeHandoffOwnershipLocksTx(ctx context.Context, tx storage.Tx, hand
 		return &storage.FederationError{Code: storage.ErrInvalidRecordCode, Message: "destination registration ownership locks are invalid"}
 	}
 	lockIDs = dedupeStrings(lockIDs)
+	expectedLocks, err := expectedHandoffOwnershipLocks(launch.OwnershipLocks)
+	if err != nil {
+		return err
+	}
 	if len(lockIDs) == 0 {
 		if strings.TrimSpace(permission) == storage.PermissionReadOnly {
+			if len(expectedLocks) != 0 {
+				return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination read-only registration has unexpected ownership snapshot"}
+			}
 			return nil
 		}
 		return &storage.FederationError{Code: storage.ErrOwnershipRequiredCode, Message: "destination registration has no ownership locks"}
 	}
+	if len(expectedLocks) == 0 {
+		return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock generation snapshot is missing"}
+	}
+	if err := requireExactHandoffOwnershipLockSet(lockIDs, expectedLocks); err != nil {
+		return err
+	}
 	args := []any{projectID, deliveryRunID, childAgentID, handoff.ChildRunID}
 	args = append(args, stringsToAny(lockIDs)...)
-	rows, err := tx.Query(ctx, `SELECT id, run_id, claim_generation, state
+	rows, err := tx.Query(ctx, `SELECT id, run_id, claim_generation, lock_generation, state, lease_expires_at
 		FROM agent_ownership_locks
 		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
 			AND id IN (`+handoffPlaceholders(len(lockIDs))+`)`, args...)
@@ -477,17 +490,20 @@ func terminalizeHandoffOwnershipLocksTx(ctx context.Context, tx storage.Tx, hand
 	defer rows.Close()
 	seen := map[string]bool{}
 	for rows.Next() {
-		var id, runID, state string
-		var claimGeneration int64
-		if err := rows.Scan(&id, &runID, &claimGeneration, &state); err != nil {
+		var id, runID, state, leaseExpiresAt string
+		var claimGeneration, lockGeneration int64
+		if err := rows.Scan(&id, &runID, &claimGeneration, &lockGeneration, &state, &leaseExpiresAt); err != nil {
 			return fmt.Errorf("terminalize handoff launch ownership row: %w", err)
 		}
 		seen[id] = true
-		if runID != handoff.ChildRunID || claimGeneration != launch.ClaimGeneration {
+		if runID != handoff.ChildRunID || claimGeneration != launch.ClaimGeneration || lockGeneration != expectedLocks[id] {
 			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is not fenced to terminal generation"}
 		}
 		if state != storage.OwnershipStateHeld {
 			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is " + state}
+		}
+		if !handoffOwnershipLeaseActive(leaseExpiresAt, at) {
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " lease expired at " + leaseExpiresAt}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -495,7 +511,7 @@ func terminalizeHandoffOwnershipLocksTx(ctx context.Context, tx storage.Tx, hand
 	}
 	for _, id := range lockIDs {
 		if !seen[id] {
-			return &storage.FederationError{Code: storage.ErrOwnershipRequiredCode, Message: "destination ownership lock " + id + " is missing"}
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is missing"}
 		}
 	}
 	nextState := storage.OwnershipStateReleased
@@ -506,29 +522,68 @@ func terminalizeHandoffOwnershipLocksTx(ctx context.Context, tx storage.Tx, hand
 	if action == handoffTerminalOwnershipNeedsHuman {
 		args = []any{nextState, at, at, at}
 	}
-	args = append(args, projectID, deliveryRunID, childAgentID, handoff.ChildRunID, launch.ClaimGeneration, storage.OwnershipStateHeld)
-	args = append(args, stringsToAny(lockIDs)...)
-	query := `UPDATE agent_ownership_locks
-		SET state = ?, updated_at = ?
-		WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
-			AND claim_generation = ? AND state = ?
-			AND id IN (` + handoffPlaceholders(len(lockIDs)) + `)`
-	if action == handoffTerminalOwnershipNeedsHuman {
-		query = `UPDATE agent_ownership_locks
-			SET state = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+	for _, id := range lockIDs {
+		updateArgs := append([]any{}, args...)
+		updateArgs = append(updateArgs, projectID, deliveryRunID, childAgentID, handoff.ChildRunID, launch.ClaimGeneration, expectedLocks[id], storage.OwnershipStateHeld, id)
+		query := `UPDATE agent_ownership_locks
+			SET state = ?, updated_at = ?
 			WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
-				AND claim_generation = ? AND state = ?
-				AND id IN (` + handoffPlaceholders(len(lockIDs)) + `)`
-	}
-	result, err := tx.Exec(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("terminalize handoff launch ownership update: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err == nil && affected != int64(len(lockIDs)) {
-		return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: fmt.Sprintf("terminalized %d destination ownership locks, want %d", affected, len(lockIDs))}
+				AND claim_generation = ? AND lock_generation = ? AND state = ? AND id = ?`
+		if action == handoffTerminalOwnershipNeedsHuman {
+			query = `UPDATE agent_ownership_locks
+				SET state = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+				WHERE project_id = ? AND delivery_run_id = ? AND child_agent_id = ? AND run_id = ?
+					AND claim_generation = ? AND lock_generation = ? AND state = ? AND id = ?`
+		}
+		result, err := tx.Exec(ctx, query, updateArgs...)
+		if err != nil {
+			return fmt.Errorf("terminalize handoff launch ownership update: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err == nil && affected != 1 {
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: fmt.Sprintf("terminalized %d destination ownership rows for %s, want 1", affected, id)}
+		}
 	}
 	return nil
+}
+
+func expectedHandoffOwnershipLocks(snapshot []storage.HandoffOwnershipLockSnapshot) (map[string]int64, error) {
+	out := map[string]int64{}
+	for _, lock := range snapshot {
+		id := strings.TrimSpace(lock.LockID)
+		if id == "" || lock.LockGeneration <= 0 {
+			return nil, &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock generation snapshot is invalid"}
+		}
+		if _, exists := out[id]; exists {
+			return nil, &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock generation snapshot has duplicate lock " + id}
+		}
+		out[id] = lock.LockGeneration
+	}
+	return out, nil
+}
+
+func requireExactHandoffOwnershipLockSet(lockIDs []string, expected map[string]int64) error {
+	if len(lockIDs) != len(expected) {
+		return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock set no longer matches launch authority"}
+	}
+	for _, id := range lockIDs {
+		if _, ok := expected[id]; !ok {
+			return &storage.FederationError{Code: storage.ErrOwnershipStaleCode, Message: "destination ownership lock " + id + " is not in launch authority"}
+		}
+	}
+	return nil
+}
+
+func handoffOwnershipLeaseActive(leaseExpiresAt, at string) bool {
+	lease, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseExpiresAt))
+	if err != nil {
+		return false
+	}
+	now, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(at))
+	if err != nil {
+		return false
+	}
+	return lease.After(now.UTC())
 }
 
 func handoffPlaceholders(count int) string {
