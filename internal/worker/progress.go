@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/progresshost"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -48,6 +49,7 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 		CorrelationID:      jobID,
 		MaxSilenceInterval: deps.ProgressMaxSilence,
 		Clock:              deps.ProgressClock,
+		DeliveryObligation: progresshost.CurrentObligationFactory(),
 	})
 	if err != nil {
 		_ = store.Close()

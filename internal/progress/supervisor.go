@@ -25,6 +25,7 @@ type SupervisorOptions struct {
 	MaxSilenceInterval time.Duration
 	Clock              Clock
 	Deliver            DeliveryFunc
+	DeliveryObligation DeliveryObligationFunc
 	Diagnostic         DiagnosticFunc
 }
 
@@ -129,6 +130,7 @@ func (s *Supervisor) emitterFor(ctx context.Context, observation Observation) (*
 		MaxSilenceInterval: s.opts.MaxSilenceInterval,
 		Clock:              s.opts.Clock,
 		Deliver:            s.opts.Deliver,
+		DeliveryObligation: s.opts.DeliveryObligation,
 	})
 	if err != nil {
 		return nil, err

@@ -73,6 +73,18 @@ type DeliveryObligation struct {
 	LatestEvidence           DeliveryEvidence `json:"latest_evidence,omitempty"`
 }
 
+type DeliveryBinding struct {
+	OriginKind        string
+	OriginID          string
+	SinkKind          string
+	SinkID            string
+	TransportContract string
+	AckPolicy         string
+	MaxAttempts       int
+}
+
+type DeliveryObligationFunc func(ProgressReceipt) (DeliveryObligation, bool)
+
 type PersistReceiptWithObligationResult struct {
 	Receipt    WriteResult
 	Obligation DeliveryObligation
@@ -244,21 +256,62 @@ type deliveryObligationReplayCandidate struct {
 }
 
 func PersistReceiptWithObligation(ctx context.Context, store storage.Store, receipt ProgressReceipt, obligation DeliveryObligation) (PersistReceiptWithObligationResult, error) {
+	return persistReceiptWithObligation(ctx, store, receipt, false, func(ProgressReceipt) (DeliveryObligation, bool) {
+		return obligation, true
+	})
+}
+
+func PersistReceiptNextSequenceWithObligation(ctx context.Context, store storage.Store, receipt ProgressReceipt, obligation DeliveryObligation) (PersistReceiptWithObligationResult, error) {
+	return persistReceiptWithObligation(ctx, store, receipt, true, func(ProgressReceipt) (DeliveryObligation, bool) {
+		return obligation, true
+	})
+}
+
+func PersistReceiptNextSequenceWithObligationFunc(ctx context.Context, store storage.Store, receipt ProgressReceipt, obligation DeliveryObligationFunc) (PersistReceiptWithObligationResult, error) {
+	return persistReceiptWithObligation(ctx, store, receipt, true, obligation)
+}
+
+func DeliveryObligationForBinding(binding DeliveryBinding) DeliveryObligationFunc {
+	return func(receipt ProgressReceipt) (DeliveryObligation, bool) {
+		return DeliveryObligation{
+			ProjectID:         receipt.ProjectID,
+			DeliveryRunID:     receipt.DeliveryRunID,
+			ProgressReceiptID: receipt.ProgressReceiptID,
+			OriginKind:        binding.OriginKind,
+			OriginID:          binding.OriginID,
+			SinkKind:          binding.SinkKind,
+			SinkID:            binding.SinkID,
+			TransportContract: binding.TransportContract,
+			AckPolicy:         binding.AckPolicy,
+			MaxAttempts:       binding.MaxAttempts,
+		}, true
+	}
+}
+
+func persistReceiptWithObligation(ctx context.Context, store storage.Store, receipt ProgressReceipt, nextSequence bool, obligation DeliveryObligationFunc) (PersistReceiptWithObligationResult, error) {
 	if store == nil {
 		return PersistReceiptWithObligationResult{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	if obligation == nil {
+		return PersistReceiptWithObligationResult{}, typed(ErrInvalidRecordCode, "delivery obligation function is required")
 	}
 	now := store.Now()
 	normalizedReceipt, err := NormalizeReceipt(receipt, now)
 	if err != nil {
 		return PersistReceiptWithObligationResult{}, err
 	}
-	normalizedObligation, err := normalizeDeliveryObligation(obligation, normalizedReceipt, now)
-	if err != nil {
-		return PersistReceiptWithObligationResult{}, err
-	}
 	var result PersistReceiptWithObligationResult
 	err = store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		receiptResult, err := persistNormalizedReceiptTx(ctx, tx, normalizedReceipt, now, false)
+		receiptResult, err := persistNormalizedReceiptTx(ctx, tx, normalizedReceipt, now, nextSequence)
+		if err != nil {
+			return err
+		}
+		obligationRecord, ok := obligation(receiptResult.Receipt)
+		if !ok {
+			result = PersistReceiptWithObligationResult{Receipt: receiptResult}
+			return nil
+		}
+		normalizedObligation, err := normalizeDeliveryObligation(obligationRecord, receiptResult.Receipt, now)
 		if err != nil {
 			return err
 		}
@@ -1113,7 +1166,7 @@ func normalizeDeliveryObligation(obligation DeliveryObligation, receipt Progress
 	obligation.OriginKind = sanitizeEnum(firstNonEmpty(obligation.OriginKind, "progress-receipt"))
 	obligation.OriginID = sanitizeID(firstNonEmpty(obligation.OriginID, receipt.CorrelationID))
 	obligation.SinkKind = sanitizeEnum(firstNonEmpty(obligation.SinkKind, "host"))
-	obligation.SinkID = sanitizeID(firstNonEmpty(obligation.SinkID, Unknown))
+	obligation.SinkID = sanitizeID(firstNonEmpty(obligation.SinkID, receipt.CorrelationID, Unknown))
 	obligation.TransportContract = sanitizeEnum(firstNonEmpty(obligation.TransportContract, Unknown))
 	obligation.Status = sanitizeEnum(firstNonEmpty(obligation.Status, DeliveryPending))
 	obligation.ClaimOwner = sanitizeID(obligation.ClaimOwner)
