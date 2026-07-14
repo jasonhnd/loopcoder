@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/audit"
@@ -86,6 +87,8 @@ type Deps struct {
 	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
 	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
 	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
 	Init                     func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	Upgrade                  func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
 	MigrateLocalState        func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
@@ -151,6 +154,13 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
+func normalizeCLINow(now func() time.Time) func() time.Time {
+	if now != nil {
+		return now
+	}
+	return DefaultDeps().Now
+}
+
 func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) int {
 	deps := DefaultDeps()
 	deps.BuildInfo = build
@@ -158,6 +168,7 @@ func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) 
 }
 
 func DefaultDeps() Deps {
+	quotaLifecycle := newDefaultProviderQuotaLifecycle()
 	return Deps{
 		NewGitHubReader: func(repoPath string) orchestration.GitHubReader {
 			return gh.New(repoPath)
@@ -216,6 +227,12 @@ func DefaultDeps() Deps {
 			defer store.Close()
 			return providerinventory.Refresh(ctx, store, report, now)
 		},
+		ProviderQuotaRefresh: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+			return quotaLifecycle.Refresh(ctx, req)
+		},
+		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			return quotaLifecycle.Status(ctx, req)
+		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
@@ -241,6 +258,103 @@ func DefaultDeps() Deps {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
 	}
+}
+
+type defaultProviderQuotaLifecycle struct {
+	mu      sync.Mutex
+	store   storage.Store
+	manager *providerinventory.RefreshManager
+	closed  bool
+	active  sync.WaitGroup
+}
+
+func newDefaultProviderQuotaLifecycle() *defaultProviderQuotaLifecycle {
+	return &defaultProviderQuotaLifecycle{}
+}
+
+func (l *defaultProviderQuotaLifecycle) managerFor(ctx context.Context, now func() time.Time) (*providerinventory.RefreshManager, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
+	if l.manager != nil {
+		return l.manager, nil
+	}
+	store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
+	if err != nil {
+		return nil, err
+	}
+	l.store = store
+	l.manager = providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
+	return l.manager, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) begin() (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
+	l.active.Add(1)
+	return l.active.Done, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	l.mu.Unlock()
+
+	l.active.Wait()
+
+	l.mu.Lock()
+	manager := l.manager
+	store := l.store
+	l.manager = nil
+	l.store = nil
+	l.mu.Unlock()
+
+	if manager != nil {
+		manager.Wait()
+	}
+	if store != nil {
+		return store.Close()
+	}
+	return nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Refresh(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	defer done()
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	req.Now = now
+	return manager.Refresh(ctx, req)
+}
+
+func (l *defaultProviderQuotaLifecycle) Status(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	defer done()
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	req.Now = now
+	return manager.Status(ctx, req)
 }
 
 func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -1467,8 +1581,9 @@ func parseRelayRepo(name string, args []string, stderr io.Writer) (string, bool)
 func printProvidersHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder providers refresh [flags]")
+	fmt.Fprintln(w, "  loopcoder providers status [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory.")
+	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory and show cached quota status.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
@@ -1512,7 +1627,10 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		args = args[1:]
 	}
 	if subcommand != "refresh" {
-		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh)\n", subcommand)
+		if subcommand == "status" {
+			return runProvidersStatus(args, stdout, stderr, deps)
+		}
+		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh or status)\n", subcommand)
 		return 2
 	}
 
@@ -1550,6 +1668,29 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	now := deps.Now()
+	if deps.ProviderQuotaRefresh != nil {
+		result, err := deps.ProviderQuotaRefresh(context.Background(), providerinventory.RefreshRequest{
+			RepoPath: resolvedRepo,
+			Config:   cfg,
+			Trigger:  providerinventory.RefreshTriggerExplicit,
+			Now:      func() time.Time { return now },
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+			return 1
+		}
+		if format == "json" {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result.Report); err != nil {
+				fmt.Fprintf(stderr, "providers refresh: write output: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+		renderProviderRefreshText(stdout, result)
+		return 0
+	}
 	report, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
 		RepoPath: resolvedRepo,
 		Config:   cfg,
@@ -1623,6 +1764,100 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
 	return 0
+}
+
+func runProvidersStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderQuotaStatus == nil {
+		deps.ProviderQuotaStatus = DefaultDeps().ProviderQuotaStatus
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("providers status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	format := "text"
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers status: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers status: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 1
+	}
+	now := deps.Now()
+	status, err := deps.ProviderQuotaStatus(context.Background(), providerinventory.RefreshRequest{
+		RepoPath: resolvedRepo,
+		Config:   cfg,
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(status); err != nil {
+			fmt.Fprintf(stderr, "providers status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	renderProviderQuotaStatusText(stdout, status)
+	return 0
+}
+
+func renderProviderRefreshText(stdout io.Writer, result providerinventory.RefreshResult) {
+	report := result.Report
+	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), report.Confidence, report.InventoryFingerprint)
+	renderProviderQuotaStatusText(stdout, result.Status)
+	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+}
+
+func renderProviderQuotaStatusText(stdout io.Writer, status providerinventory.QuotaRefreshStatus) {
+	fmt.Fprintf(stdout, "Provider quota status: %d provider(s)\n", len(status.Providers))
+	for _, provider := range status.Providers {
+		age := "unknown"
+		if provider.AgeMS != nil {
+			age = fmt.Sprintf("%dms", *provider.AgeMS)
+		}
+		errCode := provider.TerminalErrorCode
+		if errCode == "" {
+			errCode = "none"
+		}
+		fmt.Fprintf(stdout, "- %s confidence=%s freshness=%s age=%s source=%s in_flight=%t next_refresh_at=%s error=%s\n",
+			provider.AdapterID,
+			provider.Confidence,
+			provider.FreshnessState,
+			age,
+			provider.SourceKind,
+			provider.InFlight,
+			provider.NextRefreshAt,
+			errCode,
+		)
+	}
 }
 
 func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {

@@ -589,6 +589,7 @@ type Options struct {
 	RuntimeContract runtimecap.Contract
 	Now             func() time.Time
 	NetworkGrants   []NetworkGrant
+	ActiveProviders []string
 }
 
 type Deps struct {
@@ -743,6 +744,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	adapters = filterAdapterDeclarations(adapters, opts.ActiveProviders)
 	var installations []ProviderInstallation
 	var probes []ProbeResult
 	var accountProfiles []AccountProfile
@@ -2903,6 +2905,30 @@ func configuredProviderNames(cfg config.Config) []string {
 	}
 	if len(out) == 0 {
 		out = []string{"codex", "claude"}
+	}
+	return out
+}
+
+func filterAdapterDeclarations(adapters []AdapterDeclaration, active []string) []AdapterDeclaration {
+	if len(active) == 0 {
+		return adapters
+	}
+	allowed := map[string]bool{}
+	for _, provider := range active {
+		provider = strings.TrimSpace(provider)
+		if provider == "" {
+			continue
+		}
+		allowed[provider] = true
+	}
+	if len(allowed) == 0 {
+		return adapters
+	}
+	out := make([]AdapterDeclaration, 0, len(adapters))
+	for _, adapter := range adapters {
+		if allowed[adapter.AdapterID] {
+			out = append(out, adapter)
+		}
 	}
 	return out
 }

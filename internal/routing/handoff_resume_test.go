@@ -56,7 +56,7 @@ func TestCanonicalProviderAToProviderBHandoffLifecycleExecutesEachBoundaryOnce(t
 			activeStore = nil
 		}
 	})
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 
 	var sourceEffect, receiptReuse, destinationLaunch, continuedEffect, verifierEmission, reportEmission atomic.Int64
 	sourceEffect.Store(1)
@@ -254,15 +254,7 @@ func TestResumeApprovedHandoffRoutesProviderAToProviderBOnce(t *testing.T) {
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	for i := range input.Inputs.Inventory.QuotaSnapshots {
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "codex" {
-			remaining := int64(0)
-			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
-		}
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
-			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
-		}
-	}
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	var executedKey, executedAdapter string
 
@@ -336,7 +328,7 @@ func TestResumeApprovedHandoffReconcilesReceiptBackedSourceEffect(t *testing.T) 
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	var sourceExternalEffect atomic.Int64
 	sourceExternalEffect.Store(1)
@@ -417,7 +409,7 @@ func TestResumeApprovedHandoffReconcilesIdempotentSourceEffect(t *testing.T) {
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	var sourceExternalEffect atomic.Int64
 	sourceExternalEffect.Store(1)
@@ -472,7 +464,7 @@ func TestResumeApprovedHandoffReceiptContinuationCheckpointMismatchDoesNotLaunch
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
 	support.CheckpointID = support.CheckpointID + "-changed"
 	var executions atomic.Int64
@@ -505,7 +497,7 @@ func TestResumeApprovedHandoffReceiptContinuationResultMustConfirmReuse(t *testi
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	support := handoffContinuationSupport(t, ctx, store, handoff, true, false)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -541,7 +533,7 @@ func TestResumeApprovedHandoffReceiptConflictFailsClosedWithoutLaunchMutation(t 
 		}
 	})
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE delivery_attempts SET provider_receipt = 'receipt-conflict' WHERE attempt_id = 'attempt-source'`)
 		return err
@@ -607,7 +599,7 @@ func TestResumeApprovedHandoffRoutesProviderAToGrokOrdinaryWorkerOnce(t *testing
 	store, handoff, input := handoffResumeOwnershipFixtureAtPath(t, ctx, fixture, path)
 	defer store.Close()
 	appendGrokHandoffCandidate(t, ctx, store, fixture, &input)
-	makeGrokEligibleOnly(input)
+	makeGrokEligibleOnly(t, ctx, store, &input)
 	setSourceProviderSessionRef(t, ctx, store, handoff.ChildRunID, "opaque-source-session-authority")
 	var executions atomic.Int64
 
@@ -725,7 +717,7 @@ func TestResumeApprovedHandoffGrokFailureCannotCorruptOtherProviders(t *testing.
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
 	appendGrokHandoffCandidate(t, ctx, store, fixture, &input)
-	makeGrokEligibleOnly(input)
+	makeGrokEligibleOnly(t, ctx, store, &input)
 	beforeCodexRows := providerInventoryRowCount(t, ctx, store, "codex")
 	beforeClaudeRows := providerInventoryRowCount(t, ctx, store, "claude")
 	launchErr := errors.New("grok launch failed before provider accepted execution")
@@ -766,15 +758,7 @@ func TestResumeApprovedHandoffConcurrentReplayLaunchesOnce(t *testing.T) {
 	path := tempDB(t)
 	store, handoff, input := handoffResumeFixtureAtPath(t, ctx, fixture, path)
 	defer store.Close()
-	for i := range input.Inputs.Inventory.QuotaSnapshots {
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "codex" {
-			remaining := int64(0)
-			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
-		}
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
-			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
-		}
-	}
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	const workers = 6
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -843,10 +827,7 @@ func TestResumeApprovedHandoffNoEligiblePersistsBlockedDecision(t *testing.T) {
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	for i := range input.Inputs.Inventory.QuotaSnapshots {
-		remaining := int64(0)
-		input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
-	}
+	makeNoQuotaEligible(t, ctx, store, &input)
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
@@ -870,7 +851,7 @@ func TestResumeApprovedHandoffRequiresExecutorBeforeReservation(t *testing.T) {
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
@@ -891,15 +872,7 @@ func TestResumeApprovedHandoffCancellationAfterReservationReleasesBeforeLaunch(t
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	for i := range input.Inputs.Inventory.QuotaSnapshots {
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "codex" {
-			remaining := int64(0)
-			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
-		}
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
-			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
-		}
-	}
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
@@ -928,7 +901,7 @@ func TestResumeApprovedHandoffCancellationAfterPrepareTerminalizesLaunch(t *test
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -967,7 +940,7 @@ func TestResumeApprovedHandoffCancellationAfterRegistrationTerminalizesLaunch(t 
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1006,7 +979,7 @@ func TestResumeApprovedHandoffCancellationAfterPrepareReleasesDestinationOwnersh
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1047,7 +1020,7 @@ func TestResumeApprovedHandoffCancellationAfterRegistrationReleasesDestinationOw
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1088,7 +1061,7 @@ func TestResumeApprovedHandoffLiveCancellationAtLaunchBoundaryDoesNotExecute(t *
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1126,7 +1099,7 @@ func TestResumeApprovedHandoffStaleGenerationFencePreventsLaunch(t *testing.T) {
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE run_claims SET claim_generation = claim_generation + 1 WHERE run_id = ?`, handoff.ChildRunID)
 		return err
@@ -1154,7 +1127,7 @@ func TestResumeApprovedHandoffRejectsUnsafeArtifactRefAndReleasesReservation(t *
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:           handoff.HandoffID,
 		DecisionInput:       input,
@@ -1183,7 +1156,7 @@ func TestResumeApprovedHandoffReplayAfterPreLaunchStopReusesRouteAndLaunches(t *
 	fixture := newFixture(t)
 	path := tempDB(t)
 	store, handoff, input := handoffResumeFixtureAtPath(t, ctx, fixture, path)
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	stopErr := errors.New("stop after reservation")
 	first, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1229,7 +1202,7 @@ func TestResumeApprovedHandoffExpiredLaunchOwnerBlocksReplayWithoutDuplicateExec
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	first, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
 		DecisionInput:    input,
@@ -1276,15 +1249,7 @@ func TestResumeApprovedHandoffDestinationFailureUsesBoundedFallback(t *testing.T
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	for i := range input.Inputs.Inventory.QuotaSnapshots {
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "codex" {
-			remaining := int64(0)
-			input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
-		}
-		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "claude" {
-			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
-		}
-	}
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	launchErr := errors.New("destination provider launch failed")
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1313,7 +1278,7 @@ func TestResumeApprovedHandoffAmbiguousExecutorErrorDoesNotFallback(t *testing.T
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	launchErr := errors.New("ambiguous transport error")
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1345,7 +1310,7 @@ func TestResumeApprovedHandoffNilErrorNotStartedFallsBackAndBlocksReplay(t *test
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1407,7 +1372,7 @@ func TestResumeApprovedHandoffNilErrorZeroOutcomeNeedsHumanWithoutFallback(t *te
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1466,7 +1431,7 @@ func TestResumeApprovedHandoffNilErrorExplicitAmbiguousNeedsHumanWithoutFallback
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1502,7 +1467,7 @@ func TestResumeApprovedHandoffNotStartedReleasesDestinationOwnership(t *testing.
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1536,7 +1501,7 @@ func TestResumeApprovedHandoffAmbiguousFencesDestinationOwnershipNeedsHuman(t *t
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1585,7 +1550,7 @@ func TestResumeApprovedHandoffTerminalCleanupStaleOwnershipRollsBack(t *testing.
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	cancelled := false
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1630,7 +1595,7 @@ func TestResumeApprovedHandoffTerminalCleanupStaleSameClaimRenewalRollsBack(t *t
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	stopErr := errors.New("stop after stale renewal")
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1670,7 +1635,7 @@ func TestResumeApprovedHandoffTerminalCleanupWithRenewedAuthoritySucceeds(t *tes
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	stopErr := errors.New("stop after renewal")
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1707,7 +1672,7 @@ func TestResumeApprovedHandoffTerminalCleanupMixedLockGenerationRollsBack(t *tes
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var changedID string
 	var executions atomic.Int64
 	stopErr := errors.New("stop after mixed generation")
@@ -1758,7 +1723,7 @@ func TestResumeApprovedHandoffTerminalCleanupExtraRegistrationLockRollsBack(t *t
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeOwnershipFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	extraID := "lock-extra"
 	var executions atomic.Int64
 	stopErr := errors.New("stop after extra lock")
@@ -1822,7 +1787,7 @@ func TestResumeApprovedHandoffTerminalCleanupCommitFailureRollsBackReservationAn
 	fixture := newFixture(t)
 	path := tempDB(t)
 	seedStore, handoff, input := handoffResumeOwnershipFixtureAtPath(t, ctx, fixture, path)
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, seedStore, &input)
 	if err := seedStore.Close(); err != nil {
 		t.Fatalf("close seed store: %v", err)
 	}
@@ -1884,7 +1849,7 @@ func TestResumeApprovedHandoffStartedOutcomeWithoutReceiptMarksExecuting(t *test
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -1917,7 +1882,7 @@ func TestResumeApprovedHandoffStartedOutcomeErrorPersistsExecutingAndPropagates(
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	launchErr := errors.New("provider accepted launch but stream failed")
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
@@ -1969,7 +1934,7 @@ func TestResumeApprovedHandoffReceiptOverridesAmbiguousOutcome(t *testing.T) {
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	var executions atomic.Int64
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -2028,7 +1993,7 @@ func TestResumeApprovedHandoffReceiptErrorOverridesAmbiguousAndZeroOutcome(t *te
 			fixture := newFixture(t)
 			store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 			defer store.Close()
-			makeClaudeEligibleOnly(input)
+			makeClaudeEligibleOnly(t, ctx, store, &input)
 			var executions atomic.Int64
 			receipt := "receipt-" + tc.name
 			launchErr := errors.New("provider returned receipt and warning")
@@ -2083,7 +2048,7 @@ func TestResumeApprovedHandoffStartedOutcomePersistenceFailureJoinsExecutorError
 	fixture := newFixture(t)
 	path := tempDB(t)
 	seedStore, handoff, input := handoffResumeFixtureAtPath(t, ctx, fixture, path)
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, seedStore, &input)
 	if err := seedStore.Close(); err != nil {
 		t.Fatalf("close seed store: %v", err)
 	}
@@ -2165,7 +2130,7 @@ func TestResumeApprovedHandoffReleasesSourceReservationAfterDestinationBinding(t
 	fixture := newFixture(t)
 	store, handoff, input := handoffResumeFixture(t, ctx, fixture)
 	defer store.Close()
-	makeClaudeEligibleOnly(input)
+	makeClaudeEligibleOnly(t, ctx, store, &input)
 	sourceReservationID := sourceReservationID(t, ctx, store, handoff.ChildRunID)
 	result, err := ResumeApprovedHandoff(ctx, store, HandoffResumeInput{
 		HandoffID:        handoff.HandoffID,
@@ -2189,7 +2154,8 @@ func TestResumeApprovedHandoffReleasesSourceReservationAfterDestinationBinding(t
 	}
 }
 
-func makeClaudeEligibleOnly(input DecisionInput) {
+func makeClaudeEligibleOnly(t *testing.T, ctx context.Context, store storage.Store, input *DecisionInput) {
+	t.Helper()
 	for i := range input.Inputs.Inventory.QuotaSnapshots {
 		if input.Inputs.Inventory.QuotaSnapshots[i].AdapterID == "codex" {
 			remaining := int64(0)
@@ -2199,6 +2165,17 @@ func makeClaudeEligibleOnly(input DecisionInput) {
 			input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
 		}
 	}
+	persistDecisionInputInventory(t, ctx, store, input)
+}
+
+func makeNoQuotaEligible(t *testing.T, ctx context.Context, store storage.Store, input *DecisionInput) {
+	t.Helper()
+	for i := range input.Inputs.Inventory.QuotaSnapshots {
+		remaining := int64(0)
+		input.Inputs.Inventory.QuotaSnapshots[i].RemainingValue = &remaining
+		input.Inputs.Inventory.QuotaSnapshots[i].Confidence = providerinventory.ConfidenceExact
+	}
+	persistDecisionInputInventory(t, ctx, store, input)
 }
 
 func appendGrokHandoffCandidate(t *testing.T, ctx context.Context, store storage.Store, fixture hardFixture, input *DecisionInput) {
@@ -2237,7 +2214,8 @@ func appendGrokHandoffCandidate(t *testing.T, ctx context.Context, store storage
 	}
 }
 
-func makeGrokEligibleOnly(input DecisionInput) {
+func makeGrokEligibleOnly(t *testing.T, ctx context.Context, store storage.Store, input *DecisionInput) {
+	t.Helper()
 	for i := range input.Inputs.Inventory.QuotaSnapshots {
 		switch input.Inputs.Inventory.QuotaSnapshots[i].AdapterID {
 		case "codex", "claude":
@@ -2258,6 +2236,12 @@ func makeGrokEligibleOnly(input DecisionInput) {
 			input.Inputs.Availability[i].Score = 10
 		}
 	}
+	persistDecisionInputInventory(t, ctx, store, input)
+}
+
+func persistDecisionInputInventory(t *testing.T, ctx context.Context, store storage.Store, input *DecisionInput) {
+	t.Helper()
+	seedCachedRoutingInventoryPayloads(t, ctx, store, hardFixture{now: store.Now(), inventory: input.Inputs.Inventory})
 }
 
 func setSourceProviderSessionRef(t *testing.T, ctx context.Context, store storage.Store, childRunID, sessionRef string) {
@@ -2330,6 +2314,7 @@ func handoffResumeFixtureWithSourceMutation(t *testing.T, ctx context.Context, f
 	}
 	seedRoutingDecisionStore(t, ctx, store, fixture.now)
 	input := replayDecisionInput(fixture)
+	seedCachedRoutingInventoryPayloads(t, ctx, store, fixture)
 	input.Inputs.Requirement.PermissionRequired = taskrequirements.PermissionReadOnly
 	input.Inputs.Requirement.SideEffectClass = taskrequirements.SideEffectLocalRead
 	input.Inputs.Requirement.RoleKey = RoleKeyLuna
@@ -2478,7 +2463,13 @@ func seedProviderInventoryRows(t *testing.T, ctx context.Context, store storage.
 				updated_at, captured_at, stale_after, freshness_state, confidence, side_effect_class, classification, payload_json)
 				VALUES (?, 'loopcoder.provider_installation.v1', 1, 'project', 'proj-routing', ?, ?, ?, ?, '{}', ?, 'test',
 				1, 'darwin/arm64', 'exact', 'active', 'yes', ?, ?, ?, ?, 'fresh', 'exact', 'local-read', 'local-diagnostic', '{}')
-				ON CONFLICT(provider_installation_id) DO NOTHING`,
+				ON CONFLICT(provider_installation_id) DO UPDATE SET
+					installation_state = excluded.installation_state,
+					usable_for_invocation = excluded.usable_for_invocation,
+					freshness_state = excluded.freshness_state,
+					confidence = excluded.confidence,
+					side_effect_class = excluded.side_effect_class,
+					classification = excluded.classification`,
 				"pinst-"+adapter, adapter, "adecl-"+adapter, adapter, adapter, adapter, at, at, at, fixture.now.Add(time.Hour).Format(time.RFC3339Nano)); err != nil {
 				return err
 			}

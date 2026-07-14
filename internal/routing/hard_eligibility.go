@@ -2,6 +2,7 @@
 package routing
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
 
@@ -137,6 +139,17 @@ type Inputs struct {
 	Pins            []Pin
 	Exclusions      []Exclusion
 	WorkerRoute     *Candidate
+}
+
+func InputsWithCachedInventory(ctx context.Context, store storage.Store, inputs Inputs) (Inputs, error) {
+	report, err := providerinventory.Load(ctx, store)
+	if err != nil {
+		return inputs, err
+	}
+	inputs.Inventory = report
+	role, hasRole := ResolveRoleDefinition(inputs.Requirement.RoleKey, inputs.RoleDefinitions)
+	inputs.Candidates = candidatesFromInventory(inputs.Requirement, report, role, hasRole)
+	return inputs, nil
 }
 
 type RejectionReason struct {
@@ -300,10 +313,10 @@ func normalizeCandidates(candidates []Candidate, requirement taskrequirements.Ta
 			candidate.InvocationProfileKey = "default"
 		}
 		if candidate.Permission == "" {
-			candidate.Permission = defaultPermissionForRoleDefinition(candidate.RoleKey, role, hasRole)
+			candidate.Permission = defaultPermissionForRequirement(requirement, role, hasRole)
 		}
 		if candidate.LaunchSideEffectClass == "" {
-			candidate.LaunchSideEffectClass = taskrequirements.SideEffectProviderLaunch
+			candidate.LaunchSideEffectClass = defaultSideEffectForRequirement(requirement)
 		}
 		if candidate.NetworkPermission == "" {
 			candidate.NetworkPermission = providerinventory.NetworkNotNeeded
@@ -371,8 +384,8 @@ func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inven
 					ModelCapabilityID:      model.ModelCapabilityID,
 					CanonicalModelID:       model.CanonicalModelID,
 					InvocationProfileKey:   "default",
-					Permission:             defaultPermissionForRoleDefinition(requirement.RoleKey, role, hasRole),
-					LaunchSideEffectClass:  taskrequirements.SideEffectProviderLaunch,
+					Permission:             defaultPermissionForRequirement(requirement, role, hasRole),
+					LaunchSideEffectClass:  defaultSideEffectForRequirement(requirement),
 					NetworkPermission:      providerinventory.NetworkNotNeeded,
 					ScopeBounded:           true,
 					QualityFloor:           taskrequirements.QualityStandard,
@@ -390,6 +403,13 @@ func candidatesFromInventory(requirement taskrequirements.TaskRequirement, inven
 		}
 	}
 	return out
+}
+
+func defaultSideEffectForRequirement(requirement taskrequirements.TaskRequirement) taskrequirements.SideEffectClass {
+	if requirement.SideEffectClass != "" {
+		return requirement.SideEffectClass
+	}
+	return taskrequirements.SideEffectProviderLaunch
 }
 
 func evaluateModel(requirement taskrequirements.TaskRequirement, candidate Candidate, model providerinventory.ModelCapability, policy Policy, role RoleDefinition, hasRole bool) []RejectionReason {
@@ -1138,6 +1158,13 @@ func defaultPermissionForRoleDefinition(roleKey string, role RoleDefinition, has
 		return taskrequirements.PermissionReadOnly
 	}
 	return taskrequirements.PermissionWrite
+}
+
+func defaultPermissionForRequirement(requirement taskrequirements.TaskRequirement, role RoleDefinition, hasRole bool) taskrequirements.Permission {
+	if requirement.PermissionRequired != "" {
+		return requirement.PermissionRequired
+	}
+	return defaultPermissionForRoleDefinition(requirement.RoleKey, role, hasRole)
 }
 
 func permissionRank(permission taskrequirements.Permission) int {

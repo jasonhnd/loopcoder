@@ -446,6 +446,10 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 	input.PolicyInputRecords = records
 	input.Inputs.Pins = pins
 	input.Inputs.Exclusions = exclusions
+	input.Inputs, err = InputsWithCachedInventory(ctx, store, input.Inputs)
+	if err != nil {
+		return input, err
+	}
 	return input, nil
 }
 
