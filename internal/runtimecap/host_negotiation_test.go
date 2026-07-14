@@ -249,6 +249,65 @@ func TestClaudeCodeHostDeclaresOnlyDocumentedProgressCapabilities(t *testing.T) 
 	}
 }
 
+func TestPaseoHostDeclaresTruthfulPollFollowOnlyProgressCapabilities(t *testing.T) {
+	host, ok := runtimecap.LookupHost("paseo-style")
+	if !ok {
+		t.Fatal("LookupHost(paseo-style) returned false")
+	}
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "fixture"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+		Origin: runtimecap.HostRunOriginBindingRequest{
+			ProjectID:     "proj_paseo",
+			DeliveryRunID: "run_paseo",
+			CorrelationID: "corr_paseo",
+			Origin:        originDeclaration("paseo-agent-opaque", map[string]string{"env.PASEO_AGENT_ID": "present"}),
+		},
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll || contract.Progress.AckPolicy != runtimecap.HostProgressAckNone {
+		t.Fatalf("Paseo progress = %#v, want durable follow/poll without ack", contract.Progress)
+	}
+	for capability, want := range map[runtimecap.HostCapability]runtimecap.HostCapabilitySupport{
+		runtimecap.HostDurablePolling:        runtimecap.HostCapabilitySupported,
+		runtimecap.HostResumableFollow:       runtimecap.HostCapabilitySupported,
+		runtimecap.HostDetachedSteering:      runtimecap.HostCapabilityUnknown,
+		runtimecap.HostDetachedCancellation:  runtimecap.HostCapabilityUnknown,
+		runtimecap.HostCallbacks:             runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostWakeUp:                runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostAcknowledgment:        runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostManagedBackgroundWork: runtimecap.HostCapabilityUnsupported,
+	} {
+		if got := capabilitySupport(contract.Capabilities, capability); got != want {
+			t.Fatalf("%s support = %q, want %q", capability, got, want)
+		}
+	}
+	for _, capability := range []runtimecap.HostCapability{
+		runtimecap.HostDurablePolling,
+		runtimecap.HostResumableFollow,
+		runtimecap.HostCallbacks,
+		runtimecap.HostWakeUp,
+		runtimecap.HostAcknowledgment,
+		runtimecap.HostDetachedCancellation,
+	} {
+		source := capabilitySource(contract.Capabilities, capability)
+		if source != "loopcoder-local-durable-replay-follow-no-paseo-wake-proof" {
+			t.Fatalf("%s source = %q, want LoopCoder-local evidence source", capability, source)
+		}
+		if strings.Contains(source, "paseo-documented") {
+			t.Fatalf("%s source claims undocumented Paseo evidence: %q", capability, source)
+		}
+	}
+	if !contract.Origin.Bound || contract.Origin.BindingID == "" || contract.Origin.OriginRef == "" {
+		t.Fatalf("origin = %#v, want redacted Paseo origin binding", contract.Origin)
+	}
+	for _, stage := range []runtimecap.HostProgressStage{runtimecap.HostProgressStageHostAcceptance, runtimecap.HostProgressStageWakeUp, runtimecap.HostProgressStageUserVisibility, runtimecap.HostProgressStageAcknowledgment} {
+		if got := stageCode(contract.Progress.Stages, stage); got != runtimecap.HostStageUnsupported {
+			t.Fatalf("%s stage = %q, want unsupported", stage, got)
+		}
+	}
+}
+
 func TestRealCodexCLISmokeDocumentedCapabilities(t *testing.T) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		t.Skip("real Codex CLI smoke is limited to macOS Apple Silicon")
@@ -311,6 +370,37 @@ func TestRealClaudeCodeSmokeDocumentedCapabilities(t *testing.T) {
 	}
 }
 
+func TestRealPaseoSmokeTruthfulPollFollowOnly(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("real Paseo smoke is limited to macOS Apple Silicon")
+	}
+	if testing.Short() {
+		t.Skip("real Paseo smoke is opt-in")
+	}
+	if _, ok := os.LookupEnv("LOOPCODER_REAL_PASEO_SMOKE"); !ok {
+		t.Skip("set LOOPCODER_REAL_PASEO_SMOKE=1 to run the credential-free Paseo CLI smoke")
+	}
+	if _, err := exec.LookPath("paseo"); err != nil {
+		t.Skipf("paseo CLI not on PATH: %v", err)
+	}
+	out, err := exec.Command("paseo", "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("paseo --version failed: %v\n%s", err, string(out))
+	}
+	host, _ := runtimecap.LookupHost("paseo-style")
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "real-smoke"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostCallbacks) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostWakeUp) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostAcknowledgment) != runtimecap.HostCapabilityUnsupported {
+		t.Fatalf("real Paseo smoke declared unsupported callback/wake/ack incorrectly: %#v", contract.Progress)
+	}
+}
+
 func TestNegotiateHostProviderModelIndependence(t *testing.T) {
 	hostRequest := runtimecap.HostNegotiationRequest{
 		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
@@ -339,6 +429,42 @@ func TestNegotiateHostProviderModelIndependence(t *testing.T) {
 			}
 			if *provider.invoked != 0 {
 				t.Fatalf("provider invocation count = %d, want zero", *provider.invoked)
+			}
+		})
+	}
+}
+
+func TestPaseoHostTransportIsProviderModelIndependent(t *testing.T) {
+	host, ok := runtimecap.LookupHost("paseo-style")
+	if !ok {
+		t.Fatal("LookupHost(paseo-style) returned false")
+	}
+	hostRequest := runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "fixture"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+		Origin: runtimecap.HostRunOriginBindingRequest{
+			ProjectID:     "proj_paseo_matrix",
+			DeliveryRunID: "run_paseo_matrix",
+			CorrelationID: "corr_paseo_matrix",
+			Origin:        originDeclaration("paseo-agent-matrix", nil),
+		},
+	}
+	baseline := marshalNegotiation(t, runtimecap.NegotiateHost(hostRequest))
+	for _, tt := range []struct {
+		provider string
+		model    string
+	}{
+		{provider: "codex", model: "gpt-5.5"},
+		{provider: "claude", model: "claude-opus-4.5"},
+		{provider: "gemini", model: "gemini-3.1-pro"},
+		{provider: "grok", model: "grok-build"},
+		{provider: "future", model: "future-provider-model"},
+	} {
+		t.Run(tt.provider+"/"+tt.model, func(t *testing.T) {
+			got := marshalNegotiation(t, runtimecap.NegotiateHost(hostRequest))
+			if got != baseline {
+				t.Fatalf("Paseo host transport changed for provider %s model %s", tt.provider, tt.model)
 			}
 		})
 	}
@@ -717,4 +843,13 @@ func capabilitySupport(capabilities []runtimecap.HostCapabilityDeclaration, capa
 		}
 	}
 	return runtimecap.HostCapabilityUnknown
+}
+
+func capabilitySource(capabilities []runtimecap.HostCapabilityDeclaration, capability runtimecap.HostCapability) string {
+	for _, declaration := range capabilities {
+		if declaration.Capability == capability {
+			return declaration.Source
+		}
+	}
+	return ""
 }

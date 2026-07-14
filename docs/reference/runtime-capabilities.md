@@ -247,19 +247,67 @@ Current host profiles:
 | --- | --- | --- | --- |
 | `codex-cli` | Interactive Codex CLI conductor session calls `loopcoder` as a local subprocess. | best-effort/manual | Codex hook enforcement is best-effort unless manually wired. |
 | `claude-code` | Claude Code skill or conductor session calls `loopcoder` as a local subprocess. | supported | Project hook install writes conductor reporter and relay guard commands. |
-| `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | The host owns session lifetime and must keep stderr visible for relay obligations. |
+| `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | Optional host transport. The current adapter records only LoopCoder-local durable status/follow plus matching-origin next-invocation replay; no documented Paseo callback, targeted wake, visibility, or acknowledgment surface has been proven. |
 | `generic-local` | Unknown local agent host calls `loopcoder` as a subprocess. | unknown | Fallback when no explicit profile or known host signal is available. |
 
 Progress delivery capabilities are declared per host surface, not inferred from
-provider/model selection. Codex CLI and Claude Code both support foreground
+provider/model selection. Codex CLI and Claude Code support foreground
 stdout/stderr, JSON pass-through, durable `status --receipts`, and resumable
-`attach` follow. Claude Code also supports documented project hooks for
-observing local tool events, but hook invocation is only hook evidence; it is
-not evidence that the original user saw a message, that a session woke up, or
-that a progress receipt was acknowledged. Until a documented targeted wake or
-callback path is proven by an opt-in integration fixture, both hosts fall back
-to durable follow/poll and matching-origin next-invocation replay for terminal
-or consequential detached progress.
+`attach` follow as LoopCoder local surfaces. Paseo-style hosts currently inherit
+only those LoopCoder-local durable status/follow and matching-origin replay
+surfaces; LoopCoder has not found documented Paseo poll/follow, callback,
+targeted wake, visibility, or acknowledgment evidence. Claude Code also supports
+documented project hooks for observing local tool events, but hook invocation is
+only hook evidence; it is not evidence that the original user saw a message,
+that a session woke up, or that a progress receipt was acknowledged. Until a
+documented targeted wake or callback path is proven by an opt-in integration
+fixture, these hosts fall back to local durable follow/poll and matching-origin
+next-invocation replay for terminal or consequential detached progress.
+
+### Paseo Host Delivery
+
+Paseo is optional. If it is absent, disconnected, incompatible, or not selected
+by `LOOPCODER_HOST`, `.delivery.yml` `host.profile`, or known environment
+markers, LoopCoder continues with the normal host profile resolution and durable
+local receipt surfaces. No Paseo package is linked into LoopCoder core.
+
+When `PASEO_AGENT_ID` is present, LoopCoder may bind the run to a redacted
+Paseo origin for durable next-invocation replay. The raw agent id is never
+persisted; only a scoped digest, origin reference, and bounded marker-key
+evidence such as `env.PASEO_AGENT_ID` are stored. `PASEO_HOST` is a presence
+marker only. By itself it can help detect a Paseo-style host, but it does not
+create an origin binding and is not evidence of a callback, managed task,
+targeted wake, user visibility, or acknowledgment capability.
+
+The current negotiated Paseo transport is `durable-follow-poll` with `no-ack`,
+where durable follow/poll means LoopCoder's local receipt store, `status`, and
+`attach` surfaces. It is not evidence of a documented Paseo polling or following
+API.
+`callbacks`, `wake-up`, `acknowledgment`, and LoopCoder-managed background
+delivery through Paseo are advertised as unsupported until a documented Paseo
+surface and an opt-in macOS Apple Silicon integration fixture prove targeted
+progress and terminal delivery to the original session after the foreground
+turn ends. The credential-free real smoke fixture checks only that a supported
+Paseo CLI can be inspected and that LoopCoder does not claim wake/ack from CLI
+presence alone; `paseo --version` is not wake evidence.
+
+Fallback behavior is intentionally local and provider-neutral:
+
+- Use `loopcoder status --repo . --run <run-id> --receipts` for durable receipt
+  history.
+- Use `loopcoder status --repo . --follow --run <run-id>` or
+  `loopcoder attach --repo . --run <run-id>` for follow/poll.
+- On a later invocation from the same redacted Paseo origin, pending terminal or
+  consequential receipts replay exactly once before new dispatch work starts.
+- Host delivery failure, callback timeout/unsupported status, host disconnect,
+  daemon restart, session refresh, or the upstream Paseo #2034 Claude refresh
+  race must not cancel a healthy worker, renew its watchdog, alter run state, or
+  change provider/model routing.
+
+Paseo is a host transport here, not a Worker or Verifier provider. Worker and
+Verifier provider selection remains controlled by `.delivery.yml` and command
+flags, and may use Codex, Claude, Gemini, Grok, or future providers while the
+Paseo adapter only scopes host progress replay.
 
 ## Host Profile Resolution
 
