@@ -693,7 +693,7 @@ func sanitizeText(value string, maxRunes int, redaction *RedactionState) string 
 	}
 	value = genericSecretPattern.ReplaceAllStringFunc(value, func(match string) string {
 		parts := genericSecretPattern.FindStringSubmatch(match)
-		if len(parts) < 3 || !looksOpaque(parts[2]) {
+		if len(parts) < 3 {
 			return match
 		}
 		findings++
@@ -721,28 +721,6 @@ func sanitizeText(value string, maxRunes int, redaction *RedactionState) string 
 
 func DiagnosticMessage(value string) string {
 	return sanitizeText(value, maxTextRunes, nil)
-}
-
-func looksOpaque(value string) bool {
-	value = strings.Trim(value, `"'`)
-	if len(value) < 12 {
-		return false
-	}
-	hasDigit := false
-	hasPunct := false
-	for _, r := range value {
-		switch {
-		case r >= '0' && r <= '9':
-			hasDigit = true
-		case strings.ContainsRune("._~+/=_-", r):
-			hasPunct = true
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		default:
-			return false
-		}
-	}
-	return hasDigit || hasPunct
 }
 
 func normalizeTimestampOr(value, fallback string) string {
@@ -849,10 +827,11 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`AKIA[A-Z0-9]{16}`),
 	regexp.MustCompile(`(?i)(github_pat|gh[pousr]_|sk-ant-|sk-|xox[baprs]-)[A-Za-z0-9._~+/=-]{12,}`),
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{12,}`),
+	regexp.MustCompile(`(?i)callback[_-]?token\s*[=:]\s*["']?[A-Za-z0-9._~+/=_-]{12,}["']?`),
 	regexp.MustCompile(`(?i)(cookie|set-cookie):\s*[^;\n]+`),
 	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
 	regexp.MustCompile(`[A-Za-z]:\\[^\s"']{8,}`),
 	regexp.MustCompile(`/[A-Za-z0-9._@%+=:,/-]{12,}`),
 }
 
-var genericSecretPattern = regexp.MustCompile(`(?i)\b((?:token|secret|password|api[_-]?key|credential)\s*[=:]\s*["']?)([A-Za-z0-9._~+/=_-]{12,})["']?`)
+var genericSecretPattern = regexp.MustCompile(`(?i)\b((?:callback[_-]?token|token|secret|password|api[_-]?key|credential)\s*[=:]\s*["']?)([A-Za-z0-9._~+/=_-]{12,})["']?`)

@@ -27,6 +27,9 @@ const (
 	DeliveryTerminalFailure         = "terminal-failure"
 	DeliveryExpired                 = "expired"
 	DeliverySuperseded              = "superseded"
+
+	DeliveryAckPolicyRequired = "required-ack"
+	DeliveryAckPolicyNone     = "no-ack"
 )
 
 type DeliveryEvidence struct {
@@ -57,6 +60,8 @@ type DeliveryObligation struct {
 	ClaimExpiresAt           string           `json:"claim_expires_at,omitempty"`
 	AttemptCount             int              `json:"attempt_count"`
 	MaxAttempts              int              `json:"max_attempts"`
+	NextAttemptAt            string           `json:"next_attempt_at,omitempty"`
+	AckPolicy                string           `json:"ack_policy"`
 	RequiredAck              bool             `json:"required_ack"`
 	ExpiresAt                string           `json:"expires_at,omitempty"`
 	SupersededByObligationID string           `json:"superseded_by_obligation_id,omitempty"`
@@ -87,14 +92,15 @@ type ClaimResult struct {
 }
 
 type AttemptResultRequest struct {
-	ObligationID string
-	ClaimOwner   string
-	Generation   int64
-	ResultStatus string
-	Evidence     DeliveryEvidence
-	ErrorCode    string
-	StartedAt    string
-	CompletedAt  string
+	ObligationID  string
+	ClaimOwner    string
+	Generation    int64
+	ResultStatus  string
+	Evidence      DeliveryEvidence
+	ErrorCode     string
+	NextAttemptAt string
+	StartedAt     string
+	CompletedAt   string
 }
 
 type AcknowledgmentRequest struct {
@@ -113,6 +119,80 @@ type CursorAdvanceRequest struct {
 	OriginID     string
 	CursorValue  string
 	AdvancedAt   string
+}
+
+type DeliveryObligationFilter struct {
+	ProjectID     string
+	DeliveryRunID string
+	Status        string
+	SinkKind      string
+	SinkID        string
+	DueAtOrBefore string
+	Limit         int
+}
+
+type DeliveryAttemptFilter struct {
+	ProjectID     string
+	DeliveryRunID string
+	ObligationID  string
+	Limit         int
+}
+
+type DeliveryAckFilter struct {
+	ProjectID     string
+	DeliveryRunID string
+	ObligationID  string
+	Limit         int
+}
+
+type DeliveryCursorFilter struct {
+	ProjectID     string
+	DeliveryRunID string
+	OriginKind    string
+	OriginID      string
+	Limit         int
+}
+
+type DeliveryAttempt struct {
+	SchemaVersion   string           `json:"schema_version"`
+	RecordVersion   int              `json:"record_version"`
+	AttemptRecordID string           `json:"attempt_record_id"`
+	ObligationID    string           `json:"obligation_id"`
+	AttemptOrdinal  int              `json:"attempt_ordinal"`
+	ClaimOwner      string           `json:"claim_owner"`
+	ClaimGeneration int64            `json:"claim_generation"`
+	ResultStatus    string           `json:"result_status"`
+	NextAttemptAt   string           `json:"next_attempt_at,omitempty"`
+	Evidence        DeliveryEvidence `json:"evidence"`
+	ErrorCode       string           `json:"error_code,omitempty"`
+	StartedAt       string           `json:"started_at"`
+	CompletedAt     string           `json:"completed_at"`
+}
+
+type DeliveryAcknowledgment struct {
+	SchemaVersion     string           `json:"schema_version"`
+	RecordVersion     int              `json:"record_version"`
+	AcknowledgmentID  string           `json:"acknowledgment_id"`
+	ObligationID      string           `json:"obligation_id"`
+	SemanticIdentity  string           `json:"semantic_identity"`
+	ClaimOwner        string           `json:"claim_owner"`
+	ClaimGeneration   int64            `json:"claim_generation"`
+	TransportContract string           `json:"transport_contract"`
+	Evidence          DeliveryEvidence `json:"evidence"`
+	AcknowledgedAt    string           `json:"acknowledged_at"`
+}
+
+type DeliveryReplayCursor struct {
+	SchemaVersion   string `json:"schema_version"`
+	RecordVersion   int    `json:"record_version"`
+	CursorID        string `json:"cursor_id"`
+	ObligationID    string `json:"obligation_id"`
+	ClaimOwner      string `json:"claim_owner"`
+	ClaimGeneration int64  `json:"claim_generation"`
+	OriginKind      string `json:"origin_kind"`
+	OriginID        string `json:"origin_id"`
+	CursorValue     string `json:"cursor_value"`
+	AdvancedAt      string `json:"advanced_at"`
 }
 
 func PersistReceiptWithObligation(ctx context.Context, store storage.Store, receipt ProgressReceipt, obligation DeliveryObligation) (PersistReceiptWithObligationResult, error) {
@@ -167,6 +247,12 @@ func ClaimDeliveryObligation(ctx context.Context, store storage.Store, req Claim
 		if terminalDeliveryStatus(obligation.Status) {
 			return typed(ErrClaimConflictCode, "obligation %s is terminal in state %s", obligationID, obligation.Status)
 		}
+		if obligation.Status == DeliveryDeliveredUnacknowledged {
+			return typed(ErrClaimConflictCode, "obligation %s is awaiting acknowledgment", obligationID)
+		}
+		if obligation.Status == DeliveryRetryableFailure && obligation.NextAttemptAt != "" && timestampAfter(obligation.NextAttemptAt, now) {
+			return typed(ErrClaimConflictCode, "obligation %s retry is scheduled for %s", obligationID, obligation.NextAttemptAt)
+		}
 		if obligation.Status == DeliveryAttempting && obligation.ClaimExpiresAt != "" && timestampAfter(obligation.ClaimExpiresAt, now) &&
 			(obligation.ClaimOwner != owner || obligation.ClaimGeneration > 0) {
 			return typed(ErrClaimConflictCode, "obligation %s is leased by a current claimant", obligationID)
@@ -202,6 +288,7 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 	req.ClaimOwner = sanitizeID(req.ClaimOwner)
 	req.ResultStatus = sanitizeEnum(req.ResultStatus)
 	req.ErrorCode = sanitizeID(req.ErrorCode)
+	req.NextAttemptAt = normalizeTimestampOr(req.NextAttemptAt, "")
 	req.StartedAt = normalizeTimestampOr(req.StartedAt, canonicalTimestamp(now))
 	req.CompletedAt = normalizeTimestampOr(req.CompletedAt, canonicalTimestamp(now))
 	req.Evidence = normalizeDeliveryEvidence(req.Evidence)
@@ -226,10 +313,17 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		nextAttempt := obligation.AttemptCount + 1
 		status := req.ResultStatus
 		errorCode := req.ErrorCode
+		nextAttemptAt := ""
+		if status == DeliveryRetryableFailure {
+			nextAttemptAt = firstNonEmpty(req.NextAttemptAt, canonicalTimestamp(now.Add(retryDelayForAttempt(nextAttempt))))
+			if !timestampAfter(nextAttemptAt, now) {
+				return typed(ErrInvalidRecordCode, "next_attempt_at must be after now for retryable failure")
+			}
+		}
 		if nextAttempt > obligation.MaxAttempts {
 			updatedAt := canonicalTimestamp(now)
 			if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-				SET status = ?, last_error_code = ?, updated_at = ?
+				SET status = ?, next_attempt_at = '', last_error_code = ?, updated_at = ?
 				WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
 				DeliveryTerminalFailure, firstNonEmpty(errorCode, "max-attempts-exceeded"), updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
 				return fmt.Errorf("record bounded delivery attempt failure: %w", err)
@@ -255,6 +349,7 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 			"claim_owner":       req.ClaimOwner,
 			"claim_generation":  req.Generation,
 			"result_status":     status,
+			"next_attempt_at":   nextAttemptAt,
 			"evidence":          req.Evidence,
 			"error_code":        errorCode,
 			"started_at":        req.StartedAt,
@@ -266,19 +361,23 @@ func RecordDeliveryAttemptResult(ctx context.Context, store storage.Store, req A
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO progress_delivery_attempts(
 				attempt_record_id, schema_version, record_version, project_id, delivery_run_id, obligation_id,
-				attempt_ordinal, claim_owner, claim_generation, result_status, evidence_kind, evidence_ref,
+				attempt_ordinal, claim_owner, claim_generation, result_status, next_attempt_at, evidence_kind, evidence_ref,
 				evidence_json, error_code, started_at, completed_at, payload_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			attemptID, SchemaDeliveryAttempt, 1, obligation.ProjectID, obligation.DeliveryRunID, obligation.ObligationID,
-			nextAttempt, req.ClaimOwner, req.Generation, status, req.Evidence.EvidenceKind, req.Evidence.EvidenceRef,
+			nextAttempt, req.ClaimOwner, req.Generation, status, nextAttemptAt, req.Evidence.EvidenceKind, req.Evidence.EvidenceRef,
 			string(evidenceJSON), errorCode, req.StartedAt, req.CompletedAt, string(payloadJSON)); err != nil {
 			return fmt.Errorf("record delivery attempt: %w", err)
 		}
+		obligationStatus := status
+		if status == DeliveryDeliveredUnacknowledged && obligation.AckPolicy == DeliveryAckPolicyNone {
+			obligationStatus = DeliveryAcknowledged
+		}
 		updatedAt := canonicalTimestamp(now)
 		if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-			SET status = ?, attempt_count = ?, last_error_code = ?, updated_at = ?
+			SET status = ?, attempt_count = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ?
 			WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
-			status, nextAttempt, errorCode, updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
+			obligationStatus, nextAttempt, nextAttemptAt, errorCode, updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
 			return fmt.Errorf("update delivery obligation attempt result: %w", err)
 		}
 		stored, err = loadDeliveryObligationTx(ctx, tx, req.ObligationID)
@@ -311,6 +410,9 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 		}
 		if err := requireCurrentClaim(obligation, req.ClaimOwner, req.Generation, now); err != nil {
 			return err
+		}
+		if obligation.AckPolicy == DeliveryAckPolicyNone {
+			return typed(ErrEvidenceRejectedCode, "obligation %s uses no-ack delivery policy", obligation.ObligationID)
 		}
 		if obligation.Status != DeliveryDeliveredUnacknowledged && obligation.Status != DeliveryAcknowledged {
 			return typed(ErrEvidenceRejectedCode, "acknowledgment requires delivered-unacknowledged obligation, got %s", obligation.Status)
@@ -352,7 +454,7 @@ func AcknowledgeDelivery(ctx context.Context, store storage.Store, req Acknowled
 		}
 		updatedAt := canonicalTimestamp(now)
 		if _, err := tx.Exec(ctx, `UPDATE progress_delivery_obligations
-			SET status = ?, updated_at = ?
+			SET status = ?, next_attempt_at = '', updated_at = ?
 			WHERE obligation_id = ? AND claim_owner = ? AND claim_generation = ?`,
 			DeliveryAcknowledged, updatedAt, req.ObligationID, req.ClaimOwner, req.Generation); err != nil {
 			return fmt.Errorf("acknowledge delivery obligation: %w", err)
@@ -444,6 +546,225 @@ func LoadDeliveryObligation(ctx context.Context, store storage.Store, obligation
 	return obligation, err
 }
 
+func ReadDeliveryObligation(ctx context.Context, store storage.Store, projectID, deliveryRunID, obligationID string) (DeliveryObligation, error) {
+	if store == nil {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	projectID = strings.TrimSpace(projectID)
+	deliveryRunID = strings.TrimSpace(deliveryRunID)
+	obligationID = sanitizeID(obligationID)
+	if projectID == "" || deliveryRunID == "" || obligationID == "" {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "project_id, delivery_run_id, and obligation_id are required")
+	}
+	var obligation DeliveryObligation
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		var foundProject, foundRun string
+		if err := tx.QueryRow(ctx, `SELECT project_id, delivery_run_id FROM progress_delivery_obligations WHERE obligation_id = ?`, obligationID).Scan(&foundProject, &foundRun); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return typed(ErrMissingReferenceCode, "delivery obligation not found")
+			}
+			return fmt.Errorf("read delivery obligation scope: %w", err)
+		}
+		if foundProject != projectID || foundRun != deliveryRunID {
+			return typed(ErrMissingReferenceCode, "delivery obligation not found in requested project/run")
+		}
+		var err error
+		obligation, err = loadDeliveryObligationTx(ctx, tx, obligationID)
+		return err
+	})
+	return obligation, err
+}
+
+func ListDeliveryObligations(ctx context.Context, store storage.Store, filter DeliveryObligationFilter) ([]DeliveryObligation, error) {
+	if store == nil {
+		return nil, typed(ErrInvalidRecordCode, "store is required")
+	}
+	projectID := strings.TrimSpace(filter.ProjectID)
+	deliveryRunID := strings.TrimSpace(filter.DeliveryRunID)
+	if projectID == "" || deliveryRunID == "" {
+		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
+	}
+	query := `SELECT obligation_id FROM progress_delivery_obligations WHERE project_id = ? AND delivery_run_id = ?`
+	args := []any{projectID, deliveryRunID}
+	if status := sanitizeEnum(filter.Status); strings.TrimSpace(filter.Status) != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	if sinkKind := sanitizeEnum(filter.SinkKind); strings.TrimSpace(filter.SinkKind) != "" {
+		query += ` AND sink_kind = ?`
+		args = append(args, sinkKind)
+	}
+	if sinkID := sanitizeID(filter.SinkID); strings.TrimSpace(filter.SinkID) != "" {
+		query += ` AND sink_id = ?`
+		args = append(args, sinkID)
+	}
+	if due := normalizeTimestampOr(filter.DueAtOrBefore, ""); due != "" {
+		query += ` AND (next_attempt_at = '' OR next_attempt_at <= ?)`
+		args = append(args, due)
+	}
+	query += ` ORDER BY created_at, obligation_id LIMIT ?`
+	args = append(args, boundedLimit(filter.Limit))
+
+	var out []DeliveryObligation
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("list delivery obligations: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("list delivery obligations scan: %w", err)
+			}
+			obligation, err := loadDeliveryObligationTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			out = append(out, obligation)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list delivery obligations rows: %w", err)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func ListDeliveryAttempts(ctx context.Context, store storage.Store, filter DeliveryAttemptFilter) ([]DeliveryAttempt, error) {
+	if store == nil {
+		return nil, typed(ErrInvalidRecordCode, "store is required")
+	}
+	projectID := strings.TrimSpace(filter.ProjectID)
+	deliveryRunID := strings.TrimSpace(filter.DeliveryRunID)
+	if projectID == "" || deliveryRunID == "" {
+		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
+	}
+	query := `SELECT payload_json, next_attempt_at FROM progress_delivery_attempts WHERE project_id = ? AND delivery_run_id = ?`
+	args := []any{projectID, deliveryRunID}
+	if obligationID := sanitizeID(filter.ObligationID); strings.TrimSpace(filter.ObligationID) != "" {
+		query += ` AND obligation_id = ?`
+		args = append(args, obligationID)
+	}
+	query += ` ORDER BY obligation_id, attempt_ordinal, attempt_record_id LIMIT ?`
+	args = append(args, boundedLimit(filter.Limit))
+	out := []DeliveryAttempt{}
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("list delivery attempts: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload, nextAttemptAt string
+			if err := rows.Scan(&payload, &nextAttemptAt); err != nil {
+				return fmt.Errorf("list delivery attempts scan: %w", err)
+			}
+			attempt, err := decodeDeliveryAttemptPayload([]byte(payload))
+			if err != nil {
+				return err
+			}
+			attempt.NextAttemptAt = nextAttemptAt
+			out = append(out, attempt)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list delivery attempts rows: %w", err)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func ListDeliveryAcknowledgments(ctx context.Context, store storage.Store, filter DeliveryAckFilter) ([]DeliveryAcknowledgment, error) {
+	if store == nil {
+		return nil, typed(ErrInvalidRecordCode, "store is required")
+	}
+	projectID := strings.TrimSpace(filter.ProjectID)
+	deliveryRunID := strings.TrimSpace(filter.DeliveryRunID)
+	if projectID == "" || deliveryRunID == "" {
+		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
+	}
+	query := `SELECT payload_json FROM progress_delivery_acknowledgments WHERE project_id = ? AND delivery_run_id = ?`
+	args := []any{projectID, deliveryRunID}
+	if obligationID := sanitizeID(filter.ObligationID); strings.TrimSpace(filter.ObligationID) != "" {
+		query += ` AND obligation_id = ?`
+		args = append(args, obligationID)
+	}
+	query += ` ORDER BY acknowledged_at, acknowledgment_id LIMIT ?`
+	args = append(args, boundedLimit(filter.Limit))
+	out := []DeliveryAcknowledgment{}
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("list delivery acknowledgments: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				return fmt.Errorf("list delivery acknowledgments scan: %w", err)
+			}
+			ack, err := decodeDeliveryAckPayload([]byte(payload))
+			if err != nil {
+				return err
+			}
+			out = append(out, ack)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list delivery acknowledgments rows: %w", err)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func ListDeliveryReplayCursors(ctx context.Context, store storage.Store, filter DeliveryCursorFilter) ([]DeliveryReplayCursor, error) {
+	if store == nil {
+		return nil, typed(ErrInvalidRecordCode, "store is required")
+	}
+	projectID := strings.TrimSpace(filter.ProjectID)
+	deliveryRunID := strings.TrimSpace(filter.DeliveryRunID)
+	if projectID == "" || deliveryRunID == "" {
+		return nil, typed(ErrInvalidRecordCode, "project_id and delivery_run_id are required")
+	}
+	query := `SELECT payload_json FROM progress_delivery_replay_cursors WHERE project_id = ? AND delivery_run_id = ?`
+	args := []any{projectID, deliveryRunID}
+	if originKind := sanitizeEnum(filter.OriginKind); strings.TrimSpace(filter.OriginKind) != "" {
+		query += ` AND origin_kind = ?`
+		args = append(args, originKind)
+	}
+	if originID := sanitizeID(filter.OriginID); strings.TrimSpace(filter.OriginID) != "" {
+		query += ` AND origin_id = ?`
+		args = append(args, originID)
+	}
+	query += ` ORDER BY origin_kind, origin_id, cursor_id LIMIT ?`
+	args = append(args, boundedLimit(filter.Limit))
+	out := []DeliveryReplayCursor{}
+	err := store.WithTx(ctx, func(tx storage.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("list delivery replay cursors: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var payload string
+			if err := rows.Scan(&payload); err != nil {
+				return fmt.Errorf("list delivery replay cursors scan: %w", err)
+			}
+			cursor, err := decodeDeliveryCursorPayload([]byte(payload))
+			if err != nil {
+				return err
+			}
+			out = append(out, cursor)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list delivery replay cursors rows: %w", err)
+		}
+		return nil
+	})
+	return out, err
+}
+
 func persistDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligation DeliveryObligation) (DeliveryObligation, bool, error) {
 	payload, err := canonicalJSON(obligation)
 	if err != nil {
@@ -453,12 +774,13 @@ func persistDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligation 
 			obligation_id, schema_version, record_version, project_id, delivery_run_id, progress_receipt_id,
 			semantic_identity, origin_kind, origin_id, sink_kind, sink_id, transport_contract, status,
 			claim_owner, claim_generation, claimed_at, claim_expires_at, attempt_count, max_attempts,
-			required_ack, expires_at, superseded_by_obligation_id, last_error_code, created_at, updated_at, payload_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			next_attempt_at, ack_policy, required_ack, expires_at, superseded_by_obligation_id, last_error_code, created_at, updated_at, payload_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		obligation.ObligationID, obligation.SchemaVersion, obligation.RecordVersion, obligation.ProjectID, obligation.DeliveryRunID,
 		obligation.ProgressReceiptID, obligation.SemanticIdentity, obligation.OriginKind, obligation.OriginID, obligation.SinkKind,
 		obligation.SinkID, obligation.TransportContract, obligation.Status, obligation.ClaimOwner, obligation.ClaimGeneration,
-		obligation.ClaimedAt, obligation.ClaimExpiresAt, obligation.AttemptCount, obligation.MaxAttempts, boolInt(obligation.RequiredAck),
+		obligation.ClaimedAt, obligation.ClaimExpiresAt, obligation.AttemptCount, obligation.MaxAttempts, obligation.NextAttemptAt,
+		obligation.AckPolicy, boolInt(obligation.RequiredAck),
 		obligation.ExpiresAt, nullIfEmpty(obligation.SupersededByObligationID), obligation.LastErrorCode, obligation.CreatedAt, obligation.UpdatedAt, string(payload))
 	if err != nil {
 		return DeliveryObligation{}, false, fmt.Errorf("persist delivery obligation: %w", err)
@@ -498,6 +820,8 @@ func normalizeDeliveryObligation(obligation DeliveryObligation, receipt Progress
 	obligation.ClaimOwner = sanitizeID(obligation.ClaimOwner)
 	obligation.ClaimedAt = normalizeTimestampOr(obligation.ClaimedAt, "")
 	obligation.ClaimExpiresAt = normalizeTimestampOr(obligation.ClaimExpiresAt, "")
+	obligation.NextAttemptAt = normalizeTimestampOr(obligation.NextAttemptAt, "")
+	obligation.AckPolicy = sanitizeEnum(obligation.AckPolicy)
 	obligation.ExpiresAt = normalizeTimestampOr(obligation.ExpiresAt, "")
 	obligation.SupersededByObligationID = sanitizeID(obligation.SupersededByObligationID)
 	obligation.LastErrorCode = sanitizeID(obligation.LastErrorCode)
@@ -506,9 +830,14 @@ func normalizeDeliveryObligation(obligation DeliveryObligation, receipt Progress
 	if obligation.MaxAttempts == 0 {
 		obligation.MaxAttempts = 3
 	}
-	if !obligation.RequiredAck {
-		obligation.RequiredAck = true
+	switch obligation.AckPolicy {
+	case "", Unknown:
+		obligation.AckPolicy = DeliveryAckPolicyRequired
+	case DeliveryAckPolicyRequired, DeliveryAckPolicyNone:
+	default:
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "unsupported delivery ack policy %q", obligation.AckPolicy)
 	}
+	obligation.RequiredAck = obligation.AckPolicy != DeliveryAckPolicyNone
 	if !validDeliveryStatus(obligation.Status) {
 		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "unsupported delivery obligation status %q", obligation.Status)
 	}
@@ -518,6 +847,9 @@ func normalizeDeliveryObligation(obligation DeliveryObligation, receipt Progress
 	}
 	if obligation.ClaimGeneration < 0 || obligation.AttemptCount < 0 || obligation.MaxAttempts <= 0 {
 		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "delivery obligation counters are invalid")
+	}
+	if obligation.Status == DeliveryRetryableFailure && obligation.NextAttemptAt == "" {
+		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "retryable delivery obligation requires next_attempt_at")
 	}
 	semantic := deliveryObligationSemanticIdentity(obligation)
 	obligation.SemanticIdentity = semantic
@@ -573,13 +905,13 @@ func loadDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligationID s
 		return DeliveryObligation{}, typed(ErrInvalidRecordCode, "obligation_id is required")
 	}
 	row := tx.QueryRow(ctx, `SELECT payload_json, status, claim_owner, claim_generation, claimed_at, claim_expires_at,
-			attempt_count, last_error_code, updated_at
+			attempt_count, next_attempt_at, ack_policy, required_ack, last_error_code, updated_at
 		FROM progress_delivery_obligations WHERE obligation_id = ?`, obligationID)
 	var payload string
-	var status, owner, claimedAt, expiresAt, lastError, updatedAt string
+	var status, owner, claimedAt, expiresAt, nextAttemptAt, ackPolicy, lastError, updatedAt string
 	var generation int64
-	var attempts int
-	if err := row.Scan(&payload, &status, &owner, &generation, &claimedAt, &expiresAt, &attempts, &lastError, &updatedAt); err != nil {
+	var attempts, requiredAck int
+	if err := row.Scan(&payload, &status, &owner, &generation, &claimedAt, &expiresAt, &attempts, &nextAttemptAt, &ackPolicy, &requiredAck, &lastError, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryObligation{}, typed(ErrMissingReferenceCode, "delivery obligation not found")
 		}
@@ -595,6 +927,9 @@ func loadDeliveryObligationTx(ctx context.Context, tx storage.Tx, obligationID s
 	obligation.ClaimedAt = claimedAt
 	obligation.ClaimExpiresAt = expiresAt
 	obligation.AttemptCount = attempts
+	obligation.NextAttemptAt = nextAttemptAt
+	obligation.AckPolicy = ackPolicy
+	obligation.RequiredAck = requiredAck == 1
 	obligation.LastErrorCode = lastError
 	obligation.UpdatedAt = updatedAt
 	return obligation, nil
@@ -619,6 +954,39 @@ func decodeDeliveryObligationPayload(data []byte) (DeliveryObligation, error) {
 		return DeliveryObligation{}, typed(ErrUnknownRecordVersionCode, "unsupported delivery obligation %q record version %d", obligation.SchemaVersion, obligation.RecordVersion)
 	}
 	return obligation, nil
+}
+
+func decodeDeliveryAttemptPayload(data []byte) (DeliveryAttempt, error) {
+	var attempt DeliveryAttempt
+	if err := json.Unmarshal(data, &attempt); err != nil {
+		return DeliveryAttempt{}, typed(ErrInvalidRecordCode, "decode persisted delivery attempt: %v", err)
+	}
+	if attempt.SchemaVersion != SchemaDeliveryAttempt || attempt.RecordVersion != 1 {
+		return DeliveryAttempt{}, typed(ErrUnknownRecordVersionCode, "unsupported delivery attempt %q record version %d", attempt.SchemaVersion, attempt.RecordVersion)
+	}
+	return attempt, nil
+}
+
+func decodeDeliveryAckPayload(data []byte) (DeliveryAcknowledgment, error) {
+	var ack DeliveryAcknowledgment
+	if err := json.Unmarshal(data, &ack); err != nil {
+		return DeliveryAcknowledgment{}, typed(ErrInvalidRecordCode, "decode persisted delivery acknowledgment: %v", err)
+	}
+	if ack.SchemaVersion != SchemaDeliveryAck || ack.RecordVersion != 1 {
+		return DeliveryAcknowledgment{}, typed(ErrUnknownRecordVersionCode, "unsupported delivery acknowledgment %q record version %d", ack.SchemaVersion, ack.RecordVersion)
+	}
+	return ack, nil
+}
+
+func decodeDeliveryCursorPayload(data []byte) (DeliveryReplayCursor, error) {
+	var cursor DeliveryReplayCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return DeliveryReplayCursor{}, typed(ErrInvalidRecordCode, "decode persisted delivery replay cursor: %v", err)
+	}
+	if cursor.SchemaVersion != SchemaDeliveryCursor || cursor.RecordVersion != 1 {
+		return DeliveryReplayCursor{}, typed(ErrUnknownRecordVersionCode, "unsupported delivery replay cursor %q record version %d", cursor.SchemaVersion, cursor.RecordVersion)
+	}
+	return cursor, nil
 }
 
 func deliveryObligationSemanticIdentity(obligation DeliveryObligation) string {
@@ -682,6 +1050,20 @@ func terminalDeliveryStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func retryDelayForAttempt(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 15 * time.Second
+	}
+	delay := 15 * time.Second
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= 5*time.Minute {
+			return 5 * time.Minute
+		}
+	}
+	return delay
 }
 
 func timestampAfter(value string, now time.Time) bool {

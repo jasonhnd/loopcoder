@@ -51,6 +51,14 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if migrationName != "progress delivery outbox" {
 		t.Fatalf("migration 28 name = %q", migrationName)
 	}
+	for _, column := range []string{"next_attempt_at", "ack_policy", "required_ack"} {
+		if !tableColumnExists(t, store, "progress_delivery_obligations", column) {
+			t.Fatalf("progress_delivery_obligations missing column %s", column)
+		}
+	}
+	if !tableColumnExists(t, store, "progress_delivery_attempts", "next_attempt_at") {
+		t.Fatalf("progress_delivery_attempts missing next_attempt_at")
+	}
 	if tableColumnExists(t, store, "routing_decisions", "alternatives_json") {
 		t.Fatalf("routing_decisions includes non-v1 alternatives_json column")
 	}

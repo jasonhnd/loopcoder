@@ -21,6 +21,8 @@ var progressDeliveryOutboxSchemaStatements = []string{
 		claim_expires_at TEXT NOT NULL DEFAULT '',
 		attempt_count INTEGER NOT NULL DEFAULT 0,
 		max_attempts INTEGER NOT NULL DEFAULT 3,
+		next_attempt_at TEXT NOT NULL DEFAULT '',
+		ack_policy TEXT NOT NULL DEFAULT 'required-ack',
 		required_ack INTEGER NOT NULL DEFAULT 1,
 		expires_at TEXT NOT NULL DEFAULT '',
 		superseded_by_obligation_id TEXT REFERENCES progress_delivery_obligations(obligation_id) ON DELETE SET NULL,
@@ -32,6 +34,7 @@ var progressDeliveryOutboxSchemaStatements = []string{
 		CHECK(claim_generation >= 0),
 		CHECK(attempt_count >= 0),
 		CHECK(max_attempts > 0),
+		CHECK(ack_policy IN ('required-ack', 'no-ack')),
 		CHECK(required_ack IN (0, 1)),
 		CHECK(status IN ('pending', 'attempting', 'delivered-unacknowledged', 'acknowledged', 'unsupported', 'retryable-failure', 'terminal-failure', 'expired', 'superseded')),
 		CHECK(json_valid(payload_json)),
@@ -40,7 +43,7 @@ var progressDeliveryOutboxSchemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_progress_delivery_obligations_receipt
 		ON progress_delivery_obligations(project_id, delivery_run_id, progress_receipt_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_progress_delivery_obligations_claim
-		ON progress_delivery_obligations(project_id, delivery_run_id, status, claim_expires_at, claim_owner, claim_generation)`,
+		ON progress_delivery_obligations(project_id, delivery_run_id, status, next_attempt_at, claim_expires_at, claim_owner, claim_generation)`,
 	`CREATE INDEX IF NOT EXISTS idx_progress_delivery_obligations_sink
 		ON progress_delivery_obligations(project_id, delivery_run_id, sink_kind, sink_id, status)`,
 
@@ -55,6 +58,7 @@ var progressDeliveryOutboxSchemaStatements = []string{
 		claim_owner TEXT NOT NULL,
 		claim_generation INTEGER NOT NULL,
 		result_status TEXT NOT NULL,
+		next_attempt_at TEXT NOT NULL DEFAULT '',
 		evidence_kind TEXT NOT NULL,
 		evidence_ref TEXT NOT NULL,
 		evidence_json TEXT NOT NULL,

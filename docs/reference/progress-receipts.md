@@ -37,3 +37,24 @@ fence every result, acknowledgment, and cursor movement; stale claimants cannot
 advance delivery state. Acknowledgment requires typed host/transport evidence
 matching the obligation contract, and stdout bytes alone are not acknowledgment
 unless the explicit transport contract says so.
+
+Retryable delivery failures persist `next_attempt_at` on both the obligation
+and attempt history. When a caller does not provide an explicit future time,
+the outbox schedules deterministic bounded backoff from the injected store clock
+starting at 15 seconds and capped at five minutes. Pending obligations are
+claimable immediately; retryable failures are claimable only at or after
+`next_attempt_at`; delivered, terminal, acknowledged, unsupported, expired, and
+superseded obligations are not claimable retry work.
+
+Adapters and recovery readers must use project/delivery-run scoped read APIs:
+`ReadDeliveryObligation`, `ListDeliveryObligations`,
+`ListDeliveryAttempts`, `ListDeliveryAcknowledgments`, and
+`ListDeliveryReplayCursors`. Each list API uses stable ordering plus a bounded
+limit and fails closed with the canonical typed unknown-version error when a
+future payload version is encountered.
+
+The acknowledgment contract is `ack_policy`. `required-ack` obligations require
+a matching typed acknowledgment before becoming terminal. `no-ack` obligations
+become terminal when delivery is durably recorded and do not create an
+acknowledgment row; the legacy `required_ack` column is a derived compatibility
+view of that typed policy.
