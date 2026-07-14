@@ -34,6 +34,13 @@ type Resolved struct {
 	Runtime    runtimecap.HostRuntime
 }
 
+type OriginOptions struct {
+	ProjectID     string
+	DeliveryRunID string
+	CorrelationID string
+	Getenv        func(string) string
+}
+
 func Resolve(opts Options) (Resolved, error) {
 	contract := opts.Contract
 	if len(contract.Hosts) == 0 {
@@ -128,6 +135,51 @@ func detect(contract runtimecap.Contract, getenv func(string) string) Resolved {
 		}
 	}
 	return Resolved{}
+}
+
+func CodexOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	getenv := opts.Getenv
+	if getenv == nil {
+		getenv = func(string) string { return "" }
+	}
+	threadID := strings.TrimSpace(getenv("CODEX_THREAD_ID"))
+	sessionID := strings.TrimSpace(getenv("CODEX_SESSION_ID"))
+	opaque := firstNonEmpty(threadID, sessionID)
+	if opaque == "" {
+		return runtimecap.HostRunOriginBindingRequest{}, false
+	}
+	metadata := map[string]string{
+		"host": "codex-cli",
+	}
+	if threadID != "" {
+		metadata["env.CODEX_THREAD_ID"] = "present"
+	}
+	if sessionID != "" {
+		metadata["env.CODEX_SESSION_ID"] = "present"
+	}
+	if strings.TrimSpace(getenv("CODEX_CLI")) != "" {
+		metadata["env.CODEX_CLI"] = "present"
+	}
+	return runtimecap.HostRunOriginBindingRequest{
+		ProjectID:     strings.TrimSpace(opts.ProjectID),
+		DeliveryRunID: strings.TrimSpace(opts.DeliveryRunID),
+		CorrelationID: strings.TrimSpace(opts.CorrelationID),
+		Origin: runtimecap.HostRunOriginDeclaration{
+			SchemaVersion: runtimecap.HostRunOriginSchemaVersion,
+			Kind:          "codex-cli-thread",
+			OpaqueID:      opaque,
+			Metadata:      metadata,
+		},
+	}, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func unknownProfileError(raw, selector string, contract runtimecap.Contract) error {

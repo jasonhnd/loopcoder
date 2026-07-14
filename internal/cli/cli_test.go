@@ -39,6 +39,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -2362,6 +2363,102 @@ func assertNoStatusCanaryFragments(t *testing.T, name, text, canary string) {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("%s leaked canary fragment %q:\n%s", name, forbidden, text)
 		}
+	}
+}
+
+func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-replay")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-replay"
+		r.CorrelationSequence = 4
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "detached run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          "corr-dispatch-replay",
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = runID
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "899",
+		"--issue-title", "Codex replay",
+		"--run-id", runID,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("worker started before Codex progress replay was emitted: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != runID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, runID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after dispatch replay: %v", err)
+	}
+	defer store.Close()
+	obligations, err := progress.ListDeliveryObligations(context.Background(), store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligations after replay = %#v, want pending and unattempted", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(context.Background(), store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after replay = %#v, want none", acks)
 	}
 }
 

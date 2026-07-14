@@ -276,6 +276,18 @@ func HostCapabilityDeclarations(host HostRuntime) []HostCapabilityDeclaration {
 		{Capability: HostPayloadLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
 		{Capability: HostRateLimits, Support: HostCapabilityUnknown, Source: "runtime-contract"},
 	}
+	if host.Name == "codex-cli" {
+		for i := range declarations {
+			switch declarations[i].Capability {
+			case HostDurablePolling, HostResumableFollow, HostDetachedSteering, HostDetachedCancellation:
+				declarations[i].Support = HostCapabilitySupported
+				declarations[i].Source = "codex-cli-documented-local-surface"
+			case HostManagedBackgroundWork, HostCallbacks, HostWakeUp, HostAcknowledgment:
+				declarations[i].Support = HostCapabilityUnsupported
+				declarations[i].Source = "codex-cli-documented-local-surface"
+			}
+		}
+	}
 	sortHostCapabilityDeclarations(declarations)
 	return declarations
 }

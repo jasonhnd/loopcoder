@@ -599,6 +599,104 @@ func TestDeliveryOutboxNoAckPolicyTerminalsWithoutAcknowledgment(t *testing.T) {
 	}
 }
 
+func TestReplayPendingForHostIsOriginBoundCursorSafeAndDoesNotAcknowledge(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t, ctx)
+	defer store.Close()
+
+	obligationA := baseObligation()
+	obligationA.SinkID = "horigin_a"
+	createdA, err := PersistReceiptWithObligation(ctx, store, baseReceipt(), obligationA)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation A: %v", err)
+	}
+	receiptB := baseReceipt()
+	receiptB.CorrelationID = "corr_progress_b"
+	receiptB.CorrelationSequence = 2
+	receiptB.Phase = "detached-terminal"
+	receiptB.Status = "succeeded"
+	obligationB := baseObligation()
+	obligationB.OriginID = "corr_progress_b"
+	obligationB.SinkID = "horigin_b"
+	createdB, err := PersistReceiptWithObligation(ctx, store, receiptB, obligationB)
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation B: %v", err)
+	}
+
+	var replayed []ReceiptView
+	first, err := ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_a",
+		ClaimOwner:    "codex-replay",
+		Now:           fixedTime.Add(time.Minute),
+	}, func(view ReceiptView) error {
+		replayed = append(replayed, view)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost first: %v", err)
+	}
+	if first.Replayed != 1 || len(replayed) != 1 || replayed[0].Receipt.ProgressReceiptID != createdA.Receipt.Receipt.ProgressReceiptID {
+		t.Fatalf("first replay = %#v views=%#v, want only origin A", first, replayed)
+	}
+	aAfter, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", createdA.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation A: %v", err)
+	}
+	if aAfter.Status != DeliveryPending || aAfter.AttemptCount != 0 || aAfter.ClaimOwner != "" {
+		t.Fatalf("origin A obligation after replay = %#v, want pending with no delivery attempt or claim", aAfter)
+	}
+	bAfter, err := ReadDeliveryObligation(ctx, store, "proj_progress", "run_progress", createdB.Obligation.ObligationID)
+	if err != nil {
+		t.Fatalf("ReadDeliveryObligation B: %v", err)
+	}
+	if bAfter.Status != DeliveryPending || bAfter.ClaimGeneration != 0 {
+		t.Fatalf("origin B obligation changed = %#v", bAfter)
+	}
+	acks, err := ListDeliveryAcknowledgments(ctx, store, DeliveryAckFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress"})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks = %#v, want no acknowledgment from replay", acks)
+	}
+	attempts, err := ListDeliveryAttempts(ctx, store, DeliveryAttemptFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress"})
+	if err != nil {
+		t.Fatalf("ListDeliveryAttempts: %v", err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("attempts = %#v, want replay not to claim transport delivery", attempts)
+	}
+
+	replayed = nil
+	second, err := ReplayPendingForHost(ctx, store, HostReplayOptions{
+		ProjectID:     "proj_progress",
+		DeliveryRunID: "run_progress",
+		OriginKind:    "host-run-origin",
+		OriginID:      "horigin_a",
+		ClaimOwner:    "codex-replay",
+		Now:           fixedTime.Add(2 * time.Minute),
+	}, func(view ReceiptView) error {
+		replayed = append(replayed, view)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost second: %v", err)
+	}
+	if second.Replayed != 0 || len(replayed) != 0 {
+		t.Fatalf("second replay = %#v views=%#v, want cursor to suppress duplicate replay", second, replayed)
+	}
+	cursors, err := ListDeliveryReplayCursors(ctx, store, DeliveryCursorFilter{ProjectID: "proj_progress", DeliveryRunID: "run_progress", OriginKind: "host-run-origin", OriginID: "horigin_a"})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != createdA.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors = %#v, want origin A cursor", cursors)
+	}
+}
+
 func TestDeliveryOutboxStaleClaimCannotRecordAfterLeaseTakeover(t *testing.T) {
 	ctx := context.Background()
 	now := fixedTime

@@ -1,10 +1,12 @@
 package hostprofile_test
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 )
 
 func TestResolvePrefersEnvOverConfigAndDetection(t *testing.T) {
@@ -83,8 +85,62 @@ func TestResolveRejectsUnknownExplicitProfile(t *testing.T) {
 	}
 }
 
+func TestCodexOriginBindingRequestRedactsThreadBearerAndPaths(t *testing.T) {
+	secret := "AKIA" + strings.Repeat("A", 16)
+	req, ok := hostprofile.CodexOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_codex",
+		DeliveryRunID: "run_codex",
+		CorrelationID: "corr_codex",
+		Getenv: mapGetenv(map[string]string{
+			"CODEX_THREAD_ID": "thread-" + secret,
+			"CODEX_CLI":       "1",
+			"PWD":             "/Users/alice/private/repo",
+		}),
+	})
+	if !ok {
+		t.Fatal("CodexOriginBindingRequest returned ok=false")
+	}
+	binding := runtimecap.BindHostRunOrigin(req)
+	if !binding.Bound || binding.Code != runtimecap.HostOriginBound || binding.BindingID == "" {
+		t.Fatalf("binding = %#v, want bound Codex origin", binding)
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		t.Fatalf("marshal binding: %v", err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{secret, "thread-", "/Users/alice", "CODEX_THREAD_ID\":\"thread"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("binding leaked %q: %s", forbidden, text)
+		}
+	}
+	if !containsHostProfileString(binding.MetadataKeys, "env.CODEX_THREAD_ID") || !containsHostProfileString(binding.MetadataKeys, "env.CODEX_CLI") {
+		t.Fatalf("metadata keys = %#v, want marker names only", binding.MetadataKeys)
+	}
+}
+
+func TestCodexOriginBindingRequestAbsentMetadataIsNotCapabilityProof(t *testing.T) {
+	if _, ok := hostprofile.CodexOriginBindingRequest(hostprofile.OriginOptions{
+		ProjectID:     "proj_codex",
+		DeliveryRunID: "run_codex",
+		CorrelationID: "corr_codex",
+		Getenv:        mapGetenv(map[string]string{"CODEX_CLI": "1"}),
+	}); ok {
+		t.Fatal("CodexOriginBindingRequest ok=true without thread/session metadata")
+	}
+}
+
 func mapGetenv(values map[string]string) func(string) string {
 	return func(key string) string {
 		return values[key]
 	}
+}
+
+func containsHostProfileString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
