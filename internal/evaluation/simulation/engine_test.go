@@ -28,21 +28,8 @@ func TestExecuteIdenticalReplayByteStable(t *testing.T) {
 		t.Fatalf("identical scenario produced different canonical JSON\nfirst=%s\nsecond=%s", firstJSON, secondJSON)
 	}
 
-	replayScenario := scenario
-	for i := range replayScenario.Inventory.Quotas {
-		replayScenario.Inventory.Quotas[i].Confidence = providerinventory.ConfidenceUnknown
-		replayScenario.Inventory.Quotas[i].RemainingValue = nil
-	}
-	replay, err := Execute(context.Background(), replayScenario, Options{ReplayJournal: &first.ReplayJournal})
-	if err != nil {
-		t.Fatalf("Execute replay: %v", err)
-	}
-	if len(replay.Diagnostics) != 0 {
-		t.Fatalf("replay recomputed hidden quota truth, diagnostics = %#v", replay.Diagnostics)
-	}
-	if got, want := replay.Decisions[0].ChosenCandidateID, first.Decisions[0].ChosenCandidateID; got != want {
-		t.Fatalf("replay chosen candidate = %q, want %q", got, want)
-	}
+	_, err = Execute(context.Background(), scenario, Options{ReplayJournal: &first.ReplayJournal})
+	requireReplayMismatch(t, err)
 }
 
 func TestExecuteDifferentSeedChangesDeterministicDecision(t *testing.T) {
@@ -93,6 +80,149 @@ func TestExecuteRejectsReplayJournalMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), ErrReplayMismatch) {
 		t.Fatalf("error = %v, want replay mismatch", err)
 	}
+}
+
+func TestExecuteRejectsReplayJournalAtEmptyCrashBoundary(t *testing.T) {
+	scenario := baseScenario()
+	result, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*ReplayJournal)
+	}{
+		{name: "one event", mutate: func(j *ReplayJournal) {
+			j.Events = j.Events[:1]
+			j.Decisions = j.Decisions[:1]
+		}},
+		{name: "all events", mutate: func(*ReplayJournal) {}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			journal := cloneReplayJournal(result.ReplayJournal)
+			tt.mutate(&journal)
+			got, err := Execute(context.Background(), scenario, Options{ReplayJournal: &journal})
+			requireReplayMismatch(t, err)
+			if len(got.DurableState.AppliedEventIDs) != 0 || len(got.EventLog) != 0 {
+				t.Fatalf("invalid replay changed state/result: %#v", got)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalEligibilitySourceMutations(t *testing.T) {
+	scenario := singleProviderCallScenario()
+	applied, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	chosen := applied.Decisions[0].ChosenCandidateID
+	tests := []struct {
+		name   string
+		mutate func(*Scenario)
+	}{
+		{name: "model unavailable", mutate: func(s *Scenario) {
+			model := mustModelIndex(t, s, chosen)
+			s.Inventory.Models[model].Availability = providerinventory.AvailabilityTemporarilyUnavailable
+		}},
+		{name: "auth not ready", mutate: func(s *Scenario) {
+			model := s.Inventory.Models[mustModelIndex(t, s, chosen)]
+			account := mustAccountIndex(t, s, model.AccountProfileID)
+			s.Inventory.Accounts[account].Readiness = providerinventory.ReadinessNotAuthenticated
+		}},
+		{name: "provider not installed", mutate: func(s *Scenario) {
+			model := s.Inventory.Models[mustModelIndex(t, s, chosen)]
+			account := s.Inventory.Accounts[mustAccountIndex(t, s, model.AccountProfileID)]
+			provider := mustProviderIndex(t, s, account.ProviderInstallationID)
+			s.Inventory.Providers[provider].State = providerinventory.InstallationNotInstalled
+		}},
+		{name: "quota stale", mutate: func(s *Scenario) {
+			quota := mustQuotaIndex(t, s, chosen)
+			s.Inventory.Quotas[quota].Confidence = providerinventory.ConfidenceUnknown
+		}},
+		{name: "quota exhausted", mutate: func(s *Scenario) {
+			exhausted := int64(0)
+			quota := mustQuotaIndex(t, s, chosen)
+			s.Inventory.Quotas[quota].RemainingValue = &exhausted
+		}},
+		{name: "budget insufficient", mutate: func(s *Scenario) {
+			s.BudgetAuthorities[0].RemainingValue = 0
+		}},
+		{name: "role disallowed", mutate: func(s *Scenario) {
+			model := mustModelIndex(t, s, chosen)
+			s.Inventory.Models[model].Roles = []providerinventory.CatalogRole{providerinventory.CatalogRoleVerifier}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restart := scenario
+			restart.StartingState = cloneDurableState(applied.DurableState)
+			tt.mutate(&restart)
+			requireReplayMismatch(t, executeReplayErr(t, restart, &applied.ReplayJournal))
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalCanonicalDecisionMutations(t *testing.T) {
+	t.Run("false reject first eligible", func(t *testing.T) {
+		scenario := routeOnlyScenario()
+		applied, err := Execute(context.Background(), scenario, Options{})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		task := scenario.Tasks[0]
+		candidates := candidateModelsForScenario(scenario, task)
+		if len(candidates) < 2 {
+			t.Fatalf("need at least two candidates, got %#v", candidates)
+		}
+		rejected := map[string]bool{candidates[0].ModelCapabilityID: true}
+		journal := cloneReplayJournal(applied.ReplayJournal)
+		decision := &journal.Decisions[0]
+		decision.ChosenCandidateID = candidates[1].ModelCapabilityID
+		decision.RejectedCandidates = []Rejection{{CandidateID: candidates[0].ModelCapabilityID, Code: "model-unavailable", Reason: "caller supplied rejection"}}
+		decision.QuotaSnapshotIDs = expectedReplayQuotaSnapshotIDs(scenario, task, *decision, candidates, rejected)
+		restart := scenario
+		restart.StartingState = cloneDurableState(applied.DurableState)
+		requireReplayMismatch(t, executeReplayErr(t, restart, &journal))
+	})
+
+	t.Run("rejection bytes", func(t *testing.T) {
+		scenario := routeOnlyScenario()
+		first := candidateModelsForScenario(scenario, scenario.Tasks[0])[0].ModelCapabilityID
+		scenario.Inventory.Models[mustModelIndex(t, &scenario, first)].Availability = providerinventory.AvailabilityTemporarilyUnavailable
+		applied, err := Execute(context.Background(), scenario, Options{})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if len(applied.Decisions[0].RejectedCandidates) == 0 {
+			t.Fatalf("expected canonical rejection: %#v", applied.Decisions[0])
+		}
+		tests := []struct {
+			name   string
+			mutate func(*ReplayJournal)
+		}{
+			{name: "reason", mutate: func(j *ReplayJournal) {
+				j.Decisions[0].RejectedCandidates[0].Reason = "invented evidence"
+			}},
+			{name: "omit", mutate: func(j *ReplayJournal) {
+				j.Decisions[0].RejectedCandidates = nil
+			}},
+			{name: "add", mutate: func(j *ReplayJournal) {
+				j.Decisions[0].RejectedCandidates = append(j.Decisions[0].RejectedCandidates, Rejection{CandidateID: j.Decisions[0].ChosenCandidateID, Code: "invented", Reason: "invented"})
+				sortRejections(j.Decisions[0].RejectedCandidates)
+			}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				restart := scenario
+				restart.StartingState = cloneDurableState(applied.DurableState)
+				journal := cloneReplayJournal(applied.ReplayJournal)
+				tt.mutate(&journal)
+				requireReplayMismatch(t, executeReplayErr(t, restart, &journal))
+			})
+		}
+	})
 }
 
 func TestExecuteReportsEventCapTruncation(t *testing.T) {
@@ -546,6 +676,53 @@ func TestExecuteRejectsReplayJournalStateEquivalenceMutations(t *testing.T) {
 	}
 }
 
+func TestExecuteRejectsAppliedEventsWithoutMaterializedDurableRecords(t *testing.T) {
+	scenario := allSideEffectScenario()
+	applied, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*DurableState)
+		wantErr string
+	}{
+		{name: "provider receipt removed", mutate: func(s *DurableState) {
+			s.ProviderReceipts = nil
+		}, wantErr: ErrInvalidFixture},
+		{name: "budget commitment removed", mutate: func(s *DurableState) {
+			s.BudgetCommitments = nil
+		}, wantErr: ErrInvalidFixture},
+		{name: "handoff removed", mutate: func(s *DurableState) {
+			s.Handoffs = nil
+		}, wantErr: ErrInvalidFixture},
+		{name: "owner removed", mutate: func(s *DurableState) {
+			s.AgentOwners = nil
+		}, wantErr: ErrInvalidFixture},
+		{name: "provider receipt mismatched", mutate: func(s *DurableState) {
+			s.ProviderReceipts[0].LatencyMS++
+		}, wantErr: ErrInvalidFixture},
+		{name: "extra applied route", mutate: func(s *DurableState) {
+			s.AppliedEventIDs = append(s.AppliedEventIDs, "event-extra-route")
+		}, wantErr: ErrReplayMismatch},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restart := scenario
+			restart.InjectedEvents = append(restart.InjectedEvents, InjectedEvent{EventID: "event-extra-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"})
+			restart.StartingState = cloneDurableState(applied.DurableState)
+			tt.mutate(&restart.StartingState)
+			_, err := Execute(context.Background(), restart, Options{ReplayJournal: &applied.ReplayJournal})
+			if err == nil {
+				t.Fatal("Execute accepted non-equivalent starting state")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestDecodeAndExecuteMalformedFixtureFailsClosedRedacted(t *testing.T) {
 	secret := "AKIA" + strings.Repeat("A", 16)
 	raw := []byte(`{"schema_version":"` + secret + `","scenario_id":"bad"}`)
@@ -739,6 +916,79 @@ func requireReplayMismatch(t *testing.T, err error) {
 	if !strings.Contains(err.Error(), ErrReplayMismatch) {
 		t.Fatalf("error = %v, want replay mismatch", err)
 	}
+}
+
+func routeOnlyScenario() Scenario {
+	scenario := baseScenario()
+	scenario.InjectedEvents = []InjectedEvent{{EventID: "event-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"}}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-route"}}}
+	scenario.Invariants = nil
+	return scenario
+}
+
+func singleProviderCallScenario() Scenario {
+	scenario := baseScenario()
+	scenario.InjectedEvents = []InjectedEvent{{EventID: "event-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"}}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-call"}}}
+	scenario.Invariants = nil
+	return scenario
+}
+
+func allSideEffectScenario() Scenario {
+	scenario := baseScenario()
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-handoff", Kind: "handoff", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-owner", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-call", "event-budget", "event-handoff", "event-owner"}}}
+	scenario.Invariants = nil
+	return scenario
+}
+
+func mustModelIndex(t *testing.T, scenario *Scenario, modelID string) int {
+	t.Helper()
+	for i, model := range scenario.Inventory.Models {
+		if model.ModelCapabilityID == modelID {
+			return i
+		}
+	}
+	t.Fatalf("missing model %s", modelID)
+	return 0
+}
+
+func mustAccountIndex(t *testing.T, scenario *Scenario, accountID string) int {
+	t.Helper()
+	for i, account := range scenario.Inventory.Accounts {
+		if account.AccountProfileID == accountID {
+			return i
+		}
+	}
+	t.Fatalf("missing account %s", accountID)
+	return 0
+}
+
+func mustProviderIndex(t *testing.T, scenario *Scenario, providerID string) int {
+	t.Helper()
+	for i, provider := range scenario.Inventory.Providers {
+		if provider.ProviderInstallationID == providerID {
+			return i
+		}
+	}
+	t.Fatalf("missing provider %s", providerID)
+	return 0
+}
+
+func mustQuotaIndex(t *testing.T, scenario *Scenario, modelID string) int {
+	t.Helper()
+	for i, quota := range scenario.Inventory.Quotas {
+		if quota.ModelCapabilityID == modelID {
+			return i
+		}
+	}
+	t.Fatalf("missing quota for model %s", modelID)
+	return 0
 }
 
 func restartAuthorityScenario() Scenario {

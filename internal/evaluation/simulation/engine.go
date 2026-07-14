@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -320,6 +321,10 @@ func (r *runner) route(event InjectedEvent) (DecisionRecord, error) {
 		r.decisionsByTask[replay.TaskID] = replay
 		return replay, nil
 	}
+	return r.canonicalRoute(event)
+}
+
+func (r *runner) canonicalRoute(event InjectedEvent) (DecisionRecord, error) {
 	task, ok := taskByID(r.scenario.Tasks, event.TaskID)
 	if !ok {
 		return DecisionRecord{}, typedError(ErrMissingReference, "event %s references missing task %s", event.EventID, event.TaskID)
@@ -526,6 +531,13 @@ func (r *runner) eligible(task Task, model Model) (Rejection, string, bool) {
 	}
 	if *quota.RemainingValue < task.RequiredQuantity {
 		return reject(model.ModelCapabilityID, ErrQuotaInsufficient, "quota remaining is insufficient"), quota.QuotaSnapshotID, false
+	}
+	remaining, ok := r.budgetRemaining[task.BudgetAuthorityID]
+	if !ok {
+		return reject(model.ModelCapabilityID, ErrMissingReference, "budget authority is missing"), quota.QuotaSnapshotID, false
+	}
+	if remaining < task.RequiredQuantity {
+		return reject(model.ModelCapabilityID, ErrBudgetDenied, "budget remaining is insufficient"), quota.QuotaSnapshotID, false
 	}
 	return Rejection{}, quota.QuotaSnapshotID, true
 }
@@ -849,6 +861,68 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 	if err := validateReplayAgainstStartingState(s, eventRecords, decisionsByEvent); err != nil {
 		return err
 	}
+	if err := validateReplayCanonicalSimulation(s, eventRecords, decisionsByEvent); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateReplayCanonicalSimulation(s Scenario, replayEvents map[string]EventRecord, replayDecisions map[string]DecisionRecord) error {
+	if len(replayEvents) == 0 && len(replayDecisions) == 0 {
+		return nil
+	}
+	origin, err := time.Parse(time.RFC3339Nano, s.Clock.Origin)
+	if err != nil {
+		return typedError(ErrInvalidFixture, "invalid clock origin: %v", err)
+	}
+	ordered, err := orderEvents(s)
+	if err != nil {
+		return err
+	}
+	budgetRemaining, err := budgetRemaining(s, nil)
+	if err != nil {
+		return err
+	}
+	run := runner{
+		scenario:          s,
+		origin:            origin.UTC(),
+		state:             DurableState{},
+		applied:           map[string]bool{},
+		receipts:          map[string]bool{},
+		receiptRecords:    map[string]ProviderReceipt{},
+		commitments:       map[string]bool{},
+		handoffs:          map[string]bool{},
+		owners:            map[string]bool{},
+		completed:         map[string]bool{},
+		decisionReplay:    map[string]DecisionRecord{},
+		eventReplay:       map[string]EventRecord{},
+		budgetRemaining:   budgetRemaining,
+		providerCallCount: map[string]int{},
+		decisionsByTask:   map[string]DecisionRecord{},
+	}
+	for index, event := range ordered {
+		replayEvent, ok := replayEvents[event.EventID]
+		if !ok {
+			continue
+		}
+		record, decision, applyErr := run.apply(context.Background(), event, index+1)
+		if applyErr != nil {
+			record.Status = "failed"
+		}
+		replayDecision, ok := replayDecisions[event.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "replay journal event %s has no decision to compare", event.EventID)
+		}
+		if !reflect.DeepEqual(replayDecision, decision) {
+			return typedError(ErrReplayMismatch, "replay journal decision %s does not match canonical routing decision", replayDecision.DecisionID)
+		}
+		if !reflect.DeepEqual(replayEvent, record) {
+			return typedError(ErrReplayMismatch, "replay journal event %s does not match canonical event record", replayEvent.EventID)
+		}
+	}
+	if !reflect.DeepEqual(run.sortedState(), normalizeDurableState(s.StartingState)) {
+		return typedError(ErrReplayMismatch, "replay journal materialized durable state does not match starting state")
+	}
 	return nil
 }
 
@@ -1089,7 +1163,9 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		completed[taskID] = true
 	}
 	receipts := map[string]bool{}
+	receiptEvents := map[string]ProviderReceipt{}
 	receiptSemantics := map[string]bool{}
+	succeededReceiptEvents := map[string]bool{}
 	succeededTasks := map[string]bool{}
 	for _, receipt := range s.StartingState.ProviderReceipts {
 		if receipt.ReceiptID == "" || receipt.EventID == "" || receipt.TaskID == "" || receipt.ModelCapabilityID == "" {
@@ -1102,6 +1178,10 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 			return typedError(ErrInvalidFixture, "starting state contains duplicate provider receipt %s", receipt.ReceiptID)
 		}
 		receipts[receipt.ReceiptID] = true
+		if _, exists := receiptEvents[receipt.EventID]; exists {
+			return typedError(ErrInvalidFixture, "starting state contains duplicate provider receipt event %s", receipt.EventID)
+		}
+		receiptEvents[receipt.EventID] = receipt
 		semantic := strings.Join([]string{receipt.EventID, receipt.TaskID, receipt.ModelCapabilityID}, "\x00")
 		if receiptSemantics[semantic] {
 			return typedError(ErrInvalidFixture, "starting state contains duplicate semantic provider receipt for event %s task %s model %s", receipt.EventID, receipt.TaskID, receipt.ModelCapabilityID)
@@ -1132,6 +1212,7 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 			if !applied[receipt.EventID] {
 				return typedError(ErrInvalidFixture, "succeeded provider receipt %s event %s is not applied", receipt.ReceiptID, receipt.EventID)
 			}
+			succeededReceiptEvents[receipt.EventID] = true
 			succeededTasks[receipt.TaskID] = true
 		case "failed":
 			if receipt.FailureCode == "" {
@@ -1154,10 +1235,14 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 			return typedError(ErrInvalidFixture, "task %s has succeeded provider receipt but is not completed", taskID)
 		}
 	}
+	if err := validateStartingStateProviderReceipts(s, receiptEvents); err != nil {
+		return err
+	}
 	if _, err := budgetRemaining(s, s.StartingState.BudgetCommitments); err != nil {
 		return err
 	}
 	commitments := map[string]bool{}
+	commitmentEvents := map[string]bool{}
 	commitmentSemantics := map[string]bool{}
 	for _, commitment := range s.StartingState.BudgetCommitments {
 		if commitment.CommitmentID == "" || commitment.EventID == "" || commitment.TaskID == "" || commitment.BudgetAuthorityID == "" {
@@ -1205,8 +1290,10 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if commitment.CommittedValue != task.RequiredQuantity {
 			return typedError(ErrInvalidFixture, "budget commitment %s committed value %d does not match task required quantity %d", commitment.CommitmentID, commitment.CommittedValue, task.RequiredQuantity)
 		}
+		commitmentEvents[commitment.EventID] = true
 	}
 	handoffs := map[string]bool{}
+	handoffEvents := map[string]bool{}
 	handoffSemantics := map[string]bool{}
 	for _, handoff := range s.StartingState.Handoffs {
 		if handoff.HandoffID == "" || handoff.EventID == "" || handoff.SourceTaskID == "" || handoff.TargetTaskID == "" {
@@ -1247,8 +1334,10 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if handoff.AuthorizationRef != s.PolicyProvenance.AuthorizationFingerprint {
 			return typedError(ErrInvalidFixture, "handoff %s authorization ref does not match scenario authority", handoff.HandoffID)
 		}
+		handoffEvents[handoff.EventID] = true
 	}
 	owners := map[string]bool{}
+	ownerEvents := map[string]bool{}
 	ownerSemantics := map[string]bool{}
 	for _, owner := range s.StartingState.AgentOwners {
 		if owner.OwnershipID == "" || owner.EventID == "" || owner.TaskID == "" || owner.ResourceKey == "" {
@@ -1290,20 +1379,71 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if owner.OwnerState != storage.OwnershipStateHeld || owner.Permission != permissionForTask(task) || owner.SideEffectClass != sideEffectForTask(task) {
 			return typedError(ErrInvalidFixture, "agent owner %s authority fields are not canonical", owner.OwnershipID)
 		}
+		ownerEvents[owner.EventID] = true
+	}
+	for eventID := range applied {
+		event := events[eventID]
+		switch event.Kind {
+		case "route_task":
+		case "provider_call":
+			if !succeededReceiptEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied provider event %s has no succeeded durable receipt", eventID)
+			}
+		case "budget_commit":
+			if !commitmentEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied budget event %s has no durable commitment", eventID)
+			}
+		case "handoff":
+			if !handoffEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied handoff event %s has no durable handoff", eventID)
+			}
+		case "agent_own":
+			if !ownerEvents[eventID] {
+				return typedError(ErrInvalidFixture, "applied ownership event %s has no durable owner", eventID)
+			}
+		}
+	}
+	return nil
+}
+
+func validateStartingStateProviderReceipts(s Scenario, receipts map[string]ProviderReceipt) error {
+	if len(receipts) == 0 {
+		return nil
+	}
+	ordered, err := orderEvents(s)
+	if err != nil {
+		return err
+	}
+	run := runner{scenario: s}
+	counts := map[string]int{}
+	for _, event := range ordered {
+		receipt, ok := receipts[event.EventID]
+		if !ok {
+			continue
+		}
+		key := providerCallKey(receipt.TaskID, receipt.ModelCapabilityID)
+		counts[key]++
+		model, ok := modelByID(s.Inventory.Models, receipt.ModelCapabilityID)
+		if !ok {
+			return typedError(ErrMissingReference, "provider receipt %s references missing model %s", receipt.ReceiptID, receipt.ModelCapabilityID)
+		}
+		failure := run.failure(receipt.ModelCapabilityID, counts[key])
+		wantStatus := "succeeded"
+		wantFailure := ""
+		if failure.FailureCode != "" {
+			wantStatus = "failed"
+			wantFailure = failure.FailureCode
+		}
+		wantCost := max64(model.CostMicrounits, failure.CostMicrounits)
+		if receipt.Status != wantStatus || receipt.FailureCode != wantFailure || receipt.LatencyMS != run.latency(receipt.ModelCapabilityID) || receipt.CostMicrounits != wantCost {
+			return typedError(ErrInvalidFixture, "provider receipt %s does not match canonical provider outcome", receipt.ReceiptID)
+		}
 	}
 	return nil
 }
 
 func validateReplayAgainstStartingState(s Scenario, replayEvents map[string]EventRecord, replayDecisions map[string]DecisionRecord) error {
 	state := s.StartingState
-	if len(state.AppliedEventIDs) == 0 &&
-		len(state.ProviderReceipts) == 0 &&
-		len(state.BudgetCommitments) == 0 &&
-		len(state.Handoffs) == 0 &&
-		len(state.AgentOwners) == 0 &&
-		len(state.CompletedTaskIDs) == 0 {
-		return nil
-	}
 	durableEvents := map[string]bool{}
 	for _, eventID := range state.AppliedEventIDs {
 		durableEvents[eventID] = true
