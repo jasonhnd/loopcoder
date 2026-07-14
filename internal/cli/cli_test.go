@@ -289,6 +289,52 @@ func TestProvidersRefreshTextRendersNotInstalledProbe(t *testing.T) {
 	}
 }
 
+func TestProvidersStatusJSONRendersBoundedQuotaCacheState(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	age := int64(60000)
+	status := providerinventory.QuotaRefreshStatus{
+		SchemaVersion: providerinventory.QuotaRefreshStatusSchema,
+		GeneratedAt:   now.Format(time.RFC3339),
+		Providers: []providerinventory.ProviderQuotaStatus{{
+			AdapterID:         "codex",
+			AgeMS:             &age,
+			SourceKind:        providerinventory.QuotaSourceFixture,
+			Confidence:        providerinventory.ConfidenceStale,
+			FreshnessState:    providerinventory.FreshnessStale,
+			TerminalErrorCode: "ErrProviderQuotaUnavailable",
+			InFlight:          true,
+			NextRefreshAt:     now.Add(time.Minute).Format(time.RFC3339),
+			QuotaSnapshotIDs:  []string{"qsnap_status"},
+			GapReasons:        []string{"provider-error"},
+		}},
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "status", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderQuotaStatus: func(_ context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			if req.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", req.RepoPath, repo)
+			}
+			return status, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload providerinventory.QuotaRefreshStatus
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != providerinventory.QuotaRefreshStatusSchema || len(payload.Providers) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	got := payload.Providers[0]
+	if got.AdapterID != "codex" || got.TerminalErrorCode != "ErrProviderQuotaUnavailable" || !got.InFlight || got.AgeMS == nil || *got.AgeMS != age {
+		t.Fatalf("provider status = %#v", got)
+	}
+}
+
 func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	repo := t.TempDir()
