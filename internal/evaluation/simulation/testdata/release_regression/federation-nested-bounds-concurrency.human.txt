@@ -1,0 +1,38 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: federation-nested-bounds-concurrency
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v1 profile=release-regression-profile fingerprint=sha256:federation-nested-bounds-concurrency-policy plan=sha256:federation-nested-bounds-concurrency-plan authorization=sha256:federation-nested-bounds-concurrency-auth
+sources: project=project-release-regression delivery=delivery-federation-nested-bounds-concurrency inventory=inventory-federation-nested-bounds-concurrency budget=budget-federation-nested-bounds-concurrency routing=routing-federation-nested-bounds-concurrency agent_tree=agent-tree-federation-nested-bounds-concurrency handoff=handoff-federation-nested-bounds-concurrency state=durable-state-federation-nested-bounds-concurrency
+truncated: false
+decisions:
+- decision_3e5c97b337271ef4f589c764276a3242 event=event-own-b task=task-b kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_604278baf9adb75c6caaf51a8d9ff669 event=event-own-d task=task-d kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+- decision_b1291371411fc0df9ec1523aa53c7900 event=event-own-a task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_bfbb5e406f9039b25d165c23dbc5b37a event=event-own-c task=task-c kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+events:
+- 001 event-own-b kind=agent_own task=task-b status=applied decision=decision_3e5c97b337271ef4f589c764276a3242 receipt= idem=idem_3e5c97b337271ef4f589c764276a3242 at=2026-07-14T00:00:00Z
+- 002 event-own-a kind=agent_own task=task-a status=applied decision=decision_b1291371411fc0df9ec1523aa53c7900 receipt= idem=idem_b1291371411fc0df9ec1523aa53c7900 at=2026-07-14T00:00:00.01Z
+- 003 event-own-c kind=agent_own task=task-c status=applied decision=decision_bfbb5e406f9039b25d165c23dbc5b37a receipt= idem=idem_bfbb5e406f9039b25d165c23dbc5b37a at=2026-07-14T00:00:00.02Z
+- 004 event-own-d kind=agent_own task=task-d status=applied decision=decision_604278baf9adb75c6caaf51a8d9ff669 receipt= idem=idem_604278baf9adb75c6caaf51a8d9ff669 at=2026-07-14T00:00:00.03Z
+durable_state:
+- applied_events=event-own-a,event-own-b,event-own-c,event-own-d
+- completed_tasks=none
+- provider_receipts:
+  - none
+- handoffs:
+  - none
+- agent_owners:
+  - agent_owner_23bee3a9ae790d93fa5f2e65a36d7363 event=event-own-c task=task-c resource=resource-c state=held permission=orchestrate side_effect=provider-launch
+  - agent_owner_23e7218b06395d4f0a6f375b849b4e65 event=event-own-a task=task-a resource=resource-a state=held permission=orchestrate side_effect=provider-launch
+  - agent_owner_ee2932e79a7c7c9614a2eab5e9790102 event=event-own-b task=task-b resource=resource-b state=held permission=orchestrate side_effect=provider-launch
+  - agent_owner_f6229e3d1d85500f046b1a3ba44c3f79 event=event-own-d task=task-d resource=resource-d state=held permission=orchestrate side_effect=provider-launch
+invariants:
+- inv-federation-one-owner kind=one_owner_per_resource passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:30adedd1efaf600f22bcb8d4131491a3f89dd96c7447dc4670c936e63945a10c added_events=event-own-a,event-own-b,event-own-c,event-own-d added_decisions=decision_3e5c97b337271ef4f589c764276a3242,decision_604278baf9adb75c6caaf51a8d9ff669,decision_b1291371411fc0df9ec1523aa53c7900,decision_bfbb5e406f9039b25d165c23dbc5b37a

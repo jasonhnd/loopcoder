@@ -1,0 +1,37 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: handoff-crash-replay-idempotent
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v1 profile=release-regression-profile fingerprint=sha256:handoff-crash-replay-idempotent-policy plan=sha256:handoff-crash-replay-idempotent-plan authorization=sha256:handoff-crash-replay-idempotent-auth
+sources: project=project-release-regression delivery=delivery-handoff-crash-replay-idempotent inventory=inventory-handoff-crash-replay-idempotent budget=budget-handoff-crash-replay-idempotent routing=routing-handoff-crash-replay-idempotent agent_tree=agent-tree-handoff-crash-replay-idempotent handoff=handoff-handoff-crash-replay-idempotent state=durable-state-handoff-crash-replay-idempotent
+truncated: false
+decisions:
+- decision_0106432f10da859fb61923cd7f95c4f4 event=event-handoff task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_a3e7ee4a5838bfb6f35b81acc4803cf3 event=event-provider task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_b983ec773be1adc6be4aef2169d3c382 event=event-budget task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+- decision_d476bd8065dbce096e6b0e91a0e06f1f event=event-owner task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+events:
+- 001 event-provider kind=provider_call task=task-a status=applied decision=decision_a3e7ee4a5838bfb6f35b81acc4803cf3 receipt=provider_receipt_185a5d5d17a83c92a8b916bb44f5fae7 idem=idem_a3e7ee4a5838bfb6f35b81acc4803cf3 at=2026-07-14T00:00:00Z
+- 002 event-budget kind=budget_commit task=task-a status=applied decision=decision_b983ec773be1adc6be4aef2169d3c382 receipt= idem=idem_b983ec773be1adc6be4aef2169d3c382 at=2026-07-14T00:00:00.01Z
+- 003 event-handoff kind=handoff task=task-a status=applied decision=decision_0106432f10da859fb61923cd7f95c4f4 receipt= idem=idem_0106432f10da859fb61923cd7f95c4f4 at=2026-07-14T00:00:00.02Z
+- 004 event-owner kind=agent_own task=task-a status=applied decision=decision_d476bd8065dbce096e6b0e91a0e06f1f receipt= idem=idem_d476bd8065dbce096e6b0e91a0e06f1f at=2026-07-14T00:00:00.03Z
+durable_state:
+- applied_events=event-budget,event-handoff,event-owner,event-provider
+- completed_tasks=task-a
+- provider_receipts:
+  - provider_receipt_185a5d5d17a83c92a8b916bb44f5fae7 event=event-provider task=task-a model=model-b status=succeeded failure= latency_ms=100 cost_microunits=10
+- handoffs:
+  - handoff_adf3dfb7926d2298c3e1ec3430762e3d event=event-handoff source=task-a target=task-b authorization=sha256:handoff-crash-replay-idempotent-auth
+- agent_owners:
+  - agent_owner_67908803226497afad1c7f3be42dc863 event=event-owner task=task-a resource=resource-a state=held permission=orchestrate side_effect=provider-launch
+invariants:
+- inv-handoff-route kind=route_accepted passed=true diagnostic=
+- inv-one-owner kind=one_owner_per_resource passed=true diagnostic=
+- inv-task-complete kind=task_completed passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:013d1159203307a70cbbdf898a8b02876fcab584466d34f830aae8bcd4dc85cf added_events=event-budget,event-handoff,event-owner,event-provider added_decisions=decision_0106432f10da859fb61923cd7f95c4f4,decision_a3e7ee4a5838bfb6f35b81acc4803cf3,decision_b983ec773be1adc6be4aef2169d3c382,decision_d476bd8065dbce096e6b0e91a0e06f1f
