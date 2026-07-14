@@ -191,6 +191,28 @@ func TestReleaseRegressionSnapshotFilesMatchScenarioSet(t *testing.T) {
 	}
 }
 
+func TestReleaseRegressionHumanFixturesUseCanonicalLF(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("testdata", "release_regression", "*.human.txt"))
+	if err != nil {
+		t.Fatalf("glob release regression human fixtures: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no release regression human fixtures found")
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read release regression human fixture %s: %v", path, err)
+		}
+		if bytes.Contains(data, []byte{'\r'}) {
+			t.Fatalf("release regression human fixture %s contains CR bytes; fixtures are reviewed as exact LF-only bytes", path)
+		}
+		if !bytes.HasSuffix(data, []byte{'\n'}) {
+			t.Fatalf("release regression human fixture %s must end with LF", path)
+		}
+	}
+}
+
 func TestReleaseRegressionHighCountDeterminismAndCloseReopenReplay(t *testing.T) {
 	for scenarioID := range releaseRegressionScenarios() {
 		t.Run(scenarioID, func(t *testing.T) {
