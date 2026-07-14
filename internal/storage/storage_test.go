@@ -1895,6 +1895,87 @@ func TestRetryWriteTxNormalAttemptCanOutliveRetryMaxElapsed(t *testing.T) {
 	}
 }
 
+func TestRetryWriteTxBusinessDeadlineAfterBusyIsNotRetriedOrRewritten(t *testing.T) {
+	ctx := context.Background()
+	busyErr := storageSQLiteBusyError(t)
+	clock := newManualWriteTxRetryClock(time.Now().Add(time.Hour))
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 3,
+		MaxElapsed:  time.Minute,
+		Backoff:     func(int) time.Duration { return 0 },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return busyErr
+		case 2:
+			if err := attemptCtx.Err(); err != nil {
+				t.Fatalf("second attempt internal context error before business failure = %v, want nil", err)
+			}
+			if _, ok := attemptCtx.Deadline(); !ok {
+				t.Fatal("second attempt did not receive retry internal deadline")
+			}
+			return context.DeadlineExceeded
+		default:
+			t.Fatalf("unexpected retry attempt %d after non-busy deadline", attempts)
+			return nil
+		}
+	})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want exact context.DeadlineExceeded", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if clock.sleeps != 0 {
+		t.Fatalf("retry sleeps = %d, want 0 with zero backoff", clock.sleeps)
+	}
+}
+
+func TestRetryWriteTxExpiredInternalDeadlineReturnsTypedBusy(t *testing.T) {
+	ctx := context.Background()
+	busyErr := storageSQLiteBusyError(t)
+	clock := newManualWriteTxRetryClock(time.Now().Add(-time.Hour))
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 3,
+		MaxElapsed:  time.Minute,
+		Backoff:     func(int) time.Duration { return 0 },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return busyErr
+		case 2:
+			if err := attemptCtx.Err(); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("second attempt internal context error = %v, want context.DeadlineExceeded", err)
+			}
+			return attemptCtx.Err()
+		default:
+			t.Fatalf("unexpected retry attempt %d after internal deadline", attempts)
+			return nil
+		}
+	})
+	if err != busyErr {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want original typed busy %T %[2]v", err, busyErr)
+	}
+	if !IsBusy(err) {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want storage.IsBusy", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
 func TestWithWriteTxRetriesBusyBeginAfterRollbackBoundary(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -2668,6 +2749,42 @@ func beginImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB
 		t.Fatalf("begin immediate lock: %v", err)
 	}
 	return db, conn
+}
+
+func storageSQLiteBusyError(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "busy.db")
+	db1, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open busy db1: %v", err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open busy db2: %v", err)
+	}
+	defer db2.Close()
+	for _, db := range []*sql.DB{db1, db2} {
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+			t.Fatalf("set busy timeout: %v", err)
+		}
+	}
+	conn1, err := db1.Conn(ctx)
+	if err != nil {
+		t.Fatalf("busy conn1: %v", err)
+	}
+	defer conn1.Close()
+	if _, err := conn1.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin busy lock: %v", err)
+	}
+	defer conn1.ExecContext(ctx, `ROLLBACK`)
+	_, err = db2.ExecContext(ctx, `BEGIN IMMEDIATE`)
+	if err == nil || !IsBusy(err) {
+		t.Fatalf("generated busy error = %T %[1]v, want typed SQLITE_BUSY", err)
+	}
+	return err
 }
 
 func fixedNow() time.Time {

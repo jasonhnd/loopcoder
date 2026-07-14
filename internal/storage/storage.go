@@ -753,12 +753,16 @@ func retryWriteTx(ctx context.Context, policy writeTxRetryPolicy, op func(contex
 		}
 		attemptCtx := ctx
 		cancel := func() {}
+		attemptHasInternalDeadline := false
 		if retryWindowStarted && policy.useAttemptDeadline && policy.maxElapsed > 0 {
 			attemptCtx, cancel = context.WithDeadline(ctx, deadline)
+			attemptHasInternalDeadline = true
 		}
 		err = op(attemptCtx)
+		attemptCtxErr := attemptCtx.Err()
 		cancel()
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && lastBusyErr != nil {
+		internalAttemptDeadlineExpired := attemptHasInternalDeadline && errors.Is(attemptCtxErr, context.DeadlineExceeded)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && lastBusyErr != nil && internalAttemptDeadlineExpired {
 			return lastBusyErr
 		}
 		if err == nil || !IsBusy(err) {
