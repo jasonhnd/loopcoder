@@ -32,6 +32,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/platform"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
@@ -117,6 +118,159 @@ func waitForTestSignal(t *testing.T, signal <-chan struct{}, failure string) {
 	}
 }
 
+func unsupportedPlatformNoSideEffectDeps(t *testing.T) Deps {
+	t.Helper()
+	fail := func(name string) {
+		t.Helper()
+		t.Fatalf("%s dependency should not be called on unsupported platform", name)
+	}
+	return Deps{
+		RuntimeGOOS:   "linux",
+		RuntimeGOARCH: "amd64",
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			fail("NewGitHubReader")
+			return nil
+		},
+		NewIssueWriter: func(string) compiler.IssueWriter {
+			fail("NewIssueWriter")
+			return nil
+		},
+		NewPreProdWriter: func(string) orchestration.PreProdWriter {
+			fail("NewPreProdWriter")
+			return nil
+		},
+		NewPromoteWriter: func(string) orchestration.PromotionWriter {
+			fail("NewPromoteWriter")
+			return nil
+		},
+		ProcessAlive: func(int) bool {
+			fail("ProcessAlive")
+			return false
+		},
+		Now: func() time.Time {
+			fail("Now")
+			return time.Time{}
+		},
+		IsTerminal: func(io.Writer) bool {
+			fail("IsTerminal")
+			return false
+		},
+		TerminalWidth: func(io.Writer) int {
+			fail("TerminalWidth")
+			return 0
+		},
+		Stdin: strings.NewReader(""),
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			fail("ComputeReadySet")
+			return report.ReadySetReport{}, errors.New("unexpected ComputeReadySet")
+		},
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			fail("Tick")
+			return orchestration.TickReport{}, errors.New("unexpected Tick")
+		},
+		Discover: func(context.Context, perception.Options) (perception.Report, error) {
+			fail("Discover")
+			return perception.Report{}, errors.New("unexpected Discover")
+		},
+		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
+			fail("Compile")
+			return compiler.Report{}, errors.New("unexpected Compile")
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			fail("Dispatch")
+			return worker.Result{}, errors.New("unexpected Dispatch")
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			fail("Loopreview")
+			return loopreview.Result{}, errors.New("unexpected Loopreview")
+		},
+		Promote: func(context.Context, orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			fail("Promote")
+			return orchestration.PromoteReport{}, errors.New("unexpected Promote")
+		},
+		Recover: func(context.Context, recovery.Options) (recovery.Result, error) {
+			fail("Recover")
+			return recovery.Result{}, errors.New("unexpected Recover")
+		},
+		Verify: func(context.Context, verify.Options) verify.Result {
+			fail("Verify")
+			return verify.Result{}
+		},
+		Audit: func(context.Context, audit.Options) (audit.Result, error) {
+			fail("Audit")
+			return audit.Result{}, errors.New("unexpected Audit")
+		},
+		Doctor: func(context.Context, doctor.Options) doctor.Report {
+			fail("Doctor")
+			return doctor.Report{}
+		},
+		ProviderInventory: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			fail("ProviderInventory")
+			return providerinventory.Report{}, errors.New("unexpected ProviderInventory")
+		},
+		ProviderInventoryRefresh: func(context.Context, providerinventory.Report, time.Time) error {
+			fail("ProviderInventoryRefresh")
+			return errors.New("unexpected ProviderInventoryRefresh")
+		},
+		ProviderQuotaRefresh: func(context.Context, providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+			fail("ProviderQuotaRefresh")
+			return providerinventory.RefreshResult{}, errors.New("unexpected ProviderQuotaRefresh")
+		},
+		ProviderQuotaStatus: func(context.Context, providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			fail("ProviderQuotaStatus")
+			return providerinventory.QuotaRefreshStatus{}, errors.New("unexpected ProviderQuotaStatus")
+		},
+		Init: func(context.Context, scaffold.Options) (scaffold.Result, error) {
+			fail("Init")
+			return scaffold.Result{}, errors.New("unexpected Init")
+		},
+		Upgrade: func(context.Context, upgrade.Options) (upgrade.Result, error) {
+			fail("Upgrade")
+			return upgrade.Result{}, errors.New("unexpected Upgrade")
+		},
+		MigrateLocalState: func(context.Context, localmigrate.Options) (localmigrate.Result, error) {
+			fail("MigrateLocalState")
+			return localmigrate.Result{}, errors.New("unexpected MigrateLocalState")
+		},
+		SkillInstall: func(context.Context, SkillInstallOptions) (SkillInstallResult, error) {
+			fail("SkillInstall")
+			return SkillInstallResult{}, errors.New("unexpected SkillInstall")
+		},
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			fail("StatePush")
+			return statebranch.PushResult{}, errors.New("unexpected StatePush")
+		},
+		StatePull: func(context.Context, statebranch.PullOptions) (statebranch.PullResult, error) {
+			fail("StatePull")
+			return statebranch.PullResult{}, errors.New("unexpected StatePull")
+		},
+		LeaseAcquire: func(context.Context, statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			fail("LeaseAcquire")
+			return statebranch.LeaseResult{}, errors.New("unexpected LeaseAcquire")
+		},
+		LeaseRelease: func(context.Context, statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			fail("LeaseRelease")
+			return statebranch.LeaseResult{}, errors.New("unexpected LeaseRelease")
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			fail("StartDetachedDispatch")
+			return 0, errors.New("unexpected StartDetachedDispatch")
+		},
+		KillProcessTree: func(int) error {
+			fail("KillProcessTree")
+			return errors.New("unexpected KillProcessTree")
+		},
+		ProcessAuthority: func(int, time.Time) (string, error) {
+			fail("ProcessAuthority")
+			return "", errors.New("unexpected ProcessAuthority")
+		},
+		VerifyProcessAuthority: func(int, string) error {
+			fail("VerifyProcessAuthority")
+			return errors.New("unexpected VerifyProcessAuthority")
+		},
+	}
+}
+
 func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	repo := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -160,6 +314,133 @@ func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	}
 	if payload.HostProfile.Name != "codex-cli" || payload.HostProfile.Source != "env" || len(payload.Checks) != 1 {
 		t.Fatalf("payload = %#v, want host profile and one check", payload)
+	}
+}
+
+func TestUnsupportedPlatformHumanDiagnosticGolden(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"dispatch", "--repo", t.TempDir()}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	const want = "LoopCoder v0.8.0 supports macOS Apple Silicon only (darwin/arm64).\n" +
+		"Actual platform: linux/amd64.\n" +
+		"LoopCoder v0.7.0 is the final legacy multi-platform release for Windows, Linux, WSL, containers, and Intel macOS.\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr:\n%s\nwant:\n%s", stderr.String(), want)
+	}
+}
+
+func TestUnsupportedPlatformDoctorJSONDiagnosticGolden(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	deps := unsupportedPlatformNoSideEffectDeps(t)
+	deps.Doctor = func(context.Context, doctor.Options) doctor.Report {
+		t.Fatal("Doctor dependency should not be called on unsupported platform")
+		return doctor.Report{}
+	}
+
+	exitCode := RunWithDeps([]string{"doctor", "--repo", t.TempDir(), "--format", "json"}, &stdout, &stderr, deps)
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	const want = `{"schema_version":"loopcoder.diagnostic.v1","error_code":"ErrUnsupportedPlatform","message":"LoopCoder v0.8.0 supports macOS Apple Silicon only (darwin/arm64).","supported":[{"goos":"darwin","goarch":"arm64"}],"actual":{"goos":"linux","goarch":"amd64"},"phase":"startup","exit_code":78,"side_effects_performed":false}` + "\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout:\n%s\nwant:\n%s", stdout.String(), want)
+	}
+}
+
+func TestUnsupportedPlatformGateRunsBeforeEveryCommand(t *testing.T) {
+	for _, command := range Commands() {
+		if command.Name == "version" {
+			continue
+		}
+		t.Run(command.Name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps([]string{command.Name}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+			if exitCode != platform.UnsupportedExitCode {
+				t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", exitCode, platform.UnsupportedExitCode, stdout.String(), stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if firstLine := strings.SplitN(stderr.String(), "\n", 2)[0]; firstLine != platform.HumanFirstLine {
+				t.Fatalf("first line = %q, want %q; stderr=%q", firstLine, platform.HumanFirstLine, stderr.String())
+			}
+		})
+	}
+}
+
+func TestUnsupportedPlatformUnknownCommandDoesNotBypassGate(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"not-a-command"}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if strings.Contains(stderr.String(), "unknown command") {
+		t.Fatalf("stderr = %q, want platform diagnostic before unknown-command handling", stderr.String())
+	}
+}
+
+func TestUnsupportedPlatformAllowsHelpAndVersionOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "root help", args: []string{"--help"}},
+		{name: "command help", args: []string{"dispatch", "--help"}},
+		{name: "root version", args: []string{"--version"}},
+		{name: "version command", args: []string{"version"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+			if exitCode != 0 {
+				t.Fatalf("exit = %d, want 0; stderr=%q", exitCode, stderr.String())
+			}
+			if stdout.Len() == 0 {
+				t.Fatal("stdout is empty, want help/version output")
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
+
+func TestSupportedPlatformInjectionPreservesDoctorBehavior(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+	exitCode := RunWithDeps([]string{"doctor", "--repo", repo}, &stdout, &stderr, Deps{
+		RuntimeGOOS:   platform.SupportedGOOS,
+		RuntimeGOARCH: platform.SupportedGOARCH,
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:    "supported platform",
+				Status:  doctor.StatusOK,
+				Message: "accepted",
+			}}}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stdout.String() != "[ok] supported platform: accepted\n" {
+		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
 
