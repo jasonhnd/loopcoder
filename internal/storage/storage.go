@@ -28,6 +28,9 @@ const (
 	driverName = "sqlite"
 
 	rollbackTimeout = 5 * time.Second
+
+	defaultWriteTxRetryMaxAttempts = 8
+	defaultWriteTxRetryMaxElapsed  = 6 * time.Second
 )
 
 // Store is the internal storage interface for v0.7 runtime state.
@@ -53,6 +56,7 @@ type Options struct {
 	Now  func() time.Time
 
 	WriteTxCommitHookForTest WriteTxCommitHookForTest
+	WriteTxRetry             WriteTxRetryOptions
 
 	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
 	deliveryV10BackupBufferFactoryForTest func() []byte
@@ -61,6 +65,21 @@ type Options struct {
 // WriteTxCommitHookForTest lets tests inject deterministic failures at the
 // final write transaction boundary without sharing mutable package state.
 type WriteTxCommitHookForTest func(context.Context, Tx, func(context.Context) error) error
+
+// WriteTxRetryOptions controls bounded whole-transaction retry for SQLite
+// BUSY/LOCKED contention. Zero values use the production defaults.
+type WriteTxRetryOptions struct {
+	MaxAttempts int
+	MaxElapsed  time.Duration
+	Backoff     func(attempt int) time.Duration
+	Clock       WriteTxRetryClock
+}
+
+// WriteTxRetryClock lets tests advance retry time without real sleeps.
+type WriteTxRetryClock interface {
+	Now() time.Time
+	Sleep(context.Context, time.Duration) error
+}
 
 type deliveryV10BackupPhase string
 
@@ -89,6 +108,7 @@ type sqliteStore struct {
 	db                                    *sql.DB
 	now                                   func() time.Time
 	writeTxCommitHookForTest              WriteTxCommitHookForTest
+	writeTxRetry                          writeTxRetryPolicy
 	sourceExistedBeforeOpen               bool
 	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
 	deliveryV10BackupBufferFactoryForTest func() []byte
@@ -101,6 +121,16 @@ type sqlTx struct {
 type sqlConnTx struct {
 	conn *sql.Conn
 }
+
+type writeTxRetryPolicy struct {
+	maxAttempts        int
+	maxElapsed         time.Duration
+	backoff            func(attempt int) time.Duration
+	clock              WriteTxRetryClock
+	useAttemptDeadline bool
+}
+
+type realWriteTxRetryClock struct{}
 
 var rollbackConnTxHookForTest func(*sql.Conn) error
 
@@ -508,6 +538,7 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 			db:                                    db,
 			now:                                   normalizeNow(opts.Now),
 			writeTxCommitHookForTest:              opts.WriteTxCommitHookForTest,
+			writeTxRetry:                          normalizeWriteTxRetryPolicy(opts.WriteTxRetry),
 			sourceExistedBeforeOpen:               sourceExistedBeforeOpen,
 			deliveryV10BackupHookForTest:          opts.deliveryV10BackupHookForTest,
 			deliveryV10BackupBufferFactoryForTest: opts.deliveryV10BackupBufferFactoryForTest,
@@ -643,6 +674,12 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 	if fn == nil {
 		return errors.New("storage write transaction: callback is required")
 	}
+	return retryWriteTx(ctx, s.writeTxRetry, func(attemptCtx context.Context) error {
+		return s.withWriteTxOnce(attemptCtx, fn)
+	})
+}
+
+func (s *sqliteStore) withWriteTxOnce(ctx context.Context, fn func(Tx) error) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("storage write transaction: connection: %w", err)
@@ -676,6 +713,113 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 		return fmt.Errorf("storage write transaction: commit: %w", commitErr)
 	}
 	return nil
+}
+
+func normalizeWriteTxRetryPolicy(opts WriteTxRetryOptions) writeTxRetryPolicy {
+	policy := writeTxRetryPolicy{
+		maxAttempts: opts.MaxAttempts,
+		maxElapsed:  opts.MaxElapsed,
+		backoff:     opts.Backoff,
+		clock:       opts.Clock,
+	}
+	if policy.maxAttempts <= 0 {
+		policy.maxAttempts = defaultWriteTxRetryMaxAttempts
+	}
+	if policy.maxElapsed <= 0 {
+		policy.maxElapsed = defaultWriteTxRetryMaxElapsed
+	}
+	if policy.backoff == nil {
+		policy.backoff = defaultWriteTxRetryBackoff
+	}
+	if policy.clock == nil {
+		policy.clock = realWriteTxRetryClock{}
+		policy.useAttemptDeadline = true
+	}
+	return policy
+}
+
+func defaultWriteTxRetryBackoff(attempt int) time.Duration {
+	return time.Duration(attempt) * 25 * time.Millisecond
+}
+
+func retryWriteTx(ctx context.Context, policy writeTxRetryPolicy, op func(context.Context) error) error {
+	var err error
+	var lastBusyErr error
+	var deadline time.Time
+	retryWindowStarted := false
+	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
+		if retryWindowStarted && policy.maxElapsed > 0 && !policy.clock.Now().Before(deadline) {
+			return lastBusyErr
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		attemptHasInternalDeadline := false
+		if retryWindowStarted && policy.useAttemptDeadline && policy.maxElapsed > 0 {
+			attemptCtx, cancel = context.WithDeadline(ctx, deadline)
+			attemptHasInternalDeadline = true
+		}
+		err = op(attemptCtx)
+		attemptCtxErr := attemptCtx.Err()
+		cancel()
+		internalAttemptDeadlineExpired := attemptHasInternalDeadline && errors.Is(attemptCtxErr, context.DeadlineExceeded)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && lastBusyErr != nil && internalAttemptDeadlineExpired {
+			return lastBusyErr
+		}
+		if err == nil || !IsBusy(err) {
+			return err
+		}
+		lastBusyErr = err
+		if !retryWindowStarted {
+			retryWindowStarted = true
+			if policy.maxElapsed > 0 {
+				deadline = policy.clock.Now().Add(policy.maxElapsed)
+			}
+		}
+		if attempt == policy.maxAttempts {
+			return err
+		}
+		if policy.maxElapsed > 0 && !policy.clock.Now().Before(deadline) {
+			return err
+		}
+		delay := policy.backoff(attempt)
+		if delay < 0 {
+			delay = 0
+		}
+		if policy.maxElapsed > 0 {
+			remaining := deadline.Sub(policy.clock.Now())
+			if remaining <= 0 {
+				return err
+			}
+			if delay > remaining {
+				delay = remaining
+			}
+		}
+		if delay == 0 {
+			continue
+		}
+		if sleepErr := policy.clock.Sleep(ctx, delay); sleepErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return sleepErr
+		}
+	}
+	return err
+}
+
+func (realWriteTxRetryClock) Now() time.Time {
+	return time.Now()
+}
+
+func (realWriteTxRetryClock) Sleep(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func rollbackConnTx(conn *sql.Conn) error {
@@ -720,7 +864,12 @@ func IsBusy(err error) bool {
 	}
 	var sqliteErr *moderncsqlite.Error
 	if errors.As(err, &sqliteErr) {
-		return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+		switch sqliteErr.Code() & 0xff {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+			return true
+		default:
+			return false
+		}
 	}
 	return false
 }

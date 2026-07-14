@@ -1812,6 +1812,410 @@ func TestWithWriteTxRollbackFailureDiscardsConnection(t *testing.T) {
 	}
 }
 
+func TestWithWriteTxFirstAttemptDoesNotAddRetryDeadline(t *testing.T) {
+	ctx := context.Background()
+	shortRetry := WriteTxRetryOptions{
+		MaxAttempts: 2,
+		MaxElapsed:  time.Nanosecond,
+		Backoff:     func(int) time.Duration { return 0 },
+	}
+	policy := normalizeWriteTxRetryPolicy(shortRetry)
+	if !policy.useAttemptDeadline {
+		t.Fatal("normalized real-clock retry policy did not enable attempt deadlines")
+	}
+	var retryLoopSawDeadline bool
+	if err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		_, retryLoopSawDeadline = attemptCtx.Deadline()
+		return nil
+	}); err != nil {
+		t.Fatalf("retryWriteTx returned error: %v", err)
+	}
+	if retryLoopSawDeadline {
+		t.Fatal("first successful retryWriteTx attempt received an internal deadline")
+	}
+
+	var commitHookCalls int
+	store, err := Open(ctx, Options{
+		Path: filepath.Join(t.TempDir(), "loopcoder.db"),
+		Now:  fixedNow,
+		WriteTxCommitHookForTest: func(hookCtx context.Context, tx Tx, commit func(context.Context) error) error {
+			commitHookCalls++
+			if deadline, ok := hookCtx.Deadline(); ok {
+				return fmt.Errorf("commit hook context has internal deadline %s", deadline.Format(time.RFC3339Nano))
+			}
+			return commit(hookCtx)
+		},
+		WriteTxRetry: shortRetry,
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('first-attempt-no-deadline', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	}); err != nil {
+		t.Fatalf("WithWriteTx returned error: %v", err)
+	}
+	if commitHookCalls != 1 {
+		t.Fatalf("commit hook calls = %d, want 1", commitHookCalls)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'first-attempt-no-deadline'`, 1)
+}
+
+func TestRetryWriteTxNormalAttemptCanOutliveRetryMaxElapsed(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualWriteTxRetryClock(fixedNow())
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 2,
+		MaxElapsed:  time.Millisecond,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		if deadline, ok := attemptCtx.Deadline(); ok {
+			return fmt.Errorf("normal attempt has internal deadline %s", deadline.Format(time.RFC3339Nano))
+		}
+		clock.now = clock.now.Add(time.Hour)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryWriteTx returned error: %v", err)
+	}
+	if attempts != 1 || clock.sleeps != 0 {
+		t.Fatalf("attempts/sleeps = %d/%d, want 1/0", attempts, clock.sleeps)
+	}
+	if !clock.now.After(fixedNow().Add(policy.maxElapsed)) {
+		t.Fatalf("clock now = %s, want beyond retry max elapsed", clock.now.Format(time.RFC3339Nano))
+	}
+}
+
+func TestRetryWriteTxBusinessDeadlineAfterBusyIsNotRetriedOrRewritten(t *testing.T) {
+	ctx := context.Background()
+	busyErr := storageSQLiteBusyError(t)
+	clock := newManualWriteTxRetryClock(time.Now().Add(time.Hour))
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 3,
+		MaxElapsed:  time.Minute,
+		Backoff:     func(int) time.Duration { return 0 },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return busyErr
+		case 2:
+			if err := attemptCtx.Err(); err != nil {
+				t.Fatalf("second attempt internal context error before business failure = %v, want nil", err)
+			}
+			if _, ok := attemptCtx.Deadline(); !ok {
+				t.Fatal("second attempt did not receive retry internal deadline")
+			}
+			return context.DeadlineExceeded
+		default:
+			t.Fatalf("unexpected retry attempt %d after non-busy deadline", attempts)
+			return nil
+		}
+	})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want exact context.DeadlineExceeded", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if clock.sleeps != 0 {
+		t.Fatalf("retry sleeps = %d, want 0 with zero backoff", clock.sleeps)
+	}
+}
+
+func TestRetryWriteTxExpiredInternalDeadlineReturnsTypedBusy(t *testing.T) {
+	ctx := context.Background()
+	busyErr := storageSQLiteBusyError(t)
+	clock := newManualWriteTxRetryClock(time.Now().Add(-time.Hour))
+	policy := normalizeWriteTxRetryPolicy(WriteTxRetryOptions{
+		MaxAttempts: 3,
+		MaxElapsed:  time.Minute,
+		Backoff:     func(int) time.Duration { return 0 },
+		Clock:       clock,
+	})
+	policy.useAttemptDeadline = true
+
+	attempts := 0
+	err := retryWriteTx(ctx, policy, func(attemptCtx context.Context) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return busyErr
+		case 2:
+			if err := attemptCtx.Err(); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("second attempt internal context error = %v, want context.DeadlineExceeded", err)
+			}
+			return attemptCtx.Err()
+		default:
+			t.Fatalf("unexpected retry attempt %d after internal deadline", attempts)
+			return nil
+		}
+	})
+	if err != busyErr {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want original typed busy %T %[2]v", err, busyErr)
+	}
+	if !IsBusy(err) {
+		t.Fatalf("retryWriteTx error = %T %[1]v, want storage.IsBusy", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestWithWriteTxRetriesBusyBeginAfterRollbackBoundary(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	clock := newManualWriteTxRetryClock(fixedNow())
+	store, err := Open(ctx, Options{
+		Path: path,
+		Now:  fixedNow,
+		WriteTxRetry: WriteTxRetryOptions{
+			MaxAttempts: 3,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	setStoreBusyTimeout(t, ctx, store, 1)
+
+	lockDB, lockConn := beginImmediateLock(t, ctx, path)
+	defer lockDB.Close()
+	lockReleased := false
+	clock.onSleep = func() {
+		if lockReleased {
+			return
+		}
+		lockReleased = true
+		if _, err := lockConn.ExecContext(ctx, `ROLLBACK`); err != nil {
+			t.Fatalf("release lock: %v", err)
+		}
+		lockConn.Close()
+	}
+
+	closureCalls := 0
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		closureCalls++
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('retry-success', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("WithWriteTx returned error: %v", err)
+	}
+	if closureCalls != 1 {
+		t.Fatalf("closure calls = %d, want only successful transaction attempt", closureCalls)
+	}
+	if clock.sleeps != 1 {
+		t.Fatalf("retry sleeps = %d, want 1", clock.sleeps)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'retry-success'`, 1)
+}
+
+func TestWithWriteTxBusyExhaustionReturnsTypedOriginal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	clock := newManualWriteTxRetryClock(fixedNow())
+	store, err := Open(ctx, Options{
+		Path: path,
+		Now:  fixedNow,
+		WriteTxRetry: WriteTxRetryOptions{
+			MaxAttempts: 2,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	setStoreBusyTimeout(t, ctx, store, 1)
+	lockDB, lockConn := beginImmediateLock(t, ctx, path)
+	defer lockDB.Close()
+	defer lockConn.Close()
+	defer lockConn.ExecContext(ctx, `ROLLBACK`)
+
+	closureCalls := 0
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		closureCalls++
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('retry-exhausted', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	})
+	if err == nil || !IsBusy(err) || !strings.Contains(err.Error(), "storage write transaction: begin immediate") {
+		t.Fatalf("WithWriteTx error = %T %[1]v, want typed busy begin error", err)
+	}
+	if closureCalls != 0 {
+		t.Fatalf("closure calls = %d, want 0 when BEGIN IMMEDIATE never succeeds", closureCalls)
+	}
+	if clock.sleeps != 1 {
+		t.Fatalf("retry sleeps = %d, want 1", clock.sleeps)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'retry-exhausted'`, 0)
+}
+
+func TestWithWriteTxCancellationStopsBusyRetryBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "loopcoder.db")
+	clock := newManualWriteTxRetryClock(fixedNow())
+	store, err := Open(ctx, Options{
+		Path: path,
+		Now:  fixedNow,
+		WriteTxRetry: WriteTxRetryOptions{
+			MaxAttempts: 4,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Second },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	setStoreBusyTimeout(t, ctx, store, 1)
+	lockDB, lockConn := beginImmediateLock(t, context.Background(), path)
+	defer lockDB.Close()
+	defer lockConn.Close()
+	defer lockConn.ExecContext(context.Background(), `ROLLBACK`)
+	clock.onSleep = cancel
+
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('retry-cancelled', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WithWriteTx error = %v, want context.Canceled", err)
+	}
+	if clock.sleeps != 1 {
+		t.Fatalf("retry sleeps = %d, want cancellation during first backoff", clock.sleeps)
+	}
+}
+
+func TestWithWriteTxNonBusyErrorsAreNotRetriedAndRollback(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualWriteTxRetryClock(fixedNow())
+	store, err := Open(ctx, Options{
+		Path: filepath.Join(t.TempDir(), "loopcoder.db"),
+		Now:  fixedNow,
+		WriteTxRetry: WriteTxRetryOptions{
+			MaxAttempts: 4,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	wantErr := errors.New("validation failed")
+	closureCalls := 0
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		closureCalls++
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('non-busy-rollback', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+			return err
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("WithWriteTx error = %v, want %v", err, wantErr)
+	}
+	if closureCalls != 1 || clock.sleeps != 0 {
+		t.Fatalf("closure calls/sleeps = %d/%d, want 1/0", closureCalls, clock.sleeps)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'non-busy-rollback'`, 0)
+}
+
+func TestWithWriteTxNonBusyCommitErrorIsNotRetriedAndRollback(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualWriteTxRetryClock(fixedNow())
+	wantErr := errors.New("commit hook failed")
+	store, err := Open(ctx, Options{
+		Path: filepath.Join(t.TempDir(), "loopcoder.db"),
+		Now:  fixedNow,
+		WriteTxCommitHookForTest: func(context.Context, Tx, func(context.Context) error) error {
+			return wantErr
+		},
+		WriteTxRetry: WriteTxRetryOptions{
+			MaxAttempts: 4,
+			MaxElapsed:  time.Minute,
+			Backoff:     func(int) time.Duration { return time.Millisecond },
+			Clock:       clock,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	closureCalls := 0
+	err = store.WithWriteTx(ctx, func(tx Tx) error {
+		closureCalls++
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES ('commit-non-busy-rollback', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+		return err
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("WithWriteTx error = %v, want %v", err, wantErr)
+	}
+	if closureCalls != 1 || clock.sleeps != 0 {
+		t.Fatalf("closure calls/sleeps = %d/%d, want 1/0", closureCalls, clock.sleeps)
+	}
+	assertCountInStore(t, ctx, store, `SELECT COUNT(*) FROM projects WHERE id = 'commit-non-busy-rollback'`, 0)
+}
+
+func TestIsBusyRecognizesSQLiteLockedCode(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open(driverName, filepath.Join(t.TempDir(), "locked.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	for _, statement := range []string{
+		`CREATE TABLE t(id INTEGER PRIMARY KEY)`,
+		`INSERT INTO t(id) VALUES (1), (2)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("seed locked fixture: %v", err)
+		}
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, `SELECT id FROM t`)
+	if err != nil {
+		t.Fatalf("open rows: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("expected first row")
+	}
+	_, err = conn.ExecContext(ctx, `DROP TABLE t`)
+	if err == nil || !IsBusy(err) {
+		t.Fatalf("DROP TABLE error = %T %[1]v, want SQLITE_LOCKED classified as busy", err)
+	}
+}
+
 func TestCheckHealthRejectsCorruptDurableRunGraph(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "loopcoder.db")
@@ -2284,6 +2688,103 @@ func seedRunGraphRows(t *testing.T, ctx context.Context, store Store, runs []Run
 	}); err != nil {
 		t.Fatalf("seed run graph rows: %v", err)
 	}
+}
+
+type manualWriteTxRetryClock struct {
+	now     time.Time
+	sleeps  int
+	onSleep func()
+}
+
+func newManualWriteTxRetryClock(now time.Time) *manualWriteTxRetryClock {
+	return &manualWriteTxRetryClock{now: now}
+}
+
+func (c *manualWriteTxRetryClock) Now() time.Time {
+	return c.now
+}
+
+func (c *manualWriteTxRetryClock) Sleep(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.sleeps++
+	c.now = c.now.Add(delay)
+	if c.onSleep != nil {
+		c.onSleep()
+	}
+	return ctx.Err()
+}
+
+func setStoreBusyTimeout(t *testing.T, ctx context.Context, store Store, millis int) {
+	t.Helper()
+	sqliteStore, ok := store.(*sqliteStore)
+	if !ok {
+		t.Fatalf("store type = %T, want *sqliteStore", store)
+	}
+	if _, err := sqliteStore.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, millis)); err != nil {
+		t.Fatalf("set busy_timeout: %v", err)
+	}
+}
+
+func beginImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB, *sql.Conn) {
+	t.Helper()
+	db, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open lock db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+		_ = db.Close()
+		t.Fatalf("set lock busy_timeout: %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("lock conn: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("begin immediate lock: %v", err)
+	}
+	return db, conn
+}
+
+func storageSQLiteBusyError(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "busy.db")
+	db1, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open busy db1: %v", err)
+	}
+	defer db1.Close()
+	db2, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open busy db2: %v", err)
+	}
+	defer db2.Close()
+	for _, db := range []*sql.DB{db1, db2} {
+		db.SetMaxOpenConns(1)
+		if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+			t.Fatalf("set busy timeout: %v", err)
+		}
+	}
+	conn1, err := db1.Conn(ctx)
+	if err != nil {
+		t.Fatalf("busy conn1: %v", err)
+	}
+	defer conn1.Close()
+	if _, err := conn1.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin busy lock: %v", err)
+	}
+	defer conn1.ExecContext(ctx, `ROLLBACK`)
+	_, err = db2.ExecContext(ctx, `BEGIN IMMEDIATE`)
+	if err == nil || !IsBusy(err) {
+		t.Fatalf("generated busy error = %T %[1]v, want typed SQLITE_BUSY", err)
+	}
+	return err
 }
 
 func fixedNow() time.Time {
