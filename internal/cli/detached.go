@@ -790,12 +790,13 @@ func persistDetachedReceipt(ctx context.Context, store storage.Store, record det
 	if err != nil {
 		return "", err
 	}
+	sinkID, originID, transport := codexHostSink(record.ProjectID, record.RunID, record.RunID, "detached-run-status")
 	result, err := progress.PersistReceiptWithObligation(ctx, store, normalized, progress.DeliveryObligation{
 		OriginKind:        "progress-receipt",
-		OriginID:          normalized.CorrelationID,
+		OriginID:          originID,
 		SinkKind:          "host",
-		SinkID:            "detached-run-status",
-		TransportContract: "host-jsonl-v1",
+		SinkID:            sinkID,
+		TransportContract: transport,
 		AckPolicy:         progress.DeliveryAckPolicyRequired,
 		MaxAttempts:       3,
 	})

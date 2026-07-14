@@ -39,6 +39,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -2362,6 +2363,674 @@ func assertNoStatusCanaryFragments(t *testing.T, name, text, canary string) {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("%s leaked canary fragment %q:\n%s", name, forbidden, text)
 		}
+	}
+}
+
+func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-replay")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-replay"
+		r.CorrelationSequence = 4
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "detached run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = runID
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "899",
+		"--issue-title", "Codex replay",
+		"--run-id", runID,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("worker started before Codex progress replay was emitted: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != runID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, runID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after dispatch replay: %v", err)
+	}
+	defer store.Close()
+	obligations, err := progress.ListDeliveryObligations(context.Background(), store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligations after replay = %#v, want pending and unattempted", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(context.Background(), store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after replay = %#v, want none", acks)
+	}
+}
+
+func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-next-invocation")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next"
+		r.CorrelationSequence = 5
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "prior run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	heartbeat := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next-heartbeat"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-supervisor-heartbeat"
+		r.Status = "running"
+		r.NextAction = progress.ActionState{State: "continue", Summary: "heartbeat chatter"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, heartbeat, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation heartbeat fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-new-dispatch"
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Next invocation replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if opts.RunID != "" {
+				return worker.Result{}, fmt.Errorf("ordinary dispatch opts.RunID = %q, want empty", opts.RunID)
+			}
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || !strings.Contains(stderr.String(), priorRunID) {
+				return worker.Result{}, fmt.Errorf("worker started before prior Codex progress replay was emitted: %q", stderr.String())
+			}
+			if strings.Contains(stderr.String(), "detached-supervisor-heartbeat") || strings.Contains(stderr.String(), "heartbeat chatter") {
+				return worker.Result{}, fmt.Errorf("non-consequential heartbeat was replayed: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != result.RunID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+}
+
+func TestCodexHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-render-failure")
+	t.Setenv("CODEX_CLI", "1")
+	created, binding := persistCodexReplayFixture(t, store, projectID, runID, "", "receipt survives failed stderr render", 7)
+
+	renderErr := errors.New("stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retry replay count = %d, want 1", count)
+	}
+	if !strings.Contains(stderr.String(), "receipt survives failed stderr render") {
+		t.Fatalf("retry stderr missing receipt:\n%s", stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want one unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
+func TestCodexHostReplayCandidatesSkipExhaustedCursorGroupsBeforeLimit(t *testing.T) {
+	_, _, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-candidate-live-window")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	for i := 0; i < 3; i++ {
+		runID := fmt.Sprintf("run-a-exhausted-%03d", i)
+		_, binding := persistCodexReplayFixture(t, store, projectID, runID, stableOriginRef, fmt.Sprintf("exhausted matching %03d", i), i+10)
+		result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+			ProjectID:     projectID,
+			DeliveryRunID: runID,
+			OriginKind:    "host-run-origin",
+			OriginID:      binding.BindingID,
+			ClaimOwner:    "codex-query-test",
+			Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+		}, func(progress.ReceiptView) error { return nil })
+		if err != nil {
+			t.Fatalf("ReplayPendingForHost exhausted %s: %v", runID, err)
+		}
+		if result.Replayed != 1 {
+			t.Fatalf("exhausted replay %s = %#v, want one cursor advance", runID, result)
+		}
+	}
+	targetRunID := "run-z-live-candidate"
+	_, targetBinding := persistCodexReplayFixture(t, store, projectID, targetRunID, stableOriginRef, "later live matching receipt", 99)
+	candidates, err := codexHostReplayCandidates(ctx, store, projectID, stableOriginRef, time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC), 1)
+	if err != nil {
+		t.Fatalf("codexHostReplayCandidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].deliveryRunID != targetRunID || candidates[0].sinkID != targetBinding.BindingID {
+		t.Fatalf("candidates = %#v, want only live target %s", candidates, targetRunID)
+	}
+}
+
+func TestCodexHostReplayCandidatesKeepStaleCursorAnchorsDiscoverable(t *testing.T) {
+	_, _, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-candidate-stale-cursor")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	staleRunID := "run-a-stale-cursor-candidate"
+	_, staleBinding := persistCodexReplayFixture(t, store, projectID, staleRunID, stableOriginRef, "stale cursor candidate", 77)
+	result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+		ProjectID:     projectID,
+		DeliveryRunID: staleRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      staleBinding.BindingID,
+		ClaimOwner:    "codex-stale-query-test",
+		Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+	}, func(progress.ReceiptView) error { return nil })
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost stale candidate: %v", err)
+	}
+	if result.Replayed != 1 {
+		t.Fatalf("stale candidate replay = %#v, want one cursor advance", result)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: staleRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      staleBinding.BindingID,
+		Limit:         1,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 {
+		t.Fatalf("cursors = %#v, want one", cursors)
+	}
+	corrupt := cursors[0]
+	corrupt.ObligationID = "pdelobl_missing_anchor"
+	payload, err := json.Marshal(corrupt)
+	if err != nil {
+		t.Fatalf("marshal corrupt cursor: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE progress_delivery_replay_cursors SET payload_json = ? WHERE cursor_id = ?`, string(payload), corrupt.CursorID)
+		return err
+	}); err != nil {
+		t.Fatalf("corrupt cursor payload: %v", err)
+	}
+	persistCodexReplayFixture(t, store, projectID, "run-z-live-after-stale-cursor", stableOriginRef, "live after stale cursor", 78)
+	candidates, err := codexHostReplayCandidates(ctx, store, projectID, stableOriginRef, time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC), 1)
+	if err != nil {
+		t.Fatalf("codexHostReplayCandidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].deliveryRunID != staleRunID || candidates[0].sinkID != staleBinding.BindingID {
+		t.Fatalf("candidates = %#v, want stale cursor candidate %s", candidates, staleRunID)
+	}
+	var stderr bytes.Buffer
+	_, err = replayCodexHostProgressForBinding(ctx, store, projectID, staleRunID, staleBinding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if !errors.Is(err, progress.ErrMissingReference) {
+		t.Fatalf("stale cursor replay error = %v, want ErrMissingReference", err)
+	}
+	if strings.Contains(stderr.String(), "stale cursor candidate") {
+		t.Fatalf("stale cursor replay emitted from zero instead of failing closed:\n%s", stderr.String())
+	}
+}
+
+func TestDispatchWithoutRunIDBoundedReplayProgressesPastExhaustedAndUnrelatedCandidateGroups(t *testing.T) {
+	repo, _, store := setupStatusProgressFixture(t)
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-live-window")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	for i := 0; i < progress.DefaultHostReplayLimit+5; i++ {
+		runID := fmt.Sprintf("run-a-exhausted-over-limit-%03d", i)
+		_, binding := persistCodexReplayFixture(t, store, projectID, runID, stableOriginRef, fmt.Sprintf("exhausted matching over limit %03d", i), i+100)
+		result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+			ProjectID:     projectID,
+			DeliveryRunID: runID,
+			OriginKind:    "host-run-origin",
+			OriginID:      binding.BindingID,
+			ClaimOwner:    "codex-over-limit-test",
+			Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+		}, func(progress.ReceiptView) error { return nil })
+		if err != nil {
+			t.Fatalf("ReplayPendingForHost exhausted %s: %v", runID, err)
+		}
+		if result.Replayed != 1 {
+			t.Fatalf("exhausted replay %s = %#v, want one cursor advance", runID, result)
+		}
+	}
+	for i := 0; i < progress.DefaultHostReplayLimit+5; i++ {
+		runID := fmt.Sprintf("run-b-unrelated-over-limit-%03d", i)
+		persistCodexReplayFixture(t, store, projectID, runID, fmt.Sprintf("sha256:unrelated-origin-%03d", i), fmt.Sprintf("unrelated origin over limit %03d", i), i+300)
+	}
+	targetRunID := "run-z-later-matching-over-limit"
+	persistCodexReplayFixture(t, store, projectID, targetRunID, stableOriginRef, "later matching receipt after exhausted and unrelated groups", 999)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-over-limit-replay"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "903",
+		"--issue-title", "Over limit replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			text := stderr.String()
+			if !strings.Contains(text, "replaying 1 pending progress receipt") || !strings.Contains(text, "later matching receipt after exhausted and unrelated groups") {
+				return worker.Result{}, fmt.Errorf("later matching receipt was not replayed before dispatch: %q", text)
+			}
+			if strings.Contains(text, "exhausted matching over limit") || strings.Contains(text, "unrelated origin over limit") {
+				return worker.Result{}, fmt.Errorf("earlier exhausted or unrelated receipt replayed: %q", text)
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != result.RunID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+	}
+}
+
+func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-a")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-origin-mismatch"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-b")
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-origin-mismatch-new"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Origin mismatch",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now:      func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) { return result, nil },
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || strings.Contains(stderr.String(), "progress receipt") {
+		t.Fatalf("origin mismatch replayed prior receipt:\n%s", stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+}
+
+func persistCodexReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := codexHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func TestDispatchReplaysCancelledDetachedRunAndLeavesUnacknowledged(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv("CODEX_THREAD_ID", "thread-cancelled-detached-replay")
+	t.Setenv("CODEX_CLI", "1")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-cancelled-detached-replay",
+		Owner:          "owner-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    899,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "902",
+		"--issue-title", "After cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := codexHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("cancelled obligation after replay = %#v, want pending and unacknowledged", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("cancelled replay acknowledgments = %#v, want none", acks)
 	}
 }
 
@@ -8751,6 +9420,39 @@ type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("writer closed")
+}
+
+type partialFailingWriter struct {
+	buf          bytes.Buffer
+	writes       int
+	failOnWrite  int
+	partialBytes int
+	err          error
+}
+
+func (w *partialFailingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failOnWrite {
+		n := w.partialBytes
+		if n < 0 {
+			n = 0
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		if w.err != nil {
+			return n, w.err
+		}
+		return n, errors.New("partial write failed")
+	}
+	return w.buf.Write(p)
+}
+
+func (w *partialFailingWriter) String() string {
+	return w.buf.String()
 }
 
 func beginCLISQLiteImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB, *sql.Conn) {

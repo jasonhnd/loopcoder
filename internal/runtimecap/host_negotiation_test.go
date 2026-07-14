@@ -3,7 +3,10 @@ package runtimecap_test
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -176,6 +179,72 @@ func TestNegotiateHostProgressDoesNotInferActiveSupportFromProfile(t *testing.T)
 	}
 }
 
+func TestCodexHostDeclaresOnlyDocumentedProgressCapabilities(t *testing.T) {
+	host, ok := runtimecap.LookupHost("codex-cli")
+	if !ok {
+		t.Fatal("LookupHost(codex-cli) returned false")
+	}
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "fixture"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll || contract.Progress.AckPolicy != runtimecap.HostProgressAckNone {
+		t.Fatalf("Codex progress = %#v, want durable follow/poll without ack", contract.Progress)
+	}
+	for capability, want := range map[runtimecap.HostCapability]runtimecap.HostCapabilitySupport{
+		runtimecap.HostDurablePolling:        runtimecap.HostCapabilitySupported,
+		runtimecap.HostResumableFollow:       runtimecap.HostCapabilitySupported,
+		runtimecap.HostDetachedSteering:      runtimecap.HostCapabilityUnknown,
+		runtimecap.HostDetachedCancellation:  runtimecap.HostCapabilitySupported,
+		runtimecap.HostCallbacks:             runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostWakeUp:                runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostAcknowledgment:        runtimecap.HostCapabilityUnsupported,
+		runtimecap.HostManagedBackgroundWork: runtimecap.HostCapabilityUnsupported,
+	} {
+		if got := capabilitySupport(contract.Capabilities, capability); got != want {
+			t.Fatalf("%s support = %q, want %q", capability, got, want)
+		}
+	}
+	if got := stageCode(contract.Progress.Stages, runtimecap.HostProgressStageWakeUp); got != runtimecap.HostStageUnsupported {
+		t.Fatalf("wake stage = %q, want unsupported", got)
+	}
+	if got := stageCode(contract.Progress.Stages, runtimecap.HostProgressStageAcknowledgment); got != runtimecap.HostStageUnsupported {
+		t.Fatalf("ack stage = %q, want unsupported", got)
+	}
+}
+
+func TestRealCodexCLISmokeDocumentedCapabilities(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("real Codex CLI smoke is limited to macOS Apple Silicon")
+	}
+	if testing.Short() {
+		t.Skip("real Codex CLI smoke is opt-in")
+	}
+	if _, ok := os.LookupEnv("LOOPCODER_REAL_CODEX_SMOKE"); !ok {
+		t.Skip("set LOOPCODER_REAL_CODEX_SMOKE=1 to run the credential-free Codex CLI smoke")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skipf("codex CLI not on PATH: %v", err)
+	}
+	out, err := exec.Command("codex", "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("codex --version failed: %v\n%s", err, string(out))
+	}
+	host, _ := runtimecap.LookupHost("codex-cli")
+	contract := runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host:          runtimecap.HostProfileRecord{Name: host.Name, Source: "real-smoke"},
+		Capabilities:  runtimecap.HostCapabilityDeclarations(host),
+	})
+	if contract.Progress.TransportContract != runtimecap.HostProgressDurableFollowPoll ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostCallbacks) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostWakeUp) != runtimecap.HostCapabilityUnsupported ||
+		capabilitySupport(contract.Capabilities, runtimecap.HostAcknowledgment) != runtimecap.HostCapabilityUnsupported {
+		t.Fatalf("real Codex smoke declared unsupported callback/wake/ack incorrectly: %#v", contract.Progress)
+	}
+}
+
 func TestNegotiateHostProviderModelIndependence(t *testing.T) {
 	hostRequest := runtimecap.HostNegotiationRequest{
 		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
@@ -192,6 +261,7 @@ func TestNegotiateHostProviderModelIndependence(t *testing.T) {
 	providers := []providerCase{
 		{provider: "codex", model: "gpt-5.5", invoked: new(int)},
 		{provider: "claude", model: "claude-opus-4.5", invoked: new(int)},
+		{provider: "gemini", model: "gemini-3.1-pro", invoked: new(int)},
 		{provider: "grok", model: "grok-build", invoked: new(int)},
 		{provider: "synthetic", model: "future-model", invoked: new(int)},
 	}
