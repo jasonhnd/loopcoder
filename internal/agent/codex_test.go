@@ -380,3 +380,17 @@ tokens used: 1,234
 		})
 	}
 }
+
+func TestParseCodexInvocationStripsANSITokenUsage(t *testing.T) {
+	output := []byte("model: gpt-5.5\nreasoning effort: high\n\x1b[2mtokens used\x1b[0m\n223,795\n")
+	got := parseCodexInvocation(output)
+	if got.Model != "gpt-5.5" {
+		t.Fatalf("model = %q", got.Model)
+	}
+	if got.Usage.TotalTokens == nil || *got.Usage.TotalTokens != 223795 {
+		t.Fatalf("tokens = %#v", got.Usage.TotalTokens)
+	}
+	if err := validateCodexSuccessMetadata(got); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
