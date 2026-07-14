@@ -254,6 +254,120 @@ func TestGrokOrdinaryWorkerDefaultTestsDoNotUseLiveSmokeGate(t *testing.T) {
 	}
 }
 
+func TestGrokFreshAbsentUpgradeRollbackCompositionPreservesOtherAdapters(t *testing.T) {
+	root := t.TempDir()
+	exes := map[string]string{}
+	for _, name := range []string{"codex", "claude", "grok", "agy"} {
+		path := filepath.Join(root, name, executableName(name))
+		writeExecutable(t, path)
+		exes[name] = path
+	}
+	baseVersions := map[string]string{
+		filepath.Clean(exes["codex"]):  "codex 0.9.0",
+		filepath.Clean(exes["claude"]): "claude 1.2.3",
+		filepath.Clean(exes["grok"]):   "grok 0.1.211",
+		filepath.Clean(exes["agy"]):    "agy 2.0.0",
+	}
+	run := func(t *testing.T, name string, versions map[string]string, includeGrok bool) Report {
+		t.Helper()
+		deps := fakeDeps(t, versions)
+		deps.Getenv = func(key string) string {
+			if key == "PATH" {
+				return filepath.Join(root, "empty-path-"+name)
+			}
+			return ""
+		}
+		deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+			base := filepath.Base(req.Argv[0])
+			switch {
+			case base == executableName("grok") && len(req.Argv) == 2 && req.Argv[1] == "version":
+				return ProbeExecutionResult{Stdout: versions[filepath.Clean(req.Argv[0])] + "\n", ExitCode: 0}, nil
+			case base == executableName("grok") && len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+				return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+			case base == executableName("grok") && len(req.Argv) == 2 && req.Argv[1] == "models":
+				t.Fatalf("%s: grok catalog probe ran without explicit network grant: %#v", name, req.Argv)
+			}
+			version := versions[filepath.Clean(req.Argv[0])]
+			if version == "" {
+				version = base + " 0.0.0"
+			}
+			return ProbeExecutionResult{Stdout: version + "\n", ExitCode: 0}, nil
+		}
+		executables := map[string][]string{
+			"codex":       {exes["codex"]},
+			"claude":      {exes["claude"]},
+			"antigravity": {exes["agy"]},
+		}
+		if includeGrok {
+			executables["grok"] = []string{exes["grok"]}
+		}
+		report, err := Discover(context.Background(), Options{
+			Config: config.Config{
+				Adapters: config.Adapters{Worker: "grok", Verifier: "claude"},
+				ProviderInventory: config.ProviderInventory{
+					Executables: executables,
+				},
+			},
+			Now: fixedInventoryNow,
+		}, deps)
+		if err != nil {
+			t.Fatalf("%s Discover: %v", name, err)
+		}
+		return report
+	}
+
+	fresh := run(t, "fresh", baseVersions, true)
+	baselineIDs := map[string]string{}
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		installation := installationForAdapter(t, fresh, adapterID)
+		if installation.InstallationState != InstallationInstalled {
+			t.Fatalf("fresh %s installation = %#v, want installed", adapterID, installation)
+		}
+		baselineIDs[adapterID] = installation.ProviderInstallationID
+		if len(capabilitiesForAdapter(fresh, adapterID)) == 0 {
+			t.Fatalf("fresh %s capabilities missing", adapterID)
+		}
+	}
+	if installationForAdapter(t, fresh, "grok").InstallationState != InstallationInstalled {
+		t.Fatalf("fresh grok installation = %#v, want installed", installationForAdapter(t, fresh, "grok"))
+	}
+	if got := findProbe(t, fresh, "grok", "catalog").NetworkPermission; got != NetworkDenied {
+		t.Fatalf("fresh grok catalog network permission = %s, want denied", got)
+	}
+
+	upgradedVersions := map[string]string{}
+	for key, value := range baseVersions {
+		upgradedVersions[key] = value
+	}
+	upgradedVersions[filepath.Clean(exes["grok"])] = "grok 0.1.212"
+	upgraded := run(t, "upgrade", upgradedVersions, true)
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		if got := installationForAdapter(t, upgraded, adapterID).ProviderInstallationID; got != baselineIDs[adapterID] {
+			t.Fatalf("upgrade rewrote %s installation id: got %s want %s", adapterID, got, baselineIDs[adapterID])
+		}
+	}
+	if installationForAdapter(t, upgraded, "grok").Version != "grok 0.1.212" {
+		t.Fatalf("upgrade grok version = %q", installationForAdapter(t, upgraded, "grok").Version)
+	}
+
+	rollback := run(t, "rollback", baseVersions, false)
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		if got := installationForAdapter(t, rollback, adapterID).ProviderInstallationID; got != baselineIDs[adapterID] {
+			t.Fatalf("rollback rewrote %s installation id: got %s want %s", adapterID, got, baselineIDs[adapterID])
+		}
+	}
+	if probe := findProbe(t, rollback, "grok", "install"); probe.Outcome != OutcomeNotInstalled || !contains(probe.GapReasons, "executable-not-found") {
+		t.Fatalf("rollback grok absent probe = %#v", probe)
+	}
+	payload, err := json.Marshal(rollback)
+	if err != nil {
+		t.Fatalf("marshal rollback report: %v", err)
+	}
+	if strings.Contains(string(payload), root) {
+		t.Fatalf("rollback report leaked unredacted fixture root: %s", payload)
+	}
+}
+
 func TestAdapterConformanceRejectsMalformedDeclarations(t *testing.T) {
 	tests := []struct {
 		name string
