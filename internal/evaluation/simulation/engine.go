@@ -724,6 +724,21 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 	models := modelSet(s.Inventory.Models)
 	budgets := budgetSet(s.BudgetAuthorities)
 	events := eventMap(s.InjectedEvents)
+	ordered, err := orderEvents(s)
+	if err != nil {
+		return err
+	}
+	origin, err := time.Parse(time.RFC3339Nano, s.Clock.Origin)
+	if err != nil {
+		return typedError(ErrInvalidFixture, "invalid clock origin: %v", err)
+	}
+	eventSequences := map[string]int{}
+	eventTimes := map[string]string{}
+	for index, event := range ordered {
+		sequence := index + 1
+		eventSequences[event.EventID] = sequence
+		eventTimes[event.EventID] = delivery.CanonicalTimestamp(origin.UTC().Add(time.Duration(index) * time.Duration(s.Clock.StepMS) * time.Millisecond))
+	}
 	eventRecords := map[string]EventRecord{}
 	for _, event := range journal.Events {
 		if event.EventID == "" {
@@ -742,6 +757,27 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 		if event.TaskID != fixtureEvent.TaskID {
 			return typedError(ErrReplayMismatch, "replay journal event %s task %q does not match %q", event.EventID, event.TaskID, fixtureEvent.TaskID)
 		}
+		if event.Sequence != eventSequences[event.EventID] {
+			return typedError(ErrReplayMismatch, "replay journal event %s sequence %d does not match canonical sequence %d", event.EventID, event.Sequence, eventSequences[event.EventID])
+		}
+		if event.At != eventTimes[event.EventID] {
+			return typedError(ErrReplayMismatch, "replay journal event %s timestamp %q does not match canonical timestamp %q", event.EventID, event.At, eventTimes[event.EventID])
+		}
+		if event.IdempotencyKey != stableID("idem", s.ScenarioID, event.EventID) {
+			return typedError(ErrReplayMismatch, "replay journal event %s idempotency key is not canonical", event.EventID)
+		}
+		if event.DecisionID != stableID("decision", s.ScenarioID, event.EventID) {
+			return typedError(ErrReplayMismatch, "replay journal event %s decision ID is not canonical", event.EventID)
+		}
+		if event.Status != "applied" && event.Status != "failed" {
+			return typedError(ErrReplayMismatch, "replay journal event %s has noncanonical status %q", event.EventID, event.Status)
+		}
+		if fixtureEvent.Kind != "provider_call" && event.ReceiptID != "" {
+			return typedError(ErrReplayMismatch, "replay journal event %s has receipt on non-provider event", event.EventID)
+		}
+		if len(event.Details) != 0 {
+			return typedError(ErrReplayMismatch, "replay journal event %s contains noncanonical details", event.EventID)
+		}
 		eventRecords[event.EventID] = event
 	}
 	decisionsByEvent := map[string]DecisionRecord{}
@@ -754,8 +790,18 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 			return typedError(ErrReplayMismatch, "replay journal contains duplicate decision %s", decision.DecisionID)
 		}
 		decisionIDs[decision.DecisionID] = true
+		if decision.DecisionID != stableID("decision", s.ScenarioID, decision.EventID) {
+			return typedError(ErrReplayMismatch, "replay journal decision %s is not canonical for event %s", decision.DecisionID, decision.EventID)
+		}
 		if _, exists := decisionsByEvent[decision.EventID]; exists {
 			return typedError(ErrReplayMismatch, "replay journal contains duplicate decision for event %s", decision.EventID)
+		}
+		eventRecord, ok := eventRecords[decision.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "replay journal decision %s has no durable replay event %s", decision.DecisionID, decision.EventID)
+		}
+		if eventRecord.DecisionID != decision.DecisionID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s does not match event %s decision %s", decision.DecisionID, decision.EventID, eventRecord.DecisionID)
 		}
 		event, ok := events[decision.EventID]
 		if !ok {
@@ -768,34 +814,144 @@ func validateReplayJournal(s Scenario, journal *ReplayJournal) error {
 		if event.TaskID != "" && event.TaskID != decision.TaskID {
 			return typedError(ErrReplayMismatch, "replay journal decision %s task %s does not match event task %s", decision.DecisionID, decision.TaskID, event.TaskID)
 		}
-		if decision.BudgetAuthorityID != "" && (!budgets[decision.BudgetAuthorityID] || decision.BudgetAuthorityID != task.BudgetAuthorityID) {
+		if decision.DecisionKind != "routing" {
+			return typedError(ErrReplayMismatch, "replay journal decision %s has noncanonical kind %q", decision.DecisionID, decision.DecisionKind)
+		}
+		if decision.BudgetAuthorityID == "" || !budgets[decision.BudgetAuthorityID] || decision.BudgetAuthorityID != task.BudgetAuthorityID {
 			return typedError(ErrReplayMismatch, "replay journal decision %s references invalid budget authority %s", decision.DecisionID, decision.BudgetAuthorityID)
 		}
-		if decision.ChosenCandidateID != "" {
-			if !models[decision.ChosenCandidateID] || !taskAllowsModel(task, decision.ChosenCandidateID) {
-				return typedError(ErrReplayMismatch, "replay journal decision %s references invalid chosen candidate %s", decision.DecisionID, decision.ChosenCandidateID)
-			}
+		if decision.PolicyFingerprint != s.PolicyProvenance.PolicyFingerprint {
+			return typedError(ErrReplayMismatch, "replay journal decision %s policy fingerprint does not match scenario", decision.DecisionID)
 		}
-		for _, rejection := range decision.RejectedCandidates {
-			if rejection.CandidateID != "" && !models[rejection.CandidateID] {
-				return typedError(ErrReplayMismatch, "replay journal decision %s references invalid rejected candidate %s", decision.DecisionID, rejection.CandidateID)
+		if decision.PlanFingerprint != s.PolicyProvenance.PlanFingerprint {
+			return typedError(ErrReplayMismatch, "replay journal decision %s plan fingerprint does not match scenario", decision.DecisionID)
+		}
+		if decision.AuthorizationFingerprint != s.PolicyProvenance.AuthorizationFingerprint {
+			return typedError(ErrReplayMismatch, "replay journal decision %s authorization fingerprint does not match scenario", decision.DecisionID)
+		}
+		if err := validateReplayDecisionClosure(s, task, decision, models); err != nil {
+			return err
+		}
+		if event.Kind == "provider_call" && eventRecord.ReceiptID != "" {
+			wantReceiptID := stableID("provider_receipt", s.ScenarioID, decision.EventID, decision.ChosenCandidateID)
+			if eventRecord.ReceiptID != wantReceiptID {
+				return typedError(ErrReplayMismatch, "replay journal event %s receipt ID is not canonical", eventRecord.EventID)
 			}
 		}
 		decisionsByEvent[decision.EventID] = decision
 	}
 	for _, event := range journal.Events {
-		if event.DecisionID == "" {
-			continue
-		}
 		decision, ok := decisionsByEvent[event.EventID]
 		if !ok || decision.DecisionID != event.DecisionID {
 			return typedError(ErrReplayMismatch, "replay journal event %s decision %s has no matching decision", event.EventID, event.DecisionID)
 		}
 	}
-	if err := validateReplayAgainstStartingState(s.StartingState, eventRecords); err != nil {
+	if err := validateReplayAgainstStartingState(s, eventRecords, decisionsByEvent); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validateReplayDecisionClosure(s Scenario, task Task, decision DecisionRecord, models map[string]bool) error {
+	candidates := candidateModelsForScenario(s, task)
+	candidateIDs := map[string]bool{}
+	for _, candidate := range candidates {
+		candidateIDs[candidate.ModelCapabilityID] = true
+	}
+	rejected := map[string]bool{}
+	for _, rejection := range decision.RejectedCandidates {
+		if rejection.CandidateID == "" || !models[rejection.CandidateID] || !candidateIDs[rejection.CandidateID] {
+			return typedError(ErrReplayMismatch, "replay journal decision %s references invalid rejected candidate %s", decision.DecisionID, rejection.CandidateID)
+		}
+		if rejected[rejection.CandidateID] {
+			return typedError(ErrReplayMismatch, "replay journal decision %s contains duplicate rejected candidate %s", decision.DecisionID, rejection.CandidateID)
+		}
+		rejected[rejection.CandidateID] = true
+	}
+	if !rejectionsSorted(decision.RejectedCandidates) {
+		return typedError(ErrReplayMismatch, "replay journal decision %s rejected candidates are not canonical", decision.DecisionID)
+	}
+	if !sortedUniqueStrings(decision.QuotaSnapshotIDs) {
+		return typedError(ErrReplayMismatch, "replay journal decision %s quota snapshot IDs are not canonical", decision.DecisionID)
+	}
+	expectedQuotaIDs := expectedReplayQuotaSnapshotIDs(s, task, decision, candidates, rejected)
+	if !sameStringSlice(decision.QuotaSnapshotIDs, expectedQuotaIDs) {
+		return typedError(ErrReplayMismatch, "replay journal decision %s quota snapshot IDs do not match canonical evaluated candidates", decision.DecisionID)
+	}
+	if decision.Accepted {
+		if decision.ChosenCandidateID == "" || !models[decision.ChosenCandidateID] || !candidateIDs[decision.ChosenCandidateID] {
+			return typedError(ErrReplayMismatch, "replay journal decision %s references invalid chosen candidate %s", decision.DecisionID, decision.ChosenCandidateID)
+		}
+		if rejected[decision.ChosenCandidateID] {
+			return typedError(ErrReplayMismatch, "replay journal decision %s both accepts and rejects candidate %s", decision.DecisionID, decision.ChosenCandidateID)
+		}
+		chosenSeen := false
+		for _, candidate := range candidates {
+			if candidate.ModelCapabilityID == decision.ChosenCandidateID {
+				chosenSeen = true
+				continue
+			}
+			if chosenSeen {
+				if rejected[candidate.ModelCapabilityID] {
+					return typedError(ErrReplayMismatch, "replay journal decision %s rejects candidate %s after chosen candidate", decision.DecisionID, candidate.ModelCapabilityID)
+				}
+				continue
+			}
+			if !rejected[candidate.ModelCapabilityID] {
+				return typedError(ErrReplayMismatch, "replay journal decision %s omits rejected candidate %s before chosen candidate", decision.DecisionID, candidate.ModelCapabilityID)
+			}
+		}
+		if decision.Reason != "selected deterministic eligible candidate" {
+			return typedError(ErrReplayMismatch, "replay journal decision %s accepted reason is not canonical", decision.DecisionID)
+		}
+		return nil
+	}
+	if decision.ChosenCandidateID != "" {
+		return typedError(ErrReplayMismatch, "replay journal decision %s rejected route has chosen candidate %s", decision.DecisionID, decision.ChosenCandidateID)
+	}
+	if len(rejected) != len(candidates) {
+		return typedError(ErrReplayMismatch, "replay journal decision %s rejected route does not close all candidates", decision.DecisionID)
+	}
+	if decision.Reason != "no eligible candidate" {
+		return typedError(ErrReplayMismatch, "replay journal decision %s rejected reason is not canonical", decision.DecisionID)
+	}
+	return nil
+}
+
+func expectedReplayQuotaSnapshotIDs(s Scenario, task Task, decision DecisionRecord, candidates []Model, rejected map[string]bool) []string {
+	out := []string{}
+	for _, candidate := range candidates {
+		if decision.Accepted && candidate.ModelCapabilityID != decision.ChosenCandidateID && !rejected[candidate.ModelCapabilityID] {
+			continue
+		}
+		if quotaID := replayQuotaSnapshotID(s, task, candidate); quotaID != "" {
+			out = appendUnique(out, quotaID)
+		}
+		if decision.Accepted && candidate.ModelCapabilityID == decision.ChosenCandidateID {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func replayQuotaSnapshotID(s Scenario, task Task, model Model) string {
+	if model.Availability != providerinventory.AvailabilityAvailable {
+		return ""
+	}
+	account, ok := accountByID(s.Inventory.Accounts, model.AccountProfileID)
+	if !ok || account.Readiness != providerinventory.ReadinessReady {
+		return ""
+	}
+	provider, ok := providerByID(s.Inventory.Providers, account.ProviderInstallationID)
+	if !ok || provider.State != providerinventory.InstallationInstalled {
+		return ""
+	}
+	quota, ok := quotaFor(s.Inventory.Quotas, task, model)
+	if !ok {
+		return ""
+	}
+	return quota.QuotaSnapshotID
 }
 
 func orderEvents(s Scenario) ([]InjectedEvent, error) {
@@ -939,6 +1095,9 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if receipt.ReceiptID == "" || receipt.EventID == "" || receipt.TaskID == "" || receipt.ModelCapabilityID == "" {
 			return typedError(ErrInvalidFixture, "starting state provider receipt identity fields are required")
 		}
+		if receipt.ReceiptID != stableID("provider_receipt", s.ScenarioID, receipt.EventID, receipt.ModelCapabilityID) {
+			return typedError(ErrInvalidFixture, "starting state provider receipt %s is not canonical", receipt.ReceiptID)
+		}
 		if receipts[receipt.ReceiptID] {
 			return typedError(ErrInvalidFixture, "starting state contains duplicate provider receipt %s", receipt.ReceiptID)
 		}
@@ -1004,6 +1163,9 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if commitment.CommitmentID == "" || commitment.EventID == "" || commitment.TaskID == "" || commitment.BudgetAuthorityID == "" {
 			return typedError(ErrInvalidFixture, "starting state budget commitment identity fields are required")
 		}
+		if commitment.CommitmentID != stableID("budget_commitment", s.ScenarioID, commitment.EventID, commitment.BudgetAuthorityID) {
+			return typedError(ErrInvalidFixture, "starting state budget commitment %s is not canonical", commitment.CommitmentID)
+		}
 		if commitments[commitment.CommitmentID] {
 			return typedError(ErrInvalidFixture, "starting state contains duplicate budget commitment %s", commitment.CommitmentID)
 		}
@@ -1050,6 +1212,9 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if handoff.HandoffID == "" || handoff.EventID == "" || handoff.SourceTaskID == "" || handoff.TargetTaskID == "" {
 			return typedError(ErrInvalidFixture, "starting state handoff identity fields are required")
 		}
+		if handoff.HandoffID != stableID("handoff", s.ScenarioID, handoff.EventID, handoff.SourceTaskID, handoff.TargetTaskID) {
+			return typedError(ErrInvalidFixture, "starting state handoff %s is not canonical", handoff.HandoffID)
+		}
 		if handoffs[handoff.HandoffID] {
 			return typedError(ErrInvalidFixture, "starting state contains duplicate handoff %s", handoff.HandoffID)
 		}
@@ -1079,12 +1244,18 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if source.HandoffTargetTaskID != handoff.TargetTaskID {
 			return typedError(ErrInvalidFixture, "handoff %s target %s does not match source task target %s", handoff.HandoffID, handoff.TargetTaskID, source.HandoffTargetTaskID)
 		}
+		if handoff.AuthorizationRef != s.PolicyProvenance.AuthorizationFingerprint {
+			return typedError(ErrInvalidFixture, "handoff %s authorization ref does not match scenario authority", handoff.HandoffID)
+		}
 	}
 	owners := map[string]bool{}
 	ownerSemantics := map[string]bool{}
 	for _, owner := range s.StartingState.AgentOwners {
 		if owner.OwnershipID == "" || owner.EventID == "" || owner.TaskID == "" || owner.ResourceKey == "" {
 			return typedError(ErrInvalidFixture, "starting state agent owner identity fields are required")
+		}
+		if owner.OwnershipID != stableID("agent_owner", s.ScenarioID, owner.ResourceKey) {
+			return typedError(ErrInvalidFixture, "starting state agent owner %s is not canonical", owner.OwnershipID)
 		}
 		if owners[owner.OwnershipID] {
 			return typedError(ErrInvalidFixture, "starting state contains duplicate agent owner %s", owner.OwnershipID)
@@ -1116,17 +1287,36 @@ func validateStartingState(s Scenario, tasks map[string]Task, models map[string]
 		if owner.ResourceKey != resource {
 			return typedError(ErrInvalidFixture, "agent owner %s resource %s does not match task resource %s", owner.OwnershipID, owner.ResourceKey, resource)
 		}
+		if owner.OwnerState != storage.OwnershipStateHeld || owner.Permission != permissionForTask(task) || owner.SideEffectClass != sideEffectForTask(task) {
+			return typedError(ErrInvalidFixture, "agent owner %s authority fields are not canonical", owner.OwnershipID)
+		}
 	}
 	return nil
 }
 
-func validateReplayAgainstStartingState(state DurableState, replayEvents map[string]EventRecord) error {
+func validateReplayAgainstStartingState(s Scenario, replayEvents map[string]EventRecord, replayDecisions map[string]DecisionRecord) error {
+	state := s.StartingState
+	if len(state.AppliedEventIDs) == 0 &&
+		len(state.ProviderReceipts) == 0 &&
+		len(state.BudgetCommitments) == 0 &&
+		len(state.Handoffs) == 0 &&
+		len(state.AgentOwners) == 0 &&
+		len(state.CompletedTaskIDs) == 0 {
+		return nil
+	}
+	durableEvents := map[string]bool{}
 	for _, eventID := range state.AppliedEventIDs {
-		if _, ok := replayEvents[eventID]; !ok {
+		durableEvents[eventID] = true
+		event, ok := replayEvents[eventID]
+		if !ok {
 			return typedError(ErrReplayMismatch, "starting state applied event %s is missing from replay journal", eventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match applied starting state", eventID, event.Status)
 		}
 	}
 	for _, receipt := range state.ProviderReceipts {
+		durableEvents[receipt.EventID] = true
 		event, ok := replayEvents[receipt.EventID]
 		if !ok {
 			return typedError(ErrReplayMismatch, "starting state provider receipt %s event %s is missing from replay journal", receipt.ReceiptID, receipt.EventID)
@@ -1134,20 +1324,71 @@ func validateReplayAgainstStartingState(state DurableState, replayEvents map[str
 		if event.ReceiptID != receipt.ReceiptID {
 			return typedError(ErrReplayMismatch, "replay journal event %s receipt %s does not match durable receipt %s", receipt.EventID, event.ReceiptID, receipt.ReceiptID)
 		}
+		wantStatus := "applied"
+		if receipt.Status == "failed" {
+			wantStatus = "failed"
+		}
+		if event.Status != wantStatus {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match provider receipt status %q", receipt.EventID, event.Status, receipt.Status)
+		}
+		decision, ok := replayDecisions[receipt.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state provider receipt %s has no replay decision", receipt.ReceiptID)
+		}
+		if decision.ChosenCandidateID != receipt.ModelCapabilityID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s chosen candidate %s does not match durable receipt model %s", decision.DecisionID, decision.ChosenCandidateID, receipt.ModelCapabilityID)
+		}
 	}
 	for _, commitment := range state.BudgetCommitments {
-		if _, ok := replayEvents[commitment.EventID]; !ok {
+		durableEvents[commitment.EventID] = true
+		event, ok := replayEvents[commitment.EventID]
+		if !ok {
 			return typedError(ErrReplayMismatch, "starting state budget commitment %s event %s is missing from replay journal", commitment.CommitmentID, commitment.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable budget commitment", commitment.EventID, event.Status)
+		}
+		decision, ok := replayDecisions[commitment.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state budget commitment %s has no replay decision", commitment.CommitmentID)
+		}
+		if decision.BudgetAuthorityID != commitment.BudgetAuthorityID {
+			return typedError(ErrReplayMismatch, "replay journal decision %s budget authority %s does not match durable commitment authority %s", decision.DecisionID, decision.BudgetAuthorityID, commitment.BudgetAuthorityID)
 		}
 	}
 	for _, handoff := range state.Handoffs {
-		if _, ok := replayEvents[handoff.EventID]; !ok {
+		durableEvents[handoff.EventID] = true
+		event, ok := replayEvents[handoff.EventID]
+		if !ok {
 			return typedError(ErrReplayMismatch, "starting state handoff %s event %s is missing from replay journal", handoff.HandoffID, handoff.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable handoff", handoff.EventID, event.Status)
+		}
+		decision, ok := replayDecisions[handoff.EventID]
+		if !ok {
+			return typedError(ErrReplayMismatch, "starting state handoff %s has no replay decision", handoff.HandoffID)
+		}
+		if decision.AuthorizationFingerprint != handoff.AuthorizationRef {
+			return typedError(ErrReplayMismatch, "replay journal decision %s authorization does not match durable handoff", decision.DecisionID)
 		}
 	}
 	for _, owner := range state.AgentOwners {
-		if _, ok := replayEvents[owner.EventID]; !ok {
+		durableEvents[owner.EventID] = true
+		event, ok := replayEvents[owner.EventID]
+		if !ok {
 			return typedError(ErrReplayMismatch, "starting state agent owner %s event %s is missing from replay journal", owner.OwnershipID, owner.EventID)
+		}
+		if event.Status != "applied" {
+			return typedError(ErrReplayMismatch, "replay journal event %s status %q does not match durable owner", owner.EventID, event.Status)
+		}
+		if _, ok := replayDecisions[owner.EventID]; !ok {
+			return typedError(ErrReplayMismatch, "starting state agent owner %s has no replay decision", owner.OwnershipID)
+		}
+	}
+	for eventID := range replayEvents {
+		if !durableEvents[eventID] {
+			return typedError(ErrReplayMismatch, "replay journal event %s is beyond durable starting state", eventID)
 		}
 	}
 	return nil
@@ -1388,6 +1629,57 @@ func taskAllowsModel(task Task, modelID string) bool {
 		}
 	}
 	return false
+}
+
+func candidateModelsForScenario(s Scenario, task Task) []Model {
+	allowed := stringSet(task.CandidateModelIDs)
+	out := []Model{}
+	for _, model := range s.Inventory.Models {
+		if len(allowed) > 0 && !allowed[model.ModelCapabilityID] {
+			continue
+		}
+		if !roleSupported(model.Roles, task.Role) {
+			continue
+		}
+		out = append(out, model)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return scoreKey(s.Seed, task.TaskID, out[i]) < scoreKey(s.Seed, task.TaskID, out[j])
+	})
+	return out
+}
+
+func rejectionsSorted(rejections []Rejection) bool {
+	return sort.SliceIsSorted(rejections, func(i, j int) bool {
+		if rejections[i].CandidateID != rejections[j].CandidateID {
+			return rejections[i].CandidateID < rejections[j].CandidateID
+		}
+		return rejections[i].Code < rejections[j].Code
+	})
+}
+
+func sortedUniqueStrings(values []string) bool {
+	for i, value := range values {
+		if value == "" {
+			return false
+		}
+		if i > 0 && values[i-1] >= value {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func taskByID(tasks []Task, id string) (Task, bool) {

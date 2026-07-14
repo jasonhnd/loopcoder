@@ -353,6 +353,199 @@ func TestExecuteRejectsReplayJournalConflictingWithStartingState(t *testing.T) {
 	}
 }
 
+func TestExecuteRejectsReplayJournalAuthorityFingerprintMutations(t *testing.T) {
+	scenario := baseScenario()
+	crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 1})
+	if err != nil {
+		t.Fatalf("Execute crash: %v", err)
+	}
+	restart := scenario
+	restart.StartingState = crashed.DurableState
+	tests := []struct {
+		name   string
+		mutate func(*DecisionRecord)
+	}{
+		{name: "policy", mutate: func(d *DecisionRecord) { d.PolicyFingerprint = "sha256:invented-policy" }},
+		{name: "plan", mutate: func(d *DecisionRecord) { d.PlanFingerprint = "sha256:invented-plan" }},
+		{name: "authorization", mutate: func(d *DecisionRecord) { d.AuthorizationFingerprint = "sha256:invented-auth" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			journal := cloneReplayJournal(crashed.ReplayJournal)
+			tt.mutate(&journal.Decisions[0])
+			result, err := Execute(context.Background(), restart, Options{ReplayJournal: &journal})
+			requireReplayMismatch(t, err)
+			if len(result.DurableState.AppliedEventIDs) != 0 {
+				t.Fatalf("invalid replay produced durable result: %#v", result.DurableState)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalAcceptedDecisionInvariants(t *testing.T) {
+	scenario := restartAuthorityScenario()
+	crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 1})
+	if err != nil {
+		t.Fatalf("Execute crash: %v", err)
+	}
+	restart := scenario
+	restart.StartingState = crashed.DurableState
+	tests := []struct {
+		name   string
+		mutate func(*ReplayJournal)
+	}{
+		{name: "empty chosen candidate", mutate: func(j *ReplayJournal) { j.Decisions[0].ChosenCandidateID = "" }},
+		{name: "mismatched chosen candidate", mutate: func(j *ReplayJournal) { j.Decisions[0].ChosenCandidateID = "model-b" }},
+		{name: "invented decision ID", mutate: func(j *ReplayJournal) {
+			j.Decisions[0].DecisionID = "decision_invented"
+			j.Events[0].DecisionID = "decision_invented"
+		}},
+		{name: "invented idempotency key", mutate: func(j *ReplayJournal) { j.Events[0].IdempotencyKey = "idem_invented" }},
+		{name: "accepted rejected overlap", mutate: func(j *ReplayJournal) {
+			j.Decisions[0].RejectedCandidates = append(j.Decisions[0].RejectedCandidates, Rejection{CandidateID: j.Decisions[0].ChosenCandidateID, Code: "overlap", Reason: "overlap"})
+		}},
+		{name: "duplicate rejected candidate", mutate: func(j *ReplayJournal) {
+			j.Decisions[0].RejectedCandidates = []Rejection{
+				{CandidateID: "model-a", Code: "duplicate", Reason: "duplicate"},
+				{CandidateID: "model-a", Code: "duplicate", Reason: "duplicate"},
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			journal := cloneReplayJournal(crashed.ReplayJournal)
+			tt.mutate(&journal)
+			requireReplayMismatch(t, executeReplayErr(t, restart, &journal))
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalBeyondCrashBoundary(t *testing.T) {
+	tests := []struct {
+		name  string
+		event InjectedEvent
+	}{
+		{name: "commitment", event: InjectedEvent{EventID: "event-future-budget", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "handoff", event: InjectedEvent{EventID: "event-future-handoff", Kind: "handoff", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "owner", event: InjectedEvent{EventID: "event-future-owner", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "provider receipt", event: InjectedEvent{EventID: "event-future-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+		{name: "decision", event: InjectedEvent{EventID: "event-future-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenario := baseScenario()
+			scenario.InjectedEvents = []InjectedEvent{
+				{EventID: "event-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"},
+				tt.event,
+			}
+			scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-route", tt.event.EventID}}}
+			crashed, err := Execute(context.Background(), scenario, Options{CrashAfter: 1})
+			if err != nil {
+				t.Fatalf("Execute crash: %v", err)
+			}
+			uninterrupted, err := Execute(context.Background(), scenario, Options{})
+			if err != nil {
+				t.Fatalf("Execute uninterrupted: %v", err)
+			}
+			restart := scenario
+			restart.StartingState = crashed.DurableState
+			journal := cloneReplayJournal(crashed.ReplayJournal)
+			journal.Events = append(journal.Events, uninterrupted.ReplayJournal.Events[1])
+			journal.Decisions = append(journal.Decisions, uninterrupted.ReplayJournal.Decisions[1])
+			requireReplayMismatch(t, executeReplayErr(t, restart, &journal))
+		})
+	}
+}
+
+func TestExecuteRejectsNoncanonicalDurableStableIDs(t *testing.T) {
+	scenario := baseScenario()
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-handoff", Kind: "handoff", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-owner", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-call", "event-budget", "event-handoff", "event-owner"}}}
+	applied, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*DurableState)
+	}{
+		{name: "provider receipt", mutate: func(s *DurableState) { s.ProviderReceipts[0].ReceiptID = "provider_receipt_alias" }},
+		{name: "budget commitment", mutate: func(s *DurableState) { s.BudgetCommitments[0].CommitmentID = "budget_commitment_alias" }},
+		{name: "handoff", mutate: func(s *DurableState) { s.Handoffs[0].HandoffID = "handoff_alias" }},
+		{name: "ownership", mutate: func(s *DurableState) { s.AgentOwners[0].OwnershipID = "agent_owner_alias" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restart := scenario
+			restart.StartingState = cloneDurableState(applied.DurableState)
+			tt.mutate(&restart.StartingState)
+			_, err := Execute(context.Background(), restart, Options{ReplayJournal: &applied.ReplayJournal})
+			if err == nil {
+				t.Fatal("Execute accepted noncanonical durable ID")
+			}
+			if !strings.Contains(err.Error(), ErrInvalidFixture) {
+				t.Fatalf("error = %v, want invalid fixture", err)
+			}
+		})
+	}
+}
+
+func TestExecuteRejectsReplayJournalStateEquivalenceMutations(t *testing.T) {
+	scenario := baseScenario()
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-call", Kind: "provider_call", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-budget", Kind: "budget_commit", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-handoff", Kind: "handoff", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-owner", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-call", "event-budget", "event-handoff", "event-owner"}}}
+	applied, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Scenario, *ReplayJournal)
+		wantErr string
+	}{
+		{name: "wrong applied status", mutate: func(_ *Scenario, j *ReplayJournal) {
+			j.Events[1].Status = "failed"
+		}, wantErr: ErrReplayMismatch},
+		{name: "wrong generation", mutate: func(_ *Scenario, j *ReplayJournal) {
+			j.Events[1].Sequence = 99
+		}, wantErr: ErrReplayMismatch},
+		{name: "wrong commitment quantity", mutate: func(s *Scenario, _ *ReplayJournal) {
+			s.StartingState.BudgetCommitments[0].CommittedValue++
+		}, wantErr: ErrInvalidFixture},
+		{name: "wrong handoff authority", mutate: func(s *Scenario, _ *ReplayJournal) {
+			s.StartingState.Handoffs[0].AuthorizationRef = "sha256:invented-auth"
+		}, wantErr: ErrInvalidFixture},
+		{name: "wrong owner scope", mutate: func(s *Scenario, _ *ReplayJournal) {
+			s.StartingState.AgentOwners[0].ResourceKey = "invented-resource"
+		}, wantErr: ErrInvalidFixture},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restart := scenario
+			restart.StartingState = cloneDurableState(applied.DurableState)
+			journal := cloneReplayJournal(applied.ReplayJournal)
+			tt.mutate(&restart, &journal)
+			_, err := Execute(context.Background(), restart, Options{ReplayJournal: &journal})
+			if err == nil {
+				t.Fatal("Execute accepted mismatched replay/state")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestDecodeAndExecuteMalformedFixtureFailsClosedRedacted(t *testing.T) {
 	secret := "AKIA" + strings.Repeat("A", 16)
 	raw := []byte(`{"schema_version":"` + secret + `","scenario_id":"bad"}`)
@@ -507,6 +700,45 @@ func receiptByEvent(receipts []ProviderReceipt, eventID string) (ProviderReceipt
 		}
 	}
 	return ProviderReceipt{}, false
+}
+
+func executeReplayErr(t *testing.T, scenario Scenario, journal *ReplayJournal) error {
+	t.Helper()
+	result, err := Execute(context.Background(), scenario, Options{ReplayJournal: journal})
+	if err == nil && len(result.Diagnostics) != 0 {
+		t.Fatalf("Execute returned diagnostics instead of failing closed: %#v", result.Diagnostics)
+	}
+	return err
+}
+
+func cloneReplayJournal(journal ReplayJournal) ReplayJournal {
+	journal.Events = append([]EventRecord(nil), journal.Events...)
+	journal.Decisions = append([]DecisionRecord(nil), journal.Decisions...)
+	for i := range journal.Decisions {
+		journal.Decisions[i].RejectedCandidates = append([]Rejection(nil), journal.Decisions[i].RejectedCandidates...)
+		journal.Decisions[i].QuotaSnapshotIDs = append([]string(nil), journal.Decisions[i].QuotaSnapshotIDs...)
+	}
+	return journal
+}
+
+func cloneDurableState(state DurableState) DurableState {
+	state.AppliedEventIDs = append([]string(nil), state.AppliedEventIDs...)
+	state.ProviderReceipts = append([]ProviderReceipt(nil), state.ProviderReceipts...)
+	state.BudgetCommitments = append([]BudgetCommitment(nil), state.BudgetCommitments...)
+	state.Handoffs = append([]HandoffRecord(nil), state.Handoffs...)
+	state.AgentOwners = append([]AgentOwner(nil), state.AgentOwners...)
+	state.CompletedTaskIDs = append([]string(nil), state.CompletedTaskIDs...)
+	return state
+}
+
+func requireReplayMismatch(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Execute accepted invalid replay journal")
+	}
+	if !strings.Contains(err.Error(), ErrReplayMismatch) {
+		t.Fatalf("error = %v, want replay mismatch", err)
+	}
 }
 
 func restartAuthorityScenario() Scenario {
