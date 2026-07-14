@@ -164,6 +164,55 @@ func TestQuotaRefreshPublicationBoundarySharesCompletedResult(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshManagerWaitJoinsPublicationCleanup(t *testing.T) {
+	ctx := context.Background()
+	store := quotaRefreshStore(t, fixedInventoryNow)
+	defer store.Close()
+
+	now := fixedInventoryNow()
+	published := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	var publishOnce sync.Once
+	manager := NewRefreshManager(store, fakeDeps(t, nil))
+	manager.afterPublish = func() {
+		publishOnce.Do(func() { close(published) })
+		<-releaseCleanup
+	}
+	manager.Collector = func(context.Context, Options, Deps) (Report, error) {
+		return quotaRefreshReport("codex", now, 42, ""), nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.Refresh(ctx, RefreshRequest{
+			Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+			Trigger: RefreshTriggerExplicit,
+			Now:     func() time.Time { return now },
+		})
+		done <- err
+	}()
+	<-published
+	if err := <-done; err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		manager.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("Wait returned before refresh publication cleanup joined")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseCleanup)
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after publication cleanup released")
+	}
+}
+
 func TestQuotaRefreshRejectsUnconfiguredRequestedProviderWithoutInvokingIt(t *testing.T) {
 	store := quotaRefreshStore(t, fixedInventoryNow)
 	defer store.Close()

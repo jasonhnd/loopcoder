@@ -340,30 +340,27 @@ func TestProviderQuotaDefaultLifecycleStatusObservesInFlightRefresh(t *testing.T
 	ctx := context.Background()
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
 	lifecycle := newDefaultProviderQuotaLifecycle()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRefresh := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(func() {
+		releaseRefresh()
+		if err := lifecycle.Close(); err != nil {
+			t.Errorf("close lifecycle: %v", err)
+		}
+	})
 	manager, err := lifecycle.managerFor(ctx, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("managerFor: %v", err)
 	}
 	started := make(chan struct{})
-	release := make(chan struct{})
 	var once sync.Once
 	manager.Collector = func(ctx context.Context, opts providerinventory.Options, deps providerinventory.Deps) (providerinventory.Report, error) {
 		once.Do(func() { close(started) })
 		<-release
-		return providerinventory.Report{
-			SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
-			GeneratedAt:           now.Format(time.RFC3339Nano),
-			Confidence:            providerinventory.ConfidenceExact,
-			Installations:         []providerinventory.ProviderInstallation{},
-			ProbeResults:          []providerinventory.ProbeResult{},
-			AccountProfiles:       []providerinventory.AccountProfile{},
-			AuthReadiness:         []providerinventory.AuthReadiness{},
-			ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
-			ModelCapabilities:     []providerinventory.ModelCapability{},
-			QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{},
-			QuotaSnapshots:        []providerinventory.QuotaSnapshot{},
-			GapReasons:            []string{},
-		}, ctx.Err()
+		return providerQuotaEmptyReport(now), ctx.Err()
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -379,7 +376,7 @@ func TestProviderQuotaDefaultLifecycleStatusObservesInFlightRefresh(t *testing.T
 		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
 		Now:    func() time.Time { return now },
 	})
-	close(release)
+	releaseRefresh()
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -389,8 +386,16 @@ func TestProviderQuotaDefaultLifecycleStatusObservesInFlightRefresh(t *testing.T
 	if err := <-done; err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
+	if err := lifecycle.Close(); err != nil {
+		t.Fatalf("close lifecycle: %v", err)
+	}
 
 	restarted := newDefaultProviderQuotaLifecycle()
+	t.Cleanup(func() {
+		if err := restarted.Close(); err != nil {
+			t.Errorf("close restarted lifecycle: %v", err)
+		}
+	})
 	restartedStatus, err := restarted.Status(ctx, providerinventory.RefreshRequest{
 		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
 		Now:    func() time.Time { return now },
@@ -400,6 +405,106 @@ func TestProviderQuotaDefaultLifecycleStatusObservesInFlightRefresh(t *testing.T
 	}
 	if len(restartedStatus.Providers) != 1 || restartedStatus.Providers[0].InFlight {
 		t.Fatalf("restarted status = %#v, want no phantom in-flight state", restartedStatus)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatalf("close restarted lifecycle: %v", err)
+	}
+}
+
+func TestProviderQuotaDefaultLifecycleCloseWaitsForInFlightRefresh(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	lifecycle := newDefaultProviderQuotaLifecycle()
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRefresh) })
+	}
+	t.Cleanup(func() {
+		release()
+		if err := lifecycle.Close(); err != nil {
+			t.Errorf("close lifecycle: %v", err)
+		}
+	})
+	manager, err := lifecycle.managerFor(ctx, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("managerFor: %v", err)
+	}
+	started := make(chan struct{})
+	var startOnce sync.Once
+	manager.Collector = func(ctx context.Context, opts providerinventory.Options, deps providerinventory.Deps) (providerinventory.Report, error) {
+		startOnce.Do(func() { close(started) })
+		<-releaseRefresh
+		return providerQuotaEmptyReport(now), ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := lifecycle.Refresh(ctx, providerinventory.RefreshRequest{
+			Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+			Trigger: providerinventory.RefreshTriggerExplicit,
+			Now:     func() time.Time { return now },
+		})
+		done <- err
+	}()
+	<-started
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- lifecycle.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before in-flight refresh joined: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after in-flight refresh released")
+	}
+	reopened := newDefaultProviderQuotaLifecycle()
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened lifecycle: %v", err)
+		}
+	})
+	status, err := reopened.Status(ctx, providerinventory.RefreshRequest{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Now:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("reopened Status: %v", err)
+	}
+	if len(status.Providers) != 1 || status.Providers[0].InFlight {
+		t.Fatalf("reopened status = %#v, want no in-flight state", status)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened lifecycle: %v", err)
+	}
+}
+
+func providerQuotaEmptyReport(now time.Time) providerinventory.Report {
+	return providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now.Format(time.RFC3339Nano),
+		Confidence:            providerinventory.ConfidenceExact,
+		Installations:         []providerinventory.ProviderInstallation{},
+		ProbeResults:          []providerinventory.ProbeResult{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{},
+		QuotaSnapshots:        []providerinventory.QuotaSnapshot{},
+		GapReasons:            []string{},
 	}
 }
 

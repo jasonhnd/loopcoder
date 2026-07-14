@@ -106,9 +106,11 @@ type RefreshManager struct {
 	Deps      Deps
 	Collector QuotaCollector
 
-	mu       sync.Mutex
-	inFlight map[string]*refreshCall
-	active   map[string]int
+	mu                sync.Mutex
+	inFlight          map[string]*refreshCall
+	active            map[string]int
+	refreshGoroutines int
+	idle              *sync.Cond
 
 	afterPublish func()
 }
@@ -127,7 +129,9 @@ type providerCollectResult struct {
 }
 
 func NewRefreshManager(store storage.Store, deps Deps) *RefreshManager {
-	return &RefreshManager{Store: store, Deps: normalizeDeps(deps), Collector: Discover}
+	manager := &RefreshManager{Store: store, Deps: normalizeDeps(deps), Collector: Discover}
+	manager.idle = sync.NewCond(&manager.mu)
+	return manager
 }
 
 func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (RefreshResult, error) {
@@ -182,6 +186,7 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	call := &refreshCall{done: make(chan struct{})}
 	m.inFlight[key] = call
 	m.markActiveLocked(refreshProviders, 1)
+	m.refreshGoroutines++
 	m.mu.Unlock()
 
 	go func() {
@@ -198,6 +203,10 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		}
 		m.mu.Lock()
 		delete(m.inFlight, key)
+		m.refreshGoroutines--
+		if m.refreshGoroutines == 0 {
+			m.idle.Broadcast()
+		}
 		m.mu.Unlock()
 	}()
 
@@ -227,6 +236,22 @@ func (m *RefreshManager) Status(ctx context.Context, req RefreshRequest) (QuotaR
 	status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
 	sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
 	return status, nil
+}
+
+// Wait blocks until refresh publication goroutines started by this manager have
+// fully released their in-flight bookkeeping.
+func (m *RefreshManager) Wait() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.idle == nil {
+		m.idle = sync.NewCond(&m.mu)
+	}
+	for m.refreshGoroutines > 0 {
+		m.idle.Wait()
+	}
+	m.mu.Unlock()
 }
 
 func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, providers []string, inactiveResults []ProviderRefreshResult, policy RefreshPolicy, now time.Time) (RefreshResult, error) {
@@ -435,6 +460,9 @@ func (m *RefreshManager) ensureDefaults() {
 	}
 	if m.active == nil {
 		m.active = map[string]int{}
+	}
+	if m.idle == nil {
+		m.idle = sync.NewCond(&m.mu)
 	}
 }
 

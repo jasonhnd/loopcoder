@@ -264,6 +264,8 @@ type defaultProviderQuotaLifecycle struct {
 	mu      sync.Mutex
 	store   storage.Store
 	manager *providerinventory.RefreshManager
+	closed  bool
+	active  sync.WaitGroup
 }
 
 func newDefaultProviderQuotaLifecycle() *defaultProviderQuotaLifecycle {
@@ -273,6 +275,9 @@ func newDefaultProviderQuotaLifecycle() *defaultProviderQuotaLifecycle {
 func (l *defaultProviderQuotaLifecycle) managerFor(ctx context.Context, now func() time.Time) (*providerinventory.RefreshManager, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
 	if l.manager != nil {
 		return l.manager, nil
 	}
@@ -285,7 +290,49 @@ func (l *defaultProviderQuotaLifecycle) managerFor(ctx context.Context, now func
 	return l.manager, nil
 }
 
+func (l *defaultProviderQuotaLifecycle) begin() (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
+	l.active.Add(1)
+	return l.active.Done, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	l.mu.Unlock()
+
+	l.active.Wait()
+
+	l.mu.Lock()
+	manager := l.manager
+	store := l.store
+	l.manager = nil
+	l.store = nil
+	l.mu.Unlock()
+
+	if manager != nil {
+		manager.Wait()
+	}
+	if store != nil {
+		return store.Close()
+	}
+	return nil
+}
+
 func (l *defaultProviderQuotaLifecycle) Refresh(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	defer done()
 	now := normalizeCLINow(req.Now)
 	manager, err := l.managerFor(ctx, now)
 	if err != nil {
@@ -296,6 +343,11 @@ func (l *defaultProviderQuotaLifecycle) Refresh(ctx context.Context, req provide
 }
 
 func (l *defaultProviderQuotaLifecycle) Status(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	defer done()
 	now := normalizeCLINow(req.Now)
 	manager, err := l.managerFor(ctx, now)
 	if err != nil {
