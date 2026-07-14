@@ -24,3 +24,10 @@ func KillTree(pid int) error {
 	}
 	return syscall.Kill(pid, syscall.SIGKILL)
 }
+
+func KillGroup(pgid int) error {
+	if pgid <= 0 {
+		return nil
+	}
+	return syscall.Kill(-pgid, syscall.SIGKILL)
+}

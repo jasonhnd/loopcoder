@@ -126,6 +126,81 @@ func LoadProviderExecutionAuthority(ctx context.Context, store Store, projectID,
 	return authority, nil
 }
 
+func ListProviderExecutionAuthorities(ctx context.Context, store Store, projectID, runID string) ([]ProviderExecutionAuthority, error) {
+	if store == nil {
+		return nil, fmt.Errorf("provider execution authority store is required")
+	}
+	projectID = strings.TrimSpace(projectID)
+	runID = strings.TrimSpace(runID)
+	if projectID == "" {
+		return nil, fmt.Errorf("provider execution authority project_id is required")
+	}
+	query := `SELECT
+			authority_id, schema_version, record_version, project_id, run_id, attempt_id,
+			provider_pid, provider_pgid, process_birth_identity, executable_identity, owner_id, claim_generation,
+			started_at, heartbeat_at, worktree_path, log_path, identity_ambiguous, ambiguity_reason,
+			COALESCE(completed_at, ''), terminal_state, created_at, updated_at
+		FROM provider_execution_authorities
+		WHERE project_id = ?`
+	args := []any{projectID}
+	if runID != "" {
+		query += ` AND run_id = ?`
+		args = append(args, runID)
+	}
+	query += ` ORDER BY started_at, run_id, attempt_id`
+
+	var authorities []ProviderExecutionAuthority
+	err := store.WithTx(ctx, func(tx Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var authority ProviderExecutionAuthority
+			if err := rows.Scan(
+				&authority.AuthorityID, &authority.SchemaVersion, &authority.RecordVersion, &authority.ProjectID, &authority.RunID, &authority.AttemptID,
+				&authority.ProviderPID, &authority.ProviderPGID, &authority.ProcessBirthIdentity, &authority.ExecutableIdentity, &authority.OwnerID, &authority.ClaimGeneration,
+				&authority.StartedAt, &authority.HeartbeatAt, &authority.WorktreePath, &authority.LogPath, &authority.IdentityAmbiguous, &authority.AmbiguityReason,
+				&authority.CompletedAt, &authority.TerminalState, &authority.CreatedAt, &authority.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			authorities = append(authorities, authority)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return authorities, nil
+}
+
+func ValidateProviderExecutionAuthorityOwner(ctx context.Context, store Store, fence ProviderExecutionAuthorityFence, at time.Time) error {
+	if store == nil {
+		return fmt.Errorf("provider execution authority store is required")
+	}
+	fence = normalizeProviderExecutionAuthorityFence(fence)
+	if err := validateProviderExecutionAuthorityFence(fence); err != nil {
+		return err
+	}
+	now := storageTimestamp(at)
+	return store.WithTx(ctx, func(tx Tx) error {
+		var active int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*)
+			FROM agent_ownership_locks
+			WHERE project_id = ? AND delivery_run_id = ? AND run_id = ? AND child_agent_id = ?
+				AND claim_generation = ? AND state = ? AND lease_expires_at > ?`,
+			fence.ProjectID, fence.RunID, fence.RunID, fence.OwnerID, fence.ClaimGeneration, OwnershipStateHeld, now).Scan(&active); err != nil {
+			return fmt.Errorf("validate provider execution authority owner: %w", err)
+		}
+		if active == 0 {
+			return ErrOwnershipStale
+		}
+		return nil
+	})
+}
+
 func updateProviderExecutionAuthorityFenced(ctx context.Context, store Store, fence ProviderExecutionAuthorityFence, at time.Time, terminalState string, complete bool) error {
 	if store == nil {
 		return fmt.Errorf("provider execution authority store is required")

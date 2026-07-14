@@ -2,6 +2,7 @@ package runstatus
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
@@ -39,7 +42,7 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 		"Events: 1",
 		"Verifier records: 1",
 		"Lifecycle: succeeded (source=legacy entries=1)",
-		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
+		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
 		"status is read-only and local-only",
 	} {
 		if !strings.Contains(got, want) {
@@ -87,6 +90,47 @@ func TestRenderStatusIncludesGrokAttributionWithoutSecrets(t *testing.T) {
 	if strings.Contains(string(data), secretCanary) {
 		t.Fatalf("status JSON leaked secret canary: %s", string(data))
 	}
+}
+
+func TestLoadRegisteredRunningAttemptWithoutProviderAuthorityReportsMissingRow(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv(home.EnvHome, filepath.Join(t.TempDir(), "home"))
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: fixedRunstatusNow}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	runID := "run-missing-authority"
+	pid := os.Getpid()
+	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-missing-authority",
+		Issue:          909,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            pid,
+		Phase:          "codex_started",
+		Status:         state.StatusRunning,
+		StartedAt:      "2026-07-01T00:00:00Z",
+		HeartbeatAt:    "2026-07-01T00:00:01Z",
+		LastProgressAt: "2026-07-01T00:00:01Z",
+		LogBytes:       1,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+	report, err := Load(Options{RepoPath: repo, RunID: runID, Now: fixedRunstatusNow})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(report.Rows) != 1 {
+		t.Fatalf("rows = %#v", report.Rows)
+	}
+	row := report.Rows[0]
+	if row.ProviderAuthority != "missing-row" || row.ProviderVerified != "false" || row.ProviderAuthorityNote != "provider execution authority row is missing" {
+		t.Fatalf("authority columns = %#v", row)
+	}
+}
+
+func fixedRunstatusNow() time.Time {
+	return time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
 }
 
 func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
@@ -322,7 +366,7 @@ func TestRenderTotalOnlyTokensAsNotReportedSplit(t *testing.T) {
 	}
 	got := Render(report)
 
-	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | codex_exited | succeeded | not reported |"
+	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded | not reported |"
 	if !strings.Contains(got, want) {
 		t.Fatalf("rendered status missing total-only token row %q:\n%s", want, got)
 	}
@@ -359,7 +403,7 @@ func TestRenderInterruptedChildRunStatus(t *testing.T) {
 	}
 	got := Render(report)
 
-	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
+	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
 	if !strings.Contains(got, want) {
 		t.Fatalf("rendered status missing timed out child row %q:\n%s", want, got)
 	}
