@@ -2179,6 +2179,235 @@ func TestDispatchHelperSeamsSuccessPath(t *testing.T) {
 	}
 }
 
+func TestDispatchFinalizationRetryAdoptsExistingPRWithoutProviderRerun(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	var warnings strings.Builder
+	fakeGit := &workerFakeGit{status: " M file.go\n"}
+	fakeGitHub := &workerFakeGitHub{createErr: errors.New("GitHub API unavailable")}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented finalization.", 0),
+		log:       "provider completed\n",
+	}
+	deps := Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	}
+	opts := Options{
+		RepoPath:    repo,
+		IssueNumber: 965,
+		IssueTitle:  "Classify finalization",
+		RunID:       "run-finalization",
+		Branch:      "loop/issue-965",
+		Provider:    "codex",
+		Stderr:      &warnings,
+	}
+
+	first, err := Dispatch(context.Background(), opts, deps)
+	if err == nil {
+		t.Fatal("first Dispatch returned nil error, want delivery failure")
+	}
+	if first.Report == nil || first.Outcome != string(OutcomeDeliveryFailed) || first.ProviderOutcome != string(OutcomeProviderCompleted) {
+		t.Fatalf("first result = %#v, want preserved report and delivery_failed/provider_completed", first)
+	}
+	if fakeAgent.runCalls != 1 || fakeGitHub.createPRCalls != 1 {
+		t.Fatalf("first calls provider=%d createPR=%d, want 1/1", fakeAgent.runCalls, fakeGitHub.createPRCalls)
+	}
+
+	fakeGitHub.createErr = nil
+	fakeGitHub.prs = []gh.PullRequestReference{{Number: 965, URL: "https://github.com/owner/repo/pull/965"}}
+	second, err := Dispatch(context.Background(), opts, deps)
+	if err != nil {
+		t.Fatalf("second Dispatch returned error: %v", err)
+	}
+	if !second.OK || second.Outcome != string(OutcomePRAdopted) || second.PR != "https://github.com/owner/repo/pull/965" {
+		t.Fatalf("second result = %#v, want adopted PR success", second)
+	}
+	if fakeAgent.runCalls != 1 {
+		t.Fatalf("provider executions = %d, want exactly one across finalization retry", fakeAgent.runCalls)
+	}
+	if fakeGitHub.createPRCalls != 1 {
+		t.Fatalf("CreatePR calls = %d, want no second create", fakeGitHub.createPRCalls)
+	}
+}
+
+func TestDispatchPushConflictNeedsHumanAndDoesNotOverwriteRemote(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n", remoteBranchExists: true}
+	fakeGitHub := &workerFakeGitHub{}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented.", 0),
+		log:       "provider completed\n",
+	}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 966,
+		IssueTitle:  "Protect remote branch",
+		RunID:       "run-push-conflict",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err == nil {
+		t.Fatal("Dispatch returned nil error, want push conflict")
+	}
+	if result.OK || result.Status != state.StatusNeedsHuman || result.Outcome != string(OutcomePushConflict) {
+		t.Fatalf("result = %#v, want needs-human push_conflict", result)
+	}
+	if fakeGit.forcePushCalls != 0 || fakeGitHub.createPRCalls != 0 {
+		t.Fatalf("unsafe finalization calls forcePush=%d createPR=%d, want 0/0", fakeGit.forcePushCalls, fakeGitHub.createPRCalls)
+	}
+}
+
+func TestDispatchPushAlreadyAppliedAdoptsBranchPR(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{status: " M file.go\n", remoteBranchExists: true}
+	fakeGitHub := &workerFakeGitHub{
+		prsByCall: map[int][]gh.PullRequestReference{
+			3: {{Number: 968, URL: "https://github.com/owner/repo/pull/968"}},
+		},
+	}
+	fakeAgent := &workerFakeAgent{
+		resultSet: true,
+		result:    validWorkerAgentResult("Implemented.", 0),
+		log:       "provider completed\n",
+	}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 968,
+		IssueTitle:  "Adopt applied push",
+		RunID:       "run-push-applied",
+		Provider:    "codex",
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return fakeGitHub
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 2468
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+	if !result.OK || result.Outcome != string(OutcomePushAlreadyApplied) || result.PR != "https://github.com/owner/repo/pull/968" {
+		t.Fatalf("result = %#v, want push_already_applied success", result)
+	}
+	if fakeGitHub.createPRCalls != 0 || fakeGit.forcePushCalls != 0 {
+		t.Fatalf("unexpected create/overwrite calls createPR=%d forcePush=%d", fakeGitHub.createPRCalls, fakeGit.forcePushCalls)
+	}
+}
+
+func TestDispatchNoChangesClassifiesExpectedAndInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		summary     string
+		wantOK      bool
+		wantOutcome Outcome
+		wantErr     bool
+	}{
+		{name: "expected", summary: "Already implemented; no changes needed.", wantOK: true, wantOutcome: OutcomeNoChangesExpected},
+		{name: "invalid", summary: "I inspected the code.", wantOK: false, wantOutcome: OutcomeNoChangesInvalid, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			scratchRoot := t.TempDir()
+			fakeGit := &workerFakeGit{status: ""}
+			fakeGitHub := &workerFakeGitHub{}
+			fakeAgent := &workerFakeAgent{
+				resultSet: true,
+				result:    validWorkerAgentResult(tc.summary, 0),
+				log:       "provider completed\n",
+			}
+			result, err := Dispatch(context.Background(), Options{
+				RepoPath:    repo,
+				IssueNumber: 967,
+				IssueTitle:  "Classify no changes",
+				RunID:       "run-no-changes-" + tc.name,
+				Provider:    "codex",
+			}, Deps{
+				Git: fakeGit,
+				GitHub: func(string) GitHubClient {
+					return fakeGitHub
+				},
+				AgentLookup: func(string) (agent.Runner, error) {
+					return fakeAgent, nil
+				},
+				AcquireLock: func(string, time.Duration) (Lock, error) {
+					return &workerFakeLock{}, nil
+				},
+				Now: fixedNow,
+				PID: func() int {
+					return 2468
+				},
+				MkdirTemp: func(dir, pattern string) (string, error) {
+					return os.MkdirTemp(scratchRoot, pattern)
+				},
+				RemoveAll: os.RemoveAll,
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Dispatch err = %v, wantErr %t", err, tc.wantErr)
+			}
+			if result.OK != tc.wantOK || result.Outcome != string(tc.wantOutcome) || result.ProviderOutcome != string(OutcomeProviderCompleted) {
+				t.Fatalf("result = %#v, want ok=%t outcome=%s provider_completed", result, tc.wantOK, tc.wantOutcome)
+			}
+			if fakeGit.addAllCalls != 0 || fakeGit.commitCalls != 0 || fakeGit.pushCalls != 0 || fakeGitHub.createPRCalls != 0 {
+				t.Fatalf("no-change finalization made calls add=%d commit=%d push=%d pr=%d", fakeGit.addAllCalls, fakeGit.commitCalls, fakeGit.pushCalls, fakeGitHub.createPRCalls)
+			}
+		})
+	}
+}
+
 func TestCleanupRefusesUnownedScratchDeletion(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -2829,6 +3058,7 @@ func (f *workerFakeGit) BranchDelete(_ context.Context, _, branch string) error 
 type workerFakeGitHub struct {
 	prURL         string
 	prs           []gh.PullRequestReference
+	prsByCall     map[int][]gh.PullRequestReference
 	openPRs       []gh.PullRequest
 	err           error
 	repoErr       error
@@ -2836,6 +3066,7 @@ type workerFakeGitHub struct {
 	listHeadErr   error
 	listOpenErr   error
 	createPRCalls int
+	listHeadCalls int
 	lastPRHead    string
 	lastPRBase    string
 	lastPRTitle   string
@@ -2871,11 +3102,17 @@ func (f *workerFakeGitHub) CreatePR(_ context.Context, head, base, title, body s
 }
 
 func (f *workerFakeGitHub) ListHeadPRs(context.Context, string) ([]gh.PullRequestReference, error) {
+	f.listHeadCalls++
 	if f.listHeadErr != nil {
 		return nil, f.listHeadErr
 	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.prsByCall != nil {
+		if prs, ok := f.prsByCall[f.listHeadCalls]; ok {
+			return prs, nil
+		}
 	}
 	return f.prs, nil
 }
@@ -2898,9 +3135,11 @@ type workerFakeAgent struct {
 	log        string
 	exitCode   int
 	err        error
+	runCalls   int
 }
 
 func (f *workerFakeAgent) Run(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
+	f.runCalls++
 	f.invocation = invocation
 	if err := os.WriteFile(invocation.LogPath, []byte(f.log), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
