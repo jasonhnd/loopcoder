@@ -2256,6 +2256,15 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
+func hostCapabilitySupport(capabilities []runtimecap.HostCapabilityDeclaration, capability runtimecap.HostCapability) runtimecap.HostCapabilitySupport {
+	for _, declaration := range capabilities {
+		if declaration.Capability == capability {
+			return declaration.Support
+		}
+	}
+	return runtimecap.HostCapabilityUnknown
+}
+
 func statusProgressProjectID(t *testing.T, store storage.Store) string {
 	t.Helper()
 	var projectID string
@@ -3049,6 +3058,107 @@ func TestDispatchWithoutRunIDReplaysPriorClaudeOriginExactlyOnce(t *testing.T) {
 	store.Close()
 }
 
+func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-a-replacement")
+	created, bindingA := persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude session A terminal result", 47)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-b-replacement")
+	var stdoutB, stderrB bytes.Buffer
+	resultB := validDispatchResult(record)
+	resultB.RunID = "run-session-b"
+	dispatchB := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude session B",
+		"--format", "json",
+	}, &stdoutB, &stderrB, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchB = true
+			if strings.Contains(stderrB.String(), "Claude session A terminal result") || strings.Contains(stderrB.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("session B replayed session A receipt: %q", stderrB.String())
+			}
+			return resultB, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("session B dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutB.String(), stderrB.String())
+	}
+	if !dispatchB {
+		t.Fatal("session B dispatch was not called")
+	}
+	if err := relaygate.Flush(repo, io.Discard); err != nil {
+		t.Fatalf("flush session B relay gate: %v", err)
+	}
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-a-replacement")
+	var stdoutA, stderrA bytes.Buffer
+	resultA := validDispatchResult(record)
+	resultA.RunID = "run-session-a-return"
+	dispatchA := false
+	exitCode = RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude session A return",
+		"--format", "json",
+	}, &stdoutA, &stderrA, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchA = true
+			if !strings.Contains(stderrA.String(), "Claude session A terminal result") {
+				return worker.Result{}, fmt.Errorf("session A receipt was not replayed before dispatch: %q", stderrA.String())
+			}
+			return resultA, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("session A dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutA.String(), stderrA.String())
+	}
+	if !dispatchA {
+		t.Fatal("session A dispatch was not called")
+	}
+
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after session A replay: %v", err)
+	}
+	defer store.Close()
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      bindingA.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want one cursor for session A receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, bindingA.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 5, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate session A replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate session A replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+}
+
 func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
 	_, runID, store := setupStatusProgressFixture(t)
 	defer store.Close()
@@ -3070,6 +3180,9 @@ func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) 
 	if count != 0 {
 		t.Fatalf("failed replay count = %d, want 0", count)
 	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
 	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
 		ProjectID:     projectID,
 		DeliveryRunID: runID,
@@ -3082,6 +3195,29 @@ func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) 
 	}
 	if len(cursors) != 0 {
 		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
 	}
 
 	var stderr bytes.Buffer
@@ -3106,6 +3242,30 @@ func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) 
 	}
 	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
 		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want unchanged cursor %q", cursors, advancedCursor)
 	}
 }
 
@@ -3266,6 +3426,166 @@ func TestDispatchReplaysCancelledDetachedRunAndLeavesUnacknowledged(t *testing.T
 	}
 	if len(acks) != 0 {
 		t.Fatalf("cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUnknown(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-cancelled-detached")
+	t.Setenv("CLAUDECODE", "1")
+	host, ok := runtimecap.LookupHost("claude-code")
+	if !ok {
+		t.Fatal("LookupHost(claude-code) returned false")
+	}
+	capabilities := runtimecap.HostCapabilityDeclarations(host)
+	if got := hostCapabilitySupport(capabilities, runtimecap.HostDetachedCancellation); got != runtimecap.HostCapabilityUnknown {
+		t.Fatalf("Claude detached cancellation support = %q, want unknown", got)
+	}
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-claude-cancelled-detached-replay",
+		Owner:          "owner-claude-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    900,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "grok",
+		Model:          "grok-build",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-claude-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "After Claude cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Claude Code origin") ||
+				!strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled Claude receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := claudeHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 || obligations[0].ClaimOwner != "" {
+		t.Fatalf("Claude cancelled obligation after replay = %#v, want pending unacknowledged with no claim", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("Claude cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchClaudeHostReplayIsIndependentOfWorkerProvider(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{name: "non-claude-worker", provider: "grok", model: "grok-build"},
+		{name: "synthetic-future-provider", provider: "synthetic-future", model: "future-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, priorRunID, store := setupStatusProgressFixture(t)
+			projectID := statusProgressProjectID(t, store)
+			t.Setenv(hostprofile.EnvName, "claude-code")
+			t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-provider-independence-"+tt.name)
+			t.Setenv("CLAUDECODE", "1")
+			persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude host replay before "+tt.provider, 48)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			record := validDispatchReport()
+			result := validDispatchResult(record)
+			result.RunID = "run-provider-independence-" + tt.name
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--repo", repo,
+				"--issue-number", "900",
+				"--issue-title", "Claude host provider independence",
+				"--provider", tt.provider,
+				"--model", tt.model,
+				"--format", "json",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return time.Date(2026, 7, 14, 12, 6, 0, 0, time.UTC) },
+				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					if opts.Provider != tt.provider || opts.Model != tt.model {
+						return worker.Result{}, fmt.Errorf("worker selection = %s/%s, want %s/%s", opts.Provider, opts.Model, tt.provider, tt.model)
+					}
+					if !strings.Contains(stderr.String(), "Claude host replay before "+tt.provider) {
+						return worker.Result{}, fmt.Errorf("Claude host replay was not emitted before %s worker: %q", tt.provider, stderr.String())
+					}
+					return result, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var parsed worker.Result
+			assertSingleJSONValue(t, stdout.String(), &parsed)
+			if parsed.RunID != result.RunID {
+				t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+			}
+		})
 	}
 }
 

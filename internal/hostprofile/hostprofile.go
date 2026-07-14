@@ -149,7 +149,6 @@ func CodexOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBind
 func ClaudeOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
 	return originBindingRequest(opts, "claude-code", "claude-code-session", []string{
 		"CLAUDE_CODE_SESSION_ID",
-		"CLAUDECODE_SESSION_ID",
 	}, []string{
 		"CLAUDECODE",
 		"CLAUDE_CODE_ENTRYPOINT",

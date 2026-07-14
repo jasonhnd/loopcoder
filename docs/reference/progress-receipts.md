@@ -98,15 +98,14 @@ original host session. A host environment marker can identify an origin
 candidate, but it is not capability proof and does not create callback, wake-up,
 visibility, steering, or acknowledgment evidence.
 
-When `CODEX_THREAD_ID` / `CODEX_SESSION_ID` or
-`CLAUDE_CODE_SESSION_ID` / `CLAUDECODE_SESSION_ID` is present, LoopCoder binds
-the active host origin by hashing the opaque thread/session value and storing
-only the redacted binding, marker key names, and bounded metadata digest. It
-does not persist host credentials, bearer material, prompts, raw provider
-output, transcript contents, or raw local paths. If host origin metadata is
-absent, automatic origin-bound replay is unavailable; use explicit
-`status --receipts`, `status --follow`, or `attach --run` to inspect the
-durable receipts.
+When `CODEX_THREAD_ID` / `CODEX_SESSION_ID` or `CLAUDE_CODE_SESSION_ID` is
+present, LoopCoder binds the active host origin by hashing the opaque
+thread/session value and storing only the redacted binding, marker key names,
+and bounded metadata digest. It does not persist host credentials, bearer
+material, prompts, raw provider output, transcript contents, or raw local paths.
+If host origin metadata is absent, automatic origin-bound replay is unavailable;
+use explicit `status --receipts`, `status --follow`, or `attach --run` to
+inspect the durable receipts.
 
 Foreground `dispatch` keeps machine JSON stdout pure. Human progress replay and
 diagnostics are written to stderr, while `status --receipts --format jsonl` and
