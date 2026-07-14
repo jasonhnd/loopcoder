@@ -574,6 +574,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue-number int          GitHub issue number (required)")
 		fmt.Fprintln(w, "  --issue-title string        GitHub issue title (required)")
 		fmt.Fprintln(w, "  --issue-body string         GitHub issue body")
+		fmt.Fprintln(w, "  --issue-body-file string    path to GitHub issue body text")
 		fmt.Fprintln(w, "  --base-branch string        base branch to fetch and branch from (default \"main\")")
 		fmt.Fprintln(w, "  --branch string             worker branch (default loop/issue-<issue-number>)")
 		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
@@ -4184,6 +4185,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var issueNumberAlias int
 	var issueTitleAlias string
 	var issueBodyAlias string
+	var issueBodyFile string
+	var issueBodyFileAlias string
 	var baseBranchAlias string
 	var branchAlias string
 	var runIDAlias string
@@ -4219,6 +4222,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
 	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
 	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
+	fs.StringVar(&issueBodyFile, "issue-body-file", "", "path to issue body text")
+	fs.StringVar(&issueBodyFileAlias, "IssueBodyFile", "", "path to issue body text")
 	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&opts.Branch, "branch", "", "branch")
@@ -4271,6 +4276,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if issueBodyAlias != "" {
 		opts.IssueBody = issueBodyAlias
+	}
+	if issueBodyFileAlias != "" {
+		issueBodyFile = issueBodyFileAlias
+	}
+	if strings.TrimSpace(issueBodyFile) != "" {
+		// #nosec G304 -- --issue-body-file is an explicit local CLI input used to keep issue text out of child argv.
+		data, err := os.ReadFile(issueBodyFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch: read --issue-body-file: %v\n", err)
+			return 2
+		}
+		opts.IssueBody = string(data)
 	}
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias

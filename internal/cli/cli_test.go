@@ -5107,6 +5107,7 @@ func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "898",
 		"--issue-title", "Detached supervision",
+		"--issue-body", "body with runtime canary secret",
 		"--run-id", "run-20260714T040000Z-issue-898",
 		"--detach",
 	}, &stdout, &stderr, Deps{
@@ -5151,8 +5152,160 @@ func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
 	if !containsString(launchedArgs, "--supervisor-run") || !containsString(launchedArgs, "--supervisor-owner") || !containsString(launchedArgs, launch.Owner) {
 		t.Fatalf("launched args missing supervisor fence: %#v", launchedArgs)
 	}
+	if containsString(launchedArgs, "body with runtime canary secret") || !containsString(launchedArgs, "--issue-body-file") {
+		t.Fatalf("launched args exposed issue body or omitted issue-body-file: %#v", launchedArgs)
+	}
 	if !strings.Contains(launchedLog, launch.RunID) || strings.Contains(launchedLog, repo) {
 		t.Fatalf("launched log path = %q, want machine-local redacted path containing run id only", launchedLog)
+	}
+	var launchRecord detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launchRecord)
+	if strings.Contains(launchRecord.StatusCommand, repo) || strings.Contains(launchRecord.AttachCommand, repo) {
+		t.Fatalf("launch commands expose repo path: %#v", launchRecord)
+	}
+}
+
+func TestDetachedRecoverAcquiresGenerationAndLaunchesSupervisor(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-recover-detached",
+		Owner:          "owner-one",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Payload: map[string]any{
+			"issue_title": "Recovered detached supervision",
+		},
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	store.Close()
+
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"recover",
+		"--repo", repo,
+		"--run-id", claim.RunID,
+		"--detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 5151, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var result detachedrun.StatusResult
+	assertSingleJSONValue(t, stdout.String(), &result)
+	if result.Record.Generation != 2 || result.Record.Owner == claim.Owner || result.Record.ProcessPID != 5151 || result.Record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("recover result = %#v", result)
+	}
+	if !containsString(launchedArgs, "--supervisor-generation") || !containsString(launchedArgs, "2") {
+		t.Fatalf("recover launched args missing generation 2 fence: %#v", launchedArgs)
+	}
+}
+
+func TestDispatchSupervisorPersistsProviderExposureAndTerminalReceipts(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 30, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-supervisor-receipts",
+		Owner:          "owner-receipts",
+		LeaseExpiresAt: now.Add(time.Hour),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Model:          "gpt-test",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 6161, "process-tree", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	store.Close()
+
+	var dispatchCalls int
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Supervisor receipts",
+		"--run-id", claim.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalls++
+			return worker.Result{OK: true, Status: "succeeded", Issue: 898, RunID: claim.RunID}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	if dispatchCalls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1", dispatchCalls)
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !record.ProviderExposed || record.LaunchReceiptID == "" || record.TerminalReceiptID == "" || record.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("supervisor record missing receipts/exposure: %#v", record)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("receipt count = %d, want 2: %#v", len(receipts), receipts)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,12 +50,154 @@ func TestSupervisorClaimFencesTransitionsAndTerminalReplay(t *testing.T) {
 	if done.Status != StatusSucceeded || done.TerminalReceiptID != "receipt-terminal" || done.Classification != ClassificationTerminal {
 		t.Fatalf("complete = %#v", done)
 	}
+	exact, err := Complete(ctx, store, record.Fence(), StatusSucceeded, "receipt-terminal", "", "", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("Complete exact replay: %v", err)
+	}
+	if exact.RecordVersion != done.RecordVersion || exact.TerminalAt != done.TerminalAt {
+		t.Fatalf("exact replay mutated terminal record: before=%#v after=%#v", done, exact)
+	}
+	if _, err := Complete(ctx, store, record.Fence(), StatusFailed, "receipt-terminal-2", "failed", "different", now.Add(4*time.Second)); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("conflicting terminal replay error = %v, want ErrTerminal", err)
+	}
 	replay, err := Reconcile(ctx, store, record.RunID, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("Reconcile terminal: %v", err)
 	}
 	if !replay.Terminal || replay.ReplayAction != "reused-terminal" || replay.Execute {
 		t.Fatalf("terminal replay = %#v", replay)
+	}
+}
+
+func TestLaunchPhaseTransitionsAreMonotonic(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 1, 30, 0, 0, time.UTC)
+	store := newDetachedStore(t, now)
+	record, err := Claim(ctx, store, ClaimRequest{
+		ProjectID:      "proj_detached",
+		RunID:          "run-monotonic",
+		Owner:          "supervisor-a",
+		LeaseExpiresAt: now.Add(time.Hour),
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := MarkWorkerStarted(ctx, store, record.Fence(), now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkWorkerStarted: %v", err)
+	}
+	if _, err := MarkSpawned(ctx, store, record.Fence(), 1234, "process-tree", now.Add(2*time.Second)); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("regressive MarkSpawned error = %v, want ErrStaleClaim", err)
+	}
+	got, err := Get(ctx, store, record.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.LaunchPhase != PhaseWorkerStarted || got.ProcessPID != 0 {
+		t.Fatalf("regressive transition mutated record: %#v", got)
+	}
+}
+
+func TestAcquireRecoveryFencedAndSingleGeneration(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 2, 30, 0, 0, time.UTC)
+	store := newDetachedStore(t, now)
+	record, err := Claim(ctx, store, ClaimRequest{
+		ProjectID:      "proj_detached",
+		RunID:          "run-recover",
+		Owner:          "supervisor-a",
+		LeaseExpiresAt: now.Add(time.Minute),
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	acquired, err := AcquireRecovery(ctx, store, RecoveryRequest{
+		RunID:                  record.RunID,
+		ExpectedOwner:          record.Owner,
+		ExpectedGeneration:     record.Generation,
+		ExpectedLeaseExpiresAt: record.LeaseExpiresAt,
+		Owner:                  "supervisor-b",
+		LeaseExpiresAt:         now.Add(time.Hour),
+		Now:                    now.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcquireRecovery: %v", err)
+	}
+	if !acquired.Execute || acquired.Record.Generation != 2 || acquired.Record.Owner != "supervisor-b" || acquired.Record.LaunchPhase != PhaseClaimed {
+		t.Fatalf("acquired = %#v", acquired)
+	}
+	again, err := AcquireRecovery(ctx, store, RecoveryRequest{
+		RunID:                  record.RunID,
+		ExpectedOwner:          record.Owner,
+		ExpectedGeneration:     record.Generation,
+		ExpectedLeaseExpiresAt: record.LeaseExpiresAt,
+		Owner:                  "supervisor-c",
+		LeaseExpiresAt:         now.Add(time.Hour),
+		Now:                    now.Add(2 * time.Minute),
+	})
+	if !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("second AcquireRecovery error = %v result=%#v, want ErrStaleClaim", err, again)
+	}
+}
+
+func TestAcquireRecoveryNeedsHumanAfterWorkerStart(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 2, 45, 0, 0, time.UTC)
+	store := newDetachedStore(t, now)
+	record, err := Claim(ctx, store, ClaimRequest{
+		ProjectID:      "proj_detached",
+		RunID:          "run-recover-ambiguous",
+		Owner:          "supervisor-a",
+		LeaseExpiresAt: now.Add(time.Minute),
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := MarkWorkerStarted(ctx, store, record.Fence(), now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkWorkerStarted: %v", err)
+	}
+	got, err := AcquireRecovery(ctx, store, RecoveryRequest{
+		RunID:                  record.RunID,
+		ExpectedOwner:          record.Owner,
+		ExpectedGeneration:     record.Generation,
+		ExpectedLeaseExpiresAt: record.LeaseExpiresAt,
+		Owner:                  "supervisor-b",
+		LeaseExpiresAt:         now.Add(time.Hour),
+		Now:                    now.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AcquireRecovery ambiguous: %v", err)
+	}
+	if !got.NeedsHuman || got.Execute || got.Record.Generation != 1 {
+		t.Fatalf("ambiguous recovery = %#v", got)
+	}
+}
+
+func TestTerminalErrorsAreRedactedAndBounded(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 3, 0, 0, 0, time.UTC)
+	store := newDetachedStore(t, now)
+	record, err := Claim(ctx, store, ClaimRequest{
+		ProjectID:      "proj_detached",
+		RunID:          "run-redact",
+		Owner:          "supervisor-a",
+		LeaseExpiresAt: now.Add(time.Hour),
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	done, err := Complete(ctx, store, record.Fence(), StatusFailed, "receipt-terminal", "dispatch error", "failed in /tmp/secret/repo with api_key=canary-secret-value", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if strings.Contains(done.TerminalError, "/tmp/secret/repo") || strings.Contains(done.TerminalError, "canary-secret-value") {
+		t.Fatalf("terminal error was not redacted: %q", done.TerminalError)
+	}
+	if done.TerminalErrorCode != "dispatch-error" {
+		t.Fatalf("terminal error code = %q, want sanitized dispatch-error", done.TerminalErrorCode)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -178,6 +179,17 @@ type TransitionRequest struct {
 	Now               time.Time
 }
 
+type RecoveryRequest struct {
+	RunID                  string
+	ExpectedOwner          string
+	ExpectedGeneration     int64
+	ExpectedLeaseExpiresAt string
+	Owner                  string
+	LeaseExpiresAt         time.Time
+	RecoveryEvidence       []Evidence
+	Now                    time.Time
+}
+
 func Claim(ctx context.Context, store storage.Store, req ClaimRequest) (Record, error) {
 	if store == nil {
 		return Record{}, typed(ErrInvalidRecordCode, "store is required")
@@ -200,6 +212,81 @@ func Claim(ctx context.Context, store storage.Store, req ClaimRequest) (Record, 
 		}
 		out = recordFromClaim(req)
 		return insertTx(ctx, tx, out)
+	})
+	return out, err
+}
+
+func AcquireRecovery(ctx context.Context, store storage.Store, req RecoveryRequest) (StatusResult, error) {
+	if store == nil {
+		return StatusResult{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	req = normalizeRecovery(req, store.Now())
+	if err := validateRecovery(req); err != nil {
+		return StatusResult{}, err
+	}
+	var out StatusResult
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		existing, ok, err := loadTx(ctx, tx, req.RunID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		out.Record = existing
+		if existing.Owner != req.ExpectedOwner || existing.Generation != req.ExpectedGeneration || existing.LeaseExpiresAt != req.ExpectedLeaseExpiresAt {
+			return typed(ErrStaleClaimCode, "recovery fence for %s no longer matches", req.RunID)
+		}
+		if terminal(existing.Status) {
+			out.ReplayAction = "reused-terminal"
+			out.Terminal = true
+			return nil
+		}
+		if beforeOrEqual(req.Now, parseTime(existing.LeaseExpiresAt)) {
+			out.ReplayAction = "observe-running"
+			out.Reason = "active supervisor lease"
+			return nil
+		}
+		if existing.ProviderExposed || strings.TrimSpace(existing.LaunchReceiptID) != "" || phaseRank(existing.LaunchPhase) >= phaseRank(PhaseWorkerStarted) {
+			out.ReplayAction = "needs-human"
+			out.NeedsHuman = true
+			out.Reason = "recovery would risk duplicating an exposed or possibly started provider execution"
+			return nil
+		}
+		recovered := existing
+		recovered.RecordVersion++
+		recovered.Owner = req.Owner
+		recovered.Generation = existing.Generation + 1
+		recovered.LaunchPhase = PhaseClaimed
+		recovered.Status = StatusNotStarted
+		recovered.Classification = StatusNotStarted
+		recovered.ProcessPID = 0
+		recovered.ProcessAuthority = ""
+		recovered.ProviderExposed = false
+		recovered.LaunchReceiptID = ""
+		recovered.TerminalReceiptID = ""
+		recovered.CancelRequestedAt = ""
+		recovered.ClaimedAt = format(req.Now)
+		recovered.LeaseExpiresAt = format(req.LeaseExpiresAt)
+		recovered.HeartbeatAt = format(req.Now)
+		recovered.ProcessStartedAt = ""
+		recovered.WorkerStartedAt = ""
+		recovered.TerminalAt = ""
+		recovered.TerminalErrorCode = ""
+		recovered.TerminalError = ""
+		recovered.UpdatedAt = format(req.Now)
+		recovered.RecoveryEvidence = append(append([]Evidence(nil), existing.RecoveryEvidence...), req.RecoveryEvidence...)
+		if err := updateTx(ctx, tx, recovered, existing); err != nil {
+			return err
+		}
+		out = StatusResult{
+			Record:       recovered,
+			ReplayAction: "recovered",
+			Execute:      true,
+			CanRecover:   false,
+			Reason:       "expired pre-worker supervisor claim acquired by a new generation",
+		}
+		return nil
 	})
 	return out, err
 }
@@ -329,8 +416,19 @@ func Complete(ctx context.Context, store storage.Store, fence Fence, status, ter
 }
 
 func RequestCancel(ctx context.Context, store storage.Store, runID string, now time.Time) (Record, error) {
+	record, err := Get(ctx, store, runID)
+	if err != nil {
+		return Record{}, err
+	}
+	return RequestCancelFenced(ctx, store, record.Fence(), record.LeaseExpiresAt, now)
+}
+
+func RequestCancelFenced(ctx context.Context, store storage.Store, fence Fence, expectedLeaseExpiresAt string, now time.Time) (Record, error) {
 	if store == nil {
 		return Record{}, typed(ErrInvalidRecordCode, "store is required")
+	}
+	if err := validateFence(fence); err != nil {
+		return Record{}, err
 	}
 	if now.IsZero() {
 		now = store.Now()
@@ -338,7 +436,7 @@ func RequestCancel(ctx context.Context, store storage.Store, runID string, now t
 	at := format(now)
 	var out Record
 	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
-		record, ok, err := loadTx(ctx, tx, runID)
+		record, ok, err := loadTx(ctx, tx, fence.RunID)
 		if err != nil {
 			return err
 		}
@@ -348,6 +446,9 @@ func RequestCancel(ctx context.Context, store storage.Store, runID string, now t
 		if terminal(record.Status) {
 			out = record
 			return nil
+		}
+		if record.Owner != fence.Owner || record.Generation != fence.Generation || record.LeaseExpiresAt != strings.TrimSpace(expectedLeaseExpiresAt) {
+			return typed(ErrStaleClaimCode, "cancel fence for %s no longer matches", fence.RunID)
 		}
 		res, err := tx.Exec(ctx, `UPDATE detached_run_supervisors
 			SET record_version = record_version + 1, status = ?, classification = ?, cancel_requested_at = ?, updated_at = ?
@@ -360,10 +461,18 @@ func RequestCancel(ctx context.Context, store storage.Store, runID string, now t
 		if err == nil && affected != 1 {
 			return typed(ErrStaleClaimCode, "cancel update affected %d rows", affected)
 		}
-		out, _, err = loadTx(ctx, tx, runID)
+		out, _, err = loadTx(ctx, tx, fence.RunID)
 		return err
 	})
 	return out, err
+}
+
+func RenewLease(ctx context.Context, store storage.Store, fence Fence, leaseExpiresAt, now time.Time) (Record, error) {
+	return Transition(ctx, store, TransitionRequest{
+		Fence:          fence,
+		LeaseExpiresAt: leaseExpiresAt,
+		Now:            now,
+	})
 }
 
 func Transition(ctx context.Context, store storage.Store, req TransitionRequest) (Record, error) {
@@ -386,8 +495,15 @@ func Transition(ctx context.Context, store storage.Store, req TransitionRequest)
 		if existing.Owner != req.Fence.Owner || existing.Generation != req.Fence.Generation {
 			return typed(ErrStaleClaimCode, "stale supervisor fence for %s", req.Fence.RunID)
 		}
-		if terminal(existing.Status) && req.Phase != PhaseTerminal {
+		if terminal(existing.Status) {
+			if isExactTerminalReplay(existing, req) {
+				out = existing
+				return nil
+			}
 			return typed(ErrTerminalCode, "run %s is terminal", req.Fence.RunID)
+		}
+		if err := validateMonotonicTransition(existing, req); err != nil {
+			return err
 		}
 		out = mergeTransition(existing, req)
 		return updateTx(ctx, tx, out, existing)
@@ -450,6 +566,30 @@ func validateClaim(req ClaimRequest) error {
 	return nil
 }
 
+func normalizeRecovery(req RecoveryRequest, fallback time.Time) RecoveryRequest {
+	req.RunID = strings.TrimSpace(req.RunID)
+	req.ExpectedOwner = strings.TrimSpace(req.ExpectedOwner)
+	req.ExpectedLeaseExpiresAt = strings.TrimSpace(req.ExpectedLeaseExpiresAt)
+	req.Owner = strings.TrimSpace(req.Owner)
+	if req.Now.IsZero() {
+		req.Now = fallback
+	}
+	if req.LeaseExpiresAt.IsZero() {
+		req.LeaseExpiresAt = req.Now.Add(30 * time.Minute)
+	}
+	return req
+}
+
+func validateRecovery(req RecoveryRequest) error {
+	if req.RunID == "" || req.ExpectedOwner == "" || req.ExpectedGeneration <= 0 || req.ExpectedLeaseExpiresAt == "" || req.Owner == "" {
+		return typed(ErrInvalidRecordCode, "run_id, expected owner/generation/lease, and new owner are required")
+	}
+	if !req.LeaseExpiresAt.After(req.Now) {
+		return typed(ErrInvalidRecordCode, "lease_expires_at must be after now")
+	}
+	return nil
+}
+
 func recordFromClaim(req ClaimRequest) Record {
 	now := format(req.Now)
 	return Record{
@@ -501,6 +641,55 @@ func validateFence(f Fence) error {
 	return nil
 }
 
+func validateMonotonicTransition(existing Record, req TransitionRequest) error {
+	if req.Phase == "" {
+		return nil
+	}
+	currentRank, nextRank := phaseRank(existing.LaunchPhase), phaseRank(req.Phase)
+	if currentRank == 0 || nextRank == 0 {
+		return typed(ErrInvalidRecordCode, "unknown launch phase transition %q -> %q", existing.LaunchPhase, req.Phase)
+	}
+	if nextRank < currentRank {
+		return typed(ErrStaleClaimCode, "regressive launch phase transition %q -> %q", existing.LaunchPhase, req.Phase)
+	}
+	if req.Phase == PhaseTerminal && !terminal(req.Status) {
+		return typed(ErrInvalidRecordCode, "terminal phase requires terminal status")
+	}
+	if terminal(req.Status) && req.Phase != PhaseTerminal {
+		return typed(ErrInvalidRecordCode, "terminal status requires terminal phase")
+	}
+	return nil
+}
+
+func phaseRank(phase string) int {
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case PhaseClaimed:
+		return 1
+	case PhaseSpawned:
+		return 2
+	case PhaseWorkerStarted:
+		return 3
+	case PhaseProviderOpen:
+		return 4
+	case PhaseTerminal:
+		return 5
+	default:
+		return 0
+	}
+}
+
+func isExactTerminalReplay(existing Record, req TransitionRequest) bool {
+	if req.Phase != PhaseTerminal || existing.LaunchPhase != PhaseTerminal {
+		return false
+	}
+	if strings.TrimSpace(req.Status) != existing.Status || strings.TrimSpace(req.Classification) != existing.Classification {
+		return false
+	}
+	return strings.TrimSpace(req.TerminalReceiptID) == existing.TerminalReceiptID &&
+		strings.TrimSpace(req.TerminalErrorCode) == existing.TerminalErrorCode &&
+		redactBound(req.TerminalError, 500) == existing.TerminalError
+}
+
 func mergeTransition(existing Record, req TransitionRequest) Record {
 	out := existing
 	out.RecordVersion++
@@ -529,10 +718,10 @@ func mergeTransition(existing Record, req TransitionRequest) Record {
 		out.TerminalReceiptID = strings.TrimSpace(req.TerminalReceiptID)
 	}
 	if strings.TrimSpace(req.TerminalErrorCode) != "" {
-		out.TerminalErrorCode = bound(req.TerminalErrorCode, 120)
+		out.TerminalErrorCode = sanitizeID(req.TerminalErrorCode, 120)
 	}
 	if strings.TrimSpace(req.TerminalError) != "" {
-		out.TerminalError = bound(req.TerminalError, 500)
+		out.TerminalError = redactBound(req.TerminalError, 500)
 	}
 	if !req.LeaseExpiresAt.IsZero() {
 		out.LeaseExpiresAt = format(req.LeaseExpiresAt)
@@ -585,16 +774,16 @@ func updateTx(ctx context.Context, tx storage.Tx, r, existing Record) error {
 		return err
 	}
 	res, err := tx.Exec(ctx, `UPDATE detached_run_supervisors SET
-		record_version = ?, launch_phase = ?, status = ?, classification = ?, process_pid = ?, process_authority = ?,
+		record_version = ?, supervisor_owner = ?, supervisor_generation = ?, launch_phase = ?, status = ?, classification = ?, process_pid = ?, process_authority = ?,
 		receipt_policy = ?, delivery_sinks_json = ?, cancellation_channel = ?, worker_lease_json = ?,
 		recovery_evidence_json = ?, clocks_json = ?, provider_exposed = ?, launch_receipt_id = ?, terminal_receipt_id = ?,
-		cancel_requested_at = ?, lease_expires_at = ?, heartbeat_at = ?, process_started_at = ?, worker_started_at = ?,
+		cancel_requested_at = ?, claimed_at = ?, lease_expires_at = ?, heartbeat_at = ?, process_started_at = ?, worker_started_at = ?,
 		terminal_at = ?, terminal_error_code = ?, terminal_error = ?, payload_json = ?, updated_at = ?
 		WHERE run_id = ? AND supervisor_owner = ? AND supervisor_generation = ? AND record_version = ?`,
-		r.RecordVersion, r.LaunchPhase, r.Status, r.Classification, r.ProcessPID, r.ProcessAuthority,
+		r.RecordVersion, r.Owner, r.Generation, r.LaunchPhase, r.Status, r.Classification, r.ProcessPID, r.ProcessAuthority,
 		r.ReceiptPolicy, sinks, r.CancellationChannel, workerLease,
 		evidence, clocks, boolInt(r.ProviderExposed), r.LaunchReceiptID, r.TerminalReceiptID,
-		r.CancelRequestedAt, r.LeaseExpiresAt, r.HeartbeatAt, r.ProcessStartedAt, r.WorkerStartedAt,
+		r.CancelRequestedAt, r.ClaimedAt, r.LeaseExpiresAt, r.HeartbeatAt, r.ProcessStartedAt, r.WorkerStartedAt,
 		r.TerminalAt, r.TerminalErrorCode, r.TerminalError, payload, r.UpdatedAt,
 		existing.RunID, existing.Owner, existing.Generation, existing.RecordVersion)
 	if err != nil {
@@ -747,4 +936,30 @@ func bound(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit])
+}
+
+func sanitizeID(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.', r == ':':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return bound(b.String(), limit)
+}
+
+var (
+	absolutePathPattern = regexp.MustCompile(`(?m)(?:/[^\s"'<>:]+){2,}`)
+	secretPattern       = regexp.MustCompile(`(?i)(token|secret|password|api[_-]?key|authorization)(\s*[=:]\s*)([^\s"'<>]+)`)
+)
+
+func redactBound(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	value = absolutePathPattern.ReplaceAllString(value, "[redacted-path]")
+	value = secretPattern.ReplaceAllString(value, `$1$2[redacted-secret]`)
+	return bound(value, limit)
 }
