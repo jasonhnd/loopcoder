@@ -2,29 +2,42 @@ schema_version: loopcoder.evaluation.simulation_result.v1
 scenario_id: routing-churn-quota-reset-fallback
 seed: 1
 clock: 2026-07-14T00:00:00Z step_ms=10
-policy: version=simulation-release-policy-v1 profile=release-regression-profile fingerprint=sha256:routing-churn-quota-reset-fallback-policy plan=sha256:routing-churn-quota-reset-fallback-plan authorization=sha256:routing-churn-quota-reset-fallback-auth
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:routing-churn-quota-reset-fallback-policy plan=sha256:routing-churn-quota-reset-fallback-plan authorization=sha256:routing-churn-quota-reset-fallback-auth
 sources: project=project-release-regression delivery=delivery-routing-churn-quota-reset-fallback inventory=inventory-routing-churn-quota-reset-fallback budget=budget-routing-churn-quota-reset-fallback routing=routing-routing-churn-quota-reset-fallback agent_tree=agent-tree-routing-churn-quota-reset-fallback handoff=handoff-routing-churn-quota-reset-fallback state=durable-state-routing-churn-quota-reset-fallback
 truncated: false
 decisions:
-- decision_171102b2c98caa42b61005a264d60930 event=event-route-reset task=task-a kind=routing accepted=true chosen=model-zz budget=budget-a reason=selected deterministic eligible candidate
+- decision_3c958a7e4c11029af40fe200b91bb2a7 event=event-route-after-reset task=task-a kind=routing accepted=true chosen=model-zz budget=budget-a reason=selected deterministic eligible candidate
   quota_snapshots=quota-b,quota-c-stale,quota-d-exhausted,quota-e-reset
   rejected=model-a code=model-unavailable reason=temporarily-unavailable
   rejected=model-b code=ErrQuotaUnknown reason=quota confidence is not authoritative
   rejected=model-c code=ErrQuotaUnknown reason=quota confidence is not authoritative
   rejected=model-d code=ErrQuotaInsufficient reason=quota remaining is insufficient
+  rejected=model-pre-reset code=ErrQuotaUnknown reason=quota evidence is missing
+- decision_97dfdec52998d32d7fe632cbf6bc28e1 event=event-route-before-reset task=task-a kind=routing accepted=true chosen=model-pre-reset budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b,quota-d-exhausted,quota-e-pre-reset
+  rejected=model-b code=ErrQuotaUnknown reason=quota confidence is not authoritative
+  rejected=model-d code=ErrQuotaInsufficient reason=quota remaining is insufficient
 events:
-- 001 event-route-reset kind=route_task task=task-a status=applied decision=decision_171102b2c98caa42b61005a264d60930 receipt= idem=idem_171102b2c98caa42b61005a264d60930 at=2026-07-14T00:00:00Z
+- 001 event-route-before-reset kind=route_task task=task-a status=applied decision=decision_97dfdec52998d32d7fe632cbf6bc28e1 receipt= idem=idem_97dfdec52998d32d7fe632cbf6bc28e1 at=2026-07-14T00:00:00Z
+- 002 event-route-after-reset kind=route_task task=task-a status=applied decision=decision_3c958a7e4c11029af40fe200b91bb2a7 receipt= idem=idem_3c958a7e4c11029af40fe200b91bb2a7 at=2026-07-14T00:00:00.01Z
 durable_state:
-- applied_events=event-route-reset
+- applied_events=event-route-after-reset,event-route-before-reset
 - completed_tasks=none
 - provider_receipts:
+  - none
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
   - none
 - handoffs:
   - none
 - agent_owners:
   - none
 invariants:
+- inv-route-reset-candidate kind=chosen_candidate passed=true diagnostic=
 - inv-route-reset-fallback kind=route_accepted passed=true diagnostic=
 diagnostics:
 - none
-diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:0f180ae023e7caaeff3e69f35f34de94f22dbe16f63389bf66ef2b491f87c280 added_events=event-route-reset added_decisions=decision_171102b2c98caa42b61005a264d60930
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:16c2fde6dfd2528124068e1a612e984b5905e278bdda88a9d5dbd217663b49fb added_events=event-route-after-reset,event-route-before-reset added_decisions=decision_3c958a7e4c11029af40fe200b91bb2a7,decision_97dfdec52998d32d7fe632cbf6bc28e1

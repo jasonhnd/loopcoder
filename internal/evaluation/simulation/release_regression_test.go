@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	releaseRegressionFixtureSchemaV1 = "loopcoder.evaluation.release_regression_fixture.v1"
-	releaseRegressionPolicyVersion   = "simulation-release-policy-v1"
+	releaseRegressionFixtureSchemaV1 = "loopcoder.evaluation.release_regression_fixture.v3"
+	releaseRegressionPolicyVersion   = "simulation-release-policy-v3"
 	updateReleaseGoldensEnv          = "LOOPCODER_UPDATE_RELEASE_REGRESSION_GOLDENS"
 )
 
@@ -113,14 +113,37 @@ func TestReleaseRegressionMatrixCoversIssue714Invariants(t *testing.T) {
 			}
 		}
 	}
+	invariantToScenarios := map[string][]string{}
+	for _, invariant := range matrix.Invariants {
+		invariantToScenarios[invariant.InvariantID] = append([]string(nil), invariant.Scenarios...)
+		sort.Strings(invariantToScenarios[invariant.InvariantID])
+	}
+	scenarioToInvariants := map[string][]string{}
+	for _, fixture := range matrix.Scenarios {
+		scenarioToInvariants[fixture.ScenarioID] = append([]string(nil), fixture.Invariants...)
+		sort.Strings(scenarioToInvariants[fixture.ScenarioID])
+	}
+	for scenarioID, invariantIDs := range scenarioToInvariants {
+		for _, invariantID := range invariantIDs {
+			if !containsString(invariantToScenarios[invariantID], scenarioID) {
+				t.Fatalf("scenario %s claims invariant %s, but invariant does not list scenario", scenarioID, invariantID)
+			}
+		}
+	}
+	for invariantID, scenarioIDs := range invariantToScenarios {
+		for _, scenarioID := range scenarioIDs {
+			if !containsString(scenarioToInvariants[scenarioID], invariantID) {
+				t.Fatalf("invariant %s claims scenario %s, but scenario does not list invariant", invariantID, scenarioID)
+			}
+		}
+	}
+	if !sameStringSlice(keys(knownScenarioIDs), keysFuncMap(scenarios)) {
+		t.Fatalf("matrix scenario set mismatch\ngot:  %v\nwant: %v", keys(knownScenarioIDs), keysFuncMap(scenarios))
+	}
 }
 
 func TestReleaseRegressionSnapshotsStable(t *testing.T) {
-	for _, scenarioID := range []string{
-		"routing-churn-quota-reset-fallback",
-		"handoff-crash-replay-idempotent",
-		"federation-nested-bounds-concurrency",
-	} {
+	for _, scenarioID := range keysFuncMap(releaseRegressionScenarios()) {
 		t.Run(scenarioID, func(t *testing.T) {
 			scenario := releaseRegressionScenario(t, scenarioID)
 			result, err := Execute(context.Background(), scenario, Options{})
@@ -138,6 +161,33 @@ func TestReleaseRegressionSnapshotsStable(t *testing.T) {
 			}
 			assertReleaseSnapshot(t, scenarioID+".replay.canonical.json", mustCanonicalResult(t, replayed))
 		})
+	}
+}
+
+func TestReleaseRegressionSnapshotFilesMatchScenarioSet(t *testing.T) {
+	want := map[string]bool{}
+	for scenarioID := range releaseRegressionScenarios() {
+		want[scenarioID+".canonical.json"] = true
+		want[scenarioID+".human.txt"] = true
+		want[scenarioID+".replay.canonical.json"] = true
+	}
+	entries, err := os.ReadDir(filepath.Join("testdata", "release_regression"))
+	if err != nil {
+		t.Fatalf("read release regression fixtures: %v", err)
+	}
+	got := map[string]bool{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == "README.md" || name == "matrix.json" {
+			continue
+		}
+		got[name] = true
+	}
+	if !sameStringSlice(keys(got), keys(want)) {
+		t.Fatalf("release regression fixture files mismatch\ngot:  %v\nwant: %v", keys(got), keys(want))
 	}
 }
 
@@ -202,6 +252,120 @@ func TestReleaseRegressionHandoffCrashWindowReplayDoesNotDuplicate(t *testing.T)
 		t.Fatalf("handoff crash-window replay duplicated or lost side effects\nreplay=%s\nuninterrupted=%s", got, want)
 	}
 	assertNoDuplicateReleaseSideEffects(t, replayed.DurableState)
+}
+
+func TestReleaseRegressionRoutingPinVerifierDiversityIsHostIndependent(t *testing.T) {
+	scenario := releaseRegressionScenario(t, "routing-pin-verifier-diversity")
+	first, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute first host: %v", err)
+	}
+	changedHost := scenario
+	changedHost.Host = HostRuntime{
+		ConductorHostID: "host-claude-conductor",
+		AdapterID:       "host-claude",
+		Capabilities: HostCapabilities{
+			SupportsPush:   true,
+			SupportsWake:   true,
+			SupportsFollow: true,
+			SupportsPoll:   true,
+		},
+	}
+	second, err := Execute(context.Background(), changedHost, Options{})
+	if err != nil {
+		t.Fatalf("Execute changed host: %v", err)
+	}
+	worker := decisionByEvent(t, first.Decisions, "event-worker-route")
+	verifier := decisionByEvent(t, first.Decisions, "event-verifier-route")
+	if worker.UserPinnedModelID != "model-b" || worker.ChosenCandidateID != "model-b" {
+		t.Fatalf("worker pin decision = %#v, want pinned model-b", worker)
+	}
+	if verifier.UserOverrideModelID != "model-verifier" || verifier.ChosenCandidateID != "model-verifier" {
+		t.Fatalf("verifier override decision = %#v, want model-verifier", verifier)
+	}
+	if worker.ChosenCandidateID != decisionByEvent(t, second.Decisions, "event-worker-route").ChosenCandidateID ||
+		verifier.ChosenCandidateID != decisionByEvent(t, second.Decisions, "event-verifier-route").ChosenCandidateID {
+		t.Fatalf("host identity changed worker/verifier policy selection\nfirst=%#v\nsecond=%#v", first.Decisions, second.Decisions)
+	}
+	if worker.ChosenCandidateID == "model-worker-high-quota" || verifier.ChosenCandidateID == "model-worker-high-quota" {
+		t.Fatalf("worker-only high quota model crossed role/pin boundary: %#v", first.Decisions)
+	}
+}
+
+func TestReleaseRegressionQuotaResetTransitionUsesClockAndDoesNotFabricateUnknown(t *testing.T) {
+	scenario := releaseRegressionScenario(t, "routing-churn-quota-reset-fallback")
+	for _, quota := range scenario.Inventory.Quotas {
+		if (quota.Confidence == providerinventory.ConfidenceUnknown || quota.Confidence == providerinventory.ConfidenceStale) && quota.RemainingValue != nil {
+			t.Fatalf("quota %s confidence=%s carries fabricated remaining value %d", quota.QuotaSnapshotID, quota.Confidence, *quota.RemainingValue)
+		}
+	}
+	result, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	before := decisionByEvent(t, result.Decisions, "event-route-before-reset")
+	after := decisionByEvent(t, result.Decisions, "event-route-after-reset")
+	if before.ChosenCandidateID != "model-pre-reset" {
+		t.Fatalf("before reset chose %q, want model-pre-reset: %#v", before.ChosenCandidateID, before)
+	}
+	if after.ChosenCandidateID != "model-zz" {
+		t.Fatalf("after reset chose %q, want model-zz: %#v", after.ChosenCandidateID, after)
+	}
+	if !containsString(before.QuotaSnapshotIDs, "quota-e-pre-reset") || containsString(before.QuotaSnapshotIDs, "quota-e-reset") {
+		t.Fatalf("before reset quota snapshots = %#v, want only pre-reset window active", before.QuotaSnapshotIDs)
+	}
+	if !containsString(after.QuotaSnapshotIDs, "quota-e-reset") || containsString(after.QuotaSnapshotIDs, "quota-e-pre-reset") {
+		t.Fatalf("after reset quota snapshots = %#v, want reset window active", after.QuotaSnapshotIDs)
+	}
+}
+
+func TestReleaseRegressionUnsupportedPushWakeTruthfulFollowPoll(t *testing.T) {
+	scenario := releaseRegressionScenario(t, "unsupported-push-wake-truthful-follow")
+	result, err := Execute(context.Background(), scenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(result.DurableState.ProviderReceipts) != 0 {
+		t.Fatalf("provider receipts = %#v, want no external provider calls", result.DurableState.ProviderReceipts)
+	}
+	if got := len(result.DurableState.HostDeliveries); got != 1 {
+		t.Fatalf("host deliveries = %d, want 1", got)
+	}
+	delivery := result.DurableState.HostDeliveries[0]
+	if delivery.Transport != "follow-poll" || !delivery.Durable || !delivery.FollowScheduled || !delivery.PollScheduled || delivery.PushAttempted || delivery.WakeAttempted || delivery.VisibilityClaimed || delivery.Acknowledged || delivery.ExternalCall {
+		t.Fatalf("host delivery = %#v, want truthful durable follow/poll without push/wake/ack/visibility/external call", delivery)
+	}
+}
+
+func TestReleaseRegressionFederationPartialAndOwnershipConflictEvidence(t *testing.T) {
+	partialScenario := releaseRegressionScenario(t, "federation-cancellation-partial-result")
+	partialResult, err := Execute(context.Background(), partialScenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute partial scenario: %v", err)
+	}
+	if got := len(partialResult.DurableState.PartialResults); got != 1 {
+		t.Fatalf("partial results = %d, want 1", got)
+	}
+	partial := partialResult.DurableState.PartialResults[0]
+	if partial.Status != "cancelled-partial" || !partial.Durable || partial.ExternalCall || partial.ParentTaskID != "task-a" {
+		t.Fatalf("partial result = %#v, want durable cancelled partial under task-a with no external call", partial)
+	}
+
+	conflictScenario := releaseRegressionScenario(t, "federation-ownership-conflict")
+	conflictResult, err := Execute(context.Background(), conflictScenario, Options{})
+	if err != nil {
+		t.Fatalf("Execute conflict scenario: %v", err)
+	}
+	if got := len(conflictResult.DurableState.AgentOwners); got != 1 {
+		t.Fatalf("agent owners = %d, want one retained owner", got)
+	}
+	if got := len(conflictResult.DurableState.OwnerConflicts); got != 1 {
+		t.Fatalf("owner conflicts = %d, want 1", got)
+	}
+	conflict := conflictResult.DurableState.OwnerConflicts[0]
+	if conflict.ResourceKey != "resource-a" || conflict.ExistingOwnerTask != "task-a" || conflict.ConflictState != "rejected-existing-owner" || conflict.ExternalCall {
+		t.Fatalf("owner conflict = %#v, want rejected conflict against task-a without external call", conflict)
+	}
 }
 
 func TestReleaseRegressionNegativeHardRequirementsAndBounds(t *testing.T) {
@@ -370,45 +534,65 @@ func releaseRegressionScenario(t *testing.T, scenarioID string) Scenario {
 
 func releaseRegressionScenarios() map[string]func() Scenario {
 	return map[string]func() Scenario{
-		"routing-churn-quota-reset-fallback":    routingChurnQuotaResetFallbackScenario,
-		"routing-pin-verifier-diversity":        routingPinVerifierDiversityScenario,
-		"handoff-crash-replay-idempotent":       handoffCrashReplayIdempotentScenario,
-		"federation-nested-bounds-concurrency":  federationNestedBoundsConcurrencyScenario,
-		"fallback-rate-limit-outage-bounded":    fallbackRateLimitOutageBoundedScenario,
-		"unsupported-push-wake-truthful-follow": unsupportedPushWakeTruthfulFollowScenario,
+		"routing-churn-quota-reset-fallback":     routingChurnQuotaResetFallbackScenario,
+		"routing-pin-verifier-diversity":         routingPinVerifierDiversityScenario,
+		"handoff-crash-replay-idempotent":        handoffCrashReplayIdempotentScenario,
+		"federation-nested-bounds-concurrency":   federationNestedBoundsConcurrencyScenario,
+		"federation-cancellation-partial-result": federationCancellationPartialResultScenario,
+		"federation-ownership-conflict":          federationOwnershipConflictScenario,
+		"fallback-rate-limit-outage-bounded":     fallbackRateLimitOutageBoundedScenario,
+		"unsupported-push-wake-truthful-follow":  unsupportedPushWakeTruthfulFollowScenario,
 	}
 }
 
 func routingChurnQuotaResetFallbackScenario() Scenario {
 	scenario := releaseRegressionBase("routing-churn-quota-reset-fallback")
 	zero := int64(0)
-	unknownRemaining := int64(50)
+	preResetRemaining := int64(5)
 	resetRemaining := int64(25)
 	scenario.Inventory.Models[0].Availability = providerinventory.AvailabilityTemporarilyUnavailable
 	scenario.Inventory.Quotas[1].Confidence = providerinventory.ConfidenceUnknown
-	scenario.Inventory.Quotas[1].RemainingValue = &unknownRemaining
+	scenario.Inventory.Quotas[1].RemainingValue = nil
 	scenario.Inventory.Models = append(scenario.Inventory.Models,
 		releaseModel("model-c", "adapter-a", "account-a", "model-stale", providerinventory.CatalogRoleWorker),
 		releaseModel("model-d", "adapter-a", "account-a", "model-exhausted", providerinventory.CatalogRoleWorker),
+		releaseModel("model-pre-reset", "adapter-a", "account-a", "model-pre-reset", providerinventory.CatalogRoleWorker),
 		releaseModel("model-zz", "adapter-a", "account-a", "model-reset", providerinventory.CatalogRoleWorker),
 	)
 	scenario.Inventory.Quotas = append(scenario.Inventory.Quotas,
-		releaseQuota("quota-c-stale", "adapter-a", "account-a", "model-c", providerinventory.ConfidenceStale, &unknownRemaining),
+		releaseQuota("quota-c-stale", "adapter-a", "account-a", "model-c", providerinventory.ConfidenceStale, nil),
 		releaseQuota("quota-d-exhausted", "adapter-a", "account-a", "model-d", providerinventory.ConfidenceExact, &zero),
+		releaseQuota("quota-e-pre-reset", "adapter-a", "account-a", "model-pre-reset", providerinventory.ConfidenceExact, &preResetRemaining),
 		releaseQuota("quota-e-reset", "adapter-a", "account-a", "model-zz", providerinventory.ConfidenceExact, &resetRemaining),
 	)
-	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-1].WindowStart = "2026-07-14T01:00:00Z"
-	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-1].WindowEnd = "2026-07-15T01:00:00Z"
-	scenario.Tasks[0].CandidateModelIDs = []string{"model-a", "model-b", "model-c", "model-d", "model-zz"}
-	scenario.InjectedEvents = []InjectedEvent{{EventID: "event-route-reset", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"}}
-	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-route-reset"}}}
-	scenario.Invariants = []Invariant{{InvariantID: "inv-route-reset-fallback", Kind: "route_accepted", TaskID: "task-a"}}
+	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-2].WindowStart = "2026-07-14T00:00:00Z"
+	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-2].WindowEnd = "2026-07-14T00:00:00.01Z"
+	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-1].WindowStart = "2026-07-14T00:00:00.01Z"
+	scenario.Inventory.Quotas[len(scenario.Inventory.Quotas)-1].WindowEnd = "2026-07-15T00:00:00.01Z"
+	scenario.Tasks[0].CandidateModelIDs = []string{"model-a", "model-b", "model-c", "model-d", "model-pre-reset", "model-zz"}
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-route-before-reset", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-route-after-reset", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-route-before-reset", "event-route-after-reset"}}}
+	scenario.Invariants = []Invariant{
+		{InvariantID: "inv-route-reset-fallback", Kind: "route_accepted", TaskID: "task-a"},
+		{InvariantID: "inv-route-reset-candidate", Kind: "chosen_candidate", TaskID: "task-a", Expected: "model-zz"},
+	}
 	return scenario
 }
 
 func routingPinVerifierDiversityScenario() Scenario {
 	scenario := releaseRegressionBase("routing-pin-verifier-diversity")
 	remaining := int64(10_000)
+	scenario.Host = HostRuntime{
+		ConductorHostID: "host-codex-conductor",
+		AdapterID:       "host-codex",
+		Capabilities: HostCapabilities{
+			SupportsFollow: true,
+			SupportsPoll:   true,
+		},
+	}
 	scenario.Inventory.Providers = append(scenario.Inventory.Providers, Provider{
 		ProviderInstallationID: "provider-installation-verifier",
 		AdapterID:              "adapter-verifier",
@@ -421,13 +605,30 @@ func routingPinVerifierDiversityScenario() Scenario {
 		ProviderInstallationID: "provider-installation-verifier",
 		Readiness:              providerinventory.ReadinessReady,
 	})
-	scenario.Inventory.Models = append(scenario.Inventory.Models, releaseModel("model-verifier", "adapter-verifier", "account-verifier", "model-verifier", providerinventory.CatalogRoleVerifier))
-	scenario.Inventory.Quotas = append(scenario.Inventory.Quotas, releaseQuota("quota-verifier", "adapter-verifier", "account-verifier", "model-verifier", providerinventory.ConfidenceExact, &remaining))
-	scenario.Tasks[0].Role = providerinventory.CatalogRoleVerifier
-	scenario.Tasks[0].CandidateModelIDs = []string{"model-verifier"}
-	scenario.InjectedEvents = []InjectedEvent{{EventID: "event-verifier-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"}}
-	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-verifier-route"}}}
-	scenario.Invariants = []Invariant{{InvariantID: "inv-verifier-route", Kind: "route_accepted", TaskID: "task-a"}}
+	scenario.Inventory.Models = append(scenario.Inventory.Models,
+		releaseModel("model-worker-high-quota", "adapter-a", "account-a", "model-worker-high-quota", providerinventory.CatalogRoleWorker),
+		releaseModel("model-verifier", "adapter-verifier", "account-verifier", "model-verifier", providerinventory.CatalogRoleVerifier),
+	)
+	scenario.Inventory.Quotas = append(scenario.Inventory.Quotas,
+		releaseQuota("quota-worker-high", "adapter-a", "account-a", "model-worker-high-quota", providerinventory.ConfidenceExact, &remaining),
+		releaseQuota("quota-verifier", "adapter-verifier", "account-verifier", "model-verifier", providerinventory.ConfidenceExact, &remaining),
+	)
+	scenario.Tasks[0].UserPinnedModelID = "model-b"
+	scenario.Tasks[0].CandidateModelIDs = []string{"model-a", "model-b", "model-worker-high-quota"}
+	verifier := releaseTask("task-verifier", "Verifier", 1, "resource-verifier")
+	verifier.Role = providerinventory.CatalogRoleVerifier
+	verifier.UserOverrideModelID = "model-verifier"
+	verifier.CandidateModelIDs = []string{"model-worker-high-quota", "model-verifier"}
+	scenario.Tasks = append(scenario.Tasks, verifier)
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-worker-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "ready"},
+		{EventID: "event-verifier-route", Kind: "route_task", TaskID: "task-verifier", ConcurrencyGroup: "ready"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ready", EventIDs: []string{"event-worker-route", "event-verifier-route"}}}
+	scenario.Invariants = []Invariant{
+		{InvariantID: "inv-worker-pin-route", Kind: "chosen_candidate", TaskID: "task-a", Expected: "model-b"},
+		{InvariantID: "inv-verifier-override-route", Kind: "chosen_candidate", TaskID: "task-verifier", Expected: "model-verifier"},
+	}
 	return scenario
 }
 
@@ -464,6 +665,41 @@ func federationNestedBoundsConcurrencyScenario() Scenario {
 	}
 	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "federation", EventIDs: []string{"event-own-b", "event-own-a", "event-own-c", "event-own-d"}}}
 	scenario.Invariants = []Invariant{{InvariantID: "inv-federation-one-owner", Kind: "one_owner_per_resource"}}
+	return scenario
+}
+
+func federationCancellationPartialResultScenario() Scenario {
+	scenario := releaseRegressionBase("federation-cancellation-partial-result")
+	scenario.Tasks = append(scenario.Tasks, releaseTask("task-child", "Child", 2, "resource-child"))
+	scenario.InjectedEvents = []InjectedEvent{{
+		EventID:          "event-child-partial",
+		Kind:             "partial_result",
+		TaskID:           "task-child",
+		ConcurrencyGroup: "partial",
+		PayloadRef:       "task-a",
+	}}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "partial", EventIDs: []string{"event-child-partial"}}}
+	scenario.Invariants = []Invariant{{
+		InvariantID: "inv-child-cancelled-partial",
+		Kind:        "partial_result_recorded",
+		TaskID:      "task-child",
+		Expected:    "cancelled-partial",
+	}}
+	return scenario
+}
+
+func federationOwnershipConflictScenario() Scenario {
+	scenario := releaseRegressionBase("federation-ownership-conflict")
+	scenario.Tasks[1].OwnerResourceKey = "resource-a"
+	scenario.InjectedEvents = []InjectedEvent{
+		{EventID: "event-own-a", Kind: "agent_own", TaskID: "task-a", ConcurrencyGroup: "ownership"},
+		{EventID: "event-conflict-b", Kind: "ownership_conflict", TaskID: "task-b", ConcurrencyGroup: "ownership", PayloadRef: "resource-a"},
+	}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "ownership", EventIDs: []string{"event-own-a", "event-conflict-b"}}}
+	scenario.Invariants = []Invariant{
+		{InvariantID: "inv-one-owner", Kind: "one_owner_per_resource"},
+		{InvariantID: "inv-owner-conflict", Kind: "ownership_conflict_recorded", TaskID: "task-b", Expected: "rejected-existing-owner"},
+	}
 	return scenario
 }
 
@@ -505,10 +741,29 @@ func fallbackRateLimitOutageBoundedScenario() Scenario {
 
 func unsupportedPushWakeTruthfulFollowScenario() Scenario {
 	scenario := releaseRegressionBase("unsupported-push-wake-truthful-follow")
-	scenario.Extensions["x_release_regression"] = json.RawMessage(`{"fixture_schema_version":"` + releaseRegressionFixtureSchemaV1 + `","policy_schema_version":"` + releaseRegressionPolicyVersion + `","unsupported_push_wake":"truthful-follow-poll","external_provider_calls":false}`)
-	scenario.InjectedEvents = []InjectedEvent{{EventID: "event-follow-route", Kind: "route_task", TaskID: "task-a", ConcurrencyGroup: "follow"}}
-	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "follow", EventIDs: []string{"event-follow-route"}}}
-	scenario.Invariants = []Invariant{{InvariantID: "inv-follow-route", Kind: "route_accepted", TaskID: "task-a"}}
+	scenario.Host = HostRuntime{
+		ConductorHostID: "host-without-push-wake",
+		AdapterID:       "host-local",
+		Capabilities: HostCapabilities{
+			SupportsPush:   false,
+			SupportsWake:   false,
+			SupportsFollow: true,
+			SupportsPoll:   true,
+		},
+	}
+	scenario.InjectedEvents = []InjectedEvent{{
+		EventID:          "event-follow-poll-delivery",
+		Kind:             "host_deliver",
+		TaskID:           "task-a",
+		ConcurrencyGroup: "follow",
+		PayloadRef:       "release-status-poll-cursor",
+	}}
+	scenario.ConcurrencyScript = []ConcurrencyOrder{{Group: "follow", EventIDs: []string{"event-follow-poll-delivery"}}}
+	scenario.Invariants = []Invariant{
+		{InvariantID: "inv-follow-route", Kind: "route_accepted", TaskID: "task-a"},
+		{InvariantID: "inv-truthful-follow-poll", Kind: "host_truthful_follow_poll", TaskID: "task-a"},
+		{InvariantID: "inv-no-provider-calls", Kind: "no_provider_receipts"},
+	}
 	return scenario
 }
 
@@ -598,6 +853,15 @@ func assertReleaseSnapshot(t *testing.T, name string, got []byte) {
 	t.Helper()
 	path := filepath.Join("testdata", "release_regression", name)
 	if os.Getenv(updateReleaseGoldensEnv) == "1" {
+		if existing, err := os.ReadFile(path); err == nil {
+			existingMeta := releaseSnapshotMetadata(t, name, existing)
+			gotMeta := releaseSnapshotMetadata(t, name, got)
+			if existingMeta == gotMeta {
+				t.Fatalf("refusing to update snapshot %s with unchanged fixture/policy versions %q; bump reviewed release regression metadata before rewriting evidence", path, gotMeta)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read existing snapshot %s: %v", path, err)
+		}
 		if err := os.WriteFile(path, got, 0o644); err != nil {
 			t.Fatalf("update snapshot %s: %v", path, err)
 		}
@@ -612,10 +876,56 @@ func assertReleaseSnapshot(t *testing.T, name string, got []byte) {
 	}
 }
 
+func releaseSnapshotMetadata(t *testing.T, name string, data []byte) string {
+	t.Helper()
+	if strings.HasSuffix(name, ".json") {
+		var result Result
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatalf("decode snapshot metadata %s: %v", name, err)
+		}
+		return result.PolicyProvenance.PolicyVersion + "|" + releaseExtensionMetadata(t, result.Extensions)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "policy: version=") {
+			fields := strings.Fields(line)
+			if len(fields) > 1 {
+				return strings.TrimPrefix(fields[1], "version=")
+			}
+		}
+	}
+	t.Fatalf("snapshot %s has no release metadata", name)
+	return ""
+}
+
+func releaseExtensionMetadata(t *testing.T, extensions map[string]json.RawMessage) string {
+	t.Helper()
+	raw := extensions["x_release_regression"]
+	if len(raw) == 0 {
+		t.Fatalf("release snapshot missing x_release_regression metadata")
+	}
+	var metadata struct {
+		FixtureSchemaVersion string `json:"fixture_schema_version"`
+		PolicySchemaVersion  string `json:"policy_schema_version"`
+	}
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("decode x_release_regression metadata: %v", err)
+	}
+	return metadata.FixtureSchemaVersion + "|" + metadata.PolicySchemaVersion
+}
+
 func assertNoDuplicateReleaseSideEffects(t *testing.T, state DurableState) {
 	t.Helper()
 	assertUniqueBy(t, "provider receipt event", state.ProviderReceipts, func(value ProviderReceipt) string {
 		return value.EventID + "\x00" + value.TaskID + "\x00" + value.ModelCapabilityID
+	})
+	assertUniqueBy(t, "host delivery event", state.HostDeliveries, func(value HostDelivery) string {
+		return value.EventID + "\x00" + value.TaskID + "\x00" + value.HostID + "\x00" + value.PayloadRef
+	})
+	assertUniqueBy(t, "partial result event", state.PartialResults, func(value PartialResult) string {
+		return value.EventID + "\x00" + value.TaskID + "\x00" + value.ParentTaskID
+	})
+	assertUniqueBy(t, "owner conflict event", state.OwnerConflicts, func(value OwnerConflict) string {
+		return value.EventID + "\x00" + value.TaskID + "\x00" + value.ResourceKey + "\x00" + value.ExistingOwnerTask
 	})
 	assertUniqueBy(t, "budget commitment event", state.BudgetCommitments, func(value BudgetCommitment) string {
 		return value.EventID + "\x00" + value.TaskID + "\x00" + value.BudgetAuthorityID
@@ -626,6 +936,17 @@ func assertNoDuplicateReleaseSideEffects(t *testing.T, state DurableState) {
 	assertUniqueBy(t, "owner resource", state.AgentOwners, func(value AgentOwner) string {
 		return value.ResourceKey
 	})
+}
+
+func decisionByEvent(t *testing.T, decisions []DecisionRecord, eventID string) DecisionRecord {
+	t.Helper()
+	for _, decision := range decisions {
+		if decision.EventID == eventID {
+			return decision
+		}
+	}
+	t.Fatalf("missing decision for event %s in %#v", eventID, decisions)
+	return DecisionRecord{}
 }
 
 func assertUniqueBy[T any](t *testing.T, name string, values []T, key func(T) string) {
@@ -689,4 +1010,22 @@ func keys(values map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func keysFuncMap(values map[string]func() Scenario) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

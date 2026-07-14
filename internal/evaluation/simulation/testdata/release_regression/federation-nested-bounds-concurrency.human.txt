@@ -2,7 +2,7 @@ schema_version: loopcoder.evaluation.simulation_result.v1
 scenario_id: federation-nested-bounds-concurrency
 seed: 1
 clock: 2026-07-14T00:00:00Z step_ms=10
-policy: version=simulation-release-policy-v1 profile=release-regression-profile fingerprint=sha256:federation-nested-bounds-concurrency-policy plan=sha256:federation-nested-bounds-concurrency-plan authorization=sha256:federation-nested-bounds-concurrency-auth
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:federation-nested-bounds-concurrency-policy plan=sha256:federation-nested-bounds-concurrency-plan authorization=sha256:federation-nested-bounds-concurrency-auth
 sources: project=project-release-regression delivery=delivery-federation-nested-bounds-concurrency inventory=inventory-federation-nested-bounds-concurrency budget=budget-federation-nested-bounds-concurrency routing=routing-federation-nested-bounds-concurrency agent_tree=agent-tree-federation-nested-bounds-concurrency handoff=handoff-federation-nested-bounds-concurrency state=durable-state-federation-nested-bounds-concurrency
 truncated: false
 decisions:
@@ -23,6 +23,12 @@ durable_state:
 - applied_events=event-own-a,event-own-b,event-own-c,event-own-d
 - completed_tasks=none
 - provider_receipts:
+  - none
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
   - none
 - handoffs:
   - none

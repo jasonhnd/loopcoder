@@ -12,7 +12,8 @@ evaluation evidence for issue #866.
 
 Ordinary `go test` runs must never rewrite these files. For an intentional
 fixture or policy update, change `fixture_schema_version` or
-`policy_schema_version` as appropriate, then run:
+`policy_schema_version` as appropriate. Update mode refuses to rewrite existing
+evidence when those versions are unchanged. Then run:
 
 ```sh
 LOOPCODER_UPDATE_RELEASE_REGRESSION_GOLDENS=1 go test ./internal/evaluation/simulation

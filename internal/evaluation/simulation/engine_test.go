@@ -181,7 +181,7 @@ func TestExecuteRejectsReplayJournalCanonicalDecisionMutations(t *testing.T) {
 		decision := &journal.Decisions[0]
 		decision.ChosenCandidateID = candidates[1].ModelCapabilityID
 		decision.RejectedCandidates = []Rejection{{CandidateID: candidates[0].ModelCapabilityID, Code: "model-unavailable", Reason: "caller supplied rejection"}}
-		decision.QuotaSnapshotIDs = expectedReplayQuotaSnapshotIDs(scenario, task, *decision, candidates, rejected)
+		decision.QuotaSnapshotIDs = expectedReplayQuotaSnapshotIDs(scenario, scenario.InjectedEvents[0], task, *decision, candidates, rejected)
 		restart := scenario
 		restart.StartingState = cloneDurableState(applied.DurableState)
 		requireReplayMismatch(t, executeReplayErr(t, restart, &journal))
@@ -1046,6 +1046,9 @@ func cloneReplayJournal(journal ReplayJournal) ReplayJournal {
 func cloneDurableState(state DurableState) DurableState {
 	state.AppliedEventIDs = append([]string(nil), state.AppliedEventIDs...)
 	state.ProviderReceipts = append([]ProviderReceipt(nil), state.ProviderReceipts...)
+	state.HostDeliveries = append([]HostDelivery(nil), state.HostDeliveries...)
+	state.PartialResults = append([]PartialResult(nil), state.PartialResults...)
+	state.OwnerConflicts = append([]OwnerConflict(nil), state.OwnerConflicts...)
 	state.BudgetCommitments = append([]BudgetCommitment(nil), state.BudgetCommitments...)
 	state.Handoffs = append([]HandoffRecord(nil), state.Handoffs...)
 	state.AgentOwners = append([]AgentOwner(nil), state.AgentOwners...)
@@ -1168,7 +1171,15 @@ func baseScenario() Scenario {
 		ScenarioID:    "scenario-a",
 		Seed:          1,
 		Clock:         ClockPlan{Origin: "2026-07-14T00:00:00Z", StepMS: 10},
-		Limits:        Limits{MaxEvents: 20, MaxSteps: 20, MaxDepth: 3, MaxBreadth: 4},
+		Host: HostRuntime{
+			ConductorHostID: "host-fixture-a",
+			AdapterID:       "host-local",
+			Capabilities: HostCapabilities{
+				SupportsFollow: true,
+				SupportsPoll:   true,
+			},
+		},
+		Limits: Limits{MaxEvents: 20, MaxSteps: 20, MaxDepth: 3, MaxBreadth: 4},
 		DurableSourceIDs: DurableSourceIDs{
 			ProjectID:         "project-a",
 			DeliveryRunID:     "delivery-a",

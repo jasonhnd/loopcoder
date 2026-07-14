@@ -1,0 +1,34 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: unsupported-push-wake-truthful-follow
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:unsupported-push-wake-truthful-follow-policy plan=sha256:unsupported-push-wake-truthful-follow-plan authorization=sha256:unsupported-push-wake-truthful-follow-auth
+sources: project=project-release-regression delivery=delivery-unsupported-push-wake-truthful-follow inventory=inventory-unsupported-push-wake-truthful-follow budget=budget-unsupported-push-wake-truthful-follow routing=routing-unsupported-push-wake-truthful-follow agent_tree=agent-tree-unsupported-push-wake-truthful-follow handoff=handoff-unsupported-push-wake-truthful-follow state=durable-state-unsupported-push-wake-truthful-follow
+truncated: false
+decisions:
+- decision_2ba9d25b5080634fab43792c8e7a1fe7 event=event-follow-poll-delivery task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+events:
+- 001 event-follow-poll-delivery kind=host_deliver task=task-a status=applied decision=decision_2ba9d25b5080634fab43792c8e7a1fe7 receipt= idem=idem_2ba9d25b5080634fab43792c8e7a1fe7 at=2026-07-14T00:00:00Z
+durable_state:
+- applied_events=event-follow-poll-delivery
+- completed_tasks=none
+- provider_receipts:
+  - none
+- host_deliveries:
+  - host_delivery_cca2f29c59c5b2a78c23e4f26f39be1c event=event-follow-poll-delivery task=task-a host=host-without-push-wake payload=release-status-poll-cursor transport=follow-poll durable=true follow=true poll=true push_attempted=false wake_attempted=false visibility_claimed=false acknowledged=false external_call=false
+- partial_results:
+  - none
+- owner_conflicts:
+  - none
+- handoffs:
+  - none
+- agent_owners:
+  - none
+invariants:
+- inv-follow-route kind=route_accepted passed=true diagnostic=
+- inv-no-provider-calls kind=no_provider_receipts passed=true diagnostic=
+- inv-truthful-follow-poll kind=host_truthful_follow_poll passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:848180cb32e26b97e4859867a415df489246b83a5d19159902d178d211c18fcc added_events=event-follow-poll-delivery added_decisions=decision_2ba9d25b5080634fab43792c8e7a1fe7

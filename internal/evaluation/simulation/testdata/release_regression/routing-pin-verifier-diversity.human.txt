@@ -1,0 +1,38 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: routing-pin-verifier-diversity
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:routing-pin-verifier-diversity-policy plan=sha256:routing-pin-verifier-diversity-plan authorization=sha256:routing-pin-verifier-diversity-auth
+sources: project=project-release-regression delivery=delivery-routing-pin-verifier-diversity inventory=inventory-routing-pin-verifier-diversity budget=budget-routing-pin-verifier-diversity routing=routing-routing-pin-verifier-diversity agent_tree=agent-tree-routing-pin-verifier-diversity handoff=handoff-routing-pin-verifier-diversity state=durable-state-routing-pin-verifier-diversity
+truncated: false
+decisions:
+- decision_12a16a36cef3e941d9bb02d729730588 event=event-verifier-route task=task-verifier kind=routing accepted=true chosen=model-verifier budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-verifier
+  user_pin= user_override=model-verifier
+- decision_d1a4059a4ad19469648e6709711be9a9 event=event-worker-route task=task-a kind=routing accepted=true chosen=model-b budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-b
+  user_pin=model-b user_override=
+events:
+- 001 event-worker-route kind=route_task task=task-a status=applied decision=decision_d1a4059a4ad19469648e6709711be9a9 receipt= idem=idem_d1a4059a4ad19469648e6709711be9a9 at=2026-07-14T00:00:00Z
+- 002 event-verifier-route kind=route_task task=task-verifier status=applied decision=decision_12a16a36cef3e941d9bb02d729730588 receipt= idem=idem_12a16a36cef3e941d9bb02d729730588 at=2026-07-14T00:00:00.01Z
+durable_state:
+- applied_events=event-verifier-route,event-worker-route
+- completed_tasks=none
+- provider_receipts:
+  - none
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
+  - none
+- handoffs:
+  - none
+- agent_owners:
+  - none
+invariants:
+- inv-verifier-override-route kind=chosen_candidate passed=true diagnostic=
+- inv-worker-pin-route kind=chosen_candidate passed=true diagnostic=
+diagnostics:
+- none
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:dfffecf6ae5c3905ca9f0e007da89d5bd7d84759ba3776ebe18b99f72648710c added_events=event-verifier-route,event-worker-route added_decisions=decision_12a16a36cef3e941d9bb02d729730588,decision_d1a4059a4ad19469648e6709711be9a9

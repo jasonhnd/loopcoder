@@ -1,6 +1,6 @@
 {
-  "fixture_schema_version": "loopcoder.evaluation.release_regression_fixture.v1",
-  "policy_schema_version": "simulation-release-policy-v1",
+  "fixture_schema_version": "loopcoder.evaluation.release_regression_fixture.v3",
+  "policy_schema_version": "simulation-release-policy-v3",
   "source_issue": "714",
   "invariants": [
     {
@@ -9,7 +9,9 @@
       "scenarios": [
         "routing-pin-verifier-diversity",
         "handoff-crash-replay-idempotent",
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded"
       ]
     },
     {
@@ -19,7 +21,10 @@
         "routing-churn-quota-reset-fallback",
         "fallback-rate-limit-outage-bounded",
         "handoff-crash-replay-idempotent",
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "unsupported-push-wake-truthful-follow"
       ]
     },
     {
@@ -28,7 +33,11 @@
       "scenarios": [
         "routing-churn-quota-reset-fallback",
         "handoff-crash-replay-idempotent",
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded",
+        "unsupported-push-wake-truthful-follow"
       ]
     },
     {
@@ -43,8 +52,13 @@
       "source": "Issue #714 requires human and JSON inspection to explain inventory, confidence, decomposition, routes, fallback, budgets, progress, handoff, and agent trees.",
       "scenarios": [
         "routing-churn-quota-reset-fallback",
+        "routing-pin-verifier-diversity",
         "handoff-crash-replay-idempotent",
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result",
+        "federation-ownership-conflict",
+        "fallback-rate-limit-outage-bounded",
+        "unsupported-push-wake-truthful-follow"
       ]
     },
     {
@@ -59,7 +73,8 @@
       "invariant_id": "issue-714-no-uncontrolled-child-recursion",
       "source": "Issue #714 non-goals reject uncontrolled child recursion; release acceptance requires nested failure and recovery coverage.",
       "scenarios": [
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result"
       ]
     },
     {
@@ -67,7 +82,8 @@
       "source": "Issue #714 release acceptance requires recovery, rollback, and replay evidence; consequential side effects must remain idempotent.",
       "scenarios": [
         "handoff-crash-replay-idempotent",
-        "federation-nested-bounds-concurrency"
+        "federation-nested-bounds-concurrency",
+        "federation-cancellation-partial-result"
       ]
     },
     {
@@ -76,6 +92,7 @@
       "scenarios": [
         "handoff-crash-replay-idempotent",
         "federation-nested-bounds-concurrency",
+        "federation-ownership-conflict",
         "unsupported-push-wake-truthful-follow"
       ]
     },
@@ -100,10 +117,11 @@
     },
     {
       "scenario_id": "routing-pin-verifier-diversity",
-      "focus": "pinned verifier route uses an independent verifier provider/account and cannot be replaced by worker-only high quota",
+      "focus": "user-pinned Worker route and user-overridden Verifier route stay provider-neutral and host-independent",
       "invariants": [
         "issue-714-decision-ownership-boundaries",
         "issue-714-host-provider-independent-worker-verifier-selection",
+        "issue-714-human-json-inspection-explains-decisions",
         "issue-714-no-fabricated-quota-or-quota-first-unsafe-selection"
       ]
     },
@@ -133,16 +151,44 @@
       ]
     },
     {
-      "scenario_id": "fallback-rate-limit-outage-bounded",
-      "focus": "provider outage rejection and retryable rate-limit receipt stay bounded by event and step limits",
+      "scenario_id": "federation-cancellation-partial-result",
+      "focus": "nested child cancellation preserves a durable partial result without external provider calls",
       "invariants": [
-        "issue-714-deterministic-simulations-cover-release-failures"
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-no-uncontrolled-child-recursion",
+        "issue-714-recovery-replay-does-not-duplicate-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "federation-ownership-conflict",
+      "focus": "ownership conflict records rejection against the existing owner without creating a second owner",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
+        "issue-714-security-redaction-least-privilege-bounded-side-effects"
+      ]
+    },
+    {
+      "scenario_id": "fallback-rate-limit-outage-bounded",
+      "focus": "provider outage rejection, retryable rate-limit receipt, and handoff attempts stay bounded by event and step limits",
+      "invariants": [
+        "issue-714-decision-ownership-boundaries",
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions"
       ]
     },
     {
       "scenario_id": "unsupported-push-wake-truthful-follow",
       "focus": "unsupported host push/wake is represented as truthful follow/poll evidence with no external provider calls",
       "invariants": [
+        "issue-714-deterministic-simulations-cover-release-failures",
+        "issue-714-durable-reproducible-consequential-decisions",
+        "issue-714-human-json-inspection-explains-decisions",
         "issue-714-security-redaction-least-privilege-bounded-side-effects",
         "issue-714-truthful-degrade-for-unsupported-push-wake"
       ]

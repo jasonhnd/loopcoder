@@ -53,6 +53,9 @@ func HumanDecisionEvidence(result Result) string {
 		if len(decision.QuotaSnapshotIDs) > 0 {
 			fmt.Fprintf(&b, "  quota_snapshots=%s\n", strings.Join(decision.QuotaSnapshotIDs, ","))
 		}
+		if decision.UserPinnedModelID != "" || decision.UserOverrideModelID != "" {
+			fmt.Fprintf(&b, "  user_pin=%s user_override=%s\n", decision.UserPinnedModelID, decision.UserOverrideModelID)
+		}
 		for _, rejection := range decision.RejectedCandidates {
 			fmt.Fprintf(&b, "  rejected=%s code=%s reason=%s\n", rejection.CandidateID, rejection.Code, redact(rejection.Reason))
 		}
@@ -90,6 +93,55 @@ func HumanDecisionEvidence(result Result) string {
 			receipt.FailureCode,
 			receipt.LatencyMS,
 			receipt.CostMicrounits)
+	}
+	b.WriteString("- host_deliveries:\n")
+	if len(result.DurableState.HostDeliveries) == 0 {
+		b.WriteString("  - none\n")
+	}
+	for _, delivery := range result.DurableState.HostDeliveries {
+		fmt.Fprintf(&b, "  - %s event=%s task=%s host=%s payload=%s transport=%s durable=%t follow=%t poll=%t push_attempted=%t wake_attempted=%t visibility_claimed=%t acknowledged=%t external_call=%t\n",
+			delivery.DeliveryID,
+			delivery.EventID,
+			delivery.TaskID,
+			delivery.HostID,
+			delivery.PayloadRef,
+			delivery.Transport,
+			delivery.Durable,
+			delivery.FollowScheduled,
+			delivery.PollScheduled,
+			delivery.PushAttempted,
+			delivery.WakeAttempted,
+			delivery.VisibilityClaimed,
+			delivery.Acknowledged,
+			delivery.ExternalCall)
+	}
+	b.WriteString("- partial_results:\n")
+	if len(result.DurableState.PartialResults) == 0 {
+		b.WriteString("  - none\n")
+	}
+	for _, partial := range result.DurableState.PartialResults {
+		fmt.Fprintf(&b, "  - %s event=%s task=%s parent=%s status=%s durable=%t external_call=%t\n",
+			partial.PartialResultID,
+			partial.EventID,
+			partial.TaskID,
+			partial.ParentTaskID,
+			partial.Status,
+			partial.Durable,
+			partial.ExternalCall)
+	}
+	b.WriteString("- owner_conflicts:\n")
+	if len(result.DurableState.OwnerConflicts) == 0 {
+		b.WriteString("  - none\n")
+	}
+	for _, conflict := range result.DurableState.OwnerConflicts {
+		fmt.Fprintf(&b, "  - %s event=%s task=%s resource=%s existing_owner_task=%s state=%s external_call=%t\n",
+			conflict.ConflictID,
+			conflict.EventID,
+			conflict.TaskID,
+			conflict.ResourceKey,
+			conflict.ExistingOwnerTask,
+			conflict.ConflictState,
+			conflict.ExternalCall)
 	}
 	b.WriteString("- handoffs:\n")
 	if len(result.DurableState.Handoffs) == 0 {

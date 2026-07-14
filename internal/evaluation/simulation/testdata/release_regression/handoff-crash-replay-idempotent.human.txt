@@ -2,7 +2,7 @@ schema_version: loopcoder.evaluation.simulation_result.v1
 scenario_id: handoff-crash-replay-idempotent
 seed: 1
 clock: 2026-07-14T00:00:00Z step_ms=10
-policy: version=simulation-release-policy-v1 profile=release-regression-profile fingerprint=sha256:handoff-crash-replay-idempotent-policy plan=sha256:handoff-crash-replay-idempotent-plan authorization=sha256:handoff-crash-replay-idempotent-auth
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:handoff-crash-replay-idempotent-policy plan=sha256:handoff-crash-replay-idempotent-plan authorization=sha256:handoff-crash-replay-idempotent-auth
 sources: project=project-release-regression delivery=delivery-handoff-crash-replay-idempotent inventory=inventory-handoff-crash-replay-idempotent budget=budget-handoff-crash-replay-idempotent routing=routing-handoff-crash-replay-idempotent agent_tree=agent-tree-handoff-crash-replay-idempotent handoff=handoff-handoff-crash-replay-idempotent state=durable-state-handoff-crash-replay-idempotent
 truncated: false
 decisions:
@@ -24,6 +24,12 @@ durable_state:
 - completed_tasks=task-a
 - provider_receipts:
   - provider_receipt_185a5d5d17a83c92a8b916bb44f5fae7 event=event-provider task=task-a model=model-b status=succeeded failure= latency_ms=100 cost_microunits=10
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
+  - none
 - handoffs:
   - handoff_adf3dfb7926d2298c3e1ec3430762e3d event=event-handoff source=task-a target=task-b authorization=sha256:handoff-crash-replay-idempotent-auth
 - agent_owners:
