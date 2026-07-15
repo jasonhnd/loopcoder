@@ -1127,15 +1127,11 @@ func runGuardianSupervisorHelper(args []string) {
 			OwnerID:         ownerID,
 			ClaimGeneration: 1,
 			OnStart: func(guardian GuardianProcess) error {
-				data, err := json.Marshal(guardianReadyRecord{
+				return writeGuardianReadyRecord(readyPath, guardianReadyRecord{
 					ProviderPID:  started.PID,
 					ProviderPGID: started.PGID,
 					GuardianPID:  guardian.PID,
 				})
-				if err != nil {
-					return err
-				}
-				return os.WriteFile(readyPath, data, 0o600)
 			},
 		},
 	})
@@ -1350,6 +1346,22 @@ func waitGuardianReady(t *testing.T, path string) guardianReadyRecord {
 	}
 	t.Fatalf("ready record %s not written: %v", path, lastErr)
 	return guardianReadyRecord{}
+}
+
+func writeGuardianReadyRecord(path string, record guardianReadyRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func waitNotAlive(t *testing.T, pid int, timeout time.Duration, label string) {
