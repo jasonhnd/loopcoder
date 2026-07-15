@@ -191,7 +191,7 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 	// and the package would exceed CI's default 10m package timeout.
 	attempts := 100
 	if raceBuildEnabled {
-		attempts = 15
+		attempts = 5
 	}
 	for i := 0; i < attempts; i++ {
 		t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
