@@ -540,9 +540,9 @@ func nextDelay(policy Policy, waitID string, attempt int, retryAfter time.Durati
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(fmt.Sprintf("%s:%d", waitID, attempt)))
-	span := 2*policy.JitterPercent + 1
-	percent := int(h.Sum32()%uint32(span)) - policy.JitterPercent
-	jittered := delay + time.Duration(int64(delay)*int64(percent)/100)
+	span := int64(2*policy.JitterPercent + 1)
+	percent := int64(h.Sum32())%span - int64(policy.JitterPercent)
+	jittered := delay + time.Duration(int64(delay)*percent/100)
 	if jittered < policy.MinPollInterval {
 		jittered = policy.MinPollInterval
 	}
