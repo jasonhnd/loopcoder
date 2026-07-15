@@ -1,15 +1,20 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/providerauthority"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
@@ -32,81 +37,154 @@ func installShutdownOnSignal(stderr io.Writer) {
 }
 
 type managedRow struct {
-	Run      string
-	Issue    int
-	Provider string
-	PID      int
-	Status   string
-	Started  string
+	Run             string `json:"run"`
+	Attempt         string `json:"attempt"`
+	Issue           int    `json:"issue,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	PID             int    `json:"pid"`
+	PGID            int    `json:"pgid"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	Verified        bool   `json:"verified"`
+	Owner           string `json:"owner,omitempty"`
+	Generation      int64  `json:"generation,omitempty"`
+	Started         string `json:"started,omitempty"`
+	Heartbeat       string `json:"heartbeat,omitempty"`
+	Worktree        string `json:"worktree,omitempty"`
+	Log             string `json:"log,omitempty"`
+	authority       providerauthority.View
+	ownershipActive bool
 }
 
-// loadManagedProcesses lists the live loopcoder-managed worker processes for a
-// repo by reading persisted attempt sidecars — never by scanning the machine or
-// matching a bare process name. Identification is by tracked attempt PID
-// (status=="running" and still alive); it does not cross-check the live
-// process's LOOPCODER_MANAGED env, so after a crashed loopcoder OS PID reuse
-// could in theory misattribute a PID. This is the spec-sanctioned mechanism
-// (env cross-check is platform-uneven and out of scope) and is mitigated by
-// status tracking.
-func loadManagedProcesses(repoPath string) []managedRow {
+// loadManagedProcesses lists loopcoder-managed provider authority rows for a
+// repo by reading durable runtime storage. Attempt sidecars are metadata only;
+// they are never used as liveness or kill authority.
+func loadManagedProcesses(repoPath string, now func() time.Time) ([]managedRow, error) {
 	var rows []managedRow
-	entries, err := os.ReadDir(state.RunsRoot(repoPath))
+	ctx := context.Background()
+	runtime, err := providerauthority.OpenRuntime(ctx, repoPath, now)
 	if err != nil {
-		return rows
+		return nil, err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() || !state.IsRunID(entry.Name()) {
-			continue
+	if runtime.Close != nil {
+		defer runtime.Close()
+	}
+	if !runtime.Registered() {
+		return rows, nil
+	}
+	views, err := runtime.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	attempts := loadAttemptMetadata(repoPath)
+	at := time.Now
+	if now != nil {
+		at = now
+	}
+	for _, view := range views {
+		meta := attempts[view.Authority.RunID+"\x00"+view.Authority.AttemptID]
+		row := managedRow{
+			Run:        view.Authority.RunID,
+			Attempt:    view.Authority.AttemptID,
+			Issue:      meta.Issue,
+			Provider:   meta.Provider,
+			PID:        view.Authority.ProviderPID,
+			PGID:       view.Authority.ProviderPGID,
+			Status:     view.State,
+			Reason:     view.Reason,
+			Verified:   view.Verified,
+			Owner:      view.Authority.OwnerID,
+			Generation: view.Authority.ClaimGeneration,
+			Started:    firstNonEmptyManage(meta.StartedAt, view.Authority.StartedAt),
+			Heartbeat:  view.Authority.HeartbeatAt,
+			Worktree:   providerauthority.WorktreeDisplay(view.Authority.WorktreePath),
+			Log:        providerauthority.WorktreeDisplay(view.Authority.LogPath),
+			authority:  view,
 		}
-		attempts, err := state.LoadAttempts(repoPath, entry.Name())
+		if view.State == providerauthority.StateActive {
+			row.ownershipActive = runtime.ValidateOwnership(ctx, view, at()) == nil
+			if !row.ownershipActive {
+				row.Status = providerauthority.StateStale
+				row.Reason = "ownership fence is stale"
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Started < rows[j].Started })
+	return rows, nil
+}
+
+func loadAttemptMetadata(repoPath string) map[string]state.Attempt {
+	out := map[string]state.Attempt{}
+	for _, root := range state.RunsRootsForRead(repoPath) {
+		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue
 		}
-		for _, a := range attempts {
-			if a.PID == nil || *a.PID <= 0 || a.Status != "running" {
+		for _, entry := range entries {
+			if !entry.IsDir() || !state.IsRunID(entry.Name()) {
 				continue
 			}
-			if !process.Alive(*a.PID) {
+			attempts, err := state.LoadAttempts(repoPath, entry.Name())
+			if err != nil {
 				continue
 			}
-			rows = append(rows, managedRow{
-				Run:      entry.Name(),
-				Issue:    a.Issue,
-				Provider: a.Provider,
-				PID:      *a.PID,
-				Status:   a.Status,
-				Started:  a.StartedAt,
-			})
+			for _, attempt := range attempts {
+				out[entry.Name()+"\x00"+attempt.JobID] = attempt
+			}
 		}
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Started < rows[j].Started })
-	return rows
+	return out
 }
 
-func runPs(args []string, stdout, stderr io.Writer, _ Deps) int {
+func runPs(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	repo := fs.String("repo", ".", "repository path")
+	format := fs.String("format", "text", "output format: text or json")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	rows := loadManagedProcesses(*repo)
-	if len(rows) == 0 {
-		fmt.Fprintln(stdout, "no loopcoder-managed processes running")
+	if *format != "text" && *format != "json" {
+		fmt.Fprintf(stderr, "ps: invalid --format %q; want text or json\n", *format)
+		return 2
+	}
+	rows, err := loadManagedProcesses(*repo, deps.Now)
+	if err != nil {
+		fmt.Fprintf(stderr, "ps: %v\n", err)
+		return 1
+	}
+	if *format == "json" {
+		data, err := json.MarshalIndent(struct {
+			SchemaVersion string       `json:"schema_version"`
+			Rows          []managedRow `json:"rows"`
+		}{
+			SchemaVersion: "loopcoder.provider_processes.v1",
+			Rows:          rows,
+		}, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "ps: marshal json: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(data))
 		return 0
 	}
-	fmt.Fprintf(stdout, "%-34s %-6s %-9s %-7s %-8s %s\n", "RUN", "ISSUE", "PROVIDER", "PID", "STATUS", "STARTED")
+	if len(rows) == 0 {
+		fmt.Fprintln(stdout, "no loopcoder-managed provider authorities found")
+		return 0
+	}
+	fmt.Fprintf(stdout, "%-34s %-14s %-6s %-9s %-7s %-7s %-17s %-8s %s\n", "RUN", "ATTEMPT", "ISSUE", "PROVIDER", "PID", "PGID", "STATUS", "VERIFIED", "STARTED")
 	for _, r := range rows {
 		issue := "-"
 		if r.Issue > 0 {
 			issue = fmt.Sprintf("#%d", r.Issue)
 		}
-		fmt.Fprintf(stdout, "%-34s %-6s %-9s %-7d %-8s %s\n", r.Run, issue, r.Provider, r.PID, r.Status, r.Started)
+		fmt.Fprintf(stdout, "%-34s %-14s %-6s %-9s %-7d %-7d %-17s %-8t %s\n", r.Run, displayManage(r.Attempt), issue, displayManage(r.Provider), r.PID, r.PGID, r.Status, r.Verified, r.Started)
 	}
 	return 0
 }
 
-func runKill(args []string, stdout, stderr io.Writer, _ Deps) int {
+func runKill(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	repo := fs.String("repo", ".", "repository path")
@@ -119,20 +197,42 @@ func runKill(args []string, stdout, stderr io.Writer, _ Deps) int {
 		fmt.Fprintln(stderr, "kill: specify --run <id> or --all")
 		return 2
 	}
-	rows := loadManagedProcesses(*repo)
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	rows, err := loadManagedProcesses(*repo, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "kill: %v\n", err)
+		return 1
+	}
 	killed := 0
+	blocked := 0
 	for _, r := range rows {
 		if !*all && r.Run != *run {
 			continue
 		}
-		if err := process.KillTree(r.PID); err != nil {
-			fmt.Fprintf(stderr, "kill: pid %d: %v\n", r.PID, err)
+		if r.Status != providerauthority.StateActive || !r.Verified || !r.ownershipActive {
+			fmt.Fprintf(stderr, "kill: refused %s/%s pid %d: provider authority state=%s reason=%s\n", r.Run, r.Attempt, r.PID, r.Status, firstNonEmptyManage(r.Reason, "not verified"))
+			blocked++
 			continue
 		}
-		fmt.Fprintf(stdout, "terminated %s (run %s, pid %d)\n", providerLabel(r.Provider), r.Run, r.PID)
+		killGroup := deps.KillProcessGroup
+		if killGroup == nil {
+			killGroup = process.KillGroup
+		}
+		if err := killGroup(r.PGID); err != nil {
+			fmt.Fprintf(stderr, "kill: pgid %d: %v\n", r.PGID, err)
+			continue
+		}
+		fmt.Fprintf(stdout, "terminated %s (run %s, attempt %s, pid %d, pgid %d)\n", providerLabel(r.Provider), r.Run, r.Attempt, r.PID, r.PGID)
 		killed++
 	}
-	fmt.Fprintf(stdout, "terminated %d loopcoder-managed process tree(s)\n", killed)
+	if blocked > 0 && killed == 0 {
+		fmt.Fprintf(stdout, "terminated 0 loopcoder-managed provider group(s)\n")
+		return 1
+	}
+	fmt.Fprintf(stdout, "terminated %d loopcoder-managed provider group(s)\n", killed)
 	return 0
 }
 
@@ -141,4 +241,20 @@ func providerLabel(provider string) string {
 		return "process"
 	}
 	return provider
+}
+
+func displayManage(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return strings.TrimSpace(value)
+}
+
+func firstNonEmptyManage(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

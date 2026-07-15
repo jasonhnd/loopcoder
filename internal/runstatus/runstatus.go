@@ -20,6 +20,7 @@ import (
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/observability"
+	"github.com/jasonhnd/loopcoder/internal/providerauthority"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -134,6 +135,13 @@ type Row struct {
 	WorkerOutputTokens    string `json:"worker_output_tokens"`
 	WorkerTotalTokens     string `json:"worker_total_tokens"`
 	WorkerVerified        string `json:"worker_verified"`
+	ProviderPID           string `json:"provider_pid"`
+	ProviderPGID          string `json:"provider_pgid"`
+	ProviderAuthority     string `json:"provider_authority"`
+	ProviderVerified      string `json:"provider_verified"`
+	ProviderOwner         string `json:"provider_owner"`
+	ProviderGeneration    string `json:"provider_generation"`
+	ProviderAuthorityNote string `json:"provider_authority_note"`
 	Phase                 string `json:"phase"`
 	Status                string `json:"status"`
 	VerifierVerdict       string `json:"verifier_verdict"`
@@ -234,10 +242,11 @@ func Load(opts Options) (Report, error) {
 		return Report{}, fmt.Errorf("run %q has no local status records under %s", runID, filepath.ToSlash(runPath))
 	}
 
+	authorityViews := providerAuthorityViews(repoPath, runID, attempts, now)
 	rows := make([]Row, 0, len(attempts))
 	for _, attempt := range attempts {
 		verifier := matchingVerifier(attempt, metadataPR(attempt, metadata), verifiers)
-		row := rowFromAttempt(attempt, metadata, verifier)
+		row := rowFromAttempt(attempt, metadata, verifier, authorityViews[attempt.JobID])
 		rows = append(rows, row)
 	}
 	sortRows(rows)
@@ -392,6 +401,13 @@ func Render(report Report) string {
 		"Worker tokens out",
 		"Worker tokens total",
 		"Worker verified",
+		"Provider pid",
+		"Provider pgid",
+		"Provider authority",
+		"Provider verified",
+		"Provider owner",
+		"Provider generation",
+		"Provider note",
 		"Phase",
 		"Status",
 		"Verifier verdict",
@@ -435,6 +451,13 @@ func Render(report Report) string {
 				row.WorkerOutputTokens,
 				row.WorkerTotalTokens,
 				row.WorkerVerified,
+				row.ProviderPID,
+				row.ProviderPGID,
+				row.ProviderAuthority,
+				row.ProviderVerified,
+				row.ProviderOwner,
+				row.ProviderGeneration,
+				row.ProviderAuthorityNote,
 				row.Phase,
 				row.Status,
 				row.VerifierVerdict,
@@ -574,6 +597,42 @@ func usageRecordsForStatus(attempts []state.Attempt, verifiers []verifierRecord,
 	return usageledger.UsageRecordsFromReporter(records, projectID, now).Records
 }
 
+func providerAuthorityViews(repoPath, runID string, attempts []state.Attempt, now time.Time) map[string]*providerauthority.View {
+	out := map[string]*providerauthority.View{}
+	ctx := context.Background()
+	runtime, err := providerauthority.OpenRuntime(ctx, repoPath, func() time.Time { return now })
+	if err != nil || !runtime.Registered() {
+		return out
+	}
+	defer runtime.Close()
+	views, err := runtime.List(ctx, runID)
+	if err != nil {
+		for _, attempt := range attempts {
+			view := providerauthority.View{State: providerauthority.StateCorruptRow, Reason: err.Error()}
+			out[attempt.JobID] = &view
+		}
+		return out
+	}
+	for i := range views {
+		view := views[i]
+		out[view.Authority.AttemptID] = &view
+	}
+	for _, attempt := range attempts {
+		if strings.TrimSpace(attempt.JobID) == "" {
+			continue
+		}
+		if _, ok := out[attempt.JobID]; ok {
+			continue
+		}
+		if state.IsTerminalStatus(attempt.Status) {
+			continue
+		}
+		view := providerauthority.Missing(runID, attempt.JobID)
+		out[attempt.JobID] = &view
+	}
+	return out
+}
+
 func resolveProjectMetadata(repoPath string) ProjectMetadata {
 	project, err := registry.Resolve(context.Background(), registry.Options{RepoPath: repoPath}, registry.DefaultDeps())
 	if err != nil {
@@ -589,7 +648,7 @@ func resolveProjectMetadata(repoPath string) ProjectMetadata {
 	}
 }
 
-func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *verifierRecord) Row {
+func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *verifierRecord, authority *providerauthority.View) Row {
 	worker := attempt.Report
 	usage := attempt.Usage
 	if worker != nil {
@@ -602,35 +661,51 @@ func rowFromAttempt(attempt state.Attempt, metadata []metadataRecord, verifier *
 	input, output, total := formatUsage(usage)
 
 	row := Row{
-		Issue:                formatIssue(attempt.Issue),
-		WorkerJob:            display(attempt.JobID),
-		PR:                   display(metadataPR(attempt, metadata)),
-		WorkerProvider:       display(firstNonEmpty(reportProvider(worker), attempt.Provider)),
-		WorkerModel:          display(reportModel(worker)),
-		WorkerModelSource:    display(reportModelSource(worker)),
-		WorkerEffort:         display(reportEffort(worker)),
-		WorkerPermission:     display(reportPermission(worker)),
-		WorkerDuration:       formatDuration(worker),
-		WorkerInputTokens:    input,
-		WorkerOutputTokens:   output,
-		WorkerTotalTokens:    total,
-		WorkerVerified:       formatVerified(worker),
-		Phase:                display(attempt.Phase),
-		Status:               display(attempt.Status),
-		VerifierVerdict:      NotReported,
-		VerifierProvider:     NotReported,
-		VerifierModel:        NotReported,
-		VerifierModelSource:  NotReported,
-		VerifierEffort:       NotReported,
-		VerifierPermission:   NotReported,
-		VerifierDuration:     NotReported,
-		VerifierInputTokens:  NotReported,
-		VerifierOutputTokens: NotReported,
-		VerifierTotalTokens:  NotReported,
-		VerifierVerified:     NotReported,
-		issueNumber:          attempt.Issue,
-		attemptNumber:        attempt.Attempt,
-		workerJobSort:        attempt.JobID,
+		Issue:                 formatIssue(attempt.Issue),
+		WorkerJob:             display(attempt.JobID),
+		PR:                    display(metadataPR(attempt, metadata)),
+		WorkerProvider:        display(firstNonEmpty(reportProvider(worker), attempt.Provider)),
+		WorkerModel:           display(reportModel(worker)),
+		WorkerModelSource:     display(reportModelSource(worker)),
+		WorkerEffort:          display(reportEffort(worker)),
+		WorkerPermission:      display(reportPermission(worker)),
+		WorkerDuration:        formatDuration(worker),
+		WorkerInputTokens:     input,
+		WorkerOutputTokens:    output,
+		WorkerTotalTokens:     total,
+		WorkerVerified:        formatVerified(worker),
+		ProviderPID:           NotReported,
+		ProviderPGID:          NotReported,
+		ProviderAuthority:     NotReported,
+		ProviderVerified:      NotReported,
+		ProviderOwner:         NotReported,
+		ProviderGeneration:    NotReported,
+		ProviderAuthorityNote: NotReported,
+		Phase:                 display(attempt.Phase),
+		Status:                display(attempt.Status),
+		VerifierVerdict:       NotReported,
+		VerifierProvider:      NotReported,
+		VerifierModel:         NotReported,
+		VerifierModelSource:   NotReported,
+		VerifierEffort:        NotReported,
+		VerifierPermission:    NotReported,
+		VerifierDuration:      NotReported,
+		VerifierInputTokens:   NotReported,
+		VerifierOutputTokens:  NotReported,
+		VerifierTotalTokens:   NotReported,
+		VerifierVerified:      NotReported,
+		issueNumber:           attempt.Issue,
+		attemptNumber:         attempt.Attempt,
+		workerJobSort:         attempt.JobID,
+	}
+	if authority != nil {
+		row.ProviderPID = formatPositiveInt(authority.Authority.ProviderPID)
+		row.ProviderPGID = formatPositiveInt(authority.Authority.ProviderPGID)
+		row.ProviderAuthority = display(authority.State)
+		row.ProviderVerified = strconv.FormatBool(authority.Verified)
+		row.ProviderOwner = display(authority.Authority.OwnerID)
+		row.ProviderGeneration = formatPositiveInt64(authority.Authority.ClaimGeneration)
+		row.ProviderAuthorityNote = display(authority.Reason)
 	}
 	if verifier == nil {
 		return row
@@ -1120,6 +1195,20 @@ func formatIssue(issue int) string {
 		return NotReported
 	}
 	return "#" + strconv.Itoa(issue)
+}
+
+func formatPositiveInt(value int) string {
+	if value <= 0 {
+		return NotReported
+	}
+	return strconv.Itoa(value)
+}
+
+func formatPositiveInt64(value int64) string {
+	if value <= 0 {
+		return NotReported
+	}
+	return strconv.FormatInt(value, 10)
 }
 
 func display(value string) string {
