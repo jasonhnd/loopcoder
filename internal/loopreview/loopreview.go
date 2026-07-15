@@ -1124,7 +1124,7 @@ Return only JSON matching this schema:
 `, opts.PRNumber, VerdictJSONSchema, formatReviewPacket(packet))
 }
 
-const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]},"reason":{"type":"string"},"next_action":{"type":"string"}}}`
+const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{
