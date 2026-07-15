@@ -4626,8 +4626,25 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 	}
 	if result.Report == nil {
-		fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
-		return 1
+		if result.Reconciliation == nil {
+			fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
+			return 1
+		}
+		if outputMode.Format == "json" {
+			if err := renderDispatchJSON(stdout, result); err != nil {
+				fmt.Fprintf(stderr, "dispatch: %v\n", err)
+				return 1
+			}
+		} else if outputMode.Format == "jsonl" {
+			if _, err := fmt.Fprintln(stdout, result.Reconciliation.JSONLine()); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write output: %v\n", err)
+				return 1
+			}
+		} else {
+			fmt.Fprintln(stdout, result.Reconciliation.JSONLine())
+			fmt.Fprintf(stderr, "dispatch: %s\n", result.Reason)
+		}
+		return dispatchResultExitCode(result)
 	}
 	if result.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
@@ -4788,7 +4805,12 @@ func prNumberFromPR(pr string) int {
 
 func renderDispatch(w io.Writer, result worker.Result) error {
 	if result.Report == nil {
-		return errors.New("dispatch report is missing")
+		data, err := worker.MarshalResult(dispatchResultForOutput(result))
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(append(data, '\n'))
+		return err
 	}
 	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch report: %w", err)
@@ -4815,7 +4837,7 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 
 func renderDispatchJSON(w io.Writer, result worker.Result) error {
 	if result.Report == nil {
-		return errors.New("dispatch report is missing")
+		return renderCanonicalJSONLine(w, dispatchJSONPayload(result))
 	}
 	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch report: %w", err)

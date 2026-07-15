@@ -15,7 +15,9 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -276,6 +278,118 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if strings.Contains(fakeAgent.invocation.Prompt, "Repo-local skills") {
 		t.Fatalf("agent prompt unexpectedly included repo skills:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestDispatchReconcilesLiveProviderStress100BeforeCreatingDuplicateWorktree(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	if _, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: fixedNow}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	roots, err := runtimepath.Resolve(ctx, repo)
+	if err != nil {
+		t.Fatalf("runtimepath.Resolve: %v", err)
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	runID := "run-live-provider"
+	attemptID := "job-963-live"
+	ownerID := "worker:" + runID + ":" + attemptID + ":1"
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, store, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     roots.ProjectID,
+		DeliveryRunID: runID,
+		RunID:         runID,
+		OwnerID:       ownerID,
+		Now:           fixedNow(),
+		LeaseUntil:    fixedNow().Add(time.Hour),
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireAgentOwnershipLease: %v", err)
+	}
+	identity, err := process.Snapshot(os.Getpid(), fixedNow())
+	if err != nil {
+		t.Fatalf("process.Snapshot: %v", err)
+	}
+	if _, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
+		ProjectID:            roots.ProjectID,
+		RunID:                runID,
+		AttemptID:            attemptID,
+		ProviderPID:          identity.PID,
+		ProviderPGID:         identity.PGID,
+		ProcessBirthIdentity: identity.ProcessBirthIdentity,
+		ExecutableIdentity:   identity.ExecutableIdentity,
+		OwnerID:              ownerID,
+		ClaimGeneration:      lease.ClaimGeneration,
+		WorktreePath:         t.TempDir(),
+		LogPath:              filepath.Join(t.TempDir(), "provider.log"),
+	}, fixedNow()); err != nil {
+		t.Fatalf("PersistProviderExecutionAuthority: %v", err)
+	}
+	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          attemptID,
+		Issue:          963,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            identity.PID,
+		Phase:          "codex_started",
+		Status:         state.StatusRunning,
+		Branch:         "loop/issue-963",
+		StartedAt:      state.FormatTimestamp(fixedNow()),
+		HeartbeatAt:    state.FormatTimestamp(fixedNow()),
+		LastProgressAt: state.FormatTimestamp(fixedNow()),
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	fakeAgent := &workerFakeAgent{}
+	fakeGit := &workerFakeGit{}
+	var result Result
+	for i := 0; i < 100; i++ {
+		var err error
+		result, err = Dispatch(ctx, Options{
+			RepoPath:    repo,
+			IssueNumber: 963,
+			IssueTitle:  "Reconcile live provider",
+			RunID:       runID,
+			Provider:    "codex",
+		}, Deps{
+			Git: fakeGit,
+			GitHub: func(string) GitHubClient {
+				return &workerFakeGitHub{}
+			},
+			AgentLookup: func(string) (agent.Runner, error) {
+				return fakeAgent, nil
+			},
+			AcquireLock: func(string, time.Duration) (Lock, error) {
+				return &workerFakeLock{}, nil
+			},
+			Now: fixedNow,
+			PID: func() int {
+				return 7777
+			},
+		})
+		if err != nil {
+			t.Fatalf("Dispatch iteration %d returned error: %v", i, err)
+		}
+		if result.Reconciliation == nil || result.Reconciliation.Outcome != "live-owner-provider" || result.Status != state.StatusNeedsHuman {
+			t.Fatalf("iteration %d result reconciliation = %#v status=%q", i, result.Reconciliation, result.Status)
+		}
+	}
+	if fakeAgent.runCalls != 0 {
+		t.Fatalf("agent Run calls = %d, want 0", fakeAgent.runCalls)
+	}
+	if fakeGit.fetchCalls != 0 {
+		t.Fatalf("git fetch calls = %d, want 0 before duplicate worktree", fakeGit.fetchCalls)
 	}
 }
 
