@@ -766,6 +766,19 @@ func TestProcessActivityFirstAvailableCountsAsProgress(t *testing.T) {
 	}
 }
 
+func TestProcessActivityRunnableProcessCountsAsProgressWithoutCPUClockAdvance(t *testing.T) {
+	previous := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	current := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	if !current.changedFrom(previous) {
+		t.Fatal("changedFrom = false, want a runnable process to count as progress while scheduler contention delays CPU clock advance")
+	}
+
+	sleeping := processActivityObservation{available: true, signature: "123:S:42"}
+	if sleeping.changedFrom(sleeping) {
+		t.Fatal("changedFrom = true, want an unchanged sleeping process observation to remain idle")
+	}
+}
+
 func TestObserveWorktreeRootErrorWarnsAndReturnsZeroObservation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing")
 	observation := observeWorktree(path)
