@@ -116,6 +116,45 @@ func TestRestartPreservesOriginalAbsoluteDeadline(t *testing.T) {
 	}
 }
 
+func TestLegacyV1SnapshotWithoutDeadlineRecoversPendingWake(t *testing.T) {
+	start := time.Date(2026, 7, 16, 0, 50, 0, 0, time.UTC)
+	clock := &fakeClock{now: start}
+	first, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "legacy-worker", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "worker-succeeded", State: StateTerminal, Code: "worker-succeeded", Consequential: true, Terminal: true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	legacy := first.Snapshot
+	legacy.DeadlineAt = ""
+	clock.now = start.Add(2 * time.Minute)
+	probes, wakes, checkpoints := 0, 0, 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "legacy-worker", Clock: clock, Policy: fastPolicy(), Initial: legacy,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed legacy snapshot must not be probed")
+		},
+		Wake: func(context.Context, WakeDecision) error { wakes++; return nil },
+		Checkpoint: func(context.Context, Snapshot) error {
+			checkpoints++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTransition || probes != 0 || wakes != 1 || checkpoints != 1 {
+		t.Fatalf("second report = %#v, probes=%d wakes=%d checkpoints=%d", second, probes, wakes, checkpoints)
+	}
+	if second.Snapshot.DeadlineAt != timestamp(start.Add(fastPolicy().Timeout)) {
+		t.Fatalf("migrated deadline_at = %q", second.Snapshot.DeadlineAt)
+	}
+}
+
 func TestWaitIDRejectsLossyNormalizationAndPrefixCollisions(t *testing.T) {
 	for _, waitID := range []string{"approval with spaces", "quota-重置", strings.Repeat("a", 160) + "-one", strings.Repeat("a", 160) + "-two"} {
 		_, err := Run(context.Background(), Options{

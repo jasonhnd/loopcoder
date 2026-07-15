@@ -458,11 +458,18 @@ func initializeSnapshot(kind Kind, waitID string, initial Snapshot, now time.Tim
 		if initial.SchemaVersion != SnapshotSchema || initial.Kind != kind || initial.WaitID != waitID {
 			return Snapshot{}, errors.New("restart snapshot does not match wait identity")
 		}
-		if _, err := time.Parse(time.RFC3339Nano, initial.StartedAt); err != nil {
+		startedAt, err := time.Parse(time.RFC3339Nano, initial.StartedAt)
+		if err != nil {
 			return Snapshot{}, fmt.Errorf("invalid snapshot started_at: %w", err)
 		}
 		if _, err := time.Parse(time.RFC3339Nano, initial.NextReceiptAt); err != nil {
 			return Snapshot{}, fmt.Errorf("invalid snapshot next_receipt_at: %w", err)
+		}
+		// Early v1 snapshots did not persist an absolute deadline. Recover them
+		// from their original start time instead of rejecting a checkpointed
+		// wait (including a pending terminal wake) during upgrade.
+		if strings.TrimSpace(initial.DeadlineAt) == "" {
+			initial.DeadlineAt = timestamp(startedAt.Add(policy.Timeout))
 		}
 		if _, err := time.Parse(time.RFC3339Nano, initial.DeadlineAt); err != nil {
 			return Snapshot{}, fmt.Errorf("invalid snapshot deadline_at: %w", err)
