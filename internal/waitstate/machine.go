@@ -244,7 +244,12 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 				return finish(StopTimeout, err)
 			}
 			obs := Observation{EventID: "timeout", State: StateTerminal, Code: "wait-timeout", Consequential: true, Terminal: true}
-			if err := decideWake(ctx, opts, &snapshot, &report, obs, now, StopTimeout); err != nil {
+			previousState := snapshot.LastState
+			snapshot.LastEventID = obs.EventID
+			snapshot.LastState = obs.State
+			snapshot.LastCode = obs.Code
+			snapshot.PollAttempt = 0
+			if err := decideWakeWithPrevious(ctx, opts, &snapshot, &report, obs, previousState, now, StopTimeout); err != nil {
 				return finish(StopTimeout, err)
 			}
 			return finish(StopTimeout, nil)
@@ -333,10 +338,6 @@ func runKind(ctx context.Context, kind Kind, opts Options) (Report, error) {
 	}
 	opts.Kind = kind
 	return Run(ctx, opts)
-}
-
-func decideWake(ctx context.Context, opts Options, snapshot *Snapshot, report *Report, obs Observation, now time.Time, reason string) error {
-	return decideWakeWithPrevious(ctx, opts, snapshot, report, obs, snapshot.LastState, now, reason)
 }
 
 func decideWakeWithPrevious(ctx context.Context, opts Options, snapshot *Snapshot, report *Report, obs Observation, previous State, now time.Time, reason string) error {

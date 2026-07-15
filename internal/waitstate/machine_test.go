@@ -47,6 +47,41 @@ func TestThirtyMinuteCIWaitUsesNoProviderAndEmitsPolicyReceipts(t *testing.T) {
 	}
 }
 
+func TestTimeoutSnapshotDoesNotRepeatTimeoutAfterRestart(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 0, 30, 0, 0, time.UTC)}
+	first, err := Run(context.Background(), Options{
+		Kind: KindGitHubCI, WaitID: "pr-timeout-restart", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "checks-pending", State: StateWaiting, Code: "required-checks-pending"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if first.Snapshot.LastState != StateTerminal || first.Snapshot.LastCode != "wait-timeout" || first.Snapshot.PendingWake == nil {
+		t.Fatalf("timeout snapshot = %#v", first.Snapshot)
+	}
+	wantDecision := first.Snapshot.LastDecisionKey
+	probes, receipts := 0, 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindGitHubCI, WaitID: "pr-timeout-restart", Clock: clock, Policy: fastPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed timeout must not be probed")
+		},
+		Receipt: func(context.Context, Receipt) error { receipts++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTimeout || probes != 0 || receipts != 0 || second.WakeDecisions != 0 {
+		t.Fatalf("second report = %#v, probes=%d receipts=%d", second, probes, receipts)
+	}
+	if second.Snapshot.LastDecisionKey != wantDecision || second.Snapshot.PendingWake == nil {
+		t.Fatalf("timeout decision changed across restart: %#v", second.Snapshot)
+	}
+}
+
 func TestApprovalAndQuotaWaitsUseNoProvider(t *testing.T) {
 	for _, kind := range []Kind{KindApproval, KindQuotaReset} {
 		t.Run(string(kind), func(t *testing.T) {
