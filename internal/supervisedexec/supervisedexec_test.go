@@ -1364,18 +1364,6 @@ func writeGuardianReadyRecord(path string, record guardianReadyRecord) error {
 	return nil
 }
 
-func waitNotAlive(t *testing.T, pid int, timeout time.Duration, label string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !process.Alive(pid) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("%s pid %d still alive after %s", label, pid, timeout)
-}
-
 func assertGuardianDiagnostic(t *testing.T, path, wantEvent string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
