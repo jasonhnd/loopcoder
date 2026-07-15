@@ -113,7 +113,7 @@ jobs:
           test "${actual_goarch}" = "arm64"
 
       - name: Go test (race detector)
-        run: go test -race ./...
+        run: go test -race -timeout=20m ./...
 
   security:
     runs-on: macos-15

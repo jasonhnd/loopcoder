@@ -187,7 +187,12 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		t.Skip("macOS arm64 guardian crash fixture")
 	}
-	const attempts = 100
+	// Full 100-run acceptance under normal tests; under -race each attempt is multi-second
+	// and the package would exceed CI's default 10m package timeout.
+	attempts := 100
+	if raceBuildEnabled {
+		attempts = 15
+	}
 	for i := 0; i < attempts; i++ {
 		t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
 			root := t.TempDir()
