@@ -191,6 +191,19 @@ func runGuardianProcess() int {
 
 func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.File, load guardianAuthorityLoader, kill guardianGroupKiller) int {
 	defer readyFile.Close()
+	authorityCache := newGuardianAuthorityCache()
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
+	_, loadErr := retryGuardianAuthorityLoad(loadCtx, cfg, load, authorityCache)
+	cancelLoad()
+	if loadErr != nil {
+		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
+			SchemaVersion: guardianSchema,
+			Event:         "startup-failed",
+			At:            time.Now().UTC().Format(time.RFC3339Nano),
+			Error:         "retain authority before readiness: " + loadErr.Error(),
+		})
+		return 2
+	}
 	if _, err := readyFile.Write([]byte{'1'}); err != nil {
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
 			SchemaVersion: guardianSchema,
@@ -200,9 +213,6 @@ func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.Fil
 		})
 		return 2
 	}
-	retentionCtx, stopRetention := context.WithCancel(context.Background())
-	authorityCache := startGuardianAuthorityRetention(retentionCtx, cfg, load)
-	defer stopRetention()
 
 	var token [1]byte
 	_, err := readFile.Read(token[:])

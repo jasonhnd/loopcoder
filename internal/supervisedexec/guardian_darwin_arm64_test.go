@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,10 +28,8 @@ func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(
 	defer readyRead.Close()
 
 	var loadCalls atomic.Int32
-	authorityLoaded := make(chan struct{})
 	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
 		if loadCalls.Add(1) == 1 {
-			close(authorityLoaded)
 			return authority, nil
 		}
 		return storage.ProviderExecutionAuthority{}, fmt.Errorf("configure sqlite: %w", context.DeadlineExceeded)
@@ -45,11 +44,6 @@ func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(
 	}()
 
 	waitGuardianReadyToken(t, readyRead)
-	select {
-	case <-authorityLoaded:
-	case <-time.After(2 * time.Second):
-		t.Fatal("guardian did not retain authority before supervisor EOF")
-	}
 	if err := writeFile.Close(); err != nil {
 		t.Fatalf("close supervisor liveness pipe: %v", err)
 	}
@@ -70,6 +64,117 @@ func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
 }
 
+func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer cmd.Wait()
+	defer terminateProcessGroup(cmd.Process.Pid)
+
+	cfg := guardianConfigForAuthority(t, authority)
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer writeFile.Close()
+	defer readyRead.Close()
+
+	loadStarted := make(chan struct{})
+	allowLoad := make(chan struct{})
+	var closeAllowLoad sync.Once
+	defer closeAllowLoad.Do(func() { close(allowLoad) })
+	var loadCalls atomic.Int32
+	var killed atomic.Bool
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+			if loadCalls.Add(1) == 1 {
+				close(loadStarted)
+			}
+			<-allowLoad
+			return authority, nil
+		}, func(int) error {
+			killed.Store(true)
+			return nil
+		})
+	}()
+
+	select {
+	case <-loadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not start retaining authority")
+	}
+	readyDone := readGuardianReadyToken(readyRead)
+	select {
+	case err := <-readyDone:
+		t.Fatalf("guardian signaled readiness before authority retention completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	closeAllowLoad.Do(func() { close(allowLoad) })
+	select {
+	case err := <-readyDone:
+		if err != nil {
+			t.Fatalf("guardian readiness: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not signal readiness after authority retention completed")
+	}
+	if _, err := writeFile.Write([]byte{'r'}); err != nil {
+		t.Fatalf("write supervisor release: %v", err)
+	}
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("close supervisor liveness pipe: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("guardian exit code = %d, want 0", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not finish after clean release")
+	}
+	if killed.Load() {
+		t.Fatal("guardian killed provider before supervisor EOF")
+	}
+}
+
+func TestDarwinGuardianReadinessFailsWhenAuthorityCannotBeRetained(t *testing.T) {
+	cfg := guardianConfig{
+		SchemaVersion:  guardianSchema,
+		DiagnosticPath: filepath.Join(t.TempDir(), "guardian.jsonl"),
+	}
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer writeFile.Close()
+	defer readyRead.Close()
+
+	var killed atomic.Bool
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, nil, func(int) error {
+			killed.Store(true)
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-readGuardianReadyToken(readyRead):
+		if err == nil {
+			t.Fatal("guardian signaled readiness without retained authority")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian readiness failure timed out")
+	}
+	select {
+	case code := <-done:
+		if code != 2 {
+			t.Fatalf("guardian exit code = %d, want 2", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not finish after authority retention failure")
+	}
+	if killed.Load() {
+		t.Fatal("guardian killed provider after authority retention failure")
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "startup-failed")
+}
+
 func TestDarwinGuardianCleanReleaseDoesNotKillRetainedAuthority(t *testing.T) {
 	cmd, authority := startGuardianAuthorityProcess(t)
 	defer cmd.Wait()
@@ -84,9 +189,8 @@ func TestDarwinGuardianCleanReleaseDoesNotKillRetainedAuthority(t *testing.T) {
 	var killed atomic.Bool
 	done := make(chan int, 1)
 	go func() {
-		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(ctx context.Context, _ guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			<-ctx.Done()
-			return storage.ProviderExecutionAuthority{}, ctx.Err()
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+			return authority, nil
 		}, func(int) error {
 			killed.Store(true)
 			return nil
@@ -147,6 +251,18 @@ func guardianTestPipes(t *testing.T) (*os.File, *os.File, *os.File, *os.File) {
 
 func waitGuardianReadyToken(t *testing.T, readyRead *os.File) {
 	t.Helper()
+	done := readGuardianReadyToken(readyRead)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("guardian readiness: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian readiness timed out")
+	}
+}
+
+func readGuardianReadyToken(readyRead *os.File) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		var token [1]byte
@@ -161,12 +277,5 @@ func waitGuardianReadyToken(t *testing.T, readyRead *os.File) {
 		}
 		done <- nil
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("guardian readiness: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("guardian readiness timed out")
-	}
+	return done
 }
