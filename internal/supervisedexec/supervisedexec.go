@@ -85,7 +85,8 @@ type Options struct {
 	Role  string
 	// OnStart is called after the provider process starts and is adopted into
 	// its kill-group, before Run reports any running state to callers.
-	OnStart func(StartedProcess) error
+	OnStart  func(StartedProcess) error
+	Guardian GuardianOptions
 }
 
 // Result reports the outcome of a supervised command.
@@ -178,6 +179,12 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, err
 		}
 	}
+	guardian, err := startGuardian(opts.Guardian)
+	if err != nil {
+		_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, err)
+		return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, err
+	}
+	defer guardian.Release()
 
 	waitCh := make(chan waitResult, 1)
 	go func() {
@@ -326,6 +333,9 @@ func normalizeOptions(opts Options) Options {
 }
 
 func validateOptions(opts Options) error {
+	if err := validateGuardianOptions(opts.Guardian); err != nil {
+		return err
+	}
 	if opts.StallTimeout <= 0 {
 		return nil
 	}

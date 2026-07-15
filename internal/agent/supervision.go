@@ -27,6 +27,7 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		Stderr:          inv.Stderr,
 		RunID:           inv.RunID,
 		Role:            inv.Role,
+		Guardian:        inv.Guardian,
 		LivenessMode:    supervisedexec.LivenessMode(inv.LivenessMode),
 		LivenessCommand: inv.LivenessCommand,
 	}
