@@ -14,6 +14,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -135,6 +136,11 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 		}
 
 		action := classifyResumeIssue(issue, latest, primaryPR, candidateBranches, opts.Thresholds, opts.ProcessAlive, opts.Now)
+		if latest != nil && primaryPR == nil {
+			if reconcileAction, ok := resumeProviderReconcileAction(ctx, opts, number, issueAttempts); ok {
+				action = reconcileAction
+			}
+		}
 		labels := labelNames(issue.Labels)
 		evidence := resumeEvidenceLines(
 			opts.RepoPath,
@@ -146,6 +152,11 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 			action.ProgressAge,
 			action.PIDEvidence,
 		)
+		if strings.HasPrefix(action.Classification, "provider-") || action.Classification == "needs-human" {
+			if strings.TrimSpace(action.Action) != "" && strings.Contains(action.Action, providerreconcile.SchemaVersion) {
+				evidence = append(evidence, action.Action)
+			}
+		}
 		if frozen, ok := frozenByIssue[number]; ok && action.Classification != "done" && primaryPR == nil {
 			action = resumeAction{
 				Classification:      "guardrail-frozen",
@@ -202,6 +213,33 @@ func ComputeResume(ctx context.Context, opts ResumeOptions) (report.ResumeReport
 		RunTree: runTree,
 		Issues:  issues,
 	}, nil
+}
+
+func resumeProviderReconcileAction(ctx context.Context, opts ResumeOptions, issue int, attempts []state.Attempt) (resumeAction, bool) {
+	decision := providerreconcile.Check(ctx, providerreconcile.Options{
+		RepoPath: opts.RepoPath,
+		RunID:    opts.RunID,
+		Issue:    issue,
+		Attempts: attempts,
+		Now:      opts.Now,
+	})
+	if !decision.BlockRedispatch {
+		return resumeAction{}, false
+	}
+	classification := "provider-reconciliation"
+	actionKind := "blocked"
+	if decision.NeedsHuman {
+		classification = "needs-human"
+	}
+	if decision.Action == providerreconcile.ActionObserve || decision.Action == providerreconcile.ActionReconcile {
+		classification = "running"
+	}
+	return resumeAction{
+		Classification: classification,
+		ActionKind:     actionKind,
+		Action:         decision.Summary() + "; receipt=" + decision.JSONLine(),
+		PIDEvidence:    fmt.Sprintf("pid %d provider-authority state=%s", decision.ProviderPID, decision.AuthorityState),
+	}, true
 }
 
 func resumeCandidateIssueNumbers(openIssues []gh.Issue, checkedPRs []checkedPR, attempts []state.Attempt) []int {

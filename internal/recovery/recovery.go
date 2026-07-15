@@ -20,6 +20,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/sanitize"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -130,6 +131,7 @@ type Result struct {
 	ReviewResult     *loopreview.Result
 	RecoveryAttempts []AttemptRecord
 	AdoptedPR        *AdoptedPR
+	Reconciliation   *providerreconcile.Receipt
 }
 
 type PullRequestReader interface {
@@ -371,6 +373,19 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			report.WriteString(blockedReport)
 			emitRecoveryProgress(ctx, opts, "recovery-blocked", "guardrail blocked recovery", true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+
+		reconcileDecision := providerreconcile.Check(ctx, providerreconcile.Options{
+			RepoPath: repoPath,
+			RunID:    opts.RunID,
+			Issue:    opts.IssueNumber,
+			Attempts: attemptsFromHistory(attempts),
+			Now:      recoverNow(opts),
+		})
+		if reconcileDecision.BlockRedispatch {
+			report.WriteString(renderProviderReconcileBlockedReport(opts.IssueNumber, opts.RunID, reconcileDecision))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", reconcileDecision.NextAction, true)
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts, Reconciliation: &reconcileDecision}, nil
 		}
 
 		nextAttempt := priorAttempts + 1
@@ -1133,6 +1148,30 @@ func renderCircuitBlockedReport(issueNumber int, runID string, priorAttempts int
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Human decision needed: inspect the latest recovery brief and circuit-breaker evidence, then decide whether to clarify the issue, raise the no-progress threshold, close/supersede it, or explicitly start a new scoped run.")
 	return out.String()
+}
+
+func renderProviderReconcileBlockedReport(issueNumber int, runID string, decision providerreconcile.Receipt) string {
+	var out bytes.Buffer
+	fmt.Fprintln(&out, "BLOCKED: provider reconciliation needs-human")
+	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	fmt.Fprintf(&out, "Outcome: %s\n", decision.Outcome)
+	fmt.Fprintf(&out, "Action: %s\n", decision.Action)
+	fmt.Fprintf(&out, "Reason: %s\n", decision.Reason)
+	fmt.Fprintf(&out, "Next action: %s\n", decision.NextAction)
+	if len(decision.Evidence) > 0 {
+		fmt.Fprintf(&out, "Evidence: %s\n", strings.Join(decision.Evidence, "; "))
+	}
+	fmt.Fprintf(&out, "Receipt: %s\n", decision.JSONLine())
+	return out.String()
+}
+
+func attemptsFromHistory(history []attemptHistoryEntry) []state.Attempt {
+	out := make([]state.Attempt, 0, len(history))
+	for _, item := range history {
+		out = append(out, item.Record)
+	}
+	return out
 }
 
 func ledgerWriteFailedCircuitDecision(opts Options, repoPath string, err error) guardrails.Decision {
