@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -145,6 +146,51 @@ func TestClientPropagatesRunnerError(t *testing.T) {
 	}
 }
 
+func TestCleanEnvPreventsInheritedGitDirFromCapturingFixtureCommits(t *testing.T) {
+	root := t.TempDir()
+	decoy := filepath.Join(root, "decoy")
+	fixture := filepath.Join(root, "fixture")
+	if err := os.MkdirAll(decoy, 0o700); err != nil {
+		t.Fatalf("mkdir decoy: %v", err)
+	}
+	if err := os.MkdirAll(fixture, 0o700); err != nil {
+		t.Fatalf("mkdir fixture: %v", err)
+	}
+
+	runTestGit(t, decoy, "init", "-b", "main")
+	runTestGit(t, decoy, "config", "user.email", "loopcoder-test@example.com")
+	runTestGit(t, decoy, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(decoy, "README.md"), []byte("decoy\n"), 0o600); err != nil {
+		t.Fatalf("write decoy README: %v", err)
+	}
+	runTestGit(t, decoy, "add", "README.md")
+	runTestGit(t, decoy, "commit", "-m", "decoy initial")
+
+	t.Setenv("GIT_DIR", filepath.Join(decoy, ".git"))
+	t.Setenv("GIT_WORK_TREE", decoy)
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(decoy, ".git", "index"))
+	t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(decoy, ".git", "objects"))
+	t.Setenv("GIT_COMMON_DIR", filepath.Join(decoy, ".git"))
+
+	runTestGit(t, fixture, "init", "-b", "main")
+	runTestGit(t, fixture, "config", "user.email", "loopcoder-test@example.com")
+	runTestGit(t, fixture, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(fixture, "tracked.txt"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	runTestGit(t, fixture, "add", "tracked.txt")
+	runTestGit(t, fixture, "commit", "-m", "fixture initial")
+
+	decoyLog := gitTestOutput(t, decoy, "log", "--format=%s")
+	if strings.Contains(decoyLog, "fixture initial") {
+		t.Fatalf("fixture commit landed in decoy repo log:\n%s", decoyLog)
+	}
+	fixtureLog := gitTestOutput(t, fixture, "log", "--format=%s")
+	if !strings.Contains(fixtureLog, "fixture initial") {
+		t.Fatalf("fixture repo missing fixture commit:\n%s", fixtureLog)
+	}
+}
+
 func TestIsPathAbsentOnRefDiscriminatesBadRefs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -220,6 +266,29 @@ func TestIsPathAbsentOnRefDiscriminatesBadRefs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func runTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = CleanEnv(os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s failed: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+func gitTestOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = CleanEnv(os.Environ())
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s in %s failed: %v", strings.Join(args, " "), dir, err)
+	}
+	return string(out)
 }
 
 func TestExecRunnerCapturesOutputAndNonZeroExit(t *testing.T) {
