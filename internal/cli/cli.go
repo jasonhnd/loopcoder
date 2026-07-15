@@ -2888,6 +2888,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
 			cfg.Domain.RedLines,
 		),
+		WaitForChecks:   true,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,

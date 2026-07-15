@@ -6,9 +6,52 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 )
+
+func TestEvaluateRiskGateWaitsLocallyForRequiredChecks(t *testing.T) {
+	reader := &sequencedRiskReader{
+		checks: [][]gh.Check{
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pass"}},
+		},
+	}
+	clock := &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)}
+	receipts := 0
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         reader,
+		PRNumber:       967,
+		RequiredChecks: []string{"verify"},
+		WaitForChecks:  true,
+		WaitClock:      clock,
+		WaitPolicy: waitstate.Policy{
+			MinPollInterval: time.Second,
+			MaxPollInterval: time.Second,
+			ReceiptCadence:  5 * time.Minute,
+			Timeout:         time.Minute,
+		},
+		WaitReceipt: func(context.Context, waitstate.Receipt) error {
+			receipts++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusClean || len(decision.RedLines) != 0 {
+		t.Fatalf("decision = %#v, want clean after local wait", decision)
+	}
+	if decision.Wait == nil || decision.Wait.ProviderInvocations != 0 || decision.Wait.WakeDecisions != 1 {
+		t.Fatalf("wait report = %#v", decision.Wait)
+	}
+	if reader.calls != 3 || len(clock.sleeps) != 1 || receipts != 1 {
+		t.Fatalf("calls=%d sleeps=%v receipts=%d, want deterministic initial read plus two probes", reader.calls, clock.sleeps, receipts)
+	}
+}
 
 func TestEvaluateRiskGateCorePathNeedsHuman(t *testing.T) {
 	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
@@ -385,6 +428,10 @@ func TestRiskGateOptionsExposeNoCoreBypassSurface(t *testing.T) {
 		"PRNumber":           true,
 		"RequiredChecks":     true,
 		"AdditionalRedLines": true,
+		"WaitForChecks":      true,
+		"WaitPolicy":         true,
+		"WaitClock":          true,
+		"WaitReceipt":        true,
 	}
 	riskGateOptions := reflect.TypeOf(RiskGateOptions{})
 	for i := 0; i < riskGateOptions.NumField(); i++ {
@@ -401,4 +448,39 @@ func addedLineDiff(file, line string) string {
 		"+++ b/" + file + "\n" +
 		"@@ -0,0 +1 @@\n" +
 		"+" + line + "\n"
+}
+
+type sequencedRiskReader struct {
+	checks [][]gh.Check
+	calls  int
+}
+
+func (r *sequencedRiskReader) PRChecks(context.Context, int) ([]gh.Check, error) {
+	index := r.calls
+	r.calls++
+	if index >= len(r.checks) {
+		index = len(r.checks) - 1
+	}
+	return append([]gh.Check(nil), r.checks[index]...), nil
+}
+
+func (*sequencedRiskReader) PRDiff(context.Context, int) (string, error) {
+	return modifiedDiff("README.md"), nil
+}
+
+func (*sequencedRiskReader) PRDiffNameOnly(context.Context, int) ([]string, error) {
+	return []string{"README.md"}, nil
+}
+
+type riskWaitClock struct {
+	now    time.Time
+	sleeps []time.Duration
+}
+
+func (c *riskWaitClock) Now() time.Time { return c.now }
+
+func (c *riskWaitClock) Sleep(_ context.Context, delay time.Duration) error {
+	c.sleeps = append(c.sleeps, delay)
+	c.now = c.now.Add(delay)
+	return nil
 }
